@@ -8,13 +8,14 @@ was agreement with the prompt, not conditioning.
 
 About 50 minutes for the pair. Nothing here is imported by the package.
 """
+import argparse
 import json
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 OUT = Path.home() / "models/video-out/i2v-check"
 PROMPT = "a red vintage car parked on a wet street at night, neon reflections"
@@ -31,14 +32,16 @@ def make_keyframe(path: Path) -> None:
     img.save(path)
 
 
-def run(tag: str, image: Path | None) -> Path:
-    cmd = ["./.venv/bin/python", "-m", "h3_48gb", "generate", PROMPT,
-           "--width", "512", "--height", "512", "--duration", "2.4",
+def run(tag: str, image: Path | None, canvas: tuple[int, int], prompt: str,
+        duration: float) -> Path:
+    width, height = canvas
+    cmd = ["./.venv/bin/python", "-m", "h3_48gb", "generate", prompt,
+           "--width", str(width), "--height", str(height), "--duration", str(duration),
            "--steps", "31", "--seed", "20260807", "--tag", tag, "--outdir", str(OUT)]
     if image is not None:
         cmd += ["--image", str(image)]
     subprocess.run(cmd, check=True)
-    return OUT / f"h3-{tag}-512x512.mp4"
+    return OUT / f"h3-{tag}-{width}x{height}.mp4"
 
 
 def first_frame(clip: Path) -> np.ndarray:
@@ -54,13 +57,33 @@ def psnr(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def main() -> int:
-    OUT.mkdir(parents=True, exist_ok=True)
-    key = OUT / "keyframe.png"
-    make_keyframe(key)
-    reference = np.asarray(Image.open(key).convert("RGB"), dtype=np.float64)
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--image", type=Path, default=None,
+                    help="keyframe to condition on; the synthetic checkerboard if omitted")
+    ap.add_argument("--width", type=int, default=512)
+    ap.add_argument("--height", type=int, default=512)
+    ap.add_argument("--duration", type=float, default=2.4)
+    ap.add_argument("--prompt", default=PROMPT)
+    ap.add_argument("--tag", default="i2v", help="prefix for both runs' tags")
+    args = ap.parse_args()
 
-    conditioned = first_frame(run("i2v", key))
-    control = first_frame(run("control", None))
+    OUT.mkdir(parents=True, exist_ok=True)
+    canvas = (args.width, args.height)
+    if args.image is None:
+        key = OUT / "keyframe.png"
+        make_keyframe(key)
+    else:
+        key = args.image
+
+    # Compare against the keyframe as the clip's first frame can possibly show it: on the canvas,
+    # at the canvas size. Scoring a 1536x1024 source against a 576x384 frame would measure the
+    # resize, not the conditioning.
+    with Image.open(key) as raw:
+        prepared = ImageOps.exif_transpose(raw).convert("RGB").resize(canvas, Image.LANCZOS)
+    reference = np.asarray(prepared, dtype=np.float64)
+
+    conditioned = first_frame(run(f"{args.tag}", key, canvas, args.prompt, args.duration))
+    control = first_frame(run(f"{args.tag}-control", None, canvas, args.prompt, args.duration))
 
     report = {
         "conditioned_psnr": round(psnr(reference, conditioned), 2),
@@ -73,7 +96,7 @@ def main() -> int:
         if report["conditioned_psnr"] > report["control_psnr"] + 3
         else "INCONCLUSIVE: the keyframe did not move the first frame measurably"
     )
-    (OUT / "verdict.json").write_text(json.dumps(report, indent=2))
+    (OUT / f"verdict-{args.tag}.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
     return 0 if report["verdict"] == "conditioning works" else 1
 

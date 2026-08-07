@@ -59,15 +59,19 @@ deliberately** — at 1881 s/step the full 30-forward run projects to roughly 15
 not worth running to completion just to confirm a number the first 2 steps already established.
 It was a stop, not a crash: no error, no sign the process would not have completed if left running.
 
-## Scaling is worse than linear
+## Scaling bends upward, but not everywhere
 
-Per-step cost across the three geometries: **46 s -> 586 s -> 1881 s**. Going from 512x512/2.4s to
-1344x768/5s is roughly a 3.2x increase in per-step cost for a ~7x increase in pixel count (native
-resolution is 1344x768 = 1,032,192 px vs 512x512 = 262,144 px) and a ~2.1x increase in frame count
-at 24 fps; going from the 5s to the 10s native run is a 3.2x increase in per-step cost for a 2x
-increase in frame count alone (geometry unchanged). That is not the profile of a compute cost that
-scales with token count, i.e. linearly, or even a naive quadratic-in-sequence-length curve applied
-cleanly — it is worse, because:
+Per-step cost across the three geometries: **46 s -> 586 s -> 1881 s**.
+
+| Step up | Tokens | Per-step cost | Shape |
+|---|---|---|---|
+| 512x512/2.4s -> 1344x768/5s | x6.7 (3.9x pixels, 1.7x frames) | **x12.7** | ~quadratic in tokens |
+| 1344x768/5s -> 1344x768/10s | x2.0 (frames only) | **x3.2** | ~quadratic in tokens |
+
+An earlier version of this section reported the first step up as "roughly 3.2x", which is wrong:
+586/46 is 12.7. The 3.2 belongs to the second row only. The corrected numbers make the curve
+*simpler* than previously claimed, not worse — both steps land near a quadratic in token count
+rather than defying description. The mechanism is unchanged and is the reason:
 
 - **Attention is dense.** The whole packed sequence (text + keyframe conditions + audio rows +
   video rows) attends over itself with plain full self-attention — no cross-attention, no sparsity,
@@ -80,7 +84,8 @@ cleanly — it is worse, because:
   attention cost that dominates wall time at native resolution and longer clips.
 
 Anyone tuning clip length or resolution against a time budget should expect the cost curve to bend
-upward faster than the pixel or frame count alone would suggest, for exactly this reason.
+upward faster than the pixel or frame count alone would suggest, for exactly this reason: doubling
+a clip's length roughly triples the cost of every step.
 
 ## Memory profile
 
