@@ -279,7 +279,29 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         28.2 GB text encoder has been released.
         """
         self.video_vae.load()
-        return super()._encode_keyframes(images, height, width)
+        encode = super()._encode_keyframes
+        if len(images) < 2:
+            return encode(images, height, width)
+
+        # Seed 42 once per keyframe, not once per request. Upstream seeds outside its loop, so the
+        # second keyframe's posterior sample continues the stream; the reference builds a fresh
+        # `torch.Generator().manual_seed(...)` for every image
+        # (`reference/diffusers/modular/encoders.py:297`), which means two identical keyframes must
+        # encode identically. They did not: 0.83 apart. Encoding one at a time puts upstream's own
+        # seed call in front of each draw.
+        #
+        # Safe only because `__call__` has already put every keyframe on the canvas: upstream
+        # stretches image 0 and cover-crops the rest, a distinction that is lost when each is
+        # passed as index 0. Prepared frames come back untouched, so the distinction is moot — but
+        # if that ever stops being true, this must fail rather than silently stretch keyframe 2.
+        wrong_size = [(index, image.size) for index, image in enumerate(images)
+                      if image.size != (width, height)]
+        if wrong_size:
+            raise RuntimeError(
+                f"Keyframes must already be on the {width}x{height} canvas before they are encoded "
+                f"one at a time, but {wrong_size} are not. See `__call__`, which prepares them."
+            )
+        return mx.concatenate([encode([image], height, width) for image in images])
 
     # -- schedule / modulation ------------------------------------------------------------------
 

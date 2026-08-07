@@ -307,6 +307,54 @@ def test_both_consumers_get_the_same_prepared_keyframe() -> None:
         MiniMaxH3Pipeline.__call__ = original
 
 
+def test_each_keyframe_gets_its_own_seed() -> None:
+    """Two identical keyframes must encode identically, and upstream seeds outside its loop.
+
+    The reference builds a fresh generator per image, so keyframe 2 draws the same noise as
+    keyframe 1. Upstream seeds once per request, so keyframe 2 continues the stream — measured
+    0.83 apart on two byte-identical frames. Encoding one at a time puts upstream's own seed in
+    front of every draw; verified against the real VAE at max|d| = 0.0.
+    """
+    from PIL import Image
+
+    from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    class ProxyVAE:
+        def load(self):
+            pass
+
+    class Config:
+        sigma_shift_video = 12.0
+        sigma_shift_audio = 3.0
+
+    pipe = LazyMiniMaxH3Pipeline(object(), object(), ProxyVAE(), object(), Config(), verbose=False)
+    batches: list[int] = []
+
+    original = MiniMaxH3Pipeline._encode_keyframes
+    MiniMaxH3Pipeline._encode_keyframes = lambda self, images, h, w: (
+        batches.append(len(images)) or mx.zeros((len(images) * 2, 4)))
+    try:
+        canvas = Image.new("RGB", (576, 384))
+        pipe._encode_keyframes([canvas, canvas], 384, 576)
+        check("two keyframes are encoded one at a time", batches == [1, 1], f"got {batches}")
+
+        batches.clear()
+        pipe._encode_keyframes([canvas], 384, 576)
+        check("a single keyframe still goes through in one call", batches == [1], f"got {batches}")
+
+        # The one-at-a-time path loses upstream's stretch/cover-crop distinction, so it may only
+        # run on frames already on the canvas. If that stops holding, it must fail, not stretch.
+        try:
+            pipe._encode_keyframes([Image.new("RGB", (800, 600)), canvas], 384, 576)
+            raise AssertionError("unprepared keyframes should have been refused")
+        except RuntimeError as exc:
+            check("unprepared keyframes are refused, not silently stretched",
+                  "canvas" in str(exc), f"got {exc}")
+    finally:
+        MiniMaxH3Pipeline._encode_keyframes = original
+
+
 def main() -> int:
     tests = [
         test_config_is_free,
@@ -319,6 +367,7 @@ def main() -> int:
         test_phase_tracker,
         test_keyframes_load_the_vae_before_upstream_seeds,
         test_both_consumers_get_the_same_prepared_keyframe,
+        test_each_keyframe_gets_its_own_seed,
     ]
     for test in tests:
         print(f"{test.__name__}:")
