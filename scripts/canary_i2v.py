@@ -179,6 +179,15 @@ def main() -> int:
         if path is None:
             path = outdir / f"keyframe-{args.width}x{args.height}.png"
             make_keyframe(path, args.width, args.height)
+        # The CLI refuses an unpatched checkout before loading anything; the canary bypasses the
+        # CLI, so without this it would spend 20 s reaching a failure the CLI names instantly.
+        from h3_48gb.text_encoder import keyframe_scatter_patch_applied
+
+        if not keyframe_scatter_patch_applied():
+            print("[canary] upstream/ is unpatched — a keyframe run would die inside the encoder. "
+                  "Apply patches/0001-keyframe-masked-scatter.patch (see README).")
+            return 1
+
         images = [load_image(path)]
         anchors = ("first",)
         print(f"[canary] keyframe: {path} {images[0].size}", flush=True)
@@ -234,6 +243,15 @@ def main() -> int:
     print("\n" + json.dumps(report, indent=2), flush=True)
     if args.report:
         args.report.write_text(json.dumps(report, indent=2))
+
+    # A stage can be skipped without anything raising — a pipeline that quietly dropped the
+    # keyframe completes happily, and reporting that as "structurally sound" would be the exact
+    # false negative this script exists to prevent.
+    if failure is None and report["first_missing_stage"] is not None:
+        missing = report["first_missing_stage"]
+        print(f"\n[canary] the run completed but never reached `{missing}`. Nothing raised, so "
+              "some stage was skipped rather than failing — that is a defect, not a pass.")
+        return 1
 
     if failure is None:
         if args.no_image:

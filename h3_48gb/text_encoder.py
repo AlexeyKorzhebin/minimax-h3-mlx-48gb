@@ -52,22 +52,26 @@ VISION_CONV3D_WEIGHTS = frozenset({"patch_embed.proj.weight"})
 UNPATCHED_SCATTER = "mx.where(image_mask"
 
 
-def keyframe_scatter_patch_applied() -> bool:
+def keyframe_scatter_patch_applied(source: str | None = None) -> bool:
     """Whether the vendored `upstream/` carries this fork's keyframe scatter fix.
 
-    Read from the live source rather than a file path, so it stays honest when `H3_UPSTREAM`
-    points the checkout somewhere else.
+    Reads the live source rather than a file path, so it stays honest when `H3_UPSTREAM` points
+    the checkout somewhere else. `source` overrides that, which is what lets a test hand it known
+    patched and unpatched text — without it, replacing this whole body with `return True` passed
+    the entire suite.
 
     Comment lines are stripped first, and that is load-bearing: the patch quotes the very
     expression it replaces so a reader can see what changed, which made the first version of this
     check report a patched file as unpatched.
     """
-    import inspect
+    if source is None:
+        import inspect
 
-    from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
+        from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
 
-    code = [line for line in inspect.getsource(MiniMaxH3TextEncoder.encode).splitlines()
-            if not line.lstrip().startswith("#")]
+        source = inspect.getsource(MiniMaxH3TextEncoder.encode)
+
+    code = [line for line in source.splitlines() if not line.lstrip().startswith("#")]
     return not any(UNPATCHED_SCATTER in line for line in code)
 
 
@@ -102,6 +106,24 @@ def split_recipe(quantized_modules: list[str]) -> dict[str, set[str]]:
         elif path.startswith(VISION_PREFIX):
             buckets["vision"].add(path[len(VISION_PREFIX):])
     return buckets
+
+
+def prepare_loaded_tensor(bucket: str, path: str, tensor: mx.array, dtype: mx.Dtype) -> mx.array:
+    """Everything `_load_weights` does to one tensor between reading it and storing it.
+
+    Extracted from the load loop so it can be tested without materializing 28.2 GB. Both rules
+    here fail silently if dropped, which is why they are worth a unit of their own:
+
+    * the vision tower's one conv weight arrives in PyTorch's layout and must be transposed —
+      and a *wrong* permutation would not raise either, since the kernel's H and W are both 16;
+    * a quantized layer's packed storage must never be cast, because it is bit-packing rather
+      than a number, and `astype` would reinterpret it arithmetically.
+    """
+    if bucket == "vision" and path in VISION_CONV3D_WEIGHTS:
+        tensor = to_mlx_conv3d_layout(tensor)
+    if tensor.dtype not in (mx.uint32, mx.int32, mx.uint8):
+        tensor = tensor.astype(dtype)
+    return tensor
 
 
 def quantize_selected(module: nn.Module, paths: set[str], bits: int, group_size: int) -> int:
@@ -221,15 +243,9 @@ class QuantizedTextEncoder(MiniMaxH3TextEncoder):
             dropped += shard_dropped
             for bucket, keys in kept.items():
                 for key in keys:
-                    tensor = loaded[key]
                     path = self._wanted(key)[1]
-                    if bucket == "vision" and path in VISION_CONV3D_WEIGHTS:
-                        tensor = to_mlx_conv3d_layout(tensor)
-                    # Never `astype` a quantized layer's packed storage: it is bit-packing, not a
-                    # number, and the cast would convert it arithmetically.
-                    if tensor.dtype not in (mx.uint32, mx.int32, mx.uint8):
-                        tensor = tensor.astype(dtype)
-                    buckets_out[bucket][path] = tensor
+                    buckets_out[bucket][path] = prepare_loaded_tensor(
+                        bucket, path, loaded[key], dtype)
             if verbose:
                 total = len(buckets_out["language"]) + len(buckets_out["vision"])
                 print(f"  {Path(shard).name}: kept {total}")

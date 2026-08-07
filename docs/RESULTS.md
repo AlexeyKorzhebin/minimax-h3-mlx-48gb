@@ -63,15 +63,17 @@ It was a stop, not a crash: no error, no sign the process would not have complet
 
 Per-step cost across the three geometries: **46 s -> 586 s -> 1881 s**.
 
-| Step up | Tokens | Per-step cost | Shape |
+| Step up | Tokens | Per-step cost | Exponent |
 |---|---|---|---|
-| 512x512/2.4s -> 1344x768/5s | x6.7 (3.9x pixels, 1.7x frames) | **x12.7** | ~quadratic in tokens |
-| 1344x768/5s -> 1344x768/10s | x2.0 (frames only) | **x3.2** | ~quadratic in tokens |
+| 512x512/2.4s -> 1344x768/5s | x6.7 (3.9x pixels, 1.7x frames) | **x12.7** | tokens^1.34 |
+| 1344x768/5s -> 1344x768/10s | x2.0 (frames only) | **x3.2** | tokens^1.68 |
 
-An earlier version of this section reported the first step up as "roughly 3.2x", which is wrong:
-586/46 is 12.7. The 3.2 belongs to the second row only. The corrected numbers make the curve
-*simpler* than previously claimed, not worse — both steps land near a quadratic in token count
-rather than defying description. The mechanism is unchanged and is the reason:
+Two corrections to what this section used to say. It reported the first step up as "roughly 3.2x",
+which is wrong — 586/46 is 12.7, and the 3.2 belongs to the second row only. And it called the
+curve "worse than a naive quadratic": both step ups are in fact *sub*-quadratic, at exponents 1.34
+and 1.68 over token count. Growth is still faster than linear, and the second step up — where only
+the sequence gets longer, with geometry fixed — is the steeper of the two, which is what the
+mechanism predicts:
 
 - **Attention is dense.** The whole packed sequence (text + keyframe conditions + audio rows +
   video rows) attends over itself with plain full self-attention — no cross-attention, no sparsity,
@@ -415,7 +417,9 @@ table. Measured with the canary on that port's own geometry:
 | DiT precision | 4-bit | int8 |
 | **Per step** | **262 s** | **131.6 s** |
 
-Both figures are sampling only, excluding load and decode. The 2x gap is a chip generation and a
+Both figures are sampling only, excluding load and decode. Ours is the per-step time the pipeline
+itself prints, and the two forwards measured 262.1 s and 261.6 s — within 0.2% of each other, so
+neither carries hidden warm-up or load cost. The 2x gap is a chip generation and a
 quantization choice, not headroom in this code: M5's GPU carries neural accelerators per core, and
 int8 is a different trade than the 4-bit weights this fork uses to fit 48 GB at all. Attention here
 already runs through `mx.fast.scaled_dot_product_attention`, so there is no obvious slow path to

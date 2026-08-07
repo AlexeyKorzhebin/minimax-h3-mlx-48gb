@@ -139,6 +139,7 @@ def main() -> int:
         test_h_equals_w_like_the_real_checkpoint_still_catches_a_wrong_permutation,
         test_only_the_conv_stem_is_marked_for_transposition,
         test_bias_is_left_alone,
+        test_the_loader_actually_applies_the_transpose,
     ]
     for test in tests:
         print(f"{test.__name__}:")
@@ -149,3 +150,36 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_the_loader_actually_applies_the_transpose() -> None:
+    """`to_mlx_conv3d_layout` being correct is worth nothing if the loader stops calling it.
+
+    Deleting the call used to leave all 159 tests green, because every test here exercised the
+    pure function directly. `prepare_loaded_tensor` is the loader's own per-tensor step, so this
+    fails if the rule is dropped, moved, or scoped to the wrong bucket.
+    """
+    import mlx.core as mx
+
+    from h3_48gb.text_encoder import VISION_CONV3D_WEIGHTS, prepare_loaded_tensor
+
+    source = mx.random.normal((4, 3, 2, 16, 16))          # (out, in, D, H, W), PyTorch layout
+    path = next(iter(VISION_CONV3D_WEIGHTS))
+
+    out = prepare_loaded_tensor("vision", path, source, mx.float32)
+    check("the vision conv weight is transposed to channels-last",
+          out.shape == (4, 2, 16, 16, 3), f"got {out.shape}")
+    # Values, not just shape: H and W are both 16 in the real checkpoint, so a permutation that
+    # swaps them produces this exact shape too.
+    check("and it is the right permutation",
+          float(mx.abs(out - source.transpose(0, 2, 3, 4, 1)).max()) == 0.0)
+
+    same = prepare_loaded_tensor("language", path, source, mx.float32)
+    check("the same path in another bucket is left alone", same.shape == source.shape,
+          f"got {same.shape}")
+    other = prepare_loaded_tensor("vision", "blocks.0.mlp.fc1.weight", source, mx.float32)
+    check("other vision weights are left alone", other.shape == source.shape, f"got {other.shape}")
+
+    packed = mx.zeros((4, 8), dtype=mx.uint32)
+    kept = prepare_loaded_tensor("vision", "blocks.0.attn.qkv.weight", packed, mx.bfloat16)
+    check("packed quantized storage is never cast", kept.dtype == mx.uint32, f"got {kept.dtype}")

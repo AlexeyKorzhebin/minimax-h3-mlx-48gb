@@ -47,6 +47,9 @@ ERROR_CODES = {
     "preview_interval_negative": "--preview-every is negative; 0 disables previews, N > 0 sets a cadence",
     "end_image_without_image": "--end-image was given without --image; the end frame anchors a run that must also have a start frame",
     "image_not_found": "a keyframe path does not exist",
+    "image_unreadable": "a keyframe exists but could not be decoded as an image",
+    "image_aspect_unsupported": "a keyframe's aspect ratio is outside the 1:4..4:1 the model supports",
+    "partial_canvas_with_image": "--image was given with only one of --width/--height",
     "upstream_patch_missing": "a keyframe was given but the vendored upstream/ checkout is unpatched",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
@@ -239,16 +242,43 @@ def resolve_canvas(image: Path | None, width: int | None, height: int | None) ->
         return width if width is not None else default_width, \
             height if height is not None else default_height
 
-    from PIL import Image, ImageOps
+    # Half a canvas is worse than none: `--width 640` alone against a 3:2 photo used to pair the
+    # requested width with the *derived* height, producing a canvas of neither aspect and
+    # stretching the frame into it without a word.
+    if width is not None or height is not None:
+        raise CliError(
+            "partial_canvas_with_image",
+            "--image derives the canvas from the keyframe, so pass both --width and --height or "
+            f"neither. Got only --{'width' if width is not None else 'height'}.",
+            {"width": width, "height": height},
+        )
+
+    from PIL import Image, ImageOps, UnidentifiedImageError
 
     from h3_48gb._upstream import ensure_on_path  # noqa: F401  (puts upstream on sys.path)
     from minimax_h3_mlx.packing import resolve_canvas_size
 
-    with Image.open(image) as raw:
-        source = ImageOps.exif_transpose(raw).size
-    derived_height, derived_width = resolve_canvas_size(*source)
-    return width if width is not None else derived_width, \
-        height if height is not None else derived_height
+    # `RunSpec.__post_init__` refuses a missing keyframe with `image_not_found`, but it only runs
+    # once the canvas is known — so these three failures reach the user from here, and must carry
+    # the same codes rather than a raw PIL traceback.
+    if not Path(image).exists():
+        raise CliError("image_not_found", f"--image does not exist: {image}", {"image": str(image)})
+    try:
+        with Image.open(image) as raw:
+            source = ImageOps.exif_transpose(raw).size
+    except (OSError, UnidentifiedImageError) as exc:
+        raise CliError("image_unreadable", f"--image could not be read: {image} ({exc})",
+                       {"image": str(image)}) from exc
+    try:
+        derived_height, derived_width = resolve_canvas_size(*source)
+    except ValueError as exc:
+        raise CliError(
+            "image_aspect_unsupported",
+            f"--image is {source[0]}x{source[1]}; MiniMax-H3 supports aspect ratios from 1:4 to "
+            f"4:1. Crop it, or pass --width and --height explicitly. ({exc})",
+            {"image": str(image), "size": list(source)},
+        ) from exc
+    return derived_width, derived_height
 
 
 def spec_from_args(args: argparse.Namespace) -> RunSpec:
@@ -275,14 +305,25 @@ def load_keyframes(spec: RunSpec) -> tuple[list, tuple[str, ...]]:
     `exif_transpose` is not cosmetic: a camera stores orientation as a tag rather than by
     rotating the pixels, so without it a portrait photo conditions the run on a landscape
     frame — and nothing downstream can tell that happened.
+
+    Frames come back **already on the canvas**, and that is load-bearing rather than tidy: the
+    checkpoint's identity digest is taken over what this returns, while the clip is conditioned on
+    what the pipeline receives. Returning the raw frame here made those two different images the
+    moment the pipeline started preparing them itself, so `h3 resume --image photo.jpg` computed a
+    digest no checkpoint had ever been written under and reported `checkpoint_not_found`. Preparing
+    once, here, is what keeps the identity and the conditioning describing the same picture.
     """
     from PIL import Image, ImageOps
+
+    from minimax_h3_mlx.packing import prepare_keyframe_image
 
     images, anchors = [], []
     for path, anchor in ((spec.image, "first"), (spec.end_image, "last")):
         if path is None:
             continue
-        images.append(ImageOps.exif_transpose(Image.open(path).convert("RGB")))
+        oriented = ImageOps.exif_transpose(Image.open(path).convert("RGB"))
+        images.append(prepare_keyframe_image(oriented, spec.height, spec.width,
+                                             stretch=not images))
         anchors.append(anchor)
 
     # Checked here rather than in `__post_init__`, which must not import mlx, and only when a

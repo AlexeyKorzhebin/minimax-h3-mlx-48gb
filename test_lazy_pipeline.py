@@ -331,13 +331,32 @@ def test_each_keyframe_gets_its_own_seed() -> None:
     pipe = LazyMiniMaxH3Pipeline(object(), object(), ProxyVAE(), object(), Config(), verbose=False)
     batches: list[int] = []
 
+    def like_upstream(self, images, h, w):
+        """Upstream's shape: seed once, then draw once per image from the shared stream.
+
+        Reproducing the seed and the draw — rather than counting calls — is what makes this test
+        about the noise instead of about batch sizes.
+        """
+        batches.append(len(images))
+        mx.random.seed(42)
+        return mx.concatenate([mx.random.normal((2, 4)) for _ in images])
+
     original = MiniMaxH3Pipeline._encode_keyframes
-    MiniMaxH3Pipeline._encode_keyframes = lambda self, images, h, w: (
-        batches.append(len(images)) or mx.zeros((len(images) * 2, 4)))
+    MiniMaxH3Pipeline._encode_keyframes = like_upstream
     try:
         canvas = Image.new("RGB", (576, 384))
-        pipe._encode_keyframes([canvas, canvas], 384, 576)
+        rows = pipe._encode_keyframes([canvas, canvas], 384, 576)
+        first, second = rows[:2], rows[2:]
+        check("two identical keyframes draw identical noise",
+              float(mx.abs(first - second).max()) == 0.0,
+              f"max|d| = {float(mx.abs(first - second).max())}")
         check("two keyframes are encoded one at a time", batches == [1, 1], f"got {batches}")
+
+        # The control: upstream's own arrangement, one call for both, is what this fixes — and it
+        # must visibly fail the assertion above, or that assertion proves nothing.
+        upstream_rows = like_upstream(pipe, [canvas, canvas], 384, 576)
+        check("and upstream's single call would not have",
+              float(mx.abs(upstream_rows[:2] - upstream_rows[2:]).max()) > 0.0)
 
         batches.clear()
         pipe._encode_keyframes([canvas], 384, 576)
