@@ -113,12 +113,35 @@ python3 -m venv .venv
 h3 doctor --checkpoint ~/models/h3-converted
 
 # 4. Generate. --steps defaults to 31 — the only schedule the baked AdaLN table covers.
-#    --preview-every 5 writes <stem>-preview-stepNN.jpg roughly every 49 minutes at this
-#    geometry, so a five-hour render is watchable instead of opaque. It is off by default.
+#    Previews are on by default (every 5 steps, written to <stem>-preview-stepNN.jpg), so a
+#    five-hour render is watchable instead of opaque. They cost 0.125 s each — see "Previews"
+#    below. Pass --preview-every 0 to turn them off.
 h3 generate "a jeweled hummingbird hovering beside a red orchid, cinematic natural light" \
-    --checkpoint ~/models/h3-converted --outdir ~/models/video-out --width 1344 --height 768 \
-    --preview-every 5
+    --checkpoint ~/models/h3-converted --outdir ~/models/video-out --width 1344 --height 768
 ```
+
+### Previews
+
+A preview used to cost 49.3 s and 8.46 GB, because the real video VAE is causal and chunked: it
+cannot decode fewer than 7 latent frames and tiles 28 times at 1344x768 regardless. That is why
+previews were opt-in.
+
+This fork decodes them with **TAE** instead — a 9.8 MB 2D decoder, no chunk floor, no tiling — at
+**0.125 s and 2.06 GB**, which is 394x faster. Six previews of a 30-step run cost 0.8 s, so they
+are on by default. Measurements and the quality comparison are in
+[`docs/RESULTS.md`](docs/RESULTS.md).
+
+```bash
+# Optional: the TAE weights (9.8 MB). Without them previews fall back to a VAE-free latent
+# heat map — coarse but free, and nothing breaks.
+mkdir -p ~/models/tae
+curl -L -o ~/models/tae/taeh3.safetensors \
+  https://huggingface.co/Kijai/MiniMax-H3-TAE/resolve/main/vae_approx/taeh3.safetensors
+```
+
+`--preview-decoder` chooses between `tae` (default), `vae` (the real one — exact, and 394x
+slower) and `latent` (the heat map, no weights at all). TAE is an approximation for watching
+progress; the delivered clip is always decoded by the real VAE.
 
 `requirements.txt` covers both this fork and the vendored `upstream/` port: upstream's own
 `requirements.txt` omits `mlx-vlm` (imported unconditionally by its text encoder) and `pillow`

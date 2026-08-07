@@ -177,3 +177,59 @@ def test_a_wrongly_shaped_tensor_is_refused_even_when_the_name_matches(tmp_path)
     with pytest.raises(KeyError) as excinfo:
         load_tae(path)
     assert "1.weight" in str(excinfo.value)
+
+
+def test_every_fixture_is_actually_committed():
+    """A fixture the repository does not carry is a test that only passes on this machine.
+
+    This has now happened twice: `.gitignore`'s blanket `*.npz` swallowed the processor fixtures,
+    and then the TAE golden frame. Both times the suite stayed green locally and lost its
+    value-level protection for everyone else. Checked for the whole fixtures tree rather than for
+    one file, because the next one will be a different name.
+    """
+    import subprocess
+
+    root = Path(__file__).resolve().parent.parent
+    fixtures = root / "tests/fixtures"
+    on_disk = {p.relative_to(root).as_posix() for p in fixtures.rglob("*") if p.is_file()}
+    tracked = set(subprocess.run(
+        ["git", "ls-files", "tests/fixtures"], cwd=root, capture_output=True, text=True,
+        check=True).stdout.split())
+
+    missing = sorted(on_disk - tracked)
+    assert not missing, (
+        f"these fixtures exist but git does not carry them: {missing}. Add an exception to "
+        ".gitignore — a fixture that ships only on the author's machine protects nobody.")
+
+
+def test_the_normalization_constant_actually_changes_the_decode():
+    """`TAE_EXPECTS_NORMALIZED` decides what the decoder is fed; flipping it must change the frame.
+
+    The golden fixture is taken at mean=0/std=1, where denormalizing is the identity — so it pins
+    the decoder but says nothing about this constant. Measured against non-trivial statistics, the
+    two paths differ, which is what makes RESULTS.md's normalization table meaningful.
+    """
+    import mlx.core as mx
+
+    from h3_48gb import tae as tae_module
+    from h3_48gb.tae import decode_latent_frame, load_tae
+
+    decoder = load_tae(TAE_WEIGHTS_PATH)
+    latents = _deterministic_latent()
+    mean = mx.full((1, 24, 1, 1, 1), 0.4)
+    std = mx.full((1, 24, 1, 1, 1), 2.5)
+
+    original = tae_module.TAE_EXPECTS_NORMALIZED
+    try:
+        tae_module.TAE_EXPECTS_NORMALIZED = True
+        as_normalized = decode_latent_frame(decoder, latents, mean, std, 0)
+        tae_module.TAE_EXPECTS_NORMALIZED = False
+        as_denormalized = decode_latent_frame(decoder, latents, mean, std, 0)
+    finally:
+        tae_module.TAE_EXPECTS_NORMALIZED = original
+
+    difference = np.abs(as_normalized.astype(np.int16) - as_denormalized.astype(np.int16))
+    assert difference.mean() > 5, (
+        f"the two normalizations decode to nearly the same frame (mean diff {difference.mean():.2f})"
+        " — then the constant, and the table in RESULTS.md, decide nothing")
+    assert original is True, "measurement settled this at normalized; see RESULTS.md"

@@ -247,6 +247,11 @@ def preview_path(stem: str | Path, step: int) -> Path:
 DECODER_NAMES = ("vae", "tae", "latent")
 
 
+#: Decoders whose "weights absent" notice has already been printed this process. Absent weights
+#: are a supported configuration, not an incident, so the notice is worth exactly one line.
+_ANNOUNCED: dict[str, bool] = {}
+
+
 def emit_preview(
     pipeline,
     generated_video_rows: mx.array,
@@ -305,6 +310,16 @@ def emit_preview(
                 print(f"  [preview] step {step}: wrote {dest.name} via {decoder} "
                       f"({time.perf_counter() - started:.1f}s)", flush=True)
             return True
+        except FileNotFoundError as exc:
+            # Not a failure: the TAE weights are optional and previews default to TAE, so a reader
+            # who never downloaded them takes this path on every preview of every run. Said once
+            # per process, because six identical stack-adjacent lines per run is how a log stops
+            # being read.
+            if not _ANNOUNCED.get(decoder):
+                _ANNOUNCED[decoder] = True
+                print(f"  [preview] {decoder} weights not found ({exc}); using the latent heat map "
+                      "for previews. See README's Previews section to fetch them.",
+                      file=sys.stderr, flush=True)
         except Exception as exc:  # noqa: BLE001 - a broken preview must never break the real run
             print(f"  [preview] step {step}: {decoder} decode failed ({exc!r}), "
                   f"falling back to a latent-only preview", file=sys.stderr, flush=True)
