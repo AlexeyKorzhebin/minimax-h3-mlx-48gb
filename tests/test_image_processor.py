@@ -31,24 +31,15 @@ def test_processor_loads_without_torch():
     assert "torchvision" not in sys.modules
 
 
-def test_torch_free_assertion_has_teeth():
-    """Demonstrate that the torch-free check would catch a regression.
+def test_the_guard_fires_when_torch_appears(monkeypatch):
+    """Proves the guard in test_processor_loads_without_torch actually catches a regression.
 
-    If a future change accidentally imports torch during processing, this proves
-    the assertion would catch it. We simulate the regression by manually injecting
-    a sentinel into sys.modules, then confirm the assertion fires.
+    Rather than copying the assertion, this calls the real guard with a sentinel installed.
+    If torch appears in sys.modules, the real guard will fire.
     """
-    ip = load_image_processor(PROCESSOR_DIR)
-    ip(images=[Image.new("RGB", (640, 384), (200, 40, 40))], return_tensors="np")
-
-    # Simulate a regression: torch gets imported (e.g., in a future change to the processor)
-    sys.modules["torch"] = object()  # Sentinel
-    try:
-        with pytest.raises(AssertionError):
-            assert "torch" not in sys.modules
-    finally:
-        # Cleanup to avoid affecting other tests
-        del sys.modules["torch"]
+    monkeypatch.setitem(sys.modules, "torch", object())
+    with pytest.raises(AssertionError):
+        test_processor_loads_without_torch()
 
 
 def test_it_produces_what_upstream_consumes():
