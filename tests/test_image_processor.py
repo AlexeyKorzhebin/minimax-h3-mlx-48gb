@@ -9,6 +9,7 @@ from PIL import Image
 from h3_48gb.image_processor import TorchFreeProcessor, load_image_processor
 
 PROCESSOR_DIR = Path.home() / "models/h3-converted/processor"
+FIXTURES = Path(__file__).parent / "fixtures/processor"
 pytestmark = pytest.mark.skipif(not PROCESSOR_DIR.exists(),
                                 reason="converted checkpoint not present")
 
@@ -85,3 +86,25 @@ def test_encoder_serves_the_torch_free_processor(monkeypatch):
     assert proc.image_processor.merge_size == 2
     assert built["dir"].name == "processor", "must read the sibling processor directory"
     assert "torch" not in sys.modules
+
+
+def _case_image(w: int, h: int) -> Image.Image:
+    arr = np.zeros((h, w, 3), dtype=np.uint8)
+    arr[..., 0] = np.linspace(0, 255, w, dtype=np.uint8)[None, :]
+    arr[..., 1] = np.linspace(0, 255, h, dtype=np.uint8)[:, None]
+    return Image.fromarray(arr)
+
+
+@pytest.mark.parametrize("name", ["landscape", "portrait", "tiny", "huge"])
+def test_matches_transformers_reference(name):
+    """Two independent implementations can disagree in resize rounding or normalisation without
+    raising — the clip is then conditioned on a subtly different image, and the only symptom is
+    worse output hours later. These fixtures came from transformers itself."""
+    manifest = json.loads((FIXTURES / "manifest.json").read_text())
+    w, h = manifest[name]["size"]
+    reference = np.load(FIXTURES / f"{name}.npz")
+
+    out = load_image_processor(PROCESSOR_DIR)(images=[_case_image(w, h)], return_tensors="np")
+
+    np.testing.assert_array_equal(out["image_grid_thw"], reference["image_grid_thw"])
+    np.testing.assert_allclose(out["pixel_values"], reference["pixel_values"], atol=1e-5)
