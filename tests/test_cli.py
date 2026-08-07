@@ -438,6 +438,54 @@ def test_parser_accepts_the_two_flags(tmp_path):
     assert args.end_image == tmp_path / "b.png"
 
 
+def test_one_image_anchors_the_first_frame(tmp_path):
+    from PIL import Image
+    from h3_48gb.cli import load_keyframes
+
+    def _png(path, size=(64, 64), colour=(200, 30, 30)):
+        Image.new("RGB", size, colour).save(path)
+        return path
+
+    images, anchors = load_keyframes(_spec(tmp_path, image=_png(tmp_path / "a.png")))
+    assert anchors == ("first",)
+    assert len(images) == 1
+
+
+def test_two_images_anchor_both_ends(tmp_path):
+    from PIL import Image
+    from h3_48gb.cli import load_keyframes
+
+    def _png(path, size=(64, 64), colour=(200, 30, 30)):
+        Image.new("RGB", size, colour).save(path)
+        return path
+
+    spec = _spec(tmp_path, image=_png(tmp_path / "a.png"),
+                 end_image=_png(tmp_path / "b.png", colour=(30, 30, 200)))
+    images, anchors = load_keyframes(spec)
+    assert anchors == ("first", "last")
+    assert len(images) == 2
+
+
+def test_no_image_means_no_conditioning(tmp_path):
+    from h3_48gb.cli import load_keyframes
+
+    assert load_keyframes(_spec(tmp_path)) == ([], ())
+
+
+def test_exif_rotation_is_applied(tmp_path):
+    """A phone photo carries its rotation in EXIF. Ignoring it conditions the run on a
+    differently-oriented frame than the user saw, silently."""
+    from PIL import Image
+    from h3_48gb.cli import load_keyframes
+
+    path = tmp_path / "rotated.jpg"
+    exif = Image.Exif()
+    exif[274] = 6  # Orientation: rotate 90 degrees clockwise
+    Image.new("RGB", (64, 32), (10, 200, 10)).save(path, exif=exif)
+    images, _ = load_keyframes(_spec(tmp_path, image=path))
+    assert images[0].size == (32, 64), "EXIF orientation 6 rotates 90 degrees"
+
+
 def test_checkpoint_dir_overrides_the_default_location(tmp_path):
     seen = {}
 

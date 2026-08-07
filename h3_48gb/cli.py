@@ -228,6 +228,24 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
     )
 
 
+def load_keyframes(spec: RunSpec) -> tuple[list, tuple[str, ...]]:
+    """Load the conditioning frames and the anchors that place them on the timeline.
+
+    `exif_transpose` is not cosmetic: a camera stores orientation as a tag rather than by
+    rotating the pixels, so without it a portrait photo conditions the run on a landscape
+    frame — and nothing downstream can tell that happened.
+    """
+    from PIL import Image, ImageOps
+
+    images, anchors = [], []
+    for path, anchor in ((spec.image, "first"), (spec.end_image, "last")):
+        if path is None:
+            continue
+        images.append(ImageOps.exif_transpose(Image.open(path).convert("RGB")))
+        anchors.append(anchor)
+    return images, tuple(anchors)
+
+
 def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wav_fn=None,
                   resume: bool = True, verbose: bool = True) -> dict:
     """Generate a video according to the given spec.
@@ -276,6 +294,9 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
 
     started = time.perf_counter()
     try:
+        # Load conditioning keyframes if provided.
+        images, keyframe_anchors = load_keyframes(spec)
+
         # `verbose` here is not one of h3_48gb.checkpoint's own kwargs — it is upstream's own
         # `MiniMaxH3Pipeline.__call__` parameter, which `CheckpointingPipeline.__call__` also reads
         # to decide whether `ResumableRun` prints its "checkpoint: N/M steps" line. One flag, both
@@ -287,7 +308,8 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
                       resume=resume, verbose=verbose, tag=spec.tag,
                       # `<stem>-preview-stepNN.jpg`, next to where `<stem>.mp4` will land.
                       preview_every=spec.preview_every,
-                      preview_stem=str(preview_stem) if spec.preview_every else None)
+                      preview_stem=str(preview_stem) if spec.preview_every else None,
+                      images=images or None, keyframe_anchors=keyframe_anchors)
     except CheckpointMismatch as exc:
         # The message from h3_48gb.checkpoint names the file and the fields that differ, but a
         # user reading it has no way to construct that filename themselves — so name the flag.
