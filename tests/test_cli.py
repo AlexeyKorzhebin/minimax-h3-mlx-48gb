@@ -528,6 +528,48 @@ def test_keyframes_passed_to_pipeline_with_two_images(tmp_path):
     assert seen["keyframe_anchors"] == ("first", "last")
 
 
+def test_a_keyframe_changes_the_checkpoint_identity(tmp_path):
+    """Resuming a conditioned run from an unconditioned checkpoint would restart the clip
+    from different latents than the ones it was written for."""
+    plain = _spec(tmp_path)
+    conditioned = _spec(tmp_path, image=_png(tmp_path / "a.png"))
+    pipe = _StubPipe()
+    ckpt_dir = tmp_path / "checkpoints"
+    assert (_checkpoint_path_for(plain, pipe, ckpt_dir)
+            != _checkpoint_path_for(conditioned, pipe, ckpt_dir))
+
+
+def test_different_keyframes_give_different_checkpoints(tmp_path):
+    red = _spec(tmp_path, image=_png(tmp_path / "red.png", colour=(200, 30, 30)))
+    blue = _spec(tmp_path, image=_png(tmp_path / "blue.png", colour=(30, 30, 200)))
+    pipe = _StubPipe()
+    ckpt_dir = tmp_path / "checkpoints"
+    assert (_checkpoint_path_for(red, pipe, ckpt_dir)
+            != _checkpoint_path_for(blue, pipe, ckpt_dir))
+
+
+def test_renaming_a_keyframe_keeps_the_same_checkpoint(tmp_path):
+    """The digest is over content, not path — a renamed file is the same keyframe.
+
+    `_checkpoint_path_for` reads the keyframe (via `load_keyframes`) at the moment it computes the
+    identity, so `path_a` has to be captured before the rename — exactly as it would be in
+    practice: a `generate` run digests the file while it still exists at its then-current path, a
+    later `resume` after the operator renamed it digests the same bytes under the new name.
+    """
+    original = _png(tmp_path / "a.png")
+    spec_a = _spec(tmp_path, image=original)
+    pipe = _StubPipe()
+    ckpt_dir = tmp_path / "checkpoints"
+    path_a = _checkpoint_path_for(spec_a, pipe, ckpt_dir)
+
+    renamed = tmp_path / "b.png"
+    original.rename(renamed)
+    spec_b = _spec(tmp_path, image=renamed)
+    path_b = _checkpoint_path_for(spec_b, pipe, ckpt_dir)
+
+    assert path_a == path_b
+
+
 def test_checkpoint_dir_overrides_the_default_location(tmp_path):
     seen = {}
 

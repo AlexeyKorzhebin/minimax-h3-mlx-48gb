@@ -391,15 +391,22 @@ def _checkpoint_path_for(spec: RunSpec, pipe, checkpoint_dir: Path) -> Path:
     passed the same way `run_generate` passes it to `pipe(...)` — as its own `request_identity`
     argument, not through `bound.arguments`, since upstream's `__call__` has no `tag` parameter at
     all.
+
+    `images`/`keyframe_anchors` are loaded and bound here too, mirroring `run_generate`'s call —
+    without them a conditioned run and an unconditioned one with the same prompt/geometry/seed/tag
+    would resolve to the same checkpoint file, and resuming one would continue the clip from
+    latents written for different conditioning.
     """
     import inspect
 
     from h3_48gb.checkpoint import identity_digest, request_identity
     from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
 
+    images, keyframe_anchors = load_keyframes(spec)
     bound = inspect.signature(MiniMaxH3Pipeline.__call__).bind(
         pipe, prompt=spec.prompt, duration_seconds=spec.duration,
         num_inference_steps=spec.steps, seed=spec.seed, height=spec.height, width=spec.width,
+        images=images or None, keyframe_anchors=keyframe_anchors,
     )
     bound.apply_defaults()
     identity = request_identity(dict(bound.arguments), pipe.checkpoint_identity_extra(), tag=spec.tag)
