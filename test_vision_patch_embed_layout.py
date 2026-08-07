@@ -206,13 +206,13 @@ def test_the_real_loader_transposes_on_the_way_in() -> None:
     encoder.quantized_layers = {"language": 0, "vision": 0}
 
     source = mx.random.normal((4, 3, 2, 16, 16))     # (out, in, D, H, W), as the checkpoint stores it
-    directory = _Path(tempfile.mkdtemp())
-    mx.save_safetensors(str(directory / "model.safetensors"), {
-        "model.visual.patch_embed.proj.weight": source,
-        "model.language_model.norm.weight": mx.zeros((8,)),
-    })
-
-    encoder._load_weights(directory, mx.float32, False)
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = _Path(tmp)
+        mx.save_safetensors(str(directory / "model.safetensors"), {
+            "model.visual.patch_embed.proj.weight": source,
+            "model.language_model.norm.weight": mx.zeros((8,)),
+        })
+        encoder._load_weights(directory, mx.float32, False)
     loaded = encoder.vision.patch_embed.proj.weight
 
     check("the loader stores the conv weight channels-last", loaded.shape == (4, 2, 16, 16, 3),
