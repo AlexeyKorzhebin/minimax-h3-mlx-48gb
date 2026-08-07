@@ -62,3 +62,26 @@ def test_a_broken_config_fails_loudly(tmp_path):
     with pytest.raises(Exception) as excinfo:
         load_image_processor(tmp_path)
     assert "preprocessor_config.json" in str(excinfo.value)
+
+
+def test_encoder_serves_the_torch_free_processor(monkeypatch):
+    """upstream's property would build AutoProcessor; ours must shadow it entirely."""
+    import h3_48gb.text_encoder as te
+
+    built = {}
+
+    class _Spy(TorchFreeProcessor):
+        def __init__(self, processor_dir):
+            built["dir"] = Path(processor_dir)
+            super().__init__(processor_dir)
+
+    monkeypatch.setattr(te, "TorchFreeProcessor", _Spy)
+
+    encoder = te.QuantizedTextEncoder.__new__(te.QuantizedTextEncoder)
+    encoder._model_dir = Path.home() / "models/h3-converted/text_encoder"
+    encoder._processor = None
+
+    proc = encoder.processor
+    assert proc.image_processor.merge_size == 2
+    assert built["dir"].name == "processor", "must read the sibling processor directory"
+    assert "torch" not in sys.modules

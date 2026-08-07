@@ -28,6 +28,7 @@ import json
 from pathlib import Path
 
 from . import _upstream  # noqa: F401
+from .image_processor import TorchFreeProcessor
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -200,6 +201,19 @@ class QuantizedTextEncoder(MiniMaxH3TextEncoder):
         if self.vision is not None:
             mx.eval(self.vision.parameters())
         self.skipped_tensors = skipped
+
+    @property
+    def processor(self):
+        """Serve a torch-free processor instead of upstream's `AutoProcessor`.
+
+        Upstream builds the composite Qwen3VL processor, whose video half needs torchvision. It is
+        never used — `encode()` reads only `image_processor` — so constructing it costs a hard
+        dependency for nothing, and the failure surfaces only once an image is passed, after the
+        encoder has loaded.
+        """
+        if self._processor is None:
+            self._processor = TorchFreeProcessor(self._model_dir.parent / "processor")
+        return self._processor
 
     def unload(self) -> int:
         """Drop every parameter. Returns the bytes released.
