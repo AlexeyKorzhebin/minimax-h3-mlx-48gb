@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "h3-48gb"
+version = "0.1.0"
+description = "Run MiniMax H3 video+audio generation on a 48 GB Apple Silicon Mac"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "mlx>=0.32.0",
+    "mlx-vlm>=0.6.10",
+    "numpy>=1.26",
+    "safetensors>=0.4",
+    "huggingface_hub>=0.30",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+h3 = "h3_48gb.cli:main"
+
+[tool.setuptools]
+packages = ["h3_48gb"]
