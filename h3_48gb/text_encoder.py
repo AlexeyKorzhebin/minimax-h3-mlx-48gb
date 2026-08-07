@@ -28,6 +28,7 @@ import json
 from pathlib import Path
 
 from . import _upstream  # noqa: F401
+from .image_processor import TorchFreeProcessor
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -38,6 +39,58 @@ from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
 
 LANGUAGE_PREFIX = "model.language_model."
 VISION_PREFIX = "model.visual."
+
+#: Vision-tower weights stored (in the checkpoint) in a PyTorch conv layout that MLX does not use.
+#: The only convolution in the vision tower is the patch-embedding stem; everything else is
+#: attention and linear layers, which have no axis-order ambiguity to correct.
+VISION_CONV3D_WEIGHTS = frozenset({"patch_embed.proj.weight"})
+
+
+#: The expression `patches/0001-keyframe-masked-scatter.patch` removes. Its presence means the
+#: vendored checkout is unpatched, and any run with a keyframe will die inside `encode` — after
+#: the 28.2 GB encoder has loaded, which is a slow way to learn about a missing patch.
+UNPATCHED_SCATTER = "mx.where(image_mask"
+
+
+def keyframe_scatter_patch_applied(source: str | None = None) -> bool:
+    """Whether the vendored `upstream/` carries this fork's keyframe scatter fix.
+
+    Reads the live source rather than a file path, so it stays honest when `H3_UPSTREAM` points
+    the checkout somewhere else. `source` overrides that, which is what lets a test hand it known
+    patched and unpatched text — without it, replacing this whole body with `return True` passed
+    the entire suite.
+
+    Comment lines are stripped first, and that is load-bearing: the patch quotes the very
+    expression it replaces so a reader can see what changed, which made the first version of this
+    check report a patched file as unpatched.
+    """
+    if source is None:
+        import inspect
+
+        from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
+
+        source = inspect.getsource(MiniMaxH3TextEncoder.encode)
+
+    code = [line for line in source.splitlines() if not line.lstrip().startswith("#")]
+    return not any(UNPATCHED_SCATTER in line for line in code)
+
+
+def to_mlx_conv3d_layout(tensor: mx.array) -> mx.array:
+    """PyTorch's ``(out, in, D, H, W)`` conv weight -> MLX's channels-last ``(out, D, H, W, in)``.
+
+    ``mlx.nn.Conv3d`` builds its own weight as ``(out_channels, *kernel_size, in_channels)``
+    (``mlx/nn/layers/convolution.py``), but the converted checkpoint stores
+    ``model.visual.patch_embed.proj.weight`` unmodified from the source PyTorch checkpoint, as
+    ``(out_channels, in_channels, kD, kH, kW)``. Loading it as-is passes every shape check that
+    only counts elements or checks key presence — it is still a 5-D tensor of the right dtype and
+    total size — and fails only inside ``mx.conv3d`` itself, the first time an image is actually
+    encoded, with a channel-count mismatch (see ``docs/RESULTS.md``, "Keyframe conditioning").
+
+    ``upstream/minimax_h3_mlx/load.py`` already applies this exact transpose for the video VAE's
+    conv weights; the vision tower's loader (``upstream/minimax_h3_mlx/text_encoder.py``, not
+    modified by this fork) never got the same treatment, which is why this lives here instead.
+    """
+    return tensor.transpose(0, 2, 3, 4, 1)
 
 
 def split_recipe(quantized_modules: list[str]) -> dict[str, set[str]]:
@@ -53,6 +106,24 @@ def split_recipe(quantized_modules: list[str]) -> dict[str, set[str]]:
         elif path.startswith(VISION_PREFIX):
             buckets["vision"].add(path[len(VISION_PREFIX):])
     return buckets
+
+
+def prepare_loaded_tensor(bucket: str, path: str, tensor: mx.array, dtype: mx.Dtype) -> mx.array:
+    """Everything `_load_weights` does to one tensor between reading it and storing it.
+
+    Extracted from the load loop so it can be tested without materializing 28.2 GB. Both rules
+    here fail silently if dropped, which is why they are worth a unit of their own:
+
+    * the vision tower's one conv weight arrives in PyTorch's layout and must be transposed —
+      and a *wrong* permutation would not raise either, since the kernel's H and W are both 16;
+    * a quantized layer's packed storage must never be cast, because it is bit-packing rather
+      than a number, and `astype` would reinterpret it arithmetically.
+    """
+    if bucket == "vision" and path in VISION_CONV3D_WEIGHTS:
+        tensor = to_mlx_conv3d_layout(tensor)
+    if tensor.dtype not in (mx.uint32, mx.int32, mx.uint8):
+        tensor = tensor.astype(dtype)
+    return tensor
 
 
 def quantize_selected(module: nn.Module, paths: set[str], bits: int, group_size: int) -> int:
@@ -172,12 +243,9 @@ class QuantizedTextEncoder(MiniMaxH3TextEncoder):
             dropped += shard_dropped
             for bucket, keys in kept.items():
                 for key in keys:
-                    tensor = loaded[key]
-                    # Never `astype` a quantized layer's packed storage: it is bit-packing, not a
-                    # number, and the cast would convert it arithmetically.
-                    if tensor.dtype not in (mx.uint32, mx.int32, mx.uint8):
-                        tensor = tensor.astype(dtype)
-                    buckets_out[bucket][self._wanted(key)[1]] = tensor
+                    path = self._wanted(key)[1]
+                    buckets_out[bucket][path] = prepare_loaded_tensor(
+                        bucket, path, loaded[key], dtype)
             if verbose:
                 total = len(buckets_out["language"]) + len(buckets_out["vision"])
                 print(f"  {Path(shard).name}: kept {total}")
@@ -200,6 +268,19 @@ class QuantizedTextEncoder(MiniMaxH3TextEncoder):
         if self.vision is not None:
             mx.eval(self.vision.parameters())
         self.skipped_tensors = skipped
+
+    @property
+    def processor(self):
+        """Serve a torch-free processor instead of upstream's `AutoProcessor`.
+
+        Upstream builds the composite Qwen3VL processor, whose video half needs torchvision. It is
+        never used — `encode()` reads only `image_processor` — so constructing it costs a hard
+        dependency for nothing, and the failure surfaces only once an image is passed, after the
+        encoder has loaded.
+        """
+        if self._processor is None:
+            self._processor = TorchFreeProcessor(self._model_dir.parent / "processor")
+        return self._processor
 
     def unload(self) -> int:
         """Drop every parameter. Returns the bytes released.

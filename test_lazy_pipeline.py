@@ -222,6 +222,158 @@ def test_phase_tracker() -> None:
     check("snapshot reports rss too", snapshot()["rss_gb"] > 0.0)
 
 
+def test_keyframes_load_the_vae_before_upstream_seeds() -> None:
+    """Constructing the VAE draws from the global RNG, so it must not happen after `seed(42)`.
+
+    Upstream builds every component in `from_pretrained`; here the VAE is a proxy whose first
+    real use is *inside* `_encode_keyframes`, after that seed. Building it there moves the stream
+    by some 560 parameter draws, so the posterior sample lands elsewhere and a cold run differs
+    from a warm one — measured at 0.87 before this override existed.
+    """
+    from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    events: list[str] = []
+
+    class ProxyVAE:
+        def load(self):
+            events.append("vae-load")
+
+    class Config:
+        sigma_shift_video = 12.0
+        sigma_shift_audio = 3.0
+
+    pipe = LazyMiniMaxH3Pipeline(object(), object(), ProxyVAE(), object(), Config(), verbose=False)
+
+    original = MiniMaxH3Pipeline._encode_keyframes
+    MiniMaxH3Pipeline._encode_keyframes = lambda self, images, h, w: (
+        events.append("upstream-encode") or "rows")
+    try:
+        returned = pipe._encode_keyframes(["frame"], 512, 512)
+    finally:
+        MiniMaxH3Pipeline._encode_keyframes = original
+
+    check("vae is loaded before upstream runs", events == ["vae-load", "upstream-encode"],
+          f"got {events}")
+    check("upstream's return value is passed through", returned == "rows", f"got {returned!r}")
+
+
+def test_both_consumers_get_the_same_prepared_keyframe() -> None:
+    """The vision tower and the VAE must not be shown different pictures.
+
+    Upstream hands the raw image to the text encoder and prepares it only for the VAE, so
+    Qwen3-VL describes the original while the conditioning latent comes from the canvas version.
+    Nothing raises — but the vision-token count changes, and `packing` derives the rotary clock
+    of every audio and video row from it, so the whole timeline shifts.
+    """
+    import functools
+    import inspect
+
+    from PIL import Image
+
+    from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    class Config:
+        sigma_shift_video = 12.0
+        sigma_shift_audio = 3.0
+
+    pipe = LazyMiniMaxH3Pipeline(object(), object(), object(), object(), Config(), verbose=False)
+    pipe.supported_num_inference_steps = lambda: None
+
+    original = MiniMaxH3Pipeline.__call__
+    seen: dict = {}
+
+    # `functools.wraps` is load-bearing: `__call__` binds against
+    # `inspect.signature(MiniMaxH3Pipeline.__call__)`, so a spy with a bare `*args` signature
+    # would swallow every argument into `args` and the assertion below would pass vacuously.
+    @functools.wraps(original)
+    def spy(self, *args, **kwargs):
+        bound = inspect.signature(original).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        seen["sizes"] = [image.size for image in bound.arguments["images"]]
+        return "ok"
+
+    MiniMaxH3Pipeline.__call__ = spy
+    try:
+        for source, canvas in (((1536, 1024), (576, 384)),   # 3:2 landscape
+                               ((896, 1152), (448, 576)),    # 7:9 portrait
+                               ((576, 384), (576, 384))):    # already the canvas
+            pipe(prompt="x", images=[Image.new("RGB", source)], keyframe_anchors=("first",),
+                 height=canvas[1], width=canvas[0], seed=7)
+            check(f"{source[0]}x{source[1]} reaches upstream as {canvas[0]}x{canvas[1]}",
+                  seen["sizes"] == [canvas], f"got {seen['sizes']}")
+    finally:
+        MiniMaxH3Pipeline.__call__ = original
+
+
+def test_each_keyframe_gets_its_own_seed() -> None:
+    """Two identical keyframes must encode identically, and upstream seeds outside its loop.
+
+    The reference builds a fresh generator per image, so keyframe 2 draws the same noise as
+    keyframe 1. Upstream seeds once per request, so keyframe 2 continues the stream — measured
+    0.83 apart on two byte-identical frames. Encoding one at a time puts upstream's own seed in
+    front of every draw; verified against the real VAE at max|d| = 0.0.
+    """
+    from PIL import Image
+
+    from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    class ProxyVAE:
+        def load(self):
+            pass
+
+    class Config:
+        sigma_shift_video = 12.0
+        sigma_shift_audio = 3.0
+
+    pipe = LazyMiniMaxH3Pipeline(object(), object(), ProxyVAE(), object(), Config(), verbose=False)
+    batches: list[int] = []
+
+    def like_upstream(self, images, h, w):
+        """Upstream's shape: seed once, then draw once per image from the shared stream.
+
+        Reproducing the seed and the draw — rather than counting calls — is what makes this test
+        about the noise instead of about batch sizes.
+        """
+        batches.append(len(images))
+        mx.random.seed(42)
+        return mx.concatenate([mx.random.normal((2, 4)) for _ in images])
+
+    original = MiniMaxH3Pipeline._encode_keyframes
+    MiniMaxH3Pipeline._encode_keyframes = like_upstream
+    try:
+        canvas = Image.new("RGB", (576, 384))
+        rows = pipe._encode_keyframes([canvas, canvas], 384, 576)
+        first, second = rows[:2], rows[2:]
+        check("two identical keyframes draw identical noise",
+              float(mx.abs(first - second).max()) == 0.0,
+              f"max|d| = {float(mx.abs(first - second).max())}")
+        check("two keyframes are encoded one at a time", batches == [1, 1], f"got {batches}")
+
+        # The control: upstream's own arrangement, one call for both, is what this fixes — and it
+        # must visibly fail the assertion above, or that assertion proves nothing.
+        upstream_rows = like_upstream(pipe, [canvas, canvas], 384, 576)
+        check("and upstream's single call would not have",
+              float(mx.abs(upstream_rows[:2] - upstream_rows[2:]).max()) > 0.0)
+
+        batches.clear()
+        pipe._encode_keyframes([canvas], 384, 576)
+        check("a single keyframe still goes through in one call", batches == [1], f"got {batches}")
+
+        # The one-at-a-time path loses upstream's stretch/cover-crop distinction, so it may only
+        # run on frames already on the canvas. If that stops holding, it must fail, not stretch.
+        try:
+            pipe._encode_keyframes([Image.new("RGB", (800, 600)), canvas], 384, 576)
+            raise AssertionError("unprepared keyframes should have been refused")
+        except RuntimeError as exc:
+            check("unprepared keyframes are refused, not silently stretched",
+                  "canvas" in str(exc), f"got {exc}")
+    finally:
+        MiniMaxH3Pipeline._encode_keyframes = original
+
+
 def main() -> int:
     tests = [
         test_config_is_free,
@@ -232,6 +384,9 @@ def main() -> int:
         test_unload_without_eval_would_not_free,
         test_reload_after_unload,
         test_phase_tracker,
+        test_keyframes_load_the_vae_before_upstream_seeds,
+        test_both_consumers_get_the_same_prepared_keyframe,
+        test_each_keyframe_gets_its_own_seed,
     ]
     for test in tests:
         print(f"{test.__name__}:")

@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
+from PIL import Image
 
 from h3_48gb.cli import (
     CliError,
@@ -327,6 +329,48 @@ def test_cli_and_checkpoint_module_agree_on_the_file_name():
     assert _checkpoint_path_for(spec, pipe, ckpt_dir) == from_pipeline
 
 
+def test_cli_and_checkpoint_module_agree_on_the_file_name_with_a_keyframe(tmp_path):
+    """The conditioned counterpart of `test_cli_and_checkpoint_module_agree_on_the_file_name`.
+
+    That test's hand-rolled `bound(...)` never passes `images`/`keyframe_anchors`, so it cannot
+    tell a correct keyframe binding in `_checkpoint_path_for` from a broken one — both look
+    identical to it when no image is involved (unconditioned `_checkpoint_path_for` and the
+    unconditioned oracle here would agree even if `_checkpoint_path_for` bound the wrong parameter
+    name, or dropped keyframe_anchors, as long as neither is ever exercised). This binds a real
+    `image=` through `load_keyframes` into *both* resolutions — `_checkpoint_path_for`'s own
+    binding, and this test's independent oracle built from `_resolve_store`, the function
+    `CheckpointingPipeline.__call__` actually calls internally — so a keyframe-binding mistake in
+    `_checkpoint_path_for` shows up as a mismatch here even though the two tests above
+    (`test_a_keyframe_changes_the_checkpoint_identity`,
+    `test_different_keyframes_give_different_checkpoints`) would not catch it: they only compare
+    `_checkpoint_path_for` against itself, so a binding mistake shared by both calls would pass
+    them silently.
+    """
+    import inspect
+
+    from h3_48gb.checkpoint import _resolve_store, request_identity
+    from h3_48gb.cli import load_keyframes
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    spec = _spec(tmp_path, image=_png(tmp_path / "a.png"))
+    pipe = _StubPipe()
+    ckpt_dir = tmp_path / "checkpoints"
+
+    # The pipeline's own path: bind upstream's signature exactly as `CheckpointingPipeline.__call__`
+    # does, from the same `images`/`keyframe_anchors` `run_generate` passes to `pipe(...)`.
+    images, keyframe_anchors = load_keyframes(spec)
+    bound = inspect.signature(MiniMaxH3Pipeline.__call__).bind(
+        pipe, prompt=spec.prompt, duration_seconds=spec.duration,
+        num_inference_steps=spec.steps, seed=spec.seed, height=spec.height, width=spec.width,
+        images=images or None, keyframe_anchors=keyframe_anchors,
+    )
+    bound.apply_defaults()
+    identity = request_identity(dict(bound.arguments), pipe.checkpoint_identity_extra(), tag=spec.tag)
+    from_pipeline = _resolve_store({"checkpoint_dir": str(ckpt_dir)}, identity).path
+
+    assert _checkpoint_path_for(spec, pipe, ckpt_dir) == from_pipeline
+
+
 # -- preview and checkpoint control ---------------------------------------------------------------
 
 def test_generate_exposes_preview_and_checkpoint_flags():
@@ -394,6 +438,190 @@ def test_negative_preview_interval_is_refused_with_a_code():
         assert exc.code == "preview_interval_negative"
     else:
         raise AssertionError("a negative preview cadence must be refused, not passed through")
+
+
+# -- keyframe conditioning ---------------------------------------------------------------------
+
+def _spec(tmp_path, **overrides):
+    base = dict(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
+                checkpoint=tmp_path, outdir=tmp_path, tag="t")
+    base.update(overrides)
+    return RunSpec(**base)
+
+
+def _png(path, size=(64, 64), colour=(200, 30, 30)):
+    from PIL import Image
+    Image.new("RGB", size, colour).save(path)
+    return path
+
+
+def test_end_image_without_image_is_refused(tmp_path):
+    last = tmp_path / "last.png"
+    last.write_bytes(b"not really a png, never opened")
+    with pytest.raises(CliError) as excinfo:
+        _spec(tmp_path, end_image=last)
+    assert excinfo.value.code == "end_image_without_image"
+
+
+def test_a_missing_keyframe_is_refused_by_path(tmp_path):
+    with pytest.raises(CliError) as excinfo:
+        _spec(tmp_path, image=tmp_path / "absent.png")
+    assert excinfo.value.code == "image_not_found"
+    assert "absent.png" in excinfo.value.message
+
+
+def test_both_keyframes_present_is_accepted(tmp_path):
+    first, last = tmp_path / "a.png", tmp_path / "b.png"
+    first.write_bytes(b"x")
+    last.write_bytes(b"y")
+    spec = _spec(tmp_path, image=first, end_image=last)
+    assert (spec.image, spec.end_image) == (first, last)
+
+
+def test_parser_accepts_the_two_flags(tmp_path):
+    args = build_parser().parse_args(
+        ["generate", "a cat", "--image", str(tmp_path / "a.png"),
+         "--end-image", str(tmp_path / "b.png")]
+    )
+    assert args.image == tmp_path / "a.png"
+    assert args.end_image == tmp_path / "b.png"
+
+
+def test_one_image_anchors_the_first_frame(tmp_path):
+    from h3_48gb.cli import load_keyframes
+
+    images, anchors = load_keyframes(_spec(tmp_path, image=_png(tmp_path / "a.png")))
+    assert anchors == ("first",)
+    assert len(images) == 1
+
+
+def test_two_images_anchor_both_ends(tmp_path):
+    from h3_48gb.cli import load_keyframes
+
+    spec = _spec(tmp_path, image=_png(tmp_path / "a.png"),
+                 end_image=_png(tmp_path / "b.png", colour=(30, 30, 200)))
+    images, anchors = load_keyframes(spec)
+    assert anchors == ("first", "last")
+    assert len(images) == 2
+
+
+def test_no_image_means_no_conditioning(tmp_path):
+    from h3_48gb.cli import load_keyframes
+
+    assert load_keyframes(_spec(tmp_path)) == ([], ())
+
+
+def test_exif_rotation_is_applied(tmp_path):
+    """A phone photo carries its rotation in EXIF. Ignoring it conditions the run on a
+    differently-oriented frame than the user saw, silently.
+
+    Checked by content, not by size: keyframes now come back fitted to the canvas, so the size
+    after loading says nothing about whether the tag was honoured.
+    """
+    from PIL import Image
+    from h3_48gb.cli import load_keyframes
+
+    path = tmp_path / "rotated.jpg"
+    exif = Image.Exif()
+    exif[274] = 6  # Orientation: rotate 90 degrees clockwise
+    # Left half red, right half blue. Rotating 90° CW puts the left half on top.
+    source = Image.new("RGB", (64, 32), (0, 0, 220))
+    source.paste(Image.new("RGB", (32, 32), (220, 0, 0)), (0, 0))
+    source.save(path, exif=exif)
+
+    images, _ = load_keyframes(_spec(tmp_path, image=path))
+    frame = np.asarray(images[0])
+    top, bottom = frame[:16].mean(axis=(0, 1)), frame[-16:].mean(axis=(0, 1))
+    assert top[0] > top[2], f"the red half should be on top after rotation, got {top}"
+    assert bottom[2] > bottom[0], f"the blue half should be at the bottom, got {bottom}"
+
+
+def test_keyframes_passed_to_pipeline_with_no_images(tmp_path):
+    """Verify run_generate wires keyframes to the pipeline call: empty conditioning case."""
+    seen = {}
+
+    def recording_pipe(**kwargs):
+        seen.update(kwargs)
+        return _StubResult()
+
+    spec = _spec(tmp_path)  # No image or end_image
+    run_generate(spec, pipeline_factory=lambda _: recording_pipe,
+                 save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    assert seen["images"] is None, "empty conditioning must pass None, not []"
+    assert seen["keyframe_anchors"] == ()
+
+
+def test_keyframes_passed_to_pipeline_with_one_image(tmp_path):
+    """Verify run_generate wires keyframes to the pipeline call: single-image case."""
+    seen = {}
+
+    def recording_pipe(**kwargs):
+        seen.update(kwargs)
+        return _StubResult()
+
+    spec = _spec(tmp_path, image=_png(tmp_path / "a.png"))
+    run_generate(spec, pipeline_factory=lambda _: recording_pipe,
+                 save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    assert len(seen["images"]) == 1
+    assert seen["keyframe_anchors"] == ("first",)
+
+
+def test_keyframes_passed_to_pipeline_with_two_images(tmp_path):
+    """Verify run_generate wires keyframes to the pipeline call: both-ends case."""
+    seen = {}
+
+    def recording_pipe(**kwargs):
+        seen.update(kwargs)
+        return _StubResult()
+
+    spec = _spec(tmp_path, image=_png(tmp_path / "a.png"),
+                 end_image=_png(tmp_path / "b.png", colour=(30, 30, 200)))
+    run_generate(spec, pipeline_factory=lambda _: recording_pipe,
+                 save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    assert len(seen["images"]) == 2
+    assert seen["keyframe_anchors"] == ("first", "last")
+
+
+def test_a_keyframe_changes_the_checkpoint_identity(tmp_path):
+    """Resuming a conditioned run from an unconditioned checkpoint would restart the clip
+    from different latents than the ones it was written for."""
+    plain = _spec(tmp_path)
+    conditioned = _spec(tmp_path, image=_png(tmp_path / "a.png"))
+    pipe = _StubPipe()
+    ckpt_dir = tmp_path / "checkpoints"
+    assert (_checkpoint_path_for(plain, pipe, ckpt_dir)
+            != _checkpoint_path_for(conditioned, pipe, ckpt_dir))
+
+
+def test_different_keyframes_give_different_checkpoints(tmp_path):
+    red = _spec(tmp_path, image=_png(tmp_path / "red.png", colour=(200, 30, 30)))
+    blue = _spec(tmp_path, image=_png(tmp_path / "blue.png", colour=(30, 30, 200)))
+    pipe = _StubPipe()
+    ckpt_dir = tmp_path / "checkpoints"
+    assert (_checkpoint_path_for(red, pipe, ckpt_dir)
+            != _checkpoint_path_for(blue, pipe, ckpt_dir))
+
+
+def test_renaming_a_keyframe_keeps_the_same_checkpoint(tmp_path):
+    """The digest is over content, not path — a renamed file is the same keyframe.
+
+    `_checkpoint_path_for` reads the keyframe (via `load_keyframes`) at the moment it computes the
+    identity, so `path_a` has to be captured before the rename — exactly as it would be in
+    practice: a `generate` run digests the file while it still exists at its then-current path, a
+    later `resume` after the operator renamed it digests the same bytes under the new name.
+    """
+    original = _png(tmp_path / "a.png")
+    spec_a = _spec(tmp_path, image=original)
+    pipe = _StubPipe()
+    ckpt_dir = tmp_path / "checkpoints"
+    path_a = _checkpoint_path_for(spec_a, pipe, ckpt_dir)
+
+    renamed = tmp_path / "b.png"
+    original.rename(renamed)
+    spec_b = _spec(tmp_path, image=renamed)
+    path_b = _checkpoint_path_for(spec_b, pipe, ckpt_dir)
+
+    assert path_a == path_b
 
 
 def test_checkpoint_dir_overrides_the_default_location(tmp_path):
@@ -630,3 +858,241 @@ def test_main_internal_error_still_raises_in_human_mode(tmp_path, monkeypatch):
         assert "disk exploded" in str(exc)
     else:
         raise AssertionError("an unclassified exception must still surface in human mode")
+
+
+# -- the vendored upstream must carry this fork's keyframe patch ---------------------------------
+
+def test_the_patch_detector_agrees_with_the_patch_file():
+    """The marker must be the line the patch actually removes, or the guard rots silently.
+
+    Read from `patches/`, not from a copy: if someone rewrites the patch, this fails rather than
+    letting the detector keep looking for an expression that no longer means anything.
+    """
+    from h3_48gb.text_encoder import UNPATCHED_SCATTER
+
+    patch = (Path(__file__).resolve().parent.parent
+             / "patches/0001-keyframe-masked-scatter.patch").read_text()
+    removed = [line[1:] for line in patch.splitlines()
+               if line.startswith("-") and not line.startswith("---")]
+    assert any(UNPATCHED_SCATTER in line for line in removed), (
+        f"{UNPATCHED_SCATTER!r} is not among the lines the patch removes: {removed}")
+
+
+def test_the_vendored_checkout_is_patched():
+    """Not a unit test of the detector — a statement about this working tree."""
+    from h3_48gb.text_encoder import keyframe_scatter_patch_applied
+
+    assert keyframe_scatter_patch_applied(), (
+        "upstream/ is unpatched; run "
+        "`git -C upstream apply ../patches/0001-keyframe-masked-scatter.patch`")
+
+
+def test_a_keyframe_on_an_unpatched_checkout_is_refused_before_any_weight_loads(tmp_path,
+                                                                                monkeypatch):
+    from h3_48gb import cli, text_encoder
+
+    image = tmp_path / "first.png"
+    Image.new("RGB", (64, 64), (200, 40, 40)).save(image)
+    monkeypatch.setattr(text_encoder, "keyframe_scatter_patch_applied", lambda: False)
+
+    with pytest.raises(CliError) as excinfo:
+        cli.load_keyframes(_spec(tmp_path, image=image))
+    assert excinfo.value.code == "upstream_patch_missing"
+    assert "0001-keyframe-masked-scatter.patch" in excinfo.value.message
+
+
+# -- the keyframe is the geometry anchor ---------------------------------------------------------
+
+def _canvas(tmp_path, argv):
+    from h3_48gb.cli import spec_from_args
+    spec = spec_from_args(build_parser().parse_args(
+        argv + ["--outdir", str(tmp_path), "--checkpoint", str(tmp_path)]))
+    return spec.width, spec.height
+
+
+def test_a_text_only_run_still_gets_the_released_canvas(tmp_path):
+    assert _canvas(tmp_path, ["generate", "a cat"]) == (1344, 768)
+
+
+def test_the_canvas_follows_the_keyframe(tmp_path):
+    """The first keyframe is *stretched* onto the canvas, so a wrong canvas deforms the clip.
+
+    The reference resolves geometry from the first frame's aspect; before this, a portrait photo
+    was silently squashed into 16:9.
+    """
+    portrait = tmp_path / "portrait.png"
+    Image.new("RGB", (896, 1152), (200, 40, 40)).save(portrait)
+    width, height = _canvas(tmp_path, ["generate", "a cat", "--image", str(portrait)])
+    assert width < height, f"a portrait keyframe produced a {width}x{height} canvas"
+    assert abs((width / height) - (896 / 1152)) < 0.02
+
+
+def test_an_explicit_canvas_still_wins_over_the_keyframe(tmp_path):
+    portrait = tmp_path / "portrait.png"
+    Image.new("RGB", (896, 1152), (200, 40, 40)).save(portrait)
+    assert _canvas(tmp_path, ["generate", "a cat", "--image", str(portrait),
+                              "--width", "448", "--height", "576"]) == (448, 576)
+
+
+def test_exif_orientation_decides_the_canvas_too(tmp_path):
+    """A camera marks rotation in a tag; unread, a portrait photo reports itself as landscape —
+    and would pick the very canvas that deforms it."""
+    rotated = tmp_path / "rotated.jpg"
+    # 6 = rotate 90° CW on display: stored 1152x896, shown 896x1152.
+    exif = Image.Exif()
+    exif[274] = 6
+    Image.new("RGB", (1152, 896), (200, 40, 40)).save(rotated, exif=exif)
+
+    width, height = _canvas(tmp_path, ["generate", "a cat", "--image", str(rotated)])
+    assert width < height, f"the EXIF tag was ignored: got a {width}x{height} canvas"
+
+
+def test_the_pipeline_conditions_on_exactly_the_frame_the_digest_was_taken_over(tmp_path):
+    """The checkpoint's identity and the clip's conditioning must describe the same picture.
+
+    They are computed in different places — the digest from `load_keyframes` in the CLI, the
+    conditioning from whatever reaches the pipeline — so a transform applied on one side only
+    splits them. That happened: with the canvas fit living in `LazyMiniMaxH3Pipeline.__call__`,
+    `h3 resume --image photo.jpg` hashed the raw frame, the generate run had hashed the fitted
+    one, and resume reported `checkpoint_not_found` for a checkpoint sitting right there.
+
+    The keyframe here is deliberately a different size and aspect from the canvas: at 64x64 into
+    64x64 the fit is a no-op and this test could not fail.
+    """
+    import functools
+    import inspect
+
+    from h3_48gb.checkpoint import _image_digest
+    from h3_48gb.cli import load_keyframes
+    from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    path = tmp_path / "wide.png"
+    Image.new("RGB", (128, 96), (200, 30, 30)).save(path)
+    spec = _spec(tmp_path, image=path)
+    images, anchors = load_keyframes(spec)
+    assert images[0].size == (spec.width, spec.height), "load_keyframes must fit to the canvas"
+
+    class Config:
+        sigma_shift_video = 12.0
+        sigma_shift_audio = 3.0
+
+    pipe = LazyMiniMaxH3Pipeline(object(), object(), object(), object(), Config(), verbose=False)
+    pipe.supported_num_inference_steps = lambda: None
+    seen = {}
+
+    original = MiniMaxH3Pipeline.__call__
+
+    @functools.wraps(original)
+    def spy(self, *args, **kwargs):
+        bound = inspect.signature(original).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        seen["images"] = bound.arguments["images"]
+        return "ok"
+
+    MiniMaxH3Pipeline.__call__ = spy
+    try:
+        pipe(prompt=spec.prompt, duration_seconds=spec.duration, num_inference_steps=spec.steps,
+             seed=spec.seed, height=spec.height, width=spec.width,
+             images=images, keyframe_anchors=anchors)
+    finally:
+        MiniMaxH3Pipeline.__call__ = original
+
+    assert _image_digest(seen["images"][0]) == _image_digest(images[0]), (
+        "the frame the pipeline conditions on differs from the one the digest was taken over")
+
+
+def test_a_missing_keyframe_is_refused_by_code_not_by_traceback(tmp_path):
+    """`resolve_canvas` opens the file before `RunSpec` validates it, so the refusal is its job."""
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "a cat", "--image", str(tmp_path / "absent.png"),
+             "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "image_not_found"
+
+
+def test_an_undecodable_keyframe_is_refused_by_code(tmp_path):
+    path = tmp_path / "broken.png"
+    path.write_bytes(b"this is not a PNG")
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "a cat", "--image", str(path), "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "image_unreadable"
+
+
+def test_an_extreme_aspect_keyframe_is_refused_with_advice(tmp_path):
+    """The model supports 1:4..4:1. A 10:1 panorama must say so, not raise ValueError."""
+    path = tmp_path / "panorama.png"
+    Image.new("RGB", (2000, 200), (200, 30, 30)).save(path)
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "a cat", "--image", str(path), "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "image_aspect_unsupported"
+    assert "--width" in excinfo.value.message, "the message must name the way out"
+
+
+def test_half_a_canvas_with_a_keyframe_is_refused(tmp_path):
+    """`--width` alone against a 3:2 photo used to pair it with the derived height, giving a
+    canvas of neither aspect and stretching the frame into it silently."""
+    path = tmp_path / "wide.png"
+    Image.new("RGB", (1536, 1024), (200, 30, 30)).save(path)
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "a cat", "--image", str(path), "--width", "640",
+             "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "partial_canvas_with_image"
+
+
+def test_half_a_canvas_without_a_keyframe_still_works(tmp_path):
+    """Text-only runs keep the old behaviour: one axis given, the other defaults."""
+    spec = spec_from_args(build_parser().parse_args(
+        ["generate", "a cat", "--width", "640", "--outdir", str(tmp_path)]))
+    assert (spec.width, spec.height) == (640, 768)
+
+
+def test_the_patch_detector_can_actually_tell_the_two_apart():
+    """Without this, replacing the detector's body with `return True` passed the whole suite.
+
+    The unpatched line is taken from the patch file rather than retyped, so the two cannot drift.
+    """
+    from h3_48gb.text_encoder import keyframe_scatter_patch_applied
+
+    patch = (Path(__file__).resolve().parent.parent
+             / "patches/0001-keyframe-masked-scatter.patch").read_text()
+    removed = "\n".join(line[1:] for line in patch.splitlines()
+                        if line.startswith("-") and not line.startswith("---"))
+    added = "\n".join(line[1:] for line in patch.splitlines()
+                      if line.startswith("+") and not line.startswith("+++"))
+
+    assert not keyframe_scatter_patch_applied(source=removed), (
+        "the lines the patch removes must read as unpatched")
+    assert keyframe_scatter_patch_applied(source=added), (
+        "the lines the patch adds must read as patched — they quote the old expression in a "
+        "comment, which is exactly the case the comment-stripping exists for")
+    assert keyframe_scatter_patch_applied(source="def encode(self):\n    return 1\n"), (
+        "unrelated source has no marker and must read as patched")
+
+
+def test_an_undecodable_keyframe_is_refused_on_every_path(tmp_path):
+    """`resolve_canvas` only decodes when it has to derive the canvas, and only `--image`.
+
+    With an explicit canvas, or with `--end-image`, `load_keyframes` is where the file is first
+    opened — and it used to let PIL's exception through as an `internal_error` traceback.
+    """
+    from h3_48gb.cli import load_keyframes
+
+    broken = tmp_path / "broken.png"
+    broken.write_bytes(b"this is not a PNG")
+    good = _png(tmp_path / "good.png")
+
+    # Explicit canvas: resolve_canvas returns before ever opening the file.
+    with pytest.raises(CliError) as excinfo:
+        load_keyframes(_spec(tmp_path, image=broken))
+    assert excinfo.value.code == "image_unreadable"
+    assert "--image" in excinfo.value.message
+
+    # --end-image is never seen by resolve_canvas at all.
+    with pytest.raises(CliError) as excinfo:
+        load_keyframes(_spec(tmp_path, image=good, end_image=broken))
+    assert excinfo.value.code == "image_unreadable"
+    assert "--end-image" in excinfo.value.message

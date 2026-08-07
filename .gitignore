@@ -17,6 +17,7 @@ upstream/
 *.mp4
 *.wav
 !docs/media/*.jpg
+!tests/fixtures/processor/*.npz
 
 # Process artifacts from the planning/review workflow used to build this repo — not project
 # files, and not meant for a public clone.

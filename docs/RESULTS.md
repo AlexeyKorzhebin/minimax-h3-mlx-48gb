@@ -59,15 +59,21 @@ deliberately** — at 1881 s/step the full 30-forward run projects to roughly 15
 not worth running to completion just to confirm a number the first 2 steps already established.
 It was a stop, not a crash: no error, no sign the process would not have completed if left running.
 
-## Scaling is worse than linear
+## Scaling bends upward, but not everywhere
 
-Per-step cost across the three geometries: **46 s -> 586 s -> 1881 s**. Going from 512x512/2.4s to
-1344x768/5s is roughly a 3.2x increase in per-step cost for a ~7x increase in pixel count (native
-resolution is 1344x768 = 1,032,192 px vs 512x512 = 262,144 px) and a ~2.1x increase in frame count
-at 24 fps; going from the 5s to the 10s native run is a 3.2x increase in per-step cost for a 2x
-increase in frame count alone (geometry unchanged). That is not the profile of a compute cost that
-scales with token count, i.e. linearly, or even a naive quadratic-in-sequence-length curve applied
-cleanly — it is worse, because:
+Per-step cost across the three geometries: **46 s -> 586 s -> 1881 s**.
+
+| Step up | Tokens | Per-step cost | Exponent |
+|---|---|---|---|
+| 512x512/2.4s -> 1344x768/5s | x6.7 (3.9x pixels, 1.7x frames) | **x12.7** | tokens^1.34 |
+| 1344x768/5s -> 1344x768/10s | x2.0 (frames only) | **x3.2** | tokens^1.68 |
+
+Two corrections to what this section used to say. It reported the first step up as "roughly 3.2x",
+which is wrong — 586/46 is 12.7, and the 3.2 belongs to the second row only. And it called the
+curve "worse than a naive quadratic": both step ups are in fact *sub*-quadratic, at exponents 1.34
+and 1.68 over token count. Growth is still faster than linear, and the second step up — where only
+the sequence gets longer, with geometry fixed — is the steeper of the two, which is what the
+mechanism predicts:
 
 - **Attention is dense.** The whole packed sequence (text + keyframe conditions + audio rows +
   video rows) attends over itself with plain full self-attention — no cross-attention, no sparsity,
@@ -80,7 +86,8 @@ cleanly — it is worse, because:
   attention cost that dominates wall time at native resolution and longer clips.
 
 Anyone tuning clip length or resolution against a time budget should expect the cost curve to bend
-upward faster than the pixel or frame count alone would suggest, for exactly this reason.
+upward faster than the pixel or frame count alone would suggest, for exactly this reason: doubling
+a clip's length roughly triples the cost of every step.
 
 ## Memory profile
 
@@ -247,3 +254,177 @@ than assumed:
   were added in this precision-sweep commit to verify measured values against the actual data. A bare `pytest` used to fail instead,
   with five collection errors from `upstream/tests/*` importing torch; `norecursedirs` in
   `pyproject.toml` excludes the vendored clone, so the plain command is now the whole suite.
+
+## Keyframe conditioning: verified, and it works
+
+`--image`/`--end-image` (added on `feat/image-to-video`) parse, validate, and bind into checkpoint
+identity — that much is covered by unit tests. Whether a keyframe actually **conditions** the clip,
+as opposed to being silently accepted and ignored, has never been checked against the real
+checkpoint, because every existing test replaces the pipeline with a fake
+(`_default_pipeline_factory` is monkeypatched in `tests/test_cli.py` and friends). `scripts/verify_i2v.py`
+was written to close that gap: generate the same prompt and seed twice at 512x512 — once with a
+keyframe, once without — and compare each clip's first frame against the image by PSNR and
+correlation, with the unconditioned control as the baseline that makes the comparison meaningful.
+It has now run, twice, and the answer is yes — see **The measurement** below. Getting there took
+three blockers, each hidden behind the one before it, and each costing a 25-minute run to surface.
+All three are recorded here so the history is legible instead of overwritten.
+
+**Blocker 1 — `torchvision`, fixed.** `h3_48gb/image_processor.py`'s `TorchFreeProcessor` (landed on
+this branch, verified against real `transformers` output in `tests/fixtures/processor/`) now stands
+in for the composite `AutoProcessor`, so `upstream/minimax_h3_mlx/text_encoder.py`'s
+`build_request()` no longer touches `transformers.AutoProcessor.from_pretrained` for an image
+request. Confirmed directly: a conditioned run now gets past `build_request()` — token ids, tags,
+`pixel_values` and `image_grid_thw` all come back — and reaches `self.vision(...)`, the Qwen3-VL
+vision tower's own forward pass.
+
+**Blocker 2 — the vision tower's conv weight layout, fixed.** The next failure was inside the vision
+tower itself, in `mx.conv3d`:
+
+```
+ValueError: [conv] Expect the input channels in the input and weight array to match but got
+shapes - input: (4032,2,16,16,3) and weight: (1152,3,2,16,16)
+```
+
+Confirmed by inspecting the checkpoint directly: `~/models/h3-converted/text_encoder/model-00014-of-00014.safetensors`
+stores `model.visual.patch_embed.proj.weight` as `(1152, 3, 2, 16, 16)` —
+`(out_channels, in_channels, kD, kH, kW)`, PyTorch/HF's conv layout — while `mlx.nn.Conv3d` expects
+channels-last, `(out_channels, kD, kH, kW, in_channels)`, exactly as its own constructor builds
+`self.weight` (`mlx/nn/layers/convolution.py`). `upstream/minimax_h3_mlx/load.py`'s VideoVAE loader
+already applies this exact transpose to every 5-D conv weight it loads
+(`tensor.transpose(0, 2, 3, 4, 1)`, with a comment explaining why); `upstream/minimax_h3_mlx/text_encoder.py`'s
+`_load_weights()` never got the same treatment for the vision tower's one convolution (everything
+else in `VisionModel` is attention and linear layers, layout-agnostic). No test or run before this
+task ever asked the real checkpoint to encode an image, so this was never exercised.
+
+Fixed in this fork's own loader — `h3_48gb/text_encoder.py`'s `QuantizedTextEncoder._load_weights()`
+now applies `to_mlx_conv3d_layout()` to `patch_embed.proj.weight` specifically, at load time, before
+the module tree is used. `upstream/` is unmodified. Two things were added, deliberately, because a
+wrong permutation here would not raise — it would silently scramble the patch embedding and show up
+only as a worse clip, hours later, with the real checkpoint's kernel shape `(D, H, W) = (2, 16, 16)`
+giving a wrong H/W-swapping permutation the exact same output *shape* as the right one:
+
+- `test_vision_patch_embed_layout.py` pins values, not just shape — an independently-computed
+  per-index reference (plain nested loops, not another call to `.transpose()`), plus a case with
+  `H == W` matching the real checkpoint's collision, and a case that confirms a plausible wrong
+  permutation is actually distinguishable from the right one (otherwise the value check would prove
+  nothing). 7 tests, all passing.
+- Verified against the real checkpoint directly (not via the CLI, to avoid paying for a full
+  diffusion run to check one loader): `QuantizedTextEncoder(...).encode(prompt, [image])` now runs
+  the real image through `patch_embed` without the shape error — strictly further than blocker 2
+  allowed.
+
+**Blocker 3 — fixed, as a patch against `upstream/`.** Past the fixed conv layer, `encode()` failed
+one call later, still inside `upstream/minimax_h3_mlx/text_encoder.py`:
+
+```
+ValueError: [broadcast_shapes] Shapes (1,1026,1) and (1,1008,5120) cannot be broadcast.
+```
+
+at
+
+```python
+inputs_embeds = mx.where(image_mask[..., None], hidden.astype(inputs_embeds.dtype)[None], inputs_embeds)
+```
+
+`image_mask` has one entry per token in the *full* prompt (label + `<|vision_start|>` + one
+`<|image_pad|>` per merged patch + `<|vision_end|>` + the text prompt itself — 1026 tokens for this
+run); `hidden`, the vision tower's output, has one row per merged image patch only (1008 for this
+run's 1344x768 keyframe). `mx.where` requires elementwise-broadcastable shapes, so this only works
+when the whole prompt is image tokens with nothing else — never true in practice, since there is
+always at least a `<Picture i>:` label and the prompt text. Confirmed this is a real bug rather than
+a misuse: `mlx_vlm`'s own `qwen3_vl.py` (`.venv/lib/python3.12/site-packages/mlx_vlm/models/qwen3_vl/qwen3_vl.py`)
+implements the equivalent operation correctly, as `masked_scatter()` — flatten, index the True
+positions, assign, reshape — specifically because a boolean-masked `mx.where` can't do this.
+`upstream/minimax_h3_mlx/text_encoder.py`'s hand-rolled version does not use it. The processor's own
+`pixel_values`/`image_grid_thw` were checked directly and are internally consistent (4032 raw
+patches, 1008 after the checkpoint's `merge_size=2`) — the mismatch is between the image-token count
+and the full sequence length, not a processor bug.
+
+This one is a control-flow bug in the middle of `encode()`, not a weight layout fixable before the
+call, so no loader-side workaround exists. Copying `encode()` into a subclass to change one line
+would have meant carrying 40 lines of upstream logic that then drift apart silently. It is carried
+as `patches/0001-keyframe-masked-scatter.patch` instead — `upstream/` is gitignored, so an edit made
+there would exist on one machine and nowhere else. `README.md`'s setup applies it; `--image` without
+it is refused up front with `upstream_patch_missing`, before any weight loads, rather than crashing
+28.2 GB into a run. Text-only runs never reach the line.
+
+### Five silent divergences, found by reading against upstream's own reference
+
+With the run finally completing, the remaining defects were the dangerous kind: none of them raise.
+They were found by comparing this fork against `upstream/reference/diffusers/`, which ships in the
+vendored checkout, and each is now fixed and pinned by a test.
+
+| What was wrong | How it showed | Where |
+|---|---|---|
+| Seed 42 taken once per request, not once per keyframe | Two byte-identical keyframes encoded 0.83 apart; the reference makes them identical | `h3_48gb/pipeline.py` |
+| Our lazy VAE construction consumed the RNG stream between `seed(42)` and the draw | A cold and a warm run of the same request differed by 0.87 | `h3_48gb/pipeline.py` |
+| The vision tower saw the raw image, the VAE the canvas version | Vision-token count changes, which shifts the rotary clock of every media row | `h3_48gb/pipeline.py` |
+| The canvas ignored the keyframe's aspect | A portrait photo was stretched into 16:9, since keyframe 0 is stretched, not fitted | `h3_48gb/cli.py` |
+| `preprocessor_config.json` was synthesized by the converter | Values turned out correct — verified against MiniMaxAI/MiniMax-H3 — but only in the one spelling mlx-vlm reads | `convert_sawfwair.py` |
+
+That last one is worth stating plainly, because the obvious "fix" is a regression: the official file
+writes the pixel budget as `size: {shortest_edge, longest_edge}`, a key mlx-vlm's processor does not
+have. Handed the official config verbatim, it silently keeps Qwen2-VL's defaults and caps a keyframe
+at 1,003,520 pixels instead of 16,777,216 — a 4K keyframe would then yield 943 image tokens where
+the released model produces 8160, with no exception raised.
+
+### A canary, so the next blocker costs minutes
+
+`scripts/canary_i2v.py` walks the entire i2v path — encoder, keyframe encode, packing, forward,
+decode — with the denoising loop cut to two forwards. **3 minutes instead of 25, and 8 seconds to
+reach a failure inside the encoder.** It calls the real `__call__` rather than reimplementing the
+loop, because a canary that reimplements the pipeline verifies the copy. Only the loop's timestep
+list is truncated: the schedule and the AdaLN table are built in full, since `check_schedule`
+compares the sigma grid elementwise and refuses anything else. `--no-image` runs the identical path
+without a keyframe, which is what distinguishes "the i2v path is broken" from "the canary is broken".
+
+### The measurement
+
+Both pairs are the same prompt and seed run twice, once with a keyframe and once without. The
+control is the point: without it, a high score would only show that the clip agrees with the prompt.
+
+| Keyframe | Canvas | Conditioned | Control | Conditioned corr | Control corr |
+|---|---|---|---|---|---|
+| Synthetic checkerboard 512x512 | 512x512 | **34.81 dB** | 10.35 dB | **0.999** | 0.041 |
+| Photograph 1536x1024 (3:2) | 576x384 | **26.30 dB** | 9.81 dB | **0.979** | 0.314 |
+
+The two runs are deliberately different tests. In the first, the prompt (*"a red vintage car parked
+on a wet street at night"*) **contradicts** the keyframe, so a first frame that reproduces the
+checkerboard can only come from the conditioning — which is why the control scores 0.041. In the
+second the prompt agrees with the image, which is the harder case: the model would draw a dragon
+over mountains regardless, and the control's 0.314 correlation is exactly that shared composition.
+The conditioned run still clears it by 16.5 dB.
+
+The photograph scores lower than the checkerboard for a reason that is not a defect: a keyframe
+makes a round trip through the VAE, and flat colour blocks survive that far better than scales,
+cloud and foliage.
+
+The second pair also ran on the fixed code and on a 3:2 source — the case that, before the canvas
+fix, would have been stretched into 16:9 without comment.
+
+
+## How this fork compares to another Mac port
+
+A ComfyUI-based port (`Bambushu/minimax-h3-mac`) published per-step figures for the same model on
+comparable geometry, which is a rare chance to check whether this fork leaves performance on the
+table. Measured with the canary on that port's own geometry:
+
+| | this fork | Bambushu port |
+|---|---|---|
+| Canvas / duration | 1344x768, 3 s (73 frames) | 768x1376, 3 s |
+| Packed sequence | 22,434 rows | "about 22k tokens" |
+| Chip | **M4 Pro**, 20 GPU cores | **M5 Pro** |
+| DiT precision | 4-bit | int8 |
+| **Per step** | **262 s** | **131.6 s** |
+
+Both figures are sampling only, excluding load and decode. Ours is the per-step time the pipeline
+itself prints, and the two forwards measured 262.1 s and 261.6 s — within 0.2% of each other, so
+neither carries hidden warm-up or load cost. The 2x gap is a chip generation and a
+quantization choice, not headroom in this code: M5's GPU carries neural accelerators per core, and
+int8 is a different trade than the 4-bit weights this fork uses to fit 48 GB at all. Attention here
+already runs through `mx.fast.scaled_dot_product_attention`, so there is no obvious slow path to
+reclaim.
+
+One thread is worth pulling, though: that port's *whole-clip* time for a 5-second native render is
+116.8 minutes against this fork's 299 — a 2.56x gap, wider than the 1.99x per step. Some of it is
+outside sampling. This fork's video decode at 1344x768 measures 208 s, which is where to look first.

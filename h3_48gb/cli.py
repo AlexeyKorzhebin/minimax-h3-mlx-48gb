@@ -45,6 +45,12 @@ ERROR_CODES = {
     "checkpoint_mismatch": "a checkpoint exists but was written for a different request or model",
     "checkpoint_corrupt": "a checkpoint exists but could not be read",
     "preview_interval_negative": "--preview-every is negative; 0 disables previews, N > 0 sets a cadence",
+    "end_image_without_image": "--end-image was given without --image; the end frame anchors a run that must also have a start frame",
+    "image_not_found": "a keyframe path does not exist",
+    "image_unreadable": "a keyframe exists but could not be decoded as an image",
+    "image_aspect_unsupported": "a keyframe's aspect ratio is outside the 1:4..4:1 the model supports",
+    "partial_canvas_with_image": "--image was given with only one of --width/--height",
+    "upstream_patch_missing": "a keyframe was given but the vendored upstream/ checkout is unpatched",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 
@@ -93,6 +99,11 @@ class RunSpec:
     #: Disable checkpointing entirely. A crash then costs the whole run, so this exists for
     #: read-only filesystems and throwaway runs, not as an everyday flag.
     no_checkpoint: bool = False
+    #: Conditioning keyframes. One image anchors the clip's first frame; adding `end_image`
+    #: makes it interpolate to a given last frame. The checkpoint was trained on exactly these
+    #: two arrangements, so the flags deliberately cannot express a third.
+    image: Path | None = None
+    end_image: Path | None = None
     #: Decode a preview JPEG every N steps; 0 disables previews.
     preview_every: int = 0
     #: Prefix for `<stem>-preview-stepNN.jpg`; `None` means the run's own output stem.
@@ -128,6 +139,14 @@ class RunSpec:
                 f"--preview-every must be >= 0 (0 disables previews), got {self.preview_every}",
                 {"preview_every": self.preview_every},
             )
+        if self.end_image is not None and self.image is None:
+            raise CliError("end_image_without_image",
+                           "--end-image needs --image: the end frame is the far anchor of a "
+                           "run whose near anchor is the start frame.")
+        for label, path in (("--image", self.image), ("--end-image", self.end_image)):
+            if path is not None and not Path(path).exists():
+                raise CliError("image_not_found", f"{label} does not exist: {path}",
+                               {"flag": label, "path": str(path)})
 
     def output_stem(self) -> Path:
         return self.outdir / f"h3-{self.tag}-{self.width}x{self.height}"
@@ -142,8 +161,12 @@ class RunSpec:
 def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     """The flags `generate` and `resume` share — every one of them identifies or locates a run."""
     sub.add_argument("prompt")
-    sub.add_argument("--width", type=int, default=1344)
-    sub.add_argument("--height", type=int, default=768)
+    # `None` rather than 1344x768 so `spec_from_args` can tell "the caller wants the default" from
+    # "the caller asked for exactly 1344x768" — with a keyframe, the default comes from the frame.
+    sub.add_argument("--width", type=int, default=None,
+                     help="canvas width (default: 1344, or derived from --image)")
+    sub.add_argument("--height", type=int, default=None,
+                     help="canvas height (default: 768, or derived from --image)")
     sub.add_argument("--duration", type=float, default=5.0)
     sub.add_argument("--steps", type=int, default=BAKED_GRID_POINTS)
     sub.add_argument("--seed", type=int, default=0)
@@ -153,6 +176,10 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     sub.add_argument("--checkpoint-dir", type=Path, default=None,
                      help="where the resume checkpoint lives (default: <outdir>/checkpoints)")
+    sub.add_argument("--image", type=Path, default=None,
+                     help="condition the first frame on this image")
+    sub.add_argument("--end-image", type=Path, default=None,
+                     help="also condition the last frame; requires --image")
     # Previews are the only thing that makes a multi-hour render watchable, but they are not free
     # (~49 s per preview at 1344x768), so the default is off and the cadence is the caller's.
     sub.add_argument("--preview-every", type=int, default=0, metavar="N",
@@ -192,20 +219,139 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: The canvas a text-only request gets: H3's released 16:9 geometry.
+DEFAULT_CANVAS = (1344, 768)
+
+
+def resolve_canvas(image: Path | None, width: int | None, height: int | None) -> tuple[int, int]:
+    """Decide the canvas, deriving it from the keyframe when the caller did not say.
+
+    A keyframe is the geometry anchor — the reference resolves the canvas from the first frame's
+    aspect (`reference/diffusers/modular/before_encoder.py:173`), and for good reason: the first
+    keyframe is *stretched* onto whatever canvas it lands on, without preserving aspect. Left at
+    the 16:9 default, a portrait photograph is silently squashed into a landscape clip.
+
+    EXIF orientation is applied before the size is read. A camera stores rotation as a tag rather
+    than rotating pixels, so a portrait photo reports itself as landscape — and would pick exactly
+    the canvas this function exists to avoid.
+    """
+    if width is not None and height is not None:
+        return width, height
+    if image is None:
+        default_width, default_height = DEFAULT_CANVAS
+        return width if width is not None else default_width, \
+            height if height is not None else default_height
+
+    # Half a canvas is worse than none: `--width 640` alone against a 3:2 photo used to pair the
+    # requested width with the *derived* height, producing a canvas of neither aspect and
+    # stretching the frame into it without a word.
+    if width is not None or height is not None:
+        raise CliError(
+            "partial_canvas_with_image",
+            "--image derives the canvas from the keyframe, so pass both --width and --height or "
+            f"neither. Got only --{'width' if width is not None else 'height'}.",
+            {"width": width, "height": height},
+        )
+
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    from h3_48gb._upstream import ensure_on_path  # noqa: F401  (puts upstream on sys.path)
+    from minimax_h3_mlx.packing import resolve_canvas_size
+
+    # `RunSpec.__post_init__` refuses a missing keyframe with `image_not_found`, but it only runs
+    # once the canvas is known — so these three failures reach the user from here, and must carry
+    # the same codes rather than a raw PIL traceback.
+    if not Path(image).exists():
+        raise CliError("image_not_found", f"--image does not exist: {image}", {"image": str(image)})
+    try:
+        with Image.open(image) as raw:
+            source = ImageOps.exif_transpose(raw).size
+    except (OSError, UnidentifiedImageError) as exc:
+        raise CliError("image_unreadable", f"--image could not be read: {image} ({exc})",
+                       {"image": str(image)}) from exc
+    try:
+        derived_height, derived_width = resolve_canvas_size(*source)
+    except ValueError as exc:
+        raise CliError(
+            "image_aspect_unsupported",
+            f"--image is {source[0]}x{source[1]}; MiniMax-H3 supports aspect ratios from 1:4 to "
+            f"4:1. Crop it, or pass --width and --height explicitly. ({exc})",
+            {"image": str(image), "size": list(source)},
+        ) from exc
+    return derived_width, derived_height
+
+
 def spec_from_args(args: argparse.Namespace) -> RunSpec:
     """Build a `RunSpec` from parsed args, shared by `generate` and `resume` (identical flags).
 
     Validation lives in `RunSpec.__post_init__`, so it happens here for both subcommands, before
     either one touches a checkpoint path or a weight file.
     """
+    width, height = resolve_canvas(args.image, args.width, args.height)
     return RunSpec(
-        prompt=args.prompt, width=args.width, height=args.height,
+        prompt=args.prompt, width=width, height=height,
         duration=args.duration, steps=args.steps, seed=args.seed,
         checkpoint=args.checkpoint, outdir=args.outdir, tag=args.tag,
         checkpoint_dir=args.checkpoint_dir,
         no_checkpoint=getattr(args, "no_checkpoint", False),
+        image=args.image, end_image=args.end_image,
         preview_every=args.preview_every, preview_stem=args.preview_stem,
     )
+
+
+def load_keyframes(spec: RunSpec) -> tuple[list, tuple[str, ...]]:
+    """Load the conditioning frames and the anchors that place them on the timeline.
+
+    `exif_transpose` is not cosmetic: a camera stores orientation as a tag rather than by
+    rotating the pixels, so without it a portrait photo conditions the run on a landscape
+    frame — and nothing downstream can tell that happened.
+
+    Frames come back **already on the canvas**, and that is load-bearing rather than tidy: the
+    checkpoint's identity digest is taken over what this returns, while the clip is conditioned on
+    what the pipeline receives. Returning the raw frame here made those two different images the
+    moment the pipeline started preparing them itself, so `h3 resume --image photo.jpg` computed a
+    digest no checkpoint had ever been written under and reported `checkpoint_not_found`. Preparing
+    once, here, is what keeps the identity and the conditioning describing the same picture.
+    """
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    images, anchors = [], []
+    for path, anchor in ((spec.image, "first"), (spec.end_image, "last")):
+        if path is None:
+            continue
+        # `resolve_canvas` reports the same failure, but only for `--image` and only when it had
+        # to derive the canvas. `--end-image`, and any run with an explicit `--width/--height`,
+        # reach the decoder for the first time right here.
+        try:
+            with Image.open(path) as raw:
+                oriented = ImageOps.exif_transpose(raw.convert("RGB"))
+        except (OSError, UnidentifiedImageError) as exc:
+            flag = "--image" if anchor == "first" else "--end-image"
+            raise CliError("image_unreadable", f"{flag} could not be read: {path} ({exc})",
+                           {"image": str(path)}) from exc
+
+        # Imported here rather than beside `Image`: a text-only run must not pull upstream (and
+        # mlx with it) just because this function was called.
+        from minimax_h3_mlx.packing import prepare_keyframe_image
+
+        images.append(prepare_keyframe_image(oriented, spec.height, spec.width,
+                                             stretch=not images))
+        anchors.append(anchor)
+
+    # Checked here rather than in `__post_init__`, which must not import mlx, and only when a
+    # keyframe is actually present — a text-only run never reaches the patched line.
+    if images:
+        from h3_48gb.text_encoder import keyframe_scatter_patch_applied
+
+        if not keyframe_scatter_patch_applied():
+            raise CliError(
+                "upstream_patch_missing",
+                "The vendored `upstream/` checkout has not been patched, so this keyframe would "
+                "crash inside the text encoder — after 28.2 GB of weights had loaded. Apply it:\n"
+                "    git -C upstream apply ../patches/0001-keyframe-masked-scatter.patch",
+                {"patch": "patches/0001-keyframe-masked-scatter.patch"},
+            )
+    return images, tuple(anchors)
 
 
 def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wav_fn=None,
@@ -256,6 +402,9 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
 
     started = time.perf_counter()
     try:
+        # Load conditioning keyframes if provided.
+        images, keyframe_anchors = load_keyframes(spec)
+
         # `verbose` here is not one of h3_48gb.checkpoint's own kwargs — it is upstream's own
         # `MiniMaxH3Pipeline.__call__` parameter, which `CheckpointingPipeline.__call__` also reads
         # to decide whether `ResumableRun` prints its "checkpoint: N/M steps" line. One flag, both
@@ -267,7 +416,8 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
                       resume=resume, verbose=verbose, tag=spec.tag,
                       # `<stem>-preview-stepNN.jpg`, next to where `<stem>.mp4` will land.
                       preview_every=spec.preview_every,
-                      preview_stem=str(preview_stem) if spec.preview_every else None)
+                      preview_stem=str(preview_stem) if spec.preview_every else None,
+                      images=images or None, keyframe_anchors=keyframe_anchors)
     except CheckpointMismatch as exc:
         # The message from h3_48gb.checkpoint names the file and the fields that differ, but a
         # user reading it has no way to construct that filename themselves — so name the flag.
@@ -349,15 +499,22 @@ def _checkpoint_path_for(spec: RunSpec, pipe, checkpoint_dir: Path) -> Path:
     passed the same way `run_generate` passes it to `pipe(...)` — as its own `request_identity`
     argument, not through `bound.arguments`, since upstream's `__call__` has no `tag` parameter at
     all.
+
+    `images`/`keyframe_anchors` are loaded and bound here too, mirroring `run_generate`'s call —
+    without them a conditioned run and an unconditioned one with the same prompt/geometry/seed/tag
+    would resolve to the same checkpoint file, and resuming one would continue the clip from
+    latents written for different conditioning.
     """
     import inspect
 
     from h3_48gb.checkpoint import identity_digest, request_identity
     from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
 
+    images, keyframe_anchors = load_keyframes(spec)
     bound = inspect.signature(MiniMaxH3Pipeline.__call__).bind(
         pipe, prompt=spec.prompt, duration_seconds=spec.duration,
         num_inference_steps=spec.steps, seed=spec.seed, height=spec.height, width=spec.width,
+        images=images or None, keyframe_anchors=keyframe_anchors,
     )
     bound.apply_defaults()
     identity = request_identity(dict(bound.arguments), pipe.checkpoint_identity_extra(), tag=spec.tag)

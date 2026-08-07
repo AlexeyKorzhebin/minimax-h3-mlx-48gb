@@ -720,7 +720,19 @@ def qwen3_vl_config(shared: dict, entries: dict[str, Entry]) -> dict:
 
 
 def qwen3_vl_preprocessor_config() -> dict:
-    """Qwen3-VL image processor settings; only needed for keyframe (fl2va) conditioning."""
+    """Qwen3-VL image processor settings; only needed for keyframe (fl2va) conditioning.
+
+    `min_pixels` / `max_pixels` are **not** guesses: they match MiniMaxAI/MiniMax-H3, which
+    ships the same two numbers in `FL2VA/processor`, `FL2VA/text_encoder` and `processor`.
+
+    They are spelled differently here on purpose. The official file writes them as
+    ``size: {"shortest_edge": 65536, "longest_edge": 16777216}``, and mlx-vlm's processor has no
+    `size` key — handed that config it silently keeps Qwen2-VL's defaults and caps a keyframe at
+    1,003,520 pixels. Copying the official file verbatim would therefore change the conditioning
+    without raising anything: a 4K keyframe would yield 943 image tokens instead of 8160, and
+    since `num_image_tokens` sets the rotary clock of every media row, the whole timeline shifts.
+    `tests/test_image_processor.py` pins both the values and this trap.
+    """
     return {
         "image_processor_type": "Qwen2VLImageProcessorFast",
         "processor_class": "Qwen3VLProcessor",
