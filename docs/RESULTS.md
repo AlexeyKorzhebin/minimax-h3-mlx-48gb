@@ -248,7 +248,7 @@ than assumed:
   with five collection errors from `upstream/tests/*` importing torch; `norecursedirs` in
   `pyproject.toml` excludes the vendored clone, so the plain command is now the whole suite.
 
-## Keyframe conditioning: not verified — blocked before either run could complete
+## Keyframe conditioning: still not verified — the `torchvision` wall is gone, a new one is behind it
 
 `--image`/`--end-image` (added on `feat/image-to-video`) parse, validate, and bind into checkpoint
 identity — that much is covered by unit tests. Whether a keyframe actually **conditions** the clip,
@@ -259,40 +259,59 @@ was written to close that gap: generate the same prompt and seed twice at 512x51
 keyframe, once without — and compare each clip's first frame against the image by PSNR and
 correlation, with the unconditioned control as the baseline that makes the comparison meaningful.
 
-**The conditioned run cannot start.** It fails deterministically, after the 28.22 GB text encoder
-has loaded but before the first diffusion step, with:
+**The `torchvision` blocker documented below (previous revision of this section) is fixed.**
+`h3_48gb/image_processor.py`'s `TorchFreeProcessor` (landed on this branch, verified against real
+`transformers` output in `tests/fixtures/processor/`) now stands in for the composite
+`AutoProcessor`, so `upstream/minimax_h3_mlx/text_encoder.py`'s `build_request()` no longer touches
+`transformers.AutoProcessor.from_pretrained` at all for an image request. Confirmed directly: a
+conditioned run (`h3 generate ... --image docs/media/native5-frame.jpg`, 2026-08-07) now gets past
+`build_request()` — token ids, tags, `pixel_values` and `image_grid_thw` all come back — and reaches
+`self.vision(...)`, i.e. the Qwen3-VL vision tower's own forward pass. That is strictly further than
+this project has ever gotten with a real keyframe.
+
+**It then fails inside the vision tower, before the first diffusion step, with:**
 
 ```
-ValueError: /Users/aleksey.korzhebin/models/h3-converted/processor requires `torchvision` to be
-installed. Please install `torchvision` and try again.
+ValueError: [conv] Expect the input channels in the input and weight array to match but got
+shapes - input: (4032,2,16,16,3) and weight: (1152,3,2,16,16)
 ```
 
-The failure is not in this fork's own code. `h3_48gb/checkpoint.py` calls straight through to
-`upstream/minimax_h3_mlx/text_encoder.py`'s `encode()`, which — only when `images` is non-empty —
-touches a lazily-built `self.processor` property that calls `transformers.AutoProcessor.from_pretrained`
-on `~/models/h3-converted/processor`. That directory's `preprocessor_config.json` declares
-`"processor_class": "Qwen3VLProcessor"`, whose composite processor expects an image processor *and*
-a video processor. There is no `video_processor_type` and no `config.json` alongside it, so
-`transformers` (5.14.1, pulled in transitively by `mlx-vlm`) falls through to
-`VIDEO_PROCESSOR_MAPPING`, finds nothing, checks `is_torchvision_available()`, gets `False`, and
-raises. A text-only prompt never touches `self.processor` at all — `tokenizer` is a separate
-property backed by a different directory — which is why 130 passing tests and every run in the
-table above never surfaced this: this fork has never, until this run, actually asked the real
-checkpoint to encode an image.
+Traceback: `h3 generate --image ... → h3_48gb/checkpoint.py:665 encode() →
+upstream/minimax_h3_mlx/text_encoder.py:264 self.vision(...) →
+mlx_vlm/models/qwen3_vl/vision.py PatchEmbed.__call__ → proj (nn.Conv3d) → mx.conv3d`.
 
-`torchvision` is not in `pyproject.toml`'s dependencies, and pulling it in means pulling in `torch`
-— the one dependency this fork's own test configuration says it deliberately does not install
-(see the `norecursedirs` comment above). Installing it to force a number out of this run would be
-exactly the kind of workaround this measurement exists to rule out, so it was not done. The
-underlying fix (bypassing `AutoProcessor`'s video-processor auto-resolution for an image-only
-request, or vendoring a minimal image-only processor) lives in `upstream/minimax_h3_mlx/text_encoder.py`,
-which this fork does not modify, and is out of scope for this file's script/docs-only change.
+**Root cause, confirmed by inspecting the checkpoint directly** (not merely inferred from the
+message): `~/models/h3-converted/text_encoder/model-00014-of-00014.safetensors` stores
+`model.visual.patch_embed.proj.weight` as shape `(1152, 3, 2, 16, 16)` —
+`(out_channels, in_channels, kD, kH, kW)`, PyTorch/HF's conv weight layout. `mlx.nn.Conv3d` expects
+channels-last, `(out_channels, kD, kH, kW, in_channels)` — `(1152, 2, 16, 16, 3)` here — exactly as
+its own constructor builds `self.weight` (`mlx/nn/layers/convolution.py`). `np.moveaxis(w, 1, -1)`
+turns one into the other, confirmed by shape (not run against the model). This exact transpose
+already exists in this codebase, just not here: `upstream/minimax_h3_mlx/load.py`'s VideoVAE loader
+applies `tensor.transpose(0, 2, 3, 4, 1)` to every 5-D conv weight it loads, with a comment
+explaining why. `upstream/minimax_h3_mlx/text_encoder.py`'s `_load_weights()` has no such step — it
+assigns every `model.visual.*` tensor into the vision module with a plain `.astype(dtype)` and
+nothing else. The vision tower's only convolution is this one patch-embedding layer (the rest of
+`VisionModel` is attention and linear layers, which are not shape-sensitive to weight layout the
+same way), so this single missing transpose is enough to make **every** image-conditioned request
+fail, independent of image content, size, or which keyframe is used.
 
-**Result: the pair was never run.** No conditioned PSNR, no control PSNR, no correlations — there
-is nothing to report except that the run could not happen. This is a materially different, and
-more serious, finding than "INCONCLUSIVE (did not beat control by 3 dB)": it means `--image` is
-currently **inoperable** end-to-end on this fork's own declared dependency set, not merely
-unproven. Until `torchvision`/`torch` is either added as a real dependency or the upstream call is
-routed around the video-processor lookup, nobody running `h3 generate --image ...` from a clean
-`pip install` of this fork will get a video conditioned on their keyframe — they will get this
-traceback, every time, after paying for a full text-encoder load first.
+This is why no test caught it: as this section previously noted, no test and no run before this one
+ever asked the real checkpoint to encode an image, so `self.vision.parameters()` were loaded and
+compared against expected keys (shape-checked for *presence*, not layout) but never actually run
+through `mx.conv3d` until this task's Step 1 smoke run did exactly that.
+
+**This bug is in `upstream/minimax_h3_mlx/text_encoder.py`, which this fork does not modify**, and
+fixing a checkpoint-loading bug is out of scope for a script/docs-only task. Working around it (e.g.
+patching the loaded weight in `h3_48gb/checkpoint.py`, the way `TorchFreeProcessor` was patched in
+one layer up) was not attempted here, consistent with this task's instruction to report a failure
+rather than route around it.
+
+**Result: the conditioned run still cannot complete a single diffusion step, so the pair was still
+never run.** No conditioned PSNR, no control PSNR, no correlations. This is a different blocker than
+the one previously recorded, one level deeper in the same code path: fixing the processor
+(`torchvision`) got the keyframe past text tokenization and into the vision tower; a second,
+independent bug — a missing weight transpose specific to the one 5-D conv weight the vision tower
+has — stops it immediately after. `--image` remains **inoperable** end-to-end on this fork; nobody
+running `h3 generate --image ...` today gets a conditioned video, they get this traceback, after
+paying for a full text-encoder load first.
