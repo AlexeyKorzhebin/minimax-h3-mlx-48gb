@@ -328,6 +328,48 @@ def test_cli_and_checkpoint_module_agree_on_the_file_name():
     assert _checkpoint_path_for(spec, pipe, ckpt_dir) == from_pipeline
 
 
+def test_cli_and_checkpoint_module_agree_on_the_file_name_with_a_keyframe(tmp_path):
+    """The conditioned counterpart of `test_cli_and_checkpoint_module_agree_on_the_file_name`.
+
+    That test's hand-rolled `bound(...)` never passes `images`/`keyframe_anchors`, so it cannot
+    tell a correct keyframe binding in `_checkpoint_path_for` from a broken one — both look
+    identical to it when no image is involved (unconditioned `_checkpoint_path_for` and the
+    unconditioned oracle here would agree even if `_checkpoint_path_for` bound the wrong parameter
+    name, or dropped keyframe_anchors, as long as neither is ever exercised). This binds a real
+    `image=` through `load_keyframes` into *both* resolutions — `_checkpoint_path_for`'s own
+    binding, and this test's independent oracle built from `_resolve_store`, the function
+    `CheckpointingPipeline.__call__` actually calls internally — so a keyframe-binding mistake in
+    `_checkpoint_path_for` shows up as a mismatch here even though the two tests above
+    (`test_a_keyframe_changes_the_checkpoint_identity`,
+    `test_different_keyframes_give_different_checkpoints`) would not catch it: they only compare
+    `_checkpoint_path_for` against itself, so a binding mistake shared by both calls would pass
+    them silently.
+    """
+    import inspect
+
+    from h3_48gb.checkpoint import _resolve_store, request_identity
+    from h3_48gb.cli import load_keyframes
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    spec = _spec(tmp_path, image=_png(tmp_path / "a.png"))
+    pipe = _StubPipe()
+    ckpt_dir = tmp_path / "checkpoints"
+
+    # The pipeline's own path: bind upstream's signature exactly as `CheckpointingPipeline.__call__`
+    # does, from the same `images`/`keyframe_anchors` `run_generate` passes to `pipe(...)`.
+    images, keyframe_anchors = load_keyframes(spec)
+    bound = inspect.signature(MiniMaxH3Pipeline.__call__).bind(
+        pipe, prompt=spec.prompt, duration_seconds=spec.duration,
+        num_inference_steps=spec.steps, seed=spec.seed, height=spec.height, width=spec.width,
+        images=images or None, keyframe_anchors=keyframe_anchors,
+    )
+    bound.apply_defaults()
+    identity = request_identity(dict(bound.arguments), pipe.checkpoint_identity_extra(), tag=spec.tag)
+    from_pipeline = _resolve_store({"checkpoint_dir": str(ckpt_dir)}, identity).path
+
+    assert _checkpoint_path_for(spec, pipe, ckpt_dir) == from_pipeline
+
+
 # -- preview and checkpoint control ---------------------------------------------------------------
 
 def test_generate_exposes_preview_and_checkpoint_flags():
