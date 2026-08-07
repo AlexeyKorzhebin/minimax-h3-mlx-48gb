@@ -30,6 +30,21 @@ LATENT_CHANNELS = 24
 #: Four x2 upsamples. Must equal the video VAE's `spatial_compression_ratio`.
 SPATIAL_RATIO = 16
 
+#: Does TAE want the latent as the sampler holds it (normalized), or after `latents * std + mean`?
+#: Measured, not assumed — `scripts/measure_tae.py`, and the table in docs/RESULTS.md.
+#:
+#: The answer is normalized, and getting it right needed more than one metric. Against the real
+#: VAE's own decode the denormalized form scores *higher* PSNR (17.50 vs 15.11 dB), which is what
+#: a naive comparison would pick. It is wrong: that form wins on a colour shift that happens to
+#: land near the reference's tone, while losing on structure (gradient correlation 0.457 vs 0.508)
+#: and on correlation with the reference itself (0.883 vs 0.927).
+#:
+#: The decisive evidence is the second reference. The latent under test was produced by encoding a
+#: known image, so that image is ground truth: normalized scores **21.78 dB / 0.939 correlation**
+#: against it, where the real VAE manages 14.72 / 0.941 — the small decoder lands closer to the
+#: original than the VAE does, because it skips the encoder round trip and the tiling.
+TAE_EXPECTS_NORMALIZED = True
+
 
 def to_mlx_conv2d_layout(tensor: mx.array) -> mx.array:
     """PyTorch's ``(out, in, kH, kW)`` -> MLX's channels-last ``(out, kH, kW, in)``.
@@ -69,7 +84,6 @@ class Block(nn.Module):
 
 def _upsample(x: mx.array) -> mx.array:
     """Nearest-neighbour x2 on a channels-last ``(N, H, W, C)`` array."""
-    n, h, w, c = x.shape
     x = mx.repeat(x, 2, axis=1)
     return mx.repeat(x, 2, axis=2)
 
@@ -109,7 +123,11 @@ class TAEDecoder(nn.Module):
         x = self.up4(_upsample(x))                                           # slots 20, 21
         for block in self.stage5:
             x = block(x)
-        return self.conv_out(x) + 0.5
+        # No `+ 0.5` here. TAESD's decoder for Stable Diffusion adds one, and this port did too
+        # until it was measured: with it, frames came out at mean brightness 225/255 and scored
+        # 5 dB against the real VAE; without it, 17.5 dB and a recognisable image. That
+        # convention belongs to SD's latent space, not to this checkpoint.
+        return self.conv_out(x)
 
 
 #: Checkpoint slot -> module attribute. The gaps (0, 2, 6, 11, 16, 20) are parameterless layers.
@@ -188,10 +206,11 @@ def load_tae(path: Path | str = TAE_WEIGHTS_PATH, report: bool = False):
 
     raw = mx.load(str(path))
     decoder = TAEDecoder()
-    expected = {name for name, _ in tree_flatten(decoder.parameters())}
+    expected = {name: param.shape for name, param in tree_flatten(decoder.parameters())}
 
     resolved: dict[str, mx.array] = {}
     unused: list[str] = []
+    wrong_shape: list[str] = []
     for key, tensor in raw.items():
         try:
             name = _parameter_path(key)
@@ -201,19 +220,46 @@ def load_tae(path: Path | str = TAE_WEIGHTS_PATH, report: bool = False):
         if name not in expected:
             unused.append(key)
             continue
-        resolved[name] = to_mlx_conv2d_layout(tensor) if tensor.ndim == 4 else tensor
+        prepared = to_mlx_conv2d_layout(tensor) if tensor.ndim == 4 else tensor
+        # Names alone are not enough. A checkpoint whose `1.weight` is 5x5 instead of 3x3 matches
+        # by name, loads without complaint, and even runs a forward pass — MLX rebinds the
+        # parameter rather than checking it against the module that declared it. The result is a
+        # decoder quietly running a different architecture from the one this file describes.
+        if prepared.shape != expected[name]:
+            wrong_shape.append(f"{key} -> {name}: {tuple(prepared.shape)} != {tuple(expected[name])}")
+            continue
+        resolved[name] = prepared
 
-    missing = sorted(expected - resolved.keys())
-    if missing or unused:
+    missing = sorted(expected.keys() - resolved.keys())
+    if missing or unused or wrong_shape:
         missing_slots = _missing_checkpoint_slots(missing)
         raise KeyError(
             f"{path.name} does not match the decoder: {len(missing)} parameters unfilled "
             f"(e.g. {missing[:3]}) from checkpoint slot(s) {missing_slots}, "
-            f"{len(unused)} tensors unused (e.g. {sorted(unused)[:3]})."
+            f"{len(unused)} tensors unused (e.g. {sorted(unused)[:3]}), "
+            f"{len(wrong_shape)} of the wrong shape (e.g. {sorted(wrong_shape)[:3]})."
         )
 
     decoder.update(tree_unflatten(list(resolved.items())))
     mx.eval(decoder.parameters())
     if report:
-        return decoder, {"loaded": len(resolved), "missing": missing, "unused": unused}
+        return decoder, {"loaded": len(resolved), "missing": missing, "unused": unused,
+                         "wrong_shape": wrong_shape}
     return decoder
+
+
+def decode_latent_frame(decoder: TAEDecoder, latents: mx.array, latents_mean: mx.array,
+                        latents_std: mx.array, frame_index: int):
+    """One latent frame -> one ``(H, W, 3)`` uint8 RGB frame at 16x the latent resolution.
+
+    ``latents`` is ``(1, C, F, H, W)`` as the sampler holds it, i.e. normalized. Whether that is
+    fed straight in or denormalized first is `TAE_EXPECTS_NORMALIZED`, settled by measurement.
+    """
+    import numpy as np
+
+    if not TAE_EXPECTS_NORMALIZED:
+        latents = latents * latents_std + latents_mean
+    hwc = mx.transpose(latents[0, :, frame_index], (1, 2, 0))[None].astype(mx.float32)
+    out = decoder(hwc)
+    mx.eval(out)
+    return (np.clip(np.array(out)[0], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)

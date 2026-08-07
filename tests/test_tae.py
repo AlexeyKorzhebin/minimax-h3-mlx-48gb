@@ -112,3 +112,68 @@ def test_the_ratio_matches_the_video_vae():
     cfg = video_vae_config(Path.home() / "models/h3-converted/video_vae")
     assert SPATIAL_RATIO == cfg.spatial_compression_ratio
     assert LATENT_CHANNELS == cfg.latent_channels
+
+
+# -- values, not just shapes ---------------------------------------------------------------------
+
+GOLDEN = Path(__file__).resolve().parent / "fixtures/tae/golden_frame.npz"
+
+
+def _deterministic_latent():
+    """A fixed input with no RNG, so the fixture is reproducible across MLX versions."""
+    import mlx.core as mx
+
+    channels, height, width = 24, 3, 4
+    index = np.arange(channels * height * width, dtype=np.float32)
+    index = index.reshape(1, channels, 1, height, width)
+    return mx.array(np.sin(index / 7.0) * 2.0)
+
+
+def test_the_decoder_reproduces_the_golden_frame():
+    """Every test above this one passes on a decoder that computes the wrong thing.
+
+    Eight separate mutations survived the shape-only suite: swapping two entries in `SLOT_MAP`,
+    swapping two convolutions inside `Block`, turning the nearest-neighbour upsample into
+    something else, dropping either ReLU, dropping the input clamp, and adding the `+ 0.5` this
+    port carried until it was measured. All of them change the pixels and none of them change a
+    shape, so a value fixture is the only thing that catches them.
+    """
+    import mlx.core as mx
+
+    from h3_48gb.tae import decode_latent_frame, load_tae
+
+    expected = np.load(GOLDEN)["frame"]
+    got = decode_latent_frame(
+        load_tae(TAE_WEIGHTS_PATH), _deterministic_latent(),
+        mx.zeros((1, 24, 1, 1, 1)), mx.ones((1, 24, 1, 1, 1)), frame_index=0,
+    )
+    assert got.shape == expected.shape
+    # uint8 output, so an exact match is the right bar — any real defect moves pixels far more
+    # than a rounding boundary would.
+    difference = np.abs(got.astype(np.int16) - expected.astype(np.int16))
+    assert difference.max() <= 1, (
+        f"decoded frame differs from the fixture by up to {difference.max()} levels "
+        f"({(difference > 1).sum()} pixels beyond tolerance)")
+
+
+def test_the_golden_frame_is_not_uniform():
+    """A fixture of flat grey would match a decoder that had stopped working entirely."""
+    expected = np.load(GOLDEN)["frame"]
+    assert expected.std() > 10, f"the fixture carries no structure: std {expected.std():.1f}"
+    assert 20 < expected.mean() < 235, f"the fixture is saturated: mean {expected.mean():.1f}"
+
+
+def test_a_wrongly_shaped_tensor_is_refused_even_when_the_name_matches(tmp_path):
+    """Names alone let a 5x5 kernel load into a 3x3 slot: MLX rebinds rather than checking."""
+    import mlx.core as mx
+
+    from h3_48gb.tae import load_tae
+
+    raw = dict(mx.load(str(TAE_WEIGHTS_PATH)))
+    raw["1.weight"] = mx.zeros((96, 24, 5, 5))          # right name, wrong kernel
+    path = tmp_path / "wrong_shape.safetensors"
+    mx.save_safetensors(str(path), raw)
+
+    with pytest.raises(KeyError) as excinfo:
+        load_tae(path)
+    assert "1.weight" in str(excinfo.value)
