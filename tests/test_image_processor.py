@@ -57,6 +57,35 @@ def test_wrapper_exposes_the_single_attribute_upstream_uses():
     assert proc.image_processor.merge_size == 2
 
 
+def test_the_pixel_budget_survives_loading():
+    """The keyframe's pixel budget decides how much of the sequence it occupies.
+
+    `num_image_tokens = grid.prod() // merge**2` feeds `num_text`, and `packing` derives every
+    media row's rotary clock from `num_text` — so this budget moves the whole timeline, silently.
+    Checked against MiniMaxAI/MiniMax-H3, whose `FL2VA/processor`, `FL2VA/text_encoder` and
+    `processor` all carry the same two numbers.
+    """
+    ip = load_image_processor(PROCESSOR_DIR)
+    assert (ip.min_pixels, ip.max_pixels) == (65536, 16777216)
+
+
+def test_the_official_key_spelling_would_be_ignored(tmp_path):
+    """Why `convert_sawfwair.py` must not simply copy the official config verbatim.
+
+    The official file writes the budget as `size: {shortest_edge, longest_edge}`. mlx-vlm's
+    processor takes no such key: it silently keeps Qwen2-VL's defaults, capping a keyframe at
+    1,003,520 pixels instead of 16,777,216. A 4K keyframe would then yield 943 image tokens
+    where the released model produces 8160 — no exception, just a different clip. Only the
+    `min_pixels`/`max_pixels` spelling this fork writes actually lands.
+    """
+    official = {"size": {"shortest_edge": 65536, "longest_edge": 16777216},
+                "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
+                "image_mean": [0.5] * 3, "image_std": [0.5] * 3}
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps(official))
+    ignored = load_image_processor(tmp_path)
+    assert (ignored.min_pixels, ignored.max_pixels) != (65536, 16777216)
+
+
 def test_a_broken_config_fails_loudly(tmp_path):
     """A silent fallback to AutoProcessor would reintroduce torch 28 GB into a run."""
     (tmp_path / "preprocessor_config.json").write_text("{ not json")
