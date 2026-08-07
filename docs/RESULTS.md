@@ -11,7 +11,7 @@ driven by `night_queue.sh`, which passes that interval explicitly.
 prerequisite**: it was set to leave headroom for the heaviest configuration in the planned series
 (15 s at native resolution, ~42 GB projected), which was never actually run. Nothing that *was* run
 came close — the largest MLX allocation observed at any point is the 28.22 GB text encoder, and the
-diffusion phase holds about 12 GB — so reproducing the runs in the table does not require raising
+diffusion phase holds about 11.5 GB — so reproducing the runs in the table does not require raising
 the limit. It resets on reboot in any case.
 
 ## A correction: how these numbers were re-derived
@@ -49,7 +49,7 @@ so the clip that comes out is longer than the one asked for — 2.4 s of request
 which is 3.04 s at 24 fps.
 
 The 10-second run has no memory figures because its monitor attached to the wrong process:
-`h3-mem-native10.csv` records an RSS of 0.04 GB from t=220 s onward while the run's own log shows
+`h3-mem-native10.csv` records an RSS of 0.09 GB at t=221 s, dropping to 0.04 GB at t=321 s, while the run's own log shows
 it still working through steps of 1865 s and 1881 s. Nothing can be recovered from that trace, and
 it is not reported. (The cause — `night_queue.sh` slept 10 s and then `pgrep`'d for a command line
 — is fixed; the script now attaches to `$!` immediately.)
@@ -109,8 +109,9 @@ accounting for the encoder's weights. Meanwhile `night_queue.sh` slept 10 s befo
 `memwatch.sh` — and the encoder finished loading in 8.3 s and was unloaded immediately after — so
 the first RSS sample of every archived run was taken after the encoding phase was already over.
 There is no measurement of process RSS during text encoding in any of the three runs. The
-instrumentation gap is now closed (the monitor attaches to `$!` immediately), but closing it does
-not retroactively produce a sample, and the runs were not repeated: a native step costs 586 s.
+instrumentation gap is now narrowed (the monitor attaches to `$!` immediately), but since `night_queue.sh`
+still uses a 10-second sample interval and the encoder finishes in 8.3 s, catching that phase remains
+probabilistic. Closing it would require either a shorter sampling interval or attaching the monitor before the script launches the process; retroactively, it does not produce a sample anyway, and the runs were not repeated: a native step costs 586 s.
 
 So: 28.2 GB and 11.5 GB come from different tools and were never observed together. What can be
 said with both in hand is that the encoder's 28.22 GB is *allocated and released* before the
@@ -175,10 +176,10 @@ number up; instead the machine **reclaimed** swap while generating. That is the 
 supports: *these runs did not consume swap, and the machine gave some back while they ran.*
 
 The caveat, so the table is not read as more than it is. Swap does rise at the very end of the
-native5 trace, from 8.98 GB to 22.75 GB across its last 20 samples. That rise begins at t=17,581 s
+native5 trace, from 8.98 GB to 22.75 GB across its last 38 samples. That rise begins at t=17,581 s
 — and 30 steps at 585.8 s each is 17,574 s, so it starts at the moment the final diffusion step
 completes and the video VAE decode, the raw `.npz` write and the ffmpeg encode begin. The process's
-own RSS has dropped to ~0.9 GB by then. It describes the decode-and-teardown tail (and whatever
+own RSS is 1.28 GB at that moment, dropping to ~0.9 GB as the decode phase progresses. It describes the decode-and-teardown tail (and whatever
 else the overnight queue was starting), not the phase the table is about. Swap during the diffusion
 phase itself never exceeded its opening 10.94 GB.
 
@@ -242,6 +243,7 @@ than assumed:
   This file previously documented `pytest tests/ test_preview.py -q` and claimed 71 tests. That
   command collected 76, and hid the four root-level files — `test_adaln_indexing.py`,
   `test_lazy_pipeline.py`, `test_qkv_permutation.py`, `test_text_encoder_quant.py` — which are 27
-  more tests and which cover three of the four core patches. A bare `pytest` used to fail instead,
+  more tests and which cover three of the four core patches (76 + 27 = 103). The remaining 12 tests
+  were added in this precision-sweep commit to verify measured values against the actual data. A bare `pytest` used to fail instead,
   with five collection errors from `upstream/tests/*` importing torch; `norecursedirs` in
   `pyproject.toml` excludes the vendored clone, so the plain command is now the whole suite.
