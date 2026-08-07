@@ -47,6 +47,7 @@ ERROR_CODES = {
     "preview_interval_negative": "--preview-every is negative; 0 disables previews, N > 0 sets a cadence",
     "end_image_without_image": "--end-image was given without --image; the end frame anchors a run that must also have a start frame",
     "image_not_found": "a keyframe path does not exist",
+    "upstream_patch_missing": "a keyframe was given but the vendored upstream/ checkout is unpatched",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 
@@ -243,6 +244,20 @@ def load_keyframes(spec: RunSpec) -> tuple[list, tuple[str, ...]]:
             continue
         images.append(ImageOps.exif_transpose(Image.open(path).convert("RGB")))
         anchors.append(anchor)
+
+    # Checked here rather than in `__post_init__`, which must not import mlx, and only when a
+    # keyframe is actually present — a text-only run never reaches the patched line.
+    if images:
+        from h3_48gb.text_encoder import keyframe_scatter_patch_applied
+
+        if not keyframe_scatter_patch_applied():
+            raise CliError(
+                "upstream_patch_missing",
+                "The vendored `upstream/` checkout has not been patched, so this keyframe would "
+                "crash inside the text encoder — after 28.2 GB of weights had loaded. Apply it:\n"
+                "    git -C upstream apply ../patches/0001-keyframe-masked-scatter.patch",
+                {"patch": "patches/0001-keyframe-masked-scatter.patch"},
+            )
     return images, tuple(anchors)
 
 

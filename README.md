@@ -34,8 +34,10 @@ encoding phase at all, so the 28.2 GB and the 11.5 GB were never observed by the
 
 ## The four patches
 
-Everything lives in `h3_48gb/`; `upstream/` is a vendored, unmodified clone, pinned to commit
-`fcd9e9b`. Patching from the outside keeps the two separable, but the pin is not optional: this
+Everything lives in `h3_48gb/`; `upstream/` is a vendored clone, pinned to commit `fcd9e9b` and
+otherwise untouched but for a single source patch that keyframe runs cannot do without
+(`patches/0001-keyframe-masked-scatter.patch`, applied during setup below — text-only runs never
+reach it). Patching from the outside keeps the two separable, but the pin is not optional: this
 fork rebinds `FinalLayer.__class__`, binds `inspect.signature(MiniMaxH3Pipeline.__call__)` in three
 places, and `docs/DESIGN.md` cites upstream by line number. Later upstream commits are untested
 here, and any of those three couplings can break silently on one.
@@ -82,14 +84,19 @@ maps the way out. Known future work, not a permanent ceiling.
 
 ```bash
 # 0. Dependencies: this needs an Apple Silicon Mac, Python 3.12, and ffmpeg on PATH.
-#    upstream/ is a vendored, unmodified clone this fork patches from the outside — see "The
-#    four patches" above — and is never committed here, so clone it yourself first.
+#    upstream/ is a vendored clone this fork patches from the outside — see "The four patches"
+#    above — and is never committed here, so clone it yourself first.
 #    Pin the commit. This fork rebinds `FinalLayer.__class__` and binds
 #    `inspect.signature(MiniMaxH3Pipeline.__call__)` in three places, and docs/DESIGN.md cites
 #    upstream by line number — all of which a later upstream commit can silently invalidate.
 #    fcd9e9b is the only revision this fork has been tested against.
 git clone https://github.com/PipeNetwork/minimax-h3-mlx upstream
 git -C upstream checkout fcd9e9b
+
+#    One source edit is unavoidable: upstream places the vision tower's output with `mx.where`,
+#    which broadcasts, so any keyframe run dies inside the text encoder. Skip this and `--image`
+#    is refused up front with `upstream_patch_missing`; text-only runs are unaffected.
+git -C upstream apply ../patches/0001-keyframe-masked-scatter.patch
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 ./.venv/bin/pip install -e .   # installs the `h3` console script

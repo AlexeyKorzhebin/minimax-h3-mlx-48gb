@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from h3_48gb.cli import (
     CliError,
@@ -846,3 +847,44 @@ def test_main_internal_error_still_raises_in_human_mode(tmp_path, monkeypatch):
         assert "disk exploded" in str(exc)
     else:
         raise AssertionError("an unclassified exception must still surface in human mode")
+
+
+# -- the vendored upstream must carry this fork's keyframe patch ---------------------------------
+
+def test_the_patch_detector_agrees_with_the_patch_file():
+    """The marker must be the line the patch actually removes, or the guard rots silently.
+
+    Read from `patches/`, not from a copy: if someone rewrites the patch, this fails rather than
+    letting the detector keep looking for an expression that no longer means anything.
+    """
+    from h3_48gb.text_encoder import UNPATCHED_SCATTER
+
+    patch = (Path(__file__).resolve().parent.parent
+             / "patches/0001-keyframe-masked-scatter.patch").read_text()
+    removed = [line[1:] for line in patch.splitlines()
+               if line.startswith("-") and not line.startswith("---")]
+    assert any(UNPATCHED_SCATTER in line for line in removed), (
+        f"{UNPATCHED_SCATTER!r} is not among the lines the patch removes: {removed}")
+
+
+def test_the_vendored_checkout_is_patched():
+    """Not a unit test of the detector — a statement about this working tree."""
+    from h3_48gb.text_encoder import keyframe_scatter_patch_applied
+
+    assert keyframe_scatter_patch_applied(), (
+        "upstream/ is unpatched; run "
+        "`git -C upstream apply ../patches/0001-keyframe-masked-scatter.patch`")
+
+
+def test_a_keyframe_on_an_unpatched_checkout_is_refused_before_any_weight_loads(tmp_path,
+                                                                                monkeypatch):
+    from h3_48gb import cli, text_encoder
+
+    image = tmp_path / "first.png"
+    Image.new("RGB", (64, 64), (200, 40, 40)).save(image)
+    monkeypatch.setattr(text_encoder, "keyframe_scatter_patch_applied", lambda: False)
+
+    with pytest.raises(CliError) as excinfo:
+        cli.load_keyframes(_spec(tmp_path, image=image))
+    assert excinfo.value.code == "upstream_patch_missing"
+    assert "0001-keyframe-masked-scatter.patch" in excinfo.value.message

@@ -46,6 +46,31 @@ VISION_PREFIX = "model.visual."
 VISION_CONV3D_WEIGHTS = frozenset({"patch_embed.proj.weight"})
 
 
+#: The expression `patches/0001-keyframe-masked-scatter.patch` removes. Its presence means the
+#: vendored checkout is unpatched, and any run with a keyframe will die inside `encode` — after
+#: the 28.2 GB encoder has loaded, which is a slow way to learn about a missing patch.
+UNPATCHED_SCATTER = "mx.where(image_mask"
+
+
+def keyframe_scatter_patch_applied() -> bool:
+    """Whether the vendored `upstream/` carries this fork's keyframe scatter fix.
+
+    Read from the live source rather than a file path, so it stays honest when `H3_UPSTREAM`
+    points the checkout somewhere else.
+
+    Comment lines are stripped first, and that is load-bearing: the patch quotes the very
+    expression it replaces so a reader can see what changed, which made the first version of this
+    check report a patched file as unpatched.
+    """
+    import inspect
+
+    from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
+
+    code = [line for line in inspect.getsource(MiniMaxH3TextEncoder.encode).splitlines()
+            if not line.lstrip().startswith("#")]
+    return not any(UNPATCHED_SCATTER in line for line in code)
+
+
 def to_mlx_conv3d_layout(tensor: mx.array) -> mx.array:
     """PyTorch's ``(out, in, D, H, W)`` conv weight -> MLX's channels-last ``(out, D, H, W, in)``.
 
