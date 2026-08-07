@@ -17,7 +17,7 @@ the wrong choice costs a night, not a retry.
 | `--json` error code `geometry_not_multiple_of_32` | `--width`/`--height` must each be a multiple of 32 — checked before any weight loads. | Round the requested resolution to the nearest multiple of 32 first. |
 | Not sure a checkpoint is usable, or a run refuses to start | The converted checkpoint is missing a required component or the AdaLN cache. | Run `h3 doctor --checkpoint <dir> --json` before anything else — it costs seconds, not hours. |
 | `--json` error code `checkpoint_not_found` from `h3 resume` | No checkpoint under `<outdir>/checkpoints` matches this run's prompt/geometry/duration/steps/seed/tag. | Check every flag matches the interrupted `generate` call exactly, or just re-run the identical `generate` command — it auto-resumes on its own. |
-| `--json` error code `checkpoint_mismatch` / `checkpoint_corrupt` | A checkpoint file exists but was written for a different request, or cannot be read. | Inspect `<outdir>/checkpoints`; if it's stale, move it aside and start a fresh run with a new `--tag`. |
+| `--json` error code `checkpoint_mismatch` / `checkpoint_corrupt` | A checkpoint file exists but was written for a different request, or cannot be read. | The error message names the exact file (`<outdir>/checkpoints/h3-<digest>.safetensors`) — move or delete that specific file. A new `--tag` also works on its own (it is part of the checkpoint identity, so it gets a fresh file) but leaves the stale one on disk; delete it if you don't need it as evidence. |
 | Run looks stalled, no output for a long time | Expected — a native step is ~586 s, and plain `h3 generate` (no `--json`) prints only one `checkpoint: N/M steps` line per completed step. | Wait, or check the checkpoint file's mtime under `<outdir>/checkpoints`; see "watch a run" below. |
 
 ## Workflow
@@ -33,17 +33,29 @@ the wrong choice costs a night, not a retry.
    `--preview-every` flag; in default (non-`--json`) mode they only print a `checkpoint: N/M steps`
    line per step, which at least confirms the run is alive. To actually see a frame and judge
    composition/prompt adherence before committing to the full run, use the benchmarking entry point
-   instead — it drives the same pipeline and does support previews:
-   `./.venv/bin/python run_bench.py --width <w> --height <h> --duration <d> --tag <tag> --preview-every 5`.
+   instead — it drives the same pipeline and does support previews. **The checkpoint identity is
+   the prompt, `--width`, `--height`, `--duration`, `--steps`, `--seed`, `--tag`, plus which
+   `--checkpoint` and `--outdir` you point at** — every one of those must match byte-for-byte
+   between the preview run and the real one, or `h3 resume` will not recognise it as the same run
+   (`checkpoint_not_found`) even though the video/checkpoint were produced under the exact
+   geometry/duration you wanted. `run_bench.py`'s `--seed` defaults to `314159`; `h3 generate`'s
+   defaults to `0` — they will *not* match unless you pass `--seed` explicitly on both sides:
+   ```
+   ./.venv/bin/python run_bench.py --checkpoint <ckpt> --outdir <outdir> --prompt "<prompt>" \
+       --width <w> --height <h> --duration <d> --seed <seed> --tag <tag> --preview-every 5
+   ```
    That writes `<stem>-preview-stepNN.jpg` every N steps (default 5), next to where `<stem>.mp4`
-   will land once the run finishes, and it writes checkpoints in the same format `h3 generate`/
-   `h3 resume` read. Look at a preview JPEG rather than waiting for the run to finish.
+   will land once the run finishes, and writes checkpoints keyed the same way `h3 generate`/
+   `h3 resume` key theirs (tag included), so a hand-off between the two only works when every one
+   of those identity fields is repeated identically on the `h3 resume`/`h3 generate` call that
+   follows. Look at a preview JPEG rather than waiting for the run to finish.
 4. **Resume after an interruption; never restart blind.** Every step is checkpointed under
    `<outdir>/checkpoints`. Re-running the exact same `h3 generate` command after a crash or Ctrl-C
    picks the run back up bit-identically, because it auto-resumes whenever the checkpoint's
-   identity (prompt + geometry + duration + steps + seed + tag) matches. Use `h3 resume` instead
-   when you want that to be a hard assertion rather than an assumption: it fails loudly with
-   `checkpoint_not_found` if nothing matches, instead of silently starting over from step 0.
+   identity (prompt + geometry + duration + steps + seed + tag + checkpoint/outdir) matches. Use
+   `h3 resume` instead when you want that to be a hard assertion rather than an assumption: it
+   fails loudly with `checkpoint_not_found` if nothing matches, instead of silently starting over
+   from step 0.
 
 ## Runtime cost — decide before you launch
 

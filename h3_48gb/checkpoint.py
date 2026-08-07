@@ -71,6 +71,7 @@ CHECKPOINT_KWARGS = (
     "keep_checkpoint",
     "on_corrupt",
     "checkpoint_prompt_embeds",
+    "tag",
 )
 
 
@@ -124,7 +125,7 @@ def _jsonable(value: Any) -> Any:
     return repr(value)
 
 
-def request_identity(arguments: dict, extra: dict | None = None) -> dict:
+def request_identity(arguments: dict, extra: dict | None = None, tag: str | None = None) -> dict:
     """The fields that decide whether two runs are the same run.
 
     Geometry is deliberately *not* recomputed here. Canvas size, frame alignment and the latent
@@ -132,6 +133,12 @@ def request_identity(arguments: dict, extra: dict | None = None) -> dict:
     derivation would only create a second place for it to drift. What guards against drift instead
     is the row-shape check at the resume seam (:meth:`ResumableRun.adopt_rows`), which compares the
     checkpointed rows against the ones the live run actually built.
+
+    ``tag`` is not part of upstream's ``__call__`` signature — it never reaches ``arguments`` — so
+    it is threaded in as its own field instead. Without it, two runs that differ only by ``--tag``
+    would collide on the same checkpoint file, which is not what a caller naming a run with `--tag`
+    would expect. ``None`` omits the field entirely, so identities computed before this parameter
+    existed (and callers that never pass a tag at all, e.g. ``run_bench.py``) are unaffected.
     """
     fields = {
         "format": FORMAT_VERSION,
@@ -145,6 +152,8 @@ def request_identity(arguments: dict, extra: dict | None = None) -> dict:
     fields["request"]["images"] = [_image_digest(im) for im in images] if images else None
     if extra:
         fields["model"] = _jsonable(extra)
+    if tag is not None:
+        fields["tag"] = tag
     return fields
 
 
@@ -693,7 +702,7 @@ class CheckpointingPipeline:
         arguments = dict(bound.arguments)
         verbose = bool(arguments.get("verbose", True))
 
-        identity = request_identity(arguments, self.checkpoint_identity_extra())
+        identity = request_identity(arguments, self.checkpoint_identity_extra(), tag=options.get("tag"))
         store = _resolve_store(options, identity)
         loaded = _load_for_resume(
             store,

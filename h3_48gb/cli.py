@@ -201,7 +201,8 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
         result = pipe(prompt=spec.prompt, duration_seconds=spec.duration,
                       num_inference_steps=spec.steps, seed=spec.seed,
                       height=spec.height, width=spec.width,
-                      checkpoint_dir=str(checkpoint_dir), resume=resume, verbose=verbose)
+                      checkpoint_dir=str(checkpoint_dir), resume=resume, verbose=verbose,
+                      tag=spec.tag)
     except CheckpointMismatch as exc:
         raise CliError("checkpoint_mismatch", str(exc)) from exc
     except CheckpointCorrupt as exc:
@@ -274,7 +275,10 @@ def _checkpoint_path_for(spec: RunSpec, pipe, checkpoint_dir: Path) -> Path:
     identity machinery (`request_identity`, `identity_digest`) is public, so this has to agree
     with that naming rather than reimplement it blind. It binds the same upstream `__call__`
     signature `run_generate` implicitly binds by calling `pipe(...)` with the same arguments, so
-    the two stay in lockstep as long as `run_generate` does not start passing extra ones.
+    the two stay in lockstep as long as `run_generate` does not start passing extra ones. `tag` is
+    passed the same way `run_generate` passes it to `pipe(...)` — as its own `request_identity`
+    argument, not through `bound.arguments`, since upstream's `__call__` has no `tag` parameter at
+    all.
     """
     import inspect
 
@@ -286,7 +290,7 @@ def _checkpoint_path_for(spec: RunSpec, pipe, checkpoint_dir: Path) -> Path:
         num_inference_steps=spec.steps, seed=spec.seed, height=spec.height, width=spec.width,
     )
     bound.apply_defaults()
-    identity = request_identity(dict(bound.arguments), pipe.checkpoint_identity_extra())
+    identity = request_identity(dict(bound.arguments), pipe.checkpoint_identity_extra(), tag=spec.tag)
     return checkpoint_dir / f"h3-{identity_digest(identity)}.safetensors"
 
 

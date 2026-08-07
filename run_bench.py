@@ -72,9 +72,13 @@ def main() -> int:
         height=args.height,
         width=args.width,
         # Same arguments -> same checkpoint file, so re-running this command after a crash picks up
-        # where it stopped. The file is removed once the run finishes.
+        # where it stopped. The file is removed once the run finishes. `tag` is part of that
+        # identity too (see h3_48gb.checkpoint.request_identity) so this stays interoperable with
+        # `h3 generate`/`h3 resume`, which also pass it: a preview run started here can be picked
+        # up by `h3 resume` later only if every identity-bearing flag, tag included, matches.
         checkpoint_dir=str(ckpt_dir) if ckpt_dir else None,
         resume=not args.restart,
+        tag=args.tag,
         # `<stem>-preview-step07.jpg`, next to where `<stem>.mp4` will land once the run finishes.
         preview_every=args.preview_every,
         preview_stem=str(stem) if args.preview_every else None,

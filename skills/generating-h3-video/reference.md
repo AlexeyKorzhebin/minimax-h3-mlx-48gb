@@ -86,6 +86,20 @@ script, not the packaged console command, and exposes flags `generate`/`resume` 
 | `--no-checkpoint` | off | disable checkpointing entirely — a crash then costs the whole run |
 | `--restart` | off | ignore any existing checkpoint and start over from step 0 |
 
+It shares `--checkpoint`, `--outdir`, `--width`, `--height`, `--duration`, `--steps`, `--seed` and
+`--tag` with `h3 generate`/`h3 resume`, and now passes `tag` into the same checkpoint identity
+`h3` does — but **its own defaults are not the same ones**: `--checkpoint` defaults to
+`~/models/h3-converted` and `--outdir` to `~/models/video-out` (matching `h3`), `--prompt` defaults
+to the hummingbird sample prompt (`h3 generate`'s `prompt` is a required positional with no
+default), `--width`/`--height` default to `512`/`512` (`h3 generate` defaults to `1344`/`768`),
+`--duration` defaults to `2.4` (`h3 generate` defaults to `5.0`), and **`--seed` defaults to
+`314159`, not `h3`'s `0`**. Starting a preview with `run_bench.py` and later
+handing off to `h3 resume` (or `h3 generate`) only works if you pass every one of prompt,
+`--checkpoint`, `--outdir`, `--width`, `--height`, `--duration`, `--steps`, `--seed` and `--tag`
+explicitly and identically on both invocations — relying on either side's defaults will silently
+give you two different, unrelated checkpoints, not a resumed one (`checkpoint_not_found` from `h3
+resume`, or a quiet fresh start from `h3 generate`).
+
 It also always writes a phase-timed JSON report (`<stem>.json`, including `phases` and
 `seconds_per_step`) and does not support `--json`-mode machine-readable failures the way `h3`'s
 subcommands do — its errors are plain Python tracebacks. Prefer `h3 generate`/`h3 resume` for a

@@ -255,6 +255,22 @@ def test_resume_checkpoint_path_changes_with_the_request():
             != _checkpoint_path_for(spec_b, pipe, Path("/ckpt")))
 
 
+def test_resume_checkpoint_path_changes_with_the_tag_alone():
+    """Pins the fix: `tag` used to be invisible to `request_identity` (upstream's `__call__` has no
+    such parameter, so it never reached `bound.arguments`), so two otherwise-identical specs
+    differing only by `--tag` silently resolved to the *same* checkpoint file — a `--tag` that
+    looked like it named a run isolated nothing. Same prompt/geometry/duration/steps/seed here;
+    only the tag differs, so this must resolve to two different files, asserted directly.
+    """
+    spec_a = RunSpec(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
+                     checkpoint=Path("/x"), outdir=Path("/x"), tag="a")
+    spec_b = RunSpec(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
+                     checkpoint=Path("/x"), outdir=Path("/x"), tag="b")
+    pipe = _StubPipe()
+    assert (_checkpoint_path_for(spec_a, pipe, Path("/ckpt"))
+            != _checkpoint_path_for(spec_b, pipe, Path("/ckpt")))
+
+
 # -- machine-readable failures ------------------------------------------------------------------
 
 def test_checkpoint_mismatch_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path):

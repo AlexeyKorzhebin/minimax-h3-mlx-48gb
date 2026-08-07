@@ -454,6 +454,23 @@ def test_hashed_names_keep_unrelated_runs_apart(tmp_path):
     assert len(files) == 2, f"expected one checkpoint per request, got {files}"
 
 
+def test_tag_keeps_otherwise_identical_runs_apart(tmp_path):
+    """`tag` never reached `request_identity` (upstream's `__call__` has no `tag` parameter, so it
+    never landed in `bound.arguments`) until `CHECKPOINT_KWARGS`/`request_identity` grew an explicit
+    `tag` seam for it. Same prompt/geometry/duration/steps/seed as `test_hashed_names_keep_
+    unrelated_runs_apart`, differing only by `tag` this time — must still land in two files, not
+    one shared, silently-overwritten one.
+    """
+    for tag in ("a", "b"):
+        try:
+            run(ToyPipeline(fail_at=4), checkpoint_dir=str(tmp_path), tag=tag)
+            raise AssertionError("expected a crash")
+        except Interrupt:
+            pass
+    files = sorted(p.name for p in tmp_path.glob("h3-*.safetensors"))
+    assert len(files) == 2, f"expected one checkpoint per tag, got {files}"
+
+
 def test_corrupt_checkpoint_is_quarantined_and_the_run_restarts(tmp_path):
     """Truncated data has nothing to resume from, so it is moved aside and the run starts over.
 
