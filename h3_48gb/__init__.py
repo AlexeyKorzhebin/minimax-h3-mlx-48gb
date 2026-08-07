@@ -9,7 +9,8 @@ outside. Four changes, in descending order of how badly they fail without it:
    established from the data and a hard failure on any schedule the table was not baked for.
 2. :mod:`h3_48gb.text_encoder` — the port has no quantization path and would load mere.run's 8-bit
    conditioner as packed integers in bf16 slots, silently.
-3. :mod:`h3_48gb.pipeline` — components load per phase instead of all at once (55.5 GB resident).
+3. :mod:`h3_48gb.pipeline` — components load per phase instead of all at once (45.9 GB of
+   weights resident, ~55 GB with activations at 1344x768/5 s; see ``docs/RESULTS.md``).
 4. The same module unloads the 28.2 GB text encoder after its single call, materializing its output
    first so the release is real.
 5. :mod:`h3_48gb.checkpoint` — a run is resumable. At 586 s per step over 30 steps a crash on the

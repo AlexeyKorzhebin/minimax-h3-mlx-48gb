@@ -21,7 +21,8 @@ Two constraints shaped the design, both measured rather than assumed:
   ViT decoder. Measured on this machine (correctly-shaped random weights — the real checkpoint
   is not downloaded here; compute cost depends on shapes/dtypes, not weight values):
   weights resident 5.2 GB, decode itself 49s wall time, peak allocator usage 8.5 GB. See
-  `PLAN.md` / the h3_48gb README for how that compares to the diffusion loop's own budget.
+  `docs/RESULTS.md` ("Previews") for how that compares to the diffusion loop's own budget, and for
+  the same caveat about where those three numbers come from.
 
 That decode happens with the video VAE loaded on demand and unloaded again immediately after,
 rather than kept resident for the whole diffusion loop: keeping it resident would add its ~5.2 GB

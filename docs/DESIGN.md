@@ -5,11 +5,17 @@ documentation.
 
 ## What blocks a run
 
-`pipeline.py::from_pretrained` (lines 92-113 of the upstream port) loads the text encoder, the
-DiT and both VAEs one after another and keeps all of them resident until generation finishes —
-**55.5 GB** on a machine with **48 GB** physical. The mere.run runtime refuses this twice: a
-declared-support threshold of 96 GB (liftable with `--allow-unsupported`), and, separately,
-admission control that requires 32 GB free before it will admit any job at all.
+`pipeline.py::from_pretrained` (lines 92-113 of the upstream port, at commit `fcd9e9b` — the pinned
+revision this fork is written against) loads the text encoder, the DiT and both VAEs one after
+another and keeps all of them resident until generation finishes: **45.9 GB of weights**, and
+**~55 GB** at the moment diffusion peaks, on a machine with **48 GB** physical. The mere.run runtime
+refuses this twice: a declared-support threshold of 96 GB (liftable with `--allow-unsupported`),
+and, separately, admission control that requires 32 GB free before it will admit any job at all.
+
+The 45.9 GB is the sum of the per-component figures MLX itself prints during a real run
+(28.22 + 11.34 + 5.21 + 0.61 GB, plus the 0.56 GB AdaLN cache); the additional 9.3 GB is upstream's
+own measured activation working set for 1344x768 / 5 s. See `docs/RESULTS.md` for both derivations
+and for what was and was not observed directly.
 
 The four components are needed strictly by phase, though:
 
@@ -51,14 +57,25 @@ so no dequantization is required. 56 heads x 128 = 7168 = `inner_dim`.
 
 ## Expected memory use after the patches
 
-| Phase | Resident | Peak |
-|---|---|---|
-| Encoding | encoder Q8, 28.2 GB | ~29 GB |
-| Diffusion, 512x512 | DiT 11.3 + VAE 5.8 + cache 0.9 + activations ~2 | ~20 GB |
-| Diffusion, 5 s at 1344x768 | same + activations 9.3 | ~27 GB |
-| Diffusion, 15 s at 1344x768 | same + activations 24.4 | ~42 GB |
+These were the plan's projections, written before any run. They are kept as written, with what
+actually happened beside them:
 
-GPU limit raised to 44 GB (`iogpu.wired_limit_mb=45056`; resets on reboot).
+| Phase | Resident | Projected peak | Outcome |
+|---|---|---|---|
+| Encoding | encoder Q8, 28.2 GB | ~29 GB | MLX reported exactly 28.22 GB allocated and released; **process RSS was never sampled during this phase** — see `docs/RESULTS.md` |
+| Diffusion, 512x512 | DiT 11.3 + VAE 5.8 + cache 0.9 + activations ~2 | ~20 GB | peak RSS 11.54 GB |
+| Diffusion, 5 s at 1344x768 | same + activations 9.3 | ~27 GB | peak RSS 10.14 GB, flat at 9.04 GB for 1,751 consecutive samples |
+| Diffusion, 15 s at 1344x768 | same + activations 24.4 | ~42 GB | never attempted; extrapolates past 35 hours per clip |
+
+The measured RSS coming in *below* the projections is not the projections being pessimistic about
+the model — the projections describe allocated weights plus activations, while RSS describes
+resident pages, and memory-mapped safetensors weights are file-backed and evictable. `docs/RESULTS.md`
+sets out why the two are not the same measurement and which claim each one supports.
+
+The GPU limit was raised to 44 GB (`iogpu.wired_limit_mb=45056`; resets on reboot) to leave headroom
+for the 15 s row above. Since that row was never run and nothing else came near 12 GB, this is
+methodology rather than a prerequisite: reproducing the runs in `docs/RESULTS.md` does not require
+changing it.
 
 ## What this fork does not solve
 

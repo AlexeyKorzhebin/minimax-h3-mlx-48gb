@@ -14,7 +14,7 @@ risking that. So the tests here are ordered by what would be worst to get wrong 
 
 Everything here uses a deliberately tiny synthetic `VideoVAE` (2 decoder layers, dim 16, an 8x8
 latent grid) — enough to exercise the real module tree and the real chunking arithmetic without
-the multi-second cost a realistically-sized decode has (see `PLAN.md` / the h3_48gb README for what
+the multi-second cost a realistically-sized decode has (see `docs/RESULTS.md`, "Previews", for what
 that costs at native resolution, which is not what this file is measuring).
 """
 

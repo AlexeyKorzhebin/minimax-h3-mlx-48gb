@@ -1,7 +1,8 @@
 """Phase-scoped component residency for a 48 GB machine.
 
 `MiniMaxH3Pipeline.from_pretrained` loads the encoder, the DiT and both VAEs up front and holds all
-four for the whole run — 55.5 GB against 48 GB of physical memory. But the components are used in
+four for the whole run — 45.9 GB of weights, and ~55 GB once the diffusion phase's own activations
+are added, against 48 GB of physical memory. But the components are used in
 strict phases: the text encoder is read exactly once (`pipeline.py` line 238), the video VAE
 encodes keyframes and then is idle until the final decode, and the DiT only matters in between.
 

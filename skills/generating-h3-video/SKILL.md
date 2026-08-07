@@ -17,7 +17,7 @@ the wrong choice costs a night, not a retry.
 | `--json` error code `geometry_not_multiple_of_32` | `--width`/`--height` must each be a multiple of 32 — checked before any weight loads. | Round the requested resolution to the nearest multiple of 32 first. |
 | Not sure a checkpoint is usable, or a run refuses to start | The converted checkpoint is missing a required component or the AdaLN cache. | Run `h3 doctor --checkpoint <dir> --json` before anything else — it costs seconds, not hours. |
 | `--json` error code `checkpoint_not_found` from `h3 resume` | No checkpoint under `<outdir>/checkpoints` matches this run's prompt/geometry/duration/steps/seed/tag. | Check every flag matches the interrupted `generate` call exactly, or just re-run the identical `generate` command — it auto-resumes on its own. |
-| `--json` error code `checkpoint_mismatch` / `checkpoint_corrupt` | A checkpoint file exists but was written for a different request, or cannot be read. | The error message names the exact file (`<outdir>/checkpoints/h3-<digest>.safetensors`) — move or delete that specific file. A new `--tag` also works on its own (it is part of the checkpoint identity, so it gets a fresh file) but leaves the stale one on disk; delete it if you don't need it as evidence. |
+| `--json` error code `checkpoint_mismatch` / `checkpoint_corrupt` | A checkpoint file exists but was written for a different request, or cannot be read. | Re-run the same command with `--restart`: it ignores whatever is on disk and starts from step 0, still checkpointing. That is the intended recovery — the file is named after a digest you cannot compute by hand. The error message does name the exact path (`<checkpoint-dir>/h3-<digest>.safetensors`) if you would rather move it aside as evidence; a fresh `--tag` also gets a new file but leaves the stale one behind. |
 | Run looks stalled, no output for a long time | Expected — a native step is ~586 s, and plain `h3 generate` (no `--json`) prints only one `checkpoint: N/M steps` line per completed step. | Wait, or check the checkpoint file's mtime under `<outdir>/checkpoints`; see "watch a run" below. |
 
 ## Workflow
@@ -29,26 +29,23 @@ the wrong choice costs a night, not a retry.
    and tag are yours to choose — `--steps` must stay `31`, and width/height must be multiples of
    32. Use the runtime cost table below to say how long this specific run will take and how much
    memory it will hold at peak before you start it.
-3. **Watch a run instead of waiting blind.** `h3 generate`/`h3 resume` do not currently expose a
-   `--preview-every` flag; in default (non-`--json`) mode they only print a `checkpoint: N/M steps`
-   line per step, which at least confirms the run is alive. To actually see a frame and judge
-   composition/prompt adherence before committing to the full run, use the benchmarking entry point
-   instead — it drives the same pipeline and does support previews. **The checkpoint identity is
-   the prompt, `--width`, `--height`, `--duration`, `--steps`, `--seed`, `--tag`, plus which
-   `--checkpoint` and `--outdir` you point at** — every one of those must match byte-for-byte
-   between the preview run and the real one, or `h3 resume` will not recognise it as the same run
-   (`checkpoint_not_found`) even though the video/checkpoint were produced under the exact
-   geometry/duration you wanted. `run_bench.py`'s `--seed` defaults to `314159`; `h3 generate`'s
-   defaults to `0` — they will *not* match unless you pass `--seed` explicitly on both sides:
+3. **Watch a run instead of waiting blind.** Pass `--preview-every N` to `h3 generate`. It writes
+   `<stem>-preview-stepNN.jpg` every N steps, next to where `<stem>.mp4` will land once the run
+   finishes, so you can judge composition and prompt adherence long before the run ends. It is off
+   by default because one preview costs roughly 49 s at native resolution; `--preview-every 5` at
+   1344x768 is a frame roughly every 49 minutes, which is cheap against a five-hour render:
    ```
-   ./.venv/bin/python run_bench.py --checkpoint <ckpt> --outdir <outdir> --prompt "<prompt>" \
+   h3 generate "<prompt>" --checkpoint <ckpt> --outdir <outdir> \
        --width <w> --height <h> --duration <d> --seed <seed> --tag <tag> --preview-every 5
    ```
-   That writes `<stem>-preview-stepNN.jpg` every N steps (default 5), next to where `<stem>.mp4`
-   will land once the run finishes, and writes checkpoints keyed the same way `h3 generate`/
-   `h3 resume` key theirs (tag included), so a hand-off between the two only works when every one
-   of those identity fields is repeated identically on the `h3 resume`/`h3 generate` call that
-   follows. Look at a preview JPEG rather than waiting for the run to finish.
+   Without it, default (non-`--json`) mode prints only a `checkpoint: N/M steps` line per step,
+   which confirms the run is alive but shows you nothing. **The checkpoint identity is the prompt,
+   `--width`, `--height`, `--duration`, `--steps`, `--seed`, `--tag`, plus which `--checkpoint` and
+   `--outdir` (or `--checkpoint-dir`) you point at** — every one of those must match between a run
+   and the `h3 resume` that continues it, or resume will not recognise it as the same run
+   (`checkpoint_not_found`). Previewing no longer requires switching to `run_bench.py`, which
+   removes the seed trap that used to come with it (`run_bench.py --seed` defaults to `314159`,
+   `h3 generate --seed` to `0`).
 4. **Resume after an interruption; never restart blind.** Every step is checkpointed under
    `<outdir>/checkpoints`. Re-running the exact same `h3 generate` command after a crash or Ctrl-C
    picks the run back up bit-identically, because it auto-resumes whenever the checkpoint's
@@ -62,11 +59,16 @@ the wrong choice costs a night, not a retry.
 Measured on a MacBook Pro M4 Pro, 48 GB unified memory, the one schedule the baked AdaLN table
 supports (`--steps 31`, sigma shifts 12.0/3.0):
 
-| Resolution | Clip length | Per step | Total | Peak RSS |
+| Resolution | Requested | Per step | Total | Peak RSS |
 |---|---|---|---|---|
-| 512x512 | 2.4 s | 46 s | 24 min | 11.0 GB |
-| 1344x768 (native) | 5 s | 586 s | 299 min (~5 h) | 10.0 GB |
-| 1344x768 (native) | 10 s | 1881 s | ~15.7 h (extrapolated; measured for 2 steps, then stopped deliberately) | not measured |
+| 512x512 | 2.4 s (73 frames) | 46 s | 24 min | 11.5 GB |
+| 1344x768 (native) | 5 s (124 frames) | 586 s | 299 min (~5 h) | 10.1 GB |
+| 1344x768 (native) | 10 s (243 frames) | 1881 s | ~15.7 h (extrapolated; measured for 2 steps, then stopped deliberately) | not measured |
+
+`--duration` is snapped up to the latent grid, so a 2.4 s request yields 73 frames = 3.04 s at
+24 fps. Peak RSS covers the diffusion phase only; the ~10-second text-encoding phase that precedes
+it peaks at 28.2 GB by MLX's own counter. See `docs/RESULTS.md` in the repository for how each of
+those numbers was measured, and which of them were not.
 
 Cost does not scale linearly with resolution or duration: attention is dense and MiniMax has not
 released a sparse-attention implementation for H3, so this is an attention-FLOPs bottleneck, not a

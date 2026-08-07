@@ -6,8 +6,9 @@ __pycache__/
 build/
 dist/
 
-# Vendored, unmodified clone of PipeNetwork/minimax-h3-mlx (Apache-2.0) — see README.md
-# "Get the code" step and NOTICE. Users clone it themselves; it is never committed here.
+# Vendored, unmodified clone of PipeNetwork/minimax-h3-mlx (Apache-2.0) — see the README's
+# Quickstart (step 0, which pins the commit) and NOTICE. Users clone it themselves; it is never
+# committed here.
 upstream/
 
 # Never commit weights or generated media — see NOTICE for why.

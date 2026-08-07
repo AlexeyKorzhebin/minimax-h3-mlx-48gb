@@ -10,20 +10,35 @@ resident, and adds the checkpointing, previews and CLI a multi-hour local render
 ## The memory problem, in numbers
 
 The upstream pipeline loads every component at `from_pretrained` and keeps all of them resident for
-the whole run: text encoder, DiT, video VAE, audio VAE — **55.5 GB**. This machine has **48 GB**.
-mere.run, the Swift runtime whose model build this fork's converter targets, will not even attempt
-it: it refuses outright with *"Requires at least 96 GB unified memory; detected 48 GB"*, and,
-separately, its admission control demands 32 GB free before it will admit any job at all.
+the whole run: text encoder, DiT, video VAE, audio VAE. This machine has **48 GB**. mere.run, the
+Swift runtime whose model build this fork's converter targets, will not even attempt it: it refuses
+outright with *"Requires at least 96 GB unified memory; detected 48 GB"*, and, separately, its
+admission control demands 32 GB free before it will admit any job at all.
 
-Both numbers describe the model's declared footprint, not a requirement of the computation itself.
-The four components are needed in disjoint phases — the text encoder runs once, at the very start,
-and is dead weight for the rest of the render — so loading them one phase at a time and discarding
-each as its phase ends brings the measured peak down to about **11 GB**.
+The four components are needed in disjoint phases, though — the text encoder runs once, at the very
+start, and is dead weight for the rest of the render. Loading them one phase at a time and
+discarding each as its phase ends turns one number into three:
+
+| Peak | Phase | Measured by |
+|---|---|---|
+| **~55 GB** | all four components resident at once, at the moment diffusion peaks | 45.9 GB of weights (this fork's own run log, below) + 9.3 GB of activations at 1344x768/5 s (upstream's measurement) |
+| **28.2 GB** | peak during the text-encoding phase — which lasts about **10 seconds** | MLX's `get_active_memory`, printed by the run itself as `loaded text encoder: +28.22 GB in 8.3s` |
+| **10.1–11.5 GB** | for the entire multi-hour diffusion phase, which is >99% of the wall clock | process RSS, sampled every 10 s for the whole run |
+
+The 45.9 GB is the sum of the four `loaded <component>: +N GB` lines MLX prints during a real run
+(28.22 + 11.34 + 5.21 + 0.61) plus the 0.56 GB AdaLN cache; the 9.3 GB activation figure is
+upstream's own, from its README's sequence-length table. **The three figures come from two
+different instruments, and the honest version of that is in
+[`docs/RESULTS.md`](docs/RESULTS.md)** — including the fact that the RSS trace never sampled the
+encoding phase at all, so the 28.2 GB and the 11.5 GB were never observed by the same tool.
 
 ## The four patches
 
-Everything lives in `h3_48gb/`; `upstream/` is a vendored, unmodified clone, so it can be
-fast-forwarded against the original project at any time.
+Everything lives in `h3_48gb/`; `upstream/` is a vendored, unmodified clone, pinned to commit
+`fcd9e9b`. Patching from the outside keeps the two separable, but the pin is not optional: this
+fork rebinds `FinalLayer.__class__`, binds `inspect.signature(MiniMaxH3Pipeline.__call__)` in three
+places, and `docs/DESIGN.md` cites upstream by line number. Later upstream commits are untested
+here, and any of those three couplings can break silently on one.
 
 1. **`h3_48gb/adaln.py`** — the mere.run build ships no AdaLN modulation path at all (106 tensors
    absent: 50x `blocks.N.adaln_proj`, `final_layer.adaln_proj`, `time_embedder`); it precomputed
@@ -56,13 +71,25 @@ emit machine-readable JSON for scripting or an MCP wrapper.
 The full memory-phase breakdown and the QKV/quantization mapping behind the patches above are in
 [`docs/DESIGN.md`](docs/DESIGN.md).
 
+The 31-step limitation in patch 1 is a property of *this* build, not of H3:
+[`docs/FEASIBILITY-turbo-tae.md`](docs/FEASIBILITY-turbo-tae.md) is a study of two upstream
+artifacts and finds the full modulation path exists in 8-dimensional curve form inside ComfyUI's
+pruned checkpoint — 87 MB, reproducing this fork's own baked table to 2.2e-3 rel-L2. Nothing there
+is implemented, and every number in it came from safetensors headers rather than from a run, but it
+maps the way out. Known future work, not a permanent ceiling.
+
 ## Quickstart
 
 ```bash
 # 0. Dependencies: this needs an Apple Silicon Mac, Python 3.12, and ffmpeg on PATH.
 #    upstream/ is a vendored, unmodified clone this fork patches from the outside — see "The
 #    four patches" above — and is never committed here, so clone it yourself first.
+#    Pin the commit. This fork rebinds `FinalLayer.__class__` and binds
+#    `inspect.signature(MiniMaxH3Pipeline.__call__)` in three places, and docs/DESIGN.md cites
+#    upstream by line number — all of which a later upstream commit can silently invalidate.
+#    fcd9e9b is the only revision this fork has been tested against.
 git clone https://github.com/PipeNetwork/minimax-h3-mlx upstream
+git -C upstream checkout fcd9e9b
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 ./.venv/bin/pip install -e .   # installs the `h3` console script
@@ -79,8 +106,11 @@ python3 -m venv .venv
 h3 doctor --checkpoint ~/models/h3-converted
 
 # 4. Generate. --steps defaults to 31 — the only schedule the baked AdaLN table covers.
+#    --preview-every 5 writes <stem>-preview-stepNN.jpg roughly every 49 minutes at this
+#    geometry, so a five-hour render is watchable instead of opaque. It is off by default.
 h3 generate "a jeweled hummingbird hovering beside a red orchid, cinematic natural light" \
-    --checkpoint ~/models/h3-converted --outdir ~/models/video-out --width 1344 --height 768
+    --checkpoint ~/models/h3-converted --outdir ~/models/video-out --width 1344 --height 768 \
+    --preview-every 5
 ```
 
 `requirements.txt` covers both this fork and the vendored `upstream/` port: upstream's own
@@ -92,17 +122,37 @@ with `ModuleNotFoundError: No module named 'mlx_vlm'`.
 lists finished runs under `--outdir`. Every subcommand accepts `--json` for a machine-readable
 report instead of human-readable text.
 
+Checkpointing is on by default and costs one small file per step. `--checkpoint-dir` moves it,
+`--no-checkpoint` turns it off, and `--restart` ignores whatever is on disk and starts from step 0
+— which is the way out of `checkpoint_mismatch`, a refusal whose file is named after a digest you
+cannot compute by hand.
+
+Two scripts sit outside the CLI and are used for measurement rather than for generating clips:
+`run_bench.py` runs one generation and writes a JSON report of per-phase timings and memory peaks
+next to the clip, and `night_queue.sh` drives a series of them overnight (light geometry first,
+heaviest last) with `memwatch.sh` sampling process RSS and system memory beside each one. Everything
+in "Measured results" below came out of those three.
+
 ## Measured results
 
 All runs at the one schedule the baked AdaLN table supports: 31 grid points (30 forwards), sigma
 shifts 12.0/3.0. Full per-run detail, the scaling curve and the memory profile are in
 [`docs/RESULTS.md`](docs/RESULTS.md).
 
-| Resolution | Clip length | Per step | Total | Peak RSS | Swap |
-|---|---|---|---|---|---|
-| 512x512 | 2.4 s | 46 s | 24 min | 11.0 GB | 0 |
-| 1344x768 (native) | 5 s | 586 s | 299 min | 10.0 GB | 0 |
-| 1344x768 (native) | 10 s | 1881 s | ~15.7 h (extrapolated) | — | — |
+| Resolution | Requested | Frames (at 24 fps) | Per step | Total | Peak RSS | Swap |
+|---|---|---|---|---|---|---|
+| 512x512 | 2.4 s | 73 (3.04 s) | 46 s | 24 min | 11.5 GB | none consumed |
+| 1344x768 (native) | 5 s | 124 (5.17 s) | 586 s | 299 min | 10.1 GB | none consumed |
+| 1344x768 (native) | 10 s | 243 (10.13 s) | 1881 s | ~15.7 h (extrapolated) | not measured | not measured |
+
+"Requested" is the `--duration` asked for; the port snaps it to the latent grid, so the clip that
+comes out is slightly longer. **"none consumed" is not "zero swap".** The machine had 9–12 GB of
+swap in use throughout, from everything else running on it; what the re-parsed logs show is that
+each run *reduced* it, monotonically (12.01 → 9.36 GB over the smoke run, 10.94 → 8.98 GB over five
+hours of the native run) rather than adding to it. That is the stronger claim, and it is the one the data
+supports. The 10-second run's memory was not measured: its monitor attached to the wrong process.
+All of these come from re-parsing the archived CSVs; the originally published figures were
+corrupted by a locale bug in `memwatch.sh`, described in [`docs/RESULTS.md`](docs/RESULTS.md).
 
 The 10-second run was measured over 2 steps and then abandoned deliberately, not crashed — see
 `docs/RESULTS.md` for why scaling is worse than linear (attention is dense; MiniMax has not
