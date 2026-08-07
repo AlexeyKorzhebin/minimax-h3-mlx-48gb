@@ -99,13 +99,30 @@ def pop_checkpoint_kwargs(kwargs: dict) -> dict:
 # -- run identity --------------------------------------------------------------------------------
 
 def _image_digest(image: Any) -> str:
-    """A content digest for one keyframe, whatever form it arrives in."""
+    """A content digest for one keyframe, whatever form it arrives in.
+
+    The ``dtype == object`` guard is not defensive tidying. ``np.asarray`` accepts *anything*: hand
+    it a value it cannot describe numerically and it returns a 0-d object array whose ``tobytes()``
+    is the **pointer address** of the boxed Python object. That hashes cleanly, so a run's identity
+    would silently become a function of heap layout — the same image digesting differently between
+    two processes, and two different images colliding whenever the allocator reused an address.
+    A checkpoint keyed on that resumes the wrong run, or refuses to resume the right one, with no
+    symptom pointing back here. Refuse instead: this codebase's rule everywhere else is that an
+    unsupported input fails loudly rather than producing a plausible-looking wrong answer.
+    """
     if isinstance(image, (str, Path)):
         path = Path(image)
         if path.exists():
             return "file:" + hashlib.blake2b(path.read_bytes(), digest_size=16).hexdigest()
         return "path:" + str(path)
     array = np.asarray(image)
+    if array.dtype == object:
+        raise TypeError(
+            f"cannot digest a keyframe of type {type(image).__name__!r}: numpy describes it as an "
+            "object array, whose bytes are a pointer address, not content — a run identity built "
+            "from that would depend on heap layout. Pass a path, or an array of a numeric dtype "
+            "(e.g. `np.asarray(PIL.Image.open(path))`)."
+        )
     return (f"array:{array.shape}:{array.dtype}:"
             + hashlib.blake2b(array.tobytes(), digest_size=16).hexdigest())
 

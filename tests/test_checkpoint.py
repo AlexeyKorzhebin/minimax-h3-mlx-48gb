@@ -57,6 +57,13 @@ DURATION = 5.0
 STEPS = 9  # grid points; the schedule drives STEPS - 1 = 8 transformer evaluations
 SEED = 20250807
 
+# A real keyframe, not a sentinel. `ToyPipeline._encode_keyframes` never looks at the pixels, so an
+# `object()` used to do — but `_image_digest` does look at it, and for a bare object numpy yields a
+# 0-d object array whose `tobytes()` is the pointer address. Run identity then varied with heap
+# layout, so `test_resume_with_conditioning_rows` passed alone and failed as soon as another test
+# module was collected first. A fixed ndarray digests to the same value in every process.
+KEYFRAME = np.arange(CANVAS * CANVAS * 3, dtype=np.uint8).reshape(CANVAS, CANVAS, 3)
+
 
 class Interrupt(RuntimeError):
     """Raised from the toy transformer to simulate a crash mid-run."""
@@ -320,18 +327,18 @@ def test_resume_after_the_last_step_skips_the_transformer_entirely(tmp_path):
 
 def test_resume_with_conditioning_rows(tmp_path):
     """The keyframe path: conditioning rows are rebuilt, generated rows come from the checkpoint."""
-    reference = run(ToyPipeline(keyframe_rows=4), images=[object()], keyframe_anchors=("first",))
+    reference = run(ToyPipeline(keyframe_rows=4), images=[KEYFRAME], keyframe_anchors=("first",))
 
     path = tmp_path / "fl2va.safetensors"
     try:
         run(ToyPipeline(fail_at=3, keyframe_rows=4), checkpoint_path=path,
-            images=[object()], keyframe_anchors=("first",))
+            images=[KEYFRAME], keyframe_anchors=("first",))
         raise AssertionError("expected a crash")
     except Interrupt:
         pass
 
     resumed = run(ToyPipeline(keyframe_rows=4), checkpoint_path=path,
-                  images=[object()], keyframe_anchors=("first",))
+                  images=[KEYFRAME], keyframe_anchors=("first",))
     assert identical(reference, resumed)
 
 
@@ -346,7 +353,7 @@ def test_conditioning_rows_that_do_not_reproduce_are_caught(tmp_path):
     path = tmp_path / "cond.safetensors"
     try:
         run(ToyPipeline(fail_at=3, keyframe_rows=4), checkpoint_path=path,
-            images=[object()], keyframe_anchors=("first",))
+            images=[KEYFRAME], keyframe_anchors=("first",))
         raise AssertionError("expected a crash")
     except Interrupt:
         pass
@@ -357,7 +364,7 @@ def test_conditioning_rows_that_do_not_reproduce_are_caught(tmp_path):
 
     try:
         run(DriftingKeyframes(keyframe_rows=4), checkpoint_path=path,
-            images=[object()], keyframe_anchors=("first",))
+            images=[KEYFRAME], keyframe_anchors=("first",))
         raise AssertionError("conditioning rows that changed were accepted")
     except CheckpointMismatch as exc:
         assert "conditioning rows" in str(exc)
@@ -469,6 +476,31 @@ def test_tag_keeps_otherwise_identical_runs_apart(tmp_path):
             pass
     files = sorted(p.name for p in tmp_path.glob("h3-*.safetensors"))
     assert len(files) == 2, f"expected one checkpoint per tag, got {files}"
+
+
+def test_a_keyframe_numpy_cannot_describe_is_refused():
+    """An un-digestible keyframe must raise, not hash its own pointer address.
+
+    ``np.asarray(object())`` is a 0-d *object* array; its ``tobytes()`` is the address of the boxed
+    Python object, which differs between processes and repeats whenever the allocator reuses an
+    address. Hashing it produced a run identity that depended on heap layout — checkpoints that
+    refused to resume the run that wrote them, and, in principle, two different images colliding on
+    one file. Both are silent. The refusal is the fix.
+    """
+    from h3_48gb.checkpoint import _image_digest
+
+    try:
+        _image_digest(object())
+        raise AssertionError("an object-dtype keyframe was digested instead of refused")
+    except TypeError as exc:
+        assert "object array" in str(exc)
+
+    # The supported forms still work, and digest by content: same pixels -> same digest, one
+    # changed pixel -> a different one.
+    other = KEYFRAME.copy()
+    other[0, 0, 0] ^= 1
+    assert _image_digest(KEYFRAME) == _image_digest(KEYFRAME.copy())
+    assert _image_digest(KEYFRAME) != _image_digest(other)
 
 
 def test_corrupt_checkpoint_is_quarantined_and_the_run_restarts(tmp_path):
