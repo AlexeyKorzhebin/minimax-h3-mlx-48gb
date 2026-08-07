@@ -253,7 +253,7 @@ than assumed:
   with five collection errors from `upstream/tests/*` importing torch; `norecursedirs` in
   `pyproject.toml` excludes the vendored clone, so the plain command is now the whole suite.
 
-## Keyframe conditioning: still not verified — two blockers down, a third is behind them
+## Keyframe conditioning: verified, and it works
 
 `--image`/`--end-image` (added on `feat/image-to-video`) parse, validate, and bind into checkpoint
 identity — that much is covered by unit tests. Whether a keyframe actually **conditions** the clip,
@@ -263,9 +263,9 @@ checkpoint, because every existing test replaces the pipeline with a fake
 was written to close that gap: generate the same prompt and seed twice at 512x512 — once with a
 keyframe, once without — and compare each clip's first frame against the image by PSNR and
 correlation, with the unconditioned control as the baseline that makes the comparison meaningful.
-It has still never run: each attempt at driving a real keyframe through the real checkpoint has
-reached further than the last and hit a new wall, three times over. All three are recorded here so
-the history is legible instead of overwritten.
+It has now run, twice, and the answer is yes — see **The measurement** below. Getting there took
+three blockers, each hidden behind the one before it, and each costing a 25-minute run to surface.
+All three are recorded here so the history is legible instead of overwritten.
 
 **Blocker 1 — `torchvision`, fixed.** `h3_48gb/image_processor.py`'s `TorchFreeProcessor` (landed on
 this branch, verified against real `transformers` output in `tests/fixtures/processor/`) now stands
@@ -311,8 +311,8 @@ giving a wrong H/W-swapping permutation the exact same output *shape* as the rig
   the real image through `patch_embed` without the shape error — strictly further than blocker 2
   allowed.
 
-**Blocker 3 — open, and out of scope for this fork.** Past the fixed conv layer, `encode()` now
-fails one call later, still inside `upstream/minimax_h3_mlx/text_encoder.py`:
+**Blocker 3 — fixed, as a patch against `upstream/`.** Past the fixed conv layer, `encode()` failed
+one call later, still inside `upstream/minimax_h3_mlx/text_encoder.py`:
 
 ```
 ValueError: [broadcast_shapes] Shapes (1,1026,1) and (1,1008,5120) cannot be broadcast.
@@ -338,14 +338,89 @@ positions, assign, reshape — specifically because a boolean-masked `mx.where` 
 patches, 1008 after the checkpoint's `merge_size=2`) — the mismatch is between the image-token count
 and the full sequence length, not a processor bug.
 
-This is squarely inside `upstream/minimax_h3_mlx/text_encoder.py`, which this fork does not modify.
-Unlike blocker 2, there is no equivalent "fix it in `h3_48gb/`'s own loader" available — this is a
-control-flow bug in the middle of `encode()`, not a weight-layout bug fixable by transposing a
-tensor before handing it to unmodified code. Working around it was not attempted, consistent with
-this task's instruction to report a failure rather than route around it.
+This one is a control-flow bug in the middle of `encode()`, not a weight layout fixable before the
+call, so no loader-side workaround exists. Copying `encode()` into a subclass to change one line
+would have meant carrying 40 lines of upstream logic that then drift apart silently. It is carried
+as `patches/0001-keyframe-masked-scatter.patch` instead — `upstream/` is gitignored, so an edit made
+there would exist on one machine and nowhere else. `README.md`'s setup applies it; `--image` without
+it is refused up front with `upstream_patch_missing`, before any weight loads, rather than crashing
+28.2 GB into a run. Text-only runs never reach the line.
 
-**Result: the conditioned run still cannot complete a single call to `encode()`, so the pair still
-has not run.** No conditioned PSNR, no control PSNR, no correlations. `--image` remains **inoperable**
-end-to-end on this fork for any prompt that mixes a keyframe with actual prompt text — which is
-every real use of the flag. Two of three known blockers on this path are now fixed; the third
-requires a change inside `upstream/`, which is out of this fork's declared scope.
+### Five silent divergences, found by reading against upstream's own reference
+
+With the run finally completing, the remaining defects were the dangerous kind: none of them raise.
+They were found by comparing this fork against `upstream/reference/diffusers/`, which ships in the
+vendored checkout, and each is now fixed and pinned by a test.
+
+| What was wrong | How it showed | Where |
+|---|---|---|
+| Seed 42 taken once per request, not once per keyframe | Two byte-identical keyframes encoded 0.83 apart; the reference makes them identical | `h3_48gb/pipeline.py` |
+| Our lazy VAE construction consumed the RNG stream between `seed(42)` and the draw | A cold and a warm run of the same request differed by 0.87 | `h3_48gb/pipeline.py` |
+| The vision tower saw the raw image, the VAE the canvas version | Vision-token count changes, which shifts the rotary clock of every media row | `h3_48gb/pipeline.py` |
+| The canvas ignored the keyframe's aspect | A portrait photo was stretched into 16:9, since keyframe 0 is stretched, not fitted | `h3_48gb/cli.py` |
+| `preprocessor_config.json` was synthesized by the converter | Values turned out correct — verified against MiniMaxAI/MiniMax-H3 — but only in the one spelling mlx-vlm reads | `convert_sawfwair.py` |
+
+That last one is worth stating plainly, because the obvious "fix" is a regression: the official file
+writes the pixel budget as `size: {shortest_edge, longest_edge}`, a key mlx-vlm's processor does not
+have. Handed the official config verbatim, it silently keeps Qwen2-VL's defaults and caps a keyframe
+at 1,003,520 pixels instead of 16,777,216 — a 4K keyframe would then yield 943 image tokens where
+the released model produces 8160, with no exception raised.
+
+### A canary, so the next blocker costs minutes
+
+`scripts/canary_i2v.py` walks the entire i2v path — encoder, keyframe encode, packing, forward,
+decode — with the denoising loop cut to two forwards. **3 minutes instead of 25, and 8 seconds to
+reach a failure inside the encoder.** It calls the real `__call__` rather than reimplementing the
+loop, because a canary that reimplements the pipeline verifies the copy. Only the loop's timestep
+list is truncated: the schedule and the AdaLN table are built in full, since `check_schedule`
+compares the sigma grid elementwise and refuses anything else. `--no-image` runs the identical path
+without a keyframe, which is what distinguishes "the i2v path is broken" from "the canary is broken".
+
+### The measurement
+
+Both pairs are the same prompt and seed run twice, once with a keyframe and once without. The
+control is the point: without it, a high score would only show that the clip agrees with the prompt.
+
+| Keyframe | Canvas | Conditioned | Control | Conditioned corr | Control corr |
+|---|---|---|---|---|---|
+| Synthetic checkerboard 512x512 | 512x512 | **34.81 dB** | 10.35 dB | **0.999** | 0.041 |
+| Photograph 1536x1024 (3:2) | 576x384 | **26.30 dB** | 9.81 dB | **0.979** | 0.314 |
+
+The two runs are deliberately different tests. In the first, the prompt (*"a red vintage car parked
+on a wet street at night"*) **contradicts** the keyframe, so a first frame that reproduces the
+checkerboard can only come from the conditioning — which is why the control scores 0.041. In the
+second the prompt agrees with the image, which is the harder case: the model would draw a dragon
+over mountains regardless, and the control's 0.314 correlation is exactly that shared composition.
+The conditioned run still clears it by 16.5 dB.
+
+The photograph scores lower than the checkerboard for a reason that is not a defect: a keyframe
+makes a round trip through the VAE, and flat colour blocks survive that far better than scales,
+cloud and foliage.
+
+The second pair also ran on the fixed code and on a 3:2 source — the case that, before the canvas
+fix, would have been stretched into 16:9 without comment.
+
+
+## How this fork compares to another Mac port
+
+A ComfyUI-based port (`Bambushu/minimax-h3-mac`) published per-step figures for the same model on
+comparable geometry, which is a rare chance to check whether this fork leaves performance on the
+table. Measured with the canary on that port's own geometry:
+
+| | this fork | Bambushu port |
+|---|---|---|
+| Canvas / duration | 1344x768, 3 s (73 frames) | 768x1376, 3 s |
+| Packed sequence | 22,434 rows | "about 22k tokens" |
+| Chip | **M4 Pro**, 20 GPU cores | **M5 Pro** |
+| DiT precision | 4-bit | int8 |
+| **Per step** | **262 s** | **131.6 s** |
+
+Both figures are sampling only, excluding load and decode. The 2x gap is a chip generation and a
+quantization choice, not headroom in this code: M5's GPU carries neural accelerators per core, and
+int8 is a different trade than the 4-bit weights this fork uses to fit 48 GB at all. Attention here
+already runs through `mx.fast.scaled_dot_product_attention`, so there is no obvious slow path to
+reclaim.
+
+One thread is worth pulling, though: that port's *whole-clip* time for a 5-second native render is
+116.8 minutes against this fork's 299 — a 2.56x gap, wider than the 1.99x per step. Some of it is
+outside sampling. This fork's video decode at 1344x768 measures 208 s, which is where to look first.
