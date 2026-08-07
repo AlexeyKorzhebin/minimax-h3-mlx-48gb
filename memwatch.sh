@@ -7,6 +7,16 @@
 # memory, swap. Needed to tell "the model fit" apart from "the model fit at the cost
 # of swap" — the second looks the same at a glance, just several times slower.
 
+# LC_ALL=C is load-bearing, not hygiene. `printf` in bash and in awk both honour
+# LC_NUMERIC, so under a comma-decimal locale (ru_RU, de_DE, fr_FR, ...) `%.2f`
+# emits "11,54" and every value lands as two comma-separated fields — a 6-column CSV
+# silently becomes an 11-column one. Worse, bash's own printf then *rejects* bc's
+# dot-decimal output as a malformed number and writes 0,00 for wired and compressed.
+# This corrupted every sample of the overnight series that produced docs/RESULTS.md;
+# those CSVs had to be re-parsed by hand. Pin the numeric locale before the first
+# sample, not after.
+export LC_ALL=C
+
 PID="${1:?pass a PID}"
 OUT="${2:?pass a path for the CSV}"
 INTERVAL="${3:-5}"
