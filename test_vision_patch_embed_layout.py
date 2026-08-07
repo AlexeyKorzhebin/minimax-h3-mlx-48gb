@@ -130,28 +130,6 @@ def test_bias_is_left_alone() -> None:
           "patch_embed.proj.bias" not in VISION_CONV3D_WEIGHTS)
 
 
-def main() -> int:
-    tests = [
-        test_output_shape_is_channels_last,
-        test_real_checkpoint_shape_is_unambiguous_only_by_luck,
-        test_values_land_at_the_permuted_index_not_just_the_right_shape,
-        test_a_plausible_wrong_permutation_is_actually_distinguishable,
-        test_h_equals_w_like_the_real_checkpoint_still_catches_a_wrong_permutation,
-        test_only_the_conv_stem_is_marked_for_transposition,
-        test_bias_is_left_alone,
-        test_the_loader_actually_applies_the_transpose,
-    ]
-    for test in tests:
-        print(f"{test.__name__}:")
-        test()
-    print(f"\n{len(tests)} test groups passed.")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 def test_the_loader_actually_applies_the_transpose() -> None:
     """`to_mlx_conv3d_layout` being correct is worth nothing if the loader stops calling it.
 
@@ -183,3 +161,84 @@ def test_the_loader_actually_applies_the_transpose() -> None:
     packed = mx.zeros((4, 8), dtype=mx.uint32)
     kept = prepare_loaded_tensor("vision", "blocks.0.attn.qkv.weight", packed, mx.bfloat16)
     check("packed quantized storage is never cast", kept.dtype == mx.uint32, f"got {kept.dtype}")
+
+
+def test_the_real_loader_transposes_on_the_way_in() -> None:
+    """The rule being right is worth nothing if `_load_weights` stops calling it.
+
+    `test_the_loader_actually_applies_the_transpose` pins `prepare_loaded_tensor`, but replacing
+    the call site with `loaded[key]` still left every test green — the point of application was
+    unguarded. This drives the real `_load_weights` over a two-tensor synthetic checkpoint, so
+    the call site itself is covered without materializing 28.2 GB.
+    """
+    import tempfile
+    from pathlib import Path as _Path
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from h3_48gb.text_encoder import QuantizedTextEncoder
+
+    class Leaf(nn.Module):
+        def __init__(self, shape):
+            super().__init__()
+            self.weight = mx.zeros(shape)
+
+    class PatchEmbed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = Leaf((4, 2, 16, 16, 3))      # channels-last, as mlx.nn.Conv3d builds it
+
+    class Vision(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patch_embed = PatchEmbed()
+
+    class Language(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = Leaf((8,))
+
+    encoder = object.__new__(QuantizedTextEncoder)
+    encoder._recipe = None
+    encoder.num_layers = 1
+    encoder.language, encoder.vision = Language(), Vision()
+    encoder.quantized_layers = {"language": 0, "vision": 0}
+
+    source = mx.random.normal((4, 3, 2, 16, 16))     # (out, in, D, H, W), as the checkpoint stores it
+    directory = _Path(tempfile.mkdtemp())
+    mx.save_safetensors(str(directory / "model.safetensors"), {
+        "model.visual.patch_embed.proj.weight": source,
+        "model.language_model.norm.weight": mx.zeros((8,)),
+    })
+
+    encoder._load_weights(directory, mx.float32, False)
+    loaded = encoder.vision.patch_embed.proj.weight
+
+    check("the loader stores the conv weight channels-last", loaded.shape == (4, 2, 16, 16, 3),
+          f"got {loaded.shape}")
+    check("with the right permutation, not merely the right shape",
+          float(mx.abs(loaded - source.transpose(0, 2, 3, 4, 1)).max()) == 0.0)
+
+
+def main() -> int:
+    tests = [
+        test_output_shape_is_channels_last,
+        test_real_checkpoint_shape_is_unambiguous_only_by_luck,
+        test_values_land_at_the_permuted_index_not_just_the_right_shape,
+        test_a_plausible_wrong_permutation_is_actually_distinguishable,
+        test_h_equals_w_like_the_real_checkpoint_still_catches_a_wrong_permutation,
+        test_only_the_conv_stem_is_marked_for_transposition,
+        test_bias_is_left_alone,
+        test_the_loader_actually_applies_the_transpose,
+        test_the_real_loader_transposes_on_the_way_in,
+    ]
+    for test in tests:
+        print(f"{test.__name__}:")
+        test()
+    print(f"\n{len(tests)} test groups passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -313,15 +313,27 @@ def load_keyframes(spec: RunSpec) -> tuple[list, tuple[str, ...]]:
     digest no checkpoint had ever been written under and reported `checkpoint_not_found`. Preparing
     once, here, is what keeps the identity and the conditioning describing the same picture.
     """
-    from PIL import Image, ImageOps
-
-    from minimax_h3_mlx.packing import prepare_keyframe_image
+    from PIL import Image, ImageOps, UnidentifiedImageError
 
     images, anchors = [], []
     for path, anchor in ((spec.image, "first"), (spec.end_image, "last")):
         if path is None:
             continue
-        oriented = ImageOps.exif_transpose(Image.open(path).convert("RGB"))
+        # `resolve_canvas` reports the same failure, but only for `--image` and only when it had
+        # to derive the canvas. `--end-image`, and any run with an explicit `--width/--height`,
+        # reach the decoder for the first time right here.
+        try:
+            with Image.open(path) as raw:
+                oriented = ImageOps.exif_transpose(raw.convert("RGB"))
+        except (OSError, UnidentifiedImageError) as exc:
+            flag = "--image" if anchor == "first" else "--end-image"
+            raise CliError("image_unreadable", f"{flag} could not be read: {path} ({exc})",
+                           {"image": str(path)}) from exc
+
+        # Imported here rather than beside `Image`: a text-only run must not pull upstream (and
+        # mlx with it) just because this function was called.
+        from minimax_h3_mlx.packing import prepare_keyframe_image
+
         images.append(prepare_keyframe_image(oriented, spec.height, spec.width,
                                              stretch=not images))
         anchors.append(anchor)

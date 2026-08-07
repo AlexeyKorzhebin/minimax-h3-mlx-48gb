@@ -1071,3 +1071,28 @@ def test_the_patch_detector_can_actually_tell_the_two_apart():
         "comment, which is exactly the case the comment-stripping exists for")
     assert keyframe_scatter_patch_applied(source="def encode(self):\n    return 1\n"), (
         "unrelated source has no marker and must read as patched")
+
+
+def test_an_undecodable_keyframe_is_refused_on_every_path(tmp_path):
+    """`resolve_canvas` only decodes when it has to derive the canvas, and only `--image`.
+
+    With an explicit canvas, or with `--end-image`, `load_keyframes` is where the file is first
+    opened — and it used to let PIL's exception through as an `internal_error` traceback.
+    """
+    from h3_48gb.cli import load_keyframes
+
+    broken = tmp_path / "broken.png"
+    broken.write_bytes(b"this is not a PNG")
+    good = _png(tmp_path / "good.png")
+
+    # Explicit canvas: resolve_canvas returns before ever opening the file.
+    with pytest.raises(CliError) as excinfo:
+        load_keyframes(_spec(tmp_path, image=broken))
+    assert excinfo.value.code == "image_unreadable"
+    assert "--image" in excinfo.value.message
+
+    # --end-image is never seen by resolve_canvas at all.
+    with pytest.raises(CliError) as excinfo:
+        load_keyframes(_spec(tmp_path, image=good, end_image=broken))
+    assert excinfo.value.code == "image_unreadable"
+    assert "--end-image" in excinfo.value.message
