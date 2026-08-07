@@ -26,3 +26,12 @@ h3 = "h3_48gb.cli:main"
 
 [tool.setuptools]
 packages = ["h3_48gb"]
+
+[tool.pytest.ini_options]
+# `upstream/` is a vendored clone whose own tests import torch, which this fork does not install —
+# a bare `pytest` collected them and died with 5 collection errors before running a single test of
+# this fork's. Excluding them makes `pytest -q` the whole suite, root-level files included; those
+# four (test_adaln_indexing, test_lazy_pipeline, test_qkv_permutation, test_text_encoder_quant)
+# cover three of the four core patches and were invisible to the previously documented
+# `pytest tests/ test_preview.py`.
+norecursedirs = ["upstream", ".venv"]
