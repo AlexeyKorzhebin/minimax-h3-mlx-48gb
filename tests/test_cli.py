@@ -406,6 +406,12 @@ def _spec(tmp_path, **overrides):
     return RunSpec(**base)
 
 
+def _png(path, size=(64, 64), colour=(200, 30, 30)):
+    from PIL import Image
+    Image.new("RGB", size, colour).save(path)
+    return path
+
+
 def test_end_image_without_image_is_refused(tmp_path):
     last = tmp_path / "last.png"
     last.write_bytes(b"not really a png, never opened")
@@ -439,12 +445,7 @@ def test_parser_accepts_the_two_flags(tmp_path):
 
 
 def test_one_image_anchors_the_first_frame(tmp_path):
-    from PIL import Image
     from h3_48gb.cli import load_keyframes
-
-    def _png(path, size=(64, 64), colour=(200, 30, 30)):
-        Image.new("RGB", size, colour).save(path)
-        return path
 
     images, anchors = load_keyframes(_spec(tmp_path, image=_png(tmp_path / "a.png")))
     assert anchors == ("first",)
@@ -452,12 +453,7 @@ def test_one_image_anchors_the_first_frame(tmp_path):
 
 
 def test_two_images_anchor_both_ends(tmp_path):
-    from PIL import Image
     from h3_48gb.cli import load_keyframes
-
-    def _png(path, size=(64, 64), colour=(200, 30, 30)):
-        Image.new("RGB", size, colour).save(path)
-        return path
 
     spec = _spec(tmp_path, image=_png(tmp_path / "a.png"),
                  end_image=_png(tmp_path / "b.png", colour=(30, 30, 200)))
@@ -484,6 +480,52 @@ def test_exif_rotation_is_applied(tmp_path):
     Image.new("RGB", (64, 32), (10, 200, 10)).save(path, exif=exif)
     images, _ = load_keyframes(_spec(tmp_path, image=path))
     assert images[0].size == (32, 64), "EXIF orientation 6 rotates 90 degrees"
+
+
+def test_keyframes_passed_to_pipeline_with_no_images(tmp_path):
+    """Verify run_generate wires keyframes to the pipeline call: empty conditioning case."""
+    seen = {}
+
+    def recording_pipe(**kwargs):
+        seen.update(kwargs)
+        return _StubResult()
+
+    spec = _spec(tmp_path)  # No image or end_image
+    run_generate(spec, pipeline_factory=lambda _: recording_pipe,
+                 save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    assert seen["images"] is None, "empty conditioning must pass None, not []"
+    assert seen["keyframe_anchors"] == ()
+
+
+def test_keyframes_passed_to_pipeline_with_one_image(tmp_path):
+    """Verify run_generate wires keyframes to the pipeline call: single-image case."""
+    seen = {}
+
+    def recording_pipe(**kwargs):
+        seen.update(kwargs)
+        return _StubResult()
+
+    spec = _spec(tmp_path, image=_png(tmp_path / "a.png"))
+    run_generate(spec, pipeline_factory=lambda _: recording_pipe,
+                 save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    assert len(seen["images"]) == 1
+    assert seen["keyframe_anchors"] == ("first",)
+
+
+def test_keyframes_passed_to_pipeline_with_two_images(tmp_path):
+    """Verify run_generate wires keyframes to the pipeline call: both-ends case."""
+    seen = {}
+
+    def recording_pipe(**kwargs):
+        seen.update(kwargs)
+        return _StubResult()
+
+    spec = _spec(tmp_path, image=_png(tmp_path / "a.png"),
+                 end_image=_png(tmp_path / "b.png", colour=(30, 30, 200)))
+    run_generate(spec, pipeline_factory=lambda _: recording_pipe,
+                 save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    assert len(seen["images"]) == 2
+    assert seen["keyframe_anchors"] == ("first", "last")
 
 
 def test_checkpoint_dir_overrides_the_default_location(tmp_path):
