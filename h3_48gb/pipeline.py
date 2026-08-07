@@ -262,6 +262,25 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
                    weights_id=weights_fingerprint(dit_path, root / "text_encoder",
                                                   root / "video_vae", root / "audio_vae"))
 
+    # -- keyframe conditioning ------------------------------------------------------------------
+
+    def _encode_keyframes(self, images, height, width):
+        """Materialize the video VAE *before* upstream seeds the keyframe generator.
+
+        Upstream constructs every component in `from_pretrained`, long before
+        `_encode_keyframes` calls `mx.random.seed(42)` and draws the posterior sample. Here the
+        VAE is a proxy, so the first touch of `video_vae._encode_clip` builds it — which happens
+        *after* that seed, and building it draws from MLX's global RNG for some 560 parameter
+        tensors. The sample therefore comes off a different point in the stream, and the
+        conditioning latents depend on whether the VAE happened to be resident already: a cold
+        and a warm run of the same request differed by 0.87.
+
+        Loading here rather than in `__call__` keeps the peak where it was — by this point the
+        28.2 GB text encoder has been released.
+        """
+        self.video_vae.load()
+        return super()._encode_keyframes(images, height, width)
+
     # -- schedule / modulation ------------------------------------------------------------------
 
     def _build_schedules(self, num_inference_steps: int):
@@ -362,6 +381,27 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
 
         if preview_every < 0:
             raise ValueError(f"`preview_every` must be >= 0 (0 disables previews), got {preview_every}.")
+
+        # Hand both consumers the same picture. Upstream passes the raw `images` to the text
+        # encoder (its line 238) and only later prepares them for the VAE (its line 192), so
+        # Qwen3-VL describes the original while the conditioning latent is made from the canvas
+        # version. The reference prepares once, before either consumer
+        # (`reference/diffusers/modular/before_encoder.py:190`). Mismatched, nothing raises: the
+        # number of vision tokens changes, and `packing` derives every media row's rotary clock
+        # from it. Preparing here is safe to repeat — `prepare_keyframe_image` returns an image
+        # that already is the canvas untouched, so upstream's own call becomes a no-op.
+        images = bound.arguments.get("images")
+        if images:
+            from minimax_h3_mlx.packing import prepare_keyframe_image, resolve_canvas_size
+
+            height, width = bound.arguments["height"], bound.arguments["width"]
+            if height is None or width is None:
+                height, width = resolve_canvas_size(*bound.arguments["aspect"])
+            bound.arguments["images"] = [
+                prepare_keyframe_image(image, height, width, stretch=index == 0)
+                for index, image in enumerate(images)
+            ]
+            args, kwargs = bound.args[1:], bound.kwargs
 
         original_dit = self.dit
         if preview_every:

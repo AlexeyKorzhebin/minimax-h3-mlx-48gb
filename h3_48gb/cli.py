@@ -158,8 +158,12 @@ class RunSpec:
 def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     """The flags `generate` and `resume` share — every one of them identifies or locates a run."""
     sub.add_argument("prompt")
-    sub.add_argument("--width", type=int, default=1344)
-    sub.add_argument("--height", type=int, default=768)
+    # `None` rather than 1344x768 so `spec_from_args` can tell "the caller wants the default" from
+    # "the caller asked for exactly 1344x768" — with a keyframe, the default comes from the frame.
+    sub.add_argument("--width", type=int, default=None,
+                     help="canvas width (default: 1344, or derived from --image)")
+    sub.add_argument("--height", type=int, default=None,
+                     help="canvas height (default: 768, or derived from --image)")
     sub.add_argument("--duration", type=float, default=5.0)
     sub.add_argument("--steps", type=int, default=BAKED_GRID_POINTS)
     sub.add_argument("--seed", type=int, default=0)
@@ -212,14 +216,50 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: The canvas a text-only request gets: H3's released 16:9 geometry.
+DEFAULT_CANVAS = (1344, 768)
+
+
+def resolve_canvas(image: Path | None, width: int | None, height: int | None) -> tuple[int, int]:
+    """Decide the canvas, deriving it from the keyframe when the caller did not say.
+
+    A keyframe is the geometry anchor — the reference resolves the canvas from the first frame's
+    aspect (`reference/diffusers/modular/before_encoder.py:173`), and for good reason: the first
+    keyframe is *stretched* onto whatever canvas it lands on, without preserving aspect. Left at
+    the 16:9 default, a portrait photograph is silently squashed into a landscape clip.
+
+    EXIF orientation is applied before the size is read. A camera stores rotation as a tag rather
+    than rotating pixels, so a portrait photo reports itself as landscape — and would pick exactly
+    the canvas this function exists to avoid.
+    """
+    if width is not None and height is not None:
+        return width, height
+    if image is None:
+        default_width, default_height = DEFAULT_CANVAS
+        return width if width is not None else default_width, \
+            height if height is not None else default_height
+
+    from PIL import Image, ImageOps
+
+    from h3_48gb._upstream import ensure_on_path  # noqa: F401  (puts upstream on sys.path)
+    from minimax_h3_mlx.packing import resolve_canvas_size
+
+    with Image.open(image) as raw:
+        source = ImageOps.exif_transpose(raw).size
+    derived_height, derived_width = resolve_canvas_size(*source)
+    return width if width is not None else derived_width, \
+        height if height is not None else derived_height
+
+
 def spec_from_args(args: argparse.Namespace) -> RunSpec:
     """Build a `RunSpec` from parsed args, shared by `generate` and `resume` (identical flags).
 
     Validation lives in `RunSpec.__post_init__`, so it happens here for both subcommands, before
     either one touches a checkpoint path or a weight file.
     """
+    width, height = resolve_canvas(args.image, args.width, args.height)
     return RunSpec(
-        prompt=args.prompt, width=args.width, height=args.height,
+        prompt=args.prompt, width=width, height=height,
         duration=args.duration, steps=args.steps, seed=args.seed,
         checkpoint=args.checkpoint, outdir=args.outdir, tag=args.tag,
         checkpoint_dir=args.checkpoint_dir,

@@ -222,6 +222,91 @@ def test_phase_tracker() -> None:
     check("snapshot reports rss too", snapshot()["rss_gb"] > 0.0)
 
 
+def test_keyframes_load_the_vae_before_upstream_seeds() -> None:
+    """Constructing the VAE draws from the global RNG, so it must not happen after `seed(42)`.
+
+    Upstream builds every component in `from_pretrained`; here the VAE is a proxy whose first
+    real use is *inside* `_encode_keyframes`, after that seed. Building it there moves the stream
+    by some 560 parameter draws, so the posterior sample lands elsewhere and a cold run differs
+    from a warm one — measured at 0.87 before this override existed.
+    """
+    from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    events: list[str] = []
+
+    class ProxyVAE:
+        def load(self):
+            events.append("vae-load")
+
+    class Config:
+        sigma_shift_video = 12.0
+        sigma_shift_audio = 3.0
+
+    pipe = LazyMiniMaxH3Pipeline(object(), object(), ProxyVAE(), object(), Config(), verbose=False)
+
+    original = MiniMaxH3Pipeline._encode_keyframes
+    MiniMaxH3Pipeline._encode_keyframes = lambda self, images, h, w: (
+        events.append("upstream-encode") or "rows")
+    try:
+        returned = pipe._encode_keyframes(["frame"], 512, 512)
+    finally:
+        MiniMaxH3Pipeline._encode_keyframes = original
+
+    check("vae is loaded before upstream runs", events == ["vae-load", "upstream-encode"],
+          f"got {events}")
+    check("upstream's return value is passed through", returned == "rows", f"got {returned!r}")
+
+
+def test_both_consumers_get_the_same_prepared_keyframe() -> None:
+    """The vision tower and the VAE must not be shown different pictures.
+
+    Upstream hands the raw image to the text encoder and prepares it only for the VAE, so
+    Qwen3-VL describes the original while the conditioning latent comes from the canvas version.
+    Nothing raises — but the vision-token count changes, and `packing` derives the rotary clock
+    of every audio and video row from it, so the whole timeline shifts.
+    """
+    import functools
+    import inspect
+
+    from PIL import Image
+
+    from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    class Config:
+        sigma_shift_video = 12.0
+        sigma_shift_audio = 3.0
+
+    pipe = LazyMiniMaxH3Pipeline(object(), object(), object(), object(), Config(), verbose=False)
+    pipe.supported_num_inference_steps = lambda: None
+
+    original = MiniMaxH3Pipeline.__call__
+    seen: dict = {}
+
+    # `functools.wraps` is load-bearing: `__call__` binds against
+    # `inspect.signature(MiniMaxH3Pipeline.__call__)`, so a spy with a bare `*args` signature
+    # would swallow every argument into `args` and the assertion below would pass vacuously.
+    @functools.wraps(original)
+    def spy(self, *args, **kwargs):
+        bound = inspect.signature(original).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        seen["sizes"] = [image.size for image in bound.arguments["images"]]
+        return "ok"
+
+    MiniMaxH3Pipeline.__call__ = spy
+    try:
+        for source, canvas in (((1536, 1024), (576, 384)),   # 3:2 landscape
+                               ((896, 1152), (448, 576)),    # 7:9 portrait
+                               ((576, 384), (576, 384))):    # already the canvas
+            pipe(prompt="x", images=[Image.new("RGB", source)], keyframe_anchors=("first",),
+                 height=canvas[1], width=canvas[0], seed=7)
+            check(f"{source[0]}x{source[1]} reaches upstream as {canvas[0]}x{canvas[1]}",
+                  seen["sizes"] == [canvas], f"got {seen['sizes']}")
+    finally:
+        MiniMaxH3Pipeline.__call__ = original
+
+
 def main() -> int:
     tests = [
         test_config_is_free,
@@ -232,6 +317,8 @@ def main() -> int:
         test_unload_without_eval_would_not_free,
         test_reload_after_unload,
         test_phase_tracker,
+        test_keyframes_load_the_vae_before_upstream_seeds,
+        test_both_consumers_get_the_same_prepared_keyframe,
     ]
     for test in tests:
         print(f"{test.__name__}:")

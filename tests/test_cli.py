@@ -888,3 +888,49 @@ def test_a_keyframe_on_an_unpatched_checkout_is_refused_before_any_weight_loads(
         cli.load_keyframes(_spec(tmp_path, image=image))
     assert excinfo.value.code == "upstream_patch_missing"
     assert "0001-keyframe-masked-scatter.patch" in excinfo.value.message
+
+
+# -- the keyframe is the geometry anchor ---------------------------------------------------------
+
+def _canvas(tmp_path, argv):
+    from h3_48gb.cli import spec_from_args
+    spec = spec_from_args(build_parser().parse_args(
+        argv + ["--outdir", str(tmp_path), "--checkpoint", str(tmp_path)]))
+    return spec.width, spec.height
+
+
+def test_a_text_only_run_still_gets_the_released_canvas(tmp_path):
+    assert _canvas(tmp_path, ["generate", "a cat"]) == (1344, 768)
+
+
+def test_the_canvas_follows_the_keyframe(tmp_path):
+    """The first keyframe is *stretched* onto the canvas, so a wrong canvas deforms the clip.
+
+    The reference resolves geometry from the first frame's aspect; before this, a portrait photo
+    was silently squashed into 16:9.
+    """
+    portrait = tmp_path / "portrait.png"
+    Image.new("RGB", (896, 1152), (200, 40, 40)).save(portrait)
+    width, height = _canvas(tmp_path, ["generate", "a cat", "--image", str(portrait)])
+    assert width < height, f"a portrait keyframe produced a {width}x{height} canvas"
+    assert abs((width / height) - (896 / 1152)) < 0.02
+
+
+def test_an_explicit_canvas_still_wins_over_the_keyframe(tmp_path):
+    portrait = tmp_path / "portrait.png"
+    Image.new("RGB", (896, 1152), (200, 40, 40)).save(portrait)
+    assert _canvas(tmp_path, ["generate", "a cat", "--image", str(portrait),
+                              "--width", "448", "--height", "576"]) == (448, 576)
+
+
+def test_exif_orientation_decides_the_canvas_too(tmp_path):
+    """A camera marks rotation in a tag; unread, a portrait photo reports itself as landscape —
+    and would pick the very canvas that deforms it."""
+    rotated = tmp_path / "rotated.jpg"
+    # 6 = rotate 90° CW on display: stored 1152x896, shown 896x1152.
+    exif = Image.Exif()
+    exif[274] = 6
+    Image.new("RGB", (1152, 896), (200, 40, 40)).save(rotated, exif=exif)
+
+    width, height = _canvas(tmp_path, ["generate", "a cat", "--image", str(rotated)])
+    assert width < height, f"the EXIF tag was ignored: got a {width}x{height} canvas"
