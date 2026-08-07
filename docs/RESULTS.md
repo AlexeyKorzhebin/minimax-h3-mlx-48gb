@@ -428,3 +428,72 @@ reclaim.
 One thread is worth pulling, though: that port's *whole-clip* time for a 5-second native render is
 116.8 minutes against this fork's 299 — a 2.56x gap, wider than the 1.99x per step. Some of it is
 outside sampling. This fork's video decode at 1344x768 measures 208 s, which is where to look first.
+
+
+## TAE previews: 394x faster, and now on by default
+
+An in-flight preview used to cost **49.3 s and 8.46 GB** — not because decoding is expensive, but
+because the real video VAE is causal and chunked: it cannot decode fewer than 7 latent frames, and
+it tiles 28 times at 1344x768 no matter how little is asked of it. Every preview therefore decoded
+about a second of video to show one frame, loading a 5.21 GB module to do it.
+
+`Kijai/MiniMax-H3-TAE` is a 9.8 MB 2D decoder — no temporal state, no chunk floor, no tiling.
+Ported in `h3_48gb/tae.py`. Measured on the same geometry as the figure above:
+
+| | time | peak memory |
+|---|---|---|
+| Real video VAE | 49.3 s | 8.46 GB |
+| **TAE** | **0.125 s** | **2.06 GB** |
+| | **394x faster** | **4.1x smaller** |
+
+Three consecutive calls measured 0.195 s, 0.126 s and 0.125 s — the first carries compilation, so
+0.125 s is the steady-state figure.
+
+### Which normalization, and why one metric was not enough
+
+TAE was trained by a third party, and nothing said whether it expects the latent as the sampler
+holds it (normalized) or after `latents * std + mean`. The spec required this be settled by
+measurement. It was, and **a single metric would have settled it backwards**:
+
+| Compared against | normalized | denormalized |
+|---|---|---|
+| the real VAE's decode (PSNR) | 15.11 dB | **17.50 dB** |
+| the real VAE's decode (correlation) | **0.927** | 0.883 |
+| the real VAE's decode (gradient correlation, i.e. structure) | **0.508** | 0.457 |
+| **the source image (PSNR)** | **21.78 dB** | 16.15 dB |
+| **the source image (correlation)** | **0.939** | 0.847 |
+
+The denormalized form wins on PSNR against the VAE and loses everywhere else: it carries a colour
+shift that happens to land near the reference's tone, which intensity-based PSNR rewards and
+structure does not.
+
+What settles it is the second reference. The latent under test was produced by **encoding a known
+image**, so that image is ground truth independent of the VAE — and against it the normalized form
+scores 21.78 dB / 0.939 where the real VAE itself manages 14.72 / 0.941. The small decoder lands
+closer to the original than the VAE does, because it skips the encoder round trip and the tiling.
+
+`TAE_EXPECTS_NORMALIZED = True`.
+
+Two ports were wrong before this was measured, and neither raised anything:
+
+- the decoder carried TAESD's `+ 0.5` output offset, which belongs to Stable Diffusion's latent
+  space. With it, frames came out at mean brightness 225/255 and scored 5 dB. Without it, 17.5 dB.
+- eight separate mutations — swapping decoder slots, swapping convolutions inside a block, breaking
+  the upsample, dropping either ReLU, dropping the input clamp — passed a suite that only checked
+  shapes. `tests/fixtures/tae/golden_frame.npz` pins the output by value; every one of those
+  mutations now fails.
+
+### Quality, judged by eye
+
+Decoding a real latent: the dragon is fully recognisable — pose, wings, colour, the mountains
+below, the composition. Detail is smeared and textures go waxy. That is exactly the trade a preview
+wants, and it clears the bar TAE's own author set ("beats latent2rgb") by a wide margin.
+
+### Consequence: previews are on by default
+
+`--preview-every` now defaults to 5 and `--preview-decoder` to `tae`. Six previews of a 30-step run
+cost **0.8 s** with TAE against 295.8 s with the real VAE — which is why previews were opt-in
+before and why that no longer makes sense. The real VAE stays one flag away for a preview that must
+be exact; TAE is an approximation for watching progress, never for the delivered clip. Without the
+weights file the default degrades to the VAE-free latent heat map, so it costs nothing to a reader
+who never downloads it.
