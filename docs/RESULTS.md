@@ -247,3 +247,52 @@ than assumed:
   were added in this precision-sweep commit to verify measured values against the actual data. A bare `pytest` used to fail instead,
   with five collection errors from `upstream/tests/*` importing torch; `norecursedirs` in
   `pyproject.toml` excludes the vendored clone, so the plain command is now the whole suite.
+
+## Keyframe conditioning: not verified — blocked before either run could complete
+
+`--image`/`--end-image` (added on `feat/image-to-video`) parse, validate, and bind into checkpoint
+identity — that much is covered by unit tests. Whether a keyframe actually **conditions** the clip,
+as opposed to being silently accepted and ignored, has never been checked against the real
+checkpoint, because every existing test replaces the pipeline with a fake
+(`_default_pipeline_factory` is monkeypatched in `tests/test_cli.py` and friends). `scripts/verify_i2v.py`
+was written to close that gap: generate the same prompt and seed twice at 512x512 — once with a
+keyframe, once without — and compare each clip's first frame against the image by PSNR and
+correlation, with the unconditioned control as the baseline that makes the comparison meaningful.
+
+**The conditioned run cannot start.** It fails deterministically, after the 28.22 GB text encoder
+has loaded but before the first diffusion step, with:
+
+```
+ValueError: /Users/aleksey.korzhebin/models/h3-converted/processor requires `torchvision` to be
+installed. Please install `torchvision` and try again.
+```
+
+The failure is not in this fork's own code. `h3_48gb/checkpoint.py` calls straight through to
+`upstream/minimax_h3_mlx/text_encoder.py`'s `encode()`, which — only when `images` is non-empty —
+touches a lazily-built `self.processor` property that calls `transformers.AutoProcessor.from_pretrained`
+on `~/models/h3-converted/processor`. That directory's `preprocessor_config.json` declares
+`"processor_class": "Qwen3VLProcessor"`, whose composite processor expects an image processor *and*
+a video processor. There is no `video_processor_type` and no `config.json` alongside it, so
+`transformers` (5.14.1, pulled in transitively by `mlx-vlm`) falls through to
+`VIDEO_PROCESSOR_MAPPING`, finds nothing, checks `is_torchvision_available()`, gets `False`, and
+raises. A text-only prompt never touches `self.processor` at all — `tokenizer` is a separate
+property backed by a different directory — which is why 130 passing tests and every run in the
+table above never surfaced this: this fork has never, until this run, actually asked the real
+checkpoint to encode an image.
+
+`torchvision` is not in `pyproject.toml`'s dependencies, and pulling it in means pulling in `torch`
+— the one dependency this fork's own test configuration says it deliberately does not install
+(see the `norecursedirs` comment above). Installing it to force a number out of this run would be
+exactly the kind of workaround this measurement exists to rule out, so it was not done. The
+underlying fix (bypassing `AutoProcessor`'s video-processor auto-resolution for an image-only
+request, or vendoring a minimal image-only processor) lives in `upstream/minimax_h3_mlx/text_encoder.py`,
+which this fork does not modify, and is out of scope for this file's script/docs-only change.
+
+**Result: the pair was never run.** No conditioned PSNR, no control PSNR, no correlations — there
+is nothing to report except that the run could not happen. This is a materially different, and
+more serious, finding than "INCONCLUSIVE (did not beat control by 3 dB)": it means `--image` is
+currently **inoperable** end-to-end on this fork's own declared dependency set, not merely
+unproven. Until `torchvision`/`torch` is either added as a real dependency or the upstream call is
+routed around the video-processor lookup, nobody running `h3 generate --image ...` from a clean
+`pip install` of this fork will get a video conditioned on their keyframe — they will get this
+traceback, every time, after paying for a full text-encoder load first.
