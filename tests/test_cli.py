@@ -440,6 +440,39 @@ def test_negative_preview_interval_is_refused_with_a_code():
         raise AssertionError("a negative preview cadence must be refused, not passed through")
 
 
+def test_the_preview_decoder_defaults_to_the_real_vae(tmp_path):
+    spec = spec_from_args(build_parser().parse_args(
+        ["generate", "a cat", "--outdir", str(tmp_path)]))
+    assert spec.preview_decoder == "vae"
+
+
+def test_the_preview_decoder_can_be_chosen(tmp_path):
+    spec = spec_from_args(build_parser().parse_args(
+        ["generate", "a cat", "--preview-decoder", "tae", "--outdir", str(tmp_path)]))
+    assert spec.preview_decoder == "tae"
+
+
+def test_an_unknown_preview_decoder_is_refused_by_the_parser(tmp_path):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            ["generate", "a cat", "--preview-decoder", "taa", "--outdir", str(tmp_path)])
+
+
+def test_the_preview_decoder_reaches_the_pipeline(tmp_path):
+    """The flag is worthless if it stops at the RunSpec."""
+    seen = {}
+
+    def factory(_checkpoint):
+        def pipe(**kwargs):
+            seen.update(kwargs)
+            return _StubResult()
+        return pipe
+
+    spec = _spec(tmp_path, preview_every=2, preview_decoder="tae")
+    run_generate(spec, pipeline_factory=factory)
+    assert seen.get("preview_decoder") == "tae"
+
+
 # -- keyframe conditioning ---------------------------------------------------------------------
 
 def _spec(tmp_path, **overrides):

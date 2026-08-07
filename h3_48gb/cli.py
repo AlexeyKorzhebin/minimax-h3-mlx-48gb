@@ -108,6 +108,10 @@ class RunSpec:
     preview_every: int = 0
     #: Prefix for `<stem>-preview-stepNN.jpg`; `None` means the run's own output stem.
     preview_stem: Path | None = None
+    #: Which decoder in-flight previews use. The real VAE is correct but costs 49.3 s and 5.21 GB
+    #: per preview; `tae` is an approximation for watching progress and never for the delivered
+    #: clip; `latent` is the VAE-free heat map.
+    preview_decoder: str = "vae"
 
     def __post_init__(self) -> None:
         """Every refusal that depends only on the request, checked once, at construction.
@@ -186,6 +190,8 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
                      help="decode a preview JPEG every N steps; 0 (default) disables previews")
     sub.add_argument("--preview-stem", type=Path, default=None,
                      help="prefix for <stem>-preview-stepNN.jpg (default: the run's output stem)")
+    sub.add_argument("--preview-decoder", choices=("vae", "tae", "latent"), default="vae",
+                     help="decoder for in-flight previews (default: vae, the real one)")
     sub.add_argument("--json", action="store_true", help="emit a machine-readable report")
 
 
@@ -296,6 +302,7 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
         no_checkpoint=getattr(args, "no_checkpoint", False),
         image=args.image, end_image=args.end_image,
         preview_every=args.preview_every, preview_stem=args.preview_stem,
+        preview_decoder=args.preview_decoder,
     )
 
 
@@ -417,6 +424,7 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
                       # `<stem>-preview-stepNN.jpg`, next to where `<stem>.mp4` will land.
                       preview_every=spec.preview_every,
                       preview_stem=str(preview_stem) if spec.preview_every else None,
+                      preview_decoder=spec.preview_decoder,
                       images=images or None, keyframe_anchors=keyframe_anchors)
     except CheckpointMismatch as exc:
         # The message from h3_48gb.checkpoint names the file and the fields that differ, but a

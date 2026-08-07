@@ -61,7 +61,7 @@ import numpy as np
 
 #: `__call__` keyword arguments this module owns, stripped before the upstream signature is bound
 #: — mirrors `h3_48gb.checkpoint.CHECKPOINT_KWARGS` / `pop_checkpoint_kwargs`.
-PREVIEW_KWARGS = ("preview_every", "preview_stem")
+PREVIEW_KWARGS = ("preview_every", "preview_stem", "preview_decoder")
 
 
 def pop_preview_kwargs(kwargs: dict) -> dict:
@@ -363,6 +363,7 @@ class PreviewInterceptor:
         latent_width: int,
         patch_size,
         verbose: bool = True,
+        decoder: str = "vae",
     ):
         self._dit = dit
         self._pipeline = pipeline
@@ -374,6 +375,7 @@ class PreviewInterceptor:
         self._latent_width = latent_width
         self._patch_size = patch_size
         self._verbose = verbose
+        self._decoder = decoder
         self._forward_index = -1
 
     def __getattr__(self, item):
@@ -410,5 +412,6 @@ class PreviewInterceptor:
             emit_preview(
                 self._pipeline, generated, self._num_latent_frames, self._latent_height,
                 self._latent_width, self._patch_size, self._stem, step, verbose=self._verbose,
+                decoder=self._decoder,
             )
         return self._dit(video_latents, audio_latents, *args, **kwargs)
