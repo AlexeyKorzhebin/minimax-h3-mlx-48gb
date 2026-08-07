@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from h3_48gb.cli import (
     CliError,
@@ -394,6 +395,47 @@ def test_negative_preview_interval_is_refused_with_a_code():
         assert exc.code == "preview_interval_negative"
     else:
         raise AssertionError("a negative preview cadence must be refused, not passed through")
+
+
+# -- keyframe conditioning ---------------------------------------------------------------------
+
+def _spec(tmp_path, **overrides):
+    base = dict(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
+                checkpoint=tmp_path, outdir=tmp_path, tag="t")
+    base.update(overrides)
+    return RunSpec(**base)
+
+
+def test_end_image_without_image_is_refused(tmp_path):
+    last = tmp_path / "last.png"
+    last.write_bytes(b"not really a png, never opened")
+    with pytest.raises(CliError) as excinfo:
+        _spec(tmp_path, end_image=last)
+    assert excinfo.value.code == "end_image_without_image"
+
+
+def test_a_missing_keyframe_is_refused_by_path(tmp_path):
+    with pytest.raises(CliError) as excinfo:
+        _spec(tmp_path, image=tmp_path / "absent.png")
+    assert excinfo.value.code == "image_not_found"
+    assert "absent.png" in excinfo.value.message
+
+
+def test_both_keyframes_present_is_accepted(tmp_path):
+    first, last = tmp_path / "a.png", tmp_path / "b.png"
+    first.write_bytes(b"x")
+    last.write_bytes(b"y")
+    spec = _spec(tmp_path, image=first, end_image=last)
+    assert (spec.image, spec.end_image) == (first, last)
+
+
+def test_parser_accepts_the_two_flags(tmp_path):
+    args = build_parser().parse_args(
+        ["generate", "a cat", "--image", str(tmp_path / "a.png"),
+         "--end-image", str(tmp_path / "b.png")]
+    )
+    assert args.image == tmp_path / "a.png"
+    assert args.end_image == tmp_path / "b.png"
 
 
 def test_checkpoint_dir_overrides_the_default_location(tmp_path):

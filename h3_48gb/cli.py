@@ -45,6 +45,8 @@ ERROR_CODES = {
     "checkpoint_mismatch": "a checkpoint exists but was written for a different request or model",
     "checkpoint_corrupt": "a checkpoint exists but could not be read",
     "preview_interval_negative": "--preview-every is negative; 0 disables previews, N > 0 sets a cadence",
+    "end_image_without_image": "--end-image was given without --image; the end frame anchors a run that must also have a start frame",
+    "image_not_found": "a keyframe path does not exist",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 
@@ -93,6 +95,11 @@ class RunSpec:
     #: Disable checkpointing entirely. A crash then costs the whole run, so this exists for
     #: read-only filesystems and throwaway runs, not as an everyday flag.
     no_checkpoint: bool = False
+    #: Conditioning keyframes. One image anchors the clip's first frame; adding `end_image`
+    #: makes it interpolate to a given last frame. The checkpoint was trained on exactly these
+    #: two arrangements, so the flags deliberately cannot express a third.
+    image: Path | None = None
+    end_image: Path | None = None
     #: Decode a preview JPEG every N steps; 0 disables previews.
     preview_every: int = 0
     #: Prefix for `<stem>-preview-stepNN.jpg`; `None` means the run's own output stem.
@@ -128,6 +135,14 @@ class RunSpec:
                 f"--preview-every must be >= 0 (0 disables previews), got {self.preview_every}",
                 {"preview_every": self.preview_every},
             )
+        if self.end_image is not None and self.image is None:
+            raise CliError("end_image_without_image",
+                           "--end-image needs --image: the end frame is the far anchor of a "
+                           "run whose near anchor is the start frame.")
+        for label, path in (("--image", self.image), ("--end-image", self.end_image)):
+            if path is not None and not Path(path).exists():
+                raise CliError("image_not_found", f"{label} does not exist: {path}",
+                               {"flag": label, "path": str(path)})
 
     def output_stem(self) -> Path:
         return self.outdir / f"h3-{self.tag}-{self.width}x{self.height}"
@@ -153,6 +168,10 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     sub.add_argument("--checkpoint-dir", type=Path, default=None,
                      help="where the resume checkpoint lives (default: <outdir>/checkpoints)")
+    sub.add_argument("--image", type=Path, default=None,
+                     help="condition the first frame on this image")
+    sub.add_argument("--end-image", type=Path, default=None,
+                     help="also condition the last frame; requires --image")
     # Previews are the only thing that makes a multi-hour render watchable, but they are not free
     # (~49 s per preview at 1344x768), so the default is off and the cadence is the caller's.
     sub.add_argument("--preview-every", type=int, default=0, metavar="N",
@@ -204,6 +223,7 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
         checkpoint=args.checkpoint, outdir=args.outdir, tag=args.tag,
         checkpoint_dir=args.checkpoint_dir,
         no_checkpoint=getattr(args, "no_checkpoint", False),
+        image=args.image, end_image=args.end_image,
         preview_every=args.preview_every, preview_stem=args.preview_stem,
     )
 
