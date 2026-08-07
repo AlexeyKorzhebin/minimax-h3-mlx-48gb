@@ -375,7 +375,8 @@ def test_cli_and_checkpoint_module_agree_on_the_file_name_with_a_keyframe(tmp_pa
 
 def test_generate_exposes_preview_and_checkpoint_flags():
     args = build_parser().parse_args(["generate", "a cat"])
-    assert args.preview_every == 0, "previews cost ~49 s each; they must be opt-in"
+    assert args.preview_every == 5, "previews cost 0.125 s with TAE; they are on by default"
+    assert args.preview_decoder == "tae", "at 49.3 s each the real VAE cannot be the on-by-default"
     assert args.preview_stem is None and args.checkpoint_dir is None
     assert args.restart is False and args.no_checkpoint is False
 
@@ -415,8 +416,12 @@ def test_preview_stem_can_be_pointed_elsewhere(tmp_path):
     assert seen["preview_stem"] == str(tmp_path / "elsewhere" / "peek")
 
 
-def test_previews_off_by_default_pass_no_stem(tmp_path):
-    """`preview_every=0` must also clear the stem: the pipeline refuses a stem it will never use."""
+def test_previews_disabled_explicitly_pass_no_stem(tmp_path):
+    """`--preview-every 0` must also clear the stem: the pipeline refuses a stem it will never use.
+
+    Previews are on by default now, so this is the explicit opt-*out* path rather than the
+    default one — but the invariant it guards is unchanged.
+    """
     seen = {}
 
     def recording_pipe(**kwargs):
@@ -424,7 +429,8 @@ def test_previews_off_by_default_pass_no_stem(tmp_path):
         return _StubResult()
 
     args = build_parser().parse_args(
-        ["generate", "a cat", "--width", "64", "--height", "64", "--outdir", str(tmp_path)])
+        ["generate", "a cat", "--width", "64", "--height", "64", "--preview-every", "0",
+         "--outdir", str(tmp_path)])
     run_generate(spec_from_args(args), pipeline_factory=lambda _: recording_pipe,
                  save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
     assert seen["preview_every"] == 0 and seen["preview_stem"] is None
@@ -440,9 +446,22 @@ def test_negative_preview_interval_is_refused_with_a_code():
         raise AssertionError("a negative preview cadence must be refused, not passed through")
 
 
-def test_the_preview_decoder_defaults_to_the_real_vae(tmp_path):
+def test_previews_are_on_by_default_and_use_tae(tmp_path):
+    """The two defaults are one decision: previews can only be on because TAE made them cheap.
+
+    At the real VAE's 49.3 s per preview, six of them would add five minutes to every run. At
+    TAE's 0.125 s they add 0.75 s. Turning previews on while leaving `vae` as the decoder would
+    be the worst of both.
+    """
     spec = spec_from_args(build_parser().parse_args(
         ["generate", "a cat", "--outdir", str(tmp_path)]))
+    assert (spec.preview_every, spec.preview_decoder) == (5, "tae")
+
+
+def test_the_real_vae_is_still_reachable_for_an_exact_preview(tmp_path):
+    """TAE is an approximation for watching progress; a preview that must be exact needs the VAE."""
+    spec = spec_from_args(build_parser().parse_args(
+        ["generate", "a cat", "--preview-decoder", "vae", "--outdir", str(tmp_path)]))
     assert spec.preview_decoder == "vae"
 
 
