@@ -40,6 +40,29 @@ from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
 LANGUAGE_PREFIX = "model.language_model."
 VISION_PREFIX = "model.visual."
 
+#: Vision-tower weights stored (in the checkpoint) in a PyTorch conv layout that MLX does not use.
+#: The only convolution in the vision tower is the patch-embedding stem; everything else is
+#: attention and linear layers, which have no axis-order ambiguity to correct.
+VISION_CONV3D_WEIGHTS = frozenset({"patch_embed.proj.weight"})
+
+
+def to_mlx_conv3d_layout(tensor: mx.array) -> mx.array:
+    """PyTorch's ``(out, in, D, H, W)`` conv weight -> MLX's channels-last ``(out, D, H, W, in)``.
+
+    ``mlx.nn.Conv3d`` builds its own weight as ``(out_channels, *kernel_size, in_channels)``
+    (``mlx/nn/layers/convolution.py``), but the converted checkpoint stores
+    ``model.visual.patch_embed.proj.weight`` unmodified from the source PyTorch checkpoint, as
+    ``(out_channels, in_channels, kD, kH, kW)``. Loading it as-is passes every shape check that
+    only counts elements or checks key presence — it is still a 5-D tensor of the right dtype and
+    total size — and fails only inside ``mx.conv3d`` itself, the first time an image is actually
+    encoded, with a channel-count mismatch (see ``docs/RESULTS.md``, "Keyframe conditioning").
+
+    ``upstream/minimax_h3_mlx/load.py`` already applies this exact transpose for the video VAE's
+    conv weights; the vision tower's loader (``upstream/minimax_h3_mlx/text_encoder.py``, not
+    modified by this fork) never got the same treatment, which is why this lives here instead.
+    """
+    return tensor.transpose(0, 2, 3, 4, 1)
+
 
 def split_recipe(quantized_modules: list[str]) -> dict[str, set[str]]:
     """Split the recorded module paths into the two sub-trees `nn.quantize` is called on.
@@ -174,11 +197,14 @@ class QuantizedTextEncoder(MiniMaxH3TextEncoder):
             for bucket, keys in kept.items():
                 for key in keys:
                     tensor = loaded[key]
+                    path = self._wanted(key)[1]
+                    if bucket == "vision" and path in VISION_CONV3D_WEIGHTS:
+                        tensor = to_mlx_conv3d_layout(tensor)
                     # Never `astype` a quantized layer's packed storage: it is bit-packing, not a
                     # number, and the cast would convert it arithmetically.
                     if tensor.dtype not in (mx.uint32, mx.int32, mx.uint8):
                         tensor = tensor.astype(dtype)
-                    buckets_out[bucket][self._wanted(key)[1]] = tensor
+                    buckets_out[bucket][path] = tensor
             if verbose:
                 total = len(buckets_out["language"]) + len(buckets_out["vision"])
                 print(f"  {Path(shard).name}: kept {total}")

@@ -248,7 +248,7 @@ than assumed:
   with five collection errors from `upstream/tests/*` importing torch; `norecursedirs` in
   `pyproject.toml` excludes the vendored clone, so the plain command is now the whole suite.
 
-## Keyframe conditioning: still not verified — the `torchvision` wall is gone, a new one is behind it
+## Keyframe conditioning: still not verified — two blockers down, a third is behind them
 
 `--image`/`--end-image` (added on `feat/image-to-video`) parse, validate, and bind into checkpoint
 identity — that much is covered by unit tests. Whether a keyframe actually **conditions** the clip,
@@ -258,60 +258,89 @@ checkpoint, because every existing test replaces the pipeline with a fake
 was written to close that gap: generate the same prompt and seed twice at 512x512 — once with a
 keyframe, once without — and compare each clip's first frame against the image by PSNR and
 correlation, with the unconditioned control as the baseline that makes the comparison meaningful.
+It has still never run: each attempt at driving a real keyframe through the real checkpoint has
+reached further than the last and hit a new wall, three times over. All three are recorded here so
+the history is legible instead of overwritten.
 
-**The `torchvision` blocker documented below (previous revision of this section) is fixed.**
-`h3_48gb/image_processor.py`'s `TorchFreeProcessor` (landed on this branch, verified against real
-`transformers` output in `tests/fixtures/processor/`) now stands in for the composite
-`AutoProcessor`, so `upstream/minimax_h3_mlx/text_encoder.py`'s `build_request()` no longer touches
-`transformers.AutoProcessor.from_pretrained` at all for an image request. Confirmed directly: a
-conditioned run (`h3 generate ... --image docs/media/native5-frame.jpg`, 2026-08-07) now gets past
-`build_request()` — token ids, tags, `pixel_values` and `image_grid_thw` all come back — and reaches
-`self.vision(...)`, i.e. the Qwen3-VL vision tower's own forward pass. That is strictly further than
-this project has ever gotten with a real keyframe.
+**Blocker 1 — `torchvision`, fixed.** `h3_48gb/image_processor.py`'s `TorchFreeProcessor` (landed on
+this branch, verified against real `transformers` output in `tests/fixtures/processor/`) now stands
+in for the composite `AutoProcessor`, so `upstream/minimax_h3_mlx/text_encoder.py`'s
+`build_request()` no longer touches `transformers.AutoProcessor.from_pretrained` for an image
+request. Confirmed directly: a conditioned run now gets past `build_request()` — token ids, tags,
+`pixel_values` and `image_grid_thw` all come back — and reaches `self.vision(...)`, the Qwen3-VL
+vision tower's own forward pass.
 
-**It then fails inside the vision tower, before the first diffusion step, with:**
+**Blocker 2 — the vision tower's conv weight layout, fixed.** The next failure was inside the vision
+tower itself, in `mx.conv3d`:
 
 ```
 ValueError: [conv] Expect the input channels in the input and weight array to match but got
 shapes - input: (4032,2,16,16,3) and weight: (1152,3,2,16,16)
 ```
 
-Traceback: `h3 generate --image ... → h3_48gb/checkpoint.py:665 encode() →
-upstream/minimax_h3_mlx/text_encoder.py:264 self.vision(...) →
-mlx_vlm/models/qwen3_vl/vision.py PatchEmbed.__call__ → proj (nn.Conv3d) → mx.conv3d`.
+Confirmed by inspecting the checkpoint directly: `~/models/h3-converted/text_encoder/model-00014-of-00014.safetensors`
+stores `model.visual.patch_embed.proj.weight` as `(1152, 3, 2, 16, 16)` —
+`(out_channels, in_channels, kD, kH, kW)`, PyTorch/HF's conv layout — while `mlx.nn.Conv3d` expects
+channels-last, `(out_channels, kD, kH, kW, in_channels)`, exactly as its own constructor builds
+`self.weight` (`mlx/nn/layers/convolution.py`). `upstream/minimax_h3_mlx/load.py`'s VideoVAE loader
+already applies this exact transpose to every 5-D conv weight it loads
+(`tensor.transpose(0, 2, 3, 4, 1)`, with a comment explaining why); `upstream/minimax_h3_mlx/text_encoder.py`'s
+`_load_weights()` never got the same treatment for the vision tower's one convolution (everything
+else in `VisionModel` is attention and linear layers, layout-agnostic). No test or run before this
+task ever asked the real checkpoint to encode an image, so this was never exercised.
 
-**Root cause, confirmed by inspecting the checkpoint directly** (not merely inferred from the
-message): `~/models/h3-converted/text_encoder/model-00014-of-00014.safetensors` stores
-`model.visual.patch_embed.proj.weight` as shape `(1152, 3, 2, 16, 16)` —
-`(out_channels, in_channels, kD, kH, kW)`, PyTorch/HF's conv weight layout. `mlx.nn.Conv3d` expects
-channels-last, `(out_channels, kD, kH, kW, in_channels)` — `(1152, 2, 16, 16, 3)` here — exactly as
-its own constructor builds `self.weight` (`mlx/nn/layers/convolution.py`). `np.moveaxis(w, 1, -1)`
-turns one into the other, confirmed by shape (not run against the model). This exact transpose
-already exists in this codebase, just not here: `upstream/minimax_h3_mlx/load.py`'s VideoVAE loader
-applies `tensor.transpose(0, 2, 3, 4, 1)` to every 5-D conv weight it loads, with a comment
-explaining why. `upstream/minimax_h3_mlx/text_encoder.py`'s `_load_weights()` has no such step — it
-assigns every `model.visual.*` tensor into the vision module with a plain `.astype(dtype)` and
-nothing else. The vision tower's only convolution is this one patch-embedding layer (the rest of
-`VisionModel` is attention and linear layers, which are not shape-sensitive to weight layout the
-same way), so this single missing transpose is enough to make **every** image-conditioned request
-fail, independent of image content, size, or which keyframe is used.
+Fixed in this fork's own loader — `h3_48gb/text_encoder.py`'s `QuantizedTextEncoder._load_weights()`
+now applies `to_mlx_conv3d_layout()` to `patch_embed.proj.weight` specifically, at load time, before
+the module tree is used. `upstream/` is unmodified. Two things were added, deliberately, because a
+wrong permutation here would not raise — it would silently scramble the patch embedding and show up
+only as a worse clip, hours later, with the real checkpoint's kernel shape `(D, H, W) = (2, 16, 16)`
+giving a wrong H/W-swapping permutation the exact same output *shape* as the right one:
 
-This is why no test caught it: as this section previously noted, no test and no run before this one
-ever asked the real checkpoint to encode an image, so `self.vision.parameters()` were loaded and
-compared against expected keys (shape-checked for *presence*, not layout) but never actually run
-through `mx.conv3d` until this task's Step 1 smoke run did exactly that.
+- `test_vision_patch_embed_layout.py` pins values, not just shape — an independently-computed
+  per-index reference (plain nested loops, not another call to `.transpose()`), plus a case with
+  `H == W` matching the real checkpoint's collision, and a case that confirms a plausible wrong
+  permutation is actually distinguishable from the right one (otherwise the value check would prove
+  nothing). 7 tests, all passing.
+- Verified against the real checkpoint directly (not via the CLI, to avoid paying for a full
+  diffusion run to check one loader): `QuantizedTextEncoder(...).encode(prompt, [image])` now runs
+  the real image through `patch_embed` without the shape error — strictly further than blocker 2
+  allowed.
 
-**This bug is in `upstream/minimax_h3_mlx/text_encoder.py`, which this fork does not modify**, and
-fixing a checkpoint-loading bug is out of scope for a script/docs-only task. Working around it (e.g.
-patching the loaded weight in `h3_48gb/checkpoint.py`, the way `TorchFreeProcessor` was patched in
-one layer up) was not attempted here, consistent with this task's instruction to report a failure
-rather than route around it.
+**Blocker 3 — open, and out of scope for this fork.** Past the fixed conv layer, `encode()` now
+fails one call later, still inside `upstream/minimax_h3_mlx/text_encoder.py`:
 
-**Result: the conditioned run still cannot complete a single diffusion step, so the pair was still
-never run.** No conditioned PSNR, no control PSNR, no correlations. This is a different blocker than
-the one previously recorded, one level deeper in the same code path: fixing the processor
-(`torchvision`) got the keyframe past text tokenization and into the vision tower; a second,
-independent bug — a missing weight transpose specific to the one 5-D conv weight the vision tower
-has — stops it immediately after. `--image` remains **inoperable** end-to-end on this fork; nobody
-running `h3 generate --image ...` today gets a conditioned video, they get this traceback, after
-paying for a full text-encoder load first.
+```
+ValueError: [broadcast_shapes] Shapes (1,1026,1) and (1,1008,5120) cannot be broadcast.
+```
+
+at
+
+```python
+inputs_embeds = mx.where(image_mask[..., None], hidden.astype(inputs_embeds.dtype)[None], inputs_embeds)
+```
+
+`image_mask` has one entry per token in the *full* prompt (label + `<|vision_start|>` + one
+`<|image_pad|>` per merged patch + `<|vision_end|>` + the text prompt itself — 1026 tokens for this
+run); `hidden`, the vision tower's output, has one row per merged image patch only (1008 for this
+run's 1344x768 keyframe). `mx.where` requires elementwise-broadcastable shapes, so this only works
+when the whole prompt is image tokens with nothing else — never true in practice, since there is
+always at least a `<Picture i>:` label and the prompt text. Confirmed this is a real bug rather than
+a misuse: `mlx_vlm`'s own `qwen3_vl.py` (`.venv/lib/python3.12/site-packages/mlx_vlm/models/qwen3_vl/qwen3_vl.py`)
+implements the equivalent operation correctly, as `masked_scatter()` — flatten, index the True
+positions, assign, reshape — specifically because a boolean-masked `mx.where` can't do this.
+`upstream/minimax_h3_mlx/text_encoder.py`'s hand-rolled version does not use it. The processor's own
+`pixel_values`/`image_grid_thw` were checked directly and are internally consistent (4032 raw
+patches, 1008 after the checkpoint's `merge_size=2`) — the mismatch is between the image-token count
+and the full sequence length, not a processor bug.
+
+This is squarely inside `upstream/minimax_h3_mlx/text_encoder.py`, which this fork does not modify.
+Unlike blocker 2, there is no equivalent "fix it in `h3_48gb/`'s own loader" available — this is a
+control-flow bug in the middle of `encode()`, not a weight-layout bug fixable by transposing a
+tensor before handing it to unmodified code. Working around it was not attempted, consistent with
+this task's instruction to report a failure rather than route around it.
+
+**Result: the conditioned run still cannot complete a single call to `encode()`, so the pair still
+has not run.** No conditioned PSNR, no control PSNR, no correlations. `--image` remains **inoperable**
+end-to-end on this fork for any prompt that mixes a keyframe with actual prompt text — which is
+every real use of the flag. Two of three known blockers on this path are now fixed; the third
+requires a change inside `upstream/`, which is out of this fork's declared scope.
