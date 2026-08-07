@@ -44,6 +44,7 @@ ERROR_CODES = {
     "checkpoint_not_found": "`resume` was asked for, but no checkpoint matches this run's identity",
     "checkpoint_mismatch": "a checkpoint exists but was written for a different request or model",
     "checkpoint_corrupt": "a checkpoint exists but could not be read",
+    "preview_interval_negative": "--preview-every is negative; 0 disables previews, N > 0 sets a cadence",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 
@@ -85,6 +86,80 @@ class RunSpec:
     checkpoint: Path
     outdir: Path
     tag: str
+    #: Where the *resume* checkpoint lives (`checkpoint` above is the converted **weights**).
+    #: `None` means the default, `<outdir>/checkpoints`, resolved by `resume_checkpoint_dir`
+    #: rather than here so the dataclass keeps a static default and stays comparable.
+    checkpoint_dir: Path | None = None
+    #: Disable checkpointing entirely. A crash then costs the whole run, so this exists for
+    #: read-only filesystems and throwaway runs, not as an everyday flag.
+    no_checkpoint: bool = False
+    #: Decode a preview JPEG every N steps; 0 disables previews.
+    preview_every: int = 0
+    #: Prefix for `<stem>-preview-stepNN.jpg`; `None` means the run's own output stem.
+    preview_stem: Path | None = None
+
+    def __post_init__(self) -> None:
+        """Every refusal that depends only on the request, checked once, at construction.
+
+        `--steps` used to be validated inside `run_generate`, which `resume` reaches only *after*
+        computing the checkpoint path — so `h3 resume "..." --steps 20` reported
+        `checkpoint_not_found` and blamed a missing file for what is a schedule error. Validating
+        here instead means no `RunSpec` can exist that names a run this build cannot serve, and
+        both subcommands report the same first cause in the same order.
+        """
+        for name in ("width", "height"):
+            value = getattr(self, name)
+            if value % 32:
+                raise CliError(
+                    "geometry_not_multiple_of_32",
+                    f"--{name} must be a multiple of 32, got {value}",
+                    {name: value},
+                )
+        if self.steps != BAKED_GRID_POINTS:
+            raise CliError(
+                "schedule_not_baked",
+                f"steps must be {BAKED_GRID_POINTS} (baked AdaLN schedule covers only that value), "
+                f"got {self.steps}",
+                {"steps": self.steps, "required": BAKED_GRID_POINTS},
+            )
+        if self.preview_every < 0:
+            raise CliError(
+                "preview_interval_negative",
+                f"--preview-every must be >= 0 (0 disables previews), got {self.preview_every}",
+                {"preview_every": self.preview_every},
+            )
+
+    def output_stem(self) -> Path:
+        return self.outdir / f"h3-{self.tag}-{self.width}x{self.height}"
+
+    def resume_checkpoint_dir(self) -> Path | None:
+        """Directory the resume checkpoint belongs in, or `None` when checkpointing is off."""
+        if self.no_checkpoint:
+            return None
+        return self.checkpoint_dir if self.checkpoint_dir is not None else self.outdir / "checkpoints"
+
+
+def _add_run_flags(sub: argparse.ArgumentParser) -> None:
+    """The flags `generate` and `resume` share — every one of them identifies or locates a run."""
+    sub.add_argument("prompt")
+    sub.add_argument("--width", type=int, default=1344)
+    sub.add_argument("--height", type=int, default=768)
+    sub.add_argument("--duration", type=float, default=5.0)
+    sub.add_argument("--steps", type=int, default=BAKED_GRID_POINTS)
+    sub.add_argument("--seed", type=int, default=0)
+    sub.add_argument("--tag", default="run")
+    sub.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT,
+                     help="the converted model weights (see `h3 doctor`)")
+    sub.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
+    sub.add_argument("--checkpoint-dir", type=Path, default=None,
+                     help="where the resume checkpoint lives (default: <outdir>/checkpoints)")
+    # Previews are the only thing that makes a multi-hour render watchable, but they are not free
+    # (~49 s per preview at 1344x768), so the default is off and the cadence is the caller's.
+    sub.add_argument("--preview-every", type=int, default=0, metavar="N",
+                     help="decode a preview JPEG every N steps; 0 (default) disables previews")
+    sub.add_argument("--preview-stem", type=Path, default=None,
+                     help="prefix for <stem>-preview-stepNN.jpg (default: the run's output stem)")
+    sub.add_argument("--json", action="store_true", help="emit a machine-readable report")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -92,28 +167,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     gen = sub.add_parser("generate", help="generate a clip")
-    gen.add_argument("prompt")
-    gen.add_argument("--width", type=int, default=1344)
-    gen.add_argument("--height", type=int, default=768)
-    gen.add_argument("--duration", type=float, default=5.0)
-    gen.add_argument("--steps", type=int, default=BAKED_GRID_POINTS)
-    gen.add_argument("--seed", type=int, default=0)
-    gen.add_argument("--tag", default="run")
-    gen.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
-    gen.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
-    gen.add_argument("--json", action="store_true", help="emit a machine-readable report")
+    _add_run_flags(gen)
+    # `--restart` is the recovery path for this CLI's own hardest refusal, not a convenience.
+    # `checkpoint_mismatch` is a hard stop, and without this flag the only way out is to find and
+    # delete a file named `h3-{digest}.safetensors` whose digest the user has no way to compute.
+    gen.add_argument("--restart", action="store_true",
+                     help="ignore any existing checkpoint and start from step 0 "
+                          "(the way out of a checkpoint_mismatch refusal)")
+    gen.add_argument("--no-checkpoint", action="store_true",
+                     help="do not write a resume checkpoint at all; a crash then costs the whole run")
 
     res = sub.add_parser("resume", help="continue an interrupted run")
-    res.add_argument("prompt")
-    res.add_argument("--width", type=int, default=1344)
-    res.add_argument("--height", type=int, default=768)
-    res.add_argument("--duration", type=float, default=5.0)
-    res.add_argument("--steps", type=int, default=BAKED_GRID_POINTS)
-    res.add_argument("--seed", type=int, default=0)
-    res.add_argument("--tag", default="run")
-    res.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
-    res.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
-    res.add_argument("--json", action="store_true", help="emit a machine-readable report")
+    # No `--restart` / `--no-checkpoint` here on purpose: `resume` exists precisely to *assert*
+    # that a run is being continued, so a flag that turns it into a fresh start would defeat it.
+    _add_run_flags(res)
 
     lst = sub.add_parser("list", help="list finished runs")
     lst.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
@@ -126,19 +193,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def spec_from_args(args: argparse.Namespace) -> RunSpec:
-    """Build a `RunSpec` from parsed args, shared by `generate` and `resume` (identical flags)."""
-    for name in ("width", "height"):
-        value = getattr(args, name)
-        if value % 32:
-            raise CliError(
-                "geometry_not_multiple_of_32",
-                f"--{name} must be a multiple of 32, got {value}",
-                {name: value},
-            )
+    """Build a `RunSpec` from parsed args, shared by `generate` and `resume` (identical flags).
+
+    Validation lives in `RunSpec.__post_init__`, so it happens here for both subcommands, before
+    either one touches a checkpoint path or a weight file.
+    """
     return RunSpec(
         prompt=args.prompt, width=args.width, height=args.height,
         duration=args.duration, steps=args.steps, seed=args.seed,
         checkpoint=args.checkpoint, outdir=args.outdir, tag=args.tag,
+        checkpoint_dir=args.checkpoint_dir,
+        no_checkpoint=getattr(args, "no_checkpoint", False),
+        preview_every=args.preview_every, preview_stem=args.preview_stem,
     )
 
 
@@ -152,10 +218,12 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
                          the real LazyMiniMaxH3Pipeline.
         save_mp4_fn: Optional override for mp4 saving (for testing).
         save_wav_fn: Optional override for wav saving (for testing).
-        resume: Whether to continue from a matching checkpoint under `<outdir>/checkpoints` if
-            one exists, and to write one as the run progresses. On by default, following
+        resume: Whether to continue from a matching checkpoint under `spec.resume_checkpoint_dir()`
+            if one exists, and to write one as the run progresses. On by default, following
             `run_bench.py`: at 586 s/step there is no run short enough for a lost run not to
-            matter, and the write costs one small file per step.
+            matter, and the write costs one small file per step. `h3 generate --restart` passes
+            `False` here — that is the supported way out of a `checkpoint_mismatch` refusal, which
+            otherwise leaves a user hunting for a file named after a digest they cannot compute.
         verbose: Whether the pipeline (component loads, phase timings) and the checkpoint writer
             (`ResumableRun`'s "checkpoint: N/M steps" line) print progress to stdout. `main`
             passes `not as_json` here: under `--json`, stdout has exactly one contract — one JSON
@@ -166,18 +234,12 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
     Returns:
         A dict with the generation report (also written to <stem>.json)
     """
-    # Validate the schedule early, before touching any weights.
-    if spec.steps != BAKED_GRID_POINTS:
-        raise CliError(
-            "schedule_not_baked",
-            f"steps must be {BAKED_GRID_POINTS} (baked AdaLN schedule covers only that value), "
-            f"got {spec.steps}",
-            {"steps": spec.steps, "required": BAKED_GRID_POINTS},
-        )
-
+    # The schedule and the geometry are already refused by `RunSpec.__post_init__`, so nothing
+    # here can start a multi-hour run on a request this build cannot serve.
     spec.outdir.mkdir(parents=True, exist_ok=True)
-    stem = spec.outdir / f"h3-{spec.tag}-{spec.width}x{spec.height}"
-    checkpoint_dir = spec.outdir / "checkpoints"
+    stem = spec.output_stem()
+    checkpoint_dir = spec.resume_checkpoint_dir()
+    preview_stem = spec.preview_stem if spec.preview_stem is not None else stem
 
     # The single-argument `factory(checkpoint)` contract is kept even for the default factory, so
     # every existing `pipeline_factory=lambda _: ...` test stub keeps working unchanged; `verbose`
@@ -201,10 +263,18 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
         result = pipe(prompt=spec.prompt, duration_seconds=spec.duration,
                       num_inference_steps=spec.steps, seed=spec.seed,
                       height=spec.height, width=spec.width,
-                      checkpoint_dir=str(checkpoint_dir), resume=resume, verbose=verbose,
-                      tag=spec.tag)
+                      checkpoint_dir=str(checkpoint_dir) if checkpoint_dir else None,
+                      resume=resume, verbose=verbose, tag=spec.tag,
+                      # `<stem>-preview-stepNN.jpg`, next to where `<stem>.mp4` will land.
+                      preview_every=spec.preview_every,
+                      preview_stem=str(preview_stem) if spec.preview_every else None)
     except CheckpointMismatch as exc:
-        raise CliError("checkpoint_mismatch", str(exc)) from exc
+        # The message from h3_48gb.checkpoint names the file and the fields that differ, but a
+        # user reading it has no way to construct that filename themselves — so name the flag.
+        raise CliError(
+            "checkpoint_mismatch",
+            f"{exc}\n  Or re-run with --restart to ignore it and start from step 0.",
+        ) from exc
     except CheckpointCorrupt as exc:
         raise CliError("checkpoint_corrupt", str(exc)) from exc
     elapsed = time.perf_counter() - started
@@ -306,14 +376,15 @@ def run_resume(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wav_
     factory = pipeline_factory or (lambda checkpoint: _default_pipeline_factory(checkpoint, verbose=verbose))
     pipe = factory(spec.checkpoint)
 
-    checkpoint_dir = spec.outdir / "checkpoints"
+    checkpoint_dir = spec.resume_checkpoint_dir()
     path = _checkpoint_path_for(spec, pipe, checkpoint_dir)
     if not path.exists():
         raise CliError(
             "checkpoint_not_found",
             f"no checkpoint to resume at {path}; nothing matches this prompt/geometry/seed/tag "
-            "under --outdir. Run 'generate' first, or check that --checkpoint, --outdir, --tag, "
-            "--width, --height, --duration, --steps and --seed all match the interrupted run.",
+            "under --checkpoint-dir. Run 'generate' first, or check that --checkpoint, --outdir, "
+            "--checkpoint-dir, --tag, --width, --height, --duration, --steps and --seed all match "
+            "the interrupted run.",
             {"checkpoint_dir": str(checkpoint_dir)},
         )
     # The pipe is already loaded (needed above for the identity check) — reuse it rather than
@@ -360,7 +431,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "generate":
             # Under --json, stdout has exactly one contract: one JSON document. verbose=False
             # keeps the pipeline and the checkpoint writer from printing progress onto it.
-            report = run_generate(spec_from_args(args), verbose=not as_json)
+            report = run_generate(spec_from_args(args), resume=not args.restart,
+                                  verbose=not as_json)
             ok = True
             human = f"done in {report['generate_seconds'] / 60:.1f} min -> {report['video']}"
         elif args.command == "resume":

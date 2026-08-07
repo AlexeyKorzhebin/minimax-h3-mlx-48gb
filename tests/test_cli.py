@@ -110,17 +110,39 @@ def test_truncated_raw_file_is_not_left_at_destination(tmp_path):
 
 
 def test_rejects_mismatched_schedule(tmp_path):
-    """Multi-hour run must not begin on a schedule that cannot finish."""
-    spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=30, seed=0,
-                   checkpoint=tmp_path, outdir=tmp_path, tag="t")
+    """Multi-hour run must not begin on a schedule that cannot finish.
+
+    The refusal is in `RunSpec.__post_init__`, so it fires the moment the request exists — before
+    a pipeline is loaded, before a checkpoint path is computed. See
+    `test_resume_blames_the_schedule_not_a_missing_checkpoint` for why that ordering matters.
+    """
     try:
-        run_generate(spec, pipeline_factory=lambda _: (lambda **kw: _StubResult()))
+        RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=30, seed=0,
+                checkpoint=tmp_path, outdir=tmp_path, tag="t")
     except CliError as exc:
         assert "31" in str(exc), "error message must name the baked value"
         assert "AdaLN" in str(exc), "error message must explain why"
         assert exc.code == "schedule_not_baked"
     else:
         raise AssertionError("mismatched schedule must be rejected before compute")
+
+
+def test_resume_blames_the_schedule_not_a_missing_checkpoint(tmp_path):
+    """`resume --steps 20` is a schedule error, and used to be reported as `checkpoint_not_found`.
+
+    `run_resume` computes the checkpoint path (and loads a pipeline to do it) before `run_generate`
+    ever sees the spec, so a `--steps` check living in `run_generate` was unreachable: the user was
+    told a checkpoint was missing, which was true but not the reason their command failed.
+    """
+    args = build_parser().parse_args(
+        ["resume", "a cat", "--steps", "20", "--outdir", str(tmp_path)])
+    try:
+        spec_from_args(args)
+    except CliError as exc:
+        assert exc.code == "schedule_not_baked", (
+            f"a bad --steps must be reported as a schedule error, got {exc.code!r}")
+    else:
+        raise AssertionError("--steps 20 must be refused")
 
 
 def test_import_h3_48gb_does_not_load_mlx_core():
@@ -269,6 +291,182 @@ def test_resume_checkpoint_path_changes_with_the_tag_alone():
     pipe = _StubPipe()
     assert (_checkpoint_path_for(spec_a, pipe, Path("/ckpt"))
             != _checkpoint_path_for(spec_b, pipe, Path("/ckpt")))
+
+
+def test_cli_and_checkpoint_module_agree_on_the_file_name():
+    """`_checkpoint_path_for` (cli.py) must resolve to exactly what `_resolve_store`
+    (checkpoint.py) resolves to for the same run.
+
+    They are two independent reimplementations of one naming rule: the CLI needs the path *before*
+    calling the pipeline (to tell "nothing to resume" from "resuming"), while the pipeline computes
+    it internally on the way in. Every other resume test writes and reads through
+    `_checkpoint_path_for` alone, so it would keep passing in perfect agreement with itself while
+    `h3 resume` reported `checkpoint_not_found` for a checkpoint that was sitting right there.
+    Bind them once, here.
+    """
+    import inspect
+
+    from h3_48gb.checkpoint import _resolve_store, request_identity
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    spec = RunSpec(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=3,
+                   checkpoint=Path("/x"), outdir=Path("/x"), tag="t")
+    pipe = _StubPipe()
+    ckpt_dir = Path("/ckpt")
+
+    # The pipeline's own path: bind upstream's signature exactly as `CheckpointingPipeline.__call__`
+    # does, from the same arguments `run_generate` passes to `pipe(...)`.
+    bound = inspect.signature(MiniMaxH3Pipeline.__call__).bind(
+        pipe, prompt=spec.prompt, duration_seconds=spec.duration,
+        num_inference_steps=spec.steps, seed=spec.seed, height=spec.height, width=spec.width,
+    )
+    bound.apply_defaults()
+    identity = request_identity(dict(bound.arguments), pipe.checkpoint_identity_extra(), tag=spec.tag)
+    from_pipeline = _resolve_store({"checkpoint_dir": str(ckpt_dir)}, identity).path
+
+    assert _checkpoint_path_for(spec, pipe, ckpt_dir) == from_pipeline
+
+
+# -- preview and checkpoint control ---------------------------------------------------------------
+
+def test_generate_exposes_preview_and_checkpoint_flags():
+    args = build_parser().parse_args(["generate", "a cat"])
+    assert args.preview_every == 0, "previews cost ~49 s each; they must be opt-in"
+    assert args.preview_stem is None and args.checkpoint_dir is None
+    assert args.restart is False and args.no_checkpoint is False
+
+
+def test_preview_arguments_reach_the_pipeline(tmp_path):
+    """`--preview-every`/`--preview-stem` were parsed by nothing and reached nothing before this."""
+    seen = {}
+
+    def recording_pipe(**kwargs):
+        seen.update(kwargs)
+        return _StubResult()
+
+    args = build_parser().parse_args(
+        ["generate", "a cat", "--width", "64", "--height", "64", "--tag", "t",
+         "--outdir", str(tmp_path), "--preview-every", "3"])
+    run_generate(spec_from_args(args), pipeline_factory=lambda _: recording_pipe,
+                 save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+
+    assert seen["preview_every"] == 3
+    # Defaults to the run's own output stem, so previews land beside the mp4 they preview.
+    assert seen["preview_stem"] == str(tmp_path / "h3-t-64x64")
+
+
+def test_preview_stem_can_be_pointed_elsewhere(tmp_path):
+    seen = {}
+
+    def recording_pipe(**kwargs):
+        seen.update(kwargs)
+        return _StubResult()
+
+    args = build_parser().parse_args(
+        ["generate", "a cat", "--width", "64", "--height", "64", "--tag", "t",
+         "--outdir", str(tmp_path), "--preview-every", "2",
+         "--preview-stem", str(tmp_path / "elsewhere" / "peek")])
+    run_generate(spec_from_args(args), pipeline_factory=lambda _: recording_pipe,
+                 save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    assert seen["preview_stem"] == str(tmp_path / "elsewhere" / "peek")
+
+
+def test_previews_off_by_default_pass_no_stem(tmp_path):
+    """`preview_every=0` must also clear the stem: the pipeline refuses a stem it will never use."""
+    seen = {}
+
+    def recording_pipe(**kwargs):
+        seen.update(kwargs)
+        return _StubResult()
+
+    args = build_parser().parse_args(
+        ["generate", "a cat", "--width", "64", "--height", "64", "--outdir", str(tmp_path)])
+    run_generate(spec_from_args(args), pipeline_factory=lambda _: recording_pipe,
+                 save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    assert seen["preview_every"] == 0 and seen["preview_stem"] is None
+
+
+def test_negative_preview_interval_is_refused_with_a_code():
+    args = build_parser().parse_args(["generate", "a cat", "--preview-every", "-1"])
+    try:
+        spec_from_args(args)
+    except CliError as exc:
+        assert exc.code == "preview_interval_negative"
+    else:
+        raise AssertionError("a negative preview cadence must be refused, not passed through")
+
+
+def test_checkpoint_dir_overrides_the_default_location(tmp_path):
+    seen = {}
+
+    def recording_pipe(**kwargs):
+        seen.update(kwargs)
+        return _StubResult()
+
+    elsewhere = tmp_path / "ckpts"
+    args = build_parser().parse_args(
+        ["generate", "a cat", "--width", "64", "--height", "64", "--outdir", str(tmp_path),
+         "--checkpoint-dir", str(elsewhere)])
+    spec = spec_from_args(args)
+    assert spec.resume_checkpoint_dir() == elsewhere
+    run_generate(spec, pipeline_factory=lambda _: recording_pipe,
+                 save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    assert seen["checkpoint_dir"] == str(elsewhere)
+
+
+def test_no_checkpoint_turns_checkpointing_off(tmp_path):
+    """`checkpoint_dir=None` is what makes `CheckpointingPipeline.__call__` fall through
+    to upstream's untouched `__call__` — so this must be `None`, not a directory that is unused."""
+    seen = {}
+
+    def recording_pipe(**kwargs):
+        seen.update(kwargs)
+        return _StubResult()
+
+    args = build_parser().parse_args(
+        ["generate", "a cat", "--width", "64", "--height", "64", "--outdir", str(tmp_path),
+         "--no-checkpoint"])
+    spec = spec_from_args(args)
+    assert spec.resume_checkpoint_dir() is None
+    run_generate(spec, pipeline_factory=lambda _: recording_pipe,
+                 save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    assert seen["checkpoint_dir"] is None
+
+
+def test_restart_disables_resumption(tmp_path):
+    """The escape hatch from `checkpoint_mismatch`: keep checkpointing, ignore what is on disk."""
+    seen = {}
+
+    def recording_pipe(**kwargs):
+        seen.update(kwargs)
+        return _StubResult()
+
+    import unittest.mock as mock
+
+    argv = ["generate", "a cat", "--width", "64", "--height", "64", "--outdir", str(tmp_path),
+            "--restart"]
+    with mock.patch("h3_48gb.cli._default_pipeline_factory", return_value=recording_pipe), \
+         mock.patch("h3_48gb.cli.run_generate", wraps=run_generate) as spy:
+        main(argv + ["--json"])
+    assert spy.call_args.kwargs["resume"] is False
+
+
+def test_restart_is_named_in_the_mismatch_refusal(tmp_path):
+    """A user who hits `checkpoint_mismatch` cannot compute the `h3-{digest}.safetensors` filename
+    they are being told about, so the message has to name the flag that recovers from it."""
+    from h3_48gb.checkpoint import CheckpointMismatch
+
+    def exploding_pipe(**kwargs):
+        raise CheckpointMismatch("belongs to a different run")
+
+    spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
+                   checkpoint=tmp_path, outdir=tmp_path, tag="t")
+    try:
+        run_generate(spec, pipeline_factory=lambda _: exploding_pipe)
+    except CliError as exc:
+        assert "--restart" in str(exc)
+    else:
+        raise AssertionError("expected a checkpoint_mismatch refusal")
 
 
 # -- machine-readable failures ------------------------------------------------------------------
