@@ -497,3 +497,40 @@ before and why that no longer makes sense. The real VAE stays one flag away for 
 be exact; TAE is an approximation for watching progress, never for the delivered clip. Without the
 weights file the default degrades to the VAE-free latent heat map, so it costs nothing to a reader
 who never downloads it.
+
+
+## What `--image` + `--end-image` interpolates, and what it does not
+
+Both keyframes anchor their ends firmly. Measured on two 896x1152 stills at a 448x576 canvas,
+with the cross-comparison as the control:
+
+| | first frame | last frame |
+|---|---|---|
+| against the **first** keyframe | **27.55 dB / 0.987** | 13.41 dB / 0.660 |
+| against the **last** keyframe | 13.63 dB / 0.661 | **27.78 dB / 0.986** |
+
+A 14 dB gap each way, so neither anchor is being ignored. What happens *between* them depends
+entirely on whether the two frames belong to the same scene.
+
+**Unrelated stills produce a cut, not a transition.** Two different scenes — figures in snow, and
+an empty courtyard — gave a clip that holds the first still for half its length, jumps in a single
+frame, and holds the second:
+
+```
+0.9 s -> 1.0 s   mean pixel change  0.1     (held)
+1.0 s -> 1.1 s   mean pixel change 32.6     (the cut)
+1.1 s -> 1.2 s   mean pixel change  0.2     (held)
+```
+
+**Frames from one scene interpolate properly.** The control: first and last frame of an existing
+dragon clip, same scene with the camera pushed in, correlation 0.554 between them. The result
+changes continuously — 21 to 43 mean pixel change between every pair of sampled frames, no jump
+anywhere — and the midpoint is a coherent frame of that scene at an intermediate camera distance.
+
+So `fl2va` interpolates the ends of one shot. It does not cut between shots, and asking it to
+leaves it nothing to interpolate through: there is no continuous path from two people standing in
+snow to a courtyard without them. Pick keyframes that are the start and end of a single move.
+
+Worth noting how this was nearly missed: the end-point measurements above are excellent, and they
+were all that was checked at first. The clip between them was never looked at until a viewer
+watched it. Metrics aimed at the ends cannot see the middle.
