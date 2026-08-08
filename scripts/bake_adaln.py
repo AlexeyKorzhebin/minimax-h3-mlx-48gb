@@ -112,11 +112,18 @@ def bake(steps: int, dest: Path, shift_video: float = 12.0, shift_audio: float =
                 mods[s, clock * 3:(clock + 1) * 3] = value.reshape(3, width)
         out[f"blocks.{block}.modulations"] = mx.array(mods).astype(mx.bfloat16)
 
+    # `final_modulations` is [steps, 3, 2 * hidden]: the 3 is the timestep variant
+    # (video, audio, conditioning) — the same axis as the blocks' — and each variant carries the
+    # FULL shift+scale vector. An earlier version evaluated only the video clock and then sliced
+    # its 10752 outputs into three chunks of 3584, which is neither the right clock for variants
+    # 1 and 2 nor the right width for any of them. It did not raise: the output layer indexes this
+    # table by timestep alone, so a wrong-width row is silently read as a valid one.
     w = np.array(curve["final_layer.adaln_proj.linear.weight"].astype(mx.float32))
     b = np.array(curve["final_layer.adaln_proj.linear.bias"].astype(mx.float32))
-    width = w.shape[0] // 3
     final = np.stack([
-        (w @ rows[s, 0] + b + lora_delta("final_layer.adaln_proj.linear", 0, s)).reshape(3, width)
+        np.stack([w @ rows[s, clock] + b
+                  + lora_delta("final_layer.adaln_proj.linear", clock, s)
+                  for clock in range(3)])
         for s in range(forwards)])
     out["final_modulations"] = mx.array(final).astype(mx.bfloat16)
 
