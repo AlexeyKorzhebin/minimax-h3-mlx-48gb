@@ -33,7 +33,32 @@ import numpy as np
 
 DEFAULT_CHECKPOINT = Path.home() / "models/h3-converted"
 DEFAULT_OUTDIR = Path.home() / "models/video-out"
+#: The grid this fork shipped against. Only a fallback now: the real number is read from the
+#: checkpoint's own AdaLN cache, since a cache can be baked for any grid (see `baked_grid_points`).
 BAKED_GRID_POINTS = 31
+
+
+def baked_grid_points(checkpoint: Path) -> int | None:
+    """How many grid points this checkpoint's AdaLN cache covers, or None if it has none.
+
+    Reads the safetensors header directly — a few hundred bytes, no MLX — because this runs inside
+    `RunSpec.__post_init__`, which must stay importable without pulling in the MLX stack.
+
+    The count used to be the hardcoded 31 that mere.run's cache happened to carry. That was wrong
+    the moment a cache could be baked for another grid: the refusal quoted a number belonging to a
+    different checkpoint than the one the user passed.
+    """
+    import json
+    import struct
+
+    path = Path(checkpoint) / "transformer/adaln_cache.safetensors"
+    try:
+        with open(path, "rb") as fh:
+            length = struct.unpack("<Q", fh.read(8))[0]
+            header = json.loads(fh.read(length))
+        return int(header["video_sigmas"]["shape"][0])
+    except (OSError, ValueError, KeyError):
+        return None
 
 #: Every machine-readable failure code this CLI can raise under `--json`. The whole contract an
 #: MCP wrapper needs is here: match on `error.code`, never on `error.message` — the sentence can
@@ -131,12 +156,15 @@ class RunSpec:
                     f"--{name} must be a multiple of 32, got {value}",
                     {name: value},
                 )
-        if self.steps != BAKED_GRID_POINTS:
+        # A checkpoint whose cache cannot be read falls back to the shipped grid, so a missing or
+        # corrupt cache still refuses early rather than 28 GB into a run.
+        required = baked_grid_points(self.checkpoint) or BAKED_GRID_POINTS
+        if self.steps != required:
             raise CliError(
                 "schedule_not_baked",
-                f"steps must be {BAKED_GRID_POINTS} (baked AdaLN schedule covers only that value), "
+                f"steps must be {required} (this checkpoint's AdaLN cache covers only that grid), "
                 f"got {self.steps}",
-                {"steps": self.steps, "required": BAKED_GRID_POINTS},
+                {"steps": self.steps, "required": required},
             )
         if self.preview_every < 0:
             raise CliError(

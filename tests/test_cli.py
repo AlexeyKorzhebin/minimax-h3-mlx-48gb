@@ -1148,3 +1148,39 @@ def test_an_undecodable_keyframe_is_refused_on_every_path(tmp_path):
         load_keyframes(_spec(tmp_path, image=good, end_image=broken))
     assert excinfo.value.code == "image_unreadable"
     assert "--end-image" in excinfo.value.message
+
+
+def test_the_step_count_is_read_from_the_checkpoint_not_hardcoded(tmp_path):
+    """A cache can be baked for any grid, so 31 is this checkpoint's number, not the code's.
+
+    The hardcoded constant refused `--steps 8` against a checkpoint whose cache covers exactly 8,
+    quoting a number belonging to a different checkpoint.
+    """
+    import json
+    import struct
+
+    from h3_48gb.cli import baked_grid_points
+
+    def fake_checkpoint(points: int) -> Path:
+        root = tmp_path / f"ckpt{points}" / "transformer"
+        root.mkdir(parents=True, exist_ok=True)   # called twice for the same grid below
+        header = {"video_sigmas": {"dtype": "F32", "shape": [points], "data_offsets": [0, 4 * points]}}
+        packed = json.dumps(header).encode()
+        with open(root / "adaln_cache.safetensors", "wb") as fh:
+            fh.write(struct.pack("<Q", len(packed)))
+            fh.write(packed)
+            fh.write(b"\x00" * 4 * points)
+        return root.parent
+
+    assert baked_grid_points(fake_checkpoint(8)) == 8
+    assert baked_grid_points(fake_checkpoint(31)) == 31
+    assert baked_grid_points(tmp_path / "nothing-here") is None, "a missing cache must not raise"
+
+    spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=8, seed=0,
+                   checkpoint=fake_checkpoint(8), outdir=tmp_path, tag="t")
+    assert spec.steps == 8, "a checkpoint baked for 8 must accept --steps 8"
+
+    with pytest.raises(CliError) as excinfo:
+        RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
+                checkpoint=fake_checkpoint(8), outdir=tmp_path, tag="t")
+    assert excinfo.value.detail["required"] == 8, "the refusal must quote this checkpoint's grid"
