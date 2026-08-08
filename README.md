@@ -45,8 +45,10 @@ here, and any of those three couplings can break silently on one.
 1. **`h3_48gb/adaln.py`** — the mere.run build ships no AdaLN modulation path at all (106 tensors
    absent: 50x `blocks.N.adaln_proj`, `final_layer.adaln_proj`, `time_embedder`); it precomputed
    them into `adaln_cache.safetensors` for one fixed schedule, so this module serves the port's
-   `ModulationCache` interface from that file instead of computing it. Consequence: **only
-   `num_inference_steps=31`** (31 grid points, 30 forwards, sigma shifts 12.0/3.0) is servable —
+   `ModulationCache` interface from that file instead of computing it. That used to mean **only
+   `num_inference_steps=31`** was servable; `scripts/bake_adaln.py` lifts it by reconstructing the
+   table for any grid from the pruned base's folded time curve (87 MB — see "Few-step sampling"
+   below). The shipped checkpoint still carries the 31-point table, so without that step —
    any other schedule fails loudly, not silently.
 2. **`h3_48gb/text_encoder.py`** — the port builds plain `nn.Linear` layers, so mere.run's 8-bit
    conditioner would load as packed uint32 into bf16 slots and silently produce garbage; this
@@ -142,6 +144,27 @@ curl -L -o ~/models/tae/taeh3.safetensors \
 `--preview-decoder` chooses between `tae` (default), `vae` (the real one — exact, and 394x
 slower) and `latent` (the heat map, no weights at all). TAE is an approximation for watching
 progress; the delivered clip is always decoded by the real VAE.
+
+### Few-step sampling
+
+A 5-second clip at native resolution takes 299 minutes at the shipped 31-step schedule. Eight
+steps take a quarter of that at the same quality — **6.6 min against 24.5 at 512x512** — once the
+AdaLN table is baked for the shorter grid:
+
+```bash
+# 87 MB of folded time curve, pulled out of Comfy-Org's 40 GB pruned base by byte range.
+# scripts/fetch_adaln_curve.py does this; the table itself is then local and reusable.
+./.venv/bin/python scripts/bake_adaln.py 8 --out ~/models/turbo/adaln_cache_8.safetensors
+
+# Point a checkpoint at it (symlink everything else) and run with --steps 8.
+h3 generate "..." --checkpoint ~/models/h3-8step --steps 8
+```
+
+Eight steps reproduce the reference frame closely but carry **43% of its motion** — the clip looks
+right and moves wrong. The [Turbo LoRA](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora)
+restores it, applied at **strength 0.45** rather than the 1.0 its author recommends for a bf16
+base (at 1.0 it overshoots to 213% and over-sharpens). Numbers and method in
+[`docs/RESULTS.md`](docs/RESULTS.md).
 
 `requirements.txt` covers both this fork and the vendored `upstream/` port: upstream's own
 `requirements.txt` omits `mlx-vlm` (imported unconditionally by its text encoder) and `pillow`

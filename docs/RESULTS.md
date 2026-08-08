@@ -534,3 +534,72 @@ snow to a courtyard without them. Pick keyframes that are the start and end of a
 Worth noting how this was nearly missed: the end-point measurements above are excellent, and they
 were all that was checked at first. The clip between them was never looked at until a viewer
 watched it. Metrics aimed at the ends cannot see the middle.
+
+
+## Few-step sampling: 3.7x faster at the same quality
+
+This fork shipped with a hard limit of `--steps 31`, recorded everywhere in these docs as
+immovable: mere.run's build dropped the modulation path (`time_embedder` + 50 `adaln_proj`, 13B
+parameters) and shipped a table baked for that one grid. Nothing else could be evaluated.
+
+Comfy-Org's pruned base keeps that path folded into an `adaln_t_table` of 1025x8 plus per-block
+projections — **87.3 MB, pulled out of a 40 GB file by byte range**. `scripts/bake_adaln.py`
+reconstructs the table for any grid from it, reproducing the shipped 31-step table to
+4.3e-3..7.7e-3 relative error, two orders below the 0.165 the Q4 weights already carry.
+
+| | wall clock | motion vs reference | frame sharpness |
+|---|---|---|---|
+| 31 steps (reference) | 24.5 min | 100% | 2.23 |
+| 8 steps, no LoRA | **6.6 min** | 43% | 2.11 |
+| 8 steps + Turbo LoRA at 0.45 | **6.6 min** | **117%** | 3.10 |
+| 8 steps + Turbo LoRA at 1.0 | 6.6 min | 213% | 5.61 |
+
+512x512, 2.4 s, same prompt and seed throughout.
+
+### What the Turbo LoRA actually does here
+
+Not what its name suggests. It was fetched to enable 4-step sampling; the step count turned out to
+be free once the table could be baked. What the LoRA supplies is **motion**.
+
+Eight steps alone reproduce the reference frame almost exactly — sharpness 2.11 against 2.23,
+correlation 0.950 — while carrying **43% of its motion**. The clip looks right and moves wrong: a
+dragon that beats its wings half as hard. Frame-level metrics cannot see this at all, and did not:
+it was caught by a human watching the clip.
+
+The LoRA restores it, and overshoots at the strength its author recommends. At 1.0 the motion runs
+to 213% of the reference and the frame goes visibly over-sharp. At **0.45** the motion lands at
+117% and the frame correlation is 0.952 — marginally better than without it. The author's 1.0 is
+tuned for a bf16 base and his own sampler; ours is 4-bit with a different one.
+
+`h3_48gb/turbo.py` applies the backbone half at run time (a merge into 4-bit storage would
+requantize the update away) and `scripts/bake_adaln.py` folds the AdaLN half into the table, where
+merging is legitimate because the table is bf16.
+
+### The bug that cost a day, and how it hid
+
+An earlier version of the bake evaluated the output layer on the video clock only, then sliced its
+10752 outputs into three chunks of 3584. The correct shape is three timestep variants each
+carrying the full shift+scale vector.
+
+**It raised nothing.** The output layer indexes that table by timestep alone, so a wrong-width row
+reads as a valid one. Every few-step experiment that day ran on a corrupted final modulation, and
+the results led to a confident, wrong conclusion — that the Turbo LoRA was fundamentally
+incompatible with a 4-bit base, backed by eight separate ruled-out hypotheses.
+
+Two things found it, neither of them the eight hypotheses:
+
+- an independent review (codex) read the baker and spotted the shape error directly;
+- the verification that should have caught it compared the bake against the shipped table **block
+  by block** and never checked `final_modulations` at all. Checking part of a structure and
+  concluding the whole is sound is the recurring failure in this project.
+
+`tests/test_bake_adaln.py` now compares every tensor the loader reads, names `final_modulations`
+explicitly among the parametrized cases, and asserts the three variants are not slices of one
+evaluation. All three assertions go red against the old code.
+
+### Still open
+
+Strength 0.45 was tuned on one clip — a smooth flying shot. Scenes with fast or complex motion
+(a gallop, two dancers) and near-static ones may want different values; the LoRA's author warns
+specifically about smearing under fast motion at low step counts. A three-scene sweep against
+31-step references is running. Until it lands, 0.45 is one data point, not a recommendation.
