@@ -104,10 +104,15 @@ class RunSpec:
     #: two arrangements, so the flags deliberately cannot express a third.
     image: Path | None = None
     end_image: Path | None = None
-    #: Decode a preview JPEG every N steps; 0 disables previews.
-    preview_every: int = 0
+    #: Decode a preview JPEG every N steps; 0 disables previews. On by default since TAE made a
+    #: preview cost 0.125 s instead of 49.3 — see `preview_decoder`.
+    preview_every: int = 5
     #: Prefix for `<stem>-preview-stepNN.jpg`; `None` means the run's own output stem.
     preview_stem: Path | None = None
+    #: Which decoder in-flight previews use. The real VAE is correct but costs 49.3 s and 5.21 GB
+    #: per preview; `tae` is an approximation for watching progress and never for the delivered
+    #: clip; `latent` is the VAE-free heat map.
+    preview_decoder: str = "tae"
 
     def __post_init__(self) -> None:
         """Every refusal that depends only on the request, checked once, at construction.
@@ -180,12 +185,20 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
                      help="condition the first frame on this image")
     sub.add_argument("--end-image", type=Path, default=None,
                      help="also condition the last frame; requires --image")
-    # Previews are the only thing that makes a multi-hour render watchable, but they are not free
-    # (~49 s per preview at 1344x768), so the default is off and the cadence is the caller's.
-    sub.add_argument("--preview-every", type=int, default=0, metavar="N",
-                     help="decode a preview JPEG every N steps; 0 (default) disables previews")
+    # Previews are what makes a multi-hour render watchable, and they stopped being expensive: TAE
+    # decodes one in 0.125 s against the real VAE's 49.3 s at 1344x768, so six previews now cost
+    # 0.75 s of a run measured in hours. Off by default made sense at 49 s a frame; it does not now.
+    sub.add_argument("--preview-every", type=int, default=5, metavar="N",
+                     help="decode a preview JPEG every N steps (default: 5); 0 disables previews")
     sub.add_argument("--preview-stem", type=Path, default=None,
                      help="prefix for <stem>-preview-stepNN.jpg (default: the run's output stem)")
+    # `tae` by default *because* previews are on by default: at 49.3 s each the real VAE would add
+    # five minutes to every run. `vae` remains available for a preview that must be exact — TAE is
+    # an approximation for watching progress, never for the delivered clip. Without the weights,
+    # `tae` falls back to the VAE-free latent heat map, so this default costs nothing to a reader
+    # who never downloads them.
+    sub.add_argument("--preview-decoder", choices=("vae", "tae", "latent"), default="tae",
+                     help="decoder for in-flight previews (default: tae, ~400x faster than vae)")
     sub.add_argument("--json", action="store_true", help="emit a machine-readable report")
 
 
@@ -296,6 +309,7 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
         no_checkpoint=getattr(args, "no_checkpoint", False),
         image=args.image, end_image=args.end_image,
         preview_every=args.preview_every, preview_stem=args.preview_stem,
+        preview_decoder=args.preview_decoder,
     )
 
 
@@ -417,6 +431,7 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
                       # `<stem>-preview-stepNN.jpg`, next to where `<stem>.mp4` will land.
                       preview_every=spec.preview_every,
                       preview_stem=str(preview_stem) if spec.preview_every else None,
+                      preview_decoder=spec.preview_decoder,
                       images=images or None, keyframe_anchors=keyframe_anchors)
     except CheckpointMismatch as exc:
         # The message from h3_48gb.checkpoint names the file and the fields that differ, but a

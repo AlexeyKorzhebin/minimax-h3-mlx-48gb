@@ -61,7 +61,7 @@ import numpy as np
 
 #: `__call__` keyword arguments this module owns, stripped before the upstream signature is bound
 #: — mirrors `h3_48gb.checkpoint.CHECKPOINT_KWARGS` / `pop_checkpoint_kwargs`.
-PREVIEW_KWARGS = ("preview_every", "preview_stem")
+PREVIEW_KWARGS = ("preview_every", "preview_stem", "preview_decoder")
 
 
 def pop_preview_kwargs(kwargs: dict) -> dict:
@@ -140,6 +140,55 @@ def render_preview_frame(
     return (frames[frame_idx] * 255.0 + 0.5).astype(np.uint8)
 
 
+def render_tae_frame(
+    pipeline,
+    generated_video_rows: mx.array,
+    num_latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    patch_size,
+) -> np.ndarray:
+    """Decode one frame with TAE: no VAE, no chunk floor, no tiling.
+
+    Unlike `render_preview_frame` this can decode *any* single frame, because TAE has no temporal
+    state — so it takes the middle one, where the clip is most representative, rather than being
+    forced to start at frame 0 by the real VAE's causal padding.
+
+    The whole point of TAE is that it never *needs* the video VAE, so its absence, breakage, or
+    (today) its normalization constants being irrelevant must never stop this from decoding. The
+    optional read of `pipeline.video_vae.config` below is wrapped in its own narrow try/except for
+    exactly that reason: `LazyComponent.config` is documented to resolve without a load, so reading
+    it is normally free and worth doing for forward-compatibility with a future
+    `TAE_EXPECTS_NORMALIZED = False` — but if `pipeline.video_vae` cannot be reached at all (no
+    such attribute, or the attribute itself raises), this falls back to the identity transform
+    (mean 0, std 1) and the checkpoint's own `LATENT_CHANNELS`, and still decodes with TAE.
+    `hasattr` is deliberately not used here: it only swallows `AttributeError`, not an arbitrary
+    exception a `video_vae` accessor might raise, so it would not provide the fallback this
+    function needs.
+    """
+    from minimax_h3_mlx.packing import unpatchify_video_tokens
+
+    from h3_48gb.tae import LATENT_CHANNELS, TAE_WEIGHTS_PATH, decode_latent_frame, load_tae
+
+    latent_channels = LATENT_CHANNELS
+    mean = mx.zeros((1, latent_channels, 1, 1, 1))
+    std = mx.ones((1, latent_channels, 1, 1, 1))
+    try:
+        cfg = pipeline.video_vae.config
+        latent_channels = cfg.latent_channels
+        mean = mx.array(np.array(cfg.latents_mean, np.float32)).reshape(1, -1, 1, 1, 1)
+        std = mx.array(np.array(cfg.latents_std, np.float32)).reshape(1, -1, 1, 1, 1)
+    except Exception:  # noqa: BLE001 - the config is a bonus, not a requirement; see docstring
+        pass
+
+    latents = unpatchify_video_tokens(
+        generated_video_rows, num_latent_frames, latent_height, latent_width,
+        latent_channels, patch_size,
+    )
+    decoder = load_tae(TAE_WEIGHTS_PATH)
+    return decode_latent_frame(decoder, latents, mean, std, num_latent_frames // 2)
+
+
 def render_latent_fallback(
     generated_video_rows: mx.array,
     num_latent_frames: int,
@@ -190,6 +239,19 @@ def preview_path(stem: str | Path, step: int) -> Path:
     return Path(f"{stem}-preview-step{step:02d}.jpg")
 
 
+#: The valid `decoder` choices, for the error message on an unknown one. The renderer for each is
+#: looked up as a plain global inside `emit_preview` itself, not built into a dict here — tests
+#: monkeypatch `render_preview_frame` / `render_tae_frame` as module attributes (same pattern
+#: `h3_48gb.checkpoint` and others use), and a dict built once at import time would keep pointing
+#: at the original functions instead of picking up the patch.
+DECODER_NAMES = ("vae", "tae", "latent")
+
+
+#: Decoders whose "weights absent" notice has already been printed this process. Absent weights
+#: are a supported configuration, not an incident, so the notice is worth exactly one line.
+_ANNOUNCED: dict[str, bool] = {}
+
+
 def emit_preview(
     pipeline,
     generated_video_rows: mx.array,
@@ -200,39 +262,82 @@ def emit_preview(
     stem: str | Path,
     step: int,
     verbose: bool = True,
+    decoder: str = "vae",
 ) -> bool:
-    """Best-effort preview: try the real VAE decode, fall back to the latent heatmap, never raise.
+    """Best-effort preview: try the requested decoder, fall back to the latent heatmap, never raise.
 
     This is the only function in this module the diffusion loop should call directly. A generation
     can run for over fifteen hours; nothing a preview does is worth risking that run, so every
     failure here is caught, logged to stderr (regardless of ``verbose`` — a silently-broken preview
     defeats its own purpose), and swallowed.
 
+    ``decoder`` selects the renderer: ``"vae"`` (default, unchanged) is the real video VAE;
+    ``"tae"`` is the 9.8 MB approximation with no chunk floor; ``"latent"`` skips straight to the
+    VAE-free heat map that is otherwise only the fallback. Whichever primary decoder is chosen, on
+    failure this falls back to the latent heat map before giving up — and when the primary choice
+    is ``"tae"`` or ``"latent"``, that fallback also never touches ``pipeline.video_vae``, so a
+    TAE preview never costs anything from the real VAE even when it is failing.
+
+    The one deliberate exception to "never raises": an unknown ``decoder`` name raises
+    ``ValueError`` immediately, before any work starts. That is a programming error caught ahead of
+    time, not the mid-run decode failure this function exists to swallow — silently decoding with
+    something other than what the caller asked for would be worse than raising.
+
     Returns:
         Whether a JPEG was written (for tests and for the caller's own logging; the diffusion loop
         does not need to act on this).
     """
+    if decoder not in DECODER_NAMES:
+        raise ValueError(
+            f"Unknown preview decoder {decoder!r}; expected one of {sorted(DECODER_NAMES)}."
+        )
+
     dest = preview_path(stem, step)
     started = time.perf_counter()
-    try:
-        frame = render_preview_frame(
-            pipeline, generated_video_rows, num_latent_frames, latent_height, latent_width,
-            patch_size,
-        )
-        save_preview_jpeg(frame, dest)
-        if verbose:
-            print(f"  [preview] step {step}: wrote {dest.name} "
-                  f"({time.perf_counter() - started:.1f}s)", flush=True)
-        return True
-    except Exception as exc:  # noqa: BLE001 - a broken preview must never break the real run
-        print(f"  [preview] step {step}: VAE decode failed ({exc!r}), "
-              f"falling back to a latent-only preview", file=sys.stderr, flush=True)
+    # Looked up as plain globals, not through a dict built once at import time, so that tests
+    # monkeypatching `render_preview_frame` / `render_tae_frame` as module attributes still take
+    # effect (see the note on `DECODER_NAMES`). "latent" has no primary renderer of its own — it
+    # *is* the fallback below, so it goes straight there.
+    render = {"vae": render_preview_frame, "tae": render_tae_frame, "latent": None}[decoder]
+    if render is not None:
+        try:
+            frame = render(
+                pipeline, generated_video_rows, num_latent_frames, latent_height, latent_width,
+                patch_size,
+            )
+            save_preview_jpeg(frame, dest)
+            if verbose:
+                print(f"  [preview] step {step}: wrote {dest.name} via {decoder} "
+                      f"({time.perf_counter() - started:.1f}s)", flush=True)
+            return True
+        except FileNotFoundError as exc:
+            # Not a failure: the TAE weights are optional and previews default to TAE, so a reader
+            # who never downloaded them takes this path on every preview of every run. Said once
+            # per process, because six identical stack-adjacent lines per run is how a log stops
+            # being read.
+            if not _ANNOUNCED.get(decoder):
+                _ANNOUNCED[decoder] = True
+                print(f"  [preview] {decoder} weights not found ({exc}); using the latent heat map "
+                      "for previews. See README's Previews section to fetch them.",
+                      file=sys.stderr, flush=True)
+        except Exception as exc:  # noqa: BLE001 - a broken preview must never break the real run
+            print(f"  [preview] step {step}: {decoder} decode failed ({exc!r}), "
+                  f"falling back to a latent-only preview", file=sys.stderr, flush=True)
 
     try:
-        cfg = pipeline.video_vae.config
+        if decoder == "vae":
+            # Unchanged from before `decoder` existed: the VAE path is allowed to read its own
+            # config for the fallback's channel count, same as it always has.
+            latent_channels = pipeline.video_vae.config.latent_channels
+        else:
+            # "tae" and "latent" must never touch the video VAE, including in their own fallback
+            # — that is the whole point of choosing them. Use TAE's own constant instead, which is
+            # tested elsewhere to match the video VAE's `latent_channels` exactly.
+            from h3_48gb.tae import LATENT_CHANNELS
+            latent_channels = LATENT_CHANNELS
         frame = render_latent_fallback(
             generated_video_rows, num_latent_frames, latent_height, latent_width,
-            cfg.latent_channels, patch_size,
+            latent_channels, patch_size,
         )
         save_preview_jpeg(frame, dest)
         if verbose:
@@ -273,6 +378,7 @@ class PreviewInterceptor:
         latent_width: int,
         patch_size,
         verbose: bool = True,
+        decoder: str = "vae",
     ):
         self._dit = dit
         self._pipeline = pipeline
@@ -284,6 +390,7 @@ class PreviewInterceptor:
         self._latent_width = latent_width
         self._patch_size = patch_size
         self._verbose = verbose
+        self._decoder = decoder
         self._forward_index = -1
 
     def __getattr__(self, item):
@@ -320,5 +427,6 @@ class PreviewInterceptor:
             emit_preview(
                 self._pipeline, generated, self._num_latent_frames, self._latent_height,
                 self._latent_width, self._patch_size, self._stem, step, verbose=self._verbose,
+                decoder=self._decoder,
             )
         return self._dit(video_latents, audio_latents, *args, **kwargs)

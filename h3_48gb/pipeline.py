@@ -384,6 +384,7 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         preview_options = pop_preview_kwargs(kwargs)
         preview_every = int(preview_options.get("preview_every", 0) or 0)
         preview_stem = preview_options.get("preview_stem")
+        preview_decoder = preview_options.get("preview_decoder", "vae") or "vae"
         supported = self.supported_num_inference_steps()
 
         import inspect
@@ -427,13 +428,15 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
 
         original_dit = self.dit
         if preview_every:
-            self.dit = self._install_preview(original_dit, preview_every, preview_stem, bound.arguments)
+            self.dit = self._install_preview(original_dit, preview_every, preview_stem,
+                                             bound.arguments, decoder=preview_decoder)
         try:
             return super().__call__(*args, **kwargs, **checkpoint_kwargs)
         finally:
             self.dit = original_dit
 
-    def _install_preview(self, dit, every: int, stem, arguments: dict) -> PreviewInterceptor:
+    def _install_preview(self, dit, every: int, stem, arguments: dict,
+                         decoder: str = "vae") -> PreviewInterceptor:
         """Size a `PreviewInterceptor` from the same public geometry helpers upstream uses.
 
         Deliberately re-derives ``latent_height``/``latent_width``/``num_latent_frames``/
@@ -465,7 +468,7 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
 
         return PreviewInterceptor(
             dit, self, every, stem, n_cond_v, num_latent_frames, latent_height, latent_width,
-            patch_size, verbose=bool(arguments.get("verbose", True)),
+            patch_size, verbose=bool(arguments.get("verbose", True)), decoder=decoder,
         )
 
 
