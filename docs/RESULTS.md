@@ -641,3 +641,34 @@ Two fixes to the same prompt, tested against each other:
 
 Same result, one costs 2.4x more. Name the shot instead of buying pixels. Also avoid contradicting
 yourself about light: the failing prompt said `dim ballroom` and `warm stage light` in one breath.
+
+
+## Predicting wall clock: use the packed sequence length, not pixels or seconds
+
+Three measured points at 8 steps (7 forwards), all on this machine:
+
+| canvas / duration | packed rows | wall clock |
+|---|---|---|
+| 512x512, 2.4 s | 9,906 | 6.6 min |
+| 512x512, 10 s | 19,242 | 27.8 min |
+| 896x576, 10 s | 37,657 | 133 min |
+
+The local exponent between neighbours is **2.17** and **2.33** — near-quadratic in sequence
+length, which is what dense self-attention over the whole packed sequence predicts.
+
+An earlier section of this file derived exponents of 1.34 and 1.68 over *token count* from the
+31-step runs, and I used those to predict the runs above. They came out **2x low, twice**: 15 s at
+512x512 was predicted at 10 min and took 48; the 896x576 run was predicted at 60 min and took 133.
+The error came from mixing two different bases — pixels and frames scale the sequence differently,
+and neither is the quantity attention actually costs against.
+
+Estimate from rows:
+
+```
+rows ≈ (H/32) * (W/32) * latent_frames + 2 * audio_latents
+minutes ≈ 6.6 * (rows / 9906) ** 2.25          # 8 steps; multiply by 30/7 for the 31-step grid
+```
+
+That reproduces all three points within 15%. Worth doing before committing to a long render: at
+1248x832 for 10 s the sequence is 73,818 rows, which the formula puts near 9 hours at 8 steps —
+and around 38 at the full 31-step schedule.
