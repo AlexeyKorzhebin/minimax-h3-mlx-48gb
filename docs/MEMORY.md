@@ -15,10 +15,16 @@ live run that Activity Monitor showed at **29.13 GB**:
 | Activity Monitor | **29.13 GB** | counts unified-memory allocations — the real figure |
 | `mx.get_active_memory()` | matches Activity Monitor | MLX's own accounting, available inside the process |
 
-`memory.report()` prints MLX's numbers, and that is the measurement. `ps` is not a sanity check
-here; it is simply blind. An earlier version of `docs/DESIGN.md` built a whole table on RSS and
-concluded diffusion peaked at 10–11.5 GB. It does not — that was the fraction of the allocation
-that happened to be file-backed resident pages.
+`memory.report()` prints MLX's numbers, and that is the measurement of *this process's* footprint.
+`ps -o rss=` on this process is not a sanity check for that — it is blind to Metal-backed
+allocations, which is exactly the 0.13 GB row above. That blindness is specific to reading a single
+MLX process's own memory, though: summing `ps -eo rss,command` across *other* processes is a
+legitimate way to see what else is competing for the machine, which is exactly what the
+`ps -eo rss,command` snippet under "What else competes for the 48 GB" below does — those other
+processes are not running MLX, so their RSS is a real measurement, not a blind one. An earlier
+version of `docs/DESIGN.md` built a whole table on *this process's* RSS and concluded diffusion
+peaked at 10–11.5 GB. It does not — that was the fraction of the allocation that happened to be
+file-backed resident pages.
 
 ## Phase residency
 

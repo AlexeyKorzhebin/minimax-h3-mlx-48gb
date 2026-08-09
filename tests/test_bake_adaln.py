@@ -78,3 +78,39 @@ def test_the_final_layer_is_not_a_sliced_video_clock(baked):
     assert (spread > 1e-3).sum() > len(spread) // 2, (
         "the video clock and the conditioning anchor produce near-identical rows — the variants "
         "are probably slices of one evaluation rather than three")
+
+
+def test_tail_split_keeps_the_simple_prefix_bit_identical():
+    """The tail-split grid's only reason to exist is that its prefix is exactly `simple`'s.
+
+    A run on it therefore reproduces a `simple` run of the same seed step for step until the
+    final jump, which is what makes "did the extra tail steps help?" answerable — comparing 8
+    steps against 16 cannot answer it, because a grid that differs from step one moves the
+    composition, and two clips that frame the shot differently cannot be compared on detail.
+    A float64 intermediate anywhere in this construction would break that silently: the sigmas
+    would look right to three decimals and the trajectory would already have diverged.
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from bake_adaln import tail_split_sigmas
+
+    from h3_48gb import _upstream  # noqa: F401
+    from minimax_h3_mlx.scheduler import MiniMaxH3Scheduler
+
+    for steps, shift in ((8, 12.0), (8, 3.0), (16, 12.0), (31, 12.0)):
+        sched = MiniMaxH3Scheduler(shift=shift)
+        sched.set_timesteps(steps)
+        simple = np.array(sched.sigmas.tolist(), np.float32)
+
+        assert np.array_equal(tail_split_sigmas(steps, shift, 1), simple), (
+            f"split=1 must leave `simple` untouched at {steps} steps, shift {shift}")
+
+        for split in (2, 3, 4):
+            grid = tail_split_sigmas(steps, shift, split)
+            shared = len(simple) - 1          # everything up to and including the last live sigma
+            assert np.array_equal(grid[:shared], simple[:shared]), (
+                f"split={split} moved the shared prefix at {steps} steps, shift {shift}")
+            assert len(grid) == len(simple) + split - 1
+            assert grid[-1] == 0.0, "the grid must still end at the terminal sigma"
+            assert np.all(np.diff(grid) < 0), "the scheduler requires a strictly decreasing grid"

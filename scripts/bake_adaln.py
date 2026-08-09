@@ -47,8 +47,39 @@ def beta_sigmas(steps: int, shift: float, alpha: float = 0.6, beta: float = 0.6)
     return np.concatenate([shifted, [0.0]]).astype(np.float32)
 
 
+def tail_split_sigmas(steps: int, shift: float, split: int):
+    """`simple`, with only its last interval subdivided into ``split`` Euler steps.
+
+    Every sigma before the split is **bit-identical** to `simple`'s, because the same float32
+    `linspace` and the same shift produce them. That is the whole reason this schedule exists:
+    a run on it reproduces a `simple` run of the same seed exactly up to sigma 0.667, so what
+    differs in the output is the tail and nothing else. Comparing 8 steps against 16 cannot say
+    that — a different grid from step one sends the trajectory somewhere else, and the two clips
+    disagree on composition long before they disagree on detail.
+
+    The subdivision is placed in the *unshifted* domain and then shifted, so the extra points sit
+    where the schedule's own geometry puts them rather than at arbitrary sigma values.
+    """
+    from minimax_h3_mlx.scheduler import _linspace_1_to_0
+
+    if split < 1:
+        raise ValueError(f"`split` must be at least 1 (1 leaves `simple` untouched), got {split}.")
+    base = _linspace_1_to_0(int(steps))
+    last = base[-2]                       # the base sigma the final jump starts from
+    extra = (last * np.arange(split - 1, 0, -1, dtype=np.float32) / np.float32(split))
+    base = np.concatenate([base[:-1], extra, np.array([0.0], np.float32)]).astype(np.float32)
+    shift32 = np.float32(shift)
+    shifted = (shift32 * base) / (np.float32(1.0) + np.float32(shift - 1.0) * base)
+    values: list[float] = []
+    for v in shifted.tolist():            # the shift collides float32 neighbours near sigma 1
+        if not values or v != values[-1]:
+            values.append(v)
+    return np.array(values, np.float32)
+
+
 def bake(steps: int, dest: Path, shift_video: float = 12.0, shift_audio: float = 3.0,
-         lora: Path | None = None, strength: float = 1.0, schedule: str = "simple"):
+         lora: Path | None = None, strength: float = 1.0, schedule: str = "simple",
+         tail_split: int = 1):
     """Bake the table, optionally folding in the Turbo LoRA's AdaLN half.
 
     Folding is legitimate *here* and nowhere else: the table is bf16, not the 4-bit weights the
@@ -63,6 +94,11 @@ def bake(steps: int, dest: Path, shift_video: float = 12.0, shift_audio: float =
     audio = MiniMaxH3Scheduler(shift=shift_audio)
     if schedule == "beta":
         vs, as_ = beta_sigmas(steps, shift_video), beta_sigmas(steps, shift_audio)
+        video.set_timesteps(sigmas=vs.tolist())
+        audio.set_timesteps(sigmas=as_.tolist())
+    elif schedule == "tail-split":
+        vs = tail_split_sigmas(steps, shift_video, tail_split)
+        as_ = tail_split_sigmas(steps, shift_audio, tail_split)
         video.set_timesteps(sigmas=vs.tolist())
         audio.set_timesteps(sigmas=as_.tolist())
     else:
@@ -129,7 +165,9 @@ def bake(steps: int, dest: Path, shift_video: float = 12.0, shift_audio: float =
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     mx.save_safetensors(str(dest), out)
-    print(f"{dest} — {steps} grid points ({forwards} forwards), {dest.stat().st_size/1e6:.0f} MB")
+    # `len(vs)`, not `steps`: tail-split and beta both add points, and the grid count is what
+    # `--steps` has to be given as, so printing the argument back would misreport it.
+    print(f"{dest} — {len(vs)} grid points ({forwards} forwards), {dest.stat().st_size/1e6:.0f} MB")
 
 
 if __name__ == "__main__":
@@ -140,8 +178,14 @@ if __name__ == "__main__":
     ap.add_argument("--lora", type=Path, default=None)
     ap.add_argument("--strength", type=float, default=1.0)
     ap.add_argument("--out", type=Path, default=None)
-    ap.add_argument("--schedule", choices=("simple", "beta"), default="simple")
+    ap.add_argument("--schedule", choices=("simple", "beta", "tail-split"), default="simple")
+    ap.add_argument("--tail-split", type=int, default=2,
+                    help="with --schedule tail-split: how many Euler steps replace the final jump")
     a = ap.parse_args()
-    suffix = ("_turbo" if a.lora else "") + ("_beta" if a.schedule == "beta" else "")
+    suffix = ("_turbo" if a.lora else "")
+    if a.schedule == "beta":
+        suffix += "_beta"
+    elif a.schedule == "tail-split":
+        suffix += f"_tail{a.tail_split}"
     bake(a.steps, a.out or Path.home() / f"models/turbo/adaln_cache_{a.steps}{suffix}.safetensors",
-         lora=a.lora, strength=a.strength, schedule=a.schedule)
+         lora=a.lora, strength=a.strength, schedule=a.schedule, tail_split=a.tail_split)

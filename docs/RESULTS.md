@@ -1,9 +1,11 @@
 # Measured results
 
-Everything below was run on a MacBook Pro M4 Pro, 48 GB unified memory. All runs used the one
-schedule the baked AdaLN table covers — `num_inference_steps=31` (31 grid points, 30 forwards),
-sigma shifts 12.0/3.0 — since any other value fails at the `h3_48gb.adaln` layer before a single
-forward runs. Memory was watched with `memwatch.sh` (RSS via `ps`, wired/compressed via `vm_stat`,
+Everything below was run on a MacBook Pro M4 Pro, 48 GB unified memory. The runs through "Memory
+profile" below used the checkpoint's shipped AdaLN table — `num_inference_steps=31` (31 grid
+points, 30 forwards), sigma shifts 12.0/3.0. That grid is what this checkpoint ships baked, not a
+hard ceiling: `scripts/bake_adaln.py` reconstructs the AdaLN table for any grid, and the "Few-step
+sampling" section below measures 4, 8 and 16-step runs baked exactly that way. Memory was watched
+with `memwatch.sh` (RSS via `ps`, wired/compressed via `vm_stat`,
 swap via `sysctl vm.swapusage`) at a **10-second** sample interval for the duration of each run,
 driven by `night_queue.sh`, which passes that interval explicitly.
 
@@ -130,8 +132,10 @@ transition.
 
 | Phase | Resident | Notes |
 |---|---|---|
-| Text encoding | text encoder, Q8, 28.2 GB | Runs once, at the very start; unloaded immediately after (`h3_48gb/pipeline.py`) |
-| Diffusion + decode | DiT + both VAEs + AdaLN cache + activations | Text encoder is gone by this point |
+| Text encoding | text encoder, Q8, 28.2 GB | Runs once, at the very start; unloaded immediately after (`LazyTextEncoder.encode`, `h3_48gb/pipeline.py`) |
+| Diffusion | DiT + LoRA + AdaLN cache + activations | Text encoder is gone; the video VAE unloaded after keyframe encoding (`_release_vae_after`) and does not reload until decode |
+| Video decode | video VAE + activations | DiT is unloaded first (`_decode_video`), so this phase never holds the transformer alongside the VAE |
+| Audio decode | audio VAE | The video VAE is unloaded first (`_decode_audio`); the two VAEs are never resident together |
 
 The unload is why the diffusion phase costs 10–11.5 GB rather than that plus the encoder's 28.2 GB.
 It does **not** explain the 10.14 GB figure on its own: the DiT alone loads at 11.34 GB, more than
@@ -200,9 +204,9 @@ peak footprint fits inside that headroom.
 ## Previews
 
 `h3_48gb/preview.py` decodes one frame from the current, partially-denoised latent every N steps,
-so a run measured in hours is watchable rather than opaque. Enable it with
-`h3 generate --preview-every N`; it is off by default. Two constraints, both measured rather
-than assumed:
+so a run measured in hours is watchable rather than opaque. It is on by default —
+`--preview-every` defaults to 5 and `--preview-decoder` to `tae` (see "TAE previews" below for
+why); `--preview-every 0` disables it. Two constraints, both measured rather than assumed:
 
 - **One preview costs 49.3 s and 8.46 GB peak** at native (1344x768) resolution. **Measured with
   correctly-shaped random weights, not with the real checkpoint** — see `h3_48gb/preview.py`, which
@@ -214,23 +218,33 @@ than assumed:
   loaded on demand for the decode and unloaded again immediately after — it is not kept resident for
   the whole diffusion loop, which would stack its ~5.2 GB on top of the DiT's own peak activation
   moment.
-- **The VAE cannot decode fewer than 7 latent frames.** `VideoVAE.decode` is a causal chunked
-  decoder whose temporal padding assumes frame 0 of whatever it is given is the true start of the
-  clip; it refuses fewer than `2 * chunk_tokens - token_drop` latent frames outright. For the
-  released config that floor is 7 latent frames, about 22 pixel frames (~1 s at 24 fps) — there is
-  no cheaper *correct* decode than that, and a preview always decodes from the clip's actual start,
-  not from whichever moment is currently most interesting.
+- **The VAE cannot decode fewer than 7 latent frames, but it does not have to start at frame 0 to
+  do it correctly.** `VideoVAE.decode` (`upstream/minimax_h3_mlx/video_vae.py`) is a chunked
+  decoder that refuses fewer than `2 * chunk_tokens - token_drop` latent frames outright — for the
+  released config (`clip_length=17`, `token_drop=3`) that floor is 7 latent frames, about 22 pixel
+  frames (~1 s at 24 fps), and there is no cheaper *correct* decode than that. What is causal is
+  the **encoder** (`CausalConv3d`); the decoder is a non-causal 36-layer ViT with full attention
+  inside each 7-latent-frame window, so which window a preview decodes does not matter for
+  correctness. Concretely, each decode window covers latent frames `z[5i : 5i+7]` and emits 17
+  pixel frames starting at pixel frame `17i`, cross-faded over 5 frames with its neighbouring
+  window. Measured directly on four finished clips: the pixel discontinuity at every decode-window
+  seam (pixel frames 17, 51, 68) is 1.00x the local median — invisible — while frame 34, a shot cut
+  rather than a seam, is 5-11x. The minimal prefix is what a preview decodes because it is the
+  window that exists first during denoising, not because any other window would be wrong.
 
 ## Honest limits
 
-- **Only `num_inference_steps=31` works.** The AdaLN table `h3_48gb/adaln.py` serves is precomputed
-  for exactly one 31-point grid (30 forwards) at sigma shifts 12.0/3.0. Any other value raises
-  `ScheduleMismatch` before the first forward, by design — there is no fallback to a nearest-value
-  lookup. This is a limitation of *this build*, not of H3:
-  [`FEASIBILITY-turbo-tae.md`](FEASIBILITY-turbo-tae.md) locates the full modulation path in
+- **Only the loaded AdaLN table's own grid works, and a run must pass `--adaln-cache` to use any
+  grid but the checkpoint's shipped one.** `h3_48gb/adaln.py` serves whichever table is loaded —
+  the checkpoint's shipped 31-point grid (30 forwards) at sigma shifts 12.0/3.0 by default — and
+  raises `ScheduleMismatch` before the first forward for any other `--steps`, by design, with no
+  fallback to a nearest-value lookup. This used to be a hard limitation of *this build*, full stop:
+  [`FEASIBILITY-turbo-tae.md`](FEASIBILITY-turbo-tae.md) located the full modulation path in
   8-dimensional curve form inside ComfyUI's pruned checkpoint (87 MB, reproducing this fork's baked
-  table to 2.2e-3 rel-L2). Unimplemented, and derived from safetensors headers rather than from a
-  run — but it is a mapped way out rather than a permanent ceiling.
+  table to 2.2e-3 rel-L2), and `scripts/bake_adaln.py` now reconstructs a table for any grid from
+  it — see "Few-step sampling" below, where 4, 8 and 16-step tables are baked and run this way.
+  What remains true: a single run is still limited to whichever one grid its loaded table was baked
+  for.
 - **A 10-second clip at native resolution is a ~15.7-hour commitment**, extrapolated from 2
   measured steps at 1881 s each. Nothing about that run failed; it simply was not run to completion.
   `h3_48gb/checkpoint.py` makes this tractable in practice — a crash or an intentional stop costs
@@ -433,7 +447,7 @@ outside sampling. This fork's video decode at 1344x768 measures 208 s, which is 
 ## TAE previews: 394x faster, and now on by default
 
 An in-flight preview used to cost **49.3 s and 8.46 GB** — not because decoding is expensive, but
-because the real video VAE is causal and chunked: it cannot decode fewer than 7 latent frames, and
+because the real video VAE's decoder is chunked: it cannot decode fewer than 7 latent frames, and
 it tiles 28 times at 1344x768 no matter how little is asked of it. Every preview therefore decoded
 about a second of video to show one frame, loading a 5.21 GB module to do it.
 
@@ -536,7 +550,7 @@ were all that was checked at first. The clip between them was never looked at un
 watched it. Metrics aimed at the ends cannot see the middle.
 
 
-## Few-step sampling: 3.7x faster at the same quality
+## Few-step sampling: 3.7x faster, whole-frame metrics unchanged on the scenes measured
 
 This fork shipped with a hard limit of `--steps 31`, recorded everywhere in these docs as
 immovable: mere.run's build dropped the modulation path (`time_embedder` + 50 `adaln_proj`, 13B
@@ -554,7 +568,9 @@ reconstructs the table for any grid from it, reproducing the shipped 31-step tab
 | 8 steps + Turbo LoRA at 0.45 | **6.6 min** | **117%** | 3.10 |
 | 8 steps + Turbo LoRA at 1.0 | 6.6 min | 213% | 5.61 |
 
-512x512, 2.4 s, same prompt and seed throughout.
+512x512, 2.4 s, same prompt and seed throughout — one scene. See "Strength 0.45 across scenes"
+below for how far the motion figure generalizes; the sharpness figures were not re-checked on
+other scenes.
 
 ### What the Turbo LoRA actually does here
 
@@ -602,12 +618,14 @@ evaluation. All three assertions go red against the old code.
 | steps | wall clock | motion vs reference | sharpness | verdict |
 |---|---|---|---|---|
 | 31 (reference) | 24.5 min | 100% | 2.23 | |
-| 8 + LoRA 0.45 | 6.8 min | 117% | 3.10 | **the sweet spot** |
+| 8 + LoRA 0.45 | 6.8 min | 117% | 3.10 | **best whole-frame match, this scene** |
 | 4 + LoRA 0.45 | 3.5 min | 86% | 3.49 | visibly short on detail |
 
 Four steps hold their motion and cost half of eight, but detail suffers in a way a viewer notices
-immediately. That matches what users of this LoRA report independently ("8 steps, quality is much
-better"). **Eight is the recommendation**; four is for iterating on a prompt, not for output.
+immediately, on this scene. That matches what users of this LoRA report independently ("8 steps,
+quality is much better"), which is corroborating, not confirming — it is the same whole-frame-metric
+generalization this section is qualifying. **Eight looks like the better trade of the two on the
+scenes measured here**; four is for iterating on a prompt, not for output.
 
 ### Strength 0.45 across scenes
 
@@ -619,20 +637,33 @@ Tuned on one smooth flying shot, then checked against 31-step references on thre
 | galloping horse | 94% |
 | static portrait | 97% |
 
-The LoRA's author warns specifically about smearing under fast motion at low step counts; the
-gallop came out the closest of the three, so that failure mode does not appear here.
+The LoRA's author warns specifically about smearing under fast motion at low step counts. The
+gallop's motion ratio, 94%, is the closest of the three to its own reference — but that is a
+whole-frame average, and a whole-frame average cannot see local smearing (a blurred leg inside an
+otherwise-sharp frame moves this metric very little). This rules out a global motion deficit on the
+gallop; it does not rule out local smearing, which would need a per-region check that was not done
+here.
 
-A fourth scene (two people dancing) came out poorly — but **equally poorly at 31 steps**, so it is
-not a property of few-step sampling. It was a prompt problem: asking for a wide shot puts the faces
-at roughly forty pixels across, at any canvas size. Naming the shot ("medium shot from the waist
-up") fixed it at 512x512 without needing a larger canvas, which is worth knowing before spending
-four hours on a native render. See "Prompting" below.
+A fourth scene (two people dancing) also came out poorly at 31 steps — but that comparison is
+confounded, not clean: 8-step and 31-step runs use different sigma grids, so the same seed does not
+walk the same trajectory, and the two clips do not share a composition to begin with. In the
+31-step clip the woman's head is simply turned away in the early frames; that is a different
+composition, not the same shot rendered with worse detail. Whether the poor face is a property of
+few-step sampling or of this prompt is therefore **not established** by this comparison. What is
+established: naming the shot ("medium shot from the waist up") fixed the face at 512x512 without
+needing a larger canvas, which is worth knowing before spending four hours on a native render. See
+"Prompting" below.
 
 ### Prompting: name the shot
 
 The model picks a wide shot when the prompt does not say otherwise, and a wide shot at 512x512
-leaves a face perhaps forty pixels across. That is not a resolution limit — a close-up portrait at
-the same 512x512 renders faces well. It is a framing default.
+leaves a face perhaps forty pixels across. That is not a *canvas* resolution limit — a close-up
+portrait at the same 512x512 renders faces well — but it is an effective-object-resolution problem:
+the video VAE downsamples 16x spatially and the DiT patches another 2x on top of that
+(`patch_size=(1,2,2)`), so one DiT token covers 32 pixels per side of canvas. A 40 px face spans
+about 1.25 DiT tokens across, which is barely anything for attention to work with regardless of how
+many pixels the rest of the canvas has. It is a framing default that starves the face of tokens,
+not a ceiling on canvas resolution.
 
 Two fixes to the same prompt, tested against each other:
 
@@ -641,6 +672,47 @@ Two fixes to the same prompt, tested against each other:
 
 Same result, one costs 2.4x more. Name the shot instead of buying pixels. Also avoid contradicting
 yourself about light: the failing prompt said `dim ballroom` and `warm stage light` in one breath.
+
+### 16 grid points on the tango clip, and the confound that still isn't removed
+
+Four runs of the tango prompt (the "two people dancing" scene above), same seed, differing only in
+grid points and whether the Turbo LoRA is applied:
+
+| grid points | forwards | wall clock |
+|---|---|---|
+| 8 | 7 | 6.8 min |
+| 16 | 15 | 13.2 min |
+| 31 (reference) | 30 | 25 min |
+
+512x512, 2.4 s.
+
+16 grid points is visibly the best of the four tango runs, by eye, both in the wide opening shot
+and in the Shot 2 close-ups. Frame 0 in particular improved going from 8 to 16 grid points — but
+the woman's face still carries visible distortion even at 16.
+
+Per-frame whole-frame sharpness (Laplacian variance), frame 0 / mean across the clip:
+
+| run | frame 0 | mean |
+|---|---|---|
+| 31 steps | 85.3 | 133.1 |
+| 16 steps | 108.4 | 138.5 |
+| 8 steps, no LoRA | 99.2 | 118.9 |
+| 8 steps + Turbo LoRA 0.45 | 99.8 | 131.8 |
+
+The visible step at frame 34 in every one of these clips is the Shot 2 cut, not a decode-window
+seam — see the seam measurement under "Previews" above, which rules the decode window out directly
+by measuring the actual seams (frames 17, 51, 68) separately from the cut.
+
+All four of these runs carry the same confound as the original dancing-scene comparison: 8, 16 and
+31 grid points are three different sigma grids, and a different grid moves the sampling trajectory,
+not just its fidelity to one trajectory — the same seed does not compose the same shot on a
+different grid. None of the sharpness numbers or the by-eye ranking above separate "fewer steps
+render this composition worse" from "a different grid happened to compose the shot differently."
+`scripts/bake_adaln.py --schedule tail-split --tail-split K` exists specifically to remove that
+confound: it keeps `simple`'s grid bit-identical up to the final interval and only subdivides the
+tail, so a tail-split run and a `simple` run of the same seed share the same trajectory up to sigma
+0.667 and can be compared on the tail alone, without the composition moving. Tail-split runs are
+queued but not finished as of this writing; no result for that schedule is reported here.
 
 
 ## Predicting wall clock: use the packed sequence length, not pixels or seconds

@@ -120,9 +120,13 @@ def render_preview_frame(
     )
     mean = mx.array(np.array(cfg.latents_mean, np.float32)).reshape(1, -1, 1, 1, 1)
     std = mx.array(np.array(cfg.latents_std, np.float32)).reshape(1, -1, 1, 1, 1)
-    # Only the minimal decodable prefix, starting at frame 0 -- `VideoVAE`'s causal temporal
-    # padding assumes frame 0 of what it is given is the true start of the clip, so any later
-    # window would decode a boundary artifact instead of a real frame.
+    # Only the minimal decodable prefix. This used to claim a later window would decode a boundary
+    # artifact because the VAE's temporal padding is causal -- but the *encoder* is causal; the
+    # decoder is a non-causal ViT with full attention inside its 7-latent-frame window, and that
+    # window is the same wherever it sits. Measured on four finished clips: the pixel discontinuity
+    # at every decode-window seam (frames 17, 51, 68) is 1.00x the local median, i.e. invisible,
+    # while frame 34 -- a shot cut, not a seam -- is 5-11x. Any aligned window would do; the prefix
+    # is chosen because it is the one that exists first.
     latents = (latents[:, :, :needed] * std + mean).astype(mx.float32)
 
     was_loaded = bool(getattr(pipeline.video_vae, "loaded", True))

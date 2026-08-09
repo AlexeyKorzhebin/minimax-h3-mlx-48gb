@@ -222,6 +222,7 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         self._turbo_lora: Path | None = None
         self._turbo_strength: float | None = None
         self._schedules = None
+        self._cached_grids: tuple[list[float], list[float]] | None = None
         self._supported_steps: int | None = None
         self._weights_id = weights_id or {}
         self._tracker = memory.PhaseTracker(verbose=verbose)
@@ -375,9 +376,40 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
 
     # -- schedule / modulation ------------------------------------------------------------------
 
+    def _cached_sigma_grids(self):
+        """The sigma grids the cached table was baked for, or None without a cache.
+
+        Only the two sigma tensors are touched; the modulation blocks beside them in the same
+        file are never read.
+        """
+        if self._adaln_cache_path is None:
+            return None
+        if self._cached_grids is None:
+            raw = mx.load(str(self._adaln_cache_path))
+            self._cached_grids = ([float(v) for v in raw["video_sigmas"].tolist()],
+                                  [float(v) for v in raw["audio_sigmas"].tolist()])
+        return self._cached_grids
+
     def _build_schedules(self, num_inference_steps: int):
-        """Keep the schedulers: `_ensure_cache` needs them to locate rows in the cached table."""
+        """Keep the schedulers: `_ensure_cache` needs them to locate rows in the cached table.
+
+        The cache is authoritative about *which* sigma grid it was baked for, not only about the
+        modulation rows it holds. Upstream rebuilds a uniform ``linspace(1, 0, N)`` grid here, and
+        `AdaLNCacheFile.check_schedule` would then reject every non-uniform schedule the baker can
+        produce — but a non-uniform grid is exactly the point of baking one: at 8 steps the uniform
+        grid spends its last forward jumping from sigma 0.667 straight to 0, and fine detail is
+        what an Euler step that long loses. Adopting the stored grid costs a uniform cache nothing:
+        the baker wrote it from this same scheduler in float32, so the values round-trip exactly
+        (`test_simple_cache_grid_is_unchanged`).
+        """
         schedules = super()._build_schedules(num_inference_steps)
+        grids = self._cached_sigma_grids()
+        if grids is not None and len(grids[0]) == num_inference_steps:
+            video, audio = schedules
+            video.set_timesteps(sigmas=grids[0])
+            audio.set_timesteps(sigmas=grids[1])
+        # A length mismatch is left alone on purpose: `check_schedule` reports it with the grid
+        # sizes and the N-vs-N-1 convention spelled out, which beats anything raised from here.
         self._schedules = schedules
         return schedules
 
