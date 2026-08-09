@@ -150,10 +150,17 @@ def apply_backbone_lora(dit, weights_path: Path | str, strength: float = 1.0,
 
 # -- LightX2V's adapter, which is shaped differently ---------------------------------------------
 
-#: peft stores `alpha` separately from the rank and scales the update by `alpha / rank`.
-#: LightX2V's adapter is rank 128 with alpha 16, so its update must be scaled by 0.125 — applying
-#: it raw would be 8x too strong. larryvrh's needs no scaling (its metadata states alpha = rank).
-LIGHTX2V_ALPHA = 16.0
+#: peft stores `alpha` separately from the rank and scales the update by `alpha / rank`, so this
+#: number cannot be read off the checkpoint — it lives in the training config. At rank 128 that
+#: makes the effective scale 0.0625.
+#:
+#: **8, from the authors' own inference script**, `DEFAULT_LORA_ALPHA` in
+#: github.com/ModelTC/Minimax-H3-Turbo/blob/main/inference_minimax_h3.py, which computes
+#: `effective_scale = lora_scale * lora_alpha / rank`. Kijai's ComfyUI conversion guesses 16 and
+#: says so ("this is mostly a guess since I don't know how it's intended to be applied"). Taking
+#: that guess drove the motion to 2.1x the reference here — exactly the factor two the wrong alpha
+#: predicts, which is how the error was caught.
+LIGHTX2V_ALPHA = 8.0
 
 #: diffusers naming -> this fork's. The three attention projections have no single counterpart:
 #: they are split there and fused here, handled by `SplitQKVLoRALinear` below.
