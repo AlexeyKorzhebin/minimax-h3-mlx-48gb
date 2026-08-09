@@ -23,7 +23,7 @@ discarding each as its phase ends turns one number into three:
 |---|---|---|
 | **~55 GB** | all four components resident at once, at the moment diffusion peaks | 45.9 GB of weights (this fork's own run log, below) + 9.3 GB of activations at 1344x768/5 s (upstream's measurement) |
 | **28.2 GB** | peak during the text-encoding phase — which lasts about **10 seconds** | MLX's `get_active_memory`, printed by the run itself as `loaded text encoder: +28.22 GB in 8.3s` |
-| **10.1–11.5 GB** | for the entire multi-hour diffusion phase, which is >99% of the wall clock | process RSS, sampled every 10 s for the whole run |
+| **~21 GB** | for the entire multi-hour diffusion phase, which is >99% of the wall clock | MLX's own accounting: 12.09 GB of weights plus ~9.3 GB of activations. An earlier version of this table said 10.1–11.5 GB from process RSS — that instrument cannot see Metal allocations at all, see [`docs/MEMORY.md`](docs/MEMORY.md) |
 
 The 45.9 GB is the sum of the four `loaded <component>: +N GB` lines MLX prints during a real run
 (28.22 + 11.34 + 5.21 + 0.61) plus the 0.56 GB AdaLN cache; the 9.3 GB activation figure is
@@ -72,8 +72,10 @@ in-flight frame previews so a multi-hour render is watchable instead of opaque (
 and a CLI (`h3_48gb/cli.py`) with `generate`, `resume`, `list` and `doctor` subcommands, each able to
 emit machine-readable JSON for scripting or an MCP wrapper.
 
-The full memory-phase breakdown and the QKV/quantization mapping behind the patches above are in
-[`docs/DESIGN.md`](docs/DESIGN.md).
+The full memory-phase breakdown is in [`docs/MEMORY.md`](docs/MEMORY.md) — which instrument to
+trust (three disagree by two orders of magnitude), what each phase holds, why every unload is
+preceded by an `mx.eval`, and the allocator cache that quietly held 8 GB until it was bounded. The
+QKV/quantization mapping behind the patches above is in [`docs/DESIGN.md`](docs/DESIGN.md).
 
 The 31-step limitation in patch 1 is a property of *this* build, not of H3:
 [`docs/FEASIBILITY-turbo-tae.md`](docs/FEASIBILITY-turbo-tae.md) is a study of two upstream

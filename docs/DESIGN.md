@@ -63,14 +63,20 @@ actually happened beside them:
 | Phase | Resident | Projected peak | Outcome |
 |---|---|---|---|
 | Encoding | encoder Q8, 28.2 GB | ~29 GB | MLX reported exactly 28.22 GB allocated and released; **process RSS was never sampled during this phase** — see `docs/RESULTS.md` |
-| Diffusion, 512x512 | DiT 11.3 + VAE 5.8 + cache 0.9 + activations ~2 | ~20 GB | peak RSS 11.54 GB |
-| Diffusion, 5 s at 1344x768 | same + activations 9.3 | ~27 GB | peak RSS 10.14 GB, flat at 9.04 GB for 1,751 consecutive samples |
+| Diffusion, 512x512 | DiT 11.3 + VAE 5.8 + cache 0.9 + activations ~2 | ~20 GB | RSS said 11.54 GB; RSS is blind to Metal, see below |
+| Diffusion, 5 s at 1344x768 | same + activations 9.3 | ~27 GB | RSS said 10.14 GB; Activity Monitor on a comparable run said 29.13 GB |
 | Diffusion, 15 s at 1344x768 | same + activations 24.4 | ~42 GB | never attempted; extrapolates past 35 hours per clip |
 
-The measured RSS coming in *below* the projections is not the projections being pessimistic about
-the model — the projections describe allocated weights plus activations, while RSS describes
-resident pages, and memory-mapped safetensors weights are file-backed and evictable. `docs/RESULTS.md`
-sets out why the two are not the same measurement and which claim each one supports.
+**The RSS column above is not a measurement of what the run holds, and the projections were
+closer to right than it made them look.** Metal allocations do not appear in a process's resident
+set on Apple silicon: during a run Activity Monitor showed at 29.13 GB, `ps` reported 0.13 GB. The
+10–11.5 GB figures are whatever fraction of the allocation happened to be file-backed resident
+pages at sampling time, which is not a quantity anyone should plan against.
+
+The projections' error was in the other direction and smaller: they omitted MLX's freed-buffer
+cache, roughly 8 GB on a long run until it was bounded. Corrected accounting, the instrument that
+sees it, and the four unloads that keep each phase to its own budget are in
+[`docs/MEMORY.md`](MEMORY.md), which supersedes this section.
 
 The GPU limit was raised to 44 GB (`iogpu.wired_limit_mb=45056`; resets on reboot) to leave headroom
 for the 15 s row above. Since that row was never run and nothing else came near 12 GB, this is
