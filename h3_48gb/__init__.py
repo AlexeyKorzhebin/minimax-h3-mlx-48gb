@@ -27,8 +27,8 @@ Usage::
 
     pipe = LazyMiniMaxH3Pipeline.from_pretrained("~/models/h3-converted")
     result = pipe("a cat", num_inference_steps=31, height=512, width=512,
-                  checkpoint_dir="~/models/video-out/checkpoints",
-                  preview_every=5, preview_stem="~/models/video-out/h3-run")
+                  checkpoint_dir="~/video-out/checkpoints",
+                  preview_every=5, preview_stem="~/video-out/h3-run")
 
 Re-running the same call resumes where the last one stopped; a call with different parameters is
 refused rather than silently continued. ``preview_every=0`` (the default) disables previews.

@@ -19,7 +19,7 @@ from h3_48gb.cli import (
     run_resume,
     spec_from_args,
 )
-from h3_48gb.cli import _checkpoint_path_for
+from h3_48gb.cli import _checkpoint_path_for, DEFAULT_OUTDIR
 
 
 def test_parser_defaults_to_the_baked_schedule():
@@ -36,7 +36,7 @@ def test_spec_carries_every_field_that_identifies_a_run():
     assert spec == RunSpec(
         prompt="a cat", width=1344, height=768, duration=5.0, steps=31, seed=7,
         checkpoint=Path.home() / "models/h3-converted",
-        outdir=Path.home() / "models/video-out", tag="demo",
+        outdir=DEFAULT_OUTDIR, tag="demo",
     )
 
 
@@ -1184,3 +1184,26 @@ def test_the_step_count_is_read_from_the_checkpoint_not_hardcoded(tmp_path):
         RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
                 checkpoint=fake_checkpoint(8), outdir=tmp_path, tag="t")
     assert excinfo.value.detail["required"] == 8, "the refusal must quote this checkpoint's grid"
+
+
+def test_output_does_not_default_into_the_weights_directory(monkeypatch):
+    """Clips are disposable; the 46 GB of weights beside them are not.
+
+    They used to share `~/models`, which makes "clear out the videos" a dangerous command and
+    made 1.2 GB of test output accumulate inside the model store. `H3_OUTDIR` exists so a
+    permanent choice does not need a flag on every invocation.
+    """
+    import importlib
+
+    from h3_48gb import cli
+
+    assert "models" not in cli.DEFAULT_OUTDIR.parts, (
+        f"the default output directory sits inside the model store: {cli.DEFAULT_OUTDIR}")
+
+    monkeypatch.setenv("H3_OUTDIR", "/tmp/somewhere-else")
+    reloaded = importlib.reload(cli)
+    try:
+        assert reloaded.DEFAULT_OUTDIR == Path("/tmp/somewhere-else")
+    finally:
+        monkeypatch.delenv("H3_OUTDIR")
+        importlib.reload(cli)

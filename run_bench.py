@@ -33,7 +33,7 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=31)
     ap.add_argument("--seed", type=int, default=314159)
     ap.add_argument("--tag", default="run")
-    ap.add_argument("--outdir", default=str(Path.home() / "models/video-out"))
+    ap.add_argument("--outdir", default=str(Path.home() / "video-out"))
     # Resumption is on by default and costs one small file write per step. At 586 s per step there
     # is no run long enough for the write to matter and none short enough for a lost run not to.
     ap.add_argument("--checkpoint-dir", default=None,

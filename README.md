@@ -119,7 +119,7 @@ h3 doctor --checkpoint ~/models/h3-converted
 #    five-hour render is watchable instead of opaque. They cost 0.125 s each — see "Previews"
 #    below. Pass --preview-every 0 to turn them off.
 h3 generate "a jeweled hummingbird hovering beside a red orchid, cinematic natural light" \
-    --checkpoint ~/models/h3-converted --outdir ~/models/video-out --width 1344 --height 768
+    --checkpoint ~/models/h3-converted --width 1344 --height 768
 ```
 
 ### Previews

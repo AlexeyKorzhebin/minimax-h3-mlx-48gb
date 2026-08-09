@@ -32,7 +32,10 @@ from pathlib import Path
 import numpy as np
 
 DEFAULT_CHECKPOINT = Path.home() / "models/h3-converted"
-DEFAULT_OUTDIR = Path.home() / "models/video-out"
+#: Where clips land. Deliberately not under the weights directory: output is disposable and
+#: models are 46 GB you do not want to delete by accident while clearing space. `H3_OUTDIR`
+#: overrides it, so a permanent choice does not need a flag on every command.
+DEFAULT_OUTDIR = Path(os.environ.get("H3_OUTDIR") or Path.home() / "video-out")
 #: The grid this fork shipped against. Only a fallback now: the real number is read from the
 #: checkpoint's own AdaLN cache, since a cache can be baked for any grid (see `baked_grid_points`).
 BAKED_GRID_POINTS = 31
