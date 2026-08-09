@@ -227,10 +227,12 @@ why); `--preview-every 0` disables it. Two constraints, both measured rather tha
   inside each 7-latent-frame window, so which window a preview decodes does not matter for
   correctness. Concretely, each decode window covers latent frames `z[5i : 5i+7]` and emits 17
   pixel frames starting at pixel frame `17i`, cross-faded over 5 frames with its neighbouring
-  window. Measured directly on four finished clips: the pixel discontinuity at every decode-window
-  seam (pixel frames 17, 51, 68) is 1.00x the local median — invisible — while frame 34, a shot cut
-  rather than a seam, is 5-11x. The minimal prefix is what a preview decodes because it is the
-  window that exists first during denoising, not because any other window would be wrong.
+  window. Measured directly on four finished clips: at the seams that coincide with nothing else —
+  pixel frames 17, 51 and 68 — the frame-to-frame pixel discontinuity is 1.00x the local median,
+  which is to say invisible. Frame 34 is 5-11x, but frame 34 is *both* a seam and the Shot 2 cut,
+  so it cannot tell the two apart; the other three seams are what carry the point. The minimal
+  prefix is what a preview decodes because it is the window that exists first during denoising,
+  not because any other window would be wrong.
 
 ## Honest limits
 
@@ -699,20 +701,80 @@ Per-frame whole-frame sharpness (Laplacian variance), frame 0 / mean across the 
 | 8 steps, no LoRA | 99.2 | 118.9 |
 | 8 steps + Turbo LoRA 0.45 | 99.8 | 131.8 |
 
-The visible step at frame 34 in every one of these clips is the Shot 2 cut, not a decode-window
-seam — see the seam measurement under "Previews" above, which rules the decode window out directly
-by measuring the actual seams (frames 17, 51, 68) separately from the cut.
+The visible step at frame 34 in every one of these clips is the Shot 2 cut. The decode window is
+ruled out separately, by the seams that land on nothing else — see "Previews" above; frame 34 is
+itself both a seam and the cut, so on its own it proves neither.
 
 All four of these runs carry the same confound as the original dancing-scene comparison: 8, 16 and
 31 grid points are three different sigma grids, and a different grid moves the sampling trajectory,
 not just its fidelity to one trajectory — the same seed does not compose the same shot on a
 different grid. None of the sharpness numbers or the by-eye ranking above separate "fewer steps
 render this composition worse" from "a different grid happened to compose the shot differently."
-`scripts/bake_adaln.py --schedule tail-split --tail-split K` exists specifically to remove that
-confound: it keeps `simple`'s grid bit-identical up to the final interval and only subdivides the
-tail, so a tail-split run and a `simple` run of the same seed share the same trajectory up to sigma
-0.667 and can be compared on the tail alone, without the composition moving. Tail-split runs are
-queued but not finished as of this writing; no result for that schedule is reported here.
+
+### Splitting the tail does not sharpen anything — it softens
+
+`--schedule tail-split --tail-split K` was built to remove exactly that confound. It keeps
+`simple`'s grid bit-identical up to the final interval and subdivides only the tail, so a
+tail-split run and a `simple` run of the same seed share one trajectory until sigma 0.667. The
+hypothesis it was built to test: `simple` at 8 grid points spends its last forward jumping from
+0.667 straight to 0, the last third of the schedule carries most of the denoising, and fine detail
+— of which a small face is the densest kind — should be what an Euler step that long loses.
+
+Same prompt, same seed 20260909, 512x512, 2.4 s, no LoRA:
+
+| grid | forwards | tail | wall clock | sharpness f0 | mean | mean pixel distance from the baseline clip |
+|---|---|---|---|---|---|---|
+| `simple` 8 | 7 | 0.667 → 0 | 6.8 min | 99.2 | 118.9 | — |
+| tail-split 2 | 8 | 0.667 → 0.480 → 0 | 7.6 min | 89.4 | 110.4 | 3.5 |
+| tail-split 3 | 9 | 0.667 → 0.558 → 0.375 → 0 | 8.4 min | 86.8 | 104.6 | 4.3 |
+| 16 grid points | 15 | (uniform) | 13.2 min | 108.4 | 138.5 | **34.3** |
+
+The last column is what the schedule was built for. The tail-split clips sit 3.5 and 4.3 grey
+levels from the baseline — the same shot, the same poses, differing in the tail. The 16-step clip
+sits at 34.3: a different clip of the same prompt. That is the confound, measured.
+
+The hypothesis is refused. More tail steps make the image *softer*, monotonically, and the faces
+do not improve: side by side at frames 0, 8 and 16 the three clips differ by less than the JPEG
+they are viewed through. The single long jump to zero was not costing detail — if anything it was
+adding acutance the better-integrated tail does not, which is the usual few-step-flow trade of
+crispness against fidelity, in the direction opposite to the one assumed.
+
+So the gap between 8 and 16 grid points is not tail discretization. What 16 steps bought on this
+prompt was a *different composition* — one that happens to put both faces frontal and larger — and
+composition is worth more here than integration accuracy. That is consistent with the token-
+footprint argument above, and it is why the keyframe result below matters more than either.
+
+### A keyframe fixes the weak opening outright
+
+If the weak start is a framing default rather than a transient of the sampler, then taking the
+framing away from the model should end it. Handing the last frame of a finished tango clip back in
+as `--image` does exactly that: at 8 grid points with the Turbo LoRA at 0.45, 7.8 min, frame 0 of
+the new clip differs from the supplied keyframe by **6.2 grey levels of 255**. The clip opens on
+that composition — two faces, close, large — and the first frames carry none of the smear that
+started this whole investigation.
+
+This is worth more than any schedule change measured here, and it also supplies the composition
+control that the step-count comparison never had: with the opening frame fixed from outside,
+two runs can finally be compared on rendering rather than on which shot the model chose.
+
+### LightX2V at the authors' alpha
+
+The second Turbo adapter, run as its authors run it — `DEFAULT_LORA_ALPHA = 8`, strength 1.0,
+4 grid points (3 forwards):
+
+| | wall clock | sharpness f0 | mean | mean frame-to-frame motion |
+|---|---|---|---|---|
+| LightX2V, alpha 8 | 3.8 min | 61.2 | 105.6 | 7.13 |
+| 8 grid points, no LoRA | 6.8 min | 99.2 | 118.9 | 6.26 |
+| 16 grid points | 13.2 min | 108.4 | 138.5 | 8.46 |
+
+Motion is back in range. At the alpha 16 that a widely-used ComfyUI conversion guesses at — and
+says it is guessing at — the same adapter drove motion to 13.5 against a 6.4 reference, 2.1x, which
+is precisely the factor a doubled alpha predicts through `scale = strength * alpha / rank`. Reading
+the authors' inference script settled it in a minute; the guess had cost a day of runs.
+
+At three forwards the close-ups hold up and the wide shots are visibly softer than anything else
+measured here. It is the fastest usable setting in this fork, and the least detailed.
 
 
 ## Predicting wall clock: use the packed sequence length, not pixels or seconds

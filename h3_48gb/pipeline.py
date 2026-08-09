@@ -51,7 +51,7 @@ from .text_encoder import QuantizedTextEncoder
 
 
 def _file_identity(path: Path | None) -> list | None:
-    """``[name, size]`` — enough to tell a rebaked file from the one a checkpoint was written под.
+    """``[name, size]`` — enough to tell a rebaked file from the one a checkpoint was written under.
 
     Deliberately not a content hash: see `checkpoint_identity_extra`.
     """
@@ -405,11 +405,21 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         schedules = super()._build_schedules(num_inference_steps)
         grids = self._cached_sigma_grids()
         if grids is not None and len(grids[0]) == num_inference_steps:
+            # Both modalities or neither. The two grids are stepped in lockstep by a `zip` over the
+            # timestep lists: a longer audio grid is silently truncated and the audio latents finish
+            # above sigma 0, a shorter one runs the loop off the end of the plan. `check_schedule`
+            # cannot catch either, because by then both schedulers hold exactly what the table says.
+            if len(grids[1]) != len(grids[0]):
+                raise ScheduleMismatch(
+                    f"{self._adaln_cache_path.name} holds {len(grids[0])} video sigmas and "
+                    f"{len(grids[1])} audio sigmas. The two modalities are stepped together, so "
+                    "the grids must be the same length; rebake the table."
+                )
             video, audio = schedules
             video.set_timesteps(sigmas=grids[0])
             audio.set_timesteps(sigmas=grids[1])
-        # A length mismatch is left alone on purpose: `check_schedule` reports it with the grid
-        # sizes and the N-vs-N-1 convention spelled out, which beats anything raised from here.
+        # A video-length mismatch is left alone on purpose: `check_schedule` reports it with the
+        # grid sizes and the N-vs-N-1 convention spelled out, which beats anything raised here.
         self._schedules = schedules
         return schedules
 
@@ -478,12 +488,19 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         Path plus byte size, as `weights_fingerprint` does, and for the same reason: hashing the
         contents would cost more than the step it protects, while size catches the failure that
         actually happens — a rebaked or swapped file.
+
+        Size alone is not enough for the table, though, now that the run samples on whatever grid
+        the table carries: a uniform 9-point table and a tail-split-to-9 one are the same shape and
+        therefore the same size, so a swap under the same name would resume a half-finished clip
+        onto a different trajectory with nothing raised. The grid itself is a few dozen floats and
+        is already read to build the schedule, so it goes into the identity directly.
         """
         return {
             "weights": self._weights_id,
             "sigma_shift_video": self.config.sigma_shift_video,
             "sigma_shift_audio": self.config.sigma_shift_audio,
             "adaln_cache": _file_identity(self._adaln_cache_path),
+            "sigma_grid": self._cached_sigma_grids(),
             "turbo_lora": _file_identity(self._turbo_lora),
             "turbo_strength": self._turbo_strength,
         }

@@ -1322,6 +1322,11 @@ def test_the_adapter_and_its_strength_are_part_of_the_checkpoint_identity(tmp_pa
             sigma_shift_video = 12.0
             sigma_shift_audio = 3.0
 
+        # `small` is ten junk bytes, not a table. The grid half of the identity is covered by
+        # `test_the_grid_is_part_of_the_checkpoint_identity` against real safetensors.
+        def _cached_sigma_grids(self):
+            return None
+
     from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
 
     identity = LazyMiniMaxH3Pipeline.checkpoint_identity_extra(FakePipe())

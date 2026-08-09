@@ -121,3 +121,54 @@ def test_the_sigma_tensors_are_read_once(tmp_path):
         mx.load = real_load
 
     assert len(reads) == 1, f"the cache file was opened {len(reads)} times"
+
+
+def test_grids_of_different_lengths_are_refused(tmp_path):
+    """The two modalities are stepped by one `zip` over their timestep lists.
+
+    A longer audio grid is silently truncated by that `zip` and the audio latents finish above
+    sigma 0 — a run that completes, writes a file, and is quietly wrong. A shorter one runs the
+    loop off the end of the plan. `check_schedule` cannot catch either, because once both
+    schedulers have adopted the stored grids they match the table by construction.
+    """
+    from h3_48gb.adaln import ScheduleMismatch
+
+    cache = write_cache(tmp_path / "ragged.safetensors",
+                        uniform(8, 12.0), uniform(9, 3.0))
+    with pytest.raises(ScheduleMismatch) as excinfo:
+        Bare(cache)._build_schedules(8)
+    assert "8 video sigmas" in str(excinfo.value) and "9 audio sigmas" in str(excinfo.value)
+
+
+def test_the_grid_is_part_of_the_checkpoint_identity(tmp_path):
+    """Two tables of the same shape are the same size, so name-plus-size cannot tell them apart.
+
+    A uniform 9-point table and an 8-point table split to 9 hold identical tensor shapes. Before
+    the grid joined the identity, swapping one for the other under the same name let a run resume
+    onto a different trajectory — the failure `checkpoint_identity_extra` exists to prevent, in the
+    one case its own fingerprint was blind to.
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from bake_adaln import tail_split_sigmas
+
+    split = [float(v) for v in tail_split_sigmas(8, 12.0, 2)]
+    plain = uniform(9, 12.0)
+    assert len(split) == len(plain), "the premise: same length, therefore same file size"
+
+    # One path, written twice: anything less would let the test pass on the filename alone, which
+    # is the very thing being shown to be insufficient.
+    path = tmp_path / "adaln_cache.safetensors"
+
+    def identity(video):
+        write_cache(path, video, uniform(len(video), 3.0))
+        pipe = Bare(path)
+        pipe._weights_id, pipe._turbo_lora, pipe._turbo_strength = {}, None, None
+        return pipe.checkpoint_identity_extra()
+
+    first, second = identity(plain), identity(split)
+    assert first["adaln_cache"] == second["adaln_cache"], (
+        "the premise: name and size cannot tell these two tables apart")
+    assert first != second, (
+        "a tail-split table and a uniform one of the same shape share a checkpoint identity")
