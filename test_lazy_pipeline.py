@@ -387,6 +387,7 @@ def main() -> int:
         test_keyframes_load_the_vae_before_upstream_seeds,
         test_both_consumers_get_the_same_prepared_keyframe,
         test_each_keyframe_gets_its_own_seed,
+        test_the_transformer_is_released_before_decoding,
     ]
     for test in tests:
         print(f"{test.__name__}:")
@@ -397,3 +398,52 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_the_transformer_is_released_before_decoding() -> None:
+    """Decoding must not pay for the transformer it will never touch again.
+
+    Upstream keeps every component resident to the end of `__call__`, so the video VAE's tiling
+    runs on top of 11.34 GB of transformer plus its LoRA and modulation table — 12.1 GB that the
+    decode cannot use. On a long clip the decode is where the peak lands (243 frames at 896x576
+    tile 28 ways each), which is exactly the wrong place to be carrying dead weight.
+
+    The `mx.eval` before the unload is the same requirement `LazyTextEncoder` documents: an
+    unevaluated graph over a module's parameters pins all of them regardless of what is dropped.
+    """
+    from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    events: list[str] = []
+
+    class Proxy:
+        def __init__(self, name):
+            self.name = name
+
+        def unload(self):
+            events.append(f"unload:{self.name}")
+
+    class Config:
+        sigma_shift_video = 12.0
+        sigma_shift_audio = 3.0
+
+    pipe = LazyMiniMaxH3Pipeline(Proxy("dit"), object(), Proxy("video_vae"), object(),
+                                 Config(), verbose=False)
+    pipe._cache = "a table"
+
+    original_video = MiniMaxH3Pipeline._decode_video
+    original_audio = MiniMaxH3Pipeline._decode_audio
+    MiniMaxH3Pipeline._decode_video = lambda self, rows, *a, **k: events.append("decode:video")
+    MiniMaxH3Pipeline._decode_audio = lambda self, rows, *a, **k: events.append("decode:audio")
+    try:
+        pipe._decode_video(mx.zeros((4, 8)))
+        pipe._decode_audio(mx.zeros((4, 8)))
+    finally:
+        MiniMaxH3Pipeline._decode_video = original_video
+        MiniMaxH3Pipeline._decode_audio = original_audio
+
+    check("the transformer goes before the video decode, not after",
+          events[:2] == ["unload:dit", "decode:video"], f"got {events}")
+    check("the video VAE goes before the audio decode",
+          events[2:] == ["unload:video_vae", "decode:audio"], f"got {events}")
+    check("the modulation table is dropped with the transformer", pipe._cache is None)

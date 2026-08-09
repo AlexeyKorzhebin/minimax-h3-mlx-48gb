@@ -303,6 +303,37 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
             )
         return mx.concatenate([encode([image], height, width) for image in images])
 
+    # -- decoding: the diffusion phase is over, so stop paying for it ---------------------------
+
+    def _decode_video(self, rows, *args, **kwargs):
+        """Release the DiT before decoding, then decode.
+
+        By the time this runs the last forward is done and the transformer will not be touched
+        again — but upstream keeps it resident to the end of the call, so decoding pays for
+        11.34 GB of transformer, 0.62 GB of LoRA and 0.13 GB of modulation table it cannot use.
+        That is 12.1 GB on top of the video VAE's 5.21, and decoding is where the peak lands on a
+        long clip: 243 frames at 896x576 tile 28 ways each.
+
+        `video_rows` and `audio_rows` are already materialized — upstream's loop calls
+        `mx.eval(video_rows, audio_rows)` every step — so dropping the transformer here cannot
+        strand a lazy graph. That distinction is the whole reason the text encoder's unload works
+        (see `LazyTextEncoder`): an unevaluated graph over a module's parameters pins all of them
+        no matter what is deleted.
+        """
+        mx.eval(rows)
+        self.dit.unload()
+        self._cache = None
+        self._cache_timesteps = None
+        memory.release()
+        return super()._decode_video(rows, *args, **kwargs)
+
+    def _decode_audio(self, rows, *args, **kwargs):
+        """Release the video VAE before the audio VAE loads — they are never needed together."""
+        mx.eval(rows)
+        self.video_vae.unload()
+        memory.release()
+        return super()._decode_audio(rows, *args, **kwargs)
+
     # -- schedule / modulation ------------------------------------------------------------------
 
     def _build_schedules(self, num_inference_steps: int):

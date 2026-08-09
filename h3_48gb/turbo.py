@@ -142,3 +142,95 @@ def apply_backbone_lora(dit, weights_path: Path | str, strength: float = 1.0,
         print(f"  turbo: {wrapped} projections wrapped ({permuted} QKV permuted), "
               f"+{report['added_gb']:.2f} GB, strength {strength}")
     return report
+
+
+# -- LightX2V's adapter, which is shaped differently ---------------------------------------------
+
+#: peft stores `alpha` separately from the rank and scales the update by `alpha / rank`.
+#: LightX2V's adapter is rank 128 with alpha 16, so its update must be scaled by 0.125 — applying
+#: it raw would be 8x too strong. larryvrh's needs no scaling (its metadata states alpha = rank).
+LIGHTX2V_ALPHA = 16.0
+
+#: diffusers naming -> this fork's. The three attention projections have no single counterpart:
+#: they are split there and fused here, handled by `SplitQKVLoRALinear` below.
+LIGHTX2V_RENAMES = {
+    "attn.to_out.0": "attn.out_proj",
+    "ff.net.0.proj": "mlp.fc1",
+    "ff.net.2": "mlp.fc2",
+}
+
+
+class SplitQKVLoRALinear(nn.Module):
+    """A fused QKV projection carrying three separate low-rank corrections.
+
+    LightX2V trains `to_q`, `to_k` and `to_v` as independent adapters, each with its own A. They
+    cannot be concatenated into one pair — that would need a block-diagonal B and would inflate
+    the rank from 128 to 384, which is the size blow-up Kijai reports when converting this adapter
+    for a fused base.
+
+    Computing the three separately and concatenating the *outputs* is the same arithmetic at a
+    third of the memory. The concatenation is in slab order, so it is permuted into this fork's
+    per-head interleave afterwards — the same reordering the fused adapter needs.
+    """
+
+    def __init__(self, base: nn.Module, factors, permutation: mx.array, scale: float):
+        super().__init__()
+        self.base = base
+        self.q_a, self.q_b = factors["q"]
+        self.k_a, self.k_b = factors["k"]
+        self.v_a, self.v_b = factors["v"]
+        self.permutation = permutation
+        self.scale = scale
+
+    def __call__(self, x: mx.array) -> mx.array:
+        out = self.base(x)
+        delta = mx.concatenate([
+            (x @ self.q_a.T) @ self.q_b.T,
+            (x @ self.k_a.T) @ self.k_b.T,
+            (x @ self.v_a.T) @ self.v_b.T,
+        ], axis=-1)
+        return out + self.scale * delta[..., self.permutation].astype(out.dtype)
+
+
+def apply_lightx2v_lora(dit, weights_path: Path | str, strength: float = 1.0,
+                        num_heads: int = 56, head_dim: int = 128, verbose: bool = True) -> dict:
+    """Apply LightX2V's adapter, converting its layout on the way in.
+
+    Three differences from `apply_backbone_lora`, all of them silent if missed: peft's
+    `alpha / rank` scaling, diffusers key names, and split-vs-fused attention projections.
+    """
+    lora = mx.load(str(weights_path))
+    targets = sorted({k.rsplit(".lora_", 1)[0] for k in lora})
+    rank = lora[f"{targets[0]}.lora_A.default.weight"].shape[0]
+    scale = strength * LIGHTX2V_ALPHA / rank
+    permutation = slabs_to_interleaved(num_heads, head_dim)
+
+    def factors(name):
+        return (lora[f"{name}.lora_A.default.weight"], lora[f"{name}.lora_B.default.weight"])
+
+    wrapped = 0
+    for source_block, our_block in ([(f"transformer_blocks.{i}", f"blocks.{i}")
+                                     for i in range(len(dit.blocks))] +
+                                    [(f"token_refiner.refiner_blocks.{i}", f"token_refiner.blocks.{i}")
+                                     for i in range(len(getattr(dit, "token_refiner").blocks))]):
+        qkv = {part: factors(f"{source_block}.attn.to_{part}") for part in ("q", "k", "v")
+               if f"{source_block}.attn.to_{part}.lora_A.default.weight" in lora}
+        if len(qkv) == 3:
+            owner, attribute = _resolve(dit, f"{our_block}.attn.qkv_proj")
+            setattr(owner, attribute,
+                    SplitQKVLoRALinear(getattr(owner, attribute), qkv, permutation, scale))
+            wrapped += 1
+        for source_suffix, our_suffix in LIGHTX2V_RENAMES.items():
+            key = f"{source_block}.{source_suffix}"
+            if f"{key}.lora_A.default.weight" not in lora:
+                continue
+            a, b = factors(key)
+            owner, attribute = _resolve(dit, f"{our_block}.{our_suffix}")
+            setattr(owner, attribute, LoRALinear(getattr(owner, attribute), a, b, scale))
+            wrapped += 1
+
+    report = {"wrapped": wrapped, "rank": rank, "scale": round(scale, 4), "targets": len(targets)}
+    if verbose:
+        print(f"  lightx2v: {wrapped} projections, rank {rank}, "
+              f"scale {scale:.3f} (alpha {LIGHTX2V_ALPHA}/rank {rank} x strength {strength})")
+    return report
