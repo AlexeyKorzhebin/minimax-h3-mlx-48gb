@@ -14,6 +14,26 @@ live run that Activity Monitor showed at **29.13 GB**:
 | `vm_stat` "wired" | 12.3 GB | system-wide wired memory, not this process, and not all of the allocation |
 | Activity Monitor | **29.13 GB** | counts unified-memory allocations — the real figure |
 | `mx.get_active_memory()` | matches Activity Monitor | MLX's own accounting, available inside the process |
+| `footprint -p <pid>` | matches Activity Monitor | the same figure from outside the process, scriptable, **and it reports the peak** |
+
+`footprint -p` is the one to reach for from a script. It breaks the allocation down by category —
+during a native run, 24 of 25 GB sat under `IOAccelerator (graphics)`, which is exactly the part
+`ps` cannot see — and its `phys_footprint_peak` line is the number a multi-hour run has to be
+judged on, since the peak is what decides whether the machine swaps. `/tmp/memtrack.sh` samples it
+once a minute into `~/Research/TestVideo/memory.tsv` alongside the run's current phase, so a peak
+can be attributed to the phase that caused it rather than to the run as a whole.
+
+Measured peaks, 48 GB machine:
+
+| Run | Peak | Notes |
+|---|---|---|
+| 1344x768, 10 s, 8 grid points, Turbo LoRA | **27 GB** | ~25 GB steady through diffusion, essentially all of it `IOAccelerator` |
+
+Only the native run has been tracked this way so far; the 512x512 runs predate the tracker and
+their peaks are not recorded. The 27 GB peak is above the 25 GB steady state, and the phase
+residency table above says why to expect that: the text encoder alone is 28.22 GB of weights, so
+on a smaller canvas the peak should land in the encoding phase rather than in diffusion. That is a
+prediction from the table, not yet a measurement.
 
 `memory.report()` prints MLX's numbers, and that is the measurement of *this process's* footprint.
 `ps -o rss=` on this process is not a sanity check for that — it is blind to Metal-backed
