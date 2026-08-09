@@ -597,9 +597,47 @@ Two things found it, neither of them the eight hypotheses:
 explicitly among the parametrized cases, and asserts the three variants are not slices of one
 evaluation. All three assertions go red against the old code.
 
-### Still open
+### How few steps is too few
 
-Strength 0.45 was tuned on one clip — a smooth flying shot. Scenes with fast or complex motion
-(a gallop, two dancers) and near-static ones may want different values; the LoRA's author warns
-specifically about smearing under fast motion at low step counts. A three-scene sweep against
-31-step references is running. Until it lands, 0.45 is one data point, not a recommendation.
+| steps | wall clock | motion vs reference | sharpness | verdict |
+|---|---|---|---|---|
+| 31 (reference) | 24.5 min | 100% | 2.23 | |
+| 8 + LoRA 0.45 | 6.8 min | 117% | 3.10 | **the sweet spot** |
+| 4 + LoRA 0.45 | 3.5 min | 86% | 3.49 | visibly short on detail |
+
+Four steps hold their motion and cost half of eight, but detail suffers in a way a viewer notices
+immediately. That matches what users of this LoRA report independently ("8 steps, quality is much
+better"). **Eight is the recommendation**; four is for iterating on a prompt, not for output.
+
+### Strength 0.45 across scenes
+
+Tuned on one smooth flying shot, then checked against 31-step references on three more:
+
+| scene | motion vs its own reference |
+|---|---|
+| dragon in flight | 117% |
+| galloping horse | 94% |
+| static portrait | 97% |
+
+The LoRA's author warns specifically about smearing under fast motion at low step counts; the
+gallop came out the closest of the three, so that failure mode does not appear here.
+
+A fourth scene (two people dancing) came out poorly — but **equally poorly at 31 steps**, so it is
+not a property of few-step sampling. It was a prompt problem: asking for a wide shot puts the faces
+at roughly forty pixels across, at any canvas size. Naming the shot ("medium shot from the waist
+up") fixed it at 512x512 without needing a larger canvas, which is worth knowing before spending
+four hours on a native render. See "Prompting" below.
+
+### Prompting: name the shot
+
+The model picks a wide shot when the prompt does not say otherwise, and a wide shot at 512x512
+leaves a face perhaps forty pixels across. That is not a resolution limit — a close-up portrait at
+the same 512x512 renders faces well. It is a framing default.
+
+Two fixes to the same prompt, tested against each other:
+
+- naming the shot (`medium shot from the waist up`) — fixed it, at 512x512, in 6.8 min
+- moving to 768x768 without naming the shot — also fixed it, but took 16.6 min
+
+Same result, one costs 2.4x more. Name the shot instead of buying pixels. Also avoid contradicting
+yourself about light: the failing prompt said `dim ballroom` and `warm stage light` in one breath.
