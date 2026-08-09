@@ -394,6 +394,9 @@ def main() -> int:
         test_both_consumers_get_the_same_prepared_keyframe,
         test_each_keyframe_gets_its_own_seed,
         test_no_component_outlives_its_phase,
+        test_the_allocator_cache_is_bounded,
+        test_constructing_a_pipeline_applies_the_limit,
+        test_the_default_limit_leaves_room_to_work,
         test_the_transformer_is_released_before_decoding,
     ]
     for test in tests:
@@ -504,3 +507,55 @@ def test_no_component_outlives_its_phase() -> None:
     check("the transformer is released before decoding", "unload:dit" in events, f"got {events}")
     check("the video VAE is released again before the audio VAE runs",
           events.count("unload:video_vae") == 2, f"got {events}")
+
+
+def test_the_allocator_cache_is_bounded() -> None:
+    """MLX keeps freed buffers forever by default, which a 48 GB machine cannot afford.
+
+    Measured on a real run: 29.1 GB held against roughly 21.4 GB of weights plus activations. The
+    difference is cache the run has no use for, and it is what pushes the machine into swap — one
+    step took 818 s where its neighbours took 568.
+    """
+    from h3_48gb import memory
+
+    previous = memory.limit_cache(1.0)
+    try:
+        restored = memory.limit_cache(2.0)
+        check("the limit is actually applied", restored == int(1.0 * 1e9), f"got {restored}")
+        check("and reports MLX's own numbers, which ps cannot see",
+              "active" in memory.report() and "cached" in memory.report())
+    finally:
+        memory.limit_cache(previous / 1e9)
+
+
+def test_constructing_a_pipeline_applies_the_limit() -> None:
+    """Pinning the rule is not pinning the call site.
+
+    An earlier version of this file tested `limit_cache` alone; removing the pipeline's call to it
+    left every test green. The same gap once shipped a modulation table nobody was transposing.
+    """
+    from h3_48gb import memory
+    from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
+
+    calls: list = []
+    original = memory.limit_cache
+    memory.limit_cache = lambda *a, **k: calls.append(a) or 0
+    try:
+        class Config:
+            sigma_shift_video = 12.0
+            sigma_shift_audio = 3.0
+
+        LazyMiniMaxH3Pipeline(object(), object(), object(), object(), Config(), verbose=False)
+    finally:
+        memory.limit_cache = original
+
+    check("the pipeline bounds the allocator cache when it is built", len(calls) == 1,
+          f"limit_cache was called {len(calls)} times")
+
+
+def test_the_default_limit_leaves_room_to_work() -> None:
+    """Zero would return every intermediate to the OS and reallocate it — correct and slow."""
+    from h3_48gb.memory import DEFAULT_CACHE_LIMIT_GB
+
+    check("the default is neither unbounded nor zero",
+          0 < DEFAULT_CACHE_LIMIT_GB <= 8, f"got {DEFAULT_CACHE_LIMIT_GB}")

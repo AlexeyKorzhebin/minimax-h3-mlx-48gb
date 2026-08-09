@@ -47,6 +47,40 @@ def format_snapshot(label: str, snap: dict[str, float] | None = None) -> str:
             f"rss {snap['rss_gb']:.2f} GB")
 
 
+#: How much freed-buffer cache MLX may keep. Unbounded by default, which is right on a machine
+#: with headroom and wrong here: the allocator reuses buffers rather than returning them, so a
+#: long run drifts upward until the OS starts swapping. A 2h14m run showed 29.1 GB against roughly
+#: 21.4 GB of weights plus activations — the rest was cache the run had no use for.
+#:
+#: Not zero: reallocating every intermediate would cost real time. Two gigabytes is enough for the
+#: churn inside one forward while leaving the difference to the OS.
+DEFAULT_CACHE_LIMIT_GB = 2.0
+
+
+def limit_cache(gigabytes: float | None = None) -> int:
+    """Bound MLX's freed-buffer cache. Returns the previous limit in bytes.
+
+    `H3_CACHE_LIMIT_GB` overrides; 0 disables the cache entirely, which is the safest setting on a
+    machine that is swapping and the slowest everywhere else.
+    """
+    import os
+
+    if gigabytes is None:
+        gigabytes = float(os.environ.get("H3_CACHE_LIMIT_GB", DEFAULT_CACHE_LIMIT_GB))
+    return mx.set_cache_limit(int(gigabytes * 1e9))
+
+
+def report() -> str:
+    """One line of MLX's own accounting — the numbers `ps` cannot see.
+
+    Process RSS omits Metal buffers entirely on Apple silicon: during a run holding 29 GB, `ps`
+    reported 0.13 GB. Activity Monitor and MLX both see it; nothing else does.
+    """
+    s = snapshot()
+    return (f"memory: {s['mlx_active_gb']:.2f} GB active, {s['mlx_cache_gb']:.2f} GB cached, "
+            f"peak {s['mlx_peak_gb']:.2f} GB")
+
+
 def release() -> None:
     """Actually give the memory back, in the order that makes it stick.
 

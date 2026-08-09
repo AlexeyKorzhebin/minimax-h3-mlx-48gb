@@ -225,6 +225,10 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         self._supported_steps: int | None = None
         self._weights_id = weights_id or {}
         self._tracker = memory.PhaseTracker(verbose=verbose)
+        # Bound the allocator's cache before anything is loaded: unbounded, it drifts upward across
+        # a multi-hour run until the machine swaps, and swapping showed up as a step taking 818 s
+        # where its neighbours took 568.
+        memory.limit_cache()
 
     @classmethod
     def from_pretrained(
