@@ -220,6 +220,7 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         load_vision: bool = True,
         unload_after_encode: bool = True,
         verbose: bool = True,
+        adaln_cache: str | Path | None = None,
     ) -> "LazyMiniMaxH3Pipeline":
         """Read every config; read no weights.
 
@@ -232,7 +233,10 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         config = PipelineConfig.from_model_index(root / "model_index.json")
 
         dit_config = DiTConfig.from_json(dit_path / "config.json")
-        cache_path = dit_path / "adaln_cache.safetensors"
+        # An alternate table swaps the whole sampling schedule — that is how few-step runs work.
+        # Passing the path beats the alternative of building a symlink tree per step count, which
+        # is what this required before and is easy to get subtly wrong.
+        cache_path = Path(adaln_cache) if adaln_cache else dit_path / "adaln_cache.safetensors"
 
         if verbose:
             print(f"loading MiniMax-H3 configs from {root} (weights are deferred)")

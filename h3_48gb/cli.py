@@ -41,6 +41,20 @@ DEFAULT_OUTDIR = Path(os.environ.get("H3_OUTDIR") or Path.home() / "video-out")
 BAKED_GRID_POINTS = 31
 
 
+def _grid_points_of(cache: Path) -> int | None:
+    """Grid points in a standalone AdaLN table, read from its safetensors header."""
+    import json
+    import struct
+
+    try:
+        with open(cache, "rb") as fh:
+            length = struct.unpack("<Q", fh.read(8))[0]
+            header = json.loads(fh.read(length))
+        return int(header["video_sigmas"]["shape"][0])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 def baked_grid_points(checkpoint: Path) -> int | None:
     """How many grid points this checkpoint's AdaLN cache covers, or None if it has none.
 
@@ -146,6 +160,9 @@ class RunSpec:
     #: 117% of the 31-step reference where 1.0 overshoots to 213%. See docs/RESULTS.md.
     turbo_lora: Path | None = None
     turbo_strength: float = 0.45
+    #: An AdaLN table baked for a grid other than the checkpoint's own — this is what makes
+    #: `--steps 8` possible. `scripts/bake_adaln.py` produces one.
+    adaln_cache: Path | None = None
 
     def __post_init__(self) -> None:
         """Every refusal that depends only on the request, checked once, at construction.
@@ -166,7 +183,8 @@ class RunSpec:
                 )
         # A checkpoint whose cache cannot be read falls back to the shipped grid, so a missing or
         # corrupt cache still refuses early rather than 28 GB into a run.
-        required = baked_grid_points(self.checkpoint) or BAKED_GRID_POINTS
+        required = (_grid_points_of(self.adaln_cache) if self.adaln_cache
+                    else baked_grid_points(self.checkpoint)) or BAKED_GRID_POINTS
         if self.steps != required:
             raise CliError(
                 "schedule_not_baked",
@@ -236,6 +254,8 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     # Long runs must go through this CLI rather than a throwaway script, because this is where
     # checkpointing lives: a 2h14m run driven by a bare `pipe(...)` call has no resume point and
     # is lost entirely if the process dies. That happened once; hence these flags.
+    sub.add_argument("--adaln-cache", type=Path, default=None,
+                     help="AdaLN table baked for a different step count (scripts/bake_adaln.py)")
     sub.add_argument("--turbo-lora", type=Path, default=None,
                      help="apply a Turbo LoRA at run time (pairs with a few-step --steps)")
     sub.add_argument("--turbo-strength", type=float, default=0.45,
@@ -354,6 +374,7 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
         preview_every=args.preview_every, preview_stem=args.preview_stem,
         preview_decoder=args.preview_decoder,
         turbo_lora=args.turbo_lora, turbo_strength=args.turbo_strength,
+        adaln_cache=args.adaln_cache,
     )
 
 
@@ -449,7 +470,9 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
     # every existing `pipeline_factory=lambda _: ...` test stub keeps working unchanged; `verbose`
     # reaches `from_pretrained` (which does its own printing while loading configs) via closure
     # instead of a second factory argument.
-    factory = pipeline_factory or (lambda checkpoint: _default_pipeline_factory(checkpoint, verbose=verbose))
+    factory = pipeline_factory or (
+        lambda checkpoint: _default_pipeline_factory(checkpoint, verbose=verbose,
+                                                     adaln_cache=spec.adaln_cache))
     pipe = install_turbo_lora(factory(spec.checkpoint), spec, verbose=verbose)
 
     # Refusals from h3_48gb.checkpoint are already precise (which field mismatched, why the file
@@ -534,7 +557,8 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
     return report
 
 
-def _default_pipeline_factory(checkpoint: Path, verbose: bool = True):
+def _default_pipeline_factory(checkpoint: Path, verbose: bool = True,
+                              adaln_cache: Path | None = None):
     """Load the real LazyMiniMaxH3Pipeline from a checkpoint.
 
     `verbose=False` silences `from_pretrained`'s own "loading MiniMax-H3 configs..." /
@@ -543,7 +567,8 @@ def _default_pipeline_factory(checkpoint: Path, verbose: bool = True):
     """
     from h3_48gb import LazyMiniMaxH3Pipeline
 
-    return LazyMiniMaxH3Pipeline.from_pretrained(str(checkpoint), verbose=verbose)
+    return LazyMiniMaxH3Pipeline.from_pretrained(str(checkpoint), verbose=verbose,
+                                                 adaln_cache=adaln_cache)
 
 
 def install_turbo_lora(pipe, spec: RunSpec, verbose: bool = True):
@@ -616,7 +641,9 @@ def run_resume(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wav_
     continued rather than quietly restarted from step 0, which `checkpoint_not_found` makes a
     machine-checkable fact instead of something only visible in a log line.
     """
-    factory = pipeline_factory or (lambda checkpoint: _default_pipeline_factory(checkpoint, verbose=verbose))
+    factory = pipeline_factory or (
+        lambda checkpoint: _default_pipeline_factory(checkpoint, verbose=verbose,
+                                                     adaln_cache=spec.adaln_cache))
     pipe = install_turbo_lora(factory(spec.checkpoint), spec, verbose=verbose)
 
     checkpoint_dir = spec.resume_checkpoint_dir()

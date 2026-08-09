@@ -827,7 +827,7 @@ def test_error_codes_are_documented_in_one_place():
 
 # -- verbose: the --json stdout contract must survive a chatty pipeline -------------------------
 
-def _chatty_pipeline_factory(checkpoint, verbose=True):
+def _chatty_pipeline_factory(checkpoint, verbose=True, **kwargs):
     """Stands in for `_default_pipeline_factory`, printing exactly what the real one and the
     checkpoint writer do when `verbose` is left on: `LazyMiniMaxH3Pipeline.from_pretrained` prints
     while loading configs, and `ResumableRun._write` prints its "checkpoint: N/M steps" line on
@@ -1186,24 +1186,64 @@ def test_the_step_count_is_read_from_the_checkpoint_not_hardcoded(tmp_path):
     assert excinfo.value.detail["required"] == 8, "the refusal must quote this checkpoint's grid"
 
 
-def test_output_does_not_default_into_the_weights_directory(monkeypatch):
+def test_output_does_not_default_into_the_weights_directory():
     """Clips are disposable; the 46 GB of weights beside them are not.
 
     They used to share `~/models`, which makes "clear out the videos" a dangerous command and
-    made 1.2 GB of test output accumulate inside the model store. `H3_OUTDIR` exists so a
+    let 1.2 GB of test output accumulate inside the model store. `H3_OUTDIR` exists so a
     permanent choice does not need a flag on every invocation.
-    """
-    import importlib
 
+    The env-var half runs in a subprocess rather than via `importlib.reload`: reloading rebinds
+    every class in the module, so `CliError` raised afterwards is a different object than the one
+    this file imported, and unrelated tests start failing in ways that have nothing to do with
+    what they check. That happened.
+    """
     from h3_48gb import cli
 
     assert "models" not in cli.DEFAULT_OUTDIR.parts, (
         f"the default output directory sits inside the model store: {cli.DEFAULT_OUTDIR}")
 
-    monkeypatch.setenv("H3_OUTDIR", "/tmp/somewhere-else")
-    reloaded = importlib.reload(cli)
-    try:
-        assert reloaded.DEFAULT_OUTDIR == Path("/tmp/somewhere-else")
-    finally:
-        monkeypatch.delenv("H3_OUTDIR")
-        importlib.reload(cli)
+    result = subprocess.run(
+        [sys.executable, "-c", "from h3_48gb.cli import DEFAULT_OUTDIR; print(DEFAULT_OUTDIR)"],
+        capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent),
+        env={**os.environ, "H3_OUTDIR": "/tmp/somewhere-else"})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "/tmp/somewhere-else", (
+        f"H3_OUTDIR was ignored; got {result.stdout.strip()!r}")
+
+
+def test_an_alternate_adaln_cache_decides_the_step_count(tmp_path):
+    """`--adaln-cache` is what makes few-step runs reachable without a symlink tree.
+
+    Before it, running 8 steps meant building a whole fake checkpoint directory whose every
+    entry symlinked to the real one except the table — easy to get subtly wrong, and it was.
+    """
+    import json
+    import struct
+
+    from h3_48gb.cli import _grid_points_of
+
+    def table(points: int) -> Path:
+        header = {"video_sigmas": {"dtype": "F32", "shape": [points], "data_offsets": [0, 4 * points]}}
+        packed = json.dumps(header).encode()
+        path = tmp_path / f"table{points}.safetensors"
+        with open(path, "wb") as fh:
+            fh.write(struct.pack("<Q", len(packed)))
+            fh.write(packed)
+            fh.write(b"\x00" * 4 * points)
+        return path
+
+    assert _grid_points_of(table(8)) == 8
+    assert _grid_points_of(tmp_path / "absent.safetensors") is None, "a missing table must not raise"
+
+    # The checkpoint's own table says 31; the alternate says 8, and the alternate must win.
+    spec = spec_from_args(build_parser().parse_args(
+        ["generate", "a cat", "--steps", "8", "--adaln-cache", str(table(8)),
+         "--outdir", str(tmp_path)]))
+    assert spec.steps == 8
+
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "a cat", "--steps", "31", "--adaln-cache", str(table(8)),
+             "--outdir", str(tmp_path)]))
+    assert excinfo.value.detail["required"] == 8, "the refusal must quote the alternate table"
