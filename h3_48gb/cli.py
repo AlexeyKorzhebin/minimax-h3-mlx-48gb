@@ -138,6 +138,11 @@ class RunSpec:
     #: per preview; `tae` is an approximation for watching progress and never for the delivered
     #: clip; `latent` is the VAE-free heat map.
     preview_decoder: str = "tae"
+    #: A Turbo LoRA to apply at run time, restoring the motion that few-step sampling loses.
+    #: `turbo_strength` is deliberately not 1.0 by default: measured, 0.45 lands the motion at
+    #: 117% of the 31-step reference where 1.0 overshoots to 213%. See docs/RESULTS.md.
+    turbo_lora: Path | None = None
+    turbo_strength: float = 0.45
 
     def __post_init__(self) -> None:
         """Every refusal that depends only on the request, checked once, at construction.
@@ -225,6 +230,13 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     # an approximation for watching progress, never for the delivered clip. Without the weights,
     # `tae` falls back to the VAE-free latent heat map, so this default costs nothing to a reader
     # who never downloads them.
+    # Long runs must go through this CLI rather than a throwaway script, because this is where
+    # checkpointing lives: a 2h14m run driven by a bare `pipe(...)` call has no resume point and
+    # is lost entirely if the process dies. That happened once; hence these flags.
+    sub.add_argument("--turbo-lora", type=Path, default=None,
+                     help="apply a Turbo LoRA at run time (pairs with a few-step --steps)")
+    sub.add_argument("--turbo-strength", type=float, default=0.45,
+                     help="LoRA strength (default 0.45; 1.0 overshoots the reference motion)")
     sub.add_argument("--preview-decoder", choices=("vae", "tae", "latent"), default="tae",
                      help="decoder for in-flight previews (default: tae, ~400x faster than vae)")
     sub.add_argument("--json", action="store_true", help="emit a machine-readable report")
@@ -338,6 +350,7 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
         image=args.image, end_image=args.end_image,
         preview_every=args.preview_every, preview_stem=args.preview_stem,
         preview_decoder=args.preview_decoder,
+        turbo_lora=args.turbo_lora, turbo_strength=args.turbo_strength,
     )
 
 
@@ -434,7 +447,7 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
     # reaches `from_pretrained` (which does its own printing while loading configs) via closure
     # instead of a second factory argument.
     factory = pipeline_factory or (lambda checkpoint: _default_pipeline_factory(checkpoint, verbose=verbose))
-    pipe = factory(spec.checkpoint)
+    pipe = install_turbo_lora(factory(spec.checkpoint), spec, verbose=verbose)
 
     # Refusals from h3_48gb.checkpoint are already precise (which field mismatched, why the file
     # would not read) — CliError just gives them a stable code so `--json` does not have to
@@ -530,6 +543,33 @@ def _default_pipeline_factory(checkpoint: Path, verbose: bool = True):
     return LazyMiniMaxH3Pipeline.from_pretrained(str(checkpoint), verbose=verbose)
 
 
+def install_turbo_lora(pipe, spec: RunSpec, verbose: bool = True):
+    """Apply `spec.turbo_lora` to whatever pipeline the factory produced, and return it.
+
+    A separate step rather than a factory argument, for two reasons: it works with any factory
+    (test stubs take one argument and must keep doing so), and `resume` gets it for free.
+
+    Wraps the *loader* rather than the loaded transformer, because the transformer is lazy — it
+    does not exist yet here, and a resumed run drops and reloads it.
+    """
+    if spec.turbo_lora is None:
+        return pipe
+
+    from h3_48gb.turbo import apply_backbone_lora, apply_lightx2v_lora
+
+    inner = pipe.dit.__dict__["_loader"]
+    apply = (apply_lightx2v_lora if "lightx2v" in Path(spec.turbo_lora).name.lower()
+             else apply_backbone_lora)
+
+    def load_with_lora():
+        dit = inner()
+        apply(dit, spec.turbo_lora, strength=spec.turbo_strength, verbose=verbose)
+        return dit
+
+    pipe.dit.__dict__["_loader"] = load_with_lora
+    return pipe
+
+
 def _checkpoint_path_for(spec: RunSpec, pipe, checkpoint_dir: Path) -> Path:
     """The resume-checkpoint file `run_generate`'s call to `pipe(...)` would use for this spec.
 
@@ -574,7 +614,7 @@ def run_resume(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wav_
     machine-checkable fact instead of something only visible in a log line.
     """
     factory = pipeline_factory or (lambda checkpoint: _default_pipeline_factory(checkpoint, verbose=verbose))
-    pipe = factory(spec.checkpoint)
+    pipe = install_turbo_lora(factory(spec.checkpoint), spec, verbose=verbose)
 
     checkpoint_dir = spec.resume_checkpoint_dir()
     path = _checkpoint_path_for(spec, pipe, checkpoint_dir)

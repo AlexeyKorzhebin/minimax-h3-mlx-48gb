@@ -239,6 +239,9 @@ def test_keyframes_load_the_vae_before_upstream_seeds() -> None:
         def load(self):
             events.append("vae-load")
 
+        def unload(self):
+            events.append("vae-unload")
+
     class Config:
         sigma_shift_video = 12.0
         sigma_shift_audio = 3.0
@@ -253,8 +256,8 @@ def test_keyframes_load_the_vae_before_upstream_seeds() -> None:
     finally:
         MiniMaxH3Pipeline._encode_keyframes = original
 
-    check("vae is loaded before upstream runs", events == ["vae-load", "upstream-encode"],
-          f"got {events}")
+    check("vae is loaded before upstream runs, and released after",
+          events == ["vae-load", "upstream-encode", "vae-unload"], f"got {events}")
     check("upstream's return value is passed through", returned == "rows", f"got {returned!r}")
 
 
@@ -324,6 +327,9 @@ def test_each_keyframe_gets_its_own_seed() -> None:
         def load(self):
             pass
 
+        def unload(self):
+            pass
+
     class Config:
         sigma_shift_video = 12.0
         sigma_shift_audio = 3.0
@@ -387,6 +393,7 @@ def main() -> int:
         test_keyframes_load_the_vae_before_upstream_seeds,
         test_both_consumers_get_the_same_prepared_keyframe,
         test_each_keyframe_gets_its_own_seed,
+        test_no_component_outlives_its_phase,
         test_the_transformer_is_released_before_decoding,
     ]
     for test in tests:
@@ -447,3 +454,53 @@ def test_the_transformer_is_released_before_decoding() -> None:
     check("the video VAE goes before the audio decode",
           events[2:] == ["unload:video_vae", "decode:audio"], f"got {events}")
     check("the modulation table is dropped with the transformer", pipe._cache is None)
+
+
+def test_no_component_outlives_its_phase() -> None:
+    """Every phase should hold only what it needs, and nothing that is merely convenient.
+
+    Four unloads make that true, and each was absent at some point: the text encoder after
+    `encode` (28.2 GB), the video VAE after keyframe encoding (5.21 GB across hours of
+    diffusion), the transformer before decoding (11.34 GB plus LoRA and modulation table), and
+    the video VAE again before the audio VAE loads. None of them raises when missing — the run
+    just needs more memory than the machine has, which is the whole problem this fork exists for.
+    """
+    from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    events: list[str] = []
+
+    class Proxy:
+        def __init__(self, name):
+            self.name = name
+        def load(self):
+            events.append(f"load:{self.name}")
+        def unload(self):
+            events.append(f"unload:{self.name}")
+
+    class Config:
+        sigma_shift_video = 12.0
+        sigma_shift_audio = 3.0
+
+    video = Proxy("video_vae")
+    pipe = LazyMiniMaxH3Pipeline(Proxy("dit"), object(), video, Proxy("audio_vae"),
+                                 Config(), verbose=False)
+
+    originals = (MiniMaxH3Pipeline._encode_keyframes, MiniMaxH3Pipeline._decode_video,
+                 MiniMaxH3Pipeline._decode_audio)
+    MiniMaxH3Pipeline._encode_keyframes = lambda self, i, h, w: mx.zeros((2, 4))
+    MiniMaxH3Pipeline._decode_video = lambda self, r, *a, **k: "video"
+    MiniMaxH3Pipeline._decode_audio = lambda self, r, *a, **k: "audio"
+    try:
+        pipe._encode_keyframes([object()], 512, 512)
+        pipe._decode_video(mx.zeros((2, 4)), 1, 1, 1)
+        pipe._decode_audio(mx.zeros((2, 4)), 1)
+    finally:
+        (MiniMaxH3Pipeline._encode_keyframes, MiniMaxH3Pipeline._decode_video,
+         MiniMaxH3Pipeline._decode_audio) = originals
+
+    check("the video VAE is released after keyframes, not held through diffusion",
+          events[:2] == ["load:video_vae", "unload:video_vae"], f"got {events}")
+    check("the transformer is released before decoding", "unload:dit" in events, f"got {events}")
+    check("the video VAE is released again before the audio VAE runs",
+          events.count("unload:video_vae") == 2, f"got {events}")

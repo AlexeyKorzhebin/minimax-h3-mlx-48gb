@@ -281,7 +281,7 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         self.video_vae.load()
         encode = super()._encode_keyframes
         if len(images) < 2:
-            return encode(images, height, width)
+            return self._release_vae_after(encode(images, height, width))
 
         # Seed 42 once per keyframe, not once per request. Upstream seeds outside its loop, so the
         # second keyframe's posterior sample continues the stream; the reference builds a fresh
@@ -301,7 +301,23 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
                 f"Keyframes must already be on the {width}x{height} canvas before they are encoded "
                 f"one at a time, but {wrong_size} are not. See `__call__`, which prepares them."
             )
-        return mx.concatenate([encode([image], height, width) for image in images])
+        return self._release_vae_after(
+            mx.concatenate([encode([image], height, width) for image in images]))
+
+    def _release_vae_after(self, rows: mx.array) -> mx.array:
+        """Materialize the conditioning rows, then drop the video VAE until the final decode.
+
+        Encoding keyframes is the VAE's first job and the decode is its second, with the entire
+        diffusion loop in between — hours, on a long clip. Holding 5.21 GB across it buys nothing.
+
+        The `mx.eval` is what makes the release real rather than nominal: until the rows are
+        materialized they are a lazy graph over the VAE's parameters, and dropping the module
+        would free none of them. Same trap `LazyTextEncoder` documents for the 28.2 GB encoder.
+        """
+        mx.eval(rows)
+        self.video_vae.unload()
+        memory.release()
+        return rows
 
     # -- decoding: the diffusion phase is over, so stop paying for it ---------------------------
 
