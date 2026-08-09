@@ -1247,3 +1247,104 @@ def test_an_alternate_adaln_cache_decides_the_step_count(tmp_path):
             ["generate", "a cat", "--steps", "31", "--adaln-cache", str(table(8)),
              "--outdir", str(tmp_path)]))
     assert excinfo.value.detail["required"] == 8, "the refusal must quote the alternate table"
+
+
+# -- what a resume must not silently cross -------------------------------------------------------
+
+def _turbo_spec(tmp_path, **overrides):
+    lora = tmp_path / "lora.safetensors"
+    lora.write_bytes(b"x" * 128)
+    base = dict(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
+                checkpoint=tmp_path, outdir=tmp_path, tag="t", turbo_lora=lora)
+    base.update(overrides)
+    return RunSpec(**base)
+
+
+def test_the_lora_is_installed_once_even_when_resume_asks_twice(tmp_path):
+    """`run_resume` installs, then calls `run_generate`, which installs again.
+
+    Nested wrappers double the effective strength: 0.45 applies as 0.90, and every number this
+    project measured for strength stops meaning anything. Nothing raises — the clip is just wrong.
+    """
+    from h3_48gb.cli import install_turbo_lora
+
+    applied = []
+
+    class FakeLoader:
+        def __call__(self):
+            return object()
+
+    class FakeDit(dict):
+        pass
+
+    class FakePipe:
+        def __init__(self):
+            self.dit = type("P", (), {"__dict__": {"_loader": FakeLoader()}})()
+
+    import h3_48gb.turbo as turbo
+    original = turbo.apply_backbone_lora
+    turbo.apply_backbone_lora = lambda dit, path, **kw: applied.append(kw.get("strength"))
+    try:
+        pipe = FakePipe()
+        spec = _turbo_spec(tmp_path, turbo_strength=0.45)
+        install_turbo_lora(pipe, spec, verbose=False)
+        install_turbo_lora(pipe, spec, verbose=False)      # the resume path's second call
+        pipe.dit.__dict__["_loader"]()                      # force the wrapped loader to run
+    finally:
+        turbo.apply_backbone_lora = original
+
+    assert applied == [0.45], (
+        f"the adapter was applied {len(applied)} times at {applied} — nesting doubles the strength")
+
+
+def test_the_adapter_and_its_strength_are_part_of_the_checkpoint_identity(tmp_path):
+    """Resuming at a different strength must not silently continue the interrupted run.
+
+    Both change every latent the run produces, so a checkpoint written under one is not a
+    checkpoint for the other. The AdaLN table is identified by size too, not just name: tables
+    are baked now, and two bakes can share a filename while differing in step count.
+    """
+    from h3_48gb.pipeline import _file_identity
+
+    small, large = tmp_path / "t.safetensors", tmp_path / "u.safetensors"
+    small.write_bytes(b"x" * 10)
+    large.write_bytes(b"x" * 20)
+    assert _file_identity(small) != _file_identity(large), "same-name tables must not collide"
+    assert _file_identity(None) is None
+
+    class FakePipe:
+        _weights_id = {}
+        _adaln_cache_path = small
+        _turbo_lora = small
+        _turbo_strength = 0.45
+
+        class config:
+            sigma_shift_video = 12.0
+            sigma_shift_audio = 3.0
+
+    from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
+
+    identity = LazyMiniMaxH3Pipeline.checkpoint_identity_extra(FakePipe())
+    assert identity["turbo_strength"] == 0.45
+    assert identity["turbo_lora"] == [small.name, 10]
+    assert identity["adaln_cache"] == [small.name, 10]
+
+    FakePipe._turbo_strength = 0.9
+    assert LazyMiniMaxH3Pipeline.checkpoint_identity_extra(FakePipe()) != identity
+
+
+def test_bad_turbo_inputs_are_refused_before_any_weight_loads(tmp_path):
+    """These are 28 GB and several minutes from being discovered otherwise."""
+    with pytest.raises(CliError) as excinfo:
+        _turbo_spec(tmp_path, turbo_lora=tmp_path / "absent.safetensors")
+    assert excinfo.value.code == "lora_not_found"
+
+    with pytest.raises(CliError) as excinfo:
+        _turbo_spec(tmp_path, turbo_strength=float("nan"))
+    assert excinfo.value.code == "turbo_strength_invalid"
+
+    junk = tmp_path / "junk.safetensors"
+    junk.write_bytes(b"not a safetensors file at all")
+    with pytest.raises(CliError) as excinfo:
+        _turbo_spec(tmp_path, adaln_cache=junk)
+    assert excinfo.value.code == "adaln_cache_unreadable"

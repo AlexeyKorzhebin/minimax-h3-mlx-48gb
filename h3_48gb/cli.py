@@ -41,18 +41,36 @@ DEFAULT_OUTDIR = Path(os.environ.get("H3_OUTDIR") or Path.home() / "video-out")
 BAKED_GRID_POINTS = 31
 
 
+#: safetensors headers are JSON and small — the largest table here is under 64 KB of header.
+#: A junk file read as one yields an absurd length prefix, and `fh.read(that)` raises MemoryError
+#: rather than returning garbage, which no reasonable `except` clause on a parser would list.
+#: Bounding the read turns a crash into the `None` every caller already handles.
+_MAX_HEADER_BYTES = 8 << 20
+
+
+def _grid_points_from_header(path: Path) -> int | None:
+    """Grid points in a safetensors AdaLN table, or None if it cannot be read as one."""
+    import json
+    import struct
+
+    try:
+        size = Path(path).stat().st_size
+        with open(path, "rb") as fh:
+            length = struct.unpack("<Q", fh.read(8))[0]
+            if length > min(_MAX_HEADER_BYTES, size):
+                return None
+            header = json.loads(fh.read(length))
+        return int(header["video_sigmas"]["shape"][0])
+    except (OSError, ValueError, KeyError, struct.error):
+        return None
+
+
 def _grid_points_of(cache: Path) -> int | None:
     """Grid points in a standalone AdaLN table, read from its safetensors header."""
     import json
     import struct
 
-    try:
-        with open(cache, "rb") as fh:
-            length = struct.unpack("<Q", fh.read(8))[0]
-            header = json.loads(fh.read(length))
-        return int(header["video_sigmas"]["shape"][0])
-    except (OSError, ValueError, KeyError):
-        return None
+    return _grid_points_from_header(cache)
 
 
 def baked_grid_points(checkpoint: Path) -> int | None:
@@ -68,14 +86,7 @@ def baked_grid_points(checkpoint: Path) -> int | None:
     import json
     import struct
 
-    path = Path(checkpoint) / "transformer/adaln_cache.safetensors"
-    try:
-        with open(path, "rb") as fh:
-            length = struct.unpack("<Q", fh.read(8))[0]
-            header = json.loads(fh.read(length))
-        return int(header["video_sigmas"]["shape"][0])
-    except (OSError, ValueError, KeyError):
-        return None
+    return _grid_points_from_header(Path(checkpoint) / "transformer/adaln_cache.safetensors")
 
 #: Every machine-readable failure code this CLI can raise under `--json`. The whole contract an
 #: MCP wrapper needs is here: match on `error.code`, never on `error.message` — the sentence can
@@ -92,6 +103,9 @@ ERROR_CODES = {
     "image_unreadable": "a keyframe exists but could not be decoded as an image",
     "image_aspect_unsupported": "a keyframe's aspect ratio is outside the 1:4..4:1 the model supports",
     "partial_canvas_with_image": "--image was given with only one of --width/--height",
+    "lora_not_found": "--turbo-lora points at a file that does not exist",
+    "turbo_strength_invalid": "--turbo-strength is not a finite number",
+    "adaln_cache_unreadable": "--adaln-cache exists but is not a readable AdaLN table",
     "upstream_patch_missing": "a keyframe was given but the vendored upstream/ checkout is unpatched",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
@@ -202,6 +216,22 @@ class RunSpec:
             raise CliError("end_image_without_image",
                            "--end-image needs --image: the end frame is the far anchor of a "
                            "run whose near anchor is the start frame.")
+        import math
+
+        if self.turbo_lora is not None and not Path(self.turbo_lora).exists():
+            raise CliError("lora_not_found", f"--turbo-lora does not exist: {self.turbo_lora}",
+                           {"path": str(self.turbo_lora)})
+        if not math.isfinite(self.turbo_strength):
+            raise CliError("turbo_strength_invalid",
+                           f"--turbo-strength must be a finite number, got {self.turbo_strength}",
+                           {"turbo_strength": self.turbo_strength})
+        if self.adaln_cache is not None and _grid_points_of(self.adaln_cache) is None:
+            # Falling back to the checkpoint's grid here would accept `--steps 31` and then hand
+            # the pipeline an unreadable table — a failure 28 GB into the run instead of now.
+            raise CliError("adaln_cache_unreadable",
+                           f"--adaln-cache could not be read as an AdaLN table: {self.adaln_cache}",
+                           {"path": str(self.adaln_cache)})
+
         for label, path in (("--image", self.image), ("--end-image", self.end_image)):
             if path is not None and not Path(path).exists():
                 raise CliError("image_not_found", f"{label} does not exist: {path}",
@@ -583,6 +613,13 @@ def install_turbo_lora(pipe, spec: RunSpec, verbose: bool = True):
     if spec.turbo_lora is None:
         return pipe
 
+    # `run_resume` installs, then calls `run_generate`, which installs again — nesting one
+    # LoRALinear inside another and doubling the effective strength. Found in review before it
+    # cost a run: 0.45 requested would have applied as 0.90, and the numbers this project spent a
+    # day measuring would have meant nothing.
+    if getattr(pipe, "_turbo_lora", None) is not None:
+        return pipe
+
     from h3_48gb.turbo import apply_backbone_lora, apply_lightx2v_lora
 
     inner = pipe.dit.__dict__["_loader"]
@@ -595,6 +632,10 @@ def install_turbo_lora(pipe, spec: RunSpec, verbose: bool = True):
         return dit
 
     pipe.dit.__dict__["_loader"] = load_with_lora
+    # Recorded so `checkpoint_identity_extra` can bind them: a resume at another strength, or with
+    # another adapter, is a different run and must not silently continue this one's latents.
+    pipe._turbo_lora = Path(spec.turbo_lora)
+    pipe._turbo_strength = spec.turbo_strength
     return pipe
 
 

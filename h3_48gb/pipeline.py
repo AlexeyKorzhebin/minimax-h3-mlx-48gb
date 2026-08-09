@@ -50,6 +50,17 @@ from .preview import PreviewInterceptor, pop_preview_kwargs
 from .text_encoder import QuantizedTextEncoder
 
 
+def _file_identity(path: Path | None) -> list | None:
+    """``[name, size]`` — enough to tell a rebaked file from the one a checkpoint was written под.
+
+    Deliberately not a content hash: see `checkpoint_identity_extra`.
+    """
+    if path is None:
+        return None
+    path = Path(path)
+    return [path.name, path.stat().st_size if path.exists() else None]
+
+
 # -- configs read without touching the weights -------------------------------------------------
 
 def video_vae_config(model_dir: Path):
@@ -206,6 +217,10 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
                  verbose: bool = True, weights_id: dict | None = None):
         super().__init__(dit, text_encoder, video_vae, audio_vae, config)
         self._adaln_cache_path = Path(adaln_cache_path) if adaln_cache_path else None
+        #: Set by `h3_48gb.cli.install_turbo_lora`; part of the checkpoint identity because the
+        #: adapter and its strength change every latent the run produces.
+        self._turbo_lora: Path | None = None
+        self._turbo_strength: float | None = None
         self._schedules = None
         self._supported_steps: int | None = None
         self._weights_id = weights_id or {}
@@ -414,12 +429,27 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         return self._supported_steps
 
     def checkpoint_identity_extra(self) -> dict:
-        """The weight files and the sigma shifts — everything outside the request that steers the run."""
+        """Everything outside the request that steers the run, so a resume cannot cross streams.
+
+        The AdaLN table used to be identified by filename alone. That is not enough once tables
+        are baked rather than shipped: two tables can share a name and differ in step count, in
+        sigma grid, or in whether a LoRA was folded into them — and resuming across that produces
+        a clip denoised half one way and half the other, with nothing raised.
+
+        Same for the runtime adapter. `turbo_strength` changes every latent it touches, so a run
+        resumed at a different strength is not the run that was interrupted.
+
+        Path plus byte size, as `weights_fingerprint` does, and for the same reason: hashing the
+        contents would cost more than the step it protects, while size catches the failure that
+        actually happens — a rebaked or swapped file.
+        """
         return {
             "weights": self._weights_id,
             "sigma_shift_video": self.config.sigma_shift_video,
             "sigma_shift_audio": self.config.sigma_shift_audio,
-            "adaln_cache": self._adaln_cache_path.name if self._adaln_cache_path else None,
+            "adaln_cache": _file_identity(self._adaln_cache_path),
+            "turbo_lora": _file_identity(self._turbo_lora),
+            "turbo_strength": self._turbo_strength,
         }
 
     def __call__(self, *args, **kwargs):
