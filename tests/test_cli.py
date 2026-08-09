@@ -1348,3 +1348,47 @@ def test_bad_turbo_inputs_are_refused_before_any_weight_loads(tmp_path):
     with pytest.raises(CliError) as excinfo:
         _turbo_spec(tmp_path, adaln_cache=junk)
     assert excinfo.value.code == "adaln_cache_unreadable"
+
+
+def test_the_lora_side_path_is_numerically_unchanged_by_its_optimizations(tmp_path):
+    """`addmm` and the stack-instead-of-gather must be exact, not approximate.
+
+    The delta used to be materialized in full before being added — 2.16 GB for `mlp.fc1` at
+    37,657 rows — and the QKV path used to build a slab-ordered copy and then gather it into
+    per-head order. Both are avoidable; neither may change a single value.
+    """
+    import mlx.core as mx
+
+    from h3_48gb.turbo import LoRALinear, SplitQKVLoRALinear, slabs_to_interleaved
+
+    mx.random.seed(0)
+    x = mx.random.normal((3, 64))
+
+    class Base:
+        def __init__(self, out_dim):
+            self.w = mx.random.normal((out_dim, 64))
+
+        def __call__(self, v):
+            return v @ self.w.T
+
+    # plain: out + strength * (x @ A.T) @ B.T
+    base = Base(96)
+    a, b = mx.random.normal((8, 64)), mx.random.normal((96, 8))
+    layer = LoRALinear(base, a, b, strength=0.45)
+    expected = base(x) + 0.45 * ((x @ a.T) @ b.T)
+    assert float(mx.abs(layer(x) - expected).max()) < 1e-4, "addmm changed the result"
+
+    # split QKV: the stack must equal the explicit permutation
+    heads, dim = 4, 8
+    width = 3 * heads * dim
+    qkv_base = Base(width)
+    factors = {p: (mx.random.normal((8, 64)), mx.random.normal((heads * dim, 8)))
+               for p in ("q", "k", "v")}
+    permutation = slabs_to_interleaved(heads, dim)
+    layer = SplitQKVLoRALinear(qkv_base, factors, permutation, 0.45, heads, dim)
+
+    slabs = mx.concatenate([(x @ factors[p][0].T) @ factors[p][1].T for p in ("q", "k", "v")],
+                           axis=-1)
+    expected = qkv_base(x) + 0.45 * slabs[..., permutation]
+    assert float(mx.abs(layer(x) - expected).max()) < 1e-4, (
+        "the stack does not reproduce the slab -> per-head permutation")

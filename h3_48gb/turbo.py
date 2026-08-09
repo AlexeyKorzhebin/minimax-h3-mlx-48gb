@@ -60,8 +60,12 @@ class LoRALinear(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         out = self.base(x)
-        delta = (x @ self.lora_a.T) @ self.lora_b.T
-        return out + self.strength * delta.astype(out.dtype)
+        # `out + strength * (low @ B.T)` materializes a full output-sized delta before adding it:
+        # 2.16 GB for `mlp.fc1` at 37,657 rows, live only long enough to be discarded. `addmm`
+        # accumulates into `out` instead.
+        low = x @ self.lora_a.T
+        return mx.addmm(out, low.astype(out.dtype), self.lora_b.T.astype(out.dtype),
+                        alpha=self.strength)
 
 
 def _resolve(root: nn.Module, path: str):
@@ -173,23 +177,30 @@ class SplitQKVLoRALinear(nn.Module):
     per-head interleave afterwards — the same reordering the fused adapter needs.
     """
 
-    def __init__(self, base: nn.Module, factors, permutation: mx.array, scale: float):
+    def __init__(self, base: nn.Module, factors, permutation: mx.array, scale: float,
+                 num_heads: int = 56, head_dim: int = 128):
         super().__init__()
         self.base = base
         self.q_a, self.q_b = factors["q"]
         self.k_a, self.k_b = factors["k"]
         self.v_a, self.v_b = factors["v"]
-        self.permutation = permutation
         self.scale = scale
+        self.num_heads = num_heads
+        self.head_dim = head_dim
 
     def __call__(self, x: mx.array) -> mx.array:
         out = self.base(x)
-        delta = mx.concatenate([
-            (x @ self.q_a.T) @ self.q_b.T,
-            (x @ self.k_a.T) @ self.k_b.T,
-            (x @ self.v_a.T) @ self.v_b.T,
-        ], axis=-1)
-        return out + self.scale * delta[..., self.permutation].astype(out.dtype)
+        shape = (*x.shape[:-1], self.num_heads, self.head_dim)
+        # Stacking on the head axis *is* the slab -> per-head interleave permutation, so the
+        # gather this used to do is unnecessary: `[q|k|v]` reshaped per head and stacked at axis
+        # -2 lands each head's q, k and v adjacent, which is the layout `dit.py` reads. Verified
+        # elementwise against the explicit permutation. Saves a full 21,504-wide copy per block.
+        delta = mx.stack([
+            ((x @ self.q_a.T) @ self.q_b.T).reshape(shape),
+            ((x @ self.k_a.T) @ self.k_b.T).reshape(shape),
+            ((x @ self.v_a.T) @ self.v_b.T).reshape(shape),
+        ], axis=-2).reshape(*x.shape[:-1], 3 * self.num_heads * self.head_dim)
+        return out + self.scale * delta.astype(out.dtype)
 
 
 def apply_lightx2v_lora(dit, weights_path: Path | str, strength: float = 1.0,
