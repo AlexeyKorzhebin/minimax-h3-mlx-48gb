@@ -831,3 +831,42 @@ What this buys, at 8 steps, on 1344x768:
 Native resolution is affordable at short durations and only at short durations. The 10 s version is
 not four times the 5 s version, it is nearly three times, and that gap is the quadratic term
 arriving.
+
+
+## Damaged faces are a resolution problem, not a step-count problem
+
+The complaint that started this was a distorted face in a waist-up two-shot. Three things were
+tried against it and two of them did nothing:
+
+- **More steps: no effect.** 8 versus 31 grid points leaves the noise floor identical (flat-region
+  residual 0.72 vs 0.69, temporal flicker 8.55 vs 8.55). The `tail-split` runs, which hold the
+  composition bit-identical and subdivide only the final Euler step, made the image *softer* as the
+  tail was split further — 99.2, 89.4, 86.8 sharpness at frame 0 for splits of 1, 2 and 3.
+- **A pinned keyframe: no effect on rendering.** With composition fixed for the first ~8 frames,
+  8 / 16 / tail-3 differ by 5% on the face band (93.8 / 98.5 / 98.0) — which is to say they do not
+  differ. What the keyframe *does* fix is the weak opening, which is a separate problem.
+- **More pixels: this is the one.**
+
+The first resolution ladder — 512, 640, 768, 896x512 on one seed — could not settle it, because
+changing the canvas changes the latent shape and therefore the scene: four canvases produced four
+different mise-en-scenes, not one at four sizes. Averaging the framing lottery over three seeds at
+each of two canvases does settle it:
+
+| canvas | seed 20260909 | 20260912 | 20260913 | mean | spread |
+|---|---|---|---|---|---|
+| 512x512 | 81.4 | 40.2 | 44.0 | **55.2** | 18.6 |
+| 768x768 | 55.8 | 69.3 | 63.8 | **63.0** | **5.5** |
+
+768 is better on the mean and, more tellingly, **three times more consistent**. At 512 the outcome
+swings by a factor of two between seeds — sometimes a usable face, sometimes a mangled one. At 768
+every seed lands in a narrow band. Looking at the sheet
+(`_сравнения/сиды-512-против-768.png`) the difference is not subtle: at 512 two of the three seeds
+render the man's face with visibly wrong eyes, and at 768 none of them do.
+
+Read the metric with care — the face band still contains background, so the absolute numbers move
+with how cluttered the theatre is behind the dancers. The spread is the robust part of this table,
+and the eye agrees with it.
+
+The cost is 16.3 min against 6.8. On the model above that is what buying 2.25x the pixels costs,
+and for anything with a face in it, it is the cheapest quality available — cheaper than doubling
+the steps, which buys nothing here.
