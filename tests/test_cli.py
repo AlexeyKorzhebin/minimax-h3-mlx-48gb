@@ -1575,6 +1575,47 @@ def test_bad_turbo_inputs_are_refused_before_any_weight_loads(tmp_path):
     assert excinfo.value.code == "adaln_cache_unreadable"
 
 
+# -- the report records what produced the run --------------------------------------------------
+
+def _run_generate_with_fakes(tmp_path, **overrides):
+    """Run `run_generate` end to end through a faked pipeline and return its report.
+
+    The brief for this test named `_run_generate_with_fakes(tmp_path, turbo_strength=0.45)`, but
+    no such helper existed — this is that helper, built from the two patterns already proven
+    elsewhere in this file rather than a third reimplementation: `_turbo_spec` (which always sets
+    `turbo_lora`, so a run through here always has an adapter to record) and the `FakePipe`/`dit`
+    shape `test_the_lora_is_installed_once_even_when_resume_asks_twice` uses to satisfy
+    `install_turbo_lora`'s `pipe.dit.__dict__["_loader"]` access. That test's `FakePipe` is not
+    callable; this one is, so `run_generate` can run its full path instead of stopping at adapter
+    installation.
+    """
+    class FakeLoader:
+        def __call__(self):
+            return object()
+
+    class FakePipe:
+        def __init__(self):
+            self.dit = type("P", (), {"__dict__": {"_loader": FakeLoader()}})()
+
+        def __call__(self, **kwargs):
+            return _StubResult()
+
+    spec = _turbo_spec(tmp_path, **overrides)
+    return run_generate(spec, pipeline_factory=lambda _: FakePipe(),
+                        save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+
+
+def test_the_report_records_what_produced_the_run(tmp_path):
+    """On 2026-08-10 two runs of the same prompt, canvas, duration, steps and seed measured 349
+    and 265, and the cause was unrecoverable because none of this was written down."""
+    report = _run_generate_with_fakes(tmp_path, turbo_strength=0.45)
+
+    for key in ("prompt", "checkpoint", "adaln_cache", "turbo_lora", "turbo_strength",
+                "image", "end_image", "forwards"):
+        assert key in report, f"{key} is missing from the run report"
+    assert report["forwards"] == report["grid_points"] - 1
+
+
 def test_the_lora_side_path_is_numerically_unchanged_by_its_optimizations(tmp_path):
     """`addmm` and the stack-instead-of-gather must be exact, not approximate.
 

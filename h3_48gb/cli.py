@@ -599,7 +599,27 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
 
     report = {
         "tag": spec.tag, "canvas": f"{spec.width}x{spec.height}",
-        "duration_seconds": spec.duration, "grid_points": spec.steps, "seed": spec.seed,
+        "duration_seconds": spec.duration, "grid_points": spec.steps,
+        # Written out because "steps" is easy to misread: an N-point grid takes N-1 forward
+        # passes (the first grid point is the starting noise, not a pass) — this off-by-one is
+        # what cost a whole rerun on 2026-08-10, when nothing on disk said which count a "349"
+        # or a "265" actually meant.
+        "forwards": spec.steps - 1,
+        "seed": spec.seed,
+        "prompt": spec.prompt,
+        # Paths as strings: `json.dumps` cannot serialize a `Path`, and `h3 list` /
+        # analysis scripts read these back as plain text anyway.
+        "checkpoint": str(spec.checkpoint),
+        "adaln_cache": str(spec.adaln_cache) if spec.adaln_cache else None,
+        "turbo_lora": str(spec.turbo_lora) if spec.turbo_lora else None,
+        # `turbo_strength` only describes something that happened when an adapter was actually
+        # applied. With no `turbo_lora`, `spec.turbo_strength` is just RunSpec's unused default
+        # (1.0) — writing it would look like a real, chosen strength instead of a field the run
+        # never touched. `null` here must mean "no LoRA on this run," distinguishable from a
+        # forgotten field, so the key stays present rather than being omitted.
+        "turbo_strength": spec.turbo_strength if spec.turbo_lora else None,
+        "image": str(spec.image) if spec.image else None,
+        "end_image": str(spec.end_image) if spec.end_image else None,
         "generate_seconds": round(elapsed, 1),
         "seconds_per_step": round(result.seconds_per_step, 1),
         "frames": int(result.video.shape[0]),
