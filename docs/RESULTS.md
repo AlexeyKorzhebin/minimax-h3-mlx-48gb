@@ -949,11 +949,11 @@ specific, not a general softness.
 
 Two things this table settles that nothing earlier could:
 
-- **Resolution buys fine scale and nothing else.** Two samples at each canvas: fine doubles
-  (0.425 → 0.849) while mid moves 3%. So the mid-scale deficit — which is the whole of our gap —
-  is not addressable by rendering bigger. That does not contradict the face result above: a 60 px
-  face is a fine-scale object, and this says nothing about faces. It says the *bulk* of the gap
-  needs a different lever.
+- **Resolution buys fine scale always, and mid scale only when steps are short.** At 20 steps,
+  going from 896x576 to 1248x832 doubles fine (0.425 → 0.849) and moves mid by 3%. At **8** steps
+  the same jump moves mid from 490 to 601, +23%. So rendering bigger substitutes for steps when
+  steps are the binding constraint — which is exactly the regime this fork lives in — and stops
+  paying once they are not.
 - **Only two candidates remain**: DiT precision and step count. The 2x2 that separates them is
   what the night queue exists for.
 
