@@ -915,6 +915,54 @@ Four things fall out, and the first is a correction:
   measurement reached, arrived at independently and by a metric that shares none of its
   assumptions.
 
-Note what is *not* settled: 2.66 still sits above the reference's 2.19, and the reference was
-downscaled to 608x352, which suppresses grain on its own. Whether the remaining gap is quantization
-is the question the 8-bit build is being downloaded to answer.
+Note what is *not* settled by that table: 2.66 still sits above the reference's 2.19, and the
+reference was downscaled to 608x352, which suppresses grain on its own. The next section settles it.
+
+
+## It was the 4-bit DiT, and 8-bit costs nothing
+
+Decompose the ratio and the whole question changes shape. The numerator is grain-band energy, the
+denominator is structure-band energy, and a ratio can fall either by losing grain or by gaining
+detail — opposite news:
+
+| clip | grain 2-3 px | structure 8-16 px |
+|---|---|---|
+| ours, 896x512, 8 steps | 0.74 | 138 |
+| reference `soldiers.mp4` | **1.67** | **768** |
+
+**The reference has more than twice our absolute noise.** It reads as clean because it carries five
+and a half times the detail, and noise disappears into detail. So the complaint that our output
+"looks grainy" was never about noise: it was about a *detail deficit*, with a constant noise floor
+showing through the gap.
+
+That reframes the step curve too. At 896x512, on one seed, no LoRA:
+
+| steps | grain | structure | ratio | time |
+|---|---|---|---|---|
+| 8 | 0.741 | 138 | 5.36 | 12.5 min |
+| 16 | 0.641 | 275 | 2.33 | 25.4 min |
+| 31 | 0.624 | 368 | 1.69 | 46 min |
+
+Steps barely touch the noise — 14% and then 3%, saturating almost immediately. What they buy is
+detail, which doubles from 8 to 16.
+
+And the detail deficit had a cause. Same seed, same canvas, same 8 steps, same table, no LoRA;
+the only difference is the precision of the DiT's weights:
+
+| DiT | grain | structure | ratio | motion | wall clock | peak |
+|---|---|---|---|---|---|---|
+| 4-bit (mere.run) | 0.741 | 138 | 5.36 | 4.50 | 12.5 min | 27 GB |
+| **8-bit (pipenetwork)** | **0.540** | **242** | **2.24** | **6.03** | **12.6 min** | **27 GB** |
+
+27% less noise, 75% more detail, a third more motion, for **six seconds** of extra wall clock and
+**no extra peak memory at all** — the peak is the text encoder on both, and diffusion at 8 bits
+runs at 24 GB against 4-bit's 14, still under it. The two clips differ by 25 grey levels of 255, so
+4-bit was not merely blurring a shared trajectory; it was denoising to a different one.
+
+An 8-bit DiT at 8 steps therefore matches what previously took 16 steps (2.33) or a Turbo LoRA
+(2.37), and it is free. Resident cost is 21.35 GB against 11.34 — measured, and within 0.6% of
+pipenetwork's own `gb_resident_after_adaln_drop: 21.47`.
+
+Loading that build needed one fix: it *ships* the 206 AdaLN modulation tensors the mere.run
+monolith omits, and `load_dit_cached` rejected them as unexpected keys. They are now skipped by
+name, which is also what keeps the build resident in 21.5 GB instead of 35.3.

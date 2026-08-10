@@ -42,6 +42,14 @@ peak at all, only by how long the diffusion takes.
 The corollary is worth stating plainly: **nothing between 512x512 and 1344x768 is memory-limited.**
 Every canvas tried fits in the same 27 GB. The constraint on this machine is wall clock.
 
+The same corollary settled the precision question. An 8-bit DiT is 21.35 GB resident against the
+4-bit build's 11.34 — nearly twice — and the run's peak does not move: **27 GB either way**,
+because the text encoder still dominates and diffusion at 8 bits reaches 24 GB, under it. Ten extra
+gigabytes of weights were free, and they bought 27% less noise and 75% more detail (see
+`docs/RESULTS.md`). Sizing a build against the *peak* rather than against the diffusion phase is
+what makes that visible; sizing it against diffusion alone says 8-bit doubles the cost, which is
+true and irrelevant.
+
 `memory.report()` prints MLX's numbers, and that is the measurement of *this process's* footprint.
 `ps -o rss=` on this process is not a sanity check for that — it is blind to Metal-backed
 allocations, which is exactly the 0.13 GB row above. That blindness is specific to reading a single
