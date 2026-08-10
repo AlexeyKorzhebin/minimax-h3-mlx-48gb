@@ -170,10 +170,16 @@ class RunSpec:
     #: clip; `latent` is the VAE-free heat map.
     preview_decoder: str = "tae"
     #: A Turbo LoRA to apply at run time, restoring the motion that few-step sampling loses.
-    #: `turbo_strength` is deliberately not 1.0 by default: measured, 0.45 lands the motion at
-    #: 117% of the 31-step reference where 1.0 overshoots to 213%. See docs/RESULTS.md.
+    #: 1.0 is the author's own recommendation and, at the default canvas, the measured optimum on
+    #: both axes: motion 113% of the 31-step reference (8 steps alone manage 52%), and detail equal
+    #: to a 16-step run for the price of an 8-step one.
+    #:
+    #: This used to default to 0.45, because at 512x512 strength 1.0 measured 213% motion — a clear
+    #: overshoot. That number was real and is now irrelevant: it belongs to a canvas this fork no
+    #: longer defaults to, and it did not survive the move. Retiring a measurement when its
+    #: conditions change is the point; carrying 0.45 forward would have cost half the motion.
     turbo_lora: Path | None = None
-    turbo_strength: float = 0.45
+    turbo_strength: float = 1.0
     #: An AdaLN table baked for a grid other than the checkpoint's own — this is what makes
     #: `--steps 8` possible. `scripts/bake_adaln.py` produces one.
     adaln_cache: Path | None = None
@@ -289,8 +295,8 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
                      help="AdaLN table baked for a different step count (scripts/bake_adaln.py)")
     sub.add_argument("--turbo-lora", type=Path, default=None,
                      help="apply a Turbo LoRA at run time (pairs with a few-step --steps)")
-    sub.add_argument("--turbo-strength", type=float, default=0.45,
-                     help="LoRA strength (default 0.45; 1.0 overshoots the reference motion)")
+    sub.add_argument("--turbo-strength", type=float, default=1.0,
+                     help="LoRA strength (default 1.0; lower it toward 0.8 if the image over-sharpens)")
     sub.add_argument("--preview-decoder", choices=("vae", "tae", "latent"), default="tae",
                      help="decoder for in-flight previews (default: tae, ~400x faster than vae)")
     sub.add_argument("--json", action="store_true", help="emit a machine-readable report")
