@@ -232,16 +232,21 @@ def test_status_refuses_a_missing_outdir(tmp_path, capsys):
 
 def test_status_orders_in_flight_before_stale(tmp_path, monkeypatch):
     """`run_status` sorts in-flight runs first, so a human scanning the report sees what is
-    actually happening before what has died."""
+    actually happening before what has died.
+
+    The live run's directory name (`z-alive`) sorts *after* the dead one's (`a-dead`)
+    alphabetically -- `scan` itself returns runs in path order, so if `run_status` ever drops its
+    `.sort(...)` this fails instead of passing by the coincidence of matching names to path order.
+    """
     import h3_48gb.runs as runs_mod
     from h3_48gb.cli import run_status
     from h3_48gb.runs import _parse
     from tests.test_runs import write_checkpoint
 
-    write_checkpoint(tmp_path / "stale" / "checkpoints" / "h3-a.safetensors",
+    write_checkpoint(tmp_path / "a-dead" / "checkpoints" / "h3-a.safetensors",
                      completed=2, total=7, started_at="2026-08-10T21:00:00",
                      completed_at_start=0, written_at="2026-08-10T21:20:00")
-    write_checkpoint(tmp_path / "fresh" / "checkpoints" / "h3-b.safetensors",
+    write_checkpoint(tmp_path / "z-alive" / "checkpoints" / "h3-b.safetensors",
                      completed=2, total=7, started_at="2026-08-10T21:59:00",
                      completed_at_start=0, written_at="2026-08-10T22:00:00")
 
@@ -249,6 +254,7 @@ def test_status_orders_in_flight_before_stale(tmp_path, monkeypatch):
 
     report = run_status(tmp_path)
     assert [r["state"] for r in report["runs"]] == ["in_flight", "stale"]
+    assert [Path(r["outdir"]).name for r in report["runs"]] == ["z-alive", "a-dead"]
 
 
 def test_format_status_reports_progress_for_an_in_flight_run():
@@ -288,6 +294,90 @@ def test_format_status_says_nothing_is_running_when_the_report_is_empty():
     human = format_status({"ok": True, "outdir": "/x", "runs": []})
     assert "ничего не идёт" in human
     assert "/x" in human
+
+
+def test_format_status_reports_an_unreadable_run_with_its_error():
+    """`unreadable` is the whole reason `scan`'s protected `try` exists -- dropping it from the
+    human report makes the command lie: "ничего не идёт" when a broken run is sitting right there,
+    with a diagnosis already computed and thrown away.
+    """
+    from h3_48gb.cli import format_status
+
+    report = {
+        "ok": True, "outdir": "/x",
+        "runs": [{
+            "outdir": "/x/bad", "state": "unreadable", "completed": None, "total": None,
+            "fraction": None, "seconds_per_forward": None, "eta_seconds": None,
+            "age_seconds": None, "error": "ValueError: header length 999 exceeds the file",
+        }],
+    }
+    human = format_status(report)
+    assert "bad" in human
+    assert "header length 999" in human
+    assert "ничего не идёт" not in human
+
+
+def test_format_status_reports_an_unknown_rate_run_without_a_verdict():
+    """`unknown` states what is known (forwards done, time since the last write) and passes no
+    judgment on whether the run is alive -- unlike `stale`, which asserts it is dead."""
+    from h3_48gb.cli import format_status
+
+    report = {
+        "ok": True, "outdir": "/x",
+        "runs": [{
+            "outdir": "/x/old", "state": "unknown", "completed": 8, "total": 19,
+            "fraction": 8 / 19, "age_seconds": 1004.76, "seconds_per_forward": None,
+            "eta_seconds": None,
+        }],
+    }
+    human = format_status(report)
+    assert "8/19" in human
+    assert "остановлен" not in human
+
+
+def test_format_status_does_not_crash_when_total_is_unknown():
+    """`eta_seconds` is `None` not only when the rate is unknown but also when `total` is -- a
+    checkpoint whose `total_forwards` is missing or zero. Guarding on `seconds_per_forward` alone
+    divides `None / 60` and crashes the whole report over one such file; guard on `eta_seconds`
+    itself instead. `total=None` must also not render as the literal string "None"."""
+    from h3_48gb.cli import format_status
+
+    report = {
+        "ok": True, "outdir": "/x",
+        "runs": [{
+            "outdir": "/x/r", "state": "in_flight", "completed": 8, "total": None,
+            "fraction": None, "seconds_per_forward": 120.0, "eta_seconds": None,
+        }],
+    }
+    human = format_status(report)  # must not raise
+    assert "8/?" in human
+    assert "None" not in human
+
+
+def test_status_survives_a_checkpoint_with_a_zero_total(tmp_path, monkeypatch):
+    """End-to-end: `total_forwards: 0` reaches `scan` as `total=None` (see `runs.py`'s `... or
+    None`), while the rate can still be known -- exactly the shape `format_status` must not choke
+    on.
+
+    `_now` is pinned well inside the freshness window so this deterministically lands in
+    `in_flight`, the branch that divides by `eta_seconds` -- without pinning, the outcome (and
+    whether the crash this guards against is even exercised) would depend on wall-clock time
+    relative to the hardcoded `written_at`.
+    """
+    import h3_48gb.runs as runs_mod
+    from h3_48gb.cli import format_status, run_status
+    from h3_48gb.runs import _parse
+    from tests.test_runs import write_checkpoint
+
+    write_checkpoint(tmp_path / "r" / "checkpoints" / "h3-a.safetensors",
+                     completed=3, total=0, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:10:00")
+
+    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T21:11:40"))  # 100 s later
+
+    report = run_status(tmp_path)
+    assert report["runs"][0]["state"] == "in_flight"
+    format_status(report)  # must not raise
 
 
 # -- doctor ------------------------------------------------------------------------------------

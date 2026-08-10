@@ -740,25 +740,57 @@ def run_status(outdir: Path) -> dict:
         raise CliError("outdir_not_found", f"--outdir does not exist: {outdir}",
                        {"outdir": str(outdir)})
     runs = scan(outdir)
-    order = {"in_flight": 0, "stale": 1, "unreadable": 2, "finished": 3}
+    # "unknown" ranks ahead of "stale": it might still be running and deserves attention before a
+    # run already confirmed dead. See `_state_of` in runs.py for why it exists at all.
+    order = {"in_flight": 0, "unknown": 1, "stale": 2, "unreadable": 3, "finished": 4}
     runs.sort(key=lambda r: (order.get(r.state, 9), str(r.outdir)))
     return {"ok": True, "outdir": str(outdir), "runs": [r.as_dict() for r in runs]}
 
 
+def _progress(row: dict) -> str:
+    """`completed/total`, with `total=None` rendered as `?` rather than the literal `None`."""
+    total = row["total"] if row["total"] is not None else "?"
+    return f"{row['completed']}/{total}"
+
+
 def format_status(report: dict) -> str:
-    """One block per in-flight run, one line per stale one, a count of the rest."""
+    """One block per in-flight run, one line per run whose rate is unknown (forwards done and
+    time since the last write, no verdict on whether it is alive), one line per stale run, and
+    one line per unreadable run with its error -- every run `scan` found gets one line here, none
+    silently dropped, which is the whole point of a status command over a broken checkpoint.
+    """
     lines = []
     for row in report["runs"]:
         if row["state"] != "in_flight":
             continue
         pct = f"{row['fraction'] * 100:.0f}%" if row["fraction"] is not None else "?"
-        lines.append(f"{Path(row['outdir']).name}    {row['completed']}/{row['total']} форвардов, {pct}")
-        if row["seconds_per_forward"]:
+        lines.append(f"{Path(row['outdir']).name}    {_progress(row)} форвардов, {pct}")
+        # Guard on `eta_seconds` itself, not on `seconds_per_forward`: the rate can be known while
+        # `eta_seconds` is still None because `total` is -- a checkpoint missing or zero
+        # `total_forwards`. Guarding on the rate alone divides `None / 60` and crashes the whole
+        # report over one such file, the same class of regression commit dae41090 fixed for `scan`.
+        if row["eta_seconds"] is not None:
             left = row["eta_seconds"] / 60
             lines.append(f"  {row['seconds_per_forward']:.0f} с на форвард, осталось {left:.0f} мин")
-    stale = [r for r in report["runs"] if r["state"] == "stale"]
-    for row in stale:
-        lines.append(f"{Path(row['outdir']).name}: остановлен на {row['completed']}/{row['total']}")
+
+    for row in report["runs"]:
+        if row["state"] != "unknown":
+            continue
+        age = (f"{row['age_seconds']:.0f} с назад" if row["age_seconds"] is not None
+               else "неизвестно когда")
+        lines.append(f"{Path(row['outdir']).name}: {_progress(row)}, последняя запись {age}, "
+                     "скорость неизвестна")
+
+    for row in report["runs"]:
+        if row["state"] != "stale":
+            continue
+        lines.append(f"{Path(row['outdir']).name}: остановлен на {_progress(row)}")
+
+    for row in report["runs"]:
+        if row["state"] != "unreadable":
+            continue
+        lines.append(f"{Path(row['outdir']).name}: не читается ({row['error']})")
+
     if not lines:
         lines.append(f"ничего не идёт в {report['outdir']}")
     return "\n".join(lines)

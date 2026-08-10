@@ -122,10 +122,22 @@ def read_checkpoint_meta(path: Path) -> dict:
 
 
 def _state_of(run: Run) -> str:
+    """"unreadable" for a Run this can't be reached on -- construction already raised for that.
+
+    An unknown rate must not become a guessed window: `rate or 0` used to fold "I don't know the
+    speed" into "assume it is instant", which shrinks the window to the bare 120 s grace period --
+    a quarter of a real ~600 s/forward silence -- and calls a live run `stale`. Killing a run that
+    is actually in flight costs hours on a machine where one forward is ten minutes; reporting
+    `unknown` for one extra poll costs nothing. "can't tell" and "confirmed dead" must not look the
+    same, mirroring the same principle this project already applies to a checkpoint field it can't
+    parse: `None`, not a guess.
+    """
     age, rate = run.age_seconds, run.seconds_per_forward
     if age is None:
         return "in_flight"
-    window = _STALE_FORWARD_MULTIPLE * (rate or 0) + _STALE_GRACE_SECONDS
+    if rate is None:
+        return "unknown"
+    window = _STALE_FORWARD_MULTIPLE * rate + _STALE_GRACE_SECONDS
     return "in_flight" if age < window else "stale"
 
 

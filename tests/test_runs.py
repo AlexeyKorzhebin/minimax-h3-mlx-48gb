@@ -187,6 +187,30 @@ def test_freshness_decides_in_flight_on_both_sides(tmp_path, monkeypatch):
     assert {r.outdir.name: r.state for r in scan(tmp_path)}["stale"] == "stale"
 
 
+def test_unknown_rate_does_not_call_a_live_run_stale(tmp_path, monkeypatch):
+    """A checkpoint with no `started_at` (written by code predating task 2 -- every checkpoint on
+    the real machine, right now) has an unknowable rate. `rate or 0` used to fold that into "assume
+    instant", shrinking the window to the bare 120 s grace and calling a run stale after ~1000 s of
+    silence between forwards that each take ~600 s. That risks the owner killing an actually-live
+    multi-hour run. The honest answer is `unknown`, not a guess in either direction.
+    """
+    import h3_48gb.runs as runs_mod
+
+    write_checkpoint(tmp_path / "old-format" / "checkpoints" / "h3-a.safetensors",
+                     completed=8, total=19, started_at=None,
+                     completed_at_start=0, written_at="2026-08-10T23:23:36")
+    write_checkpoint(tmp_path / "healthy" / "checkpoints" / "h3-b.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:20:00")
+
+    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T23:40:20"))  # ~1004 s later
+
+    runs = {r.outdir.name: r for r in scan(tmp_path)}
+
+    assert runs["old-format"].state == "unknown"
+    assert runs["healthy"].completed == 2, "an unknown-rate neighbour must not hide a healthy run"
+
+
 def test_a_bad_started_at_does_not_hide_its_neighbours(tmp_path):
     """Valid JSON, unparsable `started_at`: `_state_of` reads `age_seconds` and
     `seconds_per_forward`, and the latter calls `_parse(started_at)` -- which raises ValueError on
