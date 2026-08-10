@@ -104,6 +104,45 @@ In one measured case a browser held 4.05 GB across six processes and four editor
 1.7 GB. Closing the editors alone moved free memory from 0.36 GB to 1.68 GB and swap from 3.98 to
 3.56, and the step time recovered.
 
+## The machine must not sleep
+
+A multi-hour run needs `caffeinate -dimsu` around it. Nothing in this fork takes a sleep
+assertion, and the generate process does not look like activity to macOS: it holds the GPU at full
+power while the keyboard, the display, and the network sit idle, which is exactly the profile
+`powerd` reads as "nobody is here".
+
+The consequence is not a slow run, it is a kernel panic. Measured, on the 1344x768 10 s run of
+2026-08-10:
+
+```
+02:20:51  DarkWake from Deep Idle             <- it had already been asleep
+02:26:56  Sleep: 'Dark Wake Thermal Emergency'
+02:34:58  DarkWake from Deep Idle
+02:35:43  Sleep: 'Maintenance Sleep'
+02:36:28  panic: GFX NMI FIQ - agx_power(6) - failed to transition to state 0 (_iopStatus=7)
+```
+
+Forty-five seconds after entering sleep, the GPU firmware failed to power down and took the
+kernel with it. The run died at step 2 of 7 and every log in `/tmp` died with the reboot.
+
+Two things fall out of this that are worth knowing separately:
+
+- **A gap in `memory.tsv` means the machine slept.** The tracker's `sleep 60` does not advance
+  through system sleep, so the gaps at 02:04-02:11, 02:11-02:21 and 02:26-02:35 are not a stalled
+  sampler — the last of them matches the 02:26:56-02:34:58 sleep to the minute. Read a gap as an
+  event, not as missing data.
+- **Sustained native-resolution load can trip a thermal emergency.** The 02:26 sleep was
+  `Dark Wake Thermal Emergency`: the machine woke for maintenance with the GPU job still resident,
+  could not shed the heat in dark wake, and bailed out. Staying awake avoids this too, because an
+  awake machine runs its fans; it does not make the thermal ceiling go away.
+
+Memory was not involved and the tracker proves it: 28 GB peak of 48, 14-22 GB free, swap flat at
+3.31 GB through the last sample before the panic. The failure mode this section describes looks
+nothing like the allocator problems above and will not be caught by watching them.
+
+Logs therefore do not belong in `/tmp`. `~/Research/TestVideo/_логи/` survives a reboot;
+`/tmp` does not, and a panic is exactly when the log matters most.
+
 ## What is not solved
 
 **Activations scale with the packed sequence, not with anything convenient.** At 37,657 rows they
