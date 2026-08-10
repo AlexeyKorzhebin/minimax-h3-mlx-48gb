@@ -962,8 +962,17 @@ def _canvas(tmp_path, argv):
     return spec.width, spec.height
 
 
-def test_a_text_only_run_still_gets_the_released_canvas(tmp_path):
-    assert _canvas(tmp_path, ["generate", "a cat"]) == (1344, 768)
+def test_a_text_only_run_gets_the_default_canvas(tmp_path):
+    """Not the released 1344x768: that is 31 min of diffusion for 2.4 s and nobody asked for it.
+
+    The default keeps the released 16:9 shape and drops to a canvas that still renders faces —
+    the 512-vs-768 measurement over three seeds is in `docs/RESULTS.md`. Pinned literally rather
+    than against `DEFAULT_CANVAS` so that changing the constant has to change a test too.
+    """
+    assert _canvas(tmp_path, ["generate", "a cat"]) == (896, 512)
+    width, height = _canvas(tmp_path, ["generate", "a cat"])
+    assert width % 32 == 0 and height % 32 == 0, "the port cannot pack a canvas off the 32 grid"
+    assert abs(width / height - 1344 / 768) < 1e-9, "the default must keep the released aspect"
 
 
 def test_the_canvas_follows_the_keyframe(tmp_path):
@@ -1099,7 +1108,7 @@ def test_half_a_canvas_without_a_keyframe_still_works(tmp_path):
     """Text-only runs keep the old behaviour: one axis given, the other defaults."""
     spec = spec_from_args(build_parser().parse_args(
         ["generate", "a cat", "--width", "640", "--outdir", str(tmp_path)]))
-    assert (spec.width, spec.height) == (640, 768)
+    assert (spec.width, spec.height) == (640, 512)
 
 
 def test_the_patch_detector_can_actually_tell_the_two_apart():

@@ -250,12 +250,13 @@ class RunSpec:
 def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     """The flags `generate` and `resume` share — every one of them identifies or locates a run."""
     sub.add_argument("prompt")
-    # `None` rather than 1344x768 so `spec_from_args` can tell "the caller wants the default" from
-    # "the caller asked for exactly 1344x768" — with a keyframe, the default comes from the frame.
+    # `None` rather than the default canvas so `spec_from_args` can tell "the caller wants the
+    # default" from "the caller asked for exactly that size" — with a keyframe, the default
+    # comes from the frame instead. See `DEFAULT_CANVAS`.
     sub.add_argument("--width", type=int, default=None,
-                     help="canvas width (default: 1344, or derived from --image)")
+                     help="canvas width (default: 896, or derived from --image)")
     sub.add_argument("--height", type=int, default=None,
-                     help="canvas height (default: 768, or derived from --image)")
+                     help="canvas height (default: 512, or derived from --image)")
     sub.add_argument("--duration", type=float, default=5.0)
     sub.add_argument("--steps", type=int, default=BAKED_GRID_POINTS)
     sub.add_argument("--seed", type=int, default=0)
@@ -325,8 +326,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-#: The canvas a text-only request gets: H3's released 16:9 geometry.
-DEFAULT_CANVAS = (1344, 768)
+#: The canvas a text-only request gets. H3's released geometry is 1344x768 and this is not it: at
+#: 8 steps that canvas is 31 minutes of diffusion for 2.4 seconds of video, which is the wrong
+#: thing to hand someone who did not ask for a size. 896x512 keeps the released 16:9 shape, costs
+#: 12.5 minutes, and sits above the resolution where faces start failing — measured over three
+#: seeds, 768x768 beat 512x512 on both the mean and, more importantly, a third of the spread, and
+#: 896x512 is in that class. Ask for `--width 1344 --height 768` when the render is worth the hour.
+DEFAULT_CANVAS = (896, 512)
 
 
 def resolve_canvas(image: Path | None, width: int | None, height: int | None) -> tuple[int, int]:
