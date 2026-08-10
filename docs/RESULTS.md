@@ -937,20 +937,37 @@ The 2-3 px band is therefore **fine-scale content**, which happens to include gr
 
 What survives the relabelling, and is the load-bearing result:
 
-| clip (centaur prompt, 10 s) | fine 2-3 px | mid 8-16 px |
+| clip (centaur prompt, 10 s, 20 steps) | fine 2-3 px | mid 8-16 px |
 |---|---|---|
-| hosted, 896x576, 3 seeds | **0.411 ± 0.034** | **551 ± 16** |
-| hosted, 1248x832 | 0.781 | 569 |
-| ours, 4-bit, 8 steps, 896x576 | 0.377 (**-8%**) | 349 (**-37%**) |
+| reference, 896x576, **4 samples** | **0.425 ± 0.038** | **574 ± 42** |
+| reference, 1248x832, 2 samples | **0.849 ± 0.068** | 593 ± 23 |
+| ours, 4-bit, 8 steps, 896x576 | 0.377 (**-11%**) | 349 (**-39%**) |
 
-Same prompt, same canvas, same duration, same frame count, and the reference's own seed-to-seed
-spread is known. **Our fine scale matches the reference to within one sigma; our mid scale is 37%
-below it, eleven sigma out.** The deficit is narrow and specific, not a general softness — and it
-is the first statement in this file about our output versus the hosted model's that rests on a
-baseline with a measured variance rather than on a single downscaled clip of another scene.
+Same prompt, same canvas, same duration, same frame count. **Our fine scale sits inside the
+reference's own spread; our mid scale is 39% below it, 5.3 sigma out.** The deficit is narrow and
+specific, not a general softness.
 
-Caveat carried forward: the reference clips are 20-step renders and ours is 8-step, so precision
-and step count are confounded in that last row. The 2x2 that separates them is running.
+Two things this table settles that nothing earlier could:
+
+- **Resolution buys fine scale and nothing else.** Two samples at each canvas: fine doubles
+  (0.425 → 0.849) while mid moves 3%. So the mid-scale deficit — which is the whole of our gap —
+  is not addressable by rendering bigger. That does not contradict the face result above: a 60 px
+  face is a fine-scale object, and this says nothing about faces. It says the *bulk* of the gap
+  needs a different lever.
+- **Only two candidates remain**: DiT precision and step count. The 2x2 that separates them is
+  what the night queue exists for.
+
+Two caveats, both load-bearing:
+
+- The reference clips are 20-step renders and ours is 8-step, so that last row confounds precision
+  with step count.
+- **The reference is not the bf16 release.** It is a ComfyUI build:
+  `minimax_h3_fl2va_pruned_int8_convrot` (DiT at int8, rotation-based),
+  `qwen3vl_32b_minimax_h3_nvfp4_awq` (text encoder at **4-bit**),
+  `minimax_h3_video_vae_fp16`, `minimax_h3_audio_vae_fp32`. Both VAEs match ours in format, and our
+  8-bit text encoder is *more* precise than theirs. The comparison is therefore our 4-bit affine
+  DiT against their int8 rotation-quantized one — a bit-width gap, not a quantized-versus-full-
+  precision one, which makes "8-bit closes it" a sharper prediction than it looked.
 
 
 ## It was the 4-bit DiT, and 8-bit costs nothing
