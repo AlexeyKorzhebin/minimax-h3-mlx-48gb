@@ -68,15 +68,30 @@ def scan(root: Path) -> list[Run]:
         outdir = checkpoint.parent.parent
         try:
             meta = read_checkpoint_meta(checkpoint)
-        except (OSError, ValueError, struct.error, MemoryError) as exc:
+            run = Run(
+                outdir=outdir,
+                state="in_flight",
+                completed=int(meta.get("completed_steps", 0)),
+                total=int(meta.get("total_forwards", 0)) or None,
+                identity_digest=meta.get("identity_digest"),
+                identity=meta.get("identity", {}),
+            )
+        except (OSError, ValueError, TypeError, AttributeError, KeyError, struct.error,
+                MemoryError) as exc:
+            # The bytes on disk are untrusted: a queue writes checkpoints by rename, so a reader
+            # can see a truncated file (OSError/struct.error) or a header cut off mid-line
+            # (ValueError from json.loads). But well-formed-JSON-with-a-surprising-shape is just
+            # as real -- a review of this function found three cases live JSON never produces
+            # from a healthy writer but a hand-edited or future-format file can: `h3_checkpoint`
+            # nested as an object instead of the JSON string mx.save_safetensors always writes
+            # (TypeError from the inner json.loads), `completed_steps: null` (TypeError from
+            # int(None)), and a top-level header that parses to a list, not an object
+            # (AttributeError from header.get). All of those are shape problems in one file, not
+            # bugs in this loop, so they get folded into the same "unreadable" outcome. The catch
+            # stays enumerated rather than `except Exception` on purpose: a typo in the Run(...)
+            # call above -- a bad keyword, a NameError from a future edit -- must still crash
+            # loudly instead of being misreported as a corrupt checkpoint.
             runs.append(Run(outdir=outdir, error=f"{type(exc).__name__}: {exc}"))
             continue
-        runs.append(Run(
-            outdir=outdir,
-            state="in_flight",
-            completed=int(meta.get("completed_steps", 0)),
-            total=int(meta.get("total_forwards", 0)) or None,
-            identity_digest=meta.get("identity_digest"),
-            identity=meta.get("identity", {}),
-        ))
+        runs.append(run)
     return runs
