@@ -845,11 +845,30 @@ def test_mode_refuses_flags_that_contradict_it(tmp_path, mode, argv_extra, expec
 
 
 def test_mode_does_not_change_the_identity(tmp_path):
-    """It is fully derivable from flags already in the identity, so it must not enter it."""
+    """It is fully derivable from flags already in the identity, so it must not enter it.
+
+    The `==` comparisons below only catch a regression that stores the *raw* `--mode` string on
+    `RunSpec` (`None` vs `"t2v"`/`"i2v"` would then differ). A regression that instead stores the
+    *derived* mode would pass both comparisons silently, since the derived value is identical with
+    or without `--mode` in each case here -- that is what the `dataclasses.fields` assertion below
+    is for: it fails regardless of which value a hypothetical field would hold, because it checks
+    that no field named `mode` exists on `RunSpec` at all.
+    """
+    import dataclasses
+
+    assert "mode" not in {f.name for f in dataclasses.fields(RunSpec)}
+
     base = ["generate", "a cat", "--outdir", str(tmp_path)]
     without = spec_from_args(build_parser().parse_args(base))
     with_mode = spec_from_args(build_parser().parse_args(base + ["--mode", "t2v"]))
     assert without == with_mode
+
+    img = _png(tmp_path / "a.png", size=(512, 512))
+    base_with_image = ["generate", "a cat", "--outdir", str(tmp_path), "--image", str(img),
+                       "--width", "512", "--height", "512"]
+    without_i2v = spec_from_args(build_parser().parse_args(base_with_image))
+    with_i2v = spec_from_args(build_parser().parse_args(base_with_image + ["--mode", "i2v"]))
+    assert without_i2v == with_i2v
 
 
 def test_mode_t2va_is_accepted_as_a_synonym_for_t2v(tmp_path):
@@ -867,10 +886,32 @@ def test_mode_accepts_flags_that_match_it(tmp_path):
          "--outdir", str(tmp_path), "--width", "512", "--height", "512"]))
 
 
-def test_mode_refuses_before_the_image_is_ever_read(tmp_path):
-    """A mismatched --mode must fail before `resolve_canvas` opens the file — so a nonexistent or
-    corrupt image must not change the outcome or its code."""
-    argv = ["generate", "a cat", "--mode", "i2v", "--outdir", str(tmp_path)]
+def test_mode_refuses_before_a_missing_image_is_ever_opened(tmp_path):
+    """A mismatched --mode must fail before `resolve_canvas` ever touches the path it names.
+
+    `--image` here points at a file that does not exist. If `check_mode` ran after
+    `resolve_canvas`, this would fail as `image_not_found` instead -- the mismatch would never
+    even be reported, because the missing file wins the race. The code below has to be
+    `mode_mismatch`, proving the mode is checked first.
+    """
+    missing = tmp_path / "does-not-exist.png"
+    argv = ["generate", "a cat", "--mode", "t2v", "--image", str(missing),
+            "--outdir", str(tmp_path)]
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(argv))
+    assert excinfo.value.code == "mode_mismatch"
+
+
+def test_mode_refuses_before_a_corrupt_image_is_ever_decoded(tmp_path):
+    """The same race, with a file that exists but is not a readable image.
+
+    If `check_mode` ran after `resolve_canvas`, this would fail as `image_unreadable` (PIL
+    choking on a text file wearing a `.png` extension) instead of `mode_mismatch`.
+    """
+    corrupt = tmp_path / "not-really-a-png.png"
+    corrupt.write_text("this is text, not image bytes")
+    argv = ["generate", "a cat", "--mode", "t2v", "--image", str(corrupt),
+            "--outdir", str(tmp_path)]
     with pytest.raises(CliError) as excinfo:
         spec_from_args(build_parser().parse_args(argv))
     assert excinfo.value.code == "mode_mismatch"
