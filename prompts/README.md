@@ -6,10 +6,14 @@ the prompt is byte-identical between runs — and a prompt that lives in `/tmp` 
 the week. One of these was lost mid-experiment exactly that way.
 
 ```bash
-h3 generate "$(cat prompts/centaur-battle.txt)" \
+h3 generate --prompt-file prompts/centaur-battle.txt \
   --width 896 --height 576 --duration 10 --steps 8 \
   --turbo-lora ~/models/turbo/minimax_h3_turbo_v4_step600_ema.safetensors
 ```
+
+`--prompt-file` replaces the `$(cat ...)` substitution above: a 2 KB prompt no longer sits in full
+in `ps`/`/proc`, shell quoting can no longer mangle its punctuation, and the run's report now
+records which file it was read from.
 
 | file | what it exercises | notes |
 |---|---|---|

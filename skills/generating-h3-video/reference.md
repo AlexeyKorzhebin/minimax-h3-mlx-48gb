@@ -10,7 +10,8 @@ Starts, or transparently continues, a render.
 
 | Flag | Default | Notes |
 |---|---|---|
-| `prompt` (positional) | — | required |
+| `prompt` (positional) | — | pass this **or** `--prompt-file`, not both |
+| `--prompt-file` | none | read the prompt from a file instead of the positional argument; strips every trailing newline, exactly as `$(cat file)` does |
 | `--width` | `896`, or the keyframe's | `None` until resolved, so "unset" is distinguishable from "asked for exactly 896"; must be a multiple of 32 |
 | `--height` | `512`, or the keyframe's | same |
 | `--duration` | `5.0` | seconds; snapped up to the latent grid, so 2.4 yields 73 frames = 3.04 s at 24 fps |
@@ -22,6 +23,7 @@ Starts, or transparently continues, a render.
 | `--checkpoint-dir` | `<outdir>/checkpoints` | where the *resume* checkpoint lives; `--checkpoint` above is the model weights |
 | `--image` | none | condition the first frame; the canvas follows it unless **both** `--width` and `--height` are given |
 | `--end-image` | none | also condition the last frame; requires `--image` |
+| `--mode` | none | one of `t2v`/`t2va`/`i2v`/`flf`; asserts the mode `--image`/`--end-image` already imply and refuses with `mode_mismatch` if they disagree. Sets nothing — it exists so a typo in a filename or a flag is caught in the first second, not an hour later in the finished clip |
 | `--adaln-cache` | the checkpoint's own | a table baked by `scripts/bake_adaln.py` for a different step count |
 | `--turbo-lora` | none | a Turbo LoRA applied at run time, for few-step runs |
 | `--turbo-strength` | `1.0` | measured optimum at the default canvas; lower toward 0.8 if the image over-sharpens |
@@ -53,6 +55,43 @@ run is being continued, so a flag turning it into a fresh start would defeat it.
 | `--json` | off |
 
 One line, or one array entry under `--json`, per finished run's `<stem>.json` under `--outdir`.
+
+## `h3 status`
+
+| Flag | Default |
+|---|---|
+| `--outdir` | `~/video-out`, or `$H3_OUTDIR` |
+| `--json` | off |
+
+Scans `--outdir` recursively for resume checkpoints and reports every run found, in-flight ones
+first (then `unknown`, then `stale`). Refuses with `outdir_not_found` if `--outdir` does not exist
+— a checked failure, unlike `watch`, which has nowhere to report one to.
+
+Each run's state is one of:
+
+| State | Meaning |
+|---|---|
+| `in_flight` | a checkpoint was written recently enough to still be running; reports a rate and an ETA |
+| `unknown` | the checkpoint predates `started_at` (older code wrote it), so age and rate cannot be computed — a reason to keep watching, not a verdict either way |
+| `stale` | old enough that nothing is plausibly still writing it |
+| `unreadable` | the checkpoint file exists but could not be parsed; reported with its error, not dropped |
+| `finished` | the run has a completed `<stem>.json` report, same as `h3 list` |
+
+Without `--json`, this is the human-readable render `format_status` produces: one block per
+in-flight run with progress and ETA, one line per `unknown`/`stale`/`unreadable` run, or
+`ничего не идёт в <outdir>` when nothing was found.
+
+## `h3 watch`
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--outdir` | `~/video-out`, or `$H3_OUTDIR` | |
+| `--interval` | `20.0` | seconds between redraws; `0` renders once and exits |
+
+Redraws `h3 status`'s human report in place (a leading escape clears the previous block, so both a
+plain terminal and a redirected log stay readable) until no run is `in_flight` or `unknown` — i.e.
+until every run is `stale`, `unreadable`, or gone. No `--json`: it exists to watch a queue on a
+terminal, not to be scripted against; script against `h3 status --json` in a loop instead.
 
 ## `h3 doctor`
 
@@ -107,6 +146,13 @@ be reworded at any time, the code cannot.
 | `lora_not_found` | `--turbo-lora` points at a file that does not exist |
 | `turbo_strength_invalid` | `--turbo-strength` is not a finite number |
 | `upstream_patch_missing` | a keyframe was given but the vendored `upstream/` checkout is unpatched |
+| `outdir_not_found` | `--outdir` does not exist or cannot be read (`h3 status`) |
+| `prompt_file_not_found` | `--prompt-file` points at a file that does not exist |
+| `prompt_file_unreadable` | `--prompt-file` exists but could not be read as UTF-8 |
+| `prompt_file_empty` | `--prompt-file` is empty once trailing newlines are stripped |
+| `prompt_both_given` | both a positional prompt and `--prompt-file` were given; pass exactly one |
+| `prompt_missing` | no prompt: pass one positionally or with `--prompt-file` |
+| `mode_mismatch` | `--mode` contradicts the `--image`/`--end-image` flags given |
 | `internal_error` | an unexpected exception reached the CLI boundary; see `detail` for its type |
 
 Without `--json` a failure prints its sentence to stderr and exits non-zero; there is no code to

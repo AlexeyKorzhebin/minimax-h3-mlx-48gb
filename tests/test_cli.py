@@ -824,6 +824,58 @@ def test_parser_accepts_the_two_flags(tmp_path):
     assert args.end_image == tmp_path / "b.png"
 
 
+# -- mode ----------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("mode,argv_extra,expected", [
+    ("i2v", [], "mode_mismatch"),                       # i2v without a picture
+    ("t2v", ["--image", "IMG"], "mode_mismatch"),       # t2v with a picture
+    ("flf", ["--image", "IMG"], "mode_mismatch"),       # flf without a second one
+])
+def test_mode_refuses_flags_that_contradict_it(tmp_path, mode, argv_extra, expected):
+    """The point is the typo: without this, a mistyped --image gives you t2va and you find out an
+    hour later by watching the clip."""
+    img = _png(tmp_path / "a.png", size=(512, 512))
+    argv = ["generate", "a cat", "--mode", mode, "--outdir", str(tmp_path),
+            "--width", "512", "--height", "512"]
+    argv += [str(img) if a == "IMG" else a for a in argv_extra]
+
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(argv))
+    assert excinfo.value.code == expected
+
+
+def test_mode_does_not_change_the_identity(tmp_path):
+    """It is fully derivable from flags already in the identity, so it must not enter it."""
+    base = ["generate", "a cat", "--outdir", str(tmp_path)]
+    without = spec_from_args(build_parser().parse_args(base))
+    with_mode = spec_from_args(build_parser().parse_args(base + ["--mode", "t2v"]))
+    assert without == with_mode
+
+
+def test_mode_t2va_is_accepted_as_a_synonym_for_t2v(tmp_path):
+    """`t2va` (text-to-video-with-audio) is what a text-only run actually produces; it must not be
+    refused as a mismatch against the `t2v` the flags imply."""
+    spec_from_args(build_parser().parse_args(
+        ["generate", "a cat", "--mode", "t2va", "--outdir", str(tmp_path)]))
+
+
+def test_mode_accepts_flags_that_match_it(tmp_path):
+    img = _png(tmp_path / "a.png", size=(512, 512))
+    end = _png(tmp_path / "b.png", size=(512, 512), colour=(30, 30, 200))
+    spec_from_args(build_parser().parse_args(
+        ["generate", "a cat", "--mode", "flf", "--image", str(img), "--end-image", str(end),
+         "--outdir", str(tmp_path), "--width", "512", "--height", "512"]))
+
+
+def test_mode_refuses_before_the_image_is_ever_read(tmp_path):
+    """A mismatched --mode must fail before `resolve_canvas` opens the file — so a nonexistent or
+    corrupt image must not change the outcome or its code."""
+    argv = ["generate", "a cat", "--mode", "i2v", "--outdir", str(tmp_path)]
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(argv))
+    assert excinfo.value.code == "mode_mismatch"
+
+
 def test_one_image_anchors_the_first_frame(tmp_path):
     from h3_48gb.cli import load_keyframes
 

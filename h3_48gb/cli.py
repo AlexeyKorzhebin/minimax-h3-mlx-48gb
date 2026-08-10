@@ -113,6 +113,7 @@ ERROR_CODES = {
     "prompt_file_empty": "--prompt-file is empty once trailing newlines are stripped",
     "prompt_both_given": "both a positional prompt and --prompt-file were given; pass exactly one",
     "prompt_missing": "no prompt: pass one positionally or with --prompt-file",
+    "mode_mismatch": "--mode contradicts the --image/--end-image flags given",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 
@@ -294,6 +295,11 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
                      help="condition the first frame on this image")
     sub.add_argument("--end-image", type=Path, default=None,
                      help="also condition the last frame; requires --image")
+    # This sets nothing: the mode is fully determined by --image/--end-image (see `check_mode`
+    # below `resolve_prompt`). It exists so a typo in a filename or a flag is refused in the
+    # first second, rather than discovered an hour later by watching the finished clip.
+    sub.add_argument("--mode", choices=("t2v", "t2va", "i2v", "flf"), default=None,
+                     help="assert the mode the image flags imply, refusing before any weight loads")
     # Previews are what makes a multi-hour render watchable, and they stopped being expensive: TAE
     # decodes one in 0.125 s against the real VAE's 49.3 s at 1344x768, so six previews now cost
     # 0.75 s of a run measured in hours. Off by default made sense at 49 s a frame; it does not now.
@@ -459,14 +465,47 @@ def resolve_prompt(prompt: str | None, prompt_file: Path | None) -> tuple[str, s
     return text, str(path.resolve())
 
 
+def actual_mode(image: Path | None, end_image: Path | None) -> str:
+    """The mode these keyframe flags imply, with no reference to `--mode` at all.
+
+    This is the one place that derivation happens; `check_mode` and the run report both call it
+    rather than repeating the three-way `if`, so they cannot drift apart.
+    """
+    return "flf" if end_image else ("i2v" if image else "t2v")
+
+
+def check_mode(mode: str | None, image: Path | None, end_image: Path | None) -> str:
+    """Validate the declared mode against the flags, and return the effective one either way.
+
+    The mode is never *set* by this flag -- it is fully determined by the images. `--mode` exists
+    so a typo in a filename or a flag fails in the first second rather than an hour later, when
+    the clip turns out to be text-to-video.
+    """
+    actual = actual_mode(image, end_image)
+    if mode is None:
+        return actual
+    wanted = "t2v" if mode == "t2va" else mode
+    if wanted != actual:
+        raise CliError(
+            "mode_mismatch",
+            f"--mode {mode} but the flags say {actual}: "
+            f"--image {'given' if image else 'absent'}, "
+            f"--end-image {'given' if end_image else 'absent'}",
+            {"declared": mode, "actual": actual})
+    return actual
+
+
 def spec_from_args(args: argparse.Namespace) -> RunSpec:
     """Build a `RunSpec` from parsed args, shared by `generate` and `resume` (identical flags).
 
     Validation lives in `RunSpec.__post_init__`, so it happens here for both subcommands, before
     either one touches a checkpoint path or a weight file. Resolving the prompt happens first of
-    all, ahead of the canvas: a bad `--prompt-file` must refuse before anything else does.
+    all, ahead of the canvas: a bad `--prompt-file` must refuse before anything else does. `--mode`
+    is checked next, still ahead of the canvas, so a mismatched `--mode` refuses before
+    `resolve_canvas` ever opens the keyframe file.
     """
     prompt, prompt_file = resolve_prompt(args.prompt, args.prompt_file)
+    check_mode(getattr(args, "mode", None), args.image, args.end_image)
     width, height = resolve_canvas(args.image, args.width, args.height)
     return RunSpec(
         prompt=prompt, width=width, height=height,
@@ -677,6 +716,10 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
         "turbo_strength": spec.turbo_strength if spec.turbo_lora else None,
         "image": str(spec.image) if spec.image else None,
         "end_image": str(spec.end_image) if spec.end_image else None,
+        # Derived, not stored: `mode` is fully implied by `image`/`end_image`, which are already
+        # part of the run's identity, so a separate `RunSpec` field would just be a second place
+        # for the same fact to drift. This is a reader's convenience, nothing more.
+        "mode": actual_mode(spec.image, spec.end_image),
         "generate_seconds": round(elapsed, 1),
         "seconds_per_step": round(result.seconds_per_step, 1),
         "frames": int(result.video.shape[0]),
