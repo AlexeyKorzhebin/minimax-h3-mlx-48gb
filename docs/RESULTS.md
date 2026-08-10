@@ -779,30 +779,55 @@ measured here. It is the fastest usable setting in this fork, and the least deta
 
 ## Predicting wall clock: use the packed sequence length, not pixels or seconds
 
-Three measured points at 8 steps (7 forwards), all on this machine:
+Attention is quadratic in the packed sequence and everything else in the block is linear, so the
+cost of one forward is a quadratic *with a linear term* — not a power law. Fitting a single
+exponent is what went wrong for months.
 
-| canvas / duration | packed rows | wall clock |
+Five points, each a single measured forward rather than a wall clock, so loading and decoding
+cannot contaminate them:
+
+| canvas / duration | packed rows | s / forward |
 |---|---|---|
-| 512x512, 2.4 s | 9,906 | 6.6 min |
-| 512x512, 10 s | 19,242 | 27.8 min |
-| 896x576, 10 s | 37,657 | 133 min |
-
-The local exponent between neighbours is **2.17** and **2.33** — near-quadratic in sequence
-length, which is what dense self-attention over the whole packed sequence predicts.
-
-An earlier section of this file derived exponents of 1.34 and 1.68 over *token count* from the
-31-step runs, and I used those to predict the runs above. They came out **2x low, twice**: 15 s at
-512x512 was predicted at 10 min and took 48; the 896x576 run was predicted at 60 min and took 133.
-The error came from mixing two different bases — pixels and frames scale the sequence differently,
-and neither is the quantity attention actually costs against.
-
-Estimate from rows:
+| 512x512, 2.4 s | 6,671 | 51.3 |
+| 640x640, 2.4 s | 9,319 | 77.3 |
+| 896x512, 2.4 s | 10,375 | 89.7 |
+| 768x768, 2.4 s | 13,191 | 118.6 |
+| 1344x768, 10 s | 73,061 | 1842.0 |
 
 ```
-rows ≈ (H/32) * (W/32) * latent_frames + 2 * audio_latents
-minutes ≈ 6.6 * (rows / 9906) ** 2.25          # 8 steps; multiply by 30/7 for the 31-step grid
+rows    ≈ (5.53 + 1.641 * (seconds - 2.4)) * (W/16) * (H/16) + 81 * seconds + text_rows
+seconds ≈ 5.699e-3 * rows + 2.671e-7 * rows**2          # one forward
 ```
 
-That reproduces all three points within 15%. Worth doing before committing to a long render: at
-1248x832 for 10 s the sequence is 73,818 rows, which the formula puts near 9 hours at 8 steps —
-and around 38 at the full 31-step schedule.
+Every point lands within **3%**, and the row estimate reproduces the native run's 73,061 to within
+0.9%. The quadratic term is 21% of the cost at 512x512 and 77% at native resolution, which is why
+no single exponent ever fit both ends.
+
+**The old formula overestimated the native run by 2.9x, and the reason was one bad number.** The
+table this replaces listed 512x512 / 2.4 s at 9,906 rows; the model above puts it at 6,157, and the
+run's own log says 6,671 with its keyframe and longer prompt included. The other two old points —
+19,242 for 512x512 / 10 s and 37,657 for 896x576 / 10 s — both reproduce to within 1.6%, so the
+9,906 was simply wrong, and fitting a power law through it forced the exponent up to 2.25.
+
+Two cautions on using this:
+
+- It predicts **diffusion only**. Loading is a couple of minutes and decoding scales with pixels
+  and frames on its own; at 512x512 / 2.4 s the gap between the two is under a minute, at native
+  resolution it is not.
+- The one point it does not explain is the 896x576 / 10 s run at 133 min wall clock, against 69 min
+  of predicted diffusion. That run dates from before `limit_cache`, and it is the era where one
+  step took 818 s where its neighbours took 568. Treat it as unmeasured rather than as evidence
+  against the model.
+
+What this buys, at 8 steps, on 1344x768:
+
+| duration | rows | diffusion |
+|---|---|---|
+| 2.4 s | 22,791 | 31 min |
+| 3 s | 26,809 | 40 min |
+| 5 s | 40,202 | 77 min |
+| 10 s | 73,686 | 218 min |
+
+Native resolution is affordable at short durations and only at short durations. The 10 s version is
+not four times the 5 s version, it is nearly three times, and that gap is the quadratic term
+arriving.
