@@ -8,7 +8,7 @@ import json
 import struct
 from pathlib import Path
 
-from h3_48gb.runs import Run, scan
+from h3_48gb.runs import Run, _parse, scan
 
 
 def write_checkpoint(path: Path, *, completed: int, total: int, written_at: str,
@@ -162,6 +162,49 @@ def test_a_non_object_header_does_not_hide_its_neighbours(tmp_path):
     assert runs["run-bad"].state == "unreadable"
     assert runs["run-bad"].error
     assert runs["run-good"].completed == 1, "a non-object header neighbour swallowed a good run"
+
+
+def test_freshness_decides_in_flight_on_both_sides(tmp_path, monkeypatch):
+    """Pinning only one side passes with any threshold at all.
+
+    The window is 3 * seconds_per_forward + 120: three forwards absorbs one slow step, and the two
+    minutes absorb loading and decoding, during which nothing is written.
+    """
+    import h3_48gb.runs as runs_mod
+
+    # rate 600 s/forward -> window 1920 s
+    write_checkpoint(tmp_path / "fresh" / "checkpoints" / "h3-a.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:20:00")
+    write_checkpoint(tmp_path / "stale" / "checkpoints" / "h3-b.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:20:00")
+
+    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T21:51:00"))  # 1860 s later
+    assert {r.outdir.name: r.state for r in scan(tmp_path)}["fresh"] == "in_flight"
+
+    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T21:53:00"))  # 1980 s later
+    assert {r.outdir.name: r.state for r in scan(tmp_path)}["stale"] == "stale"
+
+
+def test_a_bad_started_at_does_not_hide_its_neighbours(tmp_path):
+    """Valid JSON, unparsable `started_at`: `_state_of` reads `age_seconds` and
+    `seconds_per_forward`, and the latter calls `_parse(started_at)` -- which raises ValueError on
+    a string `datetime.fromisoformat` cannot read. State computation must happen inside the same
+    protected `try` that builds the `Run`, or one such file aborts the whole scan -- exactly the
+    regression task 1 fixed for metadata parsing itself.
+    """
+    write_checkpoint(tmp_path / "run-bad" / "checkpoints" / "h3-bad.safetensors",
+                     completed=2, total=7, started_at="не-дата",
+                     completed_at_start=0, written_at="2026-08-10T21:20:00")
+    write_checkpoint(tmp_path / "run-good" / "checkpoints" / "h3-ok.safetensors",
+                     completed=1, total=7, written_at="2026-08-10T21:00:00")
+
+    runs = {r.outdir.name: r for r in scan(tmp_path)}
+
+    assert runs["run-bad"].state == "unreadable"
+    assert runs["run-bad"].error
+    assert runs["run-good"].completed == 1, "a bad started_at neighbour swallowed a good run"
 
 
 def test_subdirectories_are_found(tmp_path):

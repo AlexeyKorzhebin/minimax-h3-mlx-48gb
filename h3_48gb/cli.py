@@ -107,6 +107,7 @@ ERROR_CODES = {
     "turbo_strength_invalid": "--turbo-strength is not a finite number",
     "adaln_cache_unreadable": "--adaln-cache exists but is not a readable AdaLN table",
     "upstream_patch_missing": "a keyframe was given but the vendored upstream/ checkout is unpatched",
+    "outdir_not_found": "--outdir does not exist or cannot be read",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 
@@ -325,6 +326,10 @@ def build_parser() -> argparse.ArgumentParser:
     lst = sub.add_parser("list", help="list finished runs")
     lst.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     lst.add_argument("--json", action="store_true", help="emit a machine-readable report")
+
+    st = sub.add_parser("status", help="what is running under an outdir, and how far along")
+    st.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
+    st.add_argument("--json", action="store_true", help="emit a machine-readable report")
 
     doc = sub.add_parser("doctor", help="verify a converted checkpoint")
     doc.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
@@ -726,6 +731,39 @@ def run_list(outdir: Path) -> list[dict]:
     return rows
 
 
+def run_status(outdir: Path) -> dict:
+    """Every run under `outdir`, scanned recursively — in-flight ones first."""
+    from .runs import scan
+
+    outdir = Path(outdir)
+    if not outdir.is_dir():
+        raise CliError("outdir_not_found", f"--outdir does not exist: {outdir}",
+                       {"outdir": str(outdir)})
+    runs = scan(outdir)
+    order = {"in_flight": 0, "stale": 1, "unreadable": 2, "finished": 3}
+    runs.sort(key=lambda r: (order.get(r.state, 9), str(r.outdir)))
+    return {"ok": True, "outdir": str(outdir), "runs": [r.as_dict() for r in runs]}
+
+
+def format_status(report: dict) -> str:
+    """One block per in-flight run, one line per stale one, a count of the rest."""
+    lines = []
+    for row in report["runs"]:
+        if row["state"] != "in_flight":
+            continue
+        pct = f"{row['fraction'] * 100:.0f}%" if row["fraction"] is not None else "?"
+        lines.append(f"{Path(row['outdir']).name}    {row['completed']}/{row['total']} форвардов, {pct}")
+        if row["seconds_per_forward"]:
+            left = row["eta_seconds"] / 60
+            lines.append(f"  {row['seconds_per_forward']:.0f} с на форвард, осталось {left:.0f} мин")
+    stale = [r for r in report["runs"] if r["state"] == "stale"]
+    for row in stale:
+        lines.append(f"{Path(row['outdir']).name}: остановлен на {row['completed']}/{row['total']}")
+    if not lines:
+        lines.append(f"ничего не идёт в {report['outdir']}")
+    return "\n".join(lines)
+
+
 def run_doctor(checkpoint: Path) -> dict:
     """Check a converted checkpoint before a multi-hour run rather than during it."""
     checkpoint = Path(checkpoint)
@@ -768,6 +806,10 @@ def main(argv: list[str] | None = None) -> int:
             human = ("\n".join(f"{row.get('tag', '?')}: {row.get('frames', '?')} frames"
                                for row in report)
                      or f"no finished runs in {args.outdir}")
+        elif args.command == "status":
+            report = run_status(args.outdir)
+            ok = True
+            human = format_status(report)
         elif args.command == "doctor":
             report = run_doctor(args.checkpoint)
             ok = report["ok"]

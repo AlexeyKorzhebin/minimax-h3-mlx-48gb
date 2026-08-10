@@ -25,9 +25,19 @@ _MAX_HEADER_BYTES = 8 << 20
 
 _META_KEY = "h3_checkpoint"
 
+#: Three forwards absorbs one slow step; 120 s absorbs loading and decoding, during which the
+#: writer is silent. Below this a run has started and stopped.
+_STALE_GRACE_SECONDS = 120
+_STALE_FORWARD_MULTIPLE = 3
+
 
 def _parse(stamp: str) -> datetime:
     return datetime.fromisoformat(stamp)
+
+
+def _now() -> datetime:
+    """Indirected so tests can pin it."""
+    return datetime.now()
 
 
 @dataclass
@@ -78,6 +88,24 @@ class Run:
             return None
         return rate * (self.total - (self.completed or 0))
 
+    @property
+    def age_seconds(self) -> float | None:
+        if not self.written_at:
+            return None
+        return (_now() - _parse(self.written_at)).total_seconds()
+
+    def as_dict(self) -> dict:
+        """Flat JSON, absolute paths, computed fields included so a caller need not recompute."""
+        return {
+            "outdir": str(self.outdir), "tag": self.tag, "state": self.state,
+            "completed": self.completed, "total": self.total, "fraction": self.fraction,
+            "started_at": self.started_at, "written_at": self.written_at,
+            "age_seconds": self.age_seconds,
+            "seconds_per_forward": self.seconds_per_forward,
+            "eta_seconds": self.eta_seconds,
+            "identity_digest": self.identity_digest, "error": self.error,
+        }
+
 
 def read_checkpoint_meta(path: Path) -> dict:
     """The `h3_checkpoint` metadata block, or raise ValueError describing why not."""
@@ -93,6 +121,14 @@ def read_checkpoint_meta(path: Path) -> dict:
     return json.loads(raw[_META_KEY])
 
 
+def _state_of(run: Run) -> str:
+    age, rate = run.age_seconds, run.seconds_per_forward
+    if age is None:
+        return "in_flight"
+    window = _STALE_FORWARD_MULTIPLE * (rate or 0) + _STALE_GRACE_SECONDS
+    return "in_flight" if age < window else "stale"
+
+
 def scan(root: Path) -> list[Run]:
     """Every run under `root`, found recursively. Never raises for a file it finds."""
     root = Path(root)
@@ -103,7 +139,6 @@ def scan(root: Path) -> list[Run]:
             meta = read_checkpoint_meta(checkpoint)
             run = Run(
                 outdir=outdir,
-                state="in_flight",
                 completed=int(meta.get("completed_steps", 0)),
                 total=int(meta.get("total_forwards", 0)) or None,
                 identity_digest=meta.get("identity_digest"),
@@ -112,6 +147,13 @@ def scan(root: Path) -> list[Run]:
                 completed_at_start=int(meta.get("completed_at_start", 0)),
                 written_at=meta.get("written_at"),
             )
+            # Computed here, inside the same protected try that builds `run`: `_state_of` reads
+            # `age_seconds` and `seconds_per_forward`, both of which call `_parse` on caller-
+            # controlled timestamp strings. A checkpoint with well-formed JSON but an unparsable
+            # `started_at` must still cost one run, not the whole scan -- so this must not move
+            # outside the `try` below, where it would defeat the very isolation this function
+            # exists to provide.
+            run.state = _state_of(run)
         except (OSError, ValueError, TypeError, AttributeError, KeyError, struct.error,
                 MemoryError) as exc:
             # The bytes on disk are untrusted: a queue writes checkpoints by rename, so a reader

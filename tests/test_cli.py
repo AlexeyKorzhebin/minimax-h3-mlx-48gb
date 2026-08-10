@@ -208,6 +208,88 @@ def test_list_is_empty_for_an_outdir_with_no_finished_runs(tmp_path):
     assert run_list(tmp_path) == []
 
 
+# -- status --------------------------------------------------------------------------------------
+
+def test_status_json_lists_runs(tmp_path, capsys):
+    """The machine contract: one JSON document, ok true, a runs array."""
+    from tests.test_runs import write_checkpoint
+
+    write_checkpoint(tmp_path / "r" / "checkpoints" / "h3-a.safetensors",
+                     completed=3, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:30:00")
+
+    assert main(["status", "--outdir", str(tmp_path), "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["runs"][0]["completed"] == 3
+
+
+def test_status_refuses_a_missing_outdir(tmp_path, capsys):
+    assert main(["status", "--outdir", str(tmp_path / "nope"), "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "outdir_not_found"
+
+
+def test_status_orders_in_flight_before_stale(tmp_path, monkeypatch):
+    """`run_status` sorts in-flight runs first, so a human scanning the report sees what is
+    actually happening before what has died."""
+    import h3_48gb.runs as runs_mod
+    from h3_48gb.cli import run_status
+    from h3_48gb.runs import _parse
+    from tests.test_runs import write_checkpoint
+
+    write_checkpoint(tmp_path / "stale" / "checkpoints" / "h3-a.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:20:00")
+    write_checkpoint(tmp_path / "fresh" / "checkpoints" / "h3-b.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:59:00",
+                     completed_at_start=0, written_at="2026-08-10T22:00:00")
+
+    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T22:00:30"))
+
+    report = run_status(tmp_path)
+    assert [r["state"] for r in report["runs"]] == ["in_flight", "stale"]
+
+
+def test_format_status_reports_progress_for_an_in_flight_run():
+    from h3_48gb.cli import format_status
+
+    report = {
+        "ok": True, "outdir": "/x",
+        "runs": [{
+            "outdir": "/x/r", "state": "in_flight", "completed": 3, "total": 7,
+            "fraction": 3 / 7, "seconds_per_forward": 120.0, "eta_seconds": 480.0,
+        }],
+    }
+    human = format_status(report)
+    assert "r" in human
+    assert "3/7" in human
+    assert "43%" in human
+
+
+def test_format_status_reports_a_stale_run_as_stopped():
+    from h3_48gb.cli import format_status
+
+    report = {
+        "ok": True, "outdir": "/x",
+        "runs": [{
+            "outdir": "/x/r", "state": "stale", "completed": 3, "total": 7,
+            "fraction": 3 / 7, "seconds_per_forward": None, "eta_seconds": None,
+        }],
+    }
+    human = format_status(report)
+    assert "остановлен" in human
+    assert "3/7" in human
+
+
+def test_format_status_says_nothing_is_running_when_the_report_is_empty():
+    from h3_48gb.cli import format_status
+
+    human = format_status({"ok": True, "outdir": "/x", "runs": []})
+    assert "ничего не идёт" in human
+    assert "/x" in human
+
+
 # -- doctor ------------------------------------------------------------------------------------
 
 def test_doctor_reports_missing_components(tmp_path):
