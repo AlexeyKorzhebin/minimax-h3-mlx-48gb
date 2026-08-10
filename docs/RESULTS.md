@@ -838,10 +838,17 @@ arriving.
 The complaint that started this was a distorted face in a waist-up two-shot. Three things were
 tried against it and two of them did nothing:
 
-- **More steps: no effect.** 8 versus 31 grid points leaves the noise floor identical (flat-region
-  residual 0.72 vs 0.69, temporal flicker 8.55 vs 8.55). The `tail-split` runs, which hold the
-  composition bit-identical and subdivide only the final Euler step, made the image *softer* as the
-  tail was split further — 99.2, 89.4, 86.8 sharpness at frame 0 for splits of 1, 2 and 3.
+- **More steps: no effect on the face.** 8 versus 31 grid points leaves the noise floor identical
+  (flat-region residual 0.72 vs 0.69, temporal flicker 8.55 vs 8.55). The `tail-split` runs, which
+  hold the composition bit-identical and subdivide only the final Euler step, made the image
+  *softer* as the tail was split further — 99.2, 89.4, 86.8 sharpness at frame 0 for splits of
+  1, 2 and 3.
+
+  **Read that first line narrowly: it is about faces, not about grain.** Those two metrics measure
+  the residual in flat regions and the frame-to-frame second difference, and both are dominated by
+  what is in the shot rather than by noise. Measured properly — see "Grain is a real defect and
+  steps do fix it" below — step count halves the grain between 8 and 31. The face damage is what
+  steps do not fix.
 - **A pinned keyframe: no effect on rendering.** With composition fixed for the first ~8 frames,
   8 / 16 / tail-3 differ by 5% on the face band (93.8 / 98.5 / 98.0) — which is to say they do not
   differ. What the keyframe *does* fix is the weak opening, which is a separate problem.
@@ -870,3 +877,44 @@ and the eye agrees with it.
 The cost is 16.3 min against 6.8. On the model above that is what buying 2.25x the pixels costs,
 and for anything with a face in it, it is the cheapest quality available — cheaper than doubling
 the steps, which buys nothing here.
+
+
+## Grain is a real defect and steps do fix it — but pixels fix it cheaper
+
+Three metrics were tried against the grain question and the first two were worthless. Both the
+flat-region residual and the frame-to-frame second difference are dominated by scene content: they
+scored our clips *cleaner* than a reference clip that is visibly grainier, and they scored a
+50-step run as noisier than a 31-step one when the 50-step run had simply resolved more true
+detail — wall lamps and balcony ornament that the 31-step run left as mush — and that new detail
+moved with the camera.
+
+What works needs no motion model and no flat-region hunt. Real picture structure has a 1/f-ish
+spectrum and almost nothing at a two-pixel period; grain is flat to Nyquist. So take the radially
+averaged power at period 2-3 px over the power at period 8-16 px:
+
+| clip | grain |
+|---|---|
+| 512x512, 8 steps | **6.57** |
+| 512x512, 31 steps | 3.15 |
+| 512x512, 50 steps | 3.39 |
+| **768x768, 8 steps** | **2.66** |
+| reference `soldiers.mp4` (608x352) | 2.19 |
+| reference `rapidsave` (1920x1080, upscaled) | 0.96 |
+
+Four things fall out, and the first is a correction:
+
+- **Steps halve the grain between 8 and 31.** An earlier version of this file said step count did
+  not touch grain. That was the bad metric talking.
+- **Our 8-step 512x512 output really is about three times grainier than a reference clip from the
+  hosted model.** The first two metrics said the opposite, which is why the complaint went
+  uncorroborated for as long as it did. Trust the eye over a metric that disagrees with it.
+- **31 to 50 buys nothing** (+7.7%, marginally worse). Saturation arrives before 31, so upstream's
+  "16-31 points are undersampled, use 50" does not hold here. That run cost 39.3 min against 6.8.
+- **Pixels beat steps on grain too, and cost less.** 768x768 at 8 steps scores 2.66 — cleaner than
+  512x512 at *31* steps (3.15) — for 16.3 min against 23. This is the same conclusion the face
+  measurement reached, arrived at independently and by a metric that shares none of its
+  assumptions.
+
+Note what is *not* settled: 2.66 still sits above the reference's 2.19, and the reference was
+downscaled to 608x352, which suppresses grain on its own. Whether the remaining gap is quantization
+is the question the 8-bit build is being downloaded to answer.
