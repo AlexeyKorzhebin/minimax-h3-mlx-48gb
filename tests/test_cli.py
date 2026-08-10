@@ -1625,8 +1625,10 @@ def test_the_report_records_what_produced_the_run(tmp_path):
         "after the video is already rendered")
     assert report["turbo_lora"] == str(spec.turbo_lora)
     assert report["turbo_strength"] == 0.45
-    # Not set on this spec: must be present as null, not merely absent from the dict (see the
-    # companion test below, which pins that distinction directly).
+    # Not set on this spec: must be present as null, not merely absent from the dict. Both are
+    # None here, so a swapped image/end_image would pass this line too — that distinction needs
+    # two *different* images to be observable, which is what
+    # test_the_report_does_not_swap_image_and_end_image below is for.
     assert report["adaln_cache"] is None
     assert report["image"] is None
     assert report["end_image"] is None
@@ -1647,6 +1649,25 @@ def test_the_report_writes_null_not_a_missing_key_when_there_was_no_lora_or_imag
     assert spec.turbo_lora is None and spec.image is None and spec.end_image is None
     for key in ("turbo_lora", "turbo_strength", "image", "end_image"):
         assert key in report and report[key] is None, f"{key} must be present and null, not omitted"
+
+    json.dumps(report)
+
+
+def test_the_report_does_not_swap_image_and_end_image(tmp_path):
+    """`report["image"] == str(spec.end_image)` (and vice versa) would pass every other test in
+    this file, since the two other report tests above use no keyframes at all -- with both None,
+    a swap is invisible. Only two *different* real images make it observable, so this writes two
+    (the same `_png` helper `test_two_images_anchor_both_ends` and friends already use) and checks
+    each report field against the specific file it names, not just against "not None".
+    """
+    first = _png(tmp_path / "first.png", colour=(200, 30, 30))
+    last = _png(tmp_path / "last.png", colour=(30, 30, 200))
+
+    report, spec = _run_generate_with_fakes(tmp_path, spec_fn=_spec, image=first, end_image=last)
+
+    assert report["image"] == str(first)
+    assert report["end_image"] == str(last)
+    assert report["image"] != report["end_image"]
 
     json.dumps(report)
 
