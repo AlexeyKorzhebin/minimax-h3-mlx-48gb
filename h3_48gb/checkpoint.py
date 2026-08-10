@@ -406,6 +406,14 @@ class ResumableRun:
     #: would mean the denoising loop consumes randomness. It never has; see the module docstring.
     rng_note: str | None = None
 
+    #: When *this session* began, and how many forwards a resumed checkpoint already carried.
+    #: Both describe the session rather than the run so that a rate computed from them measures
+    #: the machine's current speed: dividing this session's elapsed time by every forward,
+    #: including ones a previous session paid for, reports a resumed run several times too fast.
+    #: Metadata, never identity -- neither enters `identity_digest`.
+    started_at: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%S"))
+    completed_at_start: int = 0
+
     _rows: dict[str, mx.array] = field(default_factory=dict)
     _stepped: dict[str, mx.array] = field(default_factory=dict)
     _prompt: tuple[mx.array, np.ndarray] | None = None
@@ -561,6 +569,8 @@ class ResumableRun:
             "row_counts": row_counts,
             "has_prompt_embeds": "prompt_embeds" in arrays,
             "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "started_at": self.started_at,
+            "completed_at_start": self.completed_at_start,
         }
         self.store.write(arrays, meta)
         self.writes += 1
@@ -734,6 +744,7 @@ class CheckpointingPipeline:
             loaded=loaded,
             verbose=verbose,
             store_prompt_embeds=bool(options.get("checkpoint_prompt_embeds", True)),
+            completed_at_start=loaded.completed_steps if loaded is not None else 0,
         )
 
         original_dit, original_text_encoder = self.dit, self.text_encoder

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import struct
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 #: safetensors headers here are JSON and small. A junk file read as one yields an absurd length
@@ -23,6 +24,10 @@ from pathlib import Path
 _MAX_HEADER_BYTES = 8 << 20
 
 _META_KEY = "h3_checkpoint"
+
+
+def _parse(stamp: str) -> datetime:
+    return datetime.fromisoformat(stamp)
 
 
 @dataclass
@@ -38,12 +43,40 @@ class Run:
     identity_digest: str | None = None
     identity: dict = field(default_factory=dict)
     error: str | None = None
+    started_at: str | None = None
+    completed_at_start: int = 0
+    written_at: str | None = None
 
     @property
     def fraction(self) -> float | None:
         if not self.total:
             return None
         return (self.completed or 0) / self.total
+
+    @property
+    def seconds_this_session(self) -> float | None:
+        if not (self.started_at and self.written_at):
+            return None
+        return (_parse(self.written_at) - _parse(self.started_at)).total_seconds()
+
+    @property
+    def forwards_this_session(self) -> int:
+        return (self.completed or 0) - self.completed_at_start
+
+    @property
+    def seconds_per_forward(self) -> float | None:
+        """None, not a crash, in the window between a resume and its first write."""
+        elapsed, done = self.seconds_this_session, self.forwards_this_session
+        if elapsed is None or done <= 0:
+            return None
+        return elapsed / done
+
+    @property
+    def eta_seconds(self) -> float | None:
+        rate = self.seconds_per_forward
+        if rate is None or self.total is None:
+            return None
+        return rate * (self.total - (self.completed or 0))
 
 
 def read_checkpoint_meta(path: Path) -> dict:
@@ -75,6 +108,9 @@ def scan(root: Path) -> list[Run]:
                 total=int(meta.get("total_forwards", 0)) or None,
                 identity_digest=meta.get("identity_digest"),
                 identity=meta.get("identity", {}),
+                started_at=meta.get("started_at"),
+                completed_at_start=int(meta.get("completed_at_start", 0)),
+                written_at=meta.get("written_at"),
             )
         except (OSError, ValueError, TypeError, AttributeError, KeyError, struct.error,
                 MemoryError) as exc:

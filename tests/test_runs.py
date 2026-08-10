@@ -12,6 +12,7 @@ from h3_48gb.runs import Run, scan
 
 
 def write_checkpoint(path: Path, *, completed: int, total: int, written_at: str,
+                     started_at: str | None = None, completed_at_start: int = 0,
                      identity: dict | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     meta = {
@@ -21,6 +22,8 @@ def write_checkpoint(path: Path, *, completed: int, total: int, written_at: str,
         "completed_steps": completed,
         "total_forwards": total,
         "written_at": written_at,
+        "started_at": started_at,
+        "completed_at_start": completed_at_start,
     }
     header = json.dumps({"__metadata__": {"h3_checkpoint": json.dumps(meta)}}).encode()
     path.write_bytes(struct.pack("<Q", len(header)) + header)
@@ -39,6 +42,37 @@ def test_a_checkpoint_is_read_into_a_run(tmp_path):
     assert run.total == 7
     assert run.fraction == 3 / 7
     assert run.identity_digest == "deadbeef"
+
+
+def test_a_resumed_run_rates_only_this_session(tmp_path):
+    """Divide this session's elapsed time by this session's forwards, not by all of them.
+
+    A run resumed at forward 5 of 7 that has since done one more forward has spent 600 s on one
+    forward. Dividing by `completed` instead of by `completed - completed_at_start` reports 100 s
+    and an ETA five times too optimistic.
+    """
+    write_checkpoint(tmp_path / "r" / "checkpoints" / "h3-a.safetensors",
+                     completed=6, total=7,
+                     started_at="2026-08-10T21:00:00", completed_at_start=5,
+                     written_at="2026-08-10T21:10:00")
+
+    run = scan(tmp_path)[0]
+
+    assert run.seconds_per_forward == 600.0
+    assert run.eta_seconds == 600.0
+
+
+def test_no_rate_before_the_first_forward_of_a_session(tmp_path):
+    """Between a resume and its first write there is nothing to divide by."""
+    write_checkpoint(tmp_path / "r" / "checkpoints" / "h3-a.safetensors",
+                     completed=5, total=7,
+                     started_at="2026-08-10T21:00:00", completed_at_start=5,
+                     written_at="2026-08-10T21:00:00")
+
+    run = scan(tmp_path)[0]
+
+    assert run.seconds_per_forward is None
+    assert run.eta_seconds is None
 
 
 def test_a_corrupt_checkpoint_does_not_hide_its_neighbours(tmp_path):

@@ -698,6 +698,24 @@ def test_metadata_is_readable_without_mlx(tmp_path):
     assert meta["completed_steps"] == STEPS - 1
 
 
+def test_session_timing_is_not_part_of_the_identity():
+    """A run resumed tomorrow must still match the checkpoint it wrote today.
+
+    `started_at` changes every session by construction. If it reached `identity_digest`, every
+    resume would be a fresh run and the checkpoint would be dead weight.
+    """
+    from h3_48gb.checkpoint import identity_digest
+
+    identity = {"request": {"prompt": "a cat", "seed": 7}}
+    before = identity_digest(identity)
+    identity_with_timing = dict(identity, started_at="2026-08-10T21:00:00",
+                                completed_at_start=5)
+
+    assert identity_digest(identity) == before
+    assert identity_digest(identity_with_timing) != before, (
+        "the fixture is pointless if the digest ignores extra keys")
+
+
 # -- standalone runner ------------------------------------------------------------------------------
 
 def _main() -> int:
