@@ -809,7 +809,7 @@ def format_status(report: dict) -> str:
 
 
 def run_watch(outdir: Path, interval: float) -> dict:
-    """Redraw the in-flight block until none is left, then return the final state.
+    """Redraw the status block until no runs are in_flight or unknown, then return the final state.
 
     Not a TUI: the block is reprinted with a leading escape that clears the previous one, so a
     dumb terminal and a redirected log both stay readable.
@@ -896,7 +896,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         raise
 
-    print(json.dumps(report, indent=2) if as_json else human)
+    if as_json or human:
+        print(json.dumps(report, indent=2) if as_json else human)
     return 0 if ok else 1
 
 

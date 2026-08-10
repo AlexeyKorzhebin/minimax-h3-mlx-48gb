@@ -414,16 +414,34 @@ def test_watch_exits_when_nothing_is_running(tmp_path, capsys):
     assert "ничего не идёт" in capsys.readouterr().out
 
 
-def test_watch_with_interval_0_prints_unknown_run(tmp_path, capsys):
-    """watch must consider unknown state a reason to continue observing."""
+def test_watch_continues_polling_on_unknown_state(tmp_path, monkeypatch):
+    """watch loops while unknown state is present; sleeps prove it, not just format_status."""
+    import time
     from tests.test_runs import write_checkpoint
+    from h3_48gb.cli import run_watch
 
-    write_checkpoint(tmp_path / "r" / "checkpoints" / "h3-a.safetensors",
+    run_dir = tmp_path / "r"
+    write_checkpoint(run_dir / "checkpoints" / "h3-a.safetensors",
                      completed=3, total=7, written_at="2026-08-10T21:00:00")
 
-    assert main(["watch", "--outdir", str(tmp_path), "--interval", "0"]) == 0
-    output = capsys.readouterr().out
-    assert "скорость неизвестна" in output
+    sleep_calls = []
+
+    def stub_sleep(duration: float) -> None:
+        sleep_calls.append(duration)
+        if len(sleep_calls) == 1:
+            # First sleep: delete the run so next iteration sees empty dir and exits cleanly
+            import shutil
+            shutil.rmtree(run_dir)
+
+    monkeypatch.setattr(time, "sleep", stub_sleep)
+
+    # interval > 0 so the loop can actually test continuation logic
+    report = run_watch(tmp_path, interval=0.1)
+
+    # Proof that unknown state caused continuation: sleep was called, meaning at least 2 iterations
+    assert len(sleep_calls) >= 1, "watch must sleep before checking for more runs"
+    # Proof that status was checked more than once: the final iteration sees empty dir
+    assert len(report["runs"]) == 0, "run_watch must have iterated again after the unknown run vanished"
 
 
 # -- resume ------------------------------------------------------------------------------------
