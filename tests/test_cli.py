@@ -1577,17 +1577,19 @@ def test_bad_turbo_inputs_are_refused_before_any_weight_loads(tmp_path):
 
 # -- the report records what produced the run --------------------------------------------------
 
-def _run_generate_with_fakes(tmp_path, **overrides):
-    """Run `run_generate` end to end through a faked pipeline and return its report.
+def _run_generate_with_fakes(tmp_path, spec_fn=_turbo_spec, **overrides):
+    """Run `run_generate` end to end through a faked pipeline; return `(report, spec)`.
 
     The brief for this test named `_run_generate_with_fakes(tmp_path, turbo_strength=0.45)`, but
     no such helper existed — this is that helper, built from the two patterns already proven
-    elsewhere in this file rather than a third reimplementation: `_turbo_spec` (which always sets
-    `turbo_lora`, so a run through here always has an adapter to record) and the `FakePipe`/`dit`
-    shape `test_the_lora_is_installed_once_even_when_resume_asks_twice` uses to satisfy
+    elsewhere in this file rather than a third reimplementation: `spec_fn` (default `_turbo_spec`,
+    which always sets `turbo_lora`, so a run through here always has an adapter to record — pass
+    `spec_fn=_spec` for the no-adapter, no-keyframe scenario) and the `FakePipe`/`dit` shape
+    `test_the_lora_is_installed_once_even_when_resume_asks_twice` uses to satisfy
     `install_turbo_lora`'s `pipe.dit.__dict__["_loader"]` access. That test's `FakePipe` is not
     callable; this one is, so `run_generate` can run its full path instead of stopping at adapter
-    installation.
+    installation. The spec is returned alongside the report so callers can assert the report's
+    values against what actually produced the run, not just that the keys exist.
     """
     class FakeLoader:
         def __call__(self):
@@ -1600,20 +1602,53 @@ def _run_generate_with_fakes(tmp_path, **overrides):
         def __call__(self, **kwargs):
             return _StubResult()
 
-    spec = _turbo_spec(tmp_path, **overrides)
-    return run_generate(spec, pipeline_factory=lambda _: FakePipe(),
-                        save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    spec = spec_fn(tmp_path, **overrides)
+    report = run_generate(spec, pipeline_factory=lambda _: FakePipe(),
+                          save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    return report, spec
 
 
 def test_the_report_records_what_produced_the_run(tmp_path):
     """On 2026-08-10 two runs of the same prompt, canvas, duration, steps and seed measured 349
-    and 265, and the cause was unrecoverable because none of this was written down."""
-    report = _run_generate_with_fakes(tmp_path, turbo_strength=0.45)
+    and 265, and the cause was unrecoverable because none of this was written down.
 
-    for key in ("prompt", "checkpoint", "adaln_cache", "turbo_lora", "turbo_strength",
-                "image", "end_image", "forwards"):
-        assert key in report, f"{key} is missing from the run report"
+    Checks values, not just key presence: a `key in report` check alone stays true no matter what
+    a field holds, so it cannot catch a swapped `image`/`end_image`, a strength that never reached
+    the report, or a `Path` slipping in where `json.dumps` needs a string.
+    """
+    report, spec = _run_generate_with_fakes(tmp_path, turbo_strength=0.45)
+
+    assert report["prompt"] == spec.prompt
+    assert report["checkpoint"] == str(spec.checkpoint)
+    assert isinstance(report["checkpoint"], str), (
+        "a Path here passes every dict check and then breaks json.dumps hours into a real run, "
+        "after the video is already rendered")
+    assert report["turbo_lora"] == str(spec.turbo_lora)
+    assert report["turbo_strength"] == 0.45
+    # Not set on this spec: must be present as null, not merely absent from the dict (see the
+    # companion test below, which pins that distinction directly).
+    assert report["adaln_cache"] is None
+    assert report["image"] is None
+    assert report["end_image"] is None
     assert report["forwards"] == report["grid_points"] - 1
+
+    # The one line that catches a non-JSON value anywhere in the report before it ever reaches
+    # disk, rather than hours into a real run when the write finally happens.
+    json.dumps(report)
+
+
+def test_the_report_writes_null_not_a_missing_key_when_there_was_no_lora_or_image(tmp_path):
+    """`turbo_lora`/`turbo_strength`/`image`/`end_image` must let a reader tell "this run had
+    none of this" apart from "the field was never recorded" -- only an explicit `null` can do
+    that; a missing key cannot.
+    """
+    report, spec = _run_generate_with_fakes(tmp_path, spec_fn=_spec)
+
+    assert spec.turbo_lora is None and spec.image is None and spec.end_image is None
+    for key in ("turbo_lora", "turbo_strength", "image", "end_image"):
+        assert key in report and report[key] is None, f"{key} must be present and null, not omitted"
+
+    json.dumps(report)
 
 
 def test_the_lora_side_path_is_numerically_unchanged_by_its_optimizations(tmp_path):
