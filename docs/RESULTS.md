@@ -874,9 +874,13 @@ Read the metric with care — the face band still contains background, so the ab
 with how cluttered the theatre is behind the dancers. The spread is the robust part of this table,
 and the eye agrees with it.
 
-The cost is 16.3 min against 6.8. On the model above that is what buying 2.25x the pixels costs,
-and for anything with a face in it, it is the cheapest quality available — cheaper than doubling
-the steps, which buys nothing here.
+The cost is 16.3 min against 6.8. On the model above that is what buying 2.25x the pixels costs.
+
+That is **not** cheaper than doubling the steps — 512x512 at 16 steps is 13.2 min, three minutes
+less. An earlier version of this paragraph claimed otherwise and was simply wrong on the
+arithmetic. What the three-seed table supports is narrower: doubling the steps does not fix faces
+and 768 does, so the pixels are worth their extra three minutes *for this defect*. Against the
+31-step run (23 min) resolution is both cheaper and better.
 
 
 ## Grain is a real defect and steps do fix it — but pixels fix it cheaper

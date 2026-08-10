@@ -42,13 +42,18 @@ peak at all, only by how long the diffusion takes.
 The corollary is worth stating plainly: **nothing between 512x512 and 1344x768 is memory-limited.**
 Every canvas tried fits in the same 27 GB. The constraint on this machine is wall clock.
 
-The same corollary settled the precision question. An 8-bit DiT is 21.35 GB resident against the
-4-bit build's 11.34 — nearly twice — and the run's peak does not move: **27 GB either way**,
-because the text encoder still dominates and diffusion at 8 bits reaches 24 GB, under it. Ten extra
-gigabytes of weights were free, and they bought 27% less noise and 75% more detail (see
-`docs/RESULTS.md`). Sizing a build against the *peak* rather than against the diffusion phase is
-what makes that visible; sizing it against diffusion alone says 8-bit doubles the cost, which is
-true and irrelevant.
+The precision question is where that corollary stops applying, and the distinction matters. An
+8-bit DiT is 21.35 GB resident against the 4-bit build's 11.34 — nearly twice — and on a
+896x512 / 2.4 s run the peak does not move: **27 GB either way**, because the text encoder still
+dominates and diffusion at 8 bits reaches only 24 GB.
+
+That is a statement about *short clips on a middling canvas*, not a general one. The ten extra
+gigabytes are free only while diffusion stays under the encoder's 27 GB, and the activations
+section below projects a 15 s native clip past 24 GB of activations on its own. Against a 21.35 GB
+DiT that is ~46 GB on a 48 GB machine: at that size the 8-bit build *is* the peak, and the headroom
+it costs is the binding constraint rather than a footnote. An earlier version of this paragraph
+called the diffusion-phase cost "true and irrelevant"; it is true and conditionally relevant, and
+the condition is exactly the long native runs this fork most wants to reach.
 
 `memory.report()` prints MLX's numbers, and that is the measurement of *this process's* footprint.
 `ps -o rss=` on this process is not a sanity check for that — it is blind to Metal-backed
