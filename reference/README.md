@@ -32,9 +32,17 @@ That matters for reading any comparison against them:
 - `fl2va` is the same partition this fork converts, so the weights are comparable at all.
 
 Sigma shift is unrecorded; if their graph has no `MiniMaxH3SigmaShift` node it is ComfyUI's default.
-ComfyUI issue #15416 reports a broken H3 video-VAE decode at >=512 px; whether 0.31.0 still carries
-it is unverified, and if it does these clips were made with a handicap, which would make the gap
-measured against them an underestimate.
+
+**These clips were rendered through a decoder with a known defect.** ComfyUI issue #15416 reports
+the H3 video VAE decoding badly at >=512 px — mean absolute error 4.6 against the reference
+implementation, rising to 31.4 tiled with 256 px seams and banding — and as of 2026-08-10 it is
+still open, with no fixing PR and no linked branch, so 0.31.0 carries it. Every gap measured
+against these clips is therefore a **lower bound**: the reference is handicapped and still ahead.
+
+Whether this fork's decode is clean is a separate question with its own evidence — the port claims
+encode+decode round-trips to 1.2e-06 tiled and untiled — but note what that claims and does not:
+agreement with the reference *implementation*, not freedom from artifacts the reference
+implementation itself has.
 
 ## The files
 
