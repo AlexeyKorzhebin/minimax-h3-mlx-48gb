@@ -331,6 +331,11 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     st.add_argument("--json", action="store_true", help="emit a machine-readable report")
 
+    wt = sub.add_parser("watch", help="redraw a run's progress until nothing is running")
+    wt.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
+    wt.add_argument("--interval", type=float, default=20.0,
+                    help="seconds between redraws (default 20); 0 renders once and exits")
+
     doc = sub.add_parser("doctor", help="verify a converted checkpoint")
     doc.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     doc.add_argument("--json", action="store_true", help="emit a machine-readable report")
@@ -731,6 +736,13 @@ def run_list(outdir: Path) -> list[dict]:
     return rows
 
 
+#: States for which `watch` should continue polling the outdir. in_flight runs are obviously still
+#: going; unknown runs have not yet revealed their completion status (the checkpoint lacks
+#: started_at, often because it was written by older code). unknown is a reason to keep watching:
+#: if watch exited on unknown alone, the command would be useless on all existing cached checkpoints.
+WATCH_RUNNING_STATES = {"in_flight", "unknown"}
+
+
 def run_status(outdir: Path) -> dict:
     """Every run under `outdir`, scanned recursively — in-flight ones first."""
     from .runs import scan
@@ -796,6 +808,25 @@ def format_status(report: dict) -> str:
     return "\n".join(lines)
 
 
+def run_watch(outdir: Path, interval: float) -> dict:
+    """Redraw the in-flight block until none is left, then return the final state.
+
+    Not a TUI: the block is reprinted with a leading escape that clears the previous one, so a
+    dumb terminal and a redirected log both stay readable.
+    """
+    import time as _time
+
+    while True:
+        report = run_status(outdir)
+        text = format_status(report)
+        print(text, flush=True)
+        running = [r for r in report["runs"] if r["state"] in WATCH_RUNNING_STATES]
+        if not running or interval <= 0:
+            return report
+        _time.sleep(interval)
+        print(f"\033[{text.count(chr(10)) + 1}A\033[J", end="")
+
+
 def run_doctor(checkpoint: Path) -> dict:
     """Check a converted checkpoint before a multi-hour run rather than during it."""
     checkpoint = Path(checkpoint)
@@ -842,6 +873,10 @@ def main(argv: list[str] | None = None) -> int:
             report = run_status(args.outdir)
             ok = True
             human = format_status(report)
+        elif args.command == "watch":
+            report = run_watch(args.outdir, args.interval)
+            ok = True
+            human = ""
         elif args.command == "doctor":
             report = run_doctor(args.checkpoint)
             ok = report["ok"]

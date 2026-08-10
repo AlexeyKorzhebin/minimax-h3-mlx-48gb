@@ -17,6 +17,7 @@ from h3_48gb.cli import (
     run_generate,
     run_list,
     run_resume,
+    run_status,
     spec_from_args,
 )
 from h3_48gb.cli import _checkpoint_path_for, DEFAULT_OUTDIR
@@ -403,6 +404,26 @@ def test_doctor_reports_the_baked_adaln_cache_separately_from_the_component_dirs
     report = run_doctor(tmp_path)
     assert report["ok"] is False
     assert report["missing"] == ["transformer/adaln_cache.safetensors"]
+
+
+# -- watch ------------------------------------------------------------------------------------
+
+def test_watch_exits_when_nothing_is_running(tmp_path, capsys):
+    """It has to terminate on its own, or it cannot end a queue script."""
+    assert main(["watch", "--outdir", str(tmp_path), "--interval", "0"]) == 0
+    assert "ничего не идёт" in capsys.readouterr().out
+
+
+def test_watch_with_interval_0_prints_unknown_run(tmp_path, capsys):
+    """watch must consider unknown state a reason to continue observing."""
+    from tests.test_runs import write_checkpoint
+
+    write_checkpoint(tmp_path / "r" / "checkpoints" / "h3-a.safetensors",
+                     completed=3, total=7, written_at="2026-08-10T21:00:00")
+
+    assert main(["watch", "--outdir", str(tmp_path), "--interval", "0"]) == 0
+    output = capsys.readouterr().out
+    assert "скорость неизвестна" in output
 
 
 # -- resume ------------------------------------------------------------------------------------
