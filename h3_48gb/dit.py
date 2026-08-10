@@ -158,9 +158,16 @@ def load_dit_cached(
     if verbose:
         print(f"  modulation path not in this build: {len(dropped)} tensors never allocated")
 
+    # Some builds *do* ship the modulation path — pipenetwork's, for one, which carries all 206
+    # `adaln_proj` tensors the mere.run monolith omitted. Those keys are not a mismatch to report:
+    # they are the 13B this loader deliberately refuses to allocate, and the cached table stands in
+    # for them. Skipping them here is what lets an 8-bit build load into 21.5 GB instead of 35.3.
+    # They are kept distinct from `unexpected` so a genuinely stray tensor still fails loudly.
+    replaced_by_cache = set(dropped)
     expected = {key for key, _ in tree_flatten(model.parameters())}
     weights: dict[str, mx.array] = {}
     unexpected: list[str] = []
+    ignored = 0
 
     for shard in shard_paths(model_dir):
         started = time.perf_counter()
@@ -169,7 +176,10 @@ def load_dit_cached(
             if key in SKIP_KEYS:
                 continue
             if key not in expected:
-                unexpected.append(key)
+                if key in replaced_by_cache:
+                    ignored += 1
+                else:
+                    unexpected.append(key)
                 continue
             if dtype is not None and tensor.dtype not in (mx.uint32, mx.int32):
                 # Never cast a quantized layer's packed storage: it is uint32 bit-packing, not a
@@ -184,6 +194,10 @@ def load_dit_cached(
             gb = sum(t.nbytes for t in loaded.values()) / 1e9
             print(f"  {shard.name}: {len(loaded)} tensors, {gb:.2f} GB, "
                   f"{time.perf_counter() - started:.1f}s")
+
+    if verbose and ignored:
+        print(f"  this build ships the modulation path: {ignored} tensors skipped, "
+              "the cached table is used instead")
 
     missing = sorted(expected - weights.keys())
     if missing or unexpected:
