@@ -41,6 +41,36 @@ def test_spec_carries_every_field_that_identifies_a_run():
     )
 
 
+def test_prompt_file_matches_the_shell(tmp_path):
+    """`$(cat file)` strips every trailing newline, and every measured run to date was launched
+    that way. Leaving one on would change the prompt by a character, change identity_digest, and
+    orphan every checkpoint on disk."""
+    path = tmp_path / "p.txt"
+    path.write_text("a cat\n\n\n")
+
+    from_file = spec_from_args(build_parser().parse_args(
+        ["generate", "--prompt-file", str(path), "--outdir", str(tmp_path)]))
+    positional = spec_from_args(build_parser().parse_args(
+        ["generate", "a cat", "--outdir", str(tmp_path)]))
+
+    assert from_file.prompt == positional.prompt
+
+
+def test_prompt_and_prompt_file_together_are_refused(tmp_path):
+    path = tmp_path / "p.txt"
+    path.write_text("a cat\n")
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "a dog", "--prompt-file", str(path), "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "prompt_both_given"
+
+
+def test_no_prompt_at_all_is_refused(tmp_path):
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(["generate", "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "prompt_missing"
+
+
 def test_rejects_geometry_the_port_cannot_pack():
     parser = build_parser()
     args = parser.parse_args(["generate", "a cat", "--height", "432"])

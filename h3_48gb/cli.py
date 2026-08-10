@@ -108,6 +108,11 @@ ERROR_CODES = {
     "adaln_cache_unreadable": "--adaln-cache exists but is not a readable AdaLN table",
     "upstream_patch_missing": "a keyframe was given but the vendored upstream/ checkout is unpatched",
     "outdir_not_found": "--outdir does not exist or cannot be read",
+    "prompt_file_not_found": "--prompt-file points at a file that does not exist",
+    "prompt_file_unreadable": "--prompt-file exists but could not be read as UTF-8",
+    "prompt_file_empty": "--prompt-file is empty once trailing newlines are stripped",
+    "prompt_both_given": "both a positional prompt and --prompt-file were given; pass exactly one",
+    "prompt_missing": "no prompt: pass one positionally or with --prompt-file",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 
@@ -184,6 +189,13 @@ class RunSpec:
     #: An AdaLN table baked for a grid other than the checkpoint's own — this is what makes
     #: `--steps 8` possible. `scripts/bake_adaln.py` produces one.
     adaln_cache: Path | None = None
+    #: The file `prompt` was read from, when it came from `--prompt-file` rather than the
+    #: positional argument; `None` otherwise. Record-only, like `preview_every`: it is never
+    #: passed to `pipe(...)` (only the resolved `prompt` text is), so it never reaches
+    #: `request_identity` and does not enter `identity_digest` — resuming a run started with
+    #: `--prompt-file prompts/x.txt` and one started with the positional argument for the same
+    #: text must land on the same checkpoint.
+    prompt_file: str | None = None
 
     def __post_init__(self) -> None:
         """Every refusal that depends only on the request, checked once, at construction.
@@ -256,7 +268,12 @@ class RunSpec:
 
 def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     """The flags `generate` and `resume` share — every one of them identifies or locates a run."""
-    sub.add_argument("prompt")
+    # `nargs="?"` rather than required: a caller now may pass the prompt via `--prompt-file`
+    # instead, and `resolve_prompt` (called from `spec_from_args`) is what actually requires
+    # exactly one of the two.
+    sub.add_argument("prompt", nargs="?", default=None)
+    sub.add_argument("--prompt-file", type=Path, default=None,
+                     help="read the prompt from a file instead of the positional argument")
     # `None` rather than the default canvas so `spec_from_args` can tell "the caller wants the
     # default" from "the caller asked for exactly that size" — with a keyframe, the default
     # comes from the frame instead. See `DEFAULT_CANVAS`.
@@ -409,15 +426,50 @@ def resolve_canvas(image: Path | None, width: int | None, height: int | None) ->
     return derived_width, derived_height
 
 
+def resolve_prompt(prompt: str | None, prompt_file: Path | None) -> tuple[str, str | None]:
+    """The prompt text and the file it came from, or a refusal.
+
+    Trailing newlines are stripped -- all of them, exactly as `$(cat file)` does. This is a
+    compatibility requirement, not a preference: every measured run so far was launched through
+    that substitution, and one surviving newline would change identity_digest and orphan every
+    checkpoint on disk.
+    """
+    if prompt is not None and prompt_file is not None:
+        raise CliError("prompt_both_given",
+                       "pass either a positional prompt or --prompt-file, not both")
+    if prompt is not None:
+        return prompt, None
+    if prompt_file is None:
+        raise CliError("prompt_missing",
+                       "no prompt: pass one positionally or with --prompt-file")
+    path = Path(prompt_file)
+    if not path.is_file():
+        raise CliError("prompt_file_not_found", f"--prompt-file does not exist: {path}",
+                       {"prompt_file": str(path)})
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CliError("prompt_file_unreadable",
+                       f"--prompt-file could not be read: {path} ({exc})",
+                       {"prompt_file": str(path)}) from exc
+    text = text.rstrip("\n")
+    if not text:
+        raise CliError("prompt_file_empty", f"--prompt-file is empty: {path}",
+                       {"prompt_file": str(path)})
+    return text, str(path.resolve())
+
+
 def spec_from_args(args: argparse.Namespace) -> RunSpec:
     """Build a `RunSpec` from parsed args, shared by `generate` and `resume` (identical flags).
 
     Validation lives in `RunSpec.__post_init__`, so it happens here for both subcommands, before
-    either one touches a checkpoint path or a weight file.
+    either one touches a checkpoint path or a weight file. Resolving the prompt happens first of
+    all, ahead of the canvas: a bad `--prompt-file` must refuse before anything else does.
     """
+    prompt, prompt_file = resolve_prompt(args.prompt, args.prompt_file)
     width, height = resolve_canvas(args.image, args.width, args.height)
     return RunSpec(
-        prompt=args.prompt, width=width, height=height,
+        prompt=prompt, width=width, height=height,
         duration=args.duration, steps=args.steps, seed=args.seed,
         checkpoint=args.checkpoint, outdir=args.outdir, tag=args.tag,
         checkpoint_dir=args.checkpoint_dir,
@@ -427,6 +479,7 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
         preview_decoder=args.preview_decoder,
         turbo_lora=args.turbo_lora, turbo_strength=args.turbo_strength,
         adaln_cache=args.adaln_cache,
+        prompt_file=prompt_file,
     )
 
 
@@ -607,6 +660,10 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
         "forwards": spec.steps - 1,
         "seed": spec.seed,
         "prompt": spec.prompt,
+        # `None` when the prompt came from the positional argument; already a plain string
+        # (resolved in `resolve_prompt`) when it came from `--prompt-file`, so no `str()` needed
+        # here the way the other optional path fields below need one.
+        "prompt_file": spec.prompt_file,
         # Paths as strings: `json.dumps` cannot serialize a `Path`, and `h3 list` /
         # analysis scripts read these back as plain text anyway.
         "checkpoint": str(spec.checkpoint),
