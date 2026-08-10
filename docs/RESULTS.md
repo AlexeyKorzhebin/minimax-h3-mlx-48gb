@@ -923,11 +923,40 @@ Note what is *not* settled by that table: 2.66 still sits above the reference's 
 reference was downscaled to 608x352, which suppresses grain on its own. The next section settles it.
 
 
+## The two bands are scales, not noise and detail
+
+Everything below this heading was first written calling the 2-3 px band "grain" and the 8-16 px
+band "structure". That labelling is wrong and a ground-truth measurement disproved it.
+
+The hosted model rendered the same prompt at 896x576 (three seeds) and at 1248x832. Measured on
+equal *fractions* of each frame resampled to one size — so the bands refer to scene scale rather
+than pixel pitch — the larger render carries **90% more** 2-3 px energy with its 8-16 px energy
+unchanged (+3%). A model does not double its noise by rendering bigger; it resolves finer texture.
+The 2-3 px band is therefore **fine-scale content**, which happens to include grain, and the
+8-16 px band is **mid-scale content**. Read every table below with those names.
+
+What survives the relabelling, and is the load-bearing result:
+
+| clip (centaur prompt, 10 s) | fine 2-3 px | mid 8-16 px |
+|---|---|---|
+| hosted, 896x576, 3 seeds | **0.411 ± 0.034** | **551 ± 16** |
+| hosted, 1248x832 | 0.781 | 569 |
+| ours, 4-bit, 8 steps, 896x576 | 0.377 (**-8%**) | 349 (**-37%**) |
+
+Same prompt, same canvas, same duration, same frame count, and the reference's own seed-to-seed
+spread is known. **Our fine scale matches the reference to within one sigma; our mid scale is 37%
+below it, eleven sigma out.** The deficit is narrow and specific, not a general softness — and it
+is the first statement in this file about our output versus the hosted model's that rests on a
+baseline with a measured variance rather than on a single downscaled clip of another scene.
+
+Caveat carried forward: the reference clips are 20-step renders and ours is 8-step, so precision
+and step count are confounded in that last row. The 2x2 that separates them is running.
+
+
 ## It was the 4-bit DiT, and 8-bit costs nothing
 
-Decompose the ratio and the whole question changes shape. The numerator is grain-band energy, the
-denominator is structure-band energy, and a ratio can fall either by losing grain or by gaining
-detail — opposite news:
+Decompose the ratio and the question changes shape. The numerator is fine-scale energy, the
+denominator mid-scale energy, and a ratio can fall either way — opposite news:
 
 | clip | grain 2-3 px | structure 8-16 px |
 |---|---|---|
