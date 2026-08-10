@@ -4,6 +4,12 @@ Eight clips of `prompts/centaur-battle.txt` produced by someone else's ComfyUI i
 here because every quality claim in `docs/RESULTS.md` about how this fork compares to a working
 MiniMax-H3 setup is measured against them.
 
+**The clips themselves are not in git — only this file is.** `.gitignore` excludes `*.mp4`, and
+`NOTICE` states that this project does not host or redistribute MiniMax H3 weights or their output;
+committing eight of someone else's renders would contradict that. They live on disk beside this
+README on the machine that measured them. Anyone reproducing the numbers below needs their own copy
+of equivalent renders, which is why this file records exactly what produced these ones.
+
 They exist because measuring our own output against itself could not answer the question that
 started the investigation — "why does ours look grainy" — and the clips we first compared against
 (`soldiers.mp4`, a Reddit repost) turned out to be a different prompt, downscaled to 608x352, which
