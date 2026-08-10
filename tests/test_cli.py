@@ -44,7 +44,17 @@ def test_spec_carries_every_field_that_identifies_a_run():
 def test_prompt_file_matches_the_shell(tmp_path):
     """`$(cat file)` strips every trailing newline, and every measured run to date was launched
     that way. Leaving one on would change the prompt by a character, change identity_digest, and
-    orphan every checkpoint on disk."""
+    orphan every checkpoint on disk.
+
+    The text comparison below is diagnostically useful but is not what is actually at stake:
+    identity is built from arguments bound to the pipeline's own `__call__` signature (a stray
+    argument there raises `TypeError`, so that source is guarded) plus the free-form
+    `checkpoint_identity_extra()` dict, which is an ordinary dict a text-only comparison would not
+    notice a leak through. Comparing `_checkpoint_path_for`'s output directly is what actually
+    confirms a run started with `--prompt-file` resumes the same checkpoint as one started
+    positionally -- the same direct-comparison pattern
+    `test_resume_checkpoint_path_changes_with_the_request` already uses.
+    """
     path = tmp_path / "p.txt"
     path.write_text("a cat\n\n\n")
 
@@ -54,6 +64,10 @@ def test_prompt_file_matches_the_shell(tmp_path):
         ["generate", "a cat", "--outdir", str(tmp_path)]))
 
     assert from_file.prompt == positional.prompt
+
+    pipe = _StubPipe()
+    assert (_checkpoint_path_for(from_file, pipe, tmp_path / "checkpoints")
+            == _checkpoint_path_for(positional, pipe, tmp_path / "checkpoints"))
 
 
 def test_prompt_and_prompt_file_together_are_refused(tmp_path):
@@ -69,6 +83,36 @@ def test_no_prompt_at_all_is_refused(tmp_path):
     with pytest.raises(CliError) as excinfo:
         spec_from_args(build_parser().parse_args(["generate", "--outdir", str(tmp_path)]))
     assert excinfo.value.code == "prompt_missing"
+
+
+def test_prompt_file_pointing_nowhere_is_refused(tmp_path):
+    missing = tmp_path / "missing.txt"
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "--prompt-file", str(missing), "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "prompt_file_not_found"
+
+
+def test_prompt_file_that_is_not_valid_utf8_is_refused(tmp_path):
+    path = tmp_path / "bad.txt"
+    path.write_bytes(b"\xff\xfe\x00\x01")
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "--prompt-file", str(path), "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "prompt_file_unreadable"
+
+
+def test_prompt_file_of_only_newlines_is_refused_as_empty(tmp_path):
+    """The shell equivalent, `P="$(cat file)"`, would silently substitute an empty string, and a
+    run would spend hours generating a clip of nothing -- exactly the zone
+    `test_prompt_file_matches_the_shell` exists to police, seen from the other side.
+    """
+    path = tmp_path / "empty.txt"
+    path.write_text("\n\n\n")
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "--prompt-file", str(path), "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "prompt_file_empty"
 
 
 def test_rejects_geometry_the_port_cannot_pack():
@@ -1646,9 +1690,13 @@ def test_the_report_records_what_produced_the_run(tmp_path):
     a field holds, so it cannot catch a swapped `image`/`end_image`, a strength that never reached
     the report, or a `Path` slipping in where `json.dumps` needs a string.
     """
-    report, spec = _run_generate_with_fakes(tmp_path, turbo_strength=0.45)
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("a cat\n")
+    report, spec = _run_generate_with_fakes(tmp_path, turbo_strength=0.45,
+                                            prompt_file=str(prompt_file))
 
     assert report["prompt"] == spec.prompt
+    assert report["prompt_file"] == str(prompt_file)
     assert report["checkpoint"] == str(spec.checkpoint)
     assert isinstance(report["checkpoint"], str), (
         "a Path here passes every dict check and then breaks json.dumps hours into a real run, "
@@ -1670,14 +1718,16 @@ def test_the_report_records_what_produced_the_run(tmp_path):
 
 
 def test_the_report_writes_null_not_a_missing_key_when_there_was_no_lora_or_image(tmp_path):
-    """`turbo_lora`/`turbo_strength`/`image`/`end_image` must let a reader tell "this run had
-    none of this" apart from "the field was never recorded" -- only an explicit `null` can do
-    that; a missing key cannot.
+    """`turbo_lora`/`turbo_strength`/`image`/`end_image`/`prompt_file` must let a reader tell
+    "this run had none of this" apart from "the field was never recorded" -- only an explicit
+    `null` can do that; a missing key cannot. `_spec` builds its `RunSpec` with a positional
+    prompt (no `--prompt-file`), so `spec.prompt_file` is `None` here.
     """
     report, spec = _run_generate_with_fakes(tmp_path, spec_fn=_spec)
 
-    assert spec.turbo_lora is None and spec.image is None and spec.end_image is None
-    for key in ("turbo_lora", "turbo_strength", "image", "end_image"):
+    assert (spec.turbo_lora is None and spec.image is None and spec.end_image is None
+            and spec.prompt_file is None)
+    for key in ("turbo_lora", "turbo_strength", "image", "end_image", "prompt_file"):
         assert key in report and report[key] is None, f"{key} must be present and null, not omitted"
 
     json.dumps(report)
