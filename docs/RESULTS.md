@@ -1016,3 +1016,46 @@ pipenetwork's own `gb_resident_after_adaln_drop: 21.47`.
 Loading that build needed one fix: it *ships* the 206 AdaLN modulation tensors the mere.run
 monolith omits, and `load_dit_cached` rejected them as unexpected keys. They are now skipped by
 name, which is also what keeps the build resident in 21.5 GB instead of 35.3.
+
+## Words do not move the centaur
+
+Three prompt revisions, ten drafts, and the model's idea of a centaur did not budge. Recorded here
+because the negative result is the useful part: it says which lever to stop pulling.
+
+| version | what it added | what came back |
+|---|---|---|
+| `centaur-battle-anatomy` | where the human torso joins the horse, six limbs, "exactly one head, and it is human" | a recognisable centaur — and a horse's mane growing out of the human back |
+| `centaur-battle-anatomy-2` | no mane, no horse neck; human back all the way down to the buttocks | the horse's back returned, running up to the neck |
+| `centaur-battle-anatomy-3` | the whole creature in one sentence; W1 declared "entirely human, two-legged, no animal parts" | W1 clean; the centaur still seats the human torso too low |
+
+Two things fall out of this, and they point in different directions.
+
+**Detail made it worse, not better.** Version 2's paragraph says "horse" and its relatives a dozen
+times, and the result was horse-ness spread across the scene rather than attached to one figure —
+the observer saw a horse's back on *both* characters. A diffusion text encoder has no syntax tree
+that binds an adjective to a noun three clauses away; repetition is a vote for the concept, not for
+its placement. Version 3 said the same thing in one sentence and one figure got cleaner, which is
+the opposite of what more specification is supposed to do.
+
+**The remaining error is a prior, not a misunderstanding.** Every version puts the human torso lower
+into the horse's body than the description asks. That is not the model failing to parse a clause; it
+is the model having a fixed idea of where the seam goes and returning to it. Words are the wrong
+instrument for that, and the levers that might work — anchoring the first frame with `--image`, or
+an adapter trained on the shape — are a different kind of work, untried and out of scope here.
+
+### What this changes about measurement
+
+`prompts/centaur-battle.txt` stays exactly as it is and stays the **measurement fixture**: all eight
+reference clips in `reference/` were rendered from it, and it is the only thing that makes
+"are we behind the other build" answerable. Nothing about its anatomy needs fixing for that job —
+the reference build gets the same creature wrong in its own way, and both sides are compared on the
+same words.
+
+`prompts/greek-warrior-battle.txt` becomes the **working prompt** for questions about quality: same
+scene, same choreography, same second figure, with the centaur replaced by a body the model has seen
+a million times. Use it when the question is about skin, faces, motion or the recipe.
+
+One consequence for the numbers already recorded: the 27% seed-to-seed spread measured on the
+centaur is inflated by the model's own uncertainty about the creature, and should not be read as the
+recipe's instability alone. The Greek's spread, measured on the same canvas, is the number to
+compare against the reference's 4-9%.
