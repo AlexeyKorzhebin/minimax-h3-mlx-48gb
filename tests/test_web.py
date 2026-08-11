@@ -637,7 +637,7 @@ def test_media_serves_only_clips_and_frames(server, name, suffix):
 
 
 @pytest.mark.parametrize("name", ["absent.json", "absent.log", "absent.safetensors"])
-def test_a_forbidden_type_is_refused_before_anyone_looks_for_it(server, name):
+def test_media_refuses_a_forbidden_type_before_anyone_looks_for_it(server, name):
     """The refusal must not double as an existence oracle: the extension is checked *before*
     `is_file`, so a caller cannot tell `queue/logs/real.log` from `queue/logs/guess.log` by whether
     the answer is `media_type_not_allowed` or `not_found`. Ordering is invisible in the code and
