@@ -1,0 +1,14 @@
+[10s, multi-shot dynamic action sequence] Live-action, cinematic realism, flat overcast daylight over a rocky mountain ridge, a solid grey cloud deck with no sun disc and no sun rays, soft shadowless light from the whole sky, distant misty mountain valleys, scattered boulders and dusty gravel underfoot, kicked-up dust drifting through the cool grey light, filmed with muted natural color, shallow depth of field and crisp motion. Matte skin with visible pores and fine skin texture, no specular sheen.
+
+Characters: A nude athletic Greek warrior man (M1), classical proportions, tanned muscular body, short curly dark hair and a short beard, wielding a bronze xiphos sword. A nude athletic warrior woman (W1), tanned toned body, long dark hair in a single braid whipping behind her, medium natural breasts, wielding a long wooden spear with an iron tip.
+
+[0.0-2.5s] WIDE SHOT, side profile: the man slashes the sword down with a snap of his shoulder; the woman lunges sideways, dodging low, her braid whipping through the air, her breasts bouncing and swaying naturally with the sudden lunge, dust kicking up around her bare feet.
+[2.5-5.0s] MEDIUM TRACKING SHOT following her as she charges forward and thrusts the spear; her breasts jiggle and heave with each pounding stride and the forward thrust, muscles flexing across her torso.
+[5.0-7.0s] LOW ANGLE fast shot: the man plants his feet and rears back, muscular torso twisting to raise the sword overhead; a quick whip-pan to the woman spinning the spear overhead.
+[7.0-10.0s] CLOSE ACTION SHOT: the woman leaps in, spear clashing against the man's raised sword with sparks and dust, her breasts bouncing heavily from the impact and momentum, both frozen in a tense straining lock, skin damp and matte, hair and braid flying, before a final quick pull-back to a dramatic wide silhouette against the pale sky.
+
+Breast physics: throughout every shot her breasts move with realistic weight and jiggle - swaying with lunges, bouncing with strides, heaving with impacts and quick shifts of momentum, soft natural motion synced to her body.
+
+overall_soundscape: Epic battle ambience - the ring and scrape of bronze on wood, quick barefoot steps on gravel, sharp grunts and battle cries from both, kicked-up gravel and dust, gusting mountain wind.
+
+non_diegetic_music: A driving epic orchestral battle theme with pounding war drums, soaring strings and heroic brass, tense and fast-paced, building through the clash to a dramatic hit at the final silhouette.
