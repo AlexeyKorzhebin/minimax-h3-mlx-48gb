@@ -1351,6 +1351,32 @@ def _pending(live: _Live) -> list:
     return [job for job in jobs if job.state == "pending"]
 
 
+#: One estimate request body, reused where a test has to spell out `Content-Length` by hand.
+_ESTIMATE_BODY = json.dumps({"args": ["generate", "кот"]}).encode("utf-8")
+
+
+def _raw_exchange(live: _Live, raw: bytes):
+    """`(status, parsed_json)` for bytes written straight onto the socket.
+
+    `http.client` deduplicates and reorders headers, so a request with two `Origin` lines cannot be
+    built through it -- and two `Origin` lines are exactly what has to reach the server here.
+    """
+    import socket
+
+    with socket.create_connection((web.LOOPBACK, live.port), timeout=30) as sock:
+        sock.sendall(raw)
+        chunks = []
+        while True:
+            piece = sock.recv(65536)
+            if not piece:
+                break
+            chunks.append(piece)
+    head, _, body = b"".join(chunks).partition(b"\r\n\r\n")
+    status = int(head.split(b"\r\n", 1)[0].split()[1])
+    assert b"application/json" in head, f"the contract is JSON everywhere; got {head!r}"
+    return status, json.loads(body)
+
+
 def _write_png(path, width=64, height=64) -> None:
     """A real PNG, because `--image` is decoded by PIL before the canvas is derived from it."""
     import struct
@@ -1413,16 +1439,35 @@ def test_posting_a_job_queues_it_with_a_snapshot_of_the_prompt(queue_server):
         "editing the shared prompt after queueing changed what the job will run")
 
 
-def test_the_snapshot_text_comes_from_the_file_and_not_from_the_request(queue_server):
-    """A caller-supplied snapshot beside a different `--prompt-file` would record one prompt and
-    run another -- worse than no snapshot at all. The body's `prompt_text` is ignored.
+@pytest.mark.parametrize("field", ["prompt_text", "prompt_source", "estimate", "priority"])
+def test_a_body_field_this_route_does_not_take_is_refused_rather_than_ignored(queue_server, field):
+    """The snapshot comes from the file `--prompt-file` names and from nowhere else -- a prompt
+    supplied beside a *different* flag would record one text and run another, which is worse than
+    having no snapshot. But ignoring the field silently is only half a decision: whoever wrote the
+    caller sends it, is answered 200, and goes away sure the server used it. Same defect as
+    `suffixes=None` meaning "serve anything".
+    """
+    source = queue_server.repo / "prompts" / "scene.txt"
+    source.write_text("настоящий текст", encoding="utf-8")
+    body = {"args": _job_args(queue_server, "--prompt-file", str(source), prompt=None),
+            "note": "", field: "подложенный текст"}
+    status, answer = _call(queue_server, "POST", "/api/jobs", body)
+    assert status == 400, answer
+    assert answer["error"]["code"] == "args_invalid", answer
+    assert answer["error"]["detail"]["unknown"] == [field]
+    assert _pending(queue_server) == []
+
+
+def test_the_snapshot_text_comes_from_the_file(queue_server):
+    """The other half of the test above: with the field refused, the only source left is the file,
+    and the snapshot has to be byte-identical to it.
     """
     source = queue_server.repo / "prompts" / "scene.txt"
     source.write_text("настоящий текст", encoding="utf-8")
     status, answer = _call(queue_server, "POST", "/api/jobs",
                            {"args": _job_args(queue_server, "--prompt-file", str(source),
                                               prompt=None),
-                            "note": "", "prompt_text": "подложенный текст"})
+                            "note": ""})
     assert status == 200, answer
     snapshot = queue_server.queue_root / "prompts" / f"{answer['job']['id']}.txt"
     assert snapshot.read_text(encoding="utf-8") == "настоящий текст"
@@ -1937,7 +1982,7 @@ def test_a_write_asked_for_by_another_site_is_refused(queue_server, headers):
     status, answer = _call(queue_server, "POST", "/api/jobs",
                            {"args": _job_args(queue_server), "note": ""}, headers=headers)
     assert status == 403, answer
-    assert answer["error"]["code"] == "host_not_allowed", answer
+    assert answer["error"]["code"] == "origin_not_allowed", answer
     assert _pending(queue_server) == []
 
 
@@ -2559,3 +2604,211 @@ def test_a_job_posted_through_the_api_is_in_the_next_state_the_page_polls(queue_
     assert len(posted) == 1, after
     assert posted[0]["note"] == "круг"
     assert posted[0]["estimate"]["seconds"] > 0, "the page draws the queue's totals from this"
+
+
+# == Круг 1 ревью =================================================================================
+
+
+@pytest.mark.parametrize("args", [
+    ["generate", "кот", "--tag", "a\x00b"],
+    ["generate", "ко\x00т"],
+    ["generate", "кот", "--seed", "1\x000"],
+])
+def test_a_nul_byte_in_an_argument_is_a_refusal_not_a_crash(queue_server, args):
+    """`subprocess.run` raises `ValueError: embedded null byte` while preparing `execve`, and left
+    alone that reaches the `internal_error` net -- a 500 for input the caller controls, the exact
+    failure `resolve_within`'s docstring forbids and the one task 5 closed for `/static` URLs. The
+    body was never covered: those tests all sent the NUL in a URL.
+    """
+    full = args + ["--outdir", str(queue_server.outdir),
+                   "--checkpoint", str(queue_server.models / "ckpt")]
+    status, answer = _call(queue_server, "POST", "/api/jobs", {"args": full, "note": ""})
+    assert status == 400, answer
+    assert answer["error"]["code"] == "args_invalid", answer
+    assert _pending(queue_server) == []
+
+
+def test_validate_args_names_which_argument_carried_the_nul():
+    """Refused by name rather than by catching the exception it causes: an argument with a NUL in
+    it is not an argument, and saying which one is worth more than reporting `ValueError`.
+    """
+    with pytest.raises(CliError) as excinfo:
+        web.validate_args(["generate", "ок", "--tag", "a\x00b"])
+    assert excinfo.value.code == "args_invalid"
+    assert excinfo.value.detail["position"] == 3
+
+
+def test_a_tag_too_long_for_a_filename_does_not_blame_the_queue_directory(queue_server):
+    """The job id is built from the tag and never truncated, so a 240-character tag makes
+    `queue/pending/<id>.json` longer than the 255 bytes the filesystem allows. `ENAMETOOLONG` used
+    to travel up to `queue_errors` and answer `queue_unwritable`, 500 -- telling a person their
+    queue directory is broken when it is perfectly healthy, and sending them to check permissions
+    that have nothing to do with it.
+    """
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, tag="q" * 240), "note": ""})
+    assert status == 400, answer
+    assert answer["error"]["code"] == "path_outside_root", answer
+    assert answer["error"]["code"] != "queue_unwritable"
+    assert _pending(queue_server) == []
+    assert (queue_server.queue_root / "pending").is_dir(), "the queue itself is fine"
+
+
+def test_a_queue_that_really_cannot_be_written_is_still_a_500(queue_server, monkeypatch):
+    """The other side of the test above, and the reason its guard is narrowed to one `errno`
+    rather than "any `OSError` from the queue is the caller's fault". A permission failure really
+    is the queue directory being unusable, and it has to keep its 500 and its path -- otherwise
+    the fix for the false diagnosis would have replaced it with the opposite false diagnosis.
+    """
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(q, "submit", refuse)
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server), "note": ""})
+    assert status == 500, answer
+    assert answer["error"]["code"] == "queue_unwritable", answer
+    assert str(queue_server.queue_root) in answer["error"]["detail"]["path"]
+
+
+@pytest.mark.parametrize("method,suffix", [("DELETE", ""), ("POST", "/top")])
+def test_a_job_id_too_long_for_a_filename_is_a_400_without_queueing_anything(queue_server,
+                                                                             method, suffix):
+    """Reachable with a bare URL and no submission at all: `_job_id_of` resolves a 400-character
+    id inside `pending/` quite happily, and `queue.cancel` is where the filesystem says no.
+    `pathlib` swallows `ENOENT` and its friends but not this one, so it was a 500.
+    """
+    status, answer = _call(queue_server, method, f"/api/jobs/{'z' * 400}{suffix}")
+    assert status == 400, answer
+    assert answer["error"]["code"] == "path_outside_root", answer
+
+
+@pytest.mark.parametrize("method,url", [("POST", "/api/jobs"), ("PUT", "/api/jobs/x"),
+                                        ("DELETE", "/api/jobs/x")])
+def test_two_origin_headers_are_refused_rather_than_read_by_the_first(queue_server, method, url):
+    """`Message.get` returns the first occurrence, so `Origin: <this page>` followed by
+    `Origin: http://evil.example` passed the comparison with the attacker's line sitting in the
+    same request. Which of the two a proxy or the next reader believes is not this server's call.
+    """
+    raw = (f"{method} {url} HTTP/1.1\r\n"
+           f"Host: {web.LOOPBACK}:{queue_server.port}\r\n"
+           f"Origin: http://{web.LOOPBACK}:{queue_server.port}\r\n"
+           f"Origin: http://evil.example\r\n"
+           f"Content-Type: application/json\r\nContent-Length: 2\r\n"
+           f"Connection: close\r\n\r\n{{}}").encode()
+    status, answer = _raw_exchange(queue_server, raw)
+    assert status == 403, answer
+    assert answer["error"]["code"] == "origin_not_allowed", answer
+    assert answer["error"]["detail"]["count"] == 2
+
+
+def test_two_host_headers_are_refused_too(queue_server):
+    """The same hole one header over. A single `Host` still has to be this server's address, so
+    the pair "ours, then theirs" would otherwise pass the rebinding check as well.
+    """
+    raw = (f"GET /api/state HTTP/1.1\r\n"
+           f"Host: {web.LOOPBACK}:{queue_server.port}\r\n"
+           f"Host: evil.example\r\n"
+           f"Connection: close\r\n\r\n").encode()
+    status, answer = _raw_exchange(queue_server, raw)
+    assert status == 403, answer
+    assert answer["error"]["code"] == "host_not_allowed", answer
+
+
+def test_one_origin_header_still_works(queue_server):
+    """Paired with the two tests above: refusing every request that names an Origin would satisfy
+    both, and would break the page.
+    """
+    raw = (f"POST /api/estimate HTTP/1.1\r\n"
+           f"Host: {web.LOOPBACK}:{queue_server.port}\r\n"
+           f"Origin: http://{web.LOOPBACK}:{queue_server.port}\r\n"
+           f"Content-Type: application/json\r\nContent-Length: {len(_ESTIMATE_BODY)}\r\n"
+           f"Connection: close\r\n\r\n").encode() + _ESTIMATE_BODY
+    status, answer = _raw_exchange(queue_server, raw)
+    assert status == 200, answer
+    assert answer["estimate"]["forwards"] == 30
+
+
+def test_the_two_provenance_refusals_have_different_codes(queue_server):
+    """A wrong `Host` is an address a person typed and can retype; a wrong `Origin` is not their
+    doing at all. One code for both would leave the page branching on `detail` keys to tell them
+    apart, which is the thing codes exist to prevent.
+    """
+    from h3_48gb.cli import ERROR_CODES
+
+    assert web.ERROR_STATUS["origin_not_allowed"] == 403
+    assert {"host_not_allowed", "origin_not_allowed"} <= set(ERROR_CODES)
+    assert ERROR_CODES["host_not_allowed"] != ERROR_CODES["origin_not_allowed"]
+
+    by_host = _call(queue_server, "POST", "/api/estimate", {"args": ["generate", "x"]},
+                    headers={"Host": "evil.example"})
+    by_origin = _call(queue_server, "POST", "/api/estimate", {"args": ["generate", "x"]},
+                      headers={"Origin": "http://evil.example"})
+    assert by_host[1]["error"]["code"] == "host_not_allowed", by_host
+    assert by_origin[1]["error"]["code"] == "origin_not_allowed", by_origin
+
+
+#: What each page action may leave behind once it has raced `queue.claim`, as
+#: `(state, seed, priority)` or `("gone",)`. Two outcomes each, one per order the lock granted.
+_RACE_OUTCOMES = {
+    "edit":   {(200, ("running", "2", 0)), (409, ("running", "1", 0))},
+    "top":    {(200, ("running", "1", 1)), (409, ("running", "1", 0))},
+    "cancel": {(200, ("gone",)),           (409, ("running", "1", 0))},
+}
+
+
+def _one_job_on_disk(live: _Live):
+    jobs, broken = q.scan(live.queue_root)
+    assert broken == [], broken
+    assert len(jobs) <= 1, f"the job exists {len(jobs)} times: {[(j.id, j.state) for j in jobs]}"
+    if not jobs:
+        return ("gone",)
+    job = jobs[0]
+    return (job.state, job.args[job.args.index("--seed") + 1], job.priority)
+
+
+@pytest.mark.parametrize("operation", ["edit", "top", "cancel"])
+def test_a_page_action_racing_the_worker_leaves_exactly_one_job(queue_server, operation):
+    """Races checked by racing, as the design spec requires -- two real threads on one job, not
+    "claim, then edit".
+
+    The queue's exclusive lock is what makes each action's check-and-write one step; from up here
+    the visible proof is that whichever order the lock grants, the job exists exactly once
+    afterwards and the HTTP answer matches the state on disk. A version that raced would show the
+    job in `pending/` and `running/` at once, with the edit applied to the copy nobody runs.
+
+    Both orders are named in one unconditional assertion rather than an `if`: a branch that never
+    runs is a test that asserts nothing on the day it matters.
+    """
+    job = _queue_a_job(queue_server, "--seed", "1", tag="гонка")
+    call = {
+        "edit": lambda: _call(queue_server, "PUT", f"/api/jobs/{job['id']}",
+                              {"args": _job_args(queue_server, "--seed", "2", tag="гонка"),
+                               "note": ""}),
+        "top": lambda: _call(queue_server, "POST", f"/api/jobs/{job['id']}/top"),
+        "cancel": lambda: _call(queue_server, "DELETE", f"/api/jobs/{job['id']}"),
+    }[operation]
+
+    barrier = threading.Barrier(2)
+    answered, claimed = [], []
+
+    def act():
+        barrier.wait(timeout=60)
+        answered.append(call())
+
+    def take():
+        barrier.wait(timeout=60)
+        claimed.append(q.claim(queue_server.queue_root))
+
+    threads = [threading.Thread(target=act), threading.Thread(target=take)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=180)
+        assert not thread.is_alive(), f"{operation} never finished"
+
+    status, answer = answered[0]
+    outcome = (status, _one_job_on_disk(queue_server))
+    assert outcome in _RACE_OUTCOMES[operation], (outcome, answer, claimed)
+    if status == 409:
+        assert answer["error"]["code"] == "job_not_pending", answer

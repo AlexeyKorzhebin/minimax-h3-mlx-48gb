@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import io
 import json
@@ -132,6 +133,13 @@ PROMPTS_DIR = "prompts"
 #: request. It is mapped here *before* task 6 raises it, on purpose; see `PLANNED_CODES`.
 ERROR_STATUS = {
     "host_not_allowed": 403,
+    # A separate code from `host_not_allowed`, and separate on purpose: `Host` answers "which name
+    # did you arrive by", `Origin` answers "which page started this", and the two need different
+    # sentences from the page. A wrong `Host` is something a person can fix in the address bar; a
+    # wrong `Origin` is not their doing at all, and the honest sentence is "another site pressed
+    # that button". One code for both would leave the page branching on `detail` keys, which is
+    # precisely the "match on the code, never on the message" contract these codes exist to keep.
+    "origin_not_allowed": 403,
     "job_not_pending": 409,
     "queue_unwritable": 500,
     "internal_error": 500,
@@ -606,6 +614,19 @@ def validate_args(args, python=sys.executable, timeout: float = DRY_RUN_TIMEOUT)
     args = [str(item) for item in args]
     if not args:
         raise CliError("args_invalid", "an empty argument list names no subcommand", {"args": args})
+    for position, item in enumerate(args):
+        if "\x00" in item:
+            # `subprocess.run` raises `ValueError: embedded null byte` from deep inside `execve`
+            # preparation, and left to itself that reaches the handler's `internal_error` net --
+            # a 500 for caller-controlled input, which is exactly the failure `resolve_within`'s
+            # docstring forbids and which task 5 closed for `/static`. Refused here, by name,
+            # rather than by widening the `except` below: an argument with a NUL in it is not an
+            # argument, and saying which one is worth more than catching the exception it causes.
+            raise CliError(
+                "args_invalid",
+                f"argument {position} contains a NUL byte, which cannot be passed to a process",
+                {"position": position, "args": args},
+            )
     command = [str(python), "-m", "h3_48gb", args[0], "--dry-run", "--json", *args[1:]]
 
     try:
@@ -717,17 +738,51 @@ def prepare_submission(args, roots: dict[str, Path], *, python=sys.executable) -
 
 
 @contextlib.contextmanager
-def queue_write_errors(queue_root, *, output_stem=None):
-    """`queue_errors` plus the two refusals the queue raises by name rather than by `OSError`.
+def name_too_long_is_a_refusal(what: str):
+    """Turn `ENAMETOOLONG` into a 400 naming the input, instead of a 500 blaming the queue.
 
-    Both are races with the worker or with another submission, not mistakes in the request, and
+    A job id and a tag both become a filename -- `queue/pending/<id>.json` -- and a name over 255
+    bytes makes the filesystem refuse. Two ways in, both reachable from outside: a `--tag` of ~240
+    characters (the id is built from the tag and never truncated), and, without queueing anything
+    at all, a `DELETE /api/jobs/<400 characters>`. `pathlib` swallows `ENOENT` and its friends but
+    not this one, so it used to travel up to `queue_errors` and answer `queue_unwritable`, 500 --
+    telling a person their queue directory is broken when it is perfectly healthy and sending them
+    to check the wrong permissions.
+
+    The code is `path_outside_root`, the same one `resolve_within` already answers for a NUL byte,
+    and for the same reason its docstring gives: the caller asked for something that is not a
+    usable path. Circle 3 of task 5 fixed this class in `_serve_file`; the write routes reopened
+    it, because they build their paths from a different input.
+
+    Nested **inside** `queue_errors`, not around it: the inner manager sees the `OSError` first,
+    and what it raises is a `CliError`, which `queue_errors` then passes through untouched.
+    """
+    try:
+        yield
+    except OSError as exc:
+        if exc.errno != errno.ENAMETOOLONG:
+            raise
+        raise CliError(
+            "path_outside_root",
+            f"{what} is too long to be a filename on this filesystem: {exc}",
+            {"what": what, "errno": exc.errno},
+        ) from exc
+
+
+@contextlib.contextmanager
+def queue_write_errors(queue_root, *, what="the request", output_stem=None):
+    """`queue_errors` plus the three refusals that are not "the queue directory is unusable".
+
+    Two are races with the worker or with another submission, not mistakes in the request, and
     both have to keep their own status: `job_not_pending` is 409 (the job left `pending/` between
     the page's last poll and this click) and `output_stem_conflict` is 400 with the taken name in
-    `detail`, because the only useful thing to tell someone is which name to change.
+    `detail`, because the only useful thing to tell someone is which name to change. The third is
+    a name the filesystem itself refuses -- see `name_too_long_is_a_refusal`.
     """
     try:
         with queue_errors(queue_root):
-            yield
+            with name_too_long_is_a_refusal(what):
+                yield
     except q.JobNotPending as exc:
         raise CliError(
             "job_not_pending",
@@ -919,7 +974,7 @@ class _Handler(BaseHTTPRequestHandler):
         allowing it would leave the check with a hole reachable by the same `fetch` it exists to
         stop -- and a `curl` or `nc` by hand can pass one.
         """
-        host = self.headers.get("Host") if self.headers else None
+        host = self._sole_header("Host", "host_not_allowed")
         if host not in self.server.allowed_hosts:
             raise CliError(
                 "host_not_allowed",
@@ -927,6 +982,27 @@ class _Handler(BaseHTTPRequestHandler):
                 f"{sorted(self.server.allowed_hosts)}",
                 {"host": host, "allowed": sorted(self.server.allowed_hosts)},
             )
+
+    def _sole_header(self, name: str, code: str) -> str | None:
+        """The one value of `name`, `None` if it is absent, or a refusal if it arrived **twice**.
+
+        A repeated header is where a check that reads "the" value quietly stops being a check.
+        `email.message.Message.get` returns the *first* occurrence, so `Origin: <this page>`
+        followed by `Origin: http://evil.example` passed the comparison while the second line sat
+        in the same request -- and which of the two a proxy, a log or the next reader believes is
+        not something this server gets to decide. No browser sends two, so refusing costs nothing
+        real; picking one silently costs the whole check.
+        """
+        values = self.headers.get_all(name) if self.headers else None
+        if not values:
+            return None
+        if len(values) != 1:
+            raise CliError(
+                code,
+                f"the request carries {len(values)} {name} headers; exactly one is allowed",
+                {"header": name, "count": len(values), "values": list(values)},
+            )
+        return values[0]
 
     def _check_origin(self) -> None:
         """Refuse a **write** that another site's page asked for. Reads do not need this.
@@ -944,19 +1020,25 @@ class _Handler(BaseHTTPRequestHandler):
         anything, because no browser omits both.
 
         `Sec-Fetch-Site: none` is a user-typed URL or a bookmark, which is this machine's owner.
+
+        The code is `origin_not_allowed`, **not** `host_not_allowed`, and the split is deliberate.
+        The two failures need different sentences from the page: a wrong `Host` is an address the
+        person typed and can retype, while a wrong `Origin` is not their doing at all -- the honest
+        sentence is "another site pressed that button". Sharing one code would leave the page
+        branching on `detail` keys to tell them apart, which is exactly the "match on the code,
+        never on the message" contract the codes exist to keep.
         """
-        headers = self.headers
-        site = headers.get("Sec-Fetch-Site") if headers else None
+        site = self._sole_header("Sec-Fetch-Site", "origin_not_allowed")
         if site is not None and site.strip().lower() not in ("same-origin", "none"):
             raise CliError(
-                "host_not_allowed",
+                "origin_not_allowed",
                 f"a write must come from this server's own page; Sec-Fetch-Site is {site!r}",
                 {"sec_fetch_site": site, "method": self.command},
             )
-        origin = headers.get("Origin") if headers else None
+        origin = self._sole_header("Origin", "origin_not_allowed")
         if origin is not None and origin.strip().lower() not in self.server.allowed_origins:
             raise CliError(
-                "host_not_allowed",
+                "origin_not_allowed",
                 f"a write must come from this server's own page; Origin {origin!r} is not one of "
                 f"{sorted(self.server.allowed_origins)}",
                 {"origin": origin, "allowed": sorted(self.server.allowed_origins),
@@ -1055,12 +1137,20 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- request bodies ---------------------------------------------------------------------
 
-    def _json_request(self) -> dict:
-        """The request body as one JSON object, or a refusal that is not a 500.
+    def _json_request(self, *, allowed: tuple[str, ...]) -> dict:
+        """The request body as one JSON object with only the keys `allowed`, or a refusal.
 
         A body arrives from outside, so a truncated one, a wrong `Content-Length` and a list where
         an object belongs are all the caller's mistakes and answer 400. Only a bug in this module
         should ever reach the `internal_error` net.
+
+        **An unrecognised key is refused, not ignored,** and `allowed` is required and keyword-only
+        so a route cannot forget to say what it takes. Silently dropping a field is the same defect
+        as `suffixes=None` meaning "serve anything": whoever wrote the caller sends `prompt_source`
+        or `prompt_text`, is answered 200, and goes away believing the server used it. The snapshot
+        this server writes comes from the file `--prompt-file` names and from nowhere else -- a
+        prompt supplied beside a *different* flag would record one text and run another -- and the
+        way to say that is to refuse the field, not to swallow it.
         """
         raw_length = self.headers.get("Content-Length") if self.headers else None
         try:
@@ -1082,6 +1172,13 @@ class _Handler(BaseHTTPRequestHandler):
             raise CliError("bad_request",
                            f"the request body must be a JSON object, not {type(payload).__name__}",
                            {"type": type(payload).__name__})
+        unknown = sorted(set(payload) - set(allowed))
+        if unknown:
+            raise CliError(
+                "args_invalid",
+                f"this route takes {sorted(allowed)} and nothing else; it was also sent {unknown}",
+                {"unknown": unknown, "allowed": sorted(allowed)},
+            )
         return payload
 
     @staticmethod
@@ -1131,12 +1228,12 @@ class _Handler(BaseHTTPRequestHandler):
         `queue.submit` receives the *text* of the prompt and writes the snapshot itself -- the
         snapshot's path contains the job id, and the id does not exist until `submit` claims it.
         """
-        payload = self._json_request()
+        payload = self._json_request(allowed=("args", "note"))
         # The body's own shape is checked before a subprocess is spawned for it: a `note` that is
         # a number is the caller's mistake and should not cost a fork to discover.
         args, note = self._args_of(payload), self._note_of(payload)
         prepared = prepare_submission(args, self.server.roots)
-        with queue_write_errors(self.server.queue_root,
+        with queue_write_errors(self.server.queue_root, what="--tag",
                                 output_stem=prepared["report"]["output_stem"]):
             job = q.submit(self.server.queue_root, prepared["args"], note,
                            prepared["report"], prepared["estimate"],
@@ -1152,10 +1249,10 @@ class _Handler(BaseHTTPRequestHandler):
         would be the way to get an argument list into the queue that submission would have refused.
         """
         job_id = self._job_id_of(raw_id)
-        payload = self._json_request()
+        payload = self._json_request(allowed=("args", "note"))
         args, note = self._args_of(payload), self._note_of(payload)
         prepared = prepare_submission(args, self.server.roots)
-        with queue_write_errors(self.server.queue_root,
+        with queue_write_errors(self.server.queue_root, what="the job id",
                                 output_stem=prepared["report"]["output_stem"]):
             job = q.update(self.server.queue_root, job_id, prepared["args"],
                            note, prepared["report"], prepared["estimate"],
@@ -1166,13 +1263,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _promote_job(self, raw_id: str) -> tuple[int, str, bytes]:
         job_id = self._job_id_of(raw_id)
-        with queue_write_errors(self.server.queue_root):
+        with queue_write_errors(self.server.queue_root, what="the job id"):
             job = q.move_to_front(self.server.queue_root, job_id)
         return 200, "application/json", _json_bytes({"ok": True, "job": job.as_dict()})
 
     def _cancel_job(self, raw_id: str) -> tuple[int, str, bytes]:
         job_id = self._job_id_of(raw_id)
-        with queue_write_errors(self.server.queue_root):
+        with queue_write_errors(self.server.queue_root, what="the job id"):
             job = q.cancel(self.server.queue_root, job_id)
         return 200, "application/json", _json_bytes({"ok": True, "job": job.as_dict()})
 
@@ -1184,7 +1281,7 @@ class _Handler(BaseHTTPRequestHandler):
         this route would read `quant_config.json` from any directory a caller named, which turns
         an estimate into an existence oracle for the whole filesystem.
         """
-        payload = self._json_request()
+        payload = self._json_request(allowed=("args",))
         args = self._args_of(payload)
         _check_command_allowed(_parse_args(args))
         # The *normalised* list, for the same reason submission uses it: `--checkpoint
@@ -1242,7 +1339,7 @@ class _Handler(BaseHTTPRequestHandler):
         worst possible way to learn your history changed.
         """
         path = resolve_prompt_name(name, self.server.roots["repo"])
-        payload = self._json_request()
+        payload = self._json_request(allowed=("text",))
         text = payload.get("text")
         if not isinstance(text, str):
             raise CliError("args_invalid", "`text` must be a string",

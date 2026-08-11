@@ -133,7 +133,8 @@ ERROR_CODES = {
     # reads `web.ROUTER_CODES` instead of only scanning source for raise sites. They belong in this
     # dict all the same: the contract the design spec fixes is the one on the wire, and a page
     # turning a `code` into a Russian sentence meets these two more often than any other.
-    "host_not_allowed": "the request did not come from this server's own page: its Host is not this address (DNS rebinding), or, on a write, its Origin/Sec-Fetch-Site is another site's",
+    "host_not_allowed": "the request's Host header is not this server's own address (DNS rebinding)",
+    "origin_not_allowed": "a write did not come from this server's own page: its Origin or Sec-Fetch-Site names another site (cross-site request forgery)",
     "not_found": "no route, or no file, at that URL",
     "method_not_implemented": "this server has no handler for that HTTP method",
     "bad_request": "the request itself could not be served -- malformed, or too large to accept",
