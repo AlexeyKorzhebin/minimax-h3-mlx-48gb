@@ -271,6 +271,22 @@ def test_dir_returns_only_public_api():
     assert not extra, f"dir(h3_48gb) returns non-__all__ names: {extra}"
 
 
+def test_checkpoint_locked_is_importable_from_the_package_root():
+    """`CheckpointLocked` is a sibling of `CheckpointCorrupt`/`CheckpointMismatch` -- raised the
+    same way in `checkpoint.py`, caught the same way in `cli.py`'s handler -- but was added to
+    `checkpoint.py` without the two places that make a name part of the public API:
+    `_LAZY_IMPORTS` and `__all__` in `h3_48gb/__init__.py`. Without both,
+    `from h3_48gb import CheckpointLocked` raises `AttributeError` even though
+    `h3_48gb.checkpoint.CheckpointLocked` exists and works fine -- only the shortcut a caller
+    would actually reach for is broken.
+    """
+    import h3_48gb
+    from h3_48gb.checkpoint import CheckpointLocked as direct
+
+    assert h3_48gb.CheckpointLocked is direct, "must be the very same class, not a re-implementation"
+    assert "CheckpointLocked" in h3_48gb.__all__
+
+
 # -- list --------------------------------------------------------------------------------------
 
 def test_list_reports_finished_runs(tmp_path):
@@ -641,6 +657,34 @@ def test_watch_terminates_on_an_unreadable_checkpoint(tmp_path, monkeypatch):
 
     report = run_watch(tmp_path, interval=0.1)
     assert report["runs"][0]["state"] == "unreadable"
+
+
+def test_watch_terminates_when_flock_cannot_judge_a_lock_only_run(tmp_path, monkeypatch):
+    """End-to-end version of `test_a_lock_file_flock_cannot_judge_is_not_reported_as_in_flight`
+    (test_runs.py): a lock file with no checkpoint yet, on a filesystem where `flock` cannot judge
+    it (`ENOTSUP`), must not park `watch` in a loop it can never leave. The mutation this guards is
+    `runs.py`'s `if _writer_alive(checkpoint) is not True: continue` rewritten as `is False` --
+    under that mutation `scan()` fabricates an `in_flight` run from the unjudged lock file and this
+    test's sleep stub fires, because `run_watch` would poll a "run" that can never change state.
+    """
+    import errno
+
+    import h3_48gb.runs as runs_mod
+    from h3_48gb.cli import run_watch
+
+    checkpoints = tmp_path / "warming-up" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / "h3-abc.safetensors.lock").write_bytes(b"")
+
+    def fake_flock(fd, operation):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(runs_mod.fcntl, "flock", fake_flock)
+
+    _sleep_stub_that_must_not_be_called(monkeypatch)
+
+    report = run_watch(tmp_path, interval=0.1)
+    assert report["runs"] == [], f"expected no runs reported, got {report['runs']}"
 
 
 # -- resume ------------------------------------------------------------------------------------
@@ -1286,6 +1330,53 @@ def test_checkpoint_corrupt_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path
         raise AssertionError("a CheckpointCorrupt must surface as a machine-readable CliError")
 
 
+def test_checkpoint_locked_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path):
+    """The third sibling of the two tests above: a second writer refused the lock (round 2's fix
+    to `CheckpointStore.acquire_lock`) must reach the caller the same way `CheckpointMismatch` and
+    `CheckpointCorrupt` do, not as a bare exception `run_generate` forgot to catch."""
+    from h3_48gb.checkpoint import CheckpointLocked
+
+    def exploding_pipe(**kwargs):
+        raise CheckpointLocked("another process already holds the lock for this checkpoint")
+
+    spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
+                   checkpoint=tmp_path, outdir=tmp_path, tag="t")
+    try:
+        run_generate(spec, pipeline_factory=lambda _: exploding_pipe)
+    except CliError as exc:
+        assert exc.code == "checkpoint_locked"
+    else:
+        raise AssertionError("a CheckpointLocked must surface as a machine-readable CliError")
+
+
+def test_second_writer_reports_checkpoint_locked_not_internal_error_under_json(tmp_path, capsys):
+    """The task's literal scenario: a second writer hitting an already-occupied checkpoint, under
+    `--json`. Without the `except CheckpointLocked` handler in `run_generate` (`cli.py`), this
+    exception is not a `CliError` at all -- it falls through `main`'s last-resort
+    `except Exception` and stdout reports `error.code == "internal_error"` instead of something an
+    MCP wrapper could branch on. Deleting that one handler and rerunning this test is the
+    mutation check for this fix: it must fail with `checkpoint_locked != internal_error`.
+    """
+    import unittest.mock as mock
+
+    from h3_48gb.checkpoint import CheckpointLocked
+
+    def exploding_pipe(**kwargs):
+        raise CheckpointLocked("another process already holds the lock for this checkpoint")
+
+    argv = ["generate", "a cat", "--width", "64", "--height", "64", "--outdir", str(tmp_path),
+            "--json"]
+    with mock.patch("h3_48gb.cli._default_pipeline_factory", return_value=exploding_pipe):
+        code = main(argv)
+
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "checkpoint_locked", (
+        f"a second writer must report checkpoint_locked on stdout under --json, got "
+        f"{payload['error']['code']!r}")
+
+
 def test_main_emits_a_json_error_on_stdout_with_nonzero_exit(capsys):
     code = main(["generate", "a cat", "--height", "433", "--json"])
     assert code == 1
@@ -1320,12 +1411,34 @@ def test_main_doctor_json_reports_failure_with_nonzero_exit(tmp_path, capsys):
 
 
 def test_error_codes_are_documented_in_one_place():
-    """Codes are part of the public contract; this is the "list them in one place" the task asked for."""
+    """`ERROR_CODES` is the whole machine-readable contract (module docstring): every code the CLI
+    can actually raise must be listed there, and -- the direction a hand-picked sample of names
+    cannot catch -- every code listed there must correspond to a real `raise CliError(...)` site,
+    or the list is quietly promising something `--json` can never produce.
+
+    Checked by scanning `cli.py`'s own source for every `CliError("code", ...)` call site, rather
+    than a fixed sample: a hand-maintained list of five names would keep passing forever even if a
+    sixth call site raised a code nobody added to `ERROR_CODES` -- which is exactly what happened
+    to `checkpoint_locked` when it was added to the `except` handler in `run_generate` but not
+    here. `CliError.__init__` already asserts membership, but only for whichever branch a given
+    test happens to exercise; this test needs none of them to run.
+    """
+    import inspect
+    import re
+
+    from h3_48gb import cli as cli_mod
     from h3_48gb.cli import ERROR_CODES
 
-    for code in ("geometry_not_multiple_of_32", "schedule_not_baked", "checkpoint_not_found",
-                 "checkpoint_mismatch", "checkpoint_corrupt"):
-        assert code in ERROR_CODES
+    source = inspect.getsource(cli_mod)
+    raised_codes = set(re.findall(r'CliError\(\s*"([a-z0-9_]+)"', source))
+
+    undocumented = raised_codes - set(ERROR_CODES)
+    assert not undocumented, f"raised via CliError but missing from ERROR_CODES: {undocumented}"
+
+    unraised = set(ERROR_CODES) - raised_codes
+    assert not unraised, (
+        f"listed in ERROR_CODES but no `raise CliError(...)` site in cli.py produces them: "
+        f"{unraised}")
 
 
 # -- verbose: the --json stdout contract must survive a chatty pipeline -------------------------

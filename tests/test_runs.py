@@ -320,6 +320,38 @@ def test_scan_finds_a_run_from_its_lock_file_before_any_checkpoint_exists(tmp_pa
     assert run.total is None
 
 
+def test_a_lock_file_flock_cannot_judge_is_not_reported_as_in_flight(tmp_path, monkeypatch):
+    """The eleventh mutation on `scan`'s second pass (task 6, lock file with no checkpoint yet):
+    `if _writer_alive(checkpoint) is not True: continue` reads `None` (unknown -- `flock` could not
+    judge this lock at all, see `_writer_alive`) exactly like `False` (confirmed gone): both skip,
+    so nothing false gets reported. Rewritten as `is False`, `None` stops being caught by the
+    `continue` and falls through into `runs.append(Run(..., state="in_flight"))` a few lines below
+    -- a lock file on a filesystem where `flock` never works (`ENOTSUP`, the same failure
+    `test_a_non_busy_kernel_error_reads_unknown_not_in_flight` covers for a checkpoint that already
+    has data) would then read as a permanently running writer, with nothing on disk that could ever
+    change to clear it -- and `h3 watch` would poll it forever. See
+    `test_watch_terminates_when_flock_cannot_judge_a_lock_only_run` (test_cli.py) for the same
+    guarantee end to end through `run_watch`.
+    """
+    import errno
+
+    import h3_48gb.runs as runs_mod
+
+    checkpoints = tmp_path / "warming-up" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / "h3-abc.safetensors.lock").write_bytes(b"")  # no checkpoint file at all
+
+    def fake_flock(fd, operation):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(runs_mod.fcntl, "flock", fake_flock)
+
+    runs = scan(tmp_path)
+    assert runs == [], (
+        f"an unjudged lock file with no checkpoint must not be reported as any run "
+        f"(certainly not in_flight), got {runs}")
+
+
 def test_a_missing_written_at_reads_exactly_unknown_without_a_lock_file(tmp_path):
     """Pins task 3's fix precisely: a checkpoint missing `written_at` (the field the old writer set
     unconditionally, and the old `_state_of` treated as "not from this fork, so it must be dead")

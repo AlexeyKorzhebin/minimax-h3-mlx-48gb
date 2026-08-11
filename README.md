@@ -174,13 +174,29 @@ base (at 1.0 it overshoots to 213% and over-sharpens). Numbers and method in
 with `ModuleNotFoundError: No module named 'mlx_vlm'`.
 
 `h3 resume` continues an interrupted run from its checkpoint rather than restarting it; `h3 list`
-lists finished runs under `--outdir`. Every subcommand accepts `--json` for a machine-readable
-report instead of human-readable text.
+lists finished runs under `--outdir`; `h3 status` reports what is running under an outdir and how
+far along it is; `h3 watch` redraws that same status until nothing is running. Every subcommand
+accepts `--json` for a machine-readable report instead of human-readable text.
 
 Checkpointing is on by default and costs one small file per step. `--checkpoint-dir` moves it,
 `--no-checkpoint` turns it off, and `--restart` ignores whatever is on disk and starts from step 0
 — which is the way out of `checkpoint_mismatch`, a refusal whose file is named after a digest you
 cannot compute by hand.
+
+Both `checkpoint_locked` (the refusal that stops a second writer from opening a checkpoint another
+process already has open) and `status`/`watch`'s ability to tell a live run from a dead one rest on
+the same mechanism: an `fcntl.flock` held on a companion `.lock` file next to the checkpoint
+(`CheckpointStore.acquire_lock`, probed read-only by `runs._writer_alive`). `flock` is a reliable,
+kernel-enforced exclusion primitive on a local disk, but on network filesystems (NFS, SMB, most
+cloud-sync mounts) it is not: depending on protocol version and mount options, a lock one client
+takes may exclude only other processes on that same client, not a second machine writing the same
+path at all. Put a checkpoint directory on one of those and both halves of this feature degrade at
+once — not just the diagnostic: a second real writer can believe it acquired the lock when it did
+not and race the first to `os.replace` the same checkpoint file, which is precisely the corruption
+`acquire_lock`'s exclusivity exists to rule out, while `status`/`watch`, probing that same
+unreliable lock, keep reporting `unknown` or a stale `in_flight` instead of ever catching it. Keep
+`--checkpoint-dir` (and `--outdir`, for the in-progress lock files `watch` also reads) on a
+genuinely local filesystem.
 
 Two scripts sit outside the CLI and are used for measurement rather than for generating clips:
 `run_bench.py` runs one generation and writes a JSON report of per-phase timings and memory peaks
