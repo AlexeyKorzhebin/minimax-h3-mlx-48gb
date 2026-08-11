@@ -587,7 +587,12 @@ def test_media_does_not_serve_the_queue(server, spelling):
     (server.queue_root / "pending" / "20260811-000000-x-0000.json").write_text('{"a": 1}')
     status, body = _json(server, f"/media/{spelling}/pending/20260811-000000-x-0000.json")
     assert status == 400, f"/media/{spelling}/… answered {status}"
-    assert body["error"]["code"] in {"path_outside_root", "media_type_not_allowed"}
+    # `path_outside_root` exactly, not "one of two". Accepting `media_type_not_allowed` as well
+    # made this test survive the removal of the queue check -- the request would simply travel one
+    # step further and be refused by the allowlist for being `.json`. The docstring above claims
+    # to cover the case-spelling regression; only the exact code makes that true here rather than
+    # in one other test id.
+    assert body["error"]["code"] == "path_outside_root"
 
 
 @pytest.mark.parametrize("spelling", ["queue", "QUEUE", "QuEuE"])
@@ -603,13 +608,122 @@ def test_the_queue_is_refused_even_for_a_file_type_media_serves(server, spelling
     assert body["error"]["code"] == "path_outside_root"
 
 
-def test_the_queue_check_compares_inodes_not_names(server):
-    """The line under the test above. Recorded as its own assertion because the whole defect was
-    that path equality and `samefile` disagree here, and a reader has no reason to expect it.
+def test_samefile_sees_through_case_where_path_equality_does_not(server):
+    """Documents the *primitive*, not the route: `_is_same_file` in isolation, and the fact that
+    the obvious alternative disagrees with it on this volume.
+
+    Named for what it checks. The route-level guarantee is
+    `test_the_queue_is_refused_even_for_a_file_type_media_serves`, which is what actually fails if
+    the call site stops using this helper -- a reader should not have to work out that this test
+    is not that one.
     """
     upper = server.outdir / "QUEUE"
     assert upper.resolve() != server.queue_root.resolve(), "not a case-insensitive volume"
     assert web._is_same_file(upper, server.queue_root), "samefile did not see through the case"
+
+
+# -- circle 3: what the five checks rest on ------------------------------------------------------
+
+
+def test_the_suffix_and_the_bytes_come_from_the_same_path(server):
+    """The property underneath the whole `/media` policy: `_serve_file` takes the suffix from the
+    **resolved** path, which is the same path it then reads.
+
+    A symbolic link is the case that separates the two readings. `frame.mp4 -> notes.txt` inside a
+    run directory has an allowed name and a forbidden target; checking `relative` would allow it
+    and then hand back `notes.txt`'s bytes -- name from one file, contents from another. This is
+    what defeated all forty of circle 3's spellings, and it is not any of the five numbered checks
+    in `_media`, so nothing else pins it.
+    """
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    (run / "notes.txt").write_text("not a clip")
+    (run / "frame.mp4").symlink_to(run / "notes.txt")
+    status, body = _json(server, "/media/19-real-run/frame.mp4")
+    assert status == 400, f"answered {status} -- the suffix was taken from the link, not the target"
+    assert body["error"]["code"] == "media_type_not_allowed"
+    assert body["error"]["detail"]["suffix"] == ".txt"
+
+
+def test_a_symlink_with_an_allowed_suffix_still_cannot_leave_the_run(server):
+    """The same resolution, the other half: an allowed target type does not buy an escape."""
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    other = server.outdir / "other-run"
+    other.mkdir(exist_ok=True)
+    (other / "secret.mp4").write_bytes(b"secret")
+    (run / "innocent.mp4").symlink_to(other / "secret.mp4")
+    status, body = _json(server, "/media/19-real-run/innocent.mp4")
+    assert status == 400 and body["error"]["code"] == "path_outside_root"
+
+
+def test_a_symlink_inside_the_run_is_still_served(server):
+    """Paired with both: refusing every link would satisfy them and break an ordinary one."""
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    (run / "real.mp4").write_bytes(b"clip")
+    (run / "latest.mp4").symlink_to(run / "real.mp4")
+    status, _, body = _request(server, "/media/19-real-run/latest.mp4")
+    assert status == 200 and body == b"clip"
+
+
+# -- circle 3: a name the filesystem itself refuses ----------------------------------------------
+
+
+@pytest.mark.parametrize("url", [
+    "/media/19-real-run/{long}.mp4",     # allowed suffix: used to reach is_file() and raise
+    "/media/19-real-run/{long}.json",    # forbidden suffix: refused earlier, so it already worked
+    "/media/{long}/clip.mp4",            # the run segment
+    "/static/{long}.css",                # and the same defect on the other route
+])
+def test_an_over_long_name_is_a_404_not_a_crash(server, url):
+    """`ENAMETOOLONG` is not one of the errnos `pathlib` swallows, so `is_file()` raised it
+    straight into the handler's `internal_error` net: a 300-character `.json` answered 400 and a
+    300-character `.mp4` answered 500, for the same input class. Reporting caller-controlled input
+    as a bug in this server is exactly what `resolve_within`'s docstring forbids.
+    """
+    (server.outdir / "19-real-run").mkdir(exist_ok=True)
+    status, body = _json(server, url.format(long="a" * 300))
+    assert status in (400, 404), f"answered {status}: {body}"
+    assert body["error"]["code"] in {"not_found", "media_type_not_allowed"}
+    assert body["error"]["code"] != "internal_error"
+
+
+def test_an_unreadable_file_is_a_404_rather_than_an_oracle(server):
+    """`read_bytes` failing must answer the same as "not there": telling the two apart tells a
+    caller which files exist but are locked down.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 000 file regardless of its mode")
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    clip = run / "locked.mp4"
+    clip.write_bytes(b"clip")
+    clip.chmod(0o000)
+    try:
+        status, body = _json(server, "/media/19-real-run/locked.mp4")
+        assert status == 404 and body["error"]["code"] == "not_found"
+    finally:
+        clip.chmod(0o644)
+
+
+# -- circle 3: the allowlist cannot be opened by omission ----------------------------------------
+
+
+def test_serving_a_file_requires_saying_which_types(tmp_path):
+    """`suffixes` is required and keyword-only. It used to default to "anything", so a route added
+    later that forgot the argument would serve its whole directory silently -- an open default is
+    a class of bug, and the class is what had to go.
+    """
+    with pytest.raises(TypeError):
+        web._serve_file(tmp_path, "x.mp4")
+
+
+def test_any_suffix_is_a_decision_a_route_writes_down(tmp_path):
+    (tmp_path / "a.weird").write_bytes(b"x")
+    assert ".weird" in web.ANY_SUFFIX and ".anything-at-all" in web.ANY_SUFFIX
+    status, _, body = web._serve_file(tmp_path, "a.weird", suffixes=web.ANY_SUFFIX)
+    assert status == 200 and body == b"x"
 
 
 @pytest.mark.parametrize("name,suffix", [("job.json", ".json"), ("run.log", ".log"),

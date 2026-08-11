@@ -87,6 +87,30 @@ PATH_FLAGS = {
 #: weights through `read_bytes()`, whole, into this process's memory.
 MEDIA_SUFFIXES = frozenset({".mp4", ".jpg", ".jpeg", ".png", ".wav"})
 
+
+class _AnySuffix:
+    """The allowlist that allows everything, for a route whose root is its own bound.
+
+    A sentinel object rather than `None`, and `_serve_file`'s `suffixes` is required rather than
+    defaulting to it, so that "serve any type" is something a route *says*. The previous shape --
+    `suffixes=None` meaning "anything" -- made forgetting the argument identical to opening the
+    route, and mutation C2b (drop the argument at the one call site that has it) is that bug
+    written out. Only the single call site being under test kept it visible.
+    """
+
+    __slots__ = ()
+
+    def __contains__(self, item) -> bool:
+        return True
+
+    def __repr__(self) -> str:
+        return "ANY_SUFFIX"
+
+
+#: `/static` passes this: its root is `webui/`, a directory nothing writes into at run time, so the
+#: directory bound is the whole policy and a type allowlist would add nothing.
+ANY_SUFFIX = _AnySuffix()
+
 #: Prompt file names the page may name, per the design spec's "Пути". A bare name with a `.txt`
 #: suffix and nothing that a filesystem reads as structure -- no separator, no `..`, no leading dot.
 PROMPT_NAME = re.compile(r"[A-Za-z0-9_-]+\.txt\Z")
@@ -420,7 +444,7 @@ def _content_type(path: Path) -> str:
     return f"{guess}; charset=utf-8" if guess.startswith("text/") else guess
 
 
-def _serve_file(root, relative: str, suffixes=None) -> tuple[int, str, bytes]:
+def _serve_file(root, relative: str, *, suffixes) -> tuple[int, str, bytes]:
     """A file from under `root`, or a 404 -- never anything from outside `root`.
 
     `root` is the *leaf* directory the URL prefix maps to (`webui/` for `/static/`, one run's
@@ -431,22 +455,50 @@ def _serve_file(root, relative: str, suffixes=None) -> tuple[int, str, bytes]:
     indistinguishable from a router that simply did not recognise the URL, so a traversal test
     written against it passes on a server with no path checking at all.
 
-    `suffixes`, when given, is the allowlist of file types this route serves (`MEDIA_SUFFIXES` for
-    `/media`; `/static` passes `None` because it is bounded by a directory nobody writes into at
-    run time). Checked **before** `is_file`, so a refusal does not double as an answer to "does
-    this file exist".
+    `suffixes` is the allowlist of file types this route serves, and it is **required and
+    keyword-only**: it used to default to `None` meaning "anything", so a future route that forgot
+    the argument would serve the whole directory and say nothing. Forgetting it is now a
+    `TypeError` at the call site. `/static` passes `ANY_SUFFIX` explicitly -- a decision written
+    down rather than an omission -- because its root is a directory nothing writes into at run
+    time. Mutation C2b is exactly the old default, which is why the class had to go and not just
+    the instance.
+
+    **The suffix is taken from `target`, the resolved path -- the same path that is then read.**
+    That single fact is what defeats symbolic links: a link named `frame.mp4` pointing at
+    `notes.txt` is resolved by `resolve_within` before anything looks at its name, so the suffix
+    check sees `.txt` and the escape out of the root is caught by the same resolution. Taking the
+    suffix from `relative` instead would check the link's name and read the target's bytes -- two
+    different files, one decision. `test_the_suffix_and_the_bytes_come_from_the_same_path` pins it.
+
+    The order is `resolve` -> `suffix` -> `is_file`, so a refusal never doubles as an answer to
+    "does this file exist".
+
+    `OSError` from `is_file`/`read_bytes` is a 404, not a crash. `pathlib` swallows `ENOENT` and
+    friends but not `ENAMETOOLONG`, so a name over 255 bytes used to reach the handler's
+    `internal_error` net -- reporting caller-controlled input as a bug in this server, which is the
+    exact failure `resolve_within`'s own docstring calls out. It made an absurd asymmetry visible
+    once the suffix check moved ahead of it: a 300-character `.json` answered 400 and a
+    300-character `.mp4` answered 500.
     """
     target = resolve_within(Path(root) / relative, {"served": Path(root)}, write=False)
-    if suffixes is not None and target.suffix.lower() not in suffixes:
+    if target.suffix.lower() not in suffixes:
         raise CliError(
             "media_type_not_allowed",
             f"this route serves only {sorted(suffixes)}, and {target.name!r} is none of them",
             {"path": relative, "suffix": target.suffix, "allowed": sorted(suffixes)},
         )
-    if not target.is_file():
+    try:
+        if not target.is_file():
+            return 404, "application/json", _error_bytes(
+                "not_found", f"no such file: {relative}", {"path": relative})
+        return 200, _content_type(target), target.read_bytes()
+    except OSError as exc:
+        # Unreadable and non-existent are one answer on purpose: the alternative distinguishes
+        # "this file is here but you may not have it" from "this file is not here", which is an
+        # existence oracle for anything the server can stat but not read.
         return 404, "application/json", _error_bytes(
-            "not_found", f"no such file: {relative}", {"path": relative})
-    return 200, _content_type(target), target.read_bytes()
+            "not_found", f"no such file: {relative}",
+            {"path": relative, "error": f"{type(exc).__name__}: {exc}"})
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -525,9 +577,10 @@ class _Handler(BaseHTTPRequestHandler):
         path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
 
         if path == "/":
-            return _serve_file(self.server.webui, "index.html")
+            return _serve_file(self.server.webui, "index.html", suffixes=ANY_SUFFIX)
         if path.startswith("/static/"):
-            return _serve_file(self.server.webui, path[len("/static/"):])
+            return _serve_file(self.server.webui, path[len("/static/"):],
+                               suffixes=ANY_SUFFIX)
         if path == "/api/state":
             return (200, "application/json",
                     _json_bytes(build_state(self.server.queue_root, self.server.outdir)))
@@ -558,13 +611,33 @@ class _Handler(BaseHTTPRequestHandler):
            canonicalise case and this machine's volume is case-insensitive. `samefile` answers the
            question the filesystem actually decides: on that same pair, path equality is `False`
            and `samefile` is `True`;
-        5. and the file itself must be one of `MEDIA_SUFFIXES` (in `_serve_file`). That allowlist
-           is the load-bearing one -- check 4 is a denylist by identity, and a denylist only ever
-           covers the directories someone thought of.
+        5. and the file itself must be one of `MEDIA_SUFFIXES` (in `_serve_file`), which is what
+           makes the whole set survive a directory nobody thought of -- check 4 is a denylist by
+           identity, and a denylist only ever covers the names someone listed.
+
+        **What actually stops symbolic links is none of the five.** It is `resolve_within`
+        resolving the link *before* anything reads its name, so both the escape and the suffix are
+        judged on the target. A link named `frame.mp4` pointing at `notes.txt` is refused as
+        `.txt`, and one pointing outside the run is refused as an escape. The allowlist is policy
+        layered on top of that resolution, not a substitute for it -- circle 3 checked forty
+        spellings (double extensions, trailing dot and space, full-width Unicode, one-dot-leader,
+        Kelvin sign, `%00` either side of the extension, a FIFO, a directory named `*.mp4`) and
+        the resolution is what held. `test_the_suffix_and_the_bytes_come_from_the_same_path` pins
+        the property the five checks rest on.
 
         The tail after the run segment is deliberately *not* flattened: a run directory has
         subdirectories of its own (`checkpoints/`), and everything below it is still inside it --
         `19-real-run/checkpoints/step05.jpg` is a legitimate preview frame.
+
+        **Threat model: the run directory is trusted.** A *hard* link named `clip.mp4` inside it,
+        pointing at `queue/pending/<id>.json` or anywhere else on the volume, is served, and
+        `resolve()` cannot see it -- a hard link has no target, it *is* the file. This is accepted,
+        not overlooked: creating one needs local write access inside the output directory, and
+        whoever has that already has everything this route could give them. `st_nlink == 1` would
+        close it and would also refuse ordinary files touched by Time Machine, `cp -c` and APFS
+        clones -- false refusals on real clips, bought against an attacker who is already inside
+        the perimeter. What this route defends is the *remote* caller: a browser on someone else's
+        page, which can send URLs and nothing else.
         """
         run, separator, rest = relative.partition("/")
         if not separator or not rest:
