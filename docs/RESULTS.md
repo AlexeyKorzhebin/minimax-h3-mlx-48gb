@@ -1059,3 +1059,44 @@ One consequence for the numbers already recorded: the 27% seed-to-seed spread me
 centaur is inflated by the model's own uncertainty about the creature, and should not be read as the
 recipe's instability alone. The Greek's spread, measured on the same canvas, is the number to
 compare against the reference's 4-9%.
+
+## The plastic skin was the lighting, not the recipe
+
+A viewer described skin on the 896x576 Greek clips as plastic — overexposed, oiled. Four runs at
+one seed and one canvas separated the causes, and the answer costs nothing to apply.
+
+| arm | lighting | LoRA | prompt | skin |
+|---|---|---|---|---|
+| control | golden hour | 1.0 | plain | plastic |
+| weakened adapter | golden hour | 0.6 | plain | still plastic, and grain returned |
+| skin detail | golden hour | 1.0 | pores, texture, beads of sweat | still plastic, plus a sword that lost its blade |
+| **overcast** | **flat overcast** | 1.0 | short matte phrase | **clean** |
+
+**The recipe was never the problem.** Weakening the Turbo LoRA to 0.6 did not remove the sheen and
+brought back the grain that eight steps only survive *because* of the adapter — the adapter is what
+makes the short schedule converge, so turning it down trades one defect for a worse one. Asking for
+pores at full strength did not help either, and the extra text cost the sword its blade: the same
+attention-spreading that put a horse's back on both figures of the centaur prompt.
+
+**The lighting was.** "Epic golden-hour lighting" is a low sun, and a low sun is specular highlights
+across skin — that reading *is* the oiled look. Worse, the prompt asked for it twice: `sweat
+glistening` is a literal request for a sheen over every lit surface. Flat overcast daylight removes
+both by construction rather than by persuasion.
+
+Three things changed in the winning arm at once — the light, the `sweat glistening` phrase, and a
+one-sentence matte instruction — so which of the three carries the weight is not separated. All
+three are the same lever, and it is a free one: no steps, no bits, no pixels, no wall clock.
+
+### What to carry forward
+
+- `prompts/greek-warrior-battle-overcast.txt` is the prompt to copy for anything where skin is on
+  screen. Keep the golden-hour variant only when the sheen is wanted.
+- **Never write `sweat glistening`** unless the sheen is the point.
+- Skin detail belongs in one sentence, not a paragraph. The 485-word version produced high-frequency
+  noise and dropped objects; the 399-word version did not. Asking for detail finer than a pixel —
+  "individual beads of sweat" at 896x576 — sets a target the canvas cannot hold, and the model
+  answers with artefacts.
+- **A canvas that hides a defect is not a canvas that fixes it.** The same control clip looked clean
+  at 448x288, where a face is fifty pixels tall and there is no skin to be plastic. Drafts answer
+  questions about meaning and composition; questions about surface must be asked at the working
+  canvas. This cost one wasted pair of drafts.
