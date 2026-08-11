@@ -2260,12 +2260,15 @@ def test_worker_refuses_when_another_worker_already_holds_the_lock(tmp_path, cap
     """
     from h3_48gb import queue as q
     from h3_48gb.cli import queue_root
-    from test_queue import _external_lock
+    from test_queue import _answer_within, _external_lock
 
     root = queue_root(tmp_path)
     q.layout(root)
     with _external_lock(root, "LOCK_EX", name="worker.lock"):
-        code = main(["worker", "--outdir", str(tmp_path), "--poll", "0.01", "--json"])
+        # `_answer_within`: the refusal must be immediate. A worker lock taken without `LOCK_NB`
+        # would leave this call waiting for the other worker to exit -- here, for ever.
+        code = _answer_within(5, lambda: main(
+            ["worker", "--outdir", str(tmp_path), "--poll", "0.01", "--json"]))
 
     assert code == 1
     body = json.loads(capsys.readouterr().out)

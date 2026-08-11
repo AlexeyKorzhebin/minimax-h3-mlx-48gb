@@ -47,6 +47,29 @@ def _try(fn):
         return exc
 
 
+def _answer_within(seconds, fn):
+    """`fn()`, but failing the test if it has not answered within `seconds`.
+
+    Several things here are contractually *non-blocking*: the lease probe (`lease_is_free` runs
+    under the queue lock and must never wait on a lease), and the worker lock (a second worker must
+    refuse, not queue up behind the first for hours). Both degrade into a *blocking* call under a
+    one-token mutation -- dropping `LOCK_NB` -- and a blocking call does not make a test red, it
+    makes the suite hang, which is not a test result at all. Running the call on a daemon thread
+    and asserting it finished converts "never answered" into a real failure. Whatever `fn` raised
+    is re-raised here, so `pytest.raises` around this still works.
+    """
+    outcome = {}
+    thread = threading.Thread(target=lambda: outcome.update(result=_try(fn)), daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), (
+        f"the call did not answer within {seconds}s -- it blocked where it must not")
+    result = outcome["result"]
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
 # -- Step 1: layout and durable writes ---------------------------------------------------------
 
 
@@ -1029,7 +1052,10 @@ def test_lease_is_free_answers_free_held_and_unknown(tmp_path):
     q.lease_path(root, "probe").touch()
     assert q.lease_is_free(root, "probe") is True, "an existing but unheld lease file is free"
     with _external_lock(root, "LOCK_EX", name="leases/probe.lock"):
-        assert q.lease_is_free(root, "probe") is False, "a lease held by another process is held"
+        # Through `_answer_within`, not called directly: the probe must be non-blocking, and a
+        # blocking one would hang the suite here rather than fail it -- see `_answer_within`.
+        assert _answer_within(5, lambda: q.lease_is_free(root, "probe")) is False, (
+            "a lease held by another process is held")
     assert q.lease_is_free(root, "probe") is True, "the lease is free again once the holder exits"
 
     # Not a contrived failure: any OSError that is not "no such file" lands here. A directory
@@ -1037,6 +1063,22 @@ def test_lease_is_free_answers_free_held_and_unknown(tmp_path):
     q.lease_path(root, "weird").mkdir()
     assert q.lease_is_free(root, "weird") is None, (
         "an unanswerable probe must say so, not guess in either direction")
+
+
+def test_the_result_marker_is_written_durably(tmp_path, monkeypatch):
+    """The marker is the only record of a run's exit code between the subprocess exiting and the
+    job leaving `running/`, and the crash it is written for is exactly the kind that can lose an
+    unsynced write. A plain `write_text` here would leave a truncated or absent marker after a
+    power cut and reconciliation would call a finished run interrupted.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    calls: list[int] = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(q.os, "fsync", lambda fd: (calls.append(fd), real_fsync(fd))[1])
+    q.write_result_marker(root, "20260811-000000-a-aaaa", 0, "2020-01-01T00:00:00")
+    assert len(calls) == 2, (
+        f"expected an fsync of the marker and one of results/, got {len(calls)}")
 
 
 def test_reconcile_leaves_a_live_job_alone_and_reports_it_alive(tmp_path):

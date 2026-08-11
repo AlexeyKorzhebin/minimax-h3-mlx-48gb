@@ -19,6 +19,7 @@ Interruptions are real too: the fault-injection tests kill an actual worker proc
 `os._exit(1)` at a chosen point rather than hand-crafting the files a crash would have left, which
 is the only way the test can be wrong in the same direction the code can.
 """
+import contextlib
 import json
 import os
 import signal
@@ -35,7 +36,7 @@ from h3_48gb import worker
 # `flock` is only honest when the holder is a separate process; `_external_lock` is the queue
 # suite's helper for exactly that, extended there with `name=` so it can hold `worker.lock` and
 # `leases/<id>.lock` as well as `queue.lock`.
-from test_queue import _DRY, _external_lock, _stem
+from test_queue import _DRY, _answer_within, _external_lock, _stem
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -93,6 +94,8 @@ def test_job_command_wraps_the_job_in_caffeinate_and_this_interpreter(tmp_path):
     assert worker.job_command(job, python="/venv/bin/python") == [
         "caffeinate", "-dimsu", "/venv/bin/python", "-m", "h3_48gb",
         "generate", "--tag", "a"]
+    assert worker.job_command(job)[2] == sys.executable, (
+        "the child must run in the worker's own virtualenv, not whichever python is on PATH")
 
 
 def test_run_job_launches_exactly_the_command_job_command_builds(tmp_path):
@@ -189,12 +192,18 @@ def test_the_lease_is_free_again_once_run_job_returns(tmp_path):
 
 
 def test_main_loop_refuses_to_start_when_another_worker_holds_the_lock(tmp_path):
-    """Testing `hold_worker_lock` in isolation does not prove `main_loop` ever calls it."""
+    """Testing `hold_worker_lock` in isolation does not prove `main_loop` ever calls it.
+
+    Wrapped in `_answer_within` rather than called directly (the brief's own snippet calls it
+    directly): the refusal must be *immediate*, and the one-token way to break that -- dropping
+    `LOCK_NB`, so the second worker silently queues up behind the first and starts running jobs
+    hours later -- turns a direct call into a hang, which is not a red test but a stuck suite.
+    """
     root = tmp_path / "queue"
     q.layout(root)
     with _external_lock(root, "LOCK_EX", name="worker.lock"):
         with pytest.raises(worker.WorkerAlreadyRunning):
-            worker.main_loop(root, poll=0.01, stop=_stop_after(0.2))
+            _answer_within(5, lambda: worker.main_loop(root, poll=0.01, stop=_stop_after(0.2)))
 
 
 def test_a_worker_can_start_once_the_previous_one_has_finished(tmp_path):
@@ -207,17 +216,21 @@ def test_a_worker_can_start_once_the_previous_one_has_finished(tmp_path):
     with worker.hold_worker_lock(root):
         pass
     spawned = []
-    assert worker.main_loop(root, poll=0.01, stop=_stop_after(0.2),
-                            spawn=_recording(spawned)) == 0
+    assert _answer_within(10, lambda: worker.main_loop(
+        root, poll=0.01, stop=_stop_after(0.2), spawn=_recording(spawned))) == 0
 
 
 def test_main_loop_runs_the_queue_in_order_and_counts_what_it_ran(tmp_path):
+    """`_answer_within` here guards the other half of `stop`: a loop that never consults it runs
+    for ever, and "for ever" is a hung suite rather than a failing test.
+    """
     root = tmp_path / "queue"
     first = _queued(root, tmp_path, tag="a")
     second = _queued(root, tmp_path, tag="b")
     spawned: list[list[str]] = []
 
-    ran = worker.main_loop(root, poll=0.01, stop=_stop_after(1.0), spawn=_recording(spawned))
+    ran = _answer_within(10, lambda: worker.main_loop(
+        root, poll=0.01, stop=_stop_after(1.0), spawn=_recording(spawned)))
 
     assert ran == 2, f"the loop must run both queued jobs, ran {ran}"
     assert [cmd[-1] for cmd in spawned[:2]] == ["a", "b"], "jobs must run in queue order"
@@ -291,13 +304,23 @@ print("stopped", flush=True)
 """
 
 
+@contextlib.contextmanager
 def _signal_worker(root, mode, argument):
-    """Start a worker in its own process and block until it has a child running."""
+    """Start a worker in its own process, block until it has a child running, and make sure it is
+    gone by the end of the block however the test turns out -- a worker whose loop ignored the
+    stop request would otherwise outlive the failing test and keep spawning children for the rest
+    of the session.
+    """
     script = _SIGNAL_WORKER.format(project=str(PROJECT_ROOT))
     proc = subprocess.Popen([sys.executable, "-c", script, str(root), mode, str(argument)],
                             stdout=subprocess.PIPE, text=True)
-    assert proc.stdout.readline().strip() == "spawned", "the worker never started a job"
-    return proc
+    try:
+        assert proc.stdout.readline().strip() == "spawned", "the worker never started a job"
+        yield proc
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
 
 
 def test_the_first_stop_signal_lets_the_running_job_finish_and_takes_no_new_one(tmp_path):
@@ -310,11 +333,11 @@ def test_the_first_stop_signal_lets_the_running_job_finish_and_takes_no_new_one(
     first = _queued(root, tmp_path, tag="a")
     second = _queued(root, tmp_path, tag="b")
 
-    proc = _signal_worker(root, "sleeper", 1.5)
-    started = time.time()
-    proc.send_signal(signal.SIGTERM)
-    assert proc.wait(timeout=30) == 0, "a requested stop is not a failure"
-    elapsed = time.time() - started
+    with _signal_worker(root, "sleeper", 1.5) as proc:
+        started = time.time()
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=30) == 0, "a requested stop is not a failure"
+        elapsed = time.time() - started
 
     assert elapsed >= 1.0, (
         f"the worker stopped after {elapsed:.2f}s -- it killed the running job instead of "
@@ -335,20 +358,21 @@ def test_the_second_stop_signal_kills_the_grandchild_not_just_the_direct_child(t
     job = _queued(root, tmp_path, tag="a")
     pidfile = tmp_path / "grandchild.pid"
 
-    proc = _signal_worker(root, "grandchild", pidfile)
-    deadline = time.time() + 10
-    while not pidfile.exists() and time.time() < deadline:
-        time.sleep(0.05)
-    grandchild = int(pidfile.read_text())
-    os.kill(grandchild, 0)  # raises if the grandchild never came up at all
+    with _signal_worker(root, "grandchild", pidfile) as proc:
+        deadline = time.time() + 10
+        while not pidfile.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        grandchild = int(pidfile.read_text())
+        os.kill(grandchild, 0)  # raises if the grandchild never came up at all
 
-    proc.send_signal(signal.SIGTERM)
-    time.sleep(0.5)
-    os.kill(grandchild, 0)  # must NOT raise: the first signal leaves the run alone
+        proc.send_signal(signal.SIGTERM)
+        time.sleep(0.5)
+        os.kill(grandchild, 0)  # must NOT raise: the first signal leaves the run alone
 
-    proc.send_signal(signal.SIGTERM)
-    assert proc.wait(timeout=30) == -signal.SIGTERM, (
-        "the second signal must take the worker down with the default handler, not be swallowed")
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=30) == -signal.SIGTERM, (
+            "the second signal must take the worker down with the default handler, not be "
+            "swallowed")
 
     deadline = time.time() + 10
     while time.time() < deadline:
