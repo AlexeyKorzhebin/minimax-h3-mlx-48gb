@@ -38,6 +38,7 @@ Nothing here reimplements ``__call__``. Three seams carry the whole feature:
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -277,6 +278,57 @@ class CheckpointStore:
             path = path.with_name(path.name + ".safetensors")
         self.path = path
         self.bytes_written = 0
+        self._lock_fd: int | None = None
+
+    @property
+    def lock_path(self) -> Path:
+        """The liveness marker: a companion file a live writer holds a shared flock on.
+
+        Named after the checkpoint itself rather than kept anywhere else, so a reader who only has
+        the checkpoint path (``h3_48gb.runs`` never sees a ``CheckpointStore``) can derive it with
+        the same one-line rule this property encodes: see ``runs._writer_alive``.
+        """
+        return self.path.with_name(self.path.name + ".lock")
+
+    # -- liveness
+
+    def acquire_lock(self) -> None:
+        """Take a shared flock on the companion file, held until :meth:`release_lock`.
+
+        Shared, not exclusive: two writers racing for the same identity would not conflict on this
+        lock, but that collision is already out of scope for this store (see the class docstring —
+        two identical requests running at once do not fit in memory anyway). What the *reader*
+        needs is a lock type its own non-blocking probe reliably conflicts with, and a shared lock
+        blocks a conflicting exclusive attempt just as well as another exclusive lock would; see
+        ``runs._writer_alive`` for that probe.
+
+        No timeout and no PID recorded anywhere: `fcntl.flock` is released by the kernel the moment
+        this process's file descriptor closes, for any reason, including a crash that never runs a
+        line of Python cleanup. That is the whole mechanism this feature relies on.
+        """
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(self._lock_fd, fcntl.LOCK_SH)
+
+    def release_lock(self) -> None:
+        """Drop the lock and remove the companion file. Idempotent, and safe with no lock held.
+
+        Meant to run from a ``finally`` wrapping the whole generation, so it fires on success and
+        on any exception that unwinds through Python — a graceful exit, in other words. A file left
+        behind unlocked reads to a reader as "the writer is confirmed gone", which is more than a
+        graceful exit alone proves (the interpreter could still be about to retry, or the caller
+        could catch the exception and carry on); removing the marker instead leaves the honest
+        answer, "nothing to say". Only a crash that skips Python's stack unwinding entirely —
+        SIGKILL, a segfault, the OOM killer — leaves the file behind for a reader to find unlocked,
+        and that is deliberate: it is exactly the case a reader needs the file for.
+        """
+        if self._lock_fd is not None:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._lock_fd)
+                self._lock_fd = None
+        self.lock_path.unlink(missing_ok=True)
 
     # -- writing
 
@@ -747,23 +799,30 @@ class CheckpointingPipeline:
             completed_at_start=loaded.completed_steps if loaded is not None else 0,
         )
 
-        original_dit, original_text_encoder = self.dit, self.text_encoder
-        self._resume_run = run
-        self.dit = StepInterceptor(original_dit, run)
-        self.text_encoder = PromptRelay(original_text_encoder, run)
+        # Held for the rest of this method, released in the `finally` below — see
+        # `CheckpointStore.acquire_lock`/`release_lock` for why a shared flock on a companion file
+        # is the liveness signal `h3_48gb.runs` reads, and why no timeout is involved.
+        store.acquire_lock()
         try:
-            result = super().__call__(*args, **kwargs)
-        finally:
-            self.dit, self.text_encoder = original_dit, original_text_encoder
-            self._resume_run = None
+            original_dit, original_text_encoder = self.dit, self.text_encoder
+            self._resume_run = run
+            self.dit = StepInterceptor(original_dit, run)
+            self.text_encoder = PromptRelay(original_text_encoder, run)
+            try:
+                result = super().__call__(*args, **kwargs)
+            finally:
+                self.dit, self.text_encoder = original_dit, original_text_encoder
+                self._resume_run = None
 
-        # Only on success. A crash anywhere above — including in the VAE decode, which is its own
-        # memory cliff on a 48 GB machine — leaves the checkpoint for the next attempt.
-        if not options.get("keep_checkpoint", False):
-            store.discard()
-        elif verbose:
-            print(f"  checkpoint kept at {store.path}", flush=True)
-        return result
+            # Only on success. A crash anywhere above — including in the VAE decode, which is its
+            # own memory cliff on a 48 GB machine — leaves the checkpoint for the next attempt.
+            if not options.get("keep_checkpoint", False):
+                store.discard()
+            elif verbose:
+                print(f"  checkpoint kept at {store.path}", flush=True)
+            return result
+        finally:
+            store.release_lock()
 
 
 def _resolve_store(options: dict, identity: dict) -> CheckpointStore:

@@ -11,6 +11,7 @@ the point is that `h3 status` starts instantly and that these tests need no weig
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import struct
 from dataclasses import dataclass, field
@@ -25,22 +26,12 @@ _MAX_HEADER_BYTES = 8 << 20
 
 _META_KEY = "h3_checkpoint"
 
-#: Three forwards absorbs one slow step; 120 s absorbs loading and decoding, during which the
-#: writer is silent. Below this a run has started and stopped.
-_STALE_GRACE_SECONDS = 120
-_STALE_FORWARD_MULTIPLE = 3
-
-#: Absolute ceiling for `_state_of`'s `rate is None` branch, where `started_at` is missing and so
-#: there is no measured rate to build a `_STALE_FORWARD_MULTIPLE * rate` window from. A forward at
-#: native resolution runs up to ~30 minutes (see the timing figures in `checkpoint.py`'s module
-#: docstring), and a checkpoint can go quiet for a VAE decode on top of that before the next write.
-#: Four hours clears both several times over, so a live run sitting on a slow step is never
-#: declared dead just because its checkpoint predates `started_at` -- but it is still finite, so
-#: `h3 watch` on a checkpoint that is actually abandoned terminates instead of polling it forever.
-#: (Without this, "unknown" from a missing `started_at` was itself an unbounded window: every
-#: checkpoint on the machine at the time this was written lacks `started_at`, which made `watch`
-#: unable to end on any of them, ever.)
-_UNKNOWN_MAX_AGE_SECONDS = 4 * 3600
+#: The suffix a live writer's companion lock file carries, appended to the checkpoint's own name.
+#: Must match `CheckpointStore.lock_path` in `checkpoint.py` exactly -- the two are never allowed
+#: to share an import (`checkpoint.py` pulls in `mlx`; this module may not), so this is the one
+#: piece of the contract duplicated instead of shared, and it is exercised end to end against a
+#: real writer in `test_checkpoint.py::test_writer_holds_a_shared_lock_for_the_life_of_the_run`.
+_LOCK_SUFFIX = ".lock"
 
 
 def _parse(stamp: str) -> datetime:
@@ -133,34 +124,58 @@ def read_checkpoint_meta(path: Path) -> dict:
     return json.loads(raw[_META_KEY])
 
 
-def _state_of(run: Run) -> str:
+def _writer_alive(checkpoint: Path) -> bool | None:
+    """Whether a live writer holds the checkpoint's companion lock file.
+
+    ``True``  -- the shared flock is held: some process has this checkpoint open right now.
+    ``False`` -- the companion file exists, but nothing holds its lock. A writer held it at some
+                 point and is now gone -- a fact, not a guess: the kernel drops an `fcntl.flock`
+                 lock the instant the holding file descriptor closes, for any reason, including a
+                 crash that never ran a line of the writer's own cleanup code.
+    ``None``  -- there is no companion file to check at all. Either this checkpoint predates the
+                 code that writes one, or its writer already removed the file on a graceful exit
+                 (see `checkpoint.CheckpointStore.release_lock`). Either way there is nothing on
+                 disk to say whether a writer is still around, so there is nothing to say.
+
+    The probe takes its own non-blocking *exclusive* lock and releases it immediately. A writer's
+    *shared* lock is exactly what a conflicting exclusive attempt blocks on, so failure to acquire
+    is proof of a live holder and success is proof there is none -- no timeout, no stored pid to
+    go stale, no constant to tune.
+    """
+    lock_path = checkpoint.with_name(checkpoint.name + _LOCK_SUFFIX)
+    try:
+        handle = open(lock_path, "rb")
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        handle.close()
+
+
+def _state_of(run: Run, checkpoint: Path) -> str:
     """"unreadable" for a Run this can't be reached on -- construction already raised for that.
 
-    An unknown rate must not become a guessed window: `rate or 0` used to fold "I don't know the
-    speed" into "assume it is instant", which shrinks the window to the bare 120 s grace period --
-    a quarter of a real ~600 s/forward silence -- and calls a live run `stale`. Killing a run that
-    is actually in flight costs hours on a machine where one forward is ten minutes; reporting
-    `unknown` for one extra poll costs nothing. "can't tell" and "confirmed dead" must not look the
-    same, mirroring the same principle this project already applies to a checkpoint field it can't
-    parse: `None`, not a guess.
+    Liveness comes from the companion lock file alone -- see `_writer_alive`. No age, no measured
+    rate, no threshold of either: a checkpoint can go quiet for a slow forward or a long VAE decode
+    while its writer is very much alive, and a run can crash the instant after a write. Telling
+    those apart from silence and a clock is exactly the thing no fixed window can do without
+    guessing -- which is why an earlier version of this function tried anyway (a four-hour ceiling
+    on `rate is None`, and a `3 * rate + 120s` window otherwise) and still got a live run called
+    dead. The lock does not need to guess: `age_seconds` stays in `Run.as_dict()` as information
+    for a human, never as an input to this decision.
     """
-    age, rate = run.age_seconds, run.seconds_per_forward
-    if age is None:
-        # No `written_at` at all -- unlike `started_at` (added later for the session-rate
-        # feature, and `None` on every checkpoint written before it), `written_at` has been set
-        # on *every* call to `_write` since the checkpoint format was created; there is no path
-        # in this fork that produces a checkpoint without one. So this is not "can't tell": a
-        # file missing it is not a live checkpoint from current code, and calling it anything
-        # that keeps `watch` polling would wait forever for a field nothing will ever supply.
+    alive = _writer_alive(checkpoint)
+    if alive is True:
+        return "in_flight"
+    if alive is False:
         return "stale"
-    if rate is None:
-        # No rate -- only `started_at` is missing, which by itself might still mean "alive" (see
-        # the docstring above). Without the ceiling below, though, that "might" never resolves:
-        # `watch` would poll such a checkpoint forever. See `_UNKNOWN_MAX_AGE_SECONDS` for why
-        # four hours is the cutoff.
-        return "unknown" if age < _UNKNOWN_MAX_AGE_SECONDS else "stale"
-    window = _STALE_FORWARD_MULTIPLE * rate + _STALE_GRACE_SECONDS
-    return "in_flight" if age < window else "stale"
+    return "unknown"
 
 
 def scan(root: Path) -> list[Run]:
@@ -181,13 +196,19 @@ def scan(root: Path) -> list[Run]:
                 completed_at_start=int(meta.get("completed_at_start", 0)),
                 written_at=meta.get("written_at"),
             )
-            # Computed here, inside the same protected try that builds `run`: `_state_of` reads
-            # `age_seconds` and `seconds_per_forward`, both of which call `_parse` on caller-
-            # controlled timestamp strings. A checkpoint with well-formed JSON but an unparsable
-            # `started_at` must still cost one run, not the whole scan -- so this must not move
-            # outside the `try` below, where it would defeat the very isolation this function
-            # exists to provide.
-            run.state = _state_of(run)
+            # `_state_of` itself no longer touches these -- liveness now comes from the lock file
+            # alone -- but `age_seconds` and `seconds_per_forward` still call `_parse` on them
+            # lazily, whenever a caller (`Run.as_dict`, `format_status`) reads those properties
+            # outside of any try at all. Validating both here, inside the same protected try that
+            # builds `run`, turns a checkpoint with well-formed JSON but an unparsable timestamp
+            # into one "unreadable" run instead of a `ValueError` raised later out of a caller that
+            # has no reason to expect one -- the same isolation `read_checkpoint_meta` gives the
+            # JSON itself, extended to the two fields this module parses as datetimes.
+            if run.started_at is not None:
+                _parse(run.started_at)
+            if run.written_at is not None:
+                _parse(run.written_at)
+            run.state = _state_of(run, checkpoint)
         except (OSError, ValueError, TypeError, AttributeError, KeyError, struct.error,
                 MemoryError) as exc:
             # The bytes on disk are untrusted: a queue writes checkpoints by rename, so a reader

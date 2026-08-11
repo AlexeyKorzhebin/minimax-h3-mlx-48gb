@@ -305,7 +305,7 @@ def test_status_refuses_a_missing_outdir(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "outdir_not_found"
 
 
-def test_status_orders_in_flight_before_stale(tmp_path, monkeypatch):
+def test_status_orders_in_flight_before_stale(tmp_path):
     """`run_status` sorts in-flight runs first, so a human scanning the report sees what is
     actually happening before what has died.
 
@@ -313,21 +313,20 @@ def test_status_orders_in_flight_before_stale(tmp_path, monkeypatch):
     alphabetically -- `scan` itself returns runs in path order, so if `run_status` ever drops its
     `.sort(...)` this fails instead of passing by the coincidence of matching names to path order.
     """
-    import h3_48gb.runs as runs_mod
     from h3_48gb.cli import run_status
-    from h3_48gb.runs import _parse
-    from tests.test_runs import write_checkpoint
+    from tests.test_runs import held_lock, write_checkpoint, write_free_lock_file
 
-    write_checkpoint(tmp_path / "a-dead" / "checkpoints" / "h3-a.safetensors",
+    dead = write_checkpoint(tmp_path / "a-dead" / "checkpoints" / "h3-a.safetensors",
                      completed=2, total=7, started_at="2026-08-10T21:00:00",
                      completed_at_start=0, written_at="2026-08-10T21:20:00")
-    write_checkpoint(tmp_path / "z-alive" / "checkpoints" / "h3-b.safetensors",
+    write_free_lock_file(dead)
+    alive = write_checkpoint(tmp_path / "z-alive" / "checkpoints" / "h3-b.safetensors",
                      completed=2, total=7, started_at="2026-08-10T21:59:00",
                      completed_at_start=0, written_at="2026-08-10T22:00:00")
 
-    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T22:00:30"))
+    with held_lock(alive):
+        report = run_status(tmp_path)
 
-    report = run_status(tmp_path)
     assert [r["state"] for r in report["runs"]] == ["in_flight", "stale"]
     assert [Path(r["outdir"]).name for r in report["runs"]] == ["z-alive", "a-dead"]
 
@@ -429,28 +428,24 @@ def test_format_status_does_not_crash_when_total_is_unknown():
     assert "None" not in human
 
 
-def test_status_survives_a_checkpoint_with_a_zero_total(tmp_path, monkeypatch):
+def test_status_survives_a_checkpoint_with_a_zero_total(tmp_path):
     """End-to-end: `total_forwards: 0` reaches `scan` as `total=None` (see `runs.py`'s `... or
     None`), while the rate can still be known -- exactly the shape `format_status` must not choke
     on.
 
-    `_now` is pinned well inside the freshness window so this deterministically lands in
-    `in_flight`, the branch that divides by `eta_seconds` -- without pinning, the outcome (and
-    whether the crash this guards against is even exercised) would depend on wall-clock time
-    relative to the hardcoded `written_at`.
+    The lock is held for the duration so this deterministically lands in `in_flight`, the branch
+    that divides by `eta_seconds`.
     """
-    import h3_48gb.runs as runs_mod
     from h3_48gb.cli import format_status, run_status
-    from h3_48gb.runs import _parse
-    from tests.test_runs import write_checkpoint
+    from tests.test_runs import held_lock, write_checkpoint
 
-    write_checkpoint(tmp_path / "r" / "checkpoints" / "h3-a.safetensors",
+    checkpoint = write_checkpoint(tmp_path / "r" / "checkpoints" / "h3-a.safetensors",
                      completed=3, total=0, started_at="2026-08-10T21:00:00",
                      completed_at_start=0, written_at="2026-08-10T21:10:00")
 
-    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T21:11:40"))  # 100 s later
+    with held_lock(checkpoint):
+        report = run_status(tmp_path)
 
-    report = run_status(tmp_path)
     assert report["runs"][0]["state"] == "in_flight"
     format_status(report)  # must not raise
 
@@ -488,44 +483,45 @@ def test_watch_exits_when_nothing_is_running(tmp_path, capsys):
     assert "ничего не идёт" in capsys.readouterr().out
 
 
-def test_watch_continues_polling_on_unknown_state(tmp_path, monkeypatch):
-    """watch loops while unknown state is present; sleeps prove it, not just format_status.
-
-    `_now` is pinned well inside `runs._UNKNOWN_MAX_AGE_SECONDS` of `written_at` -- past that
-    ceiling an unknown-rate checkpoint this old reads as `stale` instead (see
-    `test_watch_terminates_on_an_old_unknown_run_past_the_ceiling`), and this test would stop
-    exercising the "still might be alive" branch it is named for.
+def test_watch_continues_while_a_writer_holds_the_lock_then_terminates(tmp_path, monkeypatch):
+    """`in_flight` is the one state `WATCH_RUNNING_STATES` may never lose: it is the only state
+    backed by a signal that can actually change between two polls (the companion lock file), so it
+    is the only one worth polling again for. This is the test the task's mutation list calls for:
+    delete `"in_flight"` from `WATCH_RUNNING_STATES` and this fails, because `run_watch` would
+    return on the first pass without ever sleeping.
     """
+    import fcntl
     import time
-    import h3_48gb.runs as runs_mod
-    from h3_48gb.runs import _parse
-    from tests.test_runs import write_checkpoint
+    from tests.test_runs import lock_path_for, write_checkpoint
     from h3_48gb.cli import run_watch
 
-    run_dir = tmp_path / "r"
-    write_checkpoint(run_dir / "checkpoints" / "h3-a.safetensors",
-                     completed=3, total=7, written_at="2026-08-10T21:00:00")
-
-    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T21:16:40"))  # 1000 s later
+    checkpoint = write_checkpoint(tmp_path / "live" / "checkpoints" / "h3-a.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:20:00")
+    handle = open(lock_path_for(checkpoint), "wb")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
 
     sleep_calls = []
 
     def stub_sleep(duration: float) -> None:
         sleep_calls.append(duration)
-        if len(sleep_calls) == 1:
-            # First sleep: delete the run so next iteration sees empty dir and exits cleanly
-            import shutil
-            shutil.rmtree(run_dir)
+        # Simulate the writer finishing between polls: release the lock so the next scan reads
+        # this run as `stale`, which is what actually lets the loop end.
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
     monkeypatch.setattr(time, "sleep", stub_sleep)
 
-    # interval > 0 so the loop can actually test continuation logic
-    report = run_watch(tmp_path, interval=0.1)
+    try:
+        report = run_watch(tmp_path, interval=0.1)
+    finally:
+        if not handle.closed:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
-    # Proof that unknown state caused continuation: sleep was called, meaning at least 2 iterations
-    assert len(sleep_calls) >= 1, "watch must sleep before checking for more runs"
-    # Proof that status was checked more than once: the final iteration sees empty dir
-    assert len(report["runs"]) == 0, "run_watch must have iterated again after the unknown run vanished"
+    assert len(sleep_calls) >= 1, "watch must sleep at least once while the lock is held"
+    assert report["runs"][0]["state"] == "stale", \
+        "run_watch must have re-scanned after the lock was released, not just slept once and stopped"
 
 
 def _sleep_stub_that_must_not_be_called(monkeypatch):
@@ -547,49 +543,37 @@ def _sleep_stub_that_must_not_be_called(monkeypatch):
     monkeypatch.setattr(time, "sleep", stub_sleep)
 
 
-def test_watch_terminates_on_an_old_unknown_run_past_the_ceiling(tmp_path, monkeypatch):
-    """A checkpoint with no `started_at` and a last write far older than
-    `runs._UNKNOWN_MAX_AGE_SECONDS` must read as `stale`, not `unknown` forever -- otherwise
-    `watch` can never end on it, which today is *every* checkpoint on the machine (none of them
-    have `started_at` yet).
+def test_watch_terminates_immediately_on_unknown_state(tmp_path, monkeypatch):
+    """`unknown` no longer keeps `watch` polling (task 4): without a lock file there is nothing
+    that could change between one poll and the next, so looping is pure waiting for an answer that
+    is never coming. Print it once and return control to the caller instead.
     """
-    from datetime import timedelta
-    import h3_48gb.runs as runs_mod
-    from h3_48gb.runs import _parse, _UNKNOWN_MAX_AGE_SECONDS
     from tests.test_runs import write_checkpoint
     from h3_48gb.cli import run_watch
 
-    write_checkpoint(tmp_path / "old" / "checkpoints" / "h3-a.safetensors",
-                     completed=8, total=19, started_at=None, written_at="2026-08-10T10:00:00")
-
-    # One second past the ceiling: still "old", nowhere near a real 30-minute forward's slack.
-    later = _parse("2026-08-10T10:00:00") + timedelta(seconds=_UNKNOWN_MAX_AGE_SECONDS + 1)
-    monkeypatch.setattr(runs_mod, "_now", lambda: later)
+    write_checkpoint(tmp_path / "old-format" / "checkpoints" / "h3-a.safetensors",
+                     completed=3, total=7, written_at="2026-08-10T21:00:00")
+    # No companion lock file at all -- what an old-format checkpoint looks like.
 
     _sleep_stub_that_must_not_be_called(monkeypatch)
 
     report = run_watch(tmp_path, interval=0.1)
-    assert report["runs"][0]["state"] == "stale"
+    assert report["runs"][0]["state"] == "unknown"
 
 
 def test_watch_terminates_on_a_stale_run(tmp_path, monkeypatch):
-    """The base case: a single ordinary (known-rate) `stale` run must not keep `watch` polling.
+    """The base case: a checkpoint whose writer is confirmed gone (lock file present, unlocked)
+    must not keep `watch` polling.
 
-    This is the test that must fail if `stale` is ever added to `WATCH_RUNNING_STATES` -- verified
-    by hand while fixing C2: adding it back in makes this test hang without the sleep guard, and
-    fail immediately with it.
+    This is the test that must fail if `stale` is ever added back to `WATCH_RUNNING_STATES`.
     """
-    import h3_48gb.runs as runs_mod
-    from h3_48gb.runs import _parse
-    from tests.test_runs import write_checkpoint
+    from tests.test_runs import write_checkpoint, write_free_lock_file
     from h3_48gb.cli import run_watch
 
-    write_checkpoint(tmp_path / "dead" / "checkpoints" / "h3-a.safetensors",
+    checkpoint = write_checkpoint(tmp_path / "dead" / "checkpoints" / "h3-a.safetensors",
                      completed=2, total=7, started_at="2026-08-10T21:00:00",
                      completed_at_start=0, written_at="2026-08-10T21:20:00")
-
-    # rate 1200 s/forward -> window 3720 s; well past it.
-    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T23:00:00"))
+    write_free_lock_file(checkpoint)
 
     _sleep_stub_that_must_not_be_called(monkeypatch)
 
@@ -598,8 +582,11 @@ def test_watch_terminates_on_a_stale_run(tmp_path, monkeypatch):
 
 
 def test_watch_terminates_when_written_at_is_missing(tmp_path, monkeypatch):
-    """A checkpoint with no `written_at` at all must not read as an eternal `in_flight` -- there is
-    no code path that ever supplies the missing field, so nothing would ever end the watch.
+    """A checkpoint with no `written_at` and no lock file reads as `unknown` -- and `unknown` must
+    not keep `watch` polling (task 4). Pinned to the exact value rather than a bare `!=
+    "in_flight"`: a regression to `stale` here is exactly the overclaim task 3 exists to remove
+    (missing `written_at` proves the file predates the current writer, not that its writer died),
+    and a loose assertion would not catch it.
     """
     from tests.test_runs import write_checkpoint
     from h3_48gb.cli import run_watch
@@ -610,7 +597,24 @@ def test_watch_terminates_when_written_at_is_missing(tmp_path, monkeypatch):
     _sleep_stub_that_must_not_be_called(monkeypatch)
 
     report = run_watch(tmp_path, interval=0.1)
-    assert report["runs"][0]["state"] != "in_flight"
+    assert report["runs"][0]["state"] == "unknown"
+
+
+def test_watch_terminates_on_an_unreadable_checkpoint(tmp_path, monkeypatch):
+    """A corrupt checkpoint reads as `unreadable`, which must stay out of `WATCH_RUNNING_STATES` --
+    this is the test the task's mutation list calls for: add `"unreadable"` back into it and this
+    fails, recreating an infinite loop on exactly the kind of file that motivated this feature.
+    """
+    from h3_48gb.cli import run_watch
+
+    checkpoints = tmp_path / "bad" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / "h3-bad.safetensors").write_bytes(b"\x01\x02\x03")
+
+    _sleep_stub_that_must_not_be_called(monkeypatch)
+
+    report = run_watch(tmp_path, interval=0.1)
+    assert report["runs"][0]["state"] == "unreadable"
 
 
 # -- resume ------------------------------------------------------------------------------------

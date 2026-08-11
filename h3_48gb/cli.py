@@ -856,11 +856,12 @@ def run_list(outdir: Path) -> list[dict]:
     return rows
 
 
-#: States for which `watch` should continue polling the outdir. in_flight runs are obviously still
-#: going; unknown runs have not yet revealed their completion status (the checkpoint lacks
-#: started_at, often because it was written by older code). unknown is a reason to keep watching:
-#: if watch exited on unknown alone, the command would be useless on all existing cached checkpoints.
-WATCH_RUNNING_STATES = {"in_flight", "unknown"}
+#: States for which `watch` should continue polling the outdir. Only `in_flight` -- the one state
+#: backed by an actual liveness signal (a companion lock file a writer holds; see
+#: `h3_48gb.runs._writer_alive`). `unknown` means "no lock file to check, nothing to say" and
+#: `stale`/`unreadable` are already-settled outcomes; polling any of them again can never turn them
+#: into new information; only `in_flight` can, when the lock is eventually released.
+WATCH_RUNNING_STATES = {"in_flight"}
 
 
 def run_status(outdir: Path) -> dict:
@@ -872,8 +873,8 @@ def run_status(outdir: Path) -> dict:
         raise CliError("outdir_not_found", f"--outdir does not exist: {outdir}",
                        {"outdir": str(outdir)})
     runs = scan(outdir)
-    # "unknown" ranks ahead of "stale": it might still be running and deserves attention before a
-    # run already confirmed dead. See `_state_of` in runs.py for why it exists at all.
+    # "unknown" ranks ahead of "stale": "confirmed gone" (stale) needs less attention than "cannot
+    # be judged at all" (unknown, no lock file to check). See `_state_of` in runs.py.
     order = {"in_flight": 0, "unknown": 1, "stale": 2, "unreadable": 3, "finished": 4}
     runs.sort(key=lambda r: (order.get(r.state, 9), str(r.outdir)))
     return {"ok": True, "outdir": str(outdir), "runs": [r.as_dict() for r in runs]}
@@ -929,7 +930,13 @@ def format_status(report: dict) -> str:
 
 
 def run_watch(outdir: Path, interval: float) -> dict:
-    """Redraw the status block until no runs are in_flight or unknown, then return the final state.
+    """Redraw the status block until no run is `in_flight`, then return the final state.
+
+    A run in `unknown` is printed once and then left alone: there is no lock file to say whether
+    its writer is still around, and polling a question with no new answer coming is just spinning.
+    `stale` and `unreadable` are already-settled outcomes for the same reason. Only `in_flight` can
+    change into something else while `watch` is looking at it -- the lock either stays held or it
+    doesn't -- so it is the only state worth another pass. See `WATCH_RUNNING_STATES`.
 
     Not a TUI: the block is reprinted with a leading escape that clears the previous one, so a
     dumb terminal and a redirected log both stay readable.

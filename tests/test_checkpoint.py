@@ -735,6 +735,101 @@ def test_resumed_checkpoint_records_previous_session_progress(tmp_path):
         "a resumed session must record the forwards already done when it began, not zero")
 
 
+def test_started_at_is_constant_across_every_write_in_one_session(tmp_path, monkeypatch):
+    """`started_at` marks when *this session* began, once — not the moment of each write.
+
+    `test_metadata_is_readable_without_mlx` only checks `started_at is not None`, which a mutation
+    that overwrites `started_at` with `written_at` (or blanks it to `""`) on every write would
+    still pass. This pins the actual value across several writes in one uninterrupted session,
+    using a fake clock so the assertion does not depend on every write happening to land in the
+    same wall-clock second (STEPS - 1 = 8 writes is comfortably faster than that on a real machine,
+    which would otherwise mask exactly the "written_at every time" mutation this test exists to
+    catch).
+    """
+    import h3_48gb.checkpoint as checkpoint_mod
+
+    clock = iter(f"2026-08-10T21:00:{i:02d}" for i in range(60))
+    monkeypatch.setattr(checkpoint_mod.time, "strftime", lambda _fmt: next(clock))
+
+    metas: list[dict] = []
+    original_write = checkpoint_mod.CheckpointStore.write
+
+    def spy_write(self, arrays, meta):
+        metas.append(dict(meta))
+        original_write(self, arrays, meta)
+
+    monkeypatch.setattr(checkpoint_mod.CheckpointStore, "write", spy_write)
+
+    path = tmp_path / "session.safetensors"
+    run(ToyPipeline(), checkpoint_path=path, keep_checkpoint=True)  # one full, uncrashed session
+
+    assert len(metas) == STEPS - 1, "expected one checkpoint write per forward"
+    # Call 0 of the fake clock is spent on `ResumableRun.started_at`'s default factory, at
+    # construction, before any write; calls 1..8 are `written_at` on each of the eight writes.
+    assert metas[0]["started_at"] == "2026-08-10T21:00:00"
+    assert {m["started_at"] for m in metas} == {"2026-08-10T21:00:00"}, (
+        "started_at must be the same value on every write in a session, not re-stamped per write")
+    assert [m["written_at"] for m in metas] == [
+        f"2026-08-10T21:00:{i:02d}" for i in range(1, len(metas) + 1)
+    ], "written_at must advance on every write, or the fixture cannot tell it apart from started_at"
+
+
+def test_writer_holds_a_shared_lock_for_the_life_of_the_run(tmp_path):
+    """The liveness signal `h3_48gb.runs._writer_alive` reads is a real, held `flock` on a
+    companion file next to the checkpoint — proved here with the reader's own probe technique
+    (a non-blocking exclusive `flock` attempt), not a mocked stand-in, while a real run is
+    mid-flight. The companion file must also be gone once the run ends.
+    """
+    import fcntl
+    from h3_48gb.checkpoint import CheckpointStore
+
+    path = tmp_path / "live.safetensors"
+    store = CheckpointStore(path)
+    observed: list[bool] = []
+
+    class ObserveMidRun(ToyPipeline):
+        def _decode_video(self, rows, *args, **kwargs):
+            assert store.lock_path.exists(), "no companion lock file while the run is in progress"
+            probe = open(store.lock_path, "rb")
+            try:
+                try:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    observed.append(True)  # acquired -- would mean no writer holds it
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    observed.append(False)  # blocked -- the writer's own shared lock is held
+            finally:
+                probe.close()
+            return super()._decode_video(rows, *args, **kwargs)
+
+    run(ObserveMidRun(), checkpoint_path=path, keep_checkpoint=True)
+
+    assert observed == [False], "a non-blocking exclusive probe must fail while the run is live"
+    assert not store.lock_path.exists(), "the companion lock file must be removed once the run ends"
+
+
+def test_lock_is_released_and_removed_after_a_crash_python_catches(tmp_path):
+    """A crash that unwinds through Python (unlike a hard process kill) still runs
+    `CheckpointStore.release_lock` from the `finally` wrapping the whole call, so a graceful
+    failure cleans up its own lock exactly like a graceful success does. The checkpoint itself is
+    untouched — it is still there for the next resume — only the liveness marker goes; see
+    `release_lock`'s docstring for why that is the right trade rather than leaving a lock file that
+    would misleadingly read as "confirmed dead" for a run that may only be retrying.
+    """
+    from h3_48gb.checkpoint import CheckpointStore
+
+    path = tmp_path / "crash.safetensors"
+    store = CheckpointStore(path)
+    try:
+        run(ToyPipeline(fail_at=3), checkpoint_path=path)
+        raise AssertionError("expected a crash")
+    except Interrupt:
+        pass
+
+    assert path.exists(), "the checkpoint should survive a crash, for the next resume"
+    assert not store.lock_path.exists(), "a Python-level crash must still release and remove the lock"
+
+
 def test_session_timing_is_not_part_of_the_identity():
     """A run resumed tomorrow must still match the checkpoint it wrote today.
 

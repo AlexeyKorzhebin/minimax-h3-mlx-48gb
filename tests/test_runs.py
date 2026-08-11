@@ -4,6 +4,8 @@ The fixtures write safetensors files by hand -- an 8-byte little-endian header l
 JSON header, then nothing. That is a valid safetensors file with no tensors, and it is all `scan`
 reads, which is the point: a run's progress must be knowable without loading 21 GB of weights.
 """
+import contextlib
+import fcntl
 import json
 import struct
 from pathlib import Path
@@ -28,6 +30,46 @@ def write_checkpoint(path: Path, *, completed: int, total: int, written_at: str,
     header = json.dumps({"__metadata__": {"h3_checkpoint": json.dumps(meta)}}).encode()
     path.write_bytes(struct.pack("<Q", len(header)) + header)
     return path
+
+
+def lock_path_for(checkpoint: Path) -> Path:
+    """Where a writer's companion flock file lives, mirroring `checkpoint.CheckpointStore.lock_path`
+    -- the two are never allowed to import each other (`checkpoint.py` needs `mlx`; `runs.py`
+    cannot), so this is the naming convention duplicated on the test side to drive `runs._writer_alive`
+    directly, the same way `runs.scan` derives it from a bare checkpoint path.
+    """
+    return checkpoint.with_name(checkpoint.name + ".lock")
+
+
+def write_free_lock_file(checkpoint: Path) -> Path:
+    """A companion lock file nobody currently holds.
+
+    This is what a writer that crashed hard looks like from the outside: the file is still there,
+    but `fcntl.flock` released whatever it held the instant the crashed process's file descriptor
+    closed -- the kernel does that unconditionally, which is the entire mechanism `_writer_alive`
+    leans on. No process needs to actually crash to produce this state; an untouched fresh file is
+    indistinguishable from one a dead writer left behind, which is the point.
+    """
+    path = lock_path_for(checkpoint)
+    path.touch()
+    return path
+
+
+@contextlib.contextmanager
+def held_lock(checkpoint: Path):
+    """A companion lock file with a live shared flock on it, for the lifetime of the `with` block.
+
+    What a running writer looks like from the outside -- see `checkpoint.CheckpointStore.acquire_lock`
+    for the real thing this stands in for.
+    """
+    path = lock_path_for(checkpoint)
+    handle = open(path, "wb")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+    try:
+        yield path
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def test_a_checkpoint_is_read_into_a_run(tmp_path):
@@ -164,35 +206,48 @@ def test_a_non_object_header_does_not_hide_its_neighbours(tmp_path):
     assert runs["run-good"].completed == 1, "a non-object header neighbour swallowed a good run"
 
 
-def test_freshness_decides_in_flight_on_both_sides(tmp_path, monkeypatch):
-    """Pinning only one side passes with any threshold at all.
+def test_a_held_lock_reads_in_flight_no_matter_how_old_the_checkpoint_is(tmp_path, monkeypatch):
+    """Liveness is the lock, full stop -- not age, not rate, not any threshold built from either.
 
-    The window is 3 * seconds_per_forward + 120: three forwards absorbs one slow step, and the two
-    minutes absorb loading and decoding, during which nothing is written.
+    A real forward can run up to half an hour, and a checkpoint can go quiet for a VAE decode on
+    top of that; no fixed window distinguishes a live run sitting on a slow step from an abandoned
+    one without guessing. `_now` is pinned absurdly far in the future here specifically to prove
+    the state ignores it: the old window-based `_state_of` would have called this run `stale` (or
+    even `unknown`) at this age. The lock does not need to guess.
     """
     import h3_48gb.runs as runs_mod
 
-    # rate 600 s/forward -> window 1920 s
-    write_checkpoint(tmp_path / "fresh" / "checkpoints" / "h3-a.safetensors",
-                     completed=2, total=7, started_at="2026-08-10T21:00:00",
-                     completed_at_start=0, written_at="2026-08-10T21:20:00")
-    write_checkpoint(tmp_path / "stale" / "checkpoints" / "h3-b.safetensors",
+    checkpoint = write_checkpoint(tmp_path / "old-but-alive" / "checkpoints" / "h3-a.safetensors",
                      completed=2, total=7, started_at="2026-08-10T21:00:00",
                      completed_at_start=0, written_at="2026-08-10T21:20:00")
 
-    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T21:51:00"))  # 1860 s later
-    assert {r.outdir.name: r.state for r in scan(tmp_path)}["fresh"] == "in_flight"
+    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-11T21:20:00"))  # 24 h later
 
-    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T21:53:00"))  # 1980 s later
-    assert {r.outdir.name: r.state for r in scan(tmp_path)}["stale"] == "stale"
+    with held_lock(checkpoint):
+        assert {r.outdir.name: r.state for r in scan(tmp_path)}["old-but-alive"] == "in_flight"
 
 
-def test_unknown_rate_does_not_call_a_live_run_stale(tmp_path, monkeypatch):
-    """A checkpoint with no `started_at` (written by code predating task 2 -- every checkpoint on
-    the real machine, right now) has an unknowable rate. `rate or 0` used to fold that into "assume
-    instant", shrinking the window to the bare 120 s grace and calling a run stale after ~1000 s of
-    silence between forwards that each take ~600 s. That risks the owner killing an actually-live
-    multi-hour run. The honest answer is `unknown`, not a guess in either direction.
+def test_an_unlocked_lock_file_reads_stale_no_matter_how_fresh_the_checkpoint_is(tmp_path, monkeypatch):
+    """The mirror image: a checkpoint written a second ago whose writer is already confirmed gone
+    (lock file present, nothing holding it) is `stale`, not `in_flight` just because it is young.
+    """
+    import h3_48gb.runs as runs_mod
+
+    checkpoint = write_checkpoint(tmp_path / "fresh-but-dead" / "checkpoints" / "h3-a.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:20:00")
+    write_free_lock_file(checkpoint)
+
+    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T21:20:01"))  # 1 s later
+
+    assert {r.outdir.name: r.state for r in scan(tmp_path)}["fresh-but-dead"] == "stale"
+
+
+def test_no_lock_file_at_all_reads_unknown_regardless_of_rate(tmp_path, monkeypatch):
+    """A checkpoint with no companion lock file -- an old-format file predating this feature, or a
+    writer that already cleaned up after a graceful exit -- has nothing to say about its writer.
+    `unknown` must not depend on whether `started_at`/rate happen to be present either: liveness is
+    the lock alone.
     """
     import h3_48gb.runs as runs_mod
 
@@ -208,7 +263,24 @@ def test_unknown_rate_does_not_call_a_live_run_stale(tmp_path, monkeypatch):
     runs = {r.outdir.name: r for r in scan(tmp_path)}
 
     assert runs["old-format"].state == "unknown"
-    assert runs["healthy"].completed == 2, "an unknown-rate neighbour must not hide a healthy run"
+    assert runs["healthy"].state == "unknown"  # no lock file for this one either
+    assert runs["healthy"].completed == 2, "an unknown neighbour must not hide a healthy run"
+
+
+def test_a_missing_written_at_reads_exactly_unknown_without_a_lock_file(tmp_path):
+    """Pins task 3's fix precisely: a checkpoint missing `written_at` (the field the old writer set
+    unconditionally, and the old `_state_of` treated as "not from this fork, so it must be dead")
+    must read as `unknown`, not merely "some non-`in_flight` value" -- a test that only asserted
+    `!= "in_flight"` would keep passing if this regressed to `"stale"`, which is exactly the
+    overclaim task 3 exists to remove: nothing here proves the writer is gone, only that there is
+    no lock file to check.
+    """
+    checkpoint = write_checkpoint(tmp_path / "no-written-at" / "checkpoints" / "h3-a.safetensors",
+                                  completed=2, total=7, written_at=None)
+
+    assert not lock_path_for(checkpoint).exists()
+    run = scan(tmp_path)[0]
+    assert run.state == "unknown"
 
 
 def test_a_bad_started_at_does_not_hide_its_neighbours(tmp_path):
