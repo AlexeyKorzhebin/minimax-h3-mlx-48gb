@@ -30,6 +30,18 @@ _META_KEY = "h3_checkpoint"
 _STALE_GRACE_SECONDS = 120
 _STALE_FORWARD_MULTIPLE = 3
 
+#: Absolute ceiling for `_state_of`'s `rate is None` branch, where `started_at` is missing and so
+#: there is no measured rate to build a `_STALE_FORWARD_MULTIPLE * rate` window from. A forward at
+#: native resolution runs up to ~30 minutes (see the timing figures in `checkpoint.py`'s module
+#: docstring), and a checkpoint can go quiet for a VAE decode on top of that before the next write.
+#: Four hours clears both several times over, so a live run sitting on a slow step is never
+#: declared dead just because its checkpoint predates `started_at` -- but it is still finite, so
+#: `h3 watch` on a checkpoint that is actually abandoned terminates instead of polling it forever.
+#: (Without this, "unknown" from a missing `started_at` was itself an unbounded window: every
+#: checkpoint on the machine at the time this was written lacks `started_at`, which made `watch`
+#: unable to end on any of them, ever.)
+_UNKNOWN_MAX_AGE_SECONDS = 4 * 3600
+
 
 def _parse(stamp: str) -> datetime:
     return datetime.fromisoformat(stamp)
@@ -134,9 +146,19 @@ def _state_of(run: Run) -> str:
     """
     age, rate = run.age_seconds, run.seconds_per_forward
     if age is None:
-        return "in_flight"
+        # No `written_at` at all -- unlike `started_at` (added later for the session-rate
+        # feature, and `None` on every checkpoint written before it), `written_at` has been set
+        # on *every* call to `_write` since the checkpoint format was created; there is no path
+        # in this fork that produces a checkpoint without one. So this is not "can't tell": a
+        # file missing it is not a live checkpoint from current code, and calling it anything
+        # that keeps `watch` polling would wait forever for a field nothing will ever supply.
+        return "stale"
     if rate is None:
-        return "unknown"
+        # No rate -- only `started_at` is missing, which by itself might still mean "alive" (see
+        # the docstring above). Without the ceiling below, though, that "might" never resolves:
+        # `watch` would poll such a checkpoint forever. See `_UNKNOWN_MAX_AGE_SECONDS` for why
+        # four hours is the cutoff.
+        return "unknown" if age < _UNKNOWN_MAX_AGE_SECONDS else "stale"
     window = _STALE_FORWARD_MULTIPLE * rate + _STALE_GRACE_SECONDS
     return "in_flight" if age < window else "stale"
 

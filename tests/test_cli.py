@@ -489,14 +489,24 @@ def test_watch_exits_when_nothing_is_running(tmp_path, capsys):
 
 
 def test_watch_continues_polling_on_unknown_state(tmp_path, monkeypatch):
-    """watch loops while unknown state is present; sleeps prove it, not just format_status."""
+    """watch loops while unknown state is present; sleeps prove it, not just format_status.
+
+    `_now` is pinned well inside `runs._UNKNOWN_MAX_AGE_SECONDS` of `written_at` -- past that
+    ceiling an unknown-rate checkpoint this old reads as `stale` instead (see
+    `test_watch_terminates_on_an_old_unknown_run_past_the_ceiling`), and this test would stop
+    exercising the "still might be alive" branch it is named for.
+    """
     import time
+    import h3_48gb.runs as runs_mod
+    from h3_48gb.runs import _parse
     from tests.test_runs import write_checkpoint
     from h3_48gb.cli import run_watch
 
     run_dir = tmp_path / "r"
     write_checkpoint(run_dir / "checkpoints" / "h3-a.safetensors",
                      completed=3, total=7, written_at="2026-08-10T21:00:00")
+
+    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T21:16:40"))  # 1000 s later
 
     sleep_calls = []
 
@@ -516,6 +526,91 @@ def test_watch_continues_polling_on_unknown_state(tmp_path, monkeypatch):
     assert len(sleep_calls) >= 1, "watch must sleep before checking for more runs"
     # Proof that status was checked more than once: the final iteration sees empty dir
     assert len(report["runs"]) == 0, "run_watch must have iterated again after the unknown run vanished"
+
+
+def _sleep_stub_that_must_not_be_called(monkeypatch):
+    """Install a `time.sleep` that fails the test instead of hanging it.
+
+    Every test below expects `run_watch` to return on its *first* pass through the loop -- no
+    running states left, so no reason to sleep. If a regression puts the run back into a state
+    `run_watch` treats as still-running, the naive failure mode is an infinite loop with a fixed
+    `_now` (nothing ever changes state between iterations), which would hang the whole suite. This
+    stub turns that into an immediate, readable assertion failure instead.
+    """
+    import time
+
+    def stub_sleep(duration: float) -> None:
+        raise AssertionError(
+            f"run_watch slept ({duration}s) instead of terminating on the first pass -- a run "
+            "that should have read as finished is still being treated as running")
+
+    monkeypatch.setattr(time, "sleep", stub_sleep)
+
+
+def test_watch_terminates_on_an_old_unknown_run_past_the_ceiling(tmp_path, monkeypatch):
+    """A checkpoint with no `started_at` and a last write far older than
+    `runs._UNKNOWN_MAX_AGE_SECONDS` must read as `stale`, not `unknown` forever -- otherwise
+    `watch` can never end on it, which today is *every* checkpoint on the machine (none of them
+    have `started_at` yet).
+    """
+    from datetime import timedelta
+    import h3_48gb.runs as runs_mod
+    from h3_48gb.runs import _parse, _UNKNOWN_MAX_AGE_SECONDS
+    from tests.test_runs import write_checkpoint
+    from h3_48gb.cli import run_watch
+
+    write_checkpoint(tmp_path / "old" / "checkpoints" / "h3-a.safetensors",
+                     completed=8, total=19, started_at=None, written_at="2026-08-10T10:00:00")
+
+    # One second past the ceiling: still "old", nowhere near a real 30-minute forward's slack.
+    later = _parse("2026-08-10T10:00:00") + timedelta(seconds=_UNKNOWN_MAX_AGE_SECONDS + 1)
+    monkeypatch.setattr(runs_mod, "_now", lambda: later)
+
+    _sleep_stub_that_must_not_be_called(monkeypatch)
+
+    report = run_watch(tmp_path, interval=0.1)
+    assert report["runs"][0]["state"] == "stale"
+
+
+def test_watch_terminates_on_a_stale_run(tmp_path, monkeypatch):
+    """The base case: a single ordinary (known-rate) `stale` run must not keep `watch` polling.
+
+    This is the test that must fail if `stale` is ever added to `WATCH_RUNNING_STATES` -- verified
+    by hand while fixing C2: adding it back in makes this test hang without the sleep guard, and
+    fail immediately with it.
+    """
+    import h3_48gb.runs as runs_mod
+    from h3_48gb.runs import _parse
+    from tests.test_runs import write_checkpoint
+    from h3_48gb.cli import run_watch
+
+    write_checkpoint(tmp_path / "dead" / "checkpoints" / "h3-a.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:20:00")
+
+    # rate 1200 s/forward -> window 3720 s; well past it.
+    monkeypatch.setattr(runs_mod, "_now", lambda: _parse("2026-08-10T23:00:00"))
+
+    _sleep_stub_that_must_not_be_called(monkeypatch)
+
+    report = run_watch(tmp_path, interval=0.1)
+    assert report["runs"][0]["state"] == "stale"
+
+
+def test_watch_terminates_when_written_at_is_missing(tmp_path, monkeypatch):
+    """A checkpoint with no `written_at` at all must not read as an eternal `in_flight` -- there is
+    no code path that ever supplies the missing field, so nothing would ever end the watch.
+    """
+    from tests.test_runs import write_checkpoint
+    from h3_48gb.cli import run_watch
+
+    write_checkpoint(tmp_path / "no-written-at" / "checkpoints" / "h3-a.safetensors",
+                     completed=2, total=7, written_at=None)
+
+    _sleep_stub_that_must_not_be_called(monkeypatch)
+
+    report = run_watch(tmp_path, interval=0.1)
+    assert report["runs"][0]["state"] != "in_flight"
 
 
 # -- resume ------------------------------------------------------------------------------------
