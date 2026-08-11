@@ -686,16 +686,53 @@ def test_the_scheduler_stays_a_real_scheduler():
     assert scheduler.shift == 12.0
 
 
+def _read_checkpoint_meta(path: Path) -> dict:
+    """Parse the safetensors JSON header by hand, the way `runs.scan` and an operator's `head` do."""
+    with open(path, "rb") as fh:
+        length = int.from_bytes(fh.read(8), "little")
+        header = json.loads(fh.read(length))
+    return json.loads(header["__metadata__"]["h3_checkpoint"])
+
+
 def test_metadata_is_readable_without_mlx(tmp_path):
     """The identity lives in the safetensors JSON header, so an operator can inspect it with `head`."""
     path = tmp_path / "meta.safetensors"
     run(ToyPipeline(), checkpoint_path=path, keep_checkpoint=True)
-    with open(path, "rb") as fh:
-        length = int.from_bytes(fh.read(8), "little")
-        header = json.loads(fh.read(length))
-    meta = json.loads(header["__metadata__"]["h3_checkpoint"])
+    meta = _read_checkpoint_meta(path)
     assert meta["identity"]["request"]["seed"] == SEED
     assert meta["completed_steps"] == STEPS - 1
+    # `h3_48gb.runs.scan` reads a live run's speed from these two fields without importing MLX —
+    # `test_a_resumed_run_rates_only_this_session` in test_runs.py depends on both being present
+    # and correct on a real, written-by-the-pipeline checkpoint, not just on a hand-built dict.
+    assert meta["started_at"] is not None
+    assert meta["completed_at_start"] == 0
+
+
+def test_resumed_checkpoint_records_previous_session_progress(tmp_path):
+    """A resume must record how many forwards the *previous* session already paid for.
+
+    `runs.seconds_per_forward` divides this session's elapsed wall time by
+    `completed_steps - completed_at_start` — the forwards *this* session actually did. If a
+    resumed run wrote `completed_at_start=0` instead of the forward count at load time, a run
+    resumed at step 4 of 8 that then does one more forward would look like it did all 5 in this
+    session, reporting a rate and an ETA several times too optimistic.
+    """
+    path = tmp_path / "resume.safetensors"
+    try:
+        run(ToyPipeline(fail_at=4), checkpoint_path=path)
+        raise AssertionError("expected a crash")
+    except Interrupt:
+        pass
+
+    before_resume = _read_checkpoint_meta(path)
+    assert before_resume["completed_steps"] == 4
+    assert before_resume["completed_at_start"] == 0, "the first session started at forward 0"
+
+    run(ToyPipeline(), checkpoint_path=path, keep_checkpoint=True)
+    after_resume = _read_checkpoint_meta(path)
+    assert after_resume["completed_steps"] == STEPS - 1
+    assert after_resume["completed_at_start"] == 4, (
+        "a resumed session must record the forwards already done when it began, not zero")
 
 
 def test_session_timing_is_not_part_of_the_identity():
