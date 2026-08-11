@@ -444,6 +444,23 @@ def test_format_status_does_not_crash_when_total_is_unknown():
     assert "None" not in human
 
 
+def test_format_status_reports_correct_eta_minutes():
+    """Regression: dividing `eta_seconds` by 3600 instead of 60 would show 0 minutes for short ETAs.
+    This test ensures the value shown is correct, not just its presence."""
+    from h3_48gb.cli import format_status
+
+    report = {
+        "ok": True, "outdir": "/x",
+        "runs": [{
+            "outdir": "/x/r", "state": "in_flight", "completed": 3, "total": 7,
+            "fraction": 3 / 7, "seconds_per_forward": 120.0, "eta_seconds": 480.0,
+        }],
+    }
+    human = format_status(report)
+    # 480 seconds / 60 = 8 minutes
+    assert "осталось 8 мин" in human
+
+
 def test_status_survives_a_checkpoint_with_a_zero_total(tmp_path):
     """End-to-end: `total_forwards: 0` reaches `scan` as `total=None` (see `runs.py`'s `... or
     None`), while the rate can still be known -- exactly the shape `format_status` must not choke
@@ -1422,6 +1439,11 @@ def test_error_codes_are_documented_in_one_place():
     to `checkpoint_locked` when it was added to the `except` handler in `run_generate` but not
     here. `CliError.__init__` already asserts membership, but only for whichever branch a given
     test happens to exercise; this test needs none of them to run.
+
+    Limitations: this regex-based scan catches only double-quoted string literals. It will miss
+    single-quoted strings, error codes passed via variables, or calls in other files; a true proof
+    would require AST-based scanning or runtime monitoring. Treat as a convention guard, not a
+    completeness proof.
     """
     import inspect
     import re

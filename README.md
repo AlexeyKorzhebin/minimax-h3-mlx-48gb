@@ -176,7 +176,8 @@ with `ModuleNotFoundError: No module named 'mlx_vlm'`.
 `h3 resume` continues an interrupted run from its checkpoint rather than restarting it; `h3 list`
 lists finished runs under `--outdir`; `h3 status` reports what is running under an outdir and how
 far along it is; `h3 watch` redraws that same status until nothing is running. Every subcommand
-accepts `--json` for a machine-readable report instead of human-readable text.
+except `watch` accepts `--json` for a machine-readable report instead of human-readable text
+(the command prints incrementally, and `--json` requires exactly one document on stdout).
 
 Checkpointing is on by default and costs one small file per step. `--checkpoint-dir` moves it,
 `--no-checkpoint` turns it off, and `--restart` ignores whatever is on disk and starts from step 0
@@ -191,10 +192,12 @@ kernel-enforced exclusion primitive on a local disk, but on network filesystems 
 cloud-sync mounts) it is not: depending on protocol version and mount options, a lock one client
 takes may exclude only other processes on that same client, not a second machine writing the same
 path at all. Put a checkpoint directory on one of those and both halves of this feature degrade at
-once — not just the diagnostic: a second real writer can believe it acquired the lock when it did
-not and race the first to `os.replace` the same checkpoint file, which is precisely the corruption
-`acquire_lock`'s exclusivity exists to rule out, while `status`/`watch`, probing that same
-unreliable lock, keep reporting `unknown` or a stale `in_flight` instead of ever catching it. Keep
+once: a second real writer will believe it acquired an exclusive lock when it did not, write its
+checkpoint atomically (via temporary file, `fsync`, and `os.replace`), yet the first writer's
+earlier state survives on the filesystem. The last write wins, and progress rolls backward — a
+second process starting from a checkpoint older than what the first writer's latest run reached
+will overwrite it with earlier state. Meanwhile, `status`/`watch` probing that same unreliable lock
+keep reporting `unknown` or stale `in_flight` instead of detecting the corruption. Keep
 `--checkpoint-dir` (and `--outdir`, for the in-progress lock files `watch` also reads) on a
 genuinely local filesystem.
 
