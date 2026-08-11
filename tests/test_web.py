@@ -2823,3 +2823,41 @@ def test_a_route_must_say_which_body_fields_it_takes():
     handler = web._Handler.__new__(web._Handler)
     with pytest.raises(TypeError):
         web._Handler._json_request(handler)
+
+
+def test_two_sec_fetch_site_headers_are_refused_as_well(queue_server):
+    """Found by a mutation that came back green: the duplicate-header rule was tested on `Origin`
+    and on `Host` and not on the third header that uses it, so changing what that path answers
+    changed nothing any test could see.
+    """
+    raw = (f"POST /api/estimate HTTP/1.1\r\n"
+           f"Host: {web.LOOPBACK}:{queue_server.port}\r\n"
+           f"Sec-Fetch-Site: same-origin\r\n"
+           f"Sec-Fetch-Site: cross-site\r\n"
+           f"Content-Type: application/json\r\nContent-Length: {len(_ESTIMATE_BODY)}\r\n"
+           f"Connection: close\r\n\r\n").encode() + _ESTIMATE_BODY
+    status, answer = _raw_exchange(queue_server, raw)
+    assert status == 403, answer
+    assert answer["error"]["code"] == "origin_not_allowed", answer
+    assert answer["error"]["detail"]["header"] == "Sec-Fetch-Site"
+    assert answer["error"]["detail"]["count"] == 2
+
+
+@pytest.mark.parametrize("method,url,body,unknown", [
+    ("PUT", "/api/prompts/new.txt", {"text": "сохрани", "prompt_source": "prompts/x.txt"},
+     "prompt_source"),
+    ("PUT", "/api/prompts/new.txt", {"text": "сохрани", "note": "заодно"}, "note"),
+    ("POST", "/api/estimate", {"args": ["generate", "кот"], "note": "заодно"}, "note"),
+])
+def test_every_body_route_refuses_a_field_it_does_not_take(queue_server, method, url, body,
+                                                            unknown):
+    """Also found by a green mutation: widening the prompt route's allowlist changed nothing,
+    because the only test touching that route sent a body that failed the *next* check anyway.
+    A rule that holds on one route out of three is not a rule.
+    """
+    status, answer = _call(queue_server, method, url, body)
+    assert status == 400, answer
+    assert answer["error"]["code"] == "args_invalid", answer
+    assert answer["error"]["detail"]["unknown"] == [unknown]
+    assert not (queue_server.repo / "prompts" / "new.txt").exists(), (
+        "the refusal happened after the write")
