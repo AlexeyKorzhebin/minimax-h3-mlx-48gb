@@ -627,10 +627,28 @@ def test_media_serves_only_clips_and_frames(server, name, suffix):
     run = server.outdir / "19-real-run"
     run.mkdir(exist_ok=True)
     (run / name).write_bytes(b"x")
-    status, body = _json(server, f"/media/19-real-run/{name}")
-    assert status == 400, f"{name} answered {status}"
+    # `_request`, not `_json`: a `.json` file served by mistake comes back *as* JSON, so decoding
+    # first turns "the file leaked" into an unreadable decode error instead of a status mismatch.
+    status, _, raw = _request(server, f"/media/19-real-run/{name}")
+    assert status == 400, f"{name} answered {status} with {raw[:40]!r}"
+    body = json.loads(raw)
     assert body["error"]["code"] == "media_type_not_allowed"
     assert body["error"]["detail"]["suffix"] == suffix
+
+
+@pytest.mark.parametrize("name", ["absent.json", "absent.log", "absent.safetensors"])
+def test_a_forbidden_type_is_refused_before_anyone_looks_for_it(server, name):
+    """The refusal must not double as an existence oracle: the extension is checked *before*
+    `is_file`, so a caller cannot tell `queue/logs/real.log` from `queue/logs/guess.log` by whether
+    the answer is `media_type_not_allowed` or `not_found`. Ordering is invisible in the code and
+    only this test pins it.
+    """
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    assert not (run / name).exists()
+    status, body = _json(server, f"/media/19-real-run/{name}")
+    assert status == 400 and body["error"]["code"] == "media_type_not_allowed", (
+        "a missing file answered differently from a present one, which is an oracle")
 
 
 @pytest.mark.parametrize("name", ["clip.mp4", "frame.jpg", "frame.jpeg", "frame.png", "sound.wav",
