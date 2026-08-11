@@ -252,11 +252,15 @@ def prompt_path(root, job_id: str) -> Path:
     return Path(root) / "prompts" / f"{job_id}.txt"
 
 
-def _stem_taken(root: Path, output_stem: str) -> bool:
+def _stem_taken(root: Path, output_stem: str, exclude_id: str | None = None) -> bool:
     """Whether `output_stem` is already claimed -- by a leftover artifact on disk, in any of
     `ARTIFACT_SUFFIXES` (not just `.mp4`: a stale `.wav` or `.json` is just as taken), or by a job
     already sitting in `pending/` or `running/`. A job file that cannot be parsed is skipped here,
     not reported: `scan` is the place that surfaces broken files, and a stem check is not a scan.
+
+    `exclude_id`, used only by `update`, skips the job being edited itself: otherwise a job could
+    never be re-submitted with the exact same `output_stem` it already holds, which is the common
+    case (editing a prompt or a seed without renaming the output).
     """
     for suffix in ARTIFACT_SUFFIXES:
         if Path(f"{output_stem}{suffix}").exists():
@@ -266,6 +270,8 @@ def _stem_taken(root: Path, output_stem: str) -> bool:
         if not directory.is_dir():
             continue
         for file in directory.glob("*.json"):
+            if exclude_id is not None and file.stem == exclude_id:
+                continue
             try:
                 data = json.loads(file.read_text(encoding="utf-8"))
             except (OSError, ValueError):
@@ -400,3 +406,215 @@ def scan(root) -> tuple[list[Job], list[Broken]]:
                     broken.append(Broken(path=str(file), error=f"{type(exc).__name__}: {exc}"))
 
     return jobs, broken
+
+
+def _max_pending_priority(root: Path) -> int:
+    """The highest `priority` among jobs currently in `pending/`, or 0 if none parse or none
+    exist. `move_to_front` adds one to this so the job it touches outranks everything already
+    waiting. Broken files are skipped the same way `_stem_taken` skips them -- surfacing them is
+    `scan`'s job, not this one's.
+    """
+    best = 0
+    directory = Path(root) / "pending"
+    if not directory.is_dir():
+        return best
+    for file in directory.glob("*.json"):
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        priority = data.get("priority", 0)
+        if isinstance(priority, int) and priority > best:
+            best = priority
+    return best
+
+
+def claim(root, now=None) -> Job | None:
+    """Take the job `pending/` would list first -- lowest `(-priority, id)`, i.e. highest
+    priority, oldest id among ties -- move it into `running/`, and stamp `started_at`. Returns
+    `None` if nothing in `pending/` parses into a candidate.
+
+    Deciding which job to take and moving it are one exclusive lock acquisition: nothing else can
+    observe `pending/` in between, so -- unlike `update` (see its docstring for why that one is
+    different) -- there is no window here for anything to race, and no second acquisition is
+    needed to check for one.
+
+    A job file that fails to parse is skipped, not raised: one broken file must not jam every
+    valid job queued behind it. `scan` is what reports broken files; this is not `scan`.
+    """
+    root = Path(root)
+    layout(root)
+    with queue_lock(root, exclusive=True):
+        directory = root / "pending"
+        candidates: list[tuple[Path, dict]] = []
+        for file in directory.glob("*.json"):
+            try:
+                data = json.loads(file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            candidates.append((file, data))
+        if not candidates:
+            return None
+
+        def sort_key(item: tuple[Path, dict]) -> tuple[int, str]:
+            _, data = item
+            priority = data.get("priority", 0)
+            priority = priority if isinstance(priority, int) else 0
+            return (-priority, str(data.get("id", "")))
+
+        candidates.sort(key=sort_key)
+        file, data = candidates[0]
+        job_id = data["id"]
+        data["started_at"] = now() if now is not None else _now()
+        write_json_durably(job_path(root, job_id, "running"), data)
+        file.unlink()
+
+    data["state"] = "running"
+    return Job(**data)
+
+
+def finish(root, job_id: str, exit_code: int, log_tail: str, finished_at=None) -> Job:
+    """Move a job out of `running/` into `done/` (exit code 0) or `failed/` (anything else),
+    stamping `finished_at`, `exit_code` and `log_tail`.
+
+    `finished_at` is a parameter, not always `_now()`: startup reconciliation (a later task)
+    restores it from the result marker `queue/results/<id>.json`, written when the run actually
+    exited, not from whenever reconciliation happens to run afterward.
+
+    Raises the module's base `QueueError` if the job is not in `running/` -- this is not the
+    `pending/`-only `JobNotPending` restriction `update`/`move_to_front`/`cancel` share, because
+    `finish` is only ever called by the worker immediately after the process it started exits, on
+    the job id it itself just claimed; a caller here has a real bug, and a bare `KeyError`/
+    `FileNotFoundError` leaking out would be indistinguishable from one to code matching on
+    `QueueError`.
+    """
+    root = Path(root)
+    layout(root)
+    with queue_lock(root, exclusive=True):
+        running = job_path(root, job_id, "running")
+        if not running.exists():
+            raise QueueError(f"job {job_id} is not running")
+        data = json.loads(running.read_text(encoding="utf-8"))
+        data["finished_at"] = finished_at if finished_at is not None else _now()
+        data["exit_code"] = exit_code
+        data["log_tail"] = log_tail
+        new_state = "done" if exit_code == 0 else "failed"
+        write_json_durably(job_path(root, job_id, new_state), data)
+        running.unlink()
+
+    data["state"] = new_state
+    return Job(**data)
+
+
+def update(root, job_id: str, args: list[str], note: str, dry_run_report: dict, estimate: dict,
+           prompt_source: str | None = None, prompt_text: str | None = None) -> Job:
+    """Replace a pending job's `args`, `note`, `estimate` and, if `prompt_text` is given, its
+    prompt snapshot -- in place, at the same `pending/<id>.json` path. `id`, `created_at` and
+    `priority` survive untouched: the log, the lease and the queue position `move_to_front` may
+    have just set all hang off `id`, and a fresh one would orphan them. Without `prompt_text`, the
+    existing snapshot and `prompt_source`/`prompt_sha256` are left exactly as they were, mirroring
+    `submit`. `output_stem` collision is checked the same way `submit` checks it, excluding this
+    job's own current entry (see `_stem_taken`'s `exclude_id`) -- otherwise a job could never be
+    re-submitted unchanged.
+
+    **Why this is two lock acquisitions, not one, unlike every other mutator here.** The first
+    acquisition only validates (still pending? does the new `output_stem` collide with anything
+    else?) and is as cheap as `claim`/`finish`/`move_to_front`/`cancel`'s single acquisition. But
+    the commit -- `write_json_durably` recreating `pending/<id>.json` with the new content, plus
+    the prompt snapshot rewrite when there is one -- cannot be nested inside that same acquisition:
+    `queue_lock`'s own docstring promises it is "held only on file operations, milliseconds, and
+    never on the time a run takes", and a worker calling `claim` is exactly the caller that must
+    never be made to wait on a page load's worth of I/O just because someone else's edit is mid
+    -write. So the commit runs unlocked, and a *second*, separate acquisition immediately verifies
+    what it produced: if the job now also exists anywhere other than `pending/`, `claim` (or
+    another mutator) won the race while the write was in flight, and the `pending/<id>.json` just
+    written is a stale duplicate of a job that has already moved on -- it is deleted and
+    `JobNotPending` is raised instead of handing back a `Job` that looks committed but never was.
+    See `test_update_racing_claim_leaves_one_state_and_consistent_content` for the test that forces
+    this exact interleaving deterministically rather than hoping to catch it.
+    """
+    root = Path(root)
+    layout(root)
+    output_stem = str(dry_run_report["output_stem"])
+    pending = job_path(root, job_id, "pending")
+
+    with queue_lock(root, exclusive=True):
+        if not pending.exists():
+            raise JobNotPending(f"job {job_id} is not pending")
+        current = _job_from_file(pending, "pending")
+        if _stem_taken(root, output_stem, exclude_id=job_id):
+            raise OutputStemConflict(f"output_stem already claimed: {output_stem}")
+
+    if prompt_text is not None:
+        if "--prompt-file" not in args or args.index("--prompt-file") + 1 >= len(args):
+            raise QueueError(
+                "prompt_text was given but args has no --prompt-file placeholder to repoint "
+                "at the snapshot"
+            )
+
+    args = list(args)
+    new_prompt_source = current.prompt_source
+    new_prompt_sha256 = current.prompt_sha256
+    if prompt_text is not None:
+        snapshot = prompt_path(root, job_id)
+        write_text_durably(snapshot, prompt_text)
+        new_prompt_source = prompt_source
+        new_prompt_sha256 = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+        args[args.index("--prompt-file") + 1] = str(snapshot)
+
+    job = Job(
+        id=current.id, state="pending", created_at=current.created_at, args=args, note=note,
+        prompt_source=new_prompt_source, prompt_sha256=new_prompt_sha256, output_stem=output_stem,
+        estimate=dict(estimate), priority=current.priority,
+        started_at=None, finished_at=None, exit_code=None, log_tail=None,
+    )
+    write_json_durably(pending, _job_file_payload(job))
+
+    with queue_lock(root, exclusive=True):
+        elsewhere = [s for s in QUEUE_STATES
+                     if s != "pending" and job_path(root, job_id, s).exists()]
+        if elsewhere:
+            pending.unlink(missing_ok=True)
+            raise JobNotPending(f"job {job_id} was claimed while being edited")
+
+    return job
+
+
+def move_to_front(root, job_id: str) -> Job:
+    """Set a pending job's `priority` to one more than the current maximum among pending jobs, so
+    it is claimed before everything already waiting -- the queue's own claim order is
+    `(-priority, id)` (see `claim`).
+
+    A single lock acquisition, unlike `update`: the rewrite here is a small, fixed-shape change to
+    a job already fully known on disk -- no argument parsing, no prompt snapshot, nothing supplied
+    by the caller that needs validating -- so there is no meaningfully slow step to keep out from
+    under the lock.
+    """
+    root = Path(root)
+    layout(root)
+    with queue_lock(root, exclusive=True):
+        pending = job_path(root, job_id, "pending")
+        if not pending.exists():
+            raise JobNotPending(f"job {job_id} is not pending")
+        current = _job_from_file(pending, "pending")
+        new_priority = _max_pending_priority(root) + 1
+        job = Job(**{**current.as_dict(), "priority": new_priority})
+        write_json_durably(pending, _job_file_payload(job))
+        return job
+
+
+def cancel(root, job_id: str) -> Job:
+    """Remove a pending job and its prompt snapshot, if it has one. Returns the removed `Job`
+    (still carrying `state="pending"`, what it was up to the moment it stopped existing) so a
+    caller can report what was cancelled.
+    """
+    root = Path(root)
+    layout(root)
+    with queue_lock(root, exclusive=True):
+        pending = job_path(root, job_id, "pending")
+        if not pending.exists():
+            raise JobNotPending(f"job {job_id} is not pending")
+        current = _job_from_file(pending, "pending")
+        pending.unlink()
+        prompt_path(root, job_id).unlink(missing_ok=True)
+        return current

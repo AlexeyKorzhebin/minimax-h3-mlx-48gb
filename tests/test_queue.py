@@ -36,6 +36,16 @@ def _stem(report: dict, new_stem: str) -> dict:
     return {**report, "output_stem": new_stem}
 
 
+def _try(fn):
+    """Call `fn`, returning either its result or the exception it raised. Used by tests that need
+    to inspect what a background thread produced without re-raising and killing the test process.
+    """
+    try:
+        return fn()
+    except BaseException as exc:  # noqa: BLE001 -- deliberately catches everything, see above
+        return exc
+
+
 # -- Step 1: layout and durable writes ---------------------------------------------------------
 
 
@@ -368,6 +378,299 @@ def test_scan_does_not_write_to_disk(tmp_path):
     jobs, broken = q.scan(root)
     assert jobs == [] and broken == []
     assert not root.exists(), "scan must not create the queue directory it was asked to read"
+
+
+# -- Step 1: every mutator takes the queue lock --------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["claim", "finish", "update", "move_to_front", "cancel"])
+def test_every_mutator_waits_for_the_queue_lock(tmp_path, name):
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    if name == "finish":
+        q.claim(root)
+    ops = {
+        "claim": lambda: q.claim(root),
+        "finish": lambda: q.finish(root, job.id, 0, "ok"),
+        "update": lambda: q.update(root, job.id, ["generate", "--tag", "a"], "", _DRY, {}),
+        "move_to_front": lambda: q.move_to_front(root, job.id),
+        "cancel": lambda: q.cancel(root, job.id),
+    }
+    finished = threading.Event()
+    with _external_lock(root, "LOCK_EX"):
+        threading.Thread(target=lambda: (ops[name](), finished.set()), daemon=True).start()
+        assert not finished.wait(0.5), f"{name} did not take the queue lock"
+    assert finished.wait(5), f"{name} never completed after the lock was released"
+
+
+# -- Step 3: claim order and finish ----------------------------------------------------------------
+
+
+def test_claim_takes_the_oldest_first_and_records_started_at(tmp_path):
+    root = tmp_path / "queue"
+    first = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {},
+                     now=lambda: "2026-08-11T13:00:00")
+    q.submit(root, ["generate", "--tag", "b"], "", _stem(_DRY, "/out/b"), {},
+             now=lambda: "2026-08-11T13:05:00")
+    taken = q.claim(root, now=lambda: "2026-08-11T14:00:00")
+    assert taken.id == first.id
+    assert taken.started_at == "2026-08-11T14:00:00"
+    assert taken.state == "running"
+    assert not q.job_path(root, first.id, "pending").exists()
+    assert q.job_path(root, first.id, "running").exists()
+
+
+def test_claim_returns_none_when_pending_is_empty(tmp_path):
+    root = tmp_path / "queue"
+    q.layout(root)
+    assert q.claim(root) is None
+
+
+def test_a_job_moved_to_the_front_is_claimed_before_older_ones(tmp_path):
+    root = tmp_path / "queue"
+    first = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {},
+                     now=lambda: "2026-08-11T13:00:00")
+    second = q.submit(root, ["generate", "--tag", "b"], "", _stem(_DRY, "/out/b"), {},
+                      now=lambda: "2026-08-11T13:05:00")
+    moved = q.move_to_front(root, second.id)
+    assert moved.priority == 1
+    taken = q.claim(root)
+    assert taken.id == second.id, "the job moved to the front must be claimed before the older one"
+    assert taken.priority == 1
+
+
+def test_finish_routes_by_exit_code_and_keeps_a_supplied_finished_at(tmp_path):
+    root = tmp_path / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    job = q.claim(root)
+    failed = q.finish(root, job.id, 137, "Killed", finished_at="2026-08-11T15:00:00")
+    assert failed.state == "failed" and failed.exit_code == 137
+    assert failed.finished_at == "2026-08-11T15:00:00"
+    assert failed.log_tail == "Killed"
+    assert not q.job_path(root, job.id, "running").exists()
+    assert q.job_path(root, job.id, "failed").exists()
+
+
+def test_finish_with_a_zero_exit_code_goes_to_done(tmp_path):
+    root = tmp_path / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    job = q.claim(root)
+    ok = q.finish(root, job.id, 0, "all good")
+    assert ok.state == "done" and ok.exit_code == 0
+    assert q.job_path(root, job.id, "done").exists()
+    assert not q.job_path(root, job.id, "running").exists()
+
+
+def test_finish_raises_a_queue_error_when_the_job_is_not_running(tmp_path):
+    """Not `JobNotPending` -- that exception is specifically for the three `pending/`-only
+    mutators. `finish` operates on `running/`, and this is a caller bug, not a normal refusal --
+    but it still must be a `QueueError`, never a bare `FileNotFoundError`/`KeyError`.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    with pytest.raises(q.QueueError):
+        q.finish(root, "no-such-job", 0, "")
+
+
+# -- Step 4: update and its boundaries -------------------------------------------------------------
+
+
+def test_update_replaces_content_and_keeps_identity(tmp_path):
+    """id, created_at and priority are references other things hang off: the log, the lease,
+    the snapshot, the queue order the user just set."""
+    root = tmp_path / "queue"
+    # NOTE: the brief's snippet for this test omits `--prompt-file` from `args`, which `submit`
+    # (task 1) requires whenever `prompt_text` is given -- see
+    # test_submit_refuses_prompt_text_without_a_prompt_file_placeholder. Added here; every other
+    # assertion is unchanged from the brief. `now=` is also pinned to a date nowhere near the real
+    # clock: without it, a mutation that has `update` overwrite `created_at` with a fresh `_now()`
+    # call can coincidentally match `job.created_at` (both land in the same real second, since
+    # `_now()` only has second resolution) and the identity assertion below would not catch it.
+    job = q.submit(root, ["generate", "--prompt-file", "p.txt", "--tag", "a"], "старая", _DRY,
+                   {"seconds": 60}, prompt_source="prompts/p.txt", prompt_text="one",
+                   now=lambda: "2020-01-01T00:00:00")
+    q.move_to_front(root, job.id)
+    edited = q.update(root, job.id, ["generate", "--prompt-file", "p.txt", "--tag", "a",
+                                      "--seed", "2"], "новая",
+                      _DRY, {"seconds": 90}, prompt_source="prompts/p.txt", prompt_text="two")
+    assert (edited.id, edited.created_at) == (job.id, job.created_at)
+    assert edited.priority == 1
+    assert edited.note == "новая" and edited.estimate == {"seconds": 90}
+    assert q.prompt_path(root, job.id).read_text() == "two"
+    assert edited.args[edited.args.index("--prompt-file") + 1] == str(q.prompt_path(root, job.id))
+
+
+def test_update_without_new_prompt_text_leaves_the_existing_snapshot_untouched(tmp_path):
+    """`update` mirrors `submit`: nothing under `prompts/` is touched unless `prompt_text` is
+    actually given -- an edit that only changes, say, `--seed` must not silently blank out the
+    prompt snapshot or its recorded hash.
+    """
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--prompt-file", "p.txt", "--tag", "a"], "", _DRY, {},
+                   prompt_source="prompts/p.txt", prompt_text="unchanged\n")
+    edited = q.update(root, job.id, ["generate", "--prompt-file", "p.txt", "--tag", "a",
+                                      "--seed", "9"], "", _DRY, {})
+    assert edited.prompt_source == job.prompt_source
+    assert edited.prompt_sha256 == job.prompt_sha256
+    assert q.prompt_path(root, job.id).read_text() == "unchanged\n"
+
+
+def test_update_refuses_a_stem_conflict_with_another_pending_job(tmp_path):
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    other = q.submit(root, ["generate", "--tag", "b"], "", _stem(_DRY, "/out/other"), {})
+    with pytest.raises(q.OutputStemConflict):
+        q.update(root, job.id, ["generate", "--tag", "a"], "", _stem(_DRY, "/out/other"), {})
+    # the collision check must not have touched the other job or corrupted this one
+    assert q.job_path(root, other.id, "pending").exists()
+    assert json.loads(q.job_path(root, job.id, "pending").read_text())["note"] == ""
+
+
+def test_editing_a_claimed_job_raises_and_leaves_running_untouched(tmp_path):
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    q.claim(root)
+    for call in (lambda: q.update(root, job.id, ["generate", "--tag", "a"], "", _DRY, {}),
+                 lambda: q.move_to_front(root, job.id),
+                 lambda: q.cancel(root, job.id)):
+        with pytest.raises(q.JobNotPending):
+            call()
+    assert q.job_path(root, job.id, "running").exists()
+    assert not q.job_path(root, job.id, "pending").exists()
+
+
+def test_cancel_removes_the_job_and_its_prompt_snapshot(tmp_path):
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--prompt-file", "p.txt", "--tag", "a"], "", _DRY, {},
+                   prompt_source="p.txt", prompt_text="hi\n")
+    cancelled = q.cancel(root, job.id)
+    assert cancelled.id == job.id
+    assert not q.job_path(root, job.id, "pending").exists()
+    assert not q.prompt_path(root, job.id).exists()
+    jobs, broken = q.scan(root)
+    assert jobs == [] and broken == [], "a cancelled job must leave no trace anywhere in the queue"
+
+
+def test_move_to_front_on_the_only_pending_job_still_raises_its_priority(tmp_path):
+    """`_max_pending_priority` must include the job being moved itself in the max it computes --
+    excluding it would let repeated `move_to_front` calls on a lone job leave its priority
+    unchanged (max of "everyone else" is 0 forever) instead of monotonically increasing.
+    """
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    first = q.move_to_front(root, job.id)
+    second = q.move_to_front(root, job.id)
+    assert first.priority == 1
+    assert second.priority == 2, "moving the same lone job to the front twice must keep raising it"
+
+
+# -- Step 6: update racing claim, forced deterministically -----------------------------------------
+
+
+def test_update_racing_claim_leaves_one_state_and_consistent_content(tmp_path, monkeypatch):
+    """Force the dangerous interleaving instead of hoping for it: `update` is paused after it
+    has read the job and before it writes it back, and the worker claims during the pause."""
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--tag", "a"], "старая", _DRY, {})
+
+    paused = threading.Event()
+    resume = threading.Event()
+    real_write = q.write_json_durably
+
+    def slow_write(path, payload):
+        if paused.is_set():
+            return real_write(path, payload)
+        paused.set()
+        assert resume.wait(5)
+        return real_write(path, payload)
+
+    monkeypatch.setattr(q, "write_json_durably", slow_write)
+    outcome: dict = {}
+    editor = threading.Thread(
+        target=lambda: outcome.update(
+            result=_try(lambda: q.update(root, job.id, ["generate", "--tag", "a"], "новая",
+                                         _DRY, {}))))
+    editor.start()
+    assert paused.wait(5)
+    claimed = _try(lambda: q.claim(root))
+    resume.set()
+    editor.join(10)
+
+    present = [s for s in q.QUEUE_STATES if q.job_path(root, job.id, s).exists()]
+    assert len(present) == 1, f"job exists in {present} at once"
+    if present == ["pending"]:
+        assert json.loads(q.job_path(root, job.id, "pending").read_text())["note"] == "новая", (
+            "update won the race but the file holds the old content")
+    else:
+        assert isinstance(outcome["result"], q.JobNotPending)
+    # Whichever side won, `claim` itself must not have raised or silently returned nothing when a
+    # job genuinely was there to take.
+    assert claimed is not None and not isinstance(claimed, BaseException)
+
+
+def test_update_first_lock_acquisition_blocks_before_any_write_is_attempted(tmp_path, monkeypatch):
+    """`update` takes the queue lock twice (see its docstring): once to validate, once -- after an
+    unlocked write -- to verify. The combined test above and the parametrized one in step 1 only
+    prove that *some* acquisition inside `update` blocks; held against a single, long external
+    lock, the second acquisition alone would make either test pass even if the first never took
+    the lock at all. This isolates the first: an external holder must block `update` before it
+    ever reaches its write, not just block it somewhere eventually because the second acquisition
+    happens to pick up the slack.
+    """
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    reached_write = threading.Event()
+    real_write = q.write_json_durably
+
+    def mark_and_write(path, payload):
+        reached_write.set()
+        return real_write(path, payload)
+
+    monkeypatch.setattr(q, "write_json_durably", mark_and_write)
+    with _external_lock(root, "LOCK_EX"):
+        threading.Thread(target=lambda: q.update(
+            root, job.id, ["generate", "--tag", "a"], "новая", _DRY, {}), daemon=True).start()
+        assert not reached_write.wait(0.5), (
+            "update reached its write before the external lock was released -- its first "
+            "(validating) lock acquisition did not wait")
+    assert reached_write.wait(5), "update never reached its write after the lock was released"
+
+
+def test_update_second_lock_acquisition_also_waits_for_the_queue_lock(tmp_path, monkeypatch):
+    """The other half of the isolation above: pause `update` right where the race test pauses it
+    (after its unlocked write is handed to `write_json_durably`), grab the queue lock externally
+    during that pause -- exactly where the post-write verification would need it -- and confirm
+    `update` does not finish until that external lock is released. Without this, the verification
+    that deletes a stale duplicate and raises `JobNotPending` (see `update`'s docstring) could run
+    concurrently with another mutator instead of after it.
+    """
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+
+    paused = threading.Event()
+    resume = threading.Event()
+    real_write = q.write_json_durably
+
+    def slow_write(path, payload):
+        if paused.is_set():
+            return real_write(path, payload)
+        paused.set()
+        assert resume.wait(5)
+        return real_write(path, payload)
+
+    monkeypatch.setattr(q, "write_json_durably", slow_write)
+    finished = threading.Event()
+    editor = threading.Thread(
+        target=lambda: (q.update(root, job.id, ["generate", "--tag", "a"], "новая", _DRY, {}),
+                        finished.set()))
+    editor.start()
+    assert paused.wait(5)
+    with _external_lock(root, "LOCK_EX"):
+        resume.set()
+        assert not finished.wait(0.5), (
+            "update's post-write verification did not wait for the queue lock")
+    assert finished.wait(5), "update never completed after the external lock was released"
+    editor.join(5)
 
 
 # -- Global constraint: queue.py must stay importable without MLX -------------------------------
