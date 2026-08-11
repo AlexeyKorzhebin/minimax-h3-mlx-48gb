@@ -774,6 +774,64 @@ def test_started_at_is_constant_across_every_write_in_one_session(tmp_path, monk
     ], "written_at must advance on every write, or the fixture cannot tell it apart from started_at"
 
 
+def test_written_at_is_stamped_after_the_step_is_materialized(tmp_path, monkeypatch):
+    """The clock must be read after the arrays are real, not while they are still a graph.
+
+    MLX is lazy. Until something forces it, `arrays` here is an unevaluated graph over the forward
+    pass that just "finished", and `mx.save_safetensors` is what forces it — so without an explicit
+    `mx.eval` the entire step executes *inside* the write, and a `written_at` taken beforehand
+    records when the step began.
+
+    Measured on the 15 s run of 2026-08-11, before the fix: the checkpoint file's mtime was
+    12:29:52 and the timestamp inside it read 12:11:46 — eighteen minutes early, one whole step.
+    `h3 status` divides `written_at - started_at` by the step count, so it announced "19 s per
+    forward, 2 minutes left" for a run doing 1086 s per forward with an hour and three quarters
+    left. Nothing raised; the number was merely wrong, which is the failure mode this whole
+    subcommand exists to avoid.
+
+    `test_started_at_is_constant_across_every_write_in_one_session` cannot catch this: it pins the
+    values a fake clock hands out, and a fake clock advances the same way whether it is read before
+    or after materialization. The ordering is the invariant, so the ordering is what is asserted.
+
+    Who calls `mx.eval` is part of the assertion, and deliberately so. The first version of this
+    test only required *some* eval immediately before each stamp, and passed with the fix reverted:
+    the pipeline's own per-step `mx.eval` in `__call__` lands there, one iteration late, and
+    satisfied the pattern without materializing anything the pending write depends on. The
+    invariant is not "an eval happened nearby" but "`_write` evaluated its own arrays before
+    reading the clock", so the frame that made the call is what is checked.
+    """
+    import sys
+
+    import h3_48gb.checkpoint as checkpoint_mod
+
+    order: list[tuple[str, str]] = []
+    real_eval = checkpoint_mod.mx.eval
+
+    def spy_eval(*args, **kwargs):
+        order.append(("eval", sys._getframe(1).f_code.co_name))
+        return real_eval(*args, **kwargs)
+
+    clock = iter(f"2026-08-10T21:00:{i:02d}" for i in range(60))
+
+    def spy_strftime(_fmt):
+        order.append(("stamp", sys._getframe(1).f_code.co_name))
+        return next(clock)
+
+    monkeypatch.setattr(checkpoint_mod.mx, "eval", spy_eval)
+    monkeypatch.setattr(checkpoint_mod.time, "strftime", spy_strftime)
+
+    run(ToyPipeline(), checkpoint_path=tmp_path / "session.safetensors", keep_checkpoint=True)
+
+    write_stamps = [i for i, event in enumerate(order) if event == ("stamp", "_write")]
+    assert len(write_stamps) == STEPS - 1, (
+        f"expected one written_at per forward, got {len(write_stamps)}")
+    for i in write_stamps:
+        assert order[i - 1] == ("eval", "_write"), (
+            "written_at was stamped while the step was still an unevaluated graph — the timestamp "
+            f"will name the moment the step started, not the moment the checkpoint landed; the "
+            f"call before it was {order[i - 1]}")
+
+
 def test_writer_holds_an_exclusive_lock_for_the_life_of_the_run(tmp_path):
     """The liveness signal `h3_48gb.runs._writer_alive` reads is a real, held `flock` on a
     companion file next to the checkpoint — proved here with the reader's own probe technique

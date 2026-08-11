@@ -642,6 +642,17 @@ class ResumableRun:
         if state:
             arrays["rng_state"] = mx.stack([k.reshape(-1) for k in state])
 
+        # Materialize before stamping the clock, because until this line `arrays` is a graph over
+        # the step that just "finished" -- MLX has not run it yet. `save_safetensors` below would
+        # force it anyway, which means the whole forward pass executes *inside* the write, and a
+        # `written_at` taken before that records when the step began rather than when the
+        # checkpoint landed. Measured on the 15 s run of 2026-08-11: the file's mtime was 12:29:52
+        # and the timestamp inside it said 12:11:46, eighteen minutes early -- one whole step. That
+        # is not cosmetic: `h3 status` divides by this interval, and it reported "19 s per forward,
+        # 2 minutes left" for a run with 1086 s per forward and an hour and three quarters to go.
+        # Same discipline as the unload path, for the same reason: eval, then act on the result.
+        mx.eval(*arrays.values())
+
         meta = {
             "format": FORMAT_VERSION,
             "identity": self.identity,
