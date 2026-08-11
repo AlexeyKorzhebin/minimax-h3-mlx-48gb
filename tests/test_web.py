@@ -2411,6 +2411,40 @@ def test_the_preview_frame_is_the_last_one_the_run_actually_wrote():
 
 
 @_needs_node
+def test_the_running_job_is_matched_to_its_own_run_on_disk():
+    """Requirement 8's numbers come from `runs.scan`, and the only thing tying a scanned run to a
+    queued job is the output directory. Matching the wrong one would show a stranger's progress.
+    """
+    mine, none = _node_eval("""
+      const runs = [{outdir: "/o/другая", completed: 9}, {outdir: "/o/ночь", completed: 3}];
+      const job = {args: ["generate", "--outdir", "/o/ночь"]};
+      console.log(JSON.stringify([app.runForJob(job, runs),
+                                  app.runForJob({args: ["generate"]}, runs)]));
+    """)
+    assert mine["completed"] == 3, mine
+    assert none is None, "a job that names no outdir matches no run"
+
+
+@_needs_node
+def test_the_output_directory_defaults_to_the_one_the_last_jobs_used():
+    """Not one of the eleven, but the field is required and typing it in every evening is how a
+    person ends up with three spellings of the same directory.
+    """
+    reused, fresh = _node_eval("""
+      const state = {queue: {pending: [
+        {created_at: "2026-08-12T21:00:00", args: ["generate", "--outdir", "/o/ночь"]},
+        {created_at: "2026-08-12T19:00:00", args: ["generate", "--outdir", "/o/утро"]},
+      ]}, runs: []};
+      console.log(JSON.stringify([
+        app.defaultOutdir(state, new Date("2026-08-12T22:00:00")),
+        app.defaultOutdir({queue: {}, runs: []}, new Date("2026-08-12T22:00:00")),
+      ]));
+    """)
+    assert reused == "/o/ночь", "the newest job's directory, not the first one scanned"
+    assert fresh == "~/video-out/2026-08-12", fresh
+
+
+@_needs_node
 def test_finished_shows_the_exit_code_and_a_failure_shows_why():
     """Requirement 9. The reason is the worker's own `log_tail`; inventing a friendlier one would
     hide the only line that says what happened.
@@ -2429,7 +2463,7 @@ def test_finished_shows_the_exit_code_and_a_failure_shows_why():
     assert "код 0" in ok
     assert "код 1" in failed
     assert "metal::malloc" in failed, "a failed run with no visible reason is a mystery, not a row"
-    assert 'class="clip"' in ok and ".mp4" in ok, "a finished clip should be reachable"
+    assert 'href="/media/%D0%BD%D0%BE%D1%87%D1%8C/h3-%D0%BA%D0%BE%D1%82-896x576.mp4"' in ok, ok
 
 
 @_needs_node
@@ -2483,15 +2517,18 @@ def test_the_argument_list_the_form_builds_is_one_the_server_accepts(queue_serve
     here checks one side or the other; a rename of `--turbo-lora` to `--lora` would pass all of
     them and break the only thing the page exists to do.
     """
+    lora = queue_server.models / "turbo.safetensors"
+    lora.write_bytes(b"\x00")
     args = _node_eval("""
       console.log(JSON.stringify(app.buildArgs({
         prompt: "кот на подоконнике", width: 896, height: 576, duration: 10, steps: 31,
         seed: 3, tag: "ночь", mode: "t2va", checkpoint: "CKPT", outdir: "OUT",
-        lora: "", loraStrength: 1, image: "", endImage: "", promptFile: null,
+        lora: "LORA", loraStrength: 0.45, image: "", endImage: "", promptFile: null,
       })));
     """)
     args = [str(queue_server.models / "ckpt") if a == "CKPT"
-            else str(queue_server.outdir) if a == "OUT" else a for a in args]
+            else str(queue_server.outdir) if a == "OUT"
+            else str(lora) if a == "LORA" else a for a in args]
 
     status, answer = _call(queue_server, "POST", "/api/estimate", {"args": args})
     assert status == 200, answer
@@ -2499,6 +2536,7 @@ def test_the_argument_list_the_form_builds_is_one_the_server_accepts(queue_serve
 
     status, answer = _call(queue_server, "POST", "/api/jobs", {"args": args, "note": "с формы"})
     assert status == 200, answer
+    assert "--turbo-lora" in answer["job"]["args"], "the LoRA flag has to be the one the CLI has"
 
     status, state = _json(queue_server, "/api/state")
     assert [job["id"] for job in state["queue"]["pending"]] == [answer["job"]["id"]], state
