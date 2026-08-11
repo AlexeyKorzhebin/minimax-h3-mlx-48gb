@@ -72,6 +72,21 @@ PATH_FLAGS = {
     "--outdir": "write", "--checkpoint-dir": "write", "--preview-stem": "write",
 }
 
+#: The only file types `/media` will serve. An **allowlist**, and that shape is the whole point.
+#:
+#: Circle 1 bounded `/media` to a run directory and excluded the queue by comparing its name.
+#: Circle 2 broke that with one capital letter: `Path.resolve()` does not canonicalise case, this
+#: machine's APFS volume is case-insensitive, and `/media/QUEUE/pending/job.json` therefore missed
+#: a name-based exclusion and read the queue. A denylist by name cannot work on a case-insensitive
+#: filesystem, and patching it per spelling only waits for the next one.
+#:
+#: One rule instead covers `queue/pending/*.json`, `queue/logs/*.log`, `queue/prompts/*.txt`,
+#: `queue/results/*` and whatever directory someone puts beside them next -- however the name is
+#: spelled. It also closes a hole nobody was looking for: `<outdir>/checkpoints` is the default
+#: `--checkpoint-dir`, so `/media/checkpoints/h3-*.safetensors` was serving multi-gigabyte resume
+#: weights through `read_bytes()`, whole, into this process's memory.
+MEDIA_SUFFIXES = frozenset({".mp4", ".jpg", ".jpeg", ".png", ".wav"})
+
 #: Prompt file names the page may name, per the design spec's "Пути". A bare name with a `.txt`
 #: suffix and nothing that a filesystem reads as structure -- no separator, no `..`, no leading dot.
 PROMPT_NAME = re.compile(r"[A-Za-z0-9_-]+\.txt\Z")
@@ -84,17 +99,28 @@ PROMPTS_DIR = "prompts"
 #: HTTP status for each `CliError` code that is not a plain refusal of the request. Everything
 #: absent from here is 400: the caller asked for something this server will not do.
 #:
-#: NOTE for task 6: `job_not_pending` belongs here as **409**, not 400 -- that request was valid
-#: and lost a race with the worker rather than being wrong. It is deliberately absent until the
-#: commit that raises it, because `test_every_status_this_module_maps_belongs_to_a_real_code`
-#: refuses a mapping for a code no `raise CliError(...)` produces, the same rule
-#: `test_error_codes_are_documented_in_one_place` applies to `ERROR_CODES` itself. Add both in
-#: one commit.
+#: `job_not_pending` is **409**, not 400: that request was valid and lost a race with the worker
+#: rather than being wrong -- the job left `pending/` between the page's last poll and this
+#: request. It is mapped here *before* task 6 raises it, on purpose; see `PLANNED_CODES`.
 ERROR_STATUS = {
     "host_not_allowed": 403,
+    "job_not_pending": 409,
     "queue_unwritable": 500,
     "internal_error": 500,
 }
+
+#: Codes `ERROR_STATUS` maps ahead of the commit that raises them, so that the failure mode
+#: "someone added the code and the raise, and forgot the status" cannot happen -- the status is
+#: already there.
+#:
+#: This replaces a conditional test (`if "job_not_pending" in ERROR_CODES: assert ...`) which had
+#: zero assertions until the day it mattered: coverage called it green, and the first tidy-up of
+#: "empty tests" would have deleted the failure mode along with it. A named list of data is a
+#: worse hiding place than a test that does nothing.
+#:
+#: It is meant to stay nearly empty. `test_no_planned_code_has_already_arrived` fails once a code
+#: here lands in `ERROR_CODES`, which forces it out of this set and back under the ordinary check.
+PLANNED_CODES = frozenset({"job_not_pending"})
 
 
 def models_root() -> Path:
@@ -371,13 +397,30 @@ _CONTENT_TYPES = {".html": "text/html", ".css": "text/css", ".js": "text/javascr
                   ".jpeg": "image/jpeg", ".png": "image/png", ".wav": "audio/wav"}
 
 
+def _is_same_file(left, right) -> bool:
+    """Whether two paths name the same inode -- the filesystem's own answer, not the text's.
+
+    `Path.resolve()` normalises `..` and symlinks but **not case**, so on a case-insensitive volume
+    (APFS by default, which is what this machine runs) `<outdir>/QUEUE` and `<outdir>/queue`
+    resolve to two different strings for one directory. Any comparison of names is therefore
+    decided by how the *request* spelled it. `os.stat` is not.
+
+    A path that does not exist is not the same file as anything, which is also the right answer
+    for a caller asking "is this the queue".
+    """
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
+
+
 def _content_type(path: Path) -> str:
     guess = _CONTENT_TYPES.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0]
     guess = guess or "application/octet-stream"
     return f"{guess}; charset=utf-8" if guess.startswith("text/") else guess
 
 
-def _serve_file(root, relative: str) -> tuple[int, str, bytes]:
+def _serve_file(root, relative: str, suffixes=None) -> tuple[int, str, bytes]:
     """A file from under `root`, or a 404 -- never anything from outside `root`.
 
     `root` is the *leaf* directory the URL prefix maps to (`webui/` for `/static/`, one run's
@@ -387,8 +430,19 @@ def _serve_file(root, relative: str) -> tuple[int, str, bytes]:
     The refusal for an escape is `path_outside_root` with a 400, not a 404. A 404 would be
     indistinguishable from a router that simply did not recognise the URL, so a traversal test
     written against it passes on a server with no path checking at all.
+
+    `suffixes`, when given, is the allowlist of file types this route serves (`MEDIA_SUFFIXES` for
+    `/media`; `/static` passes `None` because it is bounded by a directory nobody writes into at
+    run time). Checked **before** `is_file`, so a refusal does not double as an answer to "does
+    this file exist".
     """
     target = resolve_within(Path(root) / relative, {"served": Path(root)}, write=False)
+    if suffixes is not None and target.suffix.lower() not in suffixes:
+        raise CliError(
+            "media_type_not_allowed",
+            f"this route serves only {sorted(suffixes)}, and {target.name!r} is none of them",
+            {"path": relative, "suffix": target.suffix, "allowed": sorted(suffixes)},
+        )
     if not target.is_file():
         return 404, "application/json", _error_bytes(
             "not_found", f"no such file: {relative}", {"path": relative})
@@ -497,12 +551,20 @@ class _Handler(BaseHTTPRequestHandler):
            `/media/%2e/x` all resolve `<outdir>/<run>` to the outdir itself, and without this line
            they served the whole output tree, `queue/logs/*.log` and `queue/pending/*.json`
            included. Verified live before the fix, on all three spellings;
-        4. it must not be the queue. `queue/` *is* a direct child of the outdir, so check 3 lets
-           `/media/queue/pending/<id>.json` through on its own. The queue is not a run, and the
-           page has `/api/state` for it.
+        4. it must not be the queue, compared **by inode** (`os.path.samefile`) rather than by
+           path. `queue/` *is* a direct child of the outdir, so check 3 lets
+           `/media/queue/pending/<id>.json` through on its own -- and comparing the resolved paths
+           as text let `/media/QUEUE/...` through as well, because `Path.resolve()` does not
+           canonicalise case and this machine's volume is case-insensitive. `samefile` answers the
+           question the filesystem actually decides: on that same pair, path equality is `False`
+           and `samefile` is `True`;
+        5. and the file itself must be one of `MEDIA_SUFFIXES` (in `_serve_file`). That allowlist
+           is the load-bearing one -- check 4 is a denylist by identity, and a denylist only ever
+           covers the directories someone thought of.
 
         The tail after the run segment is deliberately *not* flattened: a run directory has
-        subdirectories of its own (`checkpoints/`), and everything below it is still inside it.
+        subdirectories of its own (`checkpoints/`), and everything below it is still inside it --
+        `19-real-run/checkpoints/step05.jpg` is a legitimate preview frame.
         """
         run, separator, rest = relative.partition("/")
         if not separator or not rest:
@@ -510,14 +572,14 @@ class _Handler(BaseHTTPRequestHandler):
                 "not_found", "a media URL is /media/<run>/<file>", {"path": relative})
         outdir = Path(self.server.outdir).resolve()
         run_dir = resolve_within(Path(self.server.outdir) / run, {"outdir": outdir}, write=False)
-        if run_dir.parent != outdir or run_dir == Path(self.server.queue_root).resolve():
+        if run_dir.parent != outdir or _is_same_file(run_dir, self.server.queue_root):
             raise CliError(
                 "path_outside_root",
                 f"/media serves one run's directory directly under the output directory, and "
                 f"{run!r} is not one",
                 {"path": relative, "run": run, "resolved": str(run_dir), "outdir": str(outdir)},
             )
-        return _serve_file(run_dir, rest)
+        return _serve_file(run_dir, rest, suffixes=MEDIA_SUFFIXES)
 
     def send_error(self, code, message=None, explain=None) -> None:
         """JSON, never the HTML page `BaseHTTPRequestHandler` would otherwise produce.

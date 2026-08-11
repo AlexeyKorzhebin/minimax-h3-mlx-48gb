@@ -573,14 +573,90 @@ def test_media_cannot_step_out_of_one_run_into_another(server, url):
     assert body["error"]["code"] == "path_outside_root"
 
 
-def test_media_does_not_serve_the_queue(server):
+@pytest.mark.parametrize("spelling", ["queue", "QUEUE", "Queue", "QuEuE"])
+def test_media_does_not_serve_the_queue(server, spelling):
     """`queue/` **is** a direct child of the outdir, so the direct-child rule alone lets this
     through. It is not a run: the page reads the queue over `/api/state`, which returns jobs, not
     whatever bytes happen to be sitting in `queue/logs/`.
+
+    The three capitalised spellings are circle 2's finding. `Path.resolve()` does not canonicalise
+    case, this machine's APFS volume is case-insensitive, so a comparison of resolved *paths* was
+    decided by how the request spelled the directory: `queue` was refused and `QUEUE` returned the
+    job file. Comparison is now by inode.
     """
     (server.queue_root / "pending" / "20260811-000000-x-0000.json").write_text('{"a": 1}')
-    status, body = _json(server, "/media/queue/pending/20260811-000000-x-0000.json")
-    assert status == 400 and body["error"]["code"] == "path_outside_root"
+    status, body = _json(server, f"/media/{spelling}/pending/20260811-000000-x-0000.json")
+    assert status == 400, f"/media/{spelling}/… answered {status}"
+    assert body["error"]["code"] in {"path_outside_root", "media_type_not_allowed"}
+
+
+@pytest.mark.parametrize("spelling", ["queue", "QUEUE", "QuEuE"])
+def test_the_queue_is_refused_even_for_a_file_type_media_serves(server, spelling):
+    """The allowlist would refuse `.json` and `.log` whatever directory they sat in, so it alone
+    does not prove the queue is excluded. A `.jpg` inside the queue is the case that separates the
+    two rules -- and it must still be refused, by identity.
+    """
+    (server.queue_root / "logs").mkdir(exist_ok=True)
+    (server.queue_root / "logs" / "sneak.jpg").write_bytes(b"\xff\xd8x")
+    status, body = _json(server, f"/media/{spelling}/logs/sneak.jpg")
+    assert status == 400, f"/media/{spelling}/logs/sneak.jpg answered {status}"
+    assert body["error"]["code"] == "path_outside_root"
+
+
+def test_the_queue_check_compares_inodes_not_names(server):
+    """The line under the test above. Recorded as its own assertion because the whole defect was
+    that path equality and `samefile` disagree here, and a reader has no reason to expect it.
+    """
+    upper = server.outdir / "QUEUE"
+    assert upper.resolve() != server.queue_root.resolve(), "not a case-insensitive volume"
+    assert web._is_same_file(upper, server.queue_root), "samefile did not see through the case"
+
+
+@pytest.mark.parametrize("name,suffix", [("job.json", ".json"), ("run.log", ".log"),
+                                         ("prompt.txt", ".txt"), ("h3-x.safetensors",
+                                                                  ".safetensors"),
+                                         ("notes.md", ".md"), ("script.sh", ".sh")])
+def test_media_serves_only_clips_and_frames(server, name, suffix):
+    """The allowlist, inside a perfectly legitimate run directory -- otherwise it would be covered
+    only through the queue tests and could be deleted without any of them noticing.
+
+    `.safetensors` is not hypothetical: `<outdir>/checkpoints` is the default `--checkpoint-dir`,
+    so before this rule `/media/checkpoints/h3-*.safetensors` handed out multi-gigabyte resume
+    weights, read whole into this process's memory.
+    """
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    (run / name).write_bytes(b"x")
+    status, body = _json(server, f"/media/19-real-run/{name}")
+    assert status == 400, f"{name} answered {status}"
+    assert body["error"]["code"] == "media_type_not_allowed"
+    assert body["error"]["detail"]["suffix"] == suffix
+
+
+@pytest.mark.parametrize("name", ["clip.mp4", "frame.jpg", "frame.jpeg", "frame.png", "sound.wav",
+                                  "CLIP.MP4", "Frame.JPG"])
+def test_media_still_serves_every_type_the_page_needs(server, name):
+    """The other half: an allowlist that refused everything would pass the test above. The upper
+    case spellings are here because the suffix check lowercases, and a run really can contain
+    `FRAME.JPG` -- refusing it would be the allowlist breaking a legitimate file.
+    """
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    (run / name).write_bytes(b"bytes")
+    status, _, body = _request(server, f"/media/19-real-run/{name}")
+    assert status == 200 and body == b"bytes"
+
+
+def test_media_serves_a_preview_frame_nested_under_a_run(server):
+    """`<run>/checkpoints/step05.jpg` is a legitimate preview frame. The rules above must not have
+    made the ordinary nested case collateral damage -- forbidding nesting would break real access,
+    and forbidding `checkpoints/` by name would be the denylist mistake again.
+    """
+    nested = server.outdir / "19-real-run" / "checkpoints"
+    nested.mkdir(parents=True, exist_ok=True)
+    (nested / "step05.jpg").write_bytes(b"\xff\xd8frame")
+    status, _, body = _request(server, "/media/19-real-run/checkpoints/step05.jpg")
+    assert status == 200 and body == b"\xff\xd8frame"
 
 
 def test_media_serves_a_file_nested_inside_a_run(server):
@@ -896,23 +972,34 @@ def test_the_router_code_matches_its_status(status, code):
 
 
 def test_every_status_this_module_maps_belongs_to_a_real_code():
-    """`ERROR_STATUS` is keyed by `CliError` codes; a typo there is a silent fallback to 400."""
-    from h3_48gb.cli import ERROR_CODES
+    """`ERROR_STATUS` is keyed by `CliError` codes; a typo there is a silent fallback to 400.
 
-    unknown = set(web.ERROR_STATUS) - set(ERROR_CODES)
-    assert not unknown, f"ERROR_STATUS names codes that do not exist: {unknown}"
-
-
-def test_job_not_pending_arrives_with_its_409():
-    """Green today, red the moment task 6 adds the code without its status.
-
-    `ERROR_STATUS` deliberately has no entry for a code nothing raises yet, but leaving that as a
-    comment leaves the actual failure mode uncovered: the code gets added, the `raise` gets
-    written, the status gets forgotten, the answer goes out as 400 instead of 409, and the
-    one-directional check above stays green because it only looks at entries that exist.
+    `PLANNED_CODES` is the one exemption, and it is a short, named list of data rather than a
+    widened rule.
     """
     from h3_48gb.cli import ERROR_CODES
 
-    if "job_not_pending" in ERROR_CODES:
-        assert web.ERROR_STATUS.get("job_not_pending") == 409, (
-            "job_not_pending is a lost race, not a bad request -- it answers 409")
+    unknown = set(web.ERROR_STATUS) - set(ERROR_CODES) - web.PLANNED_CODES
+    assert not unknown, f"ERROR_STATUS names codes that do not exist: {unknown}"
+
+
+def test_job_not_pending_answers_409():
+    """Unconditional, so the failure mode "task 6 adds the code and forgets the status" is not
+    tested for -- it is made impossible. The status is already here; the code arrives later.
+
+    This replaces a conditional test that asserted nothing until the day it mattered.
+    """
+    assert web.ERROR_STATUS["job_not_pending"] == 409
+
+
+def test_no_planned_code_has_already_arrived():
+    """Keeps `PLANNED_CODES` from turning into a permanent hole in the check above: once task 6
+    adds `job_not_pending` to `ERROR_CODES`, this fails until the entry is dropped from the
+    exemption, at which point the ordinary check covers it again.
+    """
+    from h3_48gb.cli import ERROR_CODES
+
+    landed = web.PLANNED_CODES & set(ERROR_CODES)
+    assert not landed, (
+        f"these codes now exist and no longer need an exemption -- drop them from "
+        f"PLANNED_CODES: {sorted(landed)}")
