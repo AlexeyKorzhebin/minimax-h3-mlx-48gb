@@ -690,12 +690,24 @@ def test_h3_web_has_no_host_flag():
         build_parser().parse_args(["web", "--host", "0.0.0.0"])
 
 
-def test_h3_web_refuses_an_outdir_that_does_not_exist(tmp_path):
+def test_h3_web_refuses_an_outdir_that_does_not_exist(tmp_path, monkeypatch):
+    """`queue.scan` deliberately does not create the directory it reads, so a typo'd outdir would
+    otherwise serve an empty queue for ever while the real one fills up somewhere else.
+
+    `serve_forever` is stubbed out even though this test expects never to reach it. Without the
+    stub, deleting the check under test does not turn this red -- it makes it **hang**, blocking on
+    a real server until the runner is killed, and a test that hangs is a test that reports nothing.
+    Asserting the stub was never called is what keeps the refusal itself under test.
+    """
     from h3_48gb import cli
+
+    served = []
+    monkeypatch.setattr(web._Server, "serve_forever", lambda self: served.append(self))
 
     with pytest.raises(CliError) as excinfo:
         cli.run_web(tmp_path / "typo", port=0)
     assert excinfo.value.code == "outdir_not_found"
+    assert served == [], "the refusal happened after the socket was already serving"
 
 
 def test_h3_web_binds_the_loopback_and_prints_the_address(tmp_path, capsys, monkeypatch):
