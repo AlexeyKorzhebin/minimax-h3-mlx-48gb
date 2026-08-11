@@ -2235,6 +2235,7 @@ def test_a_server_that_stops_answering_is_said_so_in_words():
                                   app.offlineNotice(0, at, later)]));
     """)
     assert talking is None, "a page whose last poll succeeded must say nothing"
+    assert quiet is not None, "a page whose last poll failed must not go on showing stale numbers"
     assert "не отвечает" in quiet
     assert "2 мин" in quiet, quiet
 

@@ -249,6 +249,12 @@ export function analysePrompt(text, declaredSeconds, { audio = true } = {}) {
   const notes = [];
   const bad = new Set();
 
+  // Пустое поле — не промпт без звука, а промпт, которого ещё нет. Три красных
+  // замечания на чистой странице учат не читать этот список вовсе.
+  if (!body.trim()) {
+    return { spans, blocks, notes: [{ k: "warn", t: "Промпт пуст" }], bad };
+  }
+
   if (!blocks.length) {
     notes.push({ k: "warn", t: "Блоков вида [0.0-2.5s] не найдено — вся сцена одним куском" });
   } else {
@@ -879,7 +885,9 @@ function startPage() {
     const declared = Number(String($("duration").value).replace(",", ".")) || 0;
     const analysis = analysePrompt(text, declared, { audio: $("mode").value === "t2va" });
     $("hl").innerHTML = highlightHtml(text, analysis);
-    $("scale").innerHTML = scaleHtml(analysis, declared);
+    const scale = scaleHtml(analysis, declared);
+    $("scale").innerHTML = scale;
+    $("scale").hidden = scale === "";   // пустая полоска покрытия ничего не покрывает
     $("parse").innerHTML = analysis.notes.map((n) => `<li class="${n.k}">${n.t}</li>`).join("");
 
     const box = $("prompt-src");
