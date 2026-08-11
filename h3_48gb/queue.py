@@ -38,6 +38,7 @@ import os
 import re
 import secrets
 import string
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +56,16 @@ ARTIFACT_SUFFIXES = (".mp4", ".wav", ".npz", ".json")
 #: Alphabet for the four-character random suffix appended to every job id. Lowercase and digits
 #: only, matching the `[a-z0-9-]` the rest of the id is already restricted to.
 _ID_SUFFIX_ALPHABET = string.ascii_lowercase + string.digits
+
+#: How many trailing log lines `read_log_tail` keeps, and therefore how much of a run's output
+#: lands in `Job.log_tail`. A log can be tens of megabytes; this is the amount a human reads to
+#: find out why a run ended.
+LOG_TAIL_LINES = 40
+
+#: What `reconcile` records as `log_tail` for the third row of its table -- a job whose `.mp4`
+#: exists but whose result marker does not. In Russian because it is shown to a human on the
+#: queue page, unlike this module's exception messages (see the module docstring).
+RESULT_RECOVERED_NOTE = "результат найден на диске, отметка потеряна"
 
 
 class QueueError(Exception):
@@ -115,6 +126,20 @@ class Broken:
 
     path: str
     error: str
+
+
+@dataclass(frozen=True)
+class Reconciled:
+    """What `reconcile` did, and what it deliberately did not touch.
+
+    `changed` is every job whose state it moved -- finished by its result marker, finished because
+    its `.mp4` is on disk, or returned to `pending/`. `alive` is every job it left in `running/`
+    because that job's lease is held right now: someone else's process is still generating, and the
+    caller must not start a second one (see `reconcile`'s table).
+    """
+
+    changed: list[Job]
+    alive: list[Job]
 
 
 def _now() -> str:
@@ -544,11 +569,35 @@ def claim(root, now=None) -> Job | None:
     return job
 
 
+def _finish_locked(root: Path, job_id: str, exit_code: int, log_tail: str, finished_at=None) -> Job:
+    """`finish`'s body, without acquiring the queue lock -- see `finish` for the contract.
+
+    Split out for `reconcile`, which finishes jobs from inside its own single exclusive
+    acquisition. `queue_lock` is not reentrant (its docstring says so), so a `reconcile` that
+    called the public `finish` would deadlock against itself; and a `reconcile` that dropped the
+    lock around each `finish` would reopen exactly the window review circle 1 of task 2 closed --
+    between two acquisitions a cancelled job came back to life and a running job's file was
+    overwritten. One lock, one critical section, no exceptions.
+    """
+    running = job_path(root, job_id, "running")
+    if not running.exists():
+        raise QueueError(f"job {job_id} is not running")
+    data = _read_job_dict(running)
+    _build_job(data, "running")  # validate shape before touching disk any further
+    data["finished_at"] = finished_at if finished_at is not None else _now()
+    data["exit_code"] = exit_code
+    data["log_tail"] = log_tail
+    new_state = "done" if exit_code == 0 else "failed"
+    write_json_durably(running, data)
+    _rename_durably(running, job_path(root, job_id, new_state))
+    return Job(**{**data, "state": new_state})
+
+
 def finish(root, job_id: str, exit_code: int, log_tail: str, finished_at=None) -> Job:
     """Move a job out of `running/` into `done/` (exit code 0) or `failed/` (anything else),
     stamping `finished_at`, `exit_code` and `log_tail`.
 
-    `finished_at` is a parameter, not always `_now()`: startup reconciliation (a later task)
+    `finished_at` is a parameter, not always `_now()`: startup reconciliation (`reconcile`)
     restores it from the result marker `queue/results/<id>.json`, written when the run actually
     exited, not from whenever reconciliation happens to run afterward.
 
@@ -564,20 +613,173 @@ def finish(root, job_id: str, exit_code: int, log_tail: str, finished_at=None) -
     """
     root = Path(root)
     with queue_lock(root, exclusive=True):
-        running = job_path(root, job_id, "running")
-        if not running.exists():
-            raise QueueError(f"job {job_id} is not running")
-        data = _read_job_dict(running)
-        _build_job(data, "running")  # validate shape before touching disk any further
-        data["finished_at"] = finished_at if finished_at is not None else _now()
-        data["exit_code"] = exit_code
-        data["log_tail"] = log_tail
-        new_state = "done" if exit_code == 0 else "failed"
-        write_json_durably(running, data)
-        _rename_durably(running, job_path(root, job_id, new_state))
-        job = Job(**{**data, "state": new_state})
+        return _finish_locked(root, job_id, exit_code, log_tail, finished_at)
 
-    return job
+
+def _return_to_pending_locked(root: Path, job_id: str) -> Job:
+    """Move a job back from `running/` into `pending/` without acquiring the queue lock, for
+    `reconcile`'s fourth row: the run was interrupted before it produced anything.
+
+    The file's content is deliberately not rewritten -- in particular `started_at` stays as
+    `claim` stamped it. The run resumes from its own checkpoint rather than starting over, so the
+    moment it first started is still the truth about it, and `update` is already written to carry
+    that field forward untouched (see `test_update_preserves_started_at_left_by_a_reconciled_job`).
+    """
+    running = job_path(root, job_id, "running")
+    data = _read_job_dict(running)
+    _build_job(data, "running")  # validate shape before touching disk any further
+    _rename_durably(running, job_path(root, job_id, "pending"))
+    return Job(**{**data, "state": "pending"})
+
+
+def write_result_marker(root, job_id: str, exit_code: int, finished_at: str) -> None:
+    """Record how a run ended, durably, at `queue/results/<id>.json`.
+
+    Written by the worker immediately after the subprocess exits and **before** the job's lease is
+    released, which is the entire point of it: between those two moments the worker can be killed,
+    and this file is then the only thing that still knows the run's exit code. `reconcile` reads it
+    back -- see its second table row -- and restores `finished_at` from here rather than inventing
+    a fresh one, because the run ended when it ended, not when the machine came back up.
+    """
+    write_json_durably(result_path(root, job_id),
+                       {"exit_code": int(exit_code), "finished_at": finished_at})
+
+
+def _read_result_marker(root: Path, job_id: str) -> dict | None:
+    """The result marker for `job_id`, or `None` if there is none that can be believed.
+
+    A marker that is missing, unreadable, not an object, or missing an integer `exit_code` all come
+    back as `None` -- the same answer, deliberately. A half-written marker tells us nothing about
+    how the run ended, and the rows below it in `reconcile`'s table (is there an `.mp4`?) are a
+    better answer than a guessed exit code: at worst the run is re-queued and resumes from its
+    checkpoint, where believing a corrupt marker could file a failed run under `done/`.
+    """
+    try:
+        data = json.loads(result_path(root, job_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("exit_code"), int):
+        return None
+    return data
+
+
+def read_log_tail(root, job_id: str, lines: int = LOG_TAIL_LINES) -> str:
+    """The last `lines` lines of `queue/logs/<id>.log`, or `""` if there is no readable log.
+
+    Streamed through a bounded `deque` rather than `read().splitlines()[-40:]`: a run that printed
+    a progress line per forward leaves a multi-megabyte log, and this is called on the worker's
+    hot path and again by every reconciliation.
+    """
+    try:
+        with open(log_path(root, job_id), "r", encoding="utf-8", errors="replace") as stream:
+            tail = deque(stream, maxlen=lines)
+    except OSError:
+        return ""
+    return "".join(tail)
+
+
+def lease_is_free(root, job_id: str) -> bool | None:
+    """Whether nobody currently holds `queue/leases/<id>.lock`: `True` free, `False` held,
+    `None` if the question could not be answered at all.
+
+    The lease is what says a job is *actually running*, and it is `flock`, so it disappears the
+    instant its holder dies -- no timeout, no heartbeat, no stale-lock heuristic. The checkpoint
+    lock cannot serve here: it is released as soon as diffusion ends, before the `.mp4`, `.wav` and
+    report are written, so a probe landing in that window would call an almost-finished run dead.
+
+    The probe is non-blocking on purpose. `reconcile` calls it while holding the queue lock, and a
+    worker holding a lease takes the queue lock at the end of its run (`finish`); a blocking probe
+    there would be a deadlock between the two locks rather than an answer.
+
+    A missing lock file means nobody holds it -- `flock` cannot outlive the file's creator -- and
+    is reported as free without creating the file: this is a question, not a claim. Any other
+    `OSError` (the path is a directory, permissions are wrong) is `None` rather than a guess in
+    either direction; `reconcile` documents what it does with that.
+    """
+    try:
+        fd = os.open(lease_path(root, job_id), os.O_RDWR)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        except OSError:
+            return None
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(fd)
+
+
+def reconcile(root) -> Reconciled:
+    """Decide what every job still sitting in `running/` really is, and act on it.
+
+    Called by the worker at the top of every loop iteration. The worker holds the single worker
+    lock, so nothing in `running/` was started by *this* worker: each entry is either someone
+    else's live run (its lease is held) or the wreckage of a run whose worker was killed.
+
+    | lease  | marker | `<output_stem>.mp4` | action                                            |
+    |--------|--------|---------------------|---------------------------------------------------|
+    | held   | --     | --                  | leave in `running/`, report in `alive`            |
+    | free   | yes    | --                  | `finish` by the marker's code and `finished_at`   |
+    | free   | no     | yes                 | `finish(0, RESULT_RECOVERED_NOTE)`                |
+    | free   | no     | no                  | back to `pending/`, to resume from its checkpoint |
+    | unknown| as above (an unanswerable lease probe is treated exactly like a free one)         |
+
+    The marker outranks the `.mp4` because it is the only row that knows a *non-zero* exit code: a
+    run can fail after producing an `.mp4` from an earlier attempt at the same stem, and checking
+    the artifact first would file that failure under `done/` with exit code 0.
+
+    The third row exists for the window between the subprocess exiting and the marker being
+    written. A finished `.mp4` only exists after a fully successful run, so its presence is a
+    sounder signal than any timeout -- and re-running the job would overwrite precisely the result
+    we are trying not to lose.
+
+    An unanswerable lease probe is treated as free because the worker lock already proves no other
+    worker of ours is alive; the alternative -- leaving the job in `running/` forever -- jams the
+    queue permanently on a filesystem oddity.
+
+    Everything happens under **one** exclusive `queue_lock` acquisition covering the whole table,
+    which is why this calls `_finish_locked`/`_return_to_pending_locked` rather than the public
+    `finish` (`queue_lock` is not reentrant). Splitting the section -- lock per job, or "read now,
+    write later" -- reopens the window that let a cancelled job come back to life and a running
+    job's file be overwritten in task 2.
+
+    A file in `running/` that does not parse is stepped over rather than raised on: one corrupt
+    file must not stop the worker from recovering every other job, and `scan` is what reports it.
+    """
+    root = Path(root)
+    changed: list[Job] = []
+    alive: list[Job] = []
+
+    with queue_lock(root, exclusive=True):
+        directory = root / "running"
+        if not directory.is_dir():
+            return Reconciled(changed=changed, alive=alive)
+        for file in sorted(directory.glob("*.json")):
+            try:
+                job = _load_job_or_raise(file, "running")
+            except QueueError:
+                continue
+            if lease_is_free(root, job.id) is False:
+                alive.append(job)
+                continue
+            marker = _read_result_marker(root, job.id)
+            if marker is not None:
+                changed.append(_finish_locked(
+                    root, job.id, int(marker["exit_code"]),
+                    read_log_tail(root, job.id), finished_at=marker.get("finished_at")))
+                continue
+            if Path(f"{job.output_stem}.mp4").exists():
+                changed.append(_finish_locked(root, job.id, 0, RESULT_RECOVERED_NOTE))
+                continue
+            changed.append(_return_to_pending_locked(root, job.id))
+
+    return Reconciled(changed=changed, alive=alive)
 
 
 def update(root, job_id: str, args: list[str], note: str, dry_run_report: dict, estimate: dict,

@@ -95,16 +95,22 @@ def test_durable_write_fsyncs_the_file_and_its_directory(tmp_path, monkeypatch):
 
 
 @contextlib.contextmanager
-def _external_lock(root, mode):
-    """Hold the queue lock from a *separate process*: flock is per-process, so a thread in this
-    one would silently re-acquire its own lock and prove nothing.
+def _external_lock(root, mode, name="queue.lock"):
+    """Hold one of the queue's lock files from a *separate process*: flock is per-process, so a
+    thread in this one would silently re-acquire its own lock and prove nothing.
+
+    `name` is relative to `root`, so the same helper stands in for another worker holding
+    `worker.lock` and for another run holding `leases/<id>.lock` -- both are the same `flock` on
+    the same kind of file, and both are only honest when the holder is a different process. It
+    must be an existing directory's file: nothing here creates `leases/`, so a caller passing a
+    lease path has `layout` (or `submit`) behind it.
     """
     script = ("import fcntl, os, sys, time\n"
               "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)\n"
               f"fcntl.flock(fd, fcntl.{mode})\n"
               "print('held', flush=True)\n"
               "sys.stdin.readline()\n")
-    proc = subprocess.Popen([sys.executable, "-c", script, str(Path(root) / "queue.lock")],
+    proc = subprocess.Popen([sys.executable, "-c", script, str(Path(root) / name)],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     assert proc.stdout.readline().strip() == "held"
     try:
@@ -995,6 +1001,219 @@ def test_rename_durably_refuses_to_overwrite_an_existing_destination(tmp_path):
     assert json.loads(dest.read_text()) == {"v": "stale"}, (
         "the pre-existing destination must survive untouched")
     assert src.exists(), "the source must not be consumed by a rename that was refused"
+
+
+# -- Task 4, step 1: reconciliation, every row of the table --------------------------------------
+
+
+def _claimed(root, stem, tag="a"):
+    """A job sitting in `running/`, put there the way the worker puts it there -- `submit` then
+    `claim` -- so it carries a real `started_at` and a real `output_stem` under `tmp_path`.
+    """
+    q.submit(root, ["generate", "--tag", tag], "", _stem(_DRY, str(stem)), {})
+    return q.claim(root)
+
+
+def test_lease_is_free_answers_free_held_and_unknown(tmp_path):
+    """The three answers are not decoration: `reconcile` finishes or re-queues a job on `True`
+    and `None`, and leaves it strictly alone on `False`. A probe that could only say "free"
+    would let the worker re-queue a job that is running right now and start a second 36 GB
+    process on top of it.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    assert q.lease_is_free(root, "no-such-job") is True, "an absent lease file is nobody holding it"
+    assert not q.lease_path(root, "no-such-job").exists(), (
+        "asking whether a lease is held must not create the lease file")
+
+    q.lease_path(root, "probe").touch()
+    assert q.lease_is_free(root, "probe") is True, "an existing but unheld lease file is free"
+    with _external_lock(root, "LOCK_EX", name="leases/probe.lock"):
+        assert q.lease_is_free(root, "probe") is False, "a lease held by another process is held"
+    assert q.lease_is_free(root, "probe") is True, "the lease is free again once the holder exits"
+
+    # Not a contrived failure: any OSError that is not "no such file" lands here. A directory
+    # where the lock file belongs is the portable way to produce one without being root.
+    q.lease_path(root, "weird").mkdir()
+    assert q.lease_is_free(root, "weird") is None, (
+        "an unanswerable probe must say so, not guess in either direction")
+
+
+def test_reconcile_leaves_a_live_job_alone_and_reports_it_alive(tmp_path):
+    """Row 1. The whole point of the lease: while another process holds it, that job is generating
+    right now, and touching its file -- finishing it, re-queueing it -- destroys a run in flight.
+    Two-sided, because "reconcile did nothing" is also what a `reconcile` that crashed instantly
+    looks like: once the holder lets go, the very same call must act on the job.
+    """
+    root = tmp_path / "queue"
+    job = _claimed(root, tmp_path / "h3-a-1x1")
+
+    with _external_lock(root, "LOCK_EX", name=f"leases/{job.id}.lock"):
+        held = q.reconcile(root)
+        assert [j.id for j in held.alive] == [job.id]
+        assert held.changed == [], "a live job must not be touched"
+        assert q.job_path(root, job.id, "running").exists(), "a live job stays in running/"
+
+    freed = q.reconcile(root)
+    assert freed.alive == [], "the lease was released, so the job is no longer alive"
+    assert [j.id for j in freed.changed] == [job.id], (
+        "once the lease is free the same reconcile must act on the job -- otherwise the test above "
+        "proves nothing about the lease and everything about reconcile doing nothing at all")
+
+
+@pytest.mark.parametrize("exit_code,state", [(0, "done"), (137, "failed")])
+def test_reconcile_finishes_a_free_job_by_its_result_marker(tmp_path, exit_code, state):
+    """Row 2. The marker is written before the lease is released, so it is the only thing that
+    still knows how the run ended once the worker is gone -- including `finished_at`, which must
+    come from when the run actually exited and not from whenever the machine came back up.
+    """
+    root = tmp_path / "queue"
+    job = _claimed(root, tmp_path / "h3-a-1x1")
+    q.log_path(root, job.id).write_text("шаг 7\nготово\n")
+    q.write_result_marker(root, job.id, exit_code, "2020-01-01T00:00:00")
+
+    result = q.reconcile(root)
+
+    assert [j.id for j in result.changed] == [job.id] and result.alive == []
+    assert q.job_path(root, job.id, state).exists()
+    assert not q.job_path(root, job.id, "running").exists()
+    landed = result.changed[0]
+    assert landed.state == state and landed.exit_code == exit_code
+    assert landed.finished_at == "2020-01-01T00:00:00", (
+        "finished_at must be restored from the marker, not invented at reconciliation time")
+    assert "готово" in landed.log_tail, "the run's log tail must survive into the finished job"
+
+
+def test_reconcile_treats_an_mp4_without_a_marker_as_success(tmp_path):
+    """Row 3, the window between the subprocess exiting and the marker landing. A finished `.mp4`
+    exists only after a fully successful run, so it is a sounder signal than any timeout -- and
+    re-running the job would overwrite exactly the result being rescued.
+    """
+    root = tmp_path / "queue"
+    stem = tmp_path / "h3-a-1x1"
+    job = _claimed(root, stem)
+    Path(f"{stem}.mp4").write_bytes(b"video")
+
+    result = q.reconcile(root)
+
+    assert q.job_path(root, job.id, "done").exists(), "a finished .mp4 means the run succeeded"
+    assert result.changed[0].exit_code == 0
+    assert result.changed[0].log_tail == q.RESULT_RECOVERED_NOTE, (
+        "the job must say why it was called done without a marker")
+
+
+def test_reconcile_believes_the_marker_over_the_artifact_when_both_exist(tmp_path):
+    """The order of rows 2 and 3 is load-bearing, and no single-row test can catch a swap: with
+    only a marker, or only an `.mp4`, either order produces the same outcome. A failed run whose
+    stem already carries an `.mp4` -- an earlier attempt, or a partial rewrite -- is where they
+    diverge: checking the artifact first files a failure under `done/` with exit code 0, and the
+    non-zero exit code the marker knows about is lost for good.
+    """
+    root = tmp_path / "queue"
+    stem = tmp_path / "h3-a-1x1"
+    job = _claimed(root, stem)
+    Path(f"{stem}.mp4").write_bytes(b"video from an earlier attempt")
+    q.write_result_marker(root, job.id, 137, "2020-01-01T00:00:00")
+
+    q.reconcile(root)
+
+    assert q.job_path(root, job.id, "failed").exists(), (
+        "the marker knows the exit code was 137; the .mp4 only knows a file exists")
+    assert not q.job_path(root, job.id, "done").exists()
+
+
+def test_reconcile_returns_an_interrupted_job_to_pending_keeping_started_at(tmp_path):
+    """Row 4. Nothing survived the crash, so the job goes back to the queue -- and keeps the
+    `started_at` `claim` stamped, because the rerun resumes from its checkpoint rather than
+    starting from zero, and that first start is still the truth about the job.
+    """
+    root = tmp_path / "queue"
+    job = _claimed(root, tmp_path / "h3-a-1x1")
+
+    result = q.reconcile(root)
+
+    assert q.job_path(root, job.id, "pending").exists()
+    assert not q.job_path(root, job.id, "running").exists()
+    returned = result.changed[0]
+    assert returned.state == "pending"
+    assert returned.started_at == job.started_at, "the interrupted run's start time must survive"
+    assert returned.exit_code is None and returned.finished_at is None, (
+        "a re-queued job was never finished; stamping it would make the page lie")
+    assert q.claim(root).id == job.id, "a job returned to pending/ must be claimable again"
+
+
+def test_reconcile_treats_an_unanswerable_lease_probe_as_free(tmp_path):
+    """Row 5. The worker holds the single worker lock, so nothing in `running/` can be one of
+    ours; leaving a job there because its lock file could not be opened would jam the queue on
+    that job for ever, and the recovery cost of the other choice is one resumed run.
+    """
+    root = tmp_path / "queue"
+    job = _claimed(root, tmp_path / "h3-a-1x1")
+    q.lease_path(root, job.id).mkdir()
+    assert q.lease_is_free(root, job.id) is None
+
+    result = q.reconcile(root)
+
+    assert result.alive == [], "an unknown lease must not be reported as a live job"
+    assert q.job_path(root, job.id, "pending").exists()
+
+
+def test_reconcile_steps_over_a_corrupt_running_file(tmp_path):
+    """One unreadable file in `running/` must not stop every other job from being recovered --
+    `scan` is what reports it (`Broken`), the same division of labour `claim` already follows.
+    """
+    root = tmp_path / "queue"
+    job = _claimed(root, tmp_path / "h3-a-1x1")
+    (q.layout(root)["running"] / "20260811-000000-junk-zzzz.json").write_text("{ not json")
+
+    result = q.reconcile(root)
+
+    assert [j.id for j in result.changed] == [job.id]
+    assert q.job_path(root, "20260811-000000-junk-zzzz", "running").exists(), (
+        "the corrupt file must be left where it is, not moved or destroyed")
+
+
+def test_reconcile_waits_for_the_queue_lock(tmp_path):
+    """`reconcile` rewrites queue state -- it finishes jobs and moves them back to `pending/` --
+    so it takes the same exclusive lock every other mutator takes. Two-sided: a `reconcile` that
+    simply raised would also leave the event unset.
+    """
+    root = tmp_path / "queue"
+    _claimed(root, tmp_path / "h3-a-1x1")
+    finished = threading.Event()
+    with _external_lock(root, "LOCK_EX"):
+        threading.Thread(target=lambda: (q.reconcile(root), finished.set()), daemon=True).start()
+        assert not finished.wait(0.5), "reconcile did not take the queue lock"
+    assert finished.wait(5), "reconcile never completed after the lock was released"
+
+
+def test_reconcile_takes_the_queue_lock_exactly_once_for_the_whole_table(tmp_path, monkeypatch):
+    """The critical section must cover the whole table, not one job or one decision at a time.
+    Task 2 paid for this twice: in the gap between two acquisitions a cancelled job came back to
+    life and the file of a job that was running got overwritten. A per-job or read-then-write
+    version passes every functional test above -- three jobs still end up in the right
+    directories -- while reopening exactly that gap, so assert the invariant itself.
+    """
+    root = tmp_path / "queue"
+    for tag in ("a", "b", "c"):
+        job = _claimed(root, tmp_path / f"h3-{tag}-1x1", tag=tag)
+        q.write_result_marker(root, job.id, 0, "2020-01-01T00:00:00")
+
+    acquisitions: list[bool] = []
+    real_queue_lock = q.queue_lock
+
+    @contextlib.contextmanager
+    def counting_queue_lock(root_arg, exclusive):
+        acquisitions.append(exclusive)
+        with real_queue_lock(root_arg, exclusive):
+            yield
+
+    monkeypatch.setattr(q, "queue_lock", counting_queue_lock)
+    result = q.reconcile(root)
+
+    assert len(result.changed) == 3
+    assert acquisitions == [True], (
+        f"reconcile must take the queue lock exactly once, exclusively; took {acquisitions}")
 
 
 # -- Global constraint: queue.py must stay importable without MLX -------------------------------
