@@ -2247,3 +2247,40 @@ def test_the_lora_side_path_is_numerically_unchanged_by_its_optimizations(tmp_pa
     expected = qkv_base(x) + 0.45 * slabs[..., permutation]
     assert float(mx.abs(layer(x) - expected).max()) < 1e-4, (
         "the stack does not reproduce the slab -> per-head permutation")
+
+
+# -- `h3 worker`: one per machine, and the refusal is machine-readable ---------------------------
+
+
+def test_worker_refuses_when_another_worker_already_holds_the_lock(tmp_path, capsys):
+    """The whole point of `worker_already_running` being a code and not a message: a second
+    `h3 worker` must fail loudly and identifiably, because two of them mean two 36 GB MLX
+    processes on a 48 GB machine. The lock is held from a separate process -- `flock` taken by
+    this one would not prove the CLI's own acquisition ever happens.
+    """
+    from h3_48gb import queue as q
+    from h3_48gb.cli import queue_root
+    from test_queue import _external_lock
+
+    root = queue_root(tmp_path)
+    q.layout(root)
+    with _external_lock(root, "LOCK_EX", name="worker.lock"):
+        code = main(["worker", "--outdir", str(tmp_path), "--poll", "0.01", "--json"])
+
+    assert code == 1
+    body = json.loads(capsys.readouterr().out)
+    assert body["ok"] is False
+    assert body["error"]["code"] == "worker_already_running"
+    assert body["error"]["detail"]["queue"] == str(root)
+
+
+def test_worker_refuses_an_outdir_that_does_not_exist(tmp_path, capsys):
+    """`main_loop` creates the queue layout, so an unchecked `--outdir` would let a typo build a
+    second, permanently empty queue and leave the worker idling at it while real jobs pile up.
+    """
+    missing = tmp_path / "typo"
+    code = main(["worker", "--outdir", str(missing), "--json"])
+    assert code == 1
+    body = json.loads(capsys.readouterr().out)
+    assert body["error"]["code"] == "outdir_not_found"
+    assert not (missing / "queue").exists(), "a refused worker must not create anything"

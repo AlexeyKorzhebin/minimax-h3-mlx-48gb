@@ -115,6 +115,7 @@ ERROR_CODES = {
     "prompt_both_given": "both a positional prompt and --prompt-file were given; pass exactly one",
     "prompt_missing": "no prompt: pass one positionally or with --prompt-file",
     "mode_mismatch": "--mode contradicts the --image/--end-image flags given",
+    "worker_already_running": "another worker already holds queue/worker.lock on this machine",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 
@@ -381,6 +382,12 @@ def build_parser() -> argparse.ArgumentParser:
     wt.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     wt.add_argument("--interval", type=float, default=20.0,
                     help="seconds between redraws (default 20); 0 renders once and exits")
+
+    wk = _subcommand(sub, "worker", help="run queued jobs, one at a time, until stopped")
+    wk.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
+    wk.add_argument("--poll", type=float, default=5.0,
+                    help="seconds between checks of an empty queue (default 5)")
+    wk.add_argument("--json", action="store_true", help="emit a machine-readable report")
 
     doc = _subcommand(sub, "doctor", help="verify a converted checkpoint")
     doc.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
@@ -1011,6 +1018,47 @@ def run_watch(outdir: Path, interval: float) -> dict:
         print(f"\033[{text.count(chr(10)) + 1}A\033[J", end="")
 
 
+def queue_root(outdir) -> Path:
+    """Where the queue lives for a given output directory: `<outdir>/queue`.
+
+    One function rather than a `/ "queue"` at each call site, because the worker, the web server
+    and every test have to agree on it exactly -- a second spelling would be a second, silently
+    empty queue rather than an error.
+    """
+    return Path(outdir) / "queue"
+
+
+def run_worker(outdir: Path, poll: float = 5.0) -> dict:
+    """Run the queue worker until it is asked to stop, and report how many jobs it got through.
+
+    Imported lazily, like every other heavy dependency here, though for the opposite reason: the
+    worker is deliberately cheap (it never imports MLX), but `h3 --help` still has no business
+    loading a module it will not use.
+
+    `--outdir` is validated before the queue directory is touched. `main_loop` creates the queue
+    layout under it, so an outdir that does not exist would otherwise be silently built out of a
+    typo, and the worker would then sit for ever on an empty queue while jobs pile up in the real
+    one.
+    """
+    from h3_48gb.worker import WorkerAlreadyRunning, main_loop
+
+    outdir = Path(outdir)
+    if not outdir.is_dir():
+        raise CliError("outdir_not_found", f"--outdir does not exist: {outdir}",
+                       {"outdir": str(outdir)})
+    root = queue_root(outdir)
+    try:
+        ran = main_loop(root, poll=poll)
+    except WorkerAlreadyRunning as exc:
+        raise CliError(
+            "worker_already_running",
+            f"another worker already holds {root / 'worker.lock'}; two workers on this machine "
+            "means two 36 GB processes and swap",
+            {"queue": str(root)},
+        ) from exc
+    return {"ok": True, "queue": str(root), "jobs_run": ran}
+
+
 def run_doctor(checkpoint: Path) -> dict:
     """Check a converted checkpoint before a multi-hour run rather than during it."""
     checkpoint = Path(checkpoint)
@@ -1068,6 +1116,10 @@ def main(argv: list[str] | None = None) -> int:
             report = run_watch(args.outdir, args.interval)
             ok = True
             human = ""
+        elif args.command == "worker":
+            report = run_worker(args.outdir, args.poll)
+            ok = True
+            human = f"работник остановлен, задач выполнено: {report['jobs_run']}"
         elif args.command == "doctor":
             report = run_doctor(args.checkpoint)
             ok = report["ok"]
