@@ -38,7 +38,6 @@ import os
 import re
 import secrets
 import string
-from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -122,7 +121,11 @@ def _job_file_payload(job: Job) -> dict:
 
 @dataclass(frozen=True)
 class Broken:
-    """A file `scan` could not parse into a `Job`, reported instead of silently skipped."""
+    """A file an operation could not act on, reported instead of silently skipped: unparseable to
+    `scan`, unrecoverable to `reconcile` (see `Reconciled.conflicted`). Both need the same two
+    facts -- which file, and why -- and a human staring at a queue that is one job short needs
+    them for the same reason.
+    """
 
     path: str
     error: str
@@ -130,16 +133,23 @@ class Broken:
 
 @dataclass(frozen=True)
 class Reconciled:
-    """What `reconcile` did, and what it deliberately did not touch.
+    """What `reconcile` did, what it deliberately did not touch, and what it could not fix.
 
     `changed` is every job whose state it moved -- finished by its result marker, finished because
     its `.mp4` is on disk, or returned to `pending/`. `alive` is every job it left in `running/`
     because that job's lease is held right now: someone else's process is still generating, and the
     caller must not start a second one (see `reconcile`'s table).
+
+    `conflicted` is every file it had to step over: a corrupt job file, or a desync where the
+    destination of the move already exists (`_rename_durably` refuses to overwrite). These are
+    reported rather than raised because `reconcile` runs at the top of *every* worker iteration --
+    an exception here does not fail one job, it kills the worker, and it kills the next one too,
+    on the same file, until someone repairs the directories by hand.
     """
 
     changed: list[Job]
     alive: list[Job]
+    conflicted: list[Broken]
 
 
 def _now() -> str:
@@ -663,19 +673,39 @@ def _read_result_marker(root: Path, job_id: str) -> dict | None:
     return data
 
 
+#: How much `read_log_tail` pulls per backwards step. Comfortably more than 40 lines of a progress
+#: log, so the common case is a single read.
+_TAIL_CHUNK_BYTES = 8192
+
+
 def read_log_tail(root, job_id: str, lines: int = LOG_TAIL_LINES) -> str:
     """The last `lines` lines of `queue/logs/<id>.log`, or `""` if there is no readable log.
 
-    Streamed through a bounded `deque` rather than `read().splitlines()[-40:]`: a run that printed
-    a progress line per forward leaves a multi-megabyte log, and this is called on the worker's
-    hot path and again by every reconciliation.
+    Read by seeking backwards from the end, not by streaming the file front to back. A bounded
+    `deque` over the whole file keeps *memory* constant but still pays the full read, and this is
+    called from inside `reconcile`'s exclusive critical section -- where the design spec promises
+    the queue lock is held for milliseconds. A run that prints a line per forward leaves tens of
+    megabytes; every page load waiting on that walk is the difference between a promise and a lie.
+
+    The first chunk read backwards can start mid-character; `errors="replace"` absorbs that, and
+    whatever it produces sits in the partial first line, which is discarded by the final slice.
     """
     try:
-        with open(log_path(root, job_id), "r", encoding="utf-8", errors="replace") as stream:
-            tail = deque(stream, maxlen=lines)
+        with open(log_path(root, job_id), "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            position = stream.tell()
+            data = b""
+            # One newline more than `lines` guarantees `lines` *complete* lines above the partial
+            # one this may have started in the middle of.
+            while position > 0 and data.count(b"\n") <= lines:
+                step = min(_TAIL_CHUNK_BYTES, position)
+                position -= step
+                stream.seek(position)
+                data = stream.read(step) + data
     except OSError:
         return ""
-    return "".join(tail)
+    text = data.decode("utf-8", errors="replace")
+    return "".join(text.splitlines(keepends=True)[-lines:])
 
 
 def lease_is_free(root, job_id: str) -> bool | None:
@@ -749,37 +779,52 @@ def reconcile(root) -> Reconciled:
     write later" -- reopens the window that let a cancelled job come back to life and a running
     job's file be overwritten in task 2.
 
-    A file in `running/` that does not parse is stepped over rather than raised on: one corrupt
-    file must not stop the worker from recovering every other job, and `scan` is what reports it.
+    **No single file may stop the whole recovery.** Every `QueueError` a file can produce -- it
+    does not parse, its shape is wrong, or the move refuses because the destination already exists
+    (a duplicate id, a crash caught mid-transition; see `_rename_durably`) -- is collected into
+    `conflicted` and the walk continues. Raising instead would not fail one job: `reconcile` runs
+    at the top of every worker iteration, so the exception kills the worker, and the next
+    `h3 worker` dies on the same file, and the queue stays dead until someone moves files around
+    by hand. Stepping over a corrupt file while raising on a rename conflict -- which is what this
+    used to do -- was the same policy applied in two opposite directions.
+
+    A `root` that does not exist yields an empty result rather than an error, exactly as `scan`
+    does: the queue directory not being there is "no jobs", and the HTTP layer that will call this
+    should not have to tell a missing directory apart from an empty one.
     """
     root = Path(root)
     changed: list[Job] = []
     alive: list[Job] = []
+    conflicted: list[Broken] = []
+    empty = Reconciled(changed=changed, alive=alive, conflicted=conflicted)
+
+    if not root.is_dir():
+        return empty
 
     with queue_lock(root, exclusive=True):
         directory = root / "running"
         if not directory.is_dir():
-            return Reconciled(changed=changed, alive=alive)
+            return empty
         for file in sorted(directory.glob("*.json")):
             try:
                 job = _load_job_or_raise(file, "running")
-            except QueueError:
-                continue
-            if lease_is_free(root, job.id) is False:
-                alive.append(job)
-                continue
-            marker = _read_result_marker(root, job.id)
-            if marker is not None:
-                changed.append(_finish_locked(
-                    root, job.id, int(marker["exit_code"]),
-                    read_log_tail(root, job.id), finished_at=marker.get("finished_at")))
-                continue
-            if Path(f"{job.output_stem}.mp4").exists():
-                changed.append(_finish_locked(root, job.id, 0, RESULT_RECOVERED_NOTE))
-                continue
-            changed.append(_return_to_pending_locked(root, job.id))
+                if lease_is_free(root, job.id) is False:
+                    alive.append(job)
+                    continue
+                marker = _read_result_marker(root, job.id)
+                if marker is not None:
+                    changed.append(_finish_locked(
+                        root, job.id, int(marker["exit_code"]),
+                        read_log_tail(root, job.id), finished_at=marker.get("finished_at")))
+                    continue
+                if Path(f"{job.output_stem}.mp4").exists():
+                    changed.append(_finish_locked(root, job.id, 0, RESULT_RECOVERED_NOTE))
+                    continue
+                changed.append(_return_to_pending_locked(root, job.id))
+            except QueueError as exc:
+                conflicted.append(Broken(path=str(file), error=f"{type(exc).__name__}: {exc}"))
 
-    return Reconciled(changed=changed, alive=alive)
+    return Reconciled(changed=changed, alive=alive, conflicted=conflicted)
 
 
 def update(root, job_id: str, args: list[str], note: str, dry_run_report: dict, estimate: dict,

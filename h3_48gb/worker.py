@@ -185,6 +185,12 @@ def _terminate_child_group(signum: int) -> None:
     `run_job` starts the pair in its own session. Signalling only the direct child would kill
     `caffeinate` and leave a 36 GB Python orphaned with no worker, no lease and nothing left to
     reap it -- the machine would stay full until someone noticed and killed it by hand.
+
+    `signum` is always `SIGTERM`, deliberately, even when the worker itself was stopped with a
+    second `SIGINT`: the design spec names `SIGTERM` for this, `caffeinate` has no `SIGINT`
+    semantics of its own to respect, and a `KeyboardInterrupt` traceback out of a half-written
+    generation is noise on top of a run that is being abandoned anyway. The worker still dies of
+    whichever signal it was actually sent -- only the group gets `SIGTERM`.
     """
     proc = _current_child
     if proc is None:
@@ -257,8 +263,13 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen) -> int
     root = Path(root)
     # The worker owns this directory, unlike `scan`, which deliberately refuses to create it: the
     # lock file it is about to take lives inside it, and `h3 worker` on a machine whose queue has
-    # never been used must work. `h3 worker` validates that `--outdir` itself exists first, so a
-    # typo cannot get this far and silently build a second, empty queue.
+    # never been used must work.
+    #
+    # NOTE for any future caller: this creates the layout unconditionally, so the guarantee that a
+    # typo'd path cannot silently become a second, permanently empty queue does NOT live here --
+    # it lives in `cli.run_worker`, which refuses an `--outdir` that does not exist before ever
+    # calling this. Anything that invokes `main_loop` directly (the web server in a later task)
+    # inherits the responsibility for that check along with it.
     q.layout(root)
     stop = stop if stop is not None else threading.Event()
     ran = 0

@@ -1200,9 +1200,11 @@ def test_reconcile_treats_an_unanswerable_lease_probe_as_free(tmp_path):
     assert q.job_path(root, job.id, "pending").exists()
 
 
-def test_reconcile_steps_over_a_corrupt_running_file(tmp_path):
-    """One unreadable file in `running/` must not stop every other job from being recovered --
-    `scan` is what reports it (`Broken`), the same division of labour `claim` already follows.
+def test_reconcile_steps_over_a_corrupt_running_file_and_names_it(tmp_path):
+    """One unreadable file in `running/` must not stop every other job from being recovered, and
+    it must not disappear either: a queue that is silently one job shorter than the human
+    remembers is the exact failure `scan`'s `Broken` list exists to prevent, and reconciliation
+    owes the same answer.
     """
     root = tmp_path / "queue"
     job = _claimed(root, tmp_path / "h3-a-1x1")
@@ -1211,8 +1213,178 @@ def test_reconcile_steps_over_a_corrupt_running_file(tmp_path):
     result = q.reconcile(root)
 
     assert [j.id for j in result.changed] == [job.id]
+    assert [Path(b.path).stem for b in result.conflicted] == ["20260811-000000-junk-zzzz"]
+    assert "json" in result.conflicted[0].error.lower()
     assert q.job_path(root, "20260811-000000-junk-zzzz", "running").exists(), (
         "the corrupt file must be left where it is, not moved or destroyed")
+
+
+def test_a_desync_is_reported_and_does_not_stop_the_rest_of_the_recovery(tmp_path):
+    """A job that exists in both `running/` and `pending/` -- a duplicate id, a crash caught
+    mid-transition -- makes `_rename_durably` refuse, correctly. What must not follow is the
+    refusal escaping `reconcile`: it runs at the top of *every* worker iteration, so an exception
+    here does not fail one job, it kills the worker, and then kills the next `h3 worker` on the
+    same file, and the queue stays dead until someone shuffles directories by hand.
+
+    Two jobs, one of them wedged: the healthy one must still be recovered, and the wedged one must
+    come back in `conflicted` rather than vanish -- a silently shorter queue is the failure mode
+    `scan`'s `Broken` list already exists to prevent.
+    """
+    root = tmp_path / "queue"
+    wedged = _claimed(root, tmp_path / "h3-a-1x1", tag="a")
+    healthy = _claimed(root, tmp_path / "h3-b-1x1", tag="b")
+    # The desync itself: `running/<id>.json` is live, and a stale copy already sits at the path
+    # reconciliation would move it back to.
+    shutil.copyfile(q.job_path(root, wedged.id, "running"),
+                    q.job_path(root, wedged.id, "pending"))
+
+    result = q.reconcile(root)
+
+    assert [j.id for j in result.changed] == [healthy.id], (
+        "one wedged job must not stop every other job from being recovered")
+    assert [Path(b.path).stem for b in result.conflicted] == [wedged.id]
+    assert "refusing to overwrite" in result.conflicted[0].error
+    assert q.job_path(root, wedged.id, "running").exists(), (
+        "the wedged job must be left exactly where it was, for a human to look at")
+
+    # And the worker survives it -- not once, but on every pass, which is the actual claim.
+    again = q.reconcile(root)
+    assert [Path(b.path).stem for b in again.conflicted] == [wedged.id]
+
+
+def test_reconcile_on_a_queue_that_does_not_exist_is_empty_not_an_error(tmp_path):
+    """`scan` already answers "no directory" with "no jobs" rather than an exception, and the HTTP
+    layer that will call both should not have to tell a missing queue apart from an empty one.
+    Without this, `queue_lock`'s `os.open` raises a bare `FileNotFoundError` -- not even a
+    `QueueError` -- from inside a request handler.
+    """
+    result = q.reconcile(tmp_path / "no-such-queue")
+    assert result.changed == [] and result.alive == [] and result.conflicted == []
+    assert not (tmp_path / "no-such-queue").exists(), (
+        "reconciling a queue that does not exist must not create one")
+
+
+class _CountingFile:
+    """A file wrapper that records how many bytes were handed out, whichever way they were read --
+    `read`, `readline` or iteration. Counting only `read` would miss a `deque(stream)` walk, which
+    is exactly the implementation this is here to rule out.
+    """
+
+    def __init__(self, handle, counted):
+        self._handle = handle
+        self._counted = counted
+
+    def __enter__(self):
+        self._handle.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._handle.__exit__(*exc)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        chunk = next(self._handle)
+        self._counted.append(len(chunk))
+        return chunk
+
+    def read(self, *a):
+        chunk = self._handle.read(*a)
+        self._counted.append(len(chunk))
+        return chunk
+
+    def readline(self, *a):
+        chunk = self._handle.readline(*a)
+        self._counted.append(len(chunk))
+        return chunk
+
+    def seek(self, *a):
+        return self._handle.seek(*a)
+
+    def tell(self):
+        return self._handle.tell()
+
+
+def test_read_log_tail_seeks_instead_of_walking_the_whole_log(tmp_path, monkeypatch):
+    """`reconcile` calls this inside its exclusive critical section, and the design spec promises
+    the queue lock is held for milliseconds. A bounded `deque` over the whole file keeps memory
+    flat but still pays the full read -- tens of megabytes for a run that prints a line per
+    forward -- so every page load would wait behind that walk. Counting the bytes actually
+    delivered is what tells "constant memory" and "constant work" apart; asserting on the returned
+    text alone cannot, since both implementations return the same forty lines.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    log = q.log_path(root, "j")
+    log.write_bytes(b"".join(b"line %d\n" % i for i in range(200_000)))
+    size = log.stat().st_size
+    assert size > 1_000_000, "the log has to be big enough for the difference to mean something"
+
+    counted: list[int] = []
+    real_open = open
+    monkeypatch.setattr(q, "open",
+                        lambda *a, **kw: _CountingFile(real_open(*a, **kw), counted),
+                        raising=False)
+
+    tail = q.read_log_tail(root, "j")
+
+    assert tail.splitlines() == [f"line {i}" for i in range(199_960, 200_000)], (
+        "the tail must be the last forty lines, in order")
+    assert sum(counted) < size / 10, (
+        f"read {sum(counted)} of {size} bytes to fetch forty lines -- the whole log was walked")
+
+
+def test_read_log_tail_handles_a_log_shorter_than_one_chunk(tmp_path):
+    """The backwards walk must stop at the start of the file rather than seeking past it, and a
+    log with fewer than `lines` lines is the common case for a run that died early.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    q.log_path(root, "j").write_text("шаг 1\nшаг 2\n")
+    assert q.read_log_tail(root, "j") == "шаг 1\nшаг 2\n"
+    assert q.read_log_tail(root, "j", lines=1) == "шаг 2\n"
+    assert q.read_log_tail(root, "missing") == "", "no log at all is an empty tail, not an error"
+
+
+def test_read_log_tail_does_not_return_a_half_line_from_the_chunk_boundary(tmp_path):
+    """Reading backwards means the buffer usually starts in the middle of a line, and the loop has
+    to fetch one newline *more* than it needs so that partial line can be thrown away. Stopping at
+    exactly `lines` newlines -- the natural off-by-one -- returns that half line as the first line
+    of the tail, which is a log entry that never existed.
+
+    Invisible at ordinary sizes: a chunk of a progress log holds hundreds of newlines, so both
+    versions stop after one read and slice the same forty lines out of it. It only shows when the
+    number of lines asked for is exactly what one backwards chunk provides, so that is computed
+    here from the chunk size rather than guessed, and the lines are fixed-width so the arithmetic
+    is exact.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    width = 100  # bytes per line, newline included
+    chunk = q._TAIL_CHUNK_BYTES
+    assert chunk % width, (
+        "this test needs the chunk size not to be a multiple of the line width, or the boundary "
+        f"lands between lines and proves nothing -- pick another width for chunk={chunk}")
+    wanted = -(-chunk // width)  # newlines contained in one backwards chunk
+    count = wanted * 3
+    q.log_path(root, "j").write_bytes(
+        b"".join(f"{i:0{width - 1}d}\n".encode() for i in range(count)))
+
+    tail = q.read_log_tail(root, "j", lines=wanted)
+
+    assert tail.splitlines() == [f"{i:0{width - 1}d}" for i in range(count - wanted, count)], (
+        "the first line of the tail was cut in half at the chunk boundary")
+
+
+def test_read_log_tail_keeps_the_last_line_when_it_has_no_newline(tmp_path):
+    """A run killed by `SIGKILL` mid-print leaves the last line unterminated, and that line is
+    usually the interesting one.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    q.log_path(root, "j").write_text("шаг 1\nоборвано")
+    assert q.read_log_tail(root, "j", lines=1) == "оборвано"
 
 
 def test_reconcile_waits_for_the_queue_lock(tmp_path):

@@ -157,6 +157,14 @@ def test_the_lease_covers_the_child_and_the_marker_lands_before_release(tmp_path
             observed["marker_during_wait"] = q.result_path(root, job.id).exists()
             return 0
 
+    def spawn(*a, **kw):
+        # The spec's wording is "the worker takes the lease **before starting the subprocess**",
+        # and nothing else in the suite pins that half down: moving `_acquire_lease` to just after
+        # `spawn` leaves every other test green, while opening a window in which the job is in
+        # `running/` with a live child and no lease -- a reconciling worker would call it dead.
+        observed["lease_at_spawn"] = q.lease_is_free(root, job.id) is False
+        return _Proc()
+
     marker_seen_free = {}
     real_release = worker._release_lease
 
@@ -166,14 +174,42 @@ def test_the_lease_covers_the_child_and_the_marker_lands_before_release(tmp_path
 
     worker._release_lease = spy_release
     try:
-        worker.run_job(root, job, spawn=lambda *a, **kw: _Proc())
+        worker.run_job(root, job, spawn=spawn)
     finally:
         worker._release_lease = real_release
 
+    assert observed["lease_at_spawn"] is True, "the lease must be held before the child is started"
     assert observed["lease_during_wait"] is True, "the lease was released while the child ran"
     assert observed["marker_during_wait"] is False, "the marker was written before the child exited"
     assert marker_seen_free["marker_before_release"] is True, (
         "the lease was released before the result marker existed -- a crash there is unrecoverable")
+
+
+def test_the_job_leaves_running_only_after_the_lease_has_been_released(tmp_path, monkeypatch):
+    """The last two steps of `run_job`'s documented order. No corruption follows from swapping
+    them today -- there is one worker, and it is the one holding the lease -- but the order is
+    written down as a contract, and an undefended contract is a comment. It is also the order that
+    keeps "the job is in `running/`" and "its lease is held" from ever disagreeing in the wrong
+    direction: a job that reaches `done/` while its lease is still held reads, to anything probing
+    the lease, as a finished job that is still generating.
+    """
+    root = tmp_path / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _stem(_DRY, str(tmp_path / "h3-a-1x1")), {})
+    job = q.claim(root)
+    order: list[str] = []
+
+    real_release = worker._release_lease
+    real_finish = q.finish
+    monkeypatch.setattr(worker, "_release_lease",
+                        lambda fd: (order.append("release"), real_release(fd))[1])
+    monkeypatch.setattr(q, "finish",
+                        lambda *a, **kw: (order.append("finish"), real_finish(*a, **kw))[1])
+
+    worker.run_job(root, job, spawn=lambda cmd, **kw: _FakeProcess(0, "ok\n", kw))
+
+    assert order == ["release", "finish"], (
+        f"the lease must be released before the job leaves running/; got {order}")
+    assert q.job_path(root, job.id, "done").exists()
 
 
 def test_the_lease_is_free_again_once_run_job_returns(tmp_path):
@@ -312,15 +348,25 @@ def _signal_worker(root, mode, argument):
     of the session.
     """
     script = _SIGNAL_WORKER.format(project=str(PROJECT_ROOT))
+    # `start_new_session=True` for the *worker under test*, not only for its child. Without it the
+    # worker sits in pytest's own process group, and the moment a mutation drops
+    # `start_new_session=True` from `run_job` the job's child joins that same group -- at which
+    # point the worker's `killpg` on the second stop signal takes the test runner down with it.
+    # That is not a red test, it is a run that vanishes mid-output: verified against exactly that
+    # mutation. The harness must contain its own blast radius.
     proc = subprocess.Popen([sys.executable, "-c", script, str(root), mode, str(argument)],
-                            stdout=subprocess.PIPE, text=True)
+                            stdout=subprocess.PIPE, text=True, start_new_session=True)
     try:
         assert proc.stdout.readline().strip() == "spawned", "the worker never started a job"
         yield proc
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=10)
+        # The whole group, for the same reason the worker signals the whole group: killing the
+        # worker alone would leave its child (and grandchild) running for the rest of the session.
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+        proc.wait(timeout=10)
 
 
 def test_the_first_stop_signal_lets_the_running_job_finish_and_takes_no_new_one(tmp_path):
