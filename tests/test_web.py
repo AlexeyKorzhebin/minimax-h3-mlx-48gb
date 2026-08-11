@@ -2812,3 +2812,14 @@ def test_a_page_action_racing_the_worker_leaves_exactly_one_job(queue_server, op
     assert outcome in _RACE_OUTCOMES[operation], (outcome, answer, claimed)
     if status == 409:
         assert answer["error"]["code"] == "job_not_pending", answer
+
+
+def test_a_route_must_say_which_body_fields_it_takes():
+    """`allowed` is required and keyword-only, exactly like `_serve_file`'s `suffixes` after
+    circle 3 of task 5. A default -- of anything at all -- makes forgetting the argument
+    indistinguishable from a decision, and the decision here is which fields a route promises to
+    honour. Forgetting it is a `TypeError` at the call site instead.
+    """
+    handler = web._Handler.__new__(web._Handler)
+    with pytest.raises(TypeError):
+        web._Handler._json_request(handler)
