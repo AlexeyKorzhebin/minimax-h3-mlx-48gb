@@ -774,11 +774,16 @@ def test_started_at_is_constant_across_every_write_in_one_session(tmp_path, monk
     ], "written_at must advance on every write, or the fixture cannot tell it apart from started_at"
 
 
-def test_writer_holds_a_shared_lock_for_the_life_of_the_run(tmp_path):
+def test_writer_holds_an_exclusive_lock_for_the_life_of_the_run(tmp_path):
     """The liveness signal `h3_48gb.runs._writer_alive` reads is a real, held `flock` on a
     companion file next to the checkpoint — proved here with the reader's own probe technique
-    (a non-blocking exclusive `flock` attempt), not a mocked stand-in, while a real run is
-    mid-flight. The companion file must also be gone once the run ends.
+    (a non-blocking shared `flock` attempt), not a mocked stand-in, while a real run is mid-flight.
+
+    The companion file must survive the run ending, unlocked but present -- see
+    `CheckpointStore.release_lock`'s docstring for why deleting it here would be exactly the race
+    task 3's fix exists to close: a reader (or the next writer for the same identity) that has the
+    path open at the moment of an unlink can end up holding a lock on an inode nobody can reach by
+    that name any more.
     """
     import fcntl
     from h3_48gb.checkpoint import CheckpointStore
@@ -793,29 +798,41 @@ def test_writer_holds_a_shared_lock_for_the_life_of_the_run(tmp_path):
             probe = open(store.lock_path, "rb")
             try:
                 try:
-                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
                     observed.append(True)  # acquired -- would mean no writer holds it
                     fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
                 except OSError:
-                    observed.append(False)  # blocked -- the writer's own shared lock is held
+                    observed.append(False)  # blocked -- the writer's own exclusive lock is held
             finally:
                 probe.close()
             return super()._decode_video(rows, *args, **kwargs)
 
     run(ObserveMidRun(), checkpoint_path=path, keep_checkpoint=True)
 
-    assert observed == [False], "a non-blocking exclusive probe must fail while the run is live"
-    assert not store.lock_path.exists(), "the companion lock file must be removed once the run ends"
+    assert observed == [False], "a non-blocking shared probe must fail while the run is live"
+    assert store.lock_path.exists(), "the companion lock file must survive the run ending"
+    # And it must actually be unlocked now -- proof `release_lock` dropped the flock, not just
+    # that the file happens to still be there.
+    probe = open(store.lock_path, "rb")
+    try:
+        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        raise AssertionError("the lock must be released once the run ends, even though the file "
+                              "stays")
+    finally:
+        probe.close()
 
 
-def test_lock_is_released_and_removed_after_a_crash_python_catches(tmp_path):
+def test_lock_is_released_but_kept_after_a_crash_python_catches(tmp_path):
     """A crash that unwinds through Python (unlike a hard process kill) still runs
     `CheckpointStore.release_lock` from the `finally` wrapping the whole call, so a graceful
-    failure cleans up its own lock exactly like a graceful success does. The checkpoint itself is
-    untouched — it is still there for the next resume — only the liveness marker goes; see
-    `release_lock`'s docstring for why that is the right trade rather than leaving a lock file that
-    would misleadingly read as "confirmed dead" for a run that may only be retrying.
+    failure drops its own flock exactly like a graceful success does. The checkpoint itself is
+    untouched — it is still there for the next resume — and so, deliberately, is the lock file:
+    see `release_lock`'s docstring for why removing it would reopen the very race it exists to
+    close.
     """
+    import fcntl
     from h3_48gb.checkpoint import CheckpointStore
 
     path = tmp_path / "crash.safetensors"
@@ -827,7 +844,118 @@ def test_lock_is_released_and_removed_after_a_crash_python_catches(tmp_path):
         pass
 
     assert path.exists(), "the checkpoint should survive a crash, for the next resume"
-    assert not store.lock_path.exists(), "a Python-level crash must still release and remove the lock"
+    assert store.lock_path.exists(), "a Python-level crash must not delete the lock file"
+    probe = open(store.lock_path, "rb")
+    try:
+        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        raise AssertionError("a Python-level crash must still release the flock")
+    finally:
+        probe.close()
+
+
+def test_a_second_writer_is_refused_the_lock(tmp_path):
+    """Two writers on the same checkpoint must not both proceed -- a shared lock (the bug this
+    fixes) lets both hold it at once; the fix is an exclusive lock, and the second `acquire_lock`
+    must fail loudly instead of silently succeeding beside the first.
+    """
+    from h3_48gb.checkpoint import CheckpointError, CheckpointLocked, CheckpointStore
+
+    path = tmp_path / "race.safetensors"
+    first = CheckpointStore(path)
+    first.acquire_lock()
+    try:
+        second = CheckpointStore(path)
+        try:
+            second.acquire_lock()
+        except CheckpointLocked:
+            pass
+        except CheckpointError as exc:
+            raise AssertionError(f"expected CheckpointLocked specifically, got {type(exc)}: {exc}")
+        else:
+            raise AssertionError(
+                "a second writer must not acquire the lock while the first still holds it")
+    finally:
+        first.release_lock()
+
+    # And once the first writer releases, a second writer must be able to acquire it -- this is
+    # not a permanent refusal, only a concurrent one.
+    third = CheckpointStore(path)
+    third.acquire_lock()
+    third.release_lock()
+
+
+def test_the_lock_is_held_before_the_checkpoint_is_read_for_resume(tmp_path, monkeypatch):
+    """The lock must be acquired before `_load_for_resume` reads anything off disk -- taking it
+    any later would let two processes both read the same `completed_steps` and then race each
+    other to `os.replace`, walking the checkpoint's progress backwards. Proved here by having
+    `_load_for_resume` itself probe the lock with an independent file handle: if the real writer's
+    own lock is not already held by the time this runs, the probe would succeed.
+    """
+    import fcntl
+
+    import h3_48gb.checkpoint as checkpoint_mod
+
+    path = tmp_path / "order.safetensors"
+    # A first, uninterrupted session, so the second run below actually has something to resume.
+    run(ToyPipeline(), checkpoint_path=path, keep_checkpoint=True)
+
+    observed: list[str] = []
+    original_load = checkpoint_mod._load_for_resume
+
+    def spy(store, *args, **kwargs):
+        probe = open(store.lock_path, "rb")
+        try:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                observed.append("free")  # would mean nothing holds the lock yet
+                fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                observed.append("held")  # the running writer's own lock is already in place
+        finally:
+            probe.close()
+        return original_load(store, *args, **kwargs)
+
+    monkeypatch.setattr(checkpoint_mod, "_load_for_resume", spy)
+
+    run(ToyPipeline(), checkpoint_path=path, keep_checkpoint=True)
+
+    assert observed == ["held"], (
+        "the lock must already be held by the time the checkpoint is read for resume, "
+        f"got {observed}")
+
+
+def test_a_real_write_is_visible_to_the_reader_end_to_end(tmp_path):
+    """Exercises the whole liveness contract through both real modules at once: a genuine
+    pipeline run under `run()` (through `checkpoint.py`'s writer), and the genuine reader entry
+    point `h3_48gb.runs.scan()` -- not a hand-built lock path.
+
+    `test_writer_holds_an_exclusive_lock_for_the_life_of_the_run` above proves the writer's own
+    flock, but does so by reading `store.lock_path` -- the writer's own property -- so the writer
+    and the probe travel together if that suffix ever changes. `test_runs.py`'s fixtures build the
+    reader's lock path as a literal `".lock"` suffix, independent of `CheckpointStore.lock_path` --
+    correct in isolation, but they never touch a real writer either. This is the one test in the
+    suite that would turn red if `checkpoint.py`'s writer and `runs.py`'s reader ever disagreed on
+    the filename convention, because it is the only one that drives a real instance of each and
+    asks whether they still agree.
+    """
+    from h3_48gb import runs as runs_mod
+
+    outdir = tmp_path / "outdir"
+    path = outdir / "checkpoints" / "h3-live.safetensors"
+    observed: list[str | None] = []
+
+    class ObserveMidRun(ToyPipeline):
+        def _decode_video(self, rows, *args, **kwargs):
+            states = {r.outdir: r.state for r in runs_mod.scan(outdir)}
+            observed.append(states.get(outdir))
+            return super()._decode_video(rows, *args, **kwargs)
+
+    run(ObserveMidRun(), checkpoint_path=path, keep_checkpoint=True)
+
+    assert observed == ["in_flight"], (
+        f"runs.scan() must see the real writer as in_flight mid-run, got {observed}")
 
 
 def test_session_timing_is_not_part_of_the_identity():

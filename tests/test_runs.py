@@ -57,14 +57,17 @@ def write_free_lock_file(checkpoint: Path) -> Path:
 
 @contextlib.contextmanager
 def held_lock(checkpoint: Path):
-    """A companion lock file with a live shared flock on it, for the lifetime of the `with` block.
+    """A companion lock file with a live exclusive flock on it, for the lifetime of the `with`
+    block.
 
     What a running writer looks like from the outside -- see `checkpoint.CheckpointStore.acquire_lock`
-    for the real thing this stands in for.
+    for the real thing this stands in for. Exclusive, matching the real writer: `_writer_alive`'s
+    probe takes a *shared* lock, and two shared locks never conflict with each other, so a fixture
+    that held a shared lock here would let the probe through and silently stop testing anything.
     """
     path = lock_path_for(checkpoint)
     handle = open(path, "wb")
-    fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     try:
         yield path
     finally:
@@ -265,6 +268,56 @@ def test_no_lock_file_at_all_reads_unknown_regardless_of_rate(tmp_path, monkeypa
     assert runs["old-format"].state == "unknown"
     assert runs["healthy"].state == "unknown"  # no lock file for this one either
     assert runs["healthy"].completed == 2, "an unknown neighbour must not hide a healthy run"
+
+
+def test_a_non_busy_kernel_error_reads_unknown_not_in_flight(tmp_path, monkeypatch):
+    """`flock` can fail for reasons that have nothing to do with another holder -- `ENOTSUP` on a
+    filesystem that does not implement `flock` at all, `EIO`, `ENOLCK`. Reading any `OSError`
+    whatsoever as "someone else holds it" turns those into a permanent false `in_flight`: on a
+    filesystem where `flock` never works, this bug would make `h3 watch` hang forever on a run
+    that may already be finished, or may never have started.
+    """
+    import errno
+
+    import h3_48gb.runs as runs_mod
+
+    checkpoint = write_checkpoint(tmp_path / "weird-fs" / "checkpoints" / "h3-a.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:20:00")
+    write_free_lock_file(checkpoint)  # a lock file must exist, or `_writer_alive` never calls flock
+
+    def fake_flock(fd, operation):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(runs_mod.fcntl, "flock", fake_flock)
+
+    assert {r.outdir.name: r.state for r in scan(tmp_path)}["weird-fs"] == "unknown"
+
+
+def test_scan_finds_a_run_from_its_lock_file_before_any_checkpoint_exists(tmp_path):
+    """The window between a writer taking its lock and its first checkpoint write -- a single
+    forward can run for minutes -- must not read as nothing running (task 6). `scan` has to find
+    this run from the lock file alone, with no `completed`/`total` to report -- `None`, not `0`,
+    since there is genuinely no data yet rather than a checkpoint claiming zero progress.
+    """
+    import fcntl
+
+    checkpoints = tmp_path / "warming-up" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    handle = open(checkpoints / "h3-abc.safetensors.lock", "wb")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    try:
+        runs = scan(tmp_path)
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+    assert len(runs) == 1, f"expected exactly one run found by its lock file alone, got {runs}"
+    run = runs[0]
+    assert run.outdir.name == "warming-up"
+    assert run.state == "in_flight"
+    assert run.completed is None
+    assert run.total is None
 
 
 def test_a_missing_written_at_reads_exactly_unknown_without_a_lock_file(tmp_path):

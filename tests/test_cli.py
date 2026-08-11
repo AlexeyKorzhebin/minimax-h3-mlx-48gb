@@ -483,6 +483,32 @@ def test_watch_exits_when_nothing_is_running(tmp_path, capsys):
     assert "ничего не идёт" in capsys.readouterr().out
 
 
+def test_watch_reports_in_flight_before_any_checkpoint_is_written(tmp_path):
+    """The blind window between a writer taking its lock and its first checkpoint write (task 6) --
+    a single forward can run for minutes -- must read as a run in progress through the whole CLI
+    path (`run_status` and `format_status`), not just at the `scan()` level.
+    """
+    import fcntl
+    from h3_48gb.cli import format_status, run_status
+
+    checkpoints = tmp_path / "warming-up" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    handle = open(checkpoints / "h3-abc.safetensors.lock", "wb")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    try:
+        report = run_status(tmp_path)
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+    assert report["runs"][0]["state"] == "in_flight"
+    assert report["runs"][0]["completed"] is None
+    assert report["runs"][0]["total"] is None
+    text = format_status(report)
+    assert "ничего не идёт" not in text, "a live run must not be reported as nothing running"
+    assert "warming-up" in text
+
+
 def test_watch_continues_while_a_writer_holds_the_lock_then_terminates(tmp_path, monkeypatch):
     """`in_flight` is the one state `WATCH_RUNNING_STATES` may never lose: it is the only state
     backed by a signal that can actually change between two polls (the companion lock file), so it
@@ -499,7 +525,7 @@ def test_watch_continues_while_a_writer_holds_the_lock_then_terminates(tmp_path,
                      completed=2, total=7, started_at="2026-08-10T21:00:00",
                      completed_at_start=0, written_at="2026-08-10T21:20:00")
     handle = open(lock_path_for(checkpoint), "wb")
-    fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # matches the real writer's exclusive lock
 
     sleep_calls = []
 

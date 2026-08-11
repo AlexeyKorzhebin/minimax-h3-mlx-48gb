@@ -97,6 +97,7 @@ ERROR_CODES = {
     "checkpoint_not_found": "`resume` was asked for, but no checkpoint matches this run's identity",
     "checkpoint_mismatch": "a checkpoint exists but was written for a different request or model",
     "checkpoint_corrupt": "a checkpoint exists but could not be read",
+    "checkpoint_locked": "another process already holds the lock for this checkpoint",
     "preview_interval_negative": "--preview-every is negative; 0 disables previews, N > 0 sets a cadence",
     "end_image_without_image": "--end-image was given without --image; the end frame anchors a run that must also have a start frame",
     "image_not_found": "a keyframe path does not exist",
@@ -623,7 +624,7 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
     # would not read) — CliError just gives them a stable code so `--json` does not have to
     # string-match the sentence. Imported here rather than at module scope to keep `import
     # h3_48gb` from pulling in mlx.core (see the module docstring / test_import_h3_48gb_...).
-    from h3_48gb.checkpoint import CheckpointCorrupt, CheckpointMismatch
+    from h3_48gb.checkpoint import CheckpointCorrupt, CheckpointLocked, CheckpointMismatch
 
     started = time.perf_counter()
     try:
@@ -653,6 +654,8 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
         ) from exc
     except CheckpointCorrupt as exc:
         raise CliError("checkpoint_corrupt", str(exc)) from exc
+    except CheckpointLocked as exc:
+        raise CliError("checkpoint_locked", str(exc)) from exc
     elapsed = time.perf_counter() - started
 
     # Raw first: an encoder failure then costs seconds, not a fifteen-hour run.
@@ -881,9 +884,12 @@ def run_status(outdir: Path) -> dict:
 
 
 def _progress(row: dict) -> str:
-    """`completed/total`, with `total=None` rendered as `?` rather than the literal `None`."""
+    """`completed/total`, with either half rendered as `?` rather than the literal `None` -- a
+    run caught by its lock file before its first checkpoint write has neither yet (see
+    `h3_48gb.runs.scan`)."""
+    completed = row["completed"] if row["completed"] is not None else "?"
     total = row["total"] if row["total"] is not None else "?"
-    return f"{row['completed']}/{total}"
+    return f"{completed}/{total}"
 
 
 def format_status(report: dict) -> str:

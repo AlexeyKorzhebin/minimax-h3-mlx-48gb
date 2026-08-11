@@ -88,6 +88,10 @@ class CheckpointCorrupt(CheckpointError):
     """The checkpoint could not be read, or read back inconsistent."""
 
 
+class CheckpointLocked(CheckpointError):
+    """Another process already holds the exclusive lock this checkpoint needs to be written."""
+
+
 def pop_checkpoint_kwargs(kwargs: dict) -> dict:
     """Remove and return this module's keyword arguments from a ``__call__`` kwargs dict.
 
@@ -267,9 +271,11 @@ class CheckpointStore:
     ``os.replace`` atomic — a rename across filesystems is not.
 
     The temporary name carries the writing process's pid, so two processes never fight over the
-    same partial file. They *would* still overwrite each other's finished checkpoints, since the
-    name is derived from the request — but two identical requests running at once on one 48 GB
-    machine is not a thing that fits in memory anyway.
+    same partial file. Two processes targeting the *same* identity at once — two accidental
+    invocations of the same command, say — are refused outright by :meth:`acquire_lock` instead:
+    on a 48 GB machine, two identical requests running concurrently do not fit in memory anyway,
+    and racing each other to `os.replace` the same checkpoint could walk its `completed_steps`
+    backwards.
     """
 
     def __init__(self, path: str | Path):
@@ -282,45 +288,70 @@ class CheckpointStore:
 
     @property
     def lock_path(self) -> Path:
-        """The liveness marker: a companion file a live writer holds a shared flock on.
+        """The liveness marker: a stable companion file a live writer holds an exclusive flock on.
 
         Named after the checkpoint itself rather than kept anywhere else, so a reader who only has
         the checkpoint path (``h3_48gb.runs`` never sees a ``CheckpointStore``) can derive it with
-        the same one-line rule this property encodes: see ``runs._writer_alive``.
+        the same one-line rule this property encodes: see ``runs._writer_alive``. Stable, and never
+        deleted by this class (see :meth:`release_lock`): a reader must always find the same path
+        to probe, whether the last writer exited cleanly, crashed, or has not written its first
+        checkpoint yet.
         """
         return self.path.with_name(self.path.name + ".lock")
 
     # -- liveness
 
     def acquire_lock(self) -> None:
-        """Take a shared flock on the companion file, held until :meth:`release_lock`.
+        """Take an exclusive, non-blocking flock on the companion file, held until
+        :meth:`release_lock`. Raises :class:`CheckpointLocked` if another process holds it.
 
-        Shared, not exclusive: two writers racing for the same identity would not conflict on this
-        lock, but that collision is already out of scope for this store (see the class docstring —
-        two identical requests running at once do not fit in memory anyway). What the *reader*
-        needs is a lock type its own non-blocking probe reliably conflicts with, and a shared lock
-        blocks a conflicting exclusive attempt just as well as another exclusive lock would; see
-        ``runs._writer_alive`` for that probe.
+        Exclusive, not shared: two writers on the same identity racing to `os.replace` the same
+        checkpoint is exactly the failure this lock exists to rule out, not merely to detect after
+        the fact — a shared lock would let both hold it at once and neither would ever find out.
+        An exclusive lock makes the second writer's attempt fail right here, before it reads a
+        single byte of the checkpoint the first writer may already be resuming from. That ordering
+        is why ``CheckpointingPipeline.__call__`` calls this *before* ``_load_for_resume``: taking
+        the lock after the read would still let two processes both load the same
+        ``completed_steps`` and then race each other to write, which is the same bug with the
+        refusal arriving one step too late to prevent it.
 
         No timeout and no PID recorded anywhere: `fcntl.flock` is released by the kernel the moment
         this process's file descriptor closes, for any reason, including a crash that never runs a
-        line of Python cleanup. That is the whole mechanism this feature relies on.
+        line of Python cleanup. That is the whole mechanism this feature, and
+        ``runs._writer_alive``'s probe of it, rely on.
         """
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-        fcntl.flock(self._lock_fd, fcntl.LOCK_SH)
+        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            raise CheckpointLocked(
+                f"{self.lock_path} is already locked: another process is writing {self.path}, or "
+                "(rarely) this filesystem does not honor flock. Refusing to start a second writer "
+                "on the same checkpoint rather than risk two processes racing to replace the same "
+                "file."
+            ) from exc
+        self._lock_fd = fd
 
     def release_lock(self) -> None:
-        """Drop the lock and remove the companion file. Idempotent, and safe with no lock held.
+        """Drop the exclusive flock. Idempotent, and safe with no lock held.
 
         Meant to run from a ``finally`` wrapping the whole generation, so it fires on success and
-        on any exception that unwinds through Python — a graceful exit, in other words. A file left
-        behind unlocked reads to a reader as "the writer is confirmed gone", which is more than a
-        graceful exit alone proves (the interpreter could still be about to retry, or the caller
-        could catch the exception and carry on); removing the marker instead leaves the honest
-        answer, "nothing to say". Only a crash that skips Python's stack unwinding entirely —
-        SIGKILL, a segfault, the OOM killer — leaves the file behind for a reader to find unlocked,
-        and that is deliberate: it is exactly the case a reader needs the file for.
+        on any exception that unwinds through Python. The companion file itself is deliberately
+        *never* removed here — only the flock on it is.
+
+        An earlier version also unlinked the file, on the theory that a lock file left behind
+        unlocked already reads to a reader as "the writer is gone", so deleting it too was just
+        tidying up. It was not: `unlink` drops the directory *name*, not the inode, and this
+        process is not the only one that can have that name open at the moment it runs — a reader
+        already mid-probe in `h3_48gb.runs._writer_alive`, or the next writer for the same
+        identity starting up, can hold their own file descriptor on the very inode being unlinked.
+        Whoever opens the path *after* the unlink gets a freshly created, lock-free file — plausible
+        proof of "no writer", even while the unlinked inode's flock is still live under a
+        descriptor nobody watching the path can reach any more. Leaving the file in place removes
+        that window: a reader always opens the one inode a writer could actually be holding a lock
+        on, and its answer — locked or not — was never ambiguous in the first place.
         """
         if self._lock_fd is not None:
             try:
@@ -328,7 +359,6 @@ class CheckpointStore:
             finally:
                 os.close(self._lock_fd)
                 self._lock_fd = None
-        self.lock_path.unlink(missing_ok=True)
 
     # -- writing
 
@@ -783,27 +813,36 @@ class CheckpointingPipeline:
 
         identity = request_identity(arguments, self.checkpoint_identity_extra(), tag=options.get("tag"))
         store = _resolve_store(options, identity)
-        loaded = _load_for_resume(
-            store,
-            identity,
-            resume=options.get("resume", True),
-            on_corrupt=options.get("on_corrupt", "restart"),
-            verbose=verbose,
-        )
-        run = ResumableRun(
-            store=store,
-            identity=identity,
-            loaded=loaded,
-            verbose=verbose,
-            store_prompt_embeds=bool(options.get("checkpoint_prompt_embeds", True)),
-            completed_at_start=loaded.completed_steps if loaded is not None else 0,
-        )
 
-        # Held for the rest of this method, released in the `finally` below — see
-        # `CheckpointStore.acquire_lock`/`release_lock` for why a shared flock on a companion file
-        # is the liveness signal `h3_48gb.runs` reads, and why no timeout is involved.
+        # Acquired here — right after `store` is known, before anything reads the checkpoint off
+        # disk — and released in the `finally` below. This is also the earliest a lock file could
+        # exist, which matters on its own: `_load_for_resume` and the loop it precedes can run for
+        # a long time (a single forward is minutes; see the module docstring) before the first
+        # checkpoint write, and `h3_48gb.runs.scan` needs a lock file on disk through that whole
+        # window to tell a live run apart from nothing running. Taking the lock any later than this
+        # would also reopen the race it exists to close: two processes both calling
+        # `_load_for_resume` before either held the lock could both read the same `completed_steps`
+        # and then race each other to `os.replace`, leaving the checkpoint a step behind whichever
+        # wrote last. See `CheckpointStore.acquire_lock` for why the lock is exclusive, not shared,
+        # and `h3_48gb.runs._writer_alive` for the liveness signal it gives a reader.
         store.acquire_lock()
         try:
+            loaded = _load_for_resume(
+                store,
+                identity,
+                resume=options.get("resume", True),
+                on_corrupt=options.get("on_corrupt", "restart"),
+                verbose=verbose,
+            )
+            run = ResumableRun(
+                store=store,
+                identity=identity,
+                loaded=loaded,
+                verbose=verbose,
+                store_prompt_embeds=bool(options.get("checkpoint_prompt_embeds", True)),
+                completed_at_start=loaded.completed_steps if loaded is not None else 0,
+            )
+
             original_dit, original_text_encoder = self.dit, self.text_encoder
             self._resume_run = run
             self.dit = StepInterceptor(original_dit, run)

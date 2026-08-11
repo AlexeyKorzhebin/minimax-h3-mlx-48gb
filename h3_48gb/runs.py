@@ -11,6 +11,7 @@ the point is that `h3 status` starts instantly and that these tests need no weig
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import struct
@@ -29,9 +30,22 @@ _META_KEY = "h3_checkpoint"
 #: The suffix a live writer's companion lock file carries, appended to the checkpoint's own name.
 #: Must match `CheckpointStore.lock_path` in `checkpoint.py` exactly -- the two are never allowed
 #: to share an import (`checkpoint.py` pulls in `mlx`; this module may not), so this is the one
-#: piece of the contract duplicated instead of shared, and it is exercised end to end against a
-#: real writer in `test_checkpoint.py::test_writer_holds_a_shared_lock_for_the_life_of_the_run`.
+#: piece of the contract duplicated instead of shared. A test that reconstructs this suffix by
+#: reading `CheckpointStore.lock_path` (or this very constant) cannot catch the two sides
+#: diverging, because it would drift along with whichever side changed. The one test that can is
+#: `test_checkpoint.py::test_a_real_write_is_visible_to_the_reader_end_to_end`, which drives a real
+#: writer through `checkpoint.py` and a real reader through this module's own `scan` and asserts
+#: the two still agree -- see that test's docstring for the mutation that would slip past every
+#: other lock test in the suite without it.
 _LOCK_SUFFIX = ".lock"
+
+#: `fcntl.flock`'s non-blocking failure mode when *another* holder has the file: `EWOULDBLOCK`
+#: and `EAGAIN` are the same errno on most platforms but not guaranteed to be, so both are listed;
+#: `EACCES` covers `fcntl`-based lock emulations (some platforms map lock contention there instead
+#: of `EAGAIN`). Anything else -- `ENOTSUP` on a filesystem that does not implement `flock` at all,
+#: `EIO`, `ENOLCK` -- means the probe could not test anything, not that someone is holding it; see
+#: `_writer_alive`.
+_BUSY_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
 
 
 def _parse(stamp: str) -> datetime:
@@ -127,20 +141,25 @@ def read_checkpoint_meta(path: Path) -> dict:
 def _writer_alive(checkpoint: Path) -> bool | None:
     """Whether a live writer holds the checkpoint's companion lock file.
 
-    ``True``  -- the shared flock is held: some process has this checkpoint open right now.
+    ``True``  -- another process holds the lock right now: some writer has this checkpoint open.
     ``False`` -- the companion file exists, but nothing holds its lock. A writer held it at some
                  point and is now gone -- a fact, not a guess: the kernel drops an `fcntl.flock`
                  lock the instant the holding file descriptor closes, for any reason, including a
                  crash that never ran a line of the writer's own cleanup code.
-    ``None``  -- there is no companion file to check at all. Either this checkpoint predates the
-                 code that writes one, or its writer already removed the file on a graceful exit
-                 (see `checkpoint.CheckpointStore.release_lock`). Either way there is nothing on
-                 disk to say whether a writer is still around, so there is nothing to say.
+    ``None``  -- either there is no companion file to check at all (this checkpoint predates the
+                 code that writes one), or there is one but `flock` could not judge it -- some
+                 kernel/filesystem error unrelated to another holder (`ENOTSUP` on a filesystem
+                 that does not implement `flock`, `EIO`, `ENOLCK`, ...). Either way there is
+                 nothing on disk this probe can vouch for, so there is nothing to say.
 
-    The probe takes its own non-blocking *exclusive* lock and releases it immediately. A writer's
-    *shared* lock is exactly what a conflicting exclusive attempt blocks on, so failure to acquire
-    is proof of a live holder and success is proof there is none -- no timeout, no stored pid to
-    go stale, no constant to tune.
+    The probe takes its own non-blocking *shared* lock and releases it immediately. The writer's
+    own lock is exclusive (`checkpoint.CheckpointStore.acquire_lock`), and an exclusive lock blocks
+    a conflicting shared attempt exactly as reliably as it blocks another exclusive one -- shared is
+    what a reader actually wants, since it does not also exclude a second, concurrent reader.
+    Failure with an errno that means "something else is holding it" (`EWOULDBLOCK`/`EAGAIN`, or
+    `EACCES` on platforms that report contention that way) is proof of a live holder; failure with
+    any other errno is not evidence of anything and must not be read as one -- see `_BUSY_ERRNOS`.
+    No timeout, no stored pid to go stale, no constant to tune.
     """
     lock_path = checkpoint.with_name(checkpoint.name + _LOCK_SUFFIX)
     try:
@@ -149,9 +168,9 @@ def _writer_alive(checkpoint: Path) -> bool | None:
         return None
     try:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return True
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as exc:
+            return True if exc.errno in _BUSY_ERRNOS else None
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         return False
     finally:
@@ -182,7 +201,9 @@ def scan(root: Path) -> list[Run]:
     """Every run under `root`, found recursively. Never raises for a file it finds."""
     root = Path(root)
     runs: list[Run] = []
+    found: set[Path] = set()
     for checkpoint in sorted(root.rglob("checkpoints/h3-*.safetensors")):
+        found.add(checkpoint)
         outdir = checkpoint.parent.parent
         try:
             meta = read_checkpoint_meta(checkpoint)
@@ -227,4 +248,23 @@ def scan(root: Path) -> list[Run]:
             runs.append(Run(outdir=outdir, error=f"{type(exc).__name__}: {exc}"))
             continue
         runs.append(run)
+
+    # A writer takes its companion lock at the very start of generation, well before the first
+    # checkpoint write -- a single forward can run for minutes (see `checkpoint.py`'s module
+    # docstring), so `checkpoints/` can hold nothing but a lock file for most of an hour of a run
+    # that is very much alive. Without this second pass, the loop above finds nothing during that
+    # whole window, and `h3 watch` would report "nothing running" and exit on it. `completed` and
+    # `total` stay `None` here (`Run`'s own defaults) rather than `0`: there genuinely is no
+    # progress data yet, and `0` would claim one where the truth is "not written yet".
+    for lock_file in sorted(root.rglob(f"checkpoints/h3-*.safetensors{_LOCK_SUFFIX}")):
+        checkpoint = lock_file.with_name(lock_file.name[: -len(_LOCK_SUFFIX)])
+        if checkpoint in found:
+            continue  # already reported above, with real progress data
+        if _writer_alive(checkpoint) is not True:
+            # No confirmed live holder and no checkpoint to read: either a writer crashed before
+            # ever writing (an unheld lock file, nothing more to say than that), or the checkpoint
+            # was written in the gap between the two `rglob` calls above and will be picked up,
+            # with real data, on the next scan. Either way there is nothing to add here.
+            continue
+        runs.append(Run(outdir=checkpoint.parent.parent, state="in_flight"))
     return runs
