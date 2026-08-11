@@ -1560,15 +1560,24 @@ def test_error_codes_are_documented_in_one_place():
     from h3_48gb.cli import ERROR_CODES
 
     source = "\n".join(inspect.getsource(module) for module in (cli_mod, web_mod))
-    raised_codes = set(re.findall(r'CliError\(\s*"([a-z0-9_]+)"', source))
+    # Three sources, not one, because there are three ways a code reaches a caller. A `CliError`
+    # raise site is the original one. `web._error_bytes("code", ...)` writes a refusal the router
+    # made before any exception existed -- scanned as a literal so a typo in one shows up here as
+    # an undocumented code. And `web.ROUTER_CODES` is read back at runtime rather than matched in
+    # source: it is the mapping `_router_code` answers from, so its values are on the wire by
+    # construction, including for statuses the standard library raises on this server's behalf and
+    # no line in this repository mentions.
+    raised_codes = (set(re.findall(r'CliError\(\s*"([a-z0-9_]+)"', source))
+                    | set(re.findall(r'_error_bytes\(\s*"([a-z0-9_]+)"', source))
+                    | set(web_mod.ROUTER_CODES.values()))
 
     undocumented = raised_codes - set(ERROR_CODES)
-    assert not undocumented, f"raised via CliError but missing from ERROR_CODES: {undocumented}"
+    assert not undocumented, f"reachable by a caller but missing from ERROR_CODES: {undocumented}"
 
     unraised = set(ERROR_CODES) - raised_codes
     assert not unraised, (
-        f"listed in ERROR_CODES but no `raise CliError(...)` site in cli.py or web.py produces "
-        f"them: {unraised}")
+        f"listed in ERROR_CODES but nothing in cli.py or web.py can produce them -- no raise "
+        f"site, no `_error_bytes` literal, no entry in web.ROUTER_CODES: {unraised}")
 
 
 # -- verbose: the --json stdout contract must survive a chatty pipeline -------------------------

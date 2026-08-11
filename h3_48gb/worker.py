@@ -37,6 +37,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -80,6 +81,13 @@ def job_command(job, python: str = sys.executable) -> list[str]:
     return ["caffeinate", "-dimsu", python, "-m", "h3_48gb", *job.args]
 
 
+#: How long `hold_worker_lock` waits before its one retry. Long enough to outlast the web server's
+#: liveness probe, which holds `worker.lock` for the few microseconds between its `LOCK_EX` and its
+#: `LOCK_UN`; short enough that a real second worker still fails while the human who typed
+#: `h3 worker` is still looking at the terminal.
+WORKER_LOCK_RETRY_SECONDS = 0.05
+
+
 @contextlib.contextmanager
 def hold_worker_lock(root):
     """Hold `queue/worker.lock` exclusively for the duration of the block, or refuse immediately.
@@ -88,14 +96,29 @@ def hold_worker_lock(root):
     not silently queue up behind the first and start running jobs hours later when the first one
     exits. `flock` dies with the process that holds it, so a worker killed by `kill -9`, a panic or
     a power cut leaves nothing to clean up -- the next `h3 worker` starts normally.
+
+    **One retry, and it is not a nicety.** `web.worker_state` answers "is a worker running" by
+    taking this same lock non-blockingly and dropping it again, so there is a microsecond window in
+    which a perfectly legitimate `h3 worker` collides with a *probe* and dies with
+    `worker_already_running` -- naming a worker that does not exist. With the page polling every
+    twenty seconds and a human starting the worker from the terminal beside it, that window gets
+    sampled. Retrying once distinguishes the two: a probe is gone in microseconds, and a real
+    worker holds the lock for days, so it is still there 50 ms later.
+
+    Blocking outright instead would be wrong in the other direction -- a second worker would wait
+    for days rather than say so.
     """
     path = Path(root) / WORKER_LOCK_NAME
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise WorkerAlreadyRunning(f"another worker already holds {path}") from exc
+        for remaining in (1, 0):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if not remaining:
+                    raise WorkerAlreadyRunning(f"another worker already holds {path}") from exc
+                time.sleep(WORKER_LOCK_RETRY_SECONDS)
         try:
             yield
         finally:

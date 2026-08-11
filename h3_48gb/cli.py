@@ -123,6 +123,15 @@ ERROR_CODES = {
     "path_outside_root": "a path names something outside every root the server may touch, or writes into the read-only models root",
     "prompt_name_invalid": "a prompt name is not a bare `[A-Za-z0-9_-]+.txt` -- it names a directory or another suffix",
     "queue_unwritable": "the queue directory could not be read or written; see `detail.path`",
+    # Router-level refusals: produced by `web._router_code` (and by the standard library's own
+    # error path behind it) rather than by a `raise CliError(...)`, which is why the contract test
+    # reads `web.ROUTER_CODES` instead of only scanning source for raise sites. They belong in this
+    # dict all the same: the contract the design spec fixes is the one on the wire, and a page
+    # turning a `code` into a Russian sentence meets these two more often than any other.
+    "host_not_allowed": "the request's Host header is not this server's own address (DNS rebinding)",
+    "not_found": "no route, or no file, at that URL",
+    "method_not_implemented": "this server has no handler for that HTTP method",
+    "bad_request": "the request itself could not be served -- malformed, or too large to accept",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 

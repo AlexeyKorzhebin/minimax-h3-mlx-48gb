@@ -64,6 +64,10 @@ def _generate_subparser(parser):
 _PATH_FLAG_NAMES = sorted(web.PATH_FLAGS)
 
 
+#: Sentinel for "leave the Host header alone" -- `None` has to mean "send no Host at all".
+_KEEP = object()
+
+
 @dataclass
 class _Live:
     """A running server plus the directories it was pointed at."""
@@ -100,23 +104,34 @@ def server(tmp_path):
     live.httpd.server_close()
 
 
-def _request(live: _Live, url: str, method: str = "GET"):
+def _request(live: _Live, url: str, method: str = "GET", host=_KEEP):
     """`(status, headers, body_bytes)` for a raw URL, sent verbatim.
 
     `http.client` does not normalise the request target, which is what makes `/static/../cli.py`
     reach the server as written instead of being collapsed by the client.
+
+    `host` replaces the `Host` header (`None` removes it), for the rebinding tests; left alone it
+    is whatever `http.client` builds, i.e. this server's real address.
     """
     connection = http.client.HTTPConnection(web.LOOPBACK, live.port, timeout=10)
     try:
-        connection.request(method, url)
+        if host is _KEEP:
+            connection.request(method, url)
+        elif host is None:
+            connection.putrequest(method, url, skip_host=True, skip_accept_encoding=True)
+            connection.endheaders()
+        else:
+            connection.putrequest(method, url, skip_host=True, skip_accept_encoding=True)
+            connection.putheader("Host", host)
+            connection.endheaders()
         response = connection.getresponse()
         return response.status, dict(response.getheaders()), response.read()
     finally:
         connection.close()
 
 
-def _json(live: _Live, url: str, method: str = "GET"):
-    status, headers, body = _request(live, url, method)
+def _json(live: _Live, url: str, method: str = "GET", host=_KEEP):
+    status, headers, body = _request(live, url, method, host=host)
     assert headers["Content-Type"] == "application/json", (
         f"{url} answered {headers['Content-Type']!r}; the contract is JSON everywhere")
     return status, json.loads(body)
@@ -534,16 +549,119 @@ def test_media_serves_a_file_from_a_run_directory(server):
     assert body == b"\x00mp4"
 
 
-def test_media_cannot_step_out_of_one_run_into_another(server):
-    """`/media` is bounded by the run's directory, not merely by the outdir: with only the outer
-    check this URL stays inside `H3_OUTDIR` and would be served.
+@pytest.mark.parametrize("url", [
+    "/media/run-a/../run-b/secret.mp4",   # the spelling the first version already refused
+    "/media//run-b/secret.mp4",           # empty first segment -> `<outdir>/""` is the outdir
+    "/media/./run-b/secret.mp4",          # `.` -> the outdir again
+    "/media/%2e/run-b/secret.mp4",        # and the encoded `.`
+])
+def test_media_cannot_step_out_of_one_run_into_another(server, url):
+    """`/media` is bounded by **one run's** directory, not merely by the outdir.
+
+    The last three spellings are review circle 1's finding, and they were all served with a 200
+    before the fix: each collapses `<outdir>/<run>` back onto the outdir itself, after which the
+    inner "is the file inside the run directory" check compares the outdir with the outdir and
+    lets the entire output tree through. The original test only covered the `..` spelling, so it
+    stayed green over the hole.
     """
     (server.outdir / "run-a").mkdir()
     other = server.outdir / "run-b"
     other.mkdir()
     (other / "secret.mp4").write_bytes(b"x")
-    status, body = _json(server, "/media/run-a/../run-b/secret.mp4")
+    status, body = _json(server, url)
+    assert status == 400, f"{url} answered {status}"
+    assert body["error"]["code"] == "path_outside_root"
+
+
+def test_media_does_not_serve_the_queue(server):
+    """`queue/` **is** a direct child of the outdir, so the direct-child rule alone lets this
+    through. It is not a run: the page reads the queue over `/api/state`, which returns jobs, not
+    whatever bytes happen to be sitting in `queue/logs/`.
+    """
+    (server.queue_root / "pending" / "20260811-000000-x-0000.json").write_text('{"a": 1}')
+    status, body = _json(server, "/media/queue/pending/20260811-000000-x-0000.json")
     assert status == 400 and body["error"]["code"] == "path_outside_root"
+
+
+def test_media_serves_a_file_nested_inside_a_run(server):
+    """The direct-child rule constrains the **run**, not the file under it. A run directory has
+    subdirectories of its own (`checkpoints/`), and a rule that flattened the tail as well would
+    refuse ordinary contents for no gain: everything below the run directory is still inside it.
+    """
+    nested = server.outdir / "a" / "b"
+    nested.mkdir(parents=True)
+    (nested / "x.mp4").write_bytes(b"x")
+    status, _, body = _request(server, "/media/a/b/x.mp4")
+    assert status == 200 and body == b"x"
+
+
+def test_media_still_serves_a_real_run(server):
+    """Paired with all of the above: a rule that refused every `/media` URL would satisfy them."""
+    run = server.outdir / "19-run"
+    run.mkdir()
+    (run / "h3-x-preview-step05.jpg").write_bytes(b"\xff\xd8jpg")
+    status, headers, body = _request(server, "/media/19-run/h3-x-preview-step05.jpg")
+    assert status == 200 and headers["Content-Type"] == "image/jpeg" and body == b"\xff\xd8jpg"
+
+
+# -- circle 1: the Host header (DNS rebinding) ---------------------------------------------------
+
+
+@pytest.mark.parametrize("host", ["evil.example", "evil.example:80", "attacker.test:1",
+                                  "127.0.0.1:1", "localhost", "127.0.0.1", None])
+def test_a_request_for_someone_elses_host_is_refused(server, host):
+    """DNS rebinding: a page on `evil.example` whose name resolves to `127.0.0.1` on its second
+    lookup is same-origin with itself, so the browser sends the request and hands the body back to
+    the attacker's script. Binding the loopback does not help -- the browser is already on it.
+    `Host` is the one header that script cannot forge, so it is the whole defence.
+
+    The port-less spellings are in the list because they are what an attacker gets for free on
+    port 80, and a check that compared only the hostname would accept them.
+    """
+    status, body = _json(server, "/api/state", host=host)
+    assert status == 403, f"Host {host!r} answered {status}"
+    assert body["error"]["code"] == "host_not_allowed"
+
+
+@pytest.mark.parametrize("template", ["127.0.0.1:{port}", "localhost:{port}"])
+def test_the_two_spellings_of_this_machine_are_accepted(server, template):
+    """The other half: a check that refused everything would pass the test above, and the page
+    itself is opened as one of these two.
+    """
+    status, body = _json(server, "/api/state", host=template.format(port=server.port))
+    assert status == 200 and body["ok"] is True
+
+
+def test_the_host_check_runs_before_the_route(server):
+    """A rebinding request must not be able to reach a route at all -- not the queue, not a file,
+    not even a 404 that confirms what exists. Checking inside each route is a check the next route
+    forgets.
+    """
+    for url in ("/", "/static/app.js", "/media/run/x.mp4", "/api/nothing", "/static/../cli.py"):
+        status, body = _json(server, url, host="evil.example")
+        assert status == 403 and body["error"]["code"] == "host_not_allowed", url
+
+
+# -- circle 1: a byte that is not a path ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("url", ["/static/%00../cli.py", "/static/a%00b.css",
+                                 "/media/run%00/x.mp4", "/media/run/x%00.mp4"])
+def test_a_nul_byte_is_a_refusal_not_a_crash(server, url):
+    """`Path.resolve()` raises `ValueError` on an embedded NUL. Reaching the `internal_error` net
+    keeps the JSON contract but reports an attacker-controlled input as a bug in this server; a
+    500 is a thing someone investigates, and this is a thing someone refuses.
+    """
+    status, body = _json(server, url)
+    assert status == 400, f"{url} answered {status}"
+    assert body["error"]["code"] == "path_outside_root"
+
+
+def test_a_tilde_naming_no_such_user_is_a_refusal_too(tmp_path):
+    """`expanduser()` raises `RuntimeError` for an unknown user, from the same line."""
+    with pytest.raises(CliError) as excinfo:
+        web.resolve_within("~nosuchuser1234/x", _roots(tmp_path), write=False)
+    assert excinfo.value.code == "path_outside_root"
 
 
 def test_a_missing_static_file_is_a_json_404_not_an_html_page(server):
@@ -571,7 +689,9 @@ def test_an_unsupported_method_answers_json_rather_than_an_html_page(server, met
     status, headers, body = _request(server, "/api/state", method=method)
     assert status == 501
     assert headers["Content-Type"] == "application/json"
-    assert json.loads(body)["error"]["code"] == "method_not_allowed"
+    # `method_not_implemented`, not `method_not_allowed`: the status the standard library raises
+    # here is 501, and the two used to share a name that said 405 while the status said 501.
+    assert json.loads(body)["error"]["code"] == "method_not_implemented"
     assert b"<html" not in body.lower() and b"<!DOCTYPE" not in body
 
 
@@ -738,10 +858,41 @@ def test_h3_web_does_not_create_the_queue_directory(tmp_path, monkeypatch):
     assert not (tmp_path / "queue").exists()
 
 
-def test_the_three_new_codes_are_in_the_shared_contract():
+def test_the_new_codes_are_in_the_shared_contract():
     from h3_48gb.cli import ERROR_CODES
 
     assert {"path_outside_root", "prompt_name_invalid", "queue_unwritable"} <= set(ERROR_CODES)
+
+
+def test_every_router_code_is_in_the_shared_contract():
+    """One dictionary on the wire, not two. `ROUTER_CODES` carries the two most ordinary failures
+    there are -- a typo in the address and the wrong method -- and task 7's page turns a `code`
+    into a Russian sentence.
+    """
+    from h3_48gb.cli import ERROR_CODES
+
+    missing = set(web.ROUTER_CODES.values()) - set(ERROR_CODES)
+    assert not missing, f"the router answers with codes ERROR_CODES does not document: {missing}"
+
+
+def test_the_router_only_ever_answers_with_a_documented_code():
+    """The catch-all branches too: `414`, `431` and `505` are raised by the standard library on
+    this server's behalf and no line here mentions them by number.
+    """
+    answered = {web._router_code(status) for status in range(400, 600)}
+    assert answered <= set(web.ROUTER_CODES.values()), (
+        f"undocumented codes reachable: {answered - set(web.ROUTER_CODES.values())}")
+
+
+@pytest.mark.parametrize("status,code", [(403, "host_not_allowed"), (404, "not_found"),
+                                         (501, "method_not_implemented"), (414, "bad_request"),
+                                         (505, "bad_request"), (502, "internal_error")])
+def test_the_router_code_matches_its_status(status, code):
+    """A name that disagrees with its status is worse than no name: `405` and `501` used to share
+    `method_not_allowed`, so a caller reading the code was told the wrong thing about the response
+    it was holding.
+    """
+    assert web._router_code(status) == code
 
 
 def test_every_status_this_module_maps_belongs_to_a_real_code():
@@ -750,3 +901,18 @@ def test_every_status_this_module_maps_belongs_to_a_real_code():
 
     unknown = set(web.ERROR_STATUS) - set(ERROR_CODES)
     assert not unknown, f"ERROR_STATUS names codes that do not exist: {unknown}"
+
+
+def test_job_not_pending_arrives_with_its_409():
+    """Green today, red the moment task 6 adds the code without its status.
+
+    `ERROR_STATUS` deliberately has no entry for a code nothing raises yet, but leaving that as a
+    comment leaves the actual failure mode uncovered: the code gets added, the `raise` gets
+    written, the status gets forgotten, the answer goes out as 400 instead of 409, and the
+    one-directional check above stays green because it only looks at entries that exist.
+    """
+    from h3_48gb.cli import ERROR_CODES
+
+    if "job_not_pending" in ERROR_CODES:
+        assert web.ERROR_STATUS.get("job_not_pending") == 409, (
+            "job_not_pending is a lost race, not a bad request -- it answers 409")

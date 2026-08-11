@@ -20,6 +20,7 @@ Interruptions are real too: the fault-injection tests kill an actual worker proc
 is the only way the test can be wrong in the same direction the code can.
 """
 import contextlib
+import fcntl
 import json
 import os
 import signal
@@ -28,6 +29,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -254,6 +256,47 @@ def test_a_worker_can_start_once_the_previous_one_has_finished(tmp_path):
     spawned = []
     assert _answer_within(10, lambda: worker.main_loop(
         root, poll=0.01, stop=_stop_after(0.2), spawn=_recording(spawned))) == 0
+
+
+def test_a_momentary_holder_does_not_look_like_a_second_worker(tmp_path):
+    """`web.worker_state` answers "is a worker running" by taking this very lock non-blockingly
+    and dropping it again, so an `h3 worker` starting inside that microsecond window used to die
+    with `worker_already_running`, naming a worker that was really a liveness probe. With the page
+    polling every twenty seconds beside the terminal the human types into, that window gets hit.
+
+    Driven with a stub rather than a real race: one `BlockingIOError` and then success is exactly
+    what a probe leaves behind, and a real race would either be flaky or never reproduce at all.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    real = fcntl.flock
+    calls = []
+
+    def flock_once_busy(fd, operation):
+        calls.append(operation)
+        if len(calls) == 1:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+        return real(fd, operation)
+
+    with mock.patch.object(worker.fcntl, "flock", flock_once_busy):
+        with worker.hold_worker_lock(root):
+            pass
+    assert len(calls) >= 2, "hold_worker_lock gave up on the first BlockingIOError"
+
+
+def test_a_worker_that_really_is_running_still_refuses(tmp_path):
+    """The other half of the retry: it must distinguish a probe from a worker, not swallow both.
+    A real worker holds the lock for days, so it is still there after the retry -- checked with a
+    lock held by a separate process, and bounded in time so a retry loop that never gave up would
+    fail rather than hang.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    with _external_lock(root, "LOCK_EX", name="worker.lock"):
+        started = time.monotonic()
+        with pytest.raises(worker.WorkerAlreadyRunning):
+            _answer_within(5, lambda: worker.hold_worker_lock(root).__enter__())
+        assert time.monotonic() - started < 2, "the refusal stopped being immediate"
 
 
 def test_main_loop_runs_the_queue_in_order_and_counts_what_it_ran(tmp_path):

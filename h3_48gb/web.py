@@ -91,6 +91,7 @@ PROMPTS_DIR = "prompts"
 #: `test_error_codes_are_documented_in_one_place` applies to `ERROR_CODES` itself. Add both in
 #: one commit.
 ERROR_STATUS = {
+    "host_not_allowed": 403,
     "queue_unwritable": 500,
     "internal_error": 500,
 }
@@ -132,7 +133,19 @@ def resolve_within(path, roots: dict[str, Path], *, write: bool) -> Path:
     mechanism behind "the models root is readable but never writable": there is no separate check
     to forget, the root simply is not in the set being searched.
     """
-    resolved = Path(path).expanduser().resolve()
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except (ValueError, OSError, RuntimeError) as exc:
+        # A NUL byte (`/static/%00../cli.py`) makes `resolve()` raise `ValueError`, and `~nobody`
+        # makes `expanduser()` raise `RuntimeError`. Both arrive from outside, so both are the
+        # caller asking for something that is not a path -- a refusal, not a 500. Reaching the
+        # handler's `internal_error` net instead would report an attacker-controlled input as a
+        # bug in this server.
+        raise CliError(
+            "path_outside_root",
+            f"not usable as a filesystem path: {path!r} ({type(exc).__name__}: {exc})",
+            {"path": str(path), "write": write},
+        ) from exc
     allowed = {name: root for name, root in roots.items()
                if not (write and name in READ_ONLY_ROOTS)}
     for root in allowed.values():
@@ -231,6 +244,17 @@ def worker_state(queue_root) -> str:
     `O_RDONLY` for the same reason it is not `O_RDWR`: `flock` does not care about the fd's access
     mode, and asking for less means the probe still works on a queue directory mounted read-only.
 
+    **The probe takes the lock for microseconds, and that is visible from outside.** `LOCK_EX`
+    then `LOCK_UN` is the only way `flock` answers the question at all, so a worker starting in
+    that window would see `BlockingIOError` and die with `worker_already_running`, naming a worker
+    that is really this probe. `worker.hold_worker_lock` retries once for exactly this reason --
+    the two modules are coupled here and the comment exists in both.
+
+    For the same reason this must not be called from a process that is itself holding the lock:
+    `flock` is per-process, so the probe would re-acquire its own lock, answer `"stopped"`, and
+    then **release it**. The server and the worker are separate processes, which is what makes
+    that safe; `queue.lease_is_free` carries the same caveat for the same reason.
+
     `"unknown"` is reserved for a probe that genuinely could not run -- the path is a directory,
     the filesystem has no `flock`. It is never a guess in either direction: `/api/state` says
     "unknown" and the page says so too, rather than telling a human the queue is about to move
@@ -301,19 +325,44 @@ def _error_bytes(code: str, message: str, detail: dict | None = None) -> bytes:
                         "error": {"code": code, "message": message, "detail": detail or {}}})
 
 
-def _router_code(status: int) -> str:
-    """A machine-readable code for a refusal the router made before any `CliError` existed.
+#: The code each router-level refusal answers with -- the ones this module produces before any
+#: `CliError` exists, or that `BaseHTTPRequestHandler` produces on its own behalf.
+#:
+#: These live in `cli.ERROR_CODES` alongside the CLI's own, and that is a correction from review
+#: circle 1. The first version kept them out on the argument that `ERROR_CODES` documents what
+#: `CliError` raises; but the contract the design spec fixes is the one **on the wire** ("контракт
+#: один на CLI, работника и сервер"), and these go over that wire on the two most ordinary
+#: failures there are -- a typo in the address and the wrong method. Task 7's page turns a `code`
+#: into a Russian sentence; with them missing it would fall into its catch-all on exactly those
+#: two, and nothing would have stopped a rename.
+#:
+#: A dict rather than a chain of `if`s so the contract test can read the values back out instead
+#: of pattern-matching source, and so `_router_code` provably returns nothing else
+#: (`test_the_router_only_ever_answers_with_a_documented_code`).
+ROUTER_CODES = {
+    403: "host_not_allowed",
+    404: "not_found",
+    # 501, not 405: `BaseHTTPRequestHandler` answers an unknown method with NOT_IMPLEMENTED, and
+    # that is the only way this code is reached. The two used to share the name
+    # `method_not_allowed`, so the code said 405 while the status said 501.
+    501: "method_not_implemented",
+    400: "bad_request",
+    # `505 HTTP Version Not Supported` is a 5xx number for a client mistake -- the base class
+    # raises it on a malformed version in the request line. Listed explicitly so the catch-all
+    # below does not label it `internal_error` and send someone looking for a bug in this server.
+    505: "bad_request",
+    500: "internal_error",
+}
 
-    These are deliberately **not** in `cli.ERROR_CODES`: that dict is the contract for refusals the
-    CLI raises, every entry of which has a real `raise CliError(...)` behind it, and "this URL does
-    not name anything" is not one of them. The wire contract stays uniform -- same envelope, same
-    `error.code` field -- without inventing CLI codes that nothing raises.
+
+def _router_code(status: int) -> str:
+    """A documented code for `status`. Anything unlisted collapses onto the 4xx/5xx catch-all --
+    `414 URI Too Long` and `431 Header Too Large` are `bad_request`, both of which the base class
+    can raise before this module sees a request at all.
     """
-    if status == 404:
-        return "not_found"
-    if status in (405, 501):
-        return "method_not_allowed"
-    return "bad_request" if status < 500 else "internal_error"
+    if status in ROUTER_CODES:
+        return ROUTER_CODES[status]
+    return ROUTER_CODES[400] if status < 500 else ROUTER_CODES[500]
 
 
 #: What `mimetypes` cannot be trusted to know on every machine, and what the page actually loads.
@@ -356,6 +405,34 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self._respond(self._route_get)
 
+    def _check_host(self) -> None:
+        """Refuse a request whose `Host` is not this server's own address.
+
+        Without this, **DNS rebinding reads the whole queue today.** The design spec already states
+        the threat -- "браузер выполняет чужой JavaScript, и запрос может прийти не только со своей
+        страницы" -- but circle 1 of the server drew only the directory-traversal conclusion from
+        it. The rest of it: a page on `evil.example` whose name resolves, on its second lookup, to
+        `127.0.0.1` is same-origin with itself, so the browser sends the request and hands the
+        response back to the attacker's script. Nothing about binding the loopback prevents that;
+        the loopback is where the browser already is.
+
+        `Host` is the one header the attacker cannot forge from JavaScript -- it is the name that
+        was navigated to. Comparing it against the address this server was actually bound to is
+        therefore the whole defence, and it is five lines.
+
+        A missing `Host` is refused as well. HTTP/1.0 permits it, but a browser never omits it, so
+        allowing it would leave the check with a hole reachable by the same `fetch` it exists to
+        stop -- and a `curl` or `nc` by hand can pass one.
+        """
+        host = self.headers.get("Host") if self.headers else None
+        if host not in self.server.allowed_hosts:
+            raise CliError(
+                "host_not_allowed",
+                f"Host {host!r} is not this server's address; expected one of "
+                f"{sorted(self.server.allowed_hosts)}",
+                {"host": host, "allowed": sorted(self.server.allowed_hosts)},
+            )
+
     def _respond(self, route) -> None:
         """Run `route` and write whatever it produced, converting every exception into JSON.
 
@@ -366,6 +443,10 @@ class _Handler(BaseHTTPRequestHandler):
         anticipated the contents of.
         """
         try:
+            # Before the route, not inside it: every route this server will ever have -- including
+            # task 6's mutating ones -- has to be behind this, and a check a route has to remember
+            # to call is a check the next route forgets.
+            self._check_host()
             status, content_type, body = route()
         except CliError as exc:
             status = ERROR_STATUS.get(exc.code, 400)
@@ -404,17 +485,38 @@ class _Handler(BaseHTTPRequestHandler):
     def _media(self, relative: str) -> tuple[int, str, bytes]:
         """A preview frame or a finished clip from **one** run's directory under the outdir.
 
-        Two checks, not one, and the second is the one that is easy to leave out: the run directory
-        must be inside the outdir, *and* the file must be inside that run directory. With only the
-        first, `/media/run/../other-run/secret.mp4` stays inside the outdir and passes -- which is
-        not what "ограничен каталогом конкретного прогона" means.
+        Four checks, and review circle 1 found the route shipping with only two of them. "Inside
+        the outdir" plus "inside the run directory" reads complete and is not: the *first segment*
+        of the URL decides what "the run directory" means, and three spellings make it collapse
+        back onto the outdir itself, at which point the second check compares the outdir with the
+        outdir and passes everything under it.
+
+        1. there must be a run segment and a file after it;
+        2. `<outdir>/<run>` must resolve inside the outdir -- this is what stops `..`;
+        3. it must be a **direct child** of the outdir. `/media//x`, `/media/./x` and
+           `/media/%2e/x` all resolve `<outdir>/<run>` to the outdir itself, and without this line
+           they served the whole output tree, `queue/logs/*.log` and `queue/pending/*.json`
+           included. Verified live before the fix, on all three spellings;
+        4. it must not be the queue. `queue/` *is* a direct child of the outdir, so check 3 lets
+           `/media/queue/pending/<id>.json` through on its own. The queue is not a run, and the
+           page has `/api/state` for it.
+
+        The tail after the run segment is deliberately *not* flattened: a run directory has
+        subdirectories of its own (`checkpoints/`), and everything below it is still inside it.
         """
         run, separator, rest = relative.partition("/")
         if not separator or not rest:
             return 404, "application/json", _error_bytes(
                 "not_found", "a media URL is /media/<run>/<file>", {"path": relative})
-        run_dir = resolve_within(Path(self.server.outdir) / run,
-                                 {"outdir": Path(self.server.outdir)}, write=False)
+        outdir = Path(self.server.outdir).resolve()
+        run_dir = resolve_within(Path(self.server.outdir) / run, {"outdir": outdir}, write=False)
+        if run_dir.parent != outdir or run_dir == Path(self.server.queue_root).resolve():
+            raise CliError(
+                "path_outside_root",
+                f"/media serves one run's directory directly under the output directory, and "
+                f"{run!r} is not one",
+                {"path": relative, "run": run, "resolved": str(run_dir), "outdir": str(outdir)},
+            )
         return _serve_file(run_dir, rest)
 
     def send_error(self, code, message=None, explain=None) -> None:
@@ -477,6 +579,10 @@ def make_server(queue_root, outdir, repo=None, models=None, webui=None, port=DEF
     production depends on a caller getting them right.
     """
     httpd = _Server((LOOPBACK, port), _Handler)
+    # Built from the port the socket actually got, not from `port`: with `port=0` the kernel picks,
+    # and a set built from the request would reject every request the server then received.
+    bound = httpd.server_address[1]
+    httpd.allowed_hosts = frozenset({f"{LOOPBACK}:{bound}", f"localhost:{bound}"})
     httpd.queue_root = Path(queue_root)
     httpd.outdir = Path(outdir)
     httpd.webui = Path(webui) if webui is not None else WEBUI_ROOT
