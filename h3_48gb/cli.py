@@ -121,6 +121,9 @@ ERROR_CODES = {
     # envelope, and a caller matching on `error.code` should not have to know which process
     # produced it. See `test_error_codes_are_documented_in_one_place`, which scans both modules.
     "args_invalid": "`h3 generate` will not accept this argument list; `detail.stderr` carries argparse's own sentence",
+    "command_not_allowed": "only `h3 generate` may be queued, and never with --no-checkpoint",
+    "output_stem_conflict": "another pending or running job, or a file already on disk, claims that output name",
+    "job_not_pending": "the job is no longer in pending/: the worker claimed it, or it was already removed",
     "path_outside_root": "a path names something outside every root the server may touch, or writes into the read-only models root",
     "prompt_name_invalid": "a prompt name is not a bare `[A-Za-z0-9_-]+.txt` -- it names a directory or another suffix",
     "queue_unwritable": "the queue directory could not be read or written; see `detail.path`",
@@ -130,7 +133,7 @@ ERROR_CODES = {
     # reads `web.ROUTER_CODES` instead of only scanning source for raise sites. They belong in this
     # dict all the same: the contract the design spec fixes is the one on the wire, and a page
     # turning a `code` into a Russian sentence meets these two more often than any other.
-    "host_not_allowed": "the request's Host header is not this server's own address (DNS rebinding)",
+    "host_not_allowed": "the request did not come from this server's own page: its Host is not this address (DNS rebinding), or, on a write, its Origin/Sec-Fetch-Site is another site's",
     "not_found": "no route, or no file, at that URL",
     "method_not_implemented": "this server has no handler for that HTTP method",
     "bad_request": "the request itself could not be served -- malformed, or too large to accept",

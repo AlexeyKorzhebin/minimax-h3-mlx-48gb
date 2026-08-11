@@ -41,7 +41,7 @@ from pathlib import Path
 
 from h3_48gb import queue as q
 from h3_48gb import runs as runs_module
-from h3_48gb.cli import DEFAULT_CANVAS, CliError, build_parser
+from h3_48gb.cli import DEFAULT_CANVAS, ERROR_CODES, CliError, build_parser
 from h3_48gb.worker import WORKER_LOCK_NAME
 
 #: The only address this server ever binds. Not a parameter, and deliberately not one: a flag that
@@ -148,7 +148,9 @@ ERROR_STATUS = {
 #:
 #: It is meant to stay nearly empty. `test_no_planned_code_has_already_arrived` fails once a code
 #: here lands in `ERROR_CODES`, which forces it out of this set and back under the ordinary check.
-PLANNED_CODES = frozenset({"job_not_pending"})
+#: That is exactly what happened to `job_not_pending` in task 6: the code arrived, the entry left,
+#: and `ERROR_STATUS`'s 409 -- placed here a task early -- is now covered by the ordinary check.
+PLANNED_CODES = frozenset()
 
 
 def models_root() -> Path:
@@ -214,33 +216,52 @@ def resolve_within(path, roots: dict[str, Path], *, write: bool) -> Path:
     )
 
 
-def check_path_flags(args: list[str], roots: dict[str, Path]) -> None:
-    """Refuse an `h3` argument list that points any of its path flags outside `roots`.
+def check_path_flags(args: list[str], roots: dict[str, Path]) -> list[str]:
+    """`args` with every path flag's value replaced by the checked, absolute path -- or a refusal.
+
+    **It returns the argument list, and the caller must use what it returns.** Checking one string
+    and queueing another is the whole bug this shape exists to prevent, and it is not hypothetical:
+    `Path.resolve()` anchors a relative value at the *current* process's working directory, which
+    is the server's, while the job is run by a worker started from some other terminal. `--outdir
+    out` checked here as `<server cwd>/out` would be executed as `<worker cwd>/out` -- a different
+    directory, never examined by anything. `~` is the same problem in a second spelling: argparse's
+    `type=Path` does not expand it, so `--outdir ~/video-out` reaches the filesystem as a literal
+    directory named `~`. Both disappear once the value stored in the job is the resolved one.
 
     Both spellings argparse accepts are checked -- `--outdir /etc` and `--outdir=/etc` -- because
     the second one is a perfectly ordinary way to write it and a checker that only understood the
-    first would be a hole with a test suite in front of it.
+    first would be a hole with a test suite in front of it. Each is rewritten in the spelling it
+    arrived in, so an argument list stays recognisable to the person who submitted it.
 
     A flag with no value after it is left alone: `argparse` in the validation subprocess is what
     reports that, with a better message than this function could invent.
+
+    This is not the whole path defence for a submission, and it cannot be. `--tag` takes no path
+    and yet builds one -- the output name is `outdir / f"h3-{tag}-{W}x{H}"`, so `--tag
+    ../../../../tmp/pwned` walks straight through this function. The line that catches it is the
+    `resolve_within` on `output_stem` in `validate_args`'s caller, which judges the path the run
+    would actually write rather than the flags it was spelled with. See `prepare_submission`.
     """
+    normalised = [str(item) for item in args]
     index = 0
-    while index < len(args):
-        token = args[index]
+    while index < len(normalised):
+        token = normalised[index]
         flag, equals, inline = token.partition("=")
         if flag not in PATH_FLAGS:
             index += 1
             continue
         if equals:
-            value = inline
-        elif index + 1 < len(args):
-            value = args[index + 1]
+            value, value_index = inline, index
+        elif index + 1 < len(normalised):
+            value, value_index = normalised[index + 1], index + 1
             index += 1
         else:
             index += 1
             continue
-        resolve_within(value, roots, write=PATH_FLAGS[flag] == "write")
+        resolved = resolve_within(value, roots, write=PATH_FLAGS[flag] == "write")
+        normalised[value_index] = f"{flag}={resolved}" if equals else str(resolved)
         index += 1
+    return normalised
 
 
 def resolve_prompt_name(name: str, repo=REPO_ROOT) -> Path:
@@ -503,6 +524,224 @@ def estimate(args, checkpoint, *, report=None) -> dict:
     }
 
 
+#: The only subcommand this server will queue. Not a list with one element -- a list invites a
+#: second entry, and the reason there is exactly one is not "we only need one": queueing `worker`
+#: would have the worker start a worker inside itself, and queueing `web` a server inside the
+#: server. See `_check_command_allowed`.
+ALLOWED_COMMAND = "generate"
+
+#: The methods that change something, and therefore the ones `_check_origin` guards. Named as data
+#: rather than spelled out in an `if` so that adding `PATCH` one day is a change to a set and not a
+#: condition somebody has to notice.
+MUTATING_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
+
+#: The largest request body this server will read. Prompts are the biggest thing the page sends and
+#: the longest one in `prompts/` is a few kilobytes; the limit exists so a `Content-Length` of four
+#: gigabytes is a refusal rather than an allocation.
+MAX_BODY_BYTES = 4 * 1024 * 1024
+
+#: How long `generate --dry-run --json` may take. It builds a `RunSpec` and returns -- no weights,
+#: no checkpoint -- so it costs a fraction of a second; with `--image` it also opens the keyframe
+#: and imports `minimax_h3_mlx.packing`, which is the slow case and still seconds. The timeout is
+#: here so that a subprocess wedged on an unreadable network mount cannot pin an HTTP thread for
+#: ever, not because the number is expected to matter.
+DRY_RUN_TIMEOUT = 120
+
+
+def _check_command_allowed(parsed: argparse.Namespace) -> None:
+    """Refuse anything but `h3 generate`, and refuse `--no-checkpoint`.
+
+    Two refusals under one code because they are one rule: what may be queued. Through the API a
+    `worker` job would put a worker inside the worker and a `web` job a server inside the server;
+    and a job without a checkpoint loses hours to any interruption, when a queue exists precisely
+    so that interrupted work continues.
+    """
+    if parsed.command != ALLOWED_COMMAND:
+        raise CliError(
+            "command_not_allowed",
+            f"only `h3 {ALLOWED_COMMAND}` may be queued, and this is `h3 {parsed.command}`",
+            {"command": parsed.command, "allowed": ALLOWED_COMMAND},
+        )
+    if getattr(parsed, "no_checkpoint", False):
+        raise CliError(
+            "command_not_allowed",
+            "--no-checkpoint is not allowed for a queued job: without a checkpoint an interrupted "
+            "run loses every hour it had already spent, and continuing interrupted work is what "
+            "the queue is for",
+            {"command": parsed.command, "flag": "--no-checkpoint"},
+        )
+
+
+def validate_args(args, python=sys.executable, timeout: float = DRY_RUN_TIMEOUT) -> dict:
+    """The `generate --dry-run --json` report for `args`, or the CLI's own refusal, as a `CliError`.
+
+    **The validation rules exist once, in the CLI, and are reached through a subprocess.** Not for
+    isolation's sake: `spec_from_args` calls `resolve_canvas`, which for `--image` without an
+    explicit canvas imports `minimax_h3_mlx.packing` and `mlx.core` with it, and this process sits
+    resident all day next to a 36 GB generation. A second copy of the MLX stack in here is memory
+    this machine does not have. Purity by construction, not by promise -- see
+    `test_posting_a_job_with_an_image_never_pulls_mlx_into_the_server`.
+
+    **`--dry-run --json` are inserted immediately after the subcommand, not appended.** Appended,
+    a trailing `--` in `args` would push them past argparse's option terminator and make them
+    positional; that particular list happens to fail with exit 2 rather than run anything, but the
+    property "this command line cannot become a real generation" should not depend on argparse's
+    handling of a corner case. Placed second, nothing in `args` can reach them: `store_true` has no
+    negation and there is no `--no-dry-run`. The returned report is checked for `dry_run: true` as
+    well, which is the assertion that survives someone editing this function.
+
+    Three outcomes, three answers:
+
+    * exit 0 -- the report, which is also the only place `output_stem` can honestly come from;
+    * exit 2 -- argparse refused to parse; `args_invalid` with argparse's own stderr, which names
+      the typo far better than anything this module could reconstruct;
+    * any other non-zero -- the CLI printed `{"ok": false, "error": {...}}`, and that refusal is
+      re-raised **with its own code**, so a geometry the CLI rejects is rejected here as
+      `geometry_not_multiple_of_32` and not as some server-side paraphrase.
+
+    `cwd` is the repository so that `-m h3_48gb` resolves from a source checkout. It is deliberately
+    not a way to make relative paths work: every path flag has already been rewritten absolute by
+    `check_path_flags`, because the worker's working directory is not this one.
+    """
+    args = [str(item) for item in args]
+    if not args:
+        raise CliError("args_invalid", "an empty argument list names no subcommand", {"args": args})
+    command = [str(python), "-m", "h3_48gb", args[0], "--dry-run", "--json", *args[1:]]
+
+    try:
+        finished = subprocess.run(command, capture_output=True, text=True, timeout=timeout,
+                                  cwd=str(REPO_ROOT), stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as exc:
+        raise CliError(
+            "internal_error",
+            f"`generate --dry-run` did not finish within {timeout} s",
+            {"type": type(exc).__name__, "timeout": timeout},
+        ) from exc
+    except OSError as exc:
+        raise CliError("internal_error", f"could not run `generate --dry-run`: {exc}",
+                       {"type": type(exc).__name__}) from exc
+
+    if finished.returncode == 2:
+        raise CliError(
+            "args_invalid",
+            f"h3 will not accept these arguments: {finished.stderr.strip() or 'exit 2'}",
+            {"args": args, "stderr": finished.stderr},
+        )
+
+    report = None
+    with contextlib.suppress(ValueError):
+        report = json.loads(finished.stdout)
+
+    if finished.returncode != 0:
+        error = report.get("error") if isinstance(report, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        if code in ERROR_CODES:
+            raise CliError(code, error.get("message") or code, error.get("detail") or {})
+        raise CliError(
+            "args_invalid",
+            f"`generate --dry-run` refused this request (exit {finished.returncode}): "
+            f"{finished.stderr.strip() or finished.stdout.strip()}",
+            {"args": args, "exit_code": finished.returncode, "stderr": finished.stderr},
+        )
+
+    if not isinstance(report, dict) or report.get("dry_run") is not True:
+        # Reached only if this function built the wrong command line, so it is a bug in this
+        # server rather than a refusal of the request -- and the one bug it would be is the
+        # dangerous one, a subprocess that was not a dry run.
+        raise CliError(
+            "internal_error",
+            "`generate --dry-run --json` did not answer with a dry-run report",
+            {"stdout": finished.stdout[:2000]},
+        )
+    return report
+
+
+def prompt_snapshot(argv: list[str], roots: dict[str, Path]) -> tuple[str | None, str | None]:
+    """The text `--prompt-file` points at and where it came from, for `queue.submit` to snapshot.
+
+    **The text is read from the file, never taken from the request body.** The snapshot exists so
+    that the bytes a person reviewed are the bytes that run; a snapshot supplied by the caller
+    alongside a different `--prompt-file` would record one prompt and run another, which is worse
+    than having no snapshot at all.
+
+    The server passes the *text*; `queue.submit` writes it and repoints `--prompt-file` at the
+    copy. That split is not arbitrary -- the snapshot's path contains the job `id`, and the id does
+    not exist until `submit` claims it.
+
+    Without `--prompt-file` (a prompt typed straight into the form and passed positionally) there
+    is nothing to snapshot and both halves are `None`.
+    """
+    parsed = _parse_args(argv)
+    if parsed.prompt_file is None:
+        return None, None
+    path = resolve_within(parsed.prompt_file, roots, write=False)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        # `--dry-run` already read this file and would have refused; reaching here means it changed
+        # underneath us between the two reads. The CLI's own code for it says exactly that.
+        raise CliError("prompt_file_unreadable", f"--prompt-file could not be read: {path} ({exc})",
+                       {"path": str(path)}) from exc
+    repo = Path(roots["repo"]).expanduser().resolve()
+    source = str(path.relative_to(repo)) if path.is_relative_to(repo) else str(path)
+    return text, source
+
+
+def prepare_submission(args, roots: dict[str, Path], *, python=sys.executable) -> dict:
+    """Everything a job needs, in the order the design spec fixes, or the first refusal.
+
+    parse -> only `generate`, never `--no-checkpoint` -> path flags (and their normalisation) ->
+    `--dry-run` subprocess -> **the output path the run would write** -> estimate.
+
+    The order is the point. Parsing first is what makes "is this `generate`" a question about the
+    parsed subcommand rather than about `args[0]` looking right. The path flags are checked before
+    a subprocess is started, so a traversal attempt never becomes a process. And the `output_stem`
+    check comes *after* the dry run because only the dry run knows it: with `--image` the canvas
+    that completes the name is derived from the keyframe.
+
+    **`output_stem` is checked as a path, and that is what closes `--tag`.** `--tag` carries no
+    path and is not in `PATH_FLAGS` -- it cannot be, it has no `type=Path` for the parser-sourced
+    coverage test to see -- yet the output name is `outdir / f"h3-{tag}-{W}x{H}"`, so `--tag
+    ../../../../tmp/pwned` builds a path outside every root and walks through `check_path_flags`
+    untouched. Adding `--tag` to the flag list would fix this one flag; judging the path the run
+    will actually write fixes every flag that composes a path, including ones not yet written.
+    """
+    _check_command_allowed(_parse_args(args))
+    argv = check_path_flags(args, roots)
+    report = validate_args(argv, python=python)
+    resolve_within(report["output_stem"], roots, write=True)
+    cost = estimate(argv, checkpoint=_parse_args(argv).checkpoint, report=report)
+    prompt_text, prompt_source = prompt_snapshot(argv, roots)
+    return {"args": argv, "report": report, "estimate": cost,
+            "prompt_text": prompt_text, "prompt_source": prompt_source}
+
+
+@contextlib.contextmanager
+def queue_write_errors(queue_root, *, output_stem=None):
+    """`queue_errors` plus the two refusals the queue raises by name rather than by `OSError`.
+
+    Both are races with the worker or with another submission, not mistakes in the request, and
+    both have to keep their own status: `job_not_pending` is 409 (the job left `pending/` between
+    the page's last poll and this click) and `output_stem_conflict` is 400 with the taken name in
+    `detail`, because the only useful thing to tell someone is which name to change.
+    """
+    try:
+        with queue_errors(queue_root):
+            yield
+    except q.JobNotPending as exc:
+        raise CliError(
+            "job_not_pending",
+            f"эта задача больше не ждёт в очереди: {exc}",
+            {"error": str(exc)},
+        ) from exc
+    except q.OutputStemConflict as exc:
+        raise CliError(
+            "output_stem_conflict",
+            f"выходное имя уже занято: {exc}",
+            {"output_stem": str(output_stem) if output_stem is not None else None},
+        ) from exc
+
+
 def _json_bytes(payload) -> bytes:
     """`payload` as the bytes of one JSON document. `ensure_ascii=False` because half the tags and
     notes on this machine are Russian and escaping them makes the wire format unreadable in a log.
@@ -652,6 +891,15 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self._respond(self._route_get)
 
+    def do_POST(self) -> None:
+        self._respond(self._route_post)
+
+    def do_PUT(self) -> None:
+        self._respond(self._route_put)
+
+    def do_DELETE(self) -> None:
+        self._respond(self._route_delete)
+
     def _check_host(self) -> None:
         """Refuse a request whose `Host` is not this server's own address.
 
@@ -680,6 +928,41 @@ class _Handler(BaseHTTPRequestHandler):
                 {"host": host, "allowed": sorted(self.server.allowed_hosts)},
             )
 
+    def _check_origin(self) -> None:
+        """Refuse a **write** that another site's page asked for. Reads do not need this.
+
+        `Host` is not enough here, and that gap is the reason this exists. `Host` says which
+        address was navigated to; a cross-site form posting to `http://127.0.0.1:8765/api/jobs`
+        sends exactly the right one. What the browser adds, and a page cannot forge, is where the
+        request came *from*: `Origin` (sent on every write, same-origin included) and
+        `Sec-Fetch-Site` (sent by every current browser on every request).
+
+        Both are checked, and each on its own terms: a header that is present must say this page,
+        a header that is absent proves nothing either way. Absent *both* means the caller is not a
+        browser -- `curl`, a script, a test -- and there is no cross-site request to forge there;
+        refusing that case would break scripting this queue from a terminal without closing
+        anything, because no browser omits both.
+
+        `Sec-Fetch-Site: none` is a user-typed URL or a bookmark, which is this machine's owner.
+        """
+        headers = self.headers
+        site = headers.get("Sec-Fetch-Site") if headers else None
+        if site is not None and site.strip().lower() not in ("same-origin", "none"):
+            raise CliError(
+                "host_not_allowed",
+                f"a write must come from this server's own page; Sec-Fetch-Site is {site!r}",
+                {"sec_fetch_site": site, "method": self.command},
+            )
+        origin = headers.get("Origin") if headers else None
+        if origin is not None and origin.strip().lower() not in self.server.allowed_origins:
+            raise CliError(
+                "host_not_allowed",
+                f"a write must come from this server's own page; Origin {origin!r} is not one of "
+                f"{sorted(self.server.allowed_origins)}",
+                {"origin": origin, "allowed": sorted(self.server.allowed_origins),
+                 "method": self.command},
+            )
+
     def _respond(self, route) -> None:
         """Run `route` and write whatever it produced, converting every exception into JSON.
 
@@ -690,10 +973,15 @@ class _Handler(BaseHTTPRequestHandler):
         anticipated the contents of.
         """
         try:
-            # Before the route, not inside it: every route this server will ever have -- including
-            # task 6's mutating ones -- has to be behind this, and a check a route has to remember
-            # to call is a check the next route forgets.
+            # Before the route, not inside it: every route this server has -- the mutating ones
+            # included -- is behind these two, and a check a route has to remember to call is a
+            # check the next route forgets. `do_POST` and friends exist only as one-line calls to
+            # this method for the same reason: a method handler written *beside* `_respond` rather
+            # than through it would have opened writes to DNS rebinding, which is where the five
+            # 501 answers of task 5 sat.
             self._check_host()
+            if self.command in MUTATING_METHODS:
+                self._check_origin()
             status, content_type, body = route()
         except CliError as exc:
             status = ERROR_STATUS.get(exc.code, 400)
@@ -725,10 +1013,245 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             return (200, "application/json",
                     _json_bytes(build_state(self.server.queue_root, self.server.outdir)))
+        if path == "/api/prompts":
+            return self._list_prompts()
+        if path.startswith("/api/prompts/"):
+            return self._read_prompt(path[len("/api/prompts/"):])
         if path.startswith("/media/"):
             return self._media(path[len("/media/"):])
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for {path}", {"path": path})
+
+    def _route_post(self) -> tuple[int, str, bytes]:
+        """Dispatch a POST. `unquote` first, for the same reason `_route_get` does it."""
+        path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+
+        if path == "/api/jobs":
+            return self._submit_job()
+        if path == "/api/estimate":
+            return self._estimate_only()
+        if path.startswith("/api/jobs/") and path.endswith("/top"):
+            return self._promote_job(path[len("/api/jobs/"):-len("/top")])
+        return 404, "application/json", _error_bytes(
+            "not_found", f"no route for POST {path}", {"path": path})
+
+    def _route_put(self) -> tuple[int, str, bytes]:
+        path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+
+        if path.startswith("/api/jobs/"):
+            return self._edit_job(path[len("/api/jobs/"):])
+        if path.startswith("/api/prompts/"):
+            return self._save_prompt(path[len("/api/prompts/"):])
+        return 404, "application/json", _error_bytes(
+            "not_found", f"no route for PUT {path}", {"path": path})
+
+    def _route_delete(self) -> tuple[int, str, bytes]:
+        path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+
+        if path.startswith("/api/jobs/"):
+            return self._cancel_job(path[len("/api/jobs/"):])
+        return 404, "application/json", _error_bytes(
+            "not_found", f"no route for DELETE {path}", {"path": path})
+
+    # -- request bodies ---------------------------------------------------------------------
+
+    def _json_request(self) -> dict:
+        """The request body as one JSON object, or a refusal that is not a 500.
+
+        A body arrives from outside, so a truncated one, a wrong `Content-Length` and a list where
+        an object belongs are all the caller's mistakes and answer 400. Only a bug in this module
+        should ever reach the `internal_error` net.
+        """
+        raw_length = self.headers.get("Content-Length") if self.headers else None
+        try:
+            length = int(raw_length or 0)
+        except ValueError as exc:
+            raise CliError("bad_request", f"Content-Length is not a number: {raw_length!r}",
+                           {"content_length": raw_length}) from exc
+        if length < 0 or length > MAX_BODY_BYTES:
+            raise CliError("bad_request",
+                           f"a request body of {length} bytes is over the {MAX_BODY_BYTES} limit",
+                           {"content_length": length, "limit": MAX_BODY_BYTES})
+        body = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise CliError("bad_request", f"the request body is not JSON: {exc}",
+                           {"bytes": length}) from exc
+        if not isinstance(payload, dict):
+            raise CliError("bad_request",
+                           f"the request body must be a JSON object, not {type(payload).__name__}",
+                           {"type": type(payload).__name__})
+        return payload
+
+    @staticmethod
+    def _args_of(payload: dict) -> list[str]:
+        args = payload.get("args")
+        if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+            raise CliError("args_invalid", "`args` must be a list of strings",
+                           {"args": args if isinstance(args, (list, str)) else None,
+                            "type": type(args).__name__})
+        return args
+
+    @staticmethod
+    def _note_of(payload: dict) -> str:
+        note = payload.get("note") or ""
+        if not isinstance(note, str):
+            raise CliError("args_invalid", "`note` must be a string",
+                           {"type": type(note).__name__})
+        return note
+
+    def _job_id_of(self, raw: str) -> str:
+        """A job id that names a file directly inside `pending/`, or `path_outside_root`.
+
+        The id comes out of a URL and is turned into a path by `queue.job_path`, so it is a path
+        component in everything but name: `../../../etc/passwd` and `a/b` both have to be refused
+        before `cancel` unlinks anything. Checked the way every other path in this module is
+        checked -- resolve it, then require the result to be exactly `<queue>/pending/<id>.json` --
+        rather than with a private pattern for ids, because the pattern would have to be kept in
+        step with `queue`'s id format and this does not.
+        """
+        queue_root = Path(self.server.queue_root)
+        target = resolve_within(q.job_path(queue_root, raw, "pending"),
+                                {"queue": queue_root}, write=True)
+        if target.parent != (queue_root / "pending").expanduser().resolve() \
+                or target.suffix != ".json":
+            raise CliError(
+                "path_outside_root",
+                f"a job id names one file in the queue's pending directory, and {raw!r} does not",
+                {"id": raw, "resolved": str(target)},
+            )
+        return raw
+
+    # -- jobs -------------------------------------------------------------------------------
+
+    def _submit_job(self) -> tuple[int, str, bytes]:
+        """`POST /api/jobs`: validate, estimate, and put one job in `pending/`.
+
+        `queue.submit` receives the *text* of the prompt and writes the snapshot itself -- the
+        snapshot's path contains the job id, and the id does not exist until `submit` claims it.
+        """
+        payload = self._json_request()
+        # The body's own shape is checked before a subprocess is spawned for it: a `note` that is
+        # a number is the caller's mistake and should not cost a fork to discover.
+        args, note = self._args_of(payload), self._note_of(payload)
+        prepared = prepare_submission(args, self.server.roots)
+        with queue_write_errors(self.server.queue_root,
+                                output_stem=prepared["report"]["output_stem"]):
+            job = q.submit(self.server.queue_root, prepared["args"], note,
+                           prepared["report"], prepared["estimate"],
+                           prompt_source=prepared["prompt_source"],
+                           prompt_text=prepared["prompt_text"])
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "job": job.as_dict(), "estimate": prepared["estimate"]})
+
+    def _edit_job(self, raw_id: str) -> tuple[int, str, bytes]:
+        """`PUT /api/jobs/<id>`: the same validation as submission, applied in place.
+
+        The same pipeline rather than a lighter one on purpose: an edit that skipped the dry run
+        would be the way to get an argument list into the queue that submission would have refused.
+        """
+        job_id = self._job_id_of(raw_id)
+        payload = self._json_request()
+        args, note = self._args_of(payload), self._note_of(payload)
+        prepared = prepare_submission(args, self.server.roots)
+        with queue_write_errors(self.server.queue_root,
+                                output_stem=prepared["report"]["output_stem"]):
+            job = q.update(self.server.queue_root, job_id, prepared["args"],
+                           note, prepared["report"], prepared["estimate"],
+                           prompt_source=prepared["prompt_source"],
+                           prompt_text=prepared["prompt_text"])
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "job": job.as_dict(), "estimate": prepared["estimate"]})
+
+    def _promote_job(self, raw_id: str) -> tuple[int, str, bytes]:
+        job_id = self._job_id_of(raw_id)
+        with queue_write_errors(self.server.queue_root):
+            job = q.move_to_front(self.server.queue_root, job_id)
+        return 200, "application/json", _json_bytes({"ok": True, "job": job.as_dict()})
+
+    def _cancel_job(self, raw_id: str) -> tuple[int, str, bytes]:
+        job_id = self._job_id_of(raw_id)
+        with queue_write_errors(self.server.queue_root):
+            job = q.cancel(self.server.queue_root, job_id)
+        return 200, "application/json", _json_bytes({"ok": True, "job": job.as_dict()})
+
+    def _estimate_only(self) -> tuple[int, str, bytes]:
+        """`POST /api/estimate`: the cost of an argument list, without queueing anything.
+
+        No subprocess here: the estimate is a formula, and the form recomputes it on every
+        keystroke. The command allowlist and the path check still run -- without the path check
+        this route would read `quant_config.json` from any directory a caller named, which turns
+        an estimate into an existence oracle for the whole filesystem.
+        """
+        payload = self._json_request()
+        args = self._args_of(payload)
+        parsed = _parse_args(args)
+        _check_command_allowed(parsed)
+        check_path_flags(args, self.server.roots)
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "estimate": estimate(args, checkpoint=parsed.checkpoint)})
+
+    # -- prompts ----------------------------------------------------------------------------
+
+    def _prompts_dir(self) -> Path:
+        return Path(self.server.roots["repo"]) / PROMPTS_DIR
+
+    def _list_prompts(self) -> tuple[int, str, bytes]:
+        """`GET /api/prompts`: the names and sizes of `prompts/*.txt`, in name order.
+
+        Only files whose names the page could ask for again: `resolve_prompt_name` is the rule for
+        reading one, and a listing that offered `../secret.txt` or `notes.md` would be offering
+        entries every other route refuses.
+        """
+        directory = self._prompts_dir()
+        rows = []
+        for candidate in sorted(directory.glob("*.txt")):
+            if not PROMPT_NAME.fullmatch(candidate.name):
+                continue
+            try:
+                if not candidate.is_file():
+                    continue
+                rows.append({"name": candidate.name, "bytes": candidate.stat().st_size})
+            except OSError:
+                continue
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "prompts": rows, "dir": str(directory)})
+
+    def _read_prompt(self, name: str) -> tuple[int, str, bytes]:
+        path = resolve_prompt_name(name, self.server.roots["repo"])
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return 404, "application/json", _error_bytes(
+                "not_found", f"нет такого промпта: {name}", {"name": name})
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CliError("prompt_file_unreadable", f"промпт не читается: {path} ({exc})",
+                           {"name": name}) from exc
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "name": name, "text": text, "path": str(path)})
+
+    def _save_prompt(self, name: str) -> tuple[int, str, bytes]:
+        """`PUT /api/prompts/<name>`: write the text to `prompts/<name>` durably.
+
+        Durably because everything this server confirms is durable (design spec, "Глобальные
+        ограничения"): the same temp-file/fsync/replace protocol the queue uses, reused rather
+        than reimplemented. Nothing is committed to git -- a silent commit out of a browser is the
+        worst possible way to learn your history changed.
+        """
+        path = resolve_prompt_name(name, self.server.roots["repo"])
+        payload = self._json_request()
+        text = payload.get("text")
+        if not isinstance(text, str):
+            raise CliError("args_invalid", "`text` must be a string",
+                           {"type": type(text).__name__})
+        try:
+            q.write_text_durably(path, text)
+        except OSError as exc:
+            raise CliError("queue_unwritable", f"промпт не сохранился: {path} ({exc})",
+                           {"path": str(path), "error": f"{type(exc).__name__}: {exc}"}) from exc
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "name": name, "bytes": len(text.encode("utf-8")), "path": str(path)})
 
     def _media(self, relative: str) -> tuple[int, str, bytes]:
         """A preview frame or a finished clip from **one** run's directory under the outdir.
@@ -859,6 +1382,9 @@ def make_server(queue_root, outdir, repo=None, models=None, webui=None, port=DEF
     # and a set built from the request would reject every request the server then received.
     bound = httpd.server_address[1]
     httpd.allowed_hosts = frozenset({f"{LOOPBACK}:{bound}", f"localhost:{bound}"})
+    # The same two names as an origin, for the write routes. Built from `allowed_hosts` so the two
+    # sets cannot drift apart, and `http://` because this server has no TLS and never will.
+    httpd.allowed_origins = frozenset(f"http://{host}" for host in httpd.allowed_hosts)
     httpd.queue_root = Path(queue_root)
     httpd.outdir = Path(outdir)
     httpd.webui = Path(webui) if webui is not None else WEBUI_ROOT

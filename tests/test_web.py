@@ -78,13 +78,16 @@ class _Live:
     queue_root: Path
     outdir: Path
     webui: Path
+    repo: Path
+    models: Path
 
 
 def _serve(queue_root, outdir, **kwargs) -> _Live:
     httpd = web.make_server(queue_root, outdir, port=0, **kwargs)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return _Live(httpd=httpd, port=httpd.server_address[1], queue_root=Path(queue_root),
-                 outdir=Path(outdir), webui=Path(httpd.webui))
+                 outdir=Path(outdir), webui=Path(httpd.webui),
+                 repo=Path(httpd.roots["repo"]), models=Path(httpd.roots["models"]))
 
 
 @pytest.fixture
@@ -889,11 +892,16 @@ def test_a_media_url_without_a_file_is_a_json_404(server):
     assert status == 404 and body["error"]["code"] == "not_found"
 
 
-@pytest.mark.parametrize("method", ["POST", "PUT", "DELETE"])
+@pytest.mark.parametrize("method", ["PATCH", "OPTIONS", "TRACE"])
 def test_an_unsupported_method_answers_json_rather_than_an_html_page(server, method):
     """`BaseHTTPRequestHandler` answers this one itself, in HTML, unless `send_error` is
     overridden -- the one place the "always JSON" contract leaks without a line of our own code
     being involved.
+
+    The three methods here used to be `POST`, `PUT` and `DELETE`; task 6 gave those handlers, so
+    they answer 404 through `_respond` now (see
+    `test_a_write_method_on_an_unknown_route_is_a_json_404`) and these three took their place --
+    still unimplemented, still reaching the base class's HTML page without the override.
     """
     status, headers, body = _request(server, "/api/state", method=method)
     assert status == 501
@@ -1266,3 +1274,758 @@ def test_the_parser_helper_does_not_swallow_a_real_refusal(monkeypatch):
     with pytest.raises(CliError) as excinfo:
         web._parse_args(["generate", "x"])
     assert excinfo.value.code == "path_outside_root"
+
+
+# -- Step 3: helpers for the write routes ---------------------------------------------------------
+
+
+@pytest.fixture
+def queue_server(tmp_path):
+    """A server whose **three** roots are all temporary.
+
+    Unlike the `server` fixture, which points at the real repository so that `/static/../cli.py`
+    has something real to escape into, submission tests need to name a checkpoint, an outdir and a
+    prompts directory that they control -- and a job naming `~/models` would be a test that reads
+    this machine's weights.
+    """
+    outdir = tmp_path / "outdir"
+    outdir.mkdir()
+    repo = tmp_path / "repo"
+    (repo / "prompts").mkdir(parents=True)
+    models = tmp_path / "models"
+    (models / "ckpt").mkdir(parents=True)
+    webui = tmp_path / "webui"
+    webui.mkdir()
+    root = q.layout(outdir / "queue")["root"]
+    live = _serve(root, outdir, repo=repo, models=models, webui=webui)
+    yield live
+    live.httpd.shutdown()
+    live.httpd.server_close()
+
+
+def _call(live: _Live, method: str, url: str, payload=None, *, headers=None):
+    """`(status, parsed_json)` for a request that may carry a JSON body.
+
+    Every answer is required to be JSON, refusals included -- the same contract `_json` enforces
+    for the read routes, restated here because a write route is exactly where a stray HTML error
+    page would first appear.
+    """
+    connection = http.client.HTTPConnection(web.LOOPBACK, live.port, timeout=180)
+    try:
+        sent = dict(headers or {})
+        body = None
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            sent.setdefault("Content-Type", "application/json")
+        connection.request(method, url, body=body, headers=sent)
+        response = connection.getresponse()
+        raw = response.read()
+        assert response.getheader("Content-Type") == "application/json", (
+            f"{method} {url} answered {response.getheader('Content-Type')!r}; "
+            f"the contract is JSON everywhere")
+        return response.status, json.loads(raw)
+    finally:
+        connection.close()
+
+
+def _job_args(live: _Live, *extra, tag="ночь", prompt="котик на подоконнике"):
+    """A minimal argument list `h3 generate --dry-run` accepts, with every path inside a root.
+
+    `--steps` is left at its default: with no baked AdaLN table in the fake checkpoint,
+    `RunSpec.__post_init__` requires exactly `BAKED_GRID_POINTS`, and spelling that out here would
+    couple every submission test to a constant none of them are about.
+    """
+    args = ["generate", "--outdir", str(live.outdir), "--checkpoint", str(live.models / "ckpt"),
+            "--tag", tag, *extra]
+    # `--prompt-file` and a positional prompt together are `prompt_both_given`, so naming a file
+    # drops the positional one rather than making every caller remember to.
+    if prompt is not None and "--prompt-file" not in extra:
+        args.insert(1, prompt)
+    return args
+
+
+def _pending(live: _Live) -> list:
+    jobs, _ = q.scan(live.queue_root)
+    return [job for job in jobs if job.state == "pending"]
+
+
+def _write_png(path, width=64, height=64) -> None:
+    """A real PNG, because `--image` is decoded by PIL before the canvas is derived from it."""
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        payload = kind + data
+        return struct.pack(">I", len(data)) + payload + struct.pack(">I", zlib.crc32(payload))
+
+    rows = b"".join(b"\x00" + b"\x80\x40\x20" * width for _ in range(height))
+    Path(path).write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b""))
+
+
+def _fake_python(tmp_path, body: str, name="fake-python") -> Path:
+    """An executable that stands in for the interpreter `validate_args` spawns.
+
+    This is how the *command line* gets tested rather than only its answer: the real subprocess
+    can only be asked whether it agreed, while a stand-in can report exactly what it was asked.
+    A shebang naming this interpreter keeps it a plain Python script.
+    """
+    script = tmp_path / name
+    script.write_text(f"#!{sys.executable}\nimport json, sys\n{body}\n")
+    script.chmod(0o755)
+    return script
+
+
+# -- Step 3: posting a job ------------------------------------------------------------------------
+
+
+def test_posting_a_job_queues_it_with_a_snapshot_of_the_prompt(queue_server):
+    """The snapshot is the whole reason prompts are files: an edit between queueing and running
+    must not change what runs. The server passes the *text*; `queue.submit` writes the copy,
+    because the copy's path contains an id that does not exist until `submit` claims it.
+    """
+    source = queue_server.repo / "prompts" / "scene.txt"
+    source.write_text("кот сидит на подоконнике", encoding="utf-8")
+
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, "--prompt-file", str(source),
+                                              prompt=None),
+                            "note": "первая ночная"})
+    assert status == 200, answer
+    job = answer["job"]
+
+    snapshot = queue_server.queue_root / "prompts" / f"{job['id']}.txt"
+    assert snapshot.read_text(encoding="utf-8") == "кот сидит на подоконнике"
+    assert job["args"][job["args"].index("--prompt-file") + 1] == str(snapshot), (
+        "the queued job must point at the snapshot, not at the shared file")
+    assert job["prompt_source"] == "prompts/scene.txt"
+    assert job["prompt_sha256"]
+    assert job["note"] == "первая ночная"
+    assert [j.id for j in _pending(queue_server)] == [job["id"]]
+
+    source.write_text("совсем другой промпт", encoding="utf-8")
+    assert snapshot.read_text(encoding="utf-8") == "кот сидит на подоконнике", (
+        "editing the shared prompt after queueing changed what the job will run")
+
+
+def test_the_snapshot_text_comes_from_the_file_and_not_from_the_request(queue_server):
+    """A caller-supplied snapshot beside a different `--prompt-file` would record one prompt and
+    run another -- worse than no snapshot at all. The body's `prompt_text` is ignored.
+    """
+    source = queue_server.repo / "prompts" / "scene.txt"
+    source.write_text("настоящий текст", encoding="utf-8")
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, "--prompt-file", str(source),
+                                              prompt=None),
+                            "note": "", "prompt_text": "подложенный текст"})
+    assert status == 200, answer
+    snapshot = queue_server.queue_root / "prompts" / f"{answer['job']['id']}.txt"
+    assert snapshot.read_text(encoding="utf-8") == "настоящий текст"
+
+
+def test_a_geometry_the_cli_refuses_is_refused_here_with_the_same_code(queue_server):
+    """One set of rules, in the CLI, reached through the subprocess -- so the page shows the code
+    the command line would have shown, not a server-side paraphrase of it.
+    """
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, "--width", "100", "--height", "288"),
+                            "note": ""})
+    assert status == 400, answer
+    assert answer["error"]["code"] == "geometry_not_multiple_of_32", answer
+    assert _pending(queue_server) == []
+
+
+def test_an_unknown_flag_becomes_args_invalid_not_a_crash(queue_server):
+    """argparse answers a typo with `SystemExit(2)` and usage on stderr. Uncaught that is a 500
+    for what is plainly the caller's mistake; argparse's own sentence names the typo.
+    """
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, "--widht", "896"), "note": ""})
+    assert status == 400, answer
+    assert answer["error"]["code"] == "args_invalid", answer
+    assert "--widht" in answer["error"]["detail"]["stderr"]
+    assert _pending(queue_server) == []
+
+
+@pytest.mark.parametrize("args", [["worker"], ["web"], ["status"], ["resume", "x"],
+                                  ["generate", "x", "--no-checkpoint"]])
+def test_only_generate_with_a_checkpoint_may_be_queued(queue_server, args):
+    """A queued `worker` would put a worker inside the worker; a queued `web`, a server inside the
+    server. `--no-checkpoint` is the same rule seen from the other side: an interrupted job that
+    cannot continue defeats the queue.
+    """
+    status, answer = _call(queue_server, "POST", "/api/jobs", {"args": args, "note": ""})
+    assert status == 400, answer
+    assert answer["error"]["code"] == "command_not_allowed", answer
+    assert _pending(queue_server) == []
+
+
+def test_a_tag_that_builds_a_path_out_of_the_outdir_is_refused(queue_server, tmp_path):
+    """`--tag` takes no path and yet composes one: the output name is
+    `outdir / f"h3-{tag}-{W}x{H}"`. It has no `type=Path`, so neither `PATH_FLAGS` nor the test
+    that reads the flag list back out of the parser can see it, and `check_path_flags` passes it
+    through untouched -- verified in circle 1 of task 5.
+
+    What catches it is the `resolve_within` on the dry run's `output_stem`: the path the run would
+    actually write, judged as a path. That closes every flag that composes a path, including ones
+    not yet written, which extending `PATH_FLAGS` would not.
+    """
+    escape = "../" * 8 + "tmp/pwned"
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, tag=escape), "note": ""})
+    assert status == 400, answer
+    assert answer["error"]["code"] == "path_outside_root", answer
+    assert _pending(queue_server) == []
+
+
+def test_a_tag_that_stays_inside_the_outdir_is_still_accepted(queue_server):
+    """The other half: refusing every tag would satisfy the test above."""
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, tag="ночь-15с"), "note": ""})
+    assert status == 200, answer
+    assert answer["job"]["output_stem"].startswith(str(queue_server.outdir))
+
+
+def test_a_path_flag_outside_the_roots_never_reaches_a_subprocess(queue_server, monkeypatch):
+    """Order, not just outcome: the path check runs before the dry run, so a traversal attempt
+    never becomes a process. A server that validated first would spawn `h3` on an attacker's path.
+    """
+    spawned = []
+    monkeypatch.setattr(web, "validate_args",
+                        lambda *a, **k: spawned.append(a) or {"output_stem": "/x", "canvas": "1x1"})
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, "--outdir", "/etc"), "note": ""})
+    assert status == 400 and answer["error"]["code"] == "path_outside_root", answer
+    assert spawned == [], "the dry-run subprocess started for a path outside every root"
+
+
+def test_the_job_stores_the_resolved_paths_not_what_the_browser_sent(queue_server):
+    """`resolve()` anchors a relative value at *this* process's working directory, and the worker
+    runs from another one. Checking one path and queueing a different one is the bug; storing what
+    was checked is the fix, which is why `check_path_flags` returns the argument list.
+    """
+    roundabout = f"{queue_server.outdir}/../{queue_server.outdir.name}/./sub"
+    (queue_server.outdir / "sub").mkdir()
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, "--outdir", roundabout,
+                                              "--outdir", roundabout), "note": ""})
+    assert status == 200, answer
+    stored = answer["job"]["args"]
+    assert roundabout not in stored, "the job kept the unresolved spelling the browser sent"
+    assert str((queue_server.outdir / "sub").resolve()) in stored
+    assert ".." not in " ".join(stored)
+
+
+def test_check_path_flags_returns_the_argument_list_it_checked(tmp_path, monkeypatch):
+    """Unit-level, on both spellings and both of the two ways a path can fail to be absolute.
+
+    A `~` is the second half of the same defect as a relative path: argparse's `type=Path` does
+    not expand it, so `--outdir ~/video-out` reaches the filesystem as a directory literally named
+    `~`.
+    """
+    roots = _roots(tmp_path)
+    monkeypatch.setenv("HOME", str(roots["repo"]))
+    given = ["generate", "x", "--outdir", str(roots["outdir"]) + "/../outdir",
+             f"--prompt-file=~/p.txt", "--tag", "a"]
+    got = web.check_path_flags(given, roots)
+    assert got is not given and given[3].endswith("/../outdir"), "the input must not be mutated"
+    assert got[3] == str(roots["outdir"].resolve())
+    assert got[4] == f"--prompt-file={(roots['repo'] / 'p.txt').resolve()}"
+    assert got[:3] == ["generate", "x", "--outdir"] and got[5:] == ["--tag", "a"]
+
+
+def test_the_estimate_is_stored_on_the_job(queue_server):
+    """The page sums the pending jobs' estimates to answer "when will the night be over". That sum
+    only exists if each job carries its own.
+    """
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, "--width", "448", "--height", "288",
+                                              "--duration", "10"),
+                            "note": ""})
+    assert status == 200, answer
+    stored = answer["job"]["estimate"]
+    assert stored["forwards"] == 30
+    assert stored["seconds"] > 0 and stored["peak_gb"] > 12
+    assert stored == answer["estimate"]
+
+
+def test_posting_a_job_with_an_image_never_pulls_mlx_into_the_server(tmp_path):
+    """The one route where MLX could sneak in.
+
+    `--image` without an explicit canvas is what makes `spec_from_args` call `resolve_canvas`,
+    which imports `minimax_h3_mlx.packing` and `mlx.core` with it. Checking only that the module
+    imports cleanly, or only that `/api/state` stays clean, misses it entirely -- the import
+    happens on the first *submission*, inside whichever process validates it. The whole server is
+    therefore run in a subprocess of its own and asked, after a real POST, what it has imported.
+    """
+    outdir = tmp_path / "outdir"
+    (outdir / "run").mkdir(parents=True)
+    repo = tmp_path / "repo"
+    (repo / "prompts").mkdir(parents=True)
+    models = tmp_path / "models" / "ckpt"
+    models.mkdir(parents=True)
+    image = outdir / "frame.png"
+    _write_png(image)
+
+    script = f"""
+import json, sys, threading, urllib.request
+from pathlib import Path
+sys.path.insert(0, {str(PROJECT_ROOT)!r})
+from h3_48gb import queue as q, web
+
+outdir = Path({str(outdir)!r})
+root = q.layout(outdir / "queue")["root"]
+httpd = web.make_server(root, outdir, repo=Path({str(repo)!r}),
+                        models=Path({str(models.parent)!r}), webui=Path({str(tmp_path)!r}), port=0)
+threading.Thread(target=httpd.serve_forever, daemon=True).start()
+body = json.dumps({{"args": ["generate", "кадр", "--image", {str(image)!r},
+                             "--tag", "i", "--outdir", str(outdir),
+                             "--checkpoint", {str(models)!r}], "note": ""}}).encode()
+request = urllib.request.Request(f"http://127.0.0.1:{{httpd.server_address[1]}}/api/jobs",
+                                 data=body, method="POST",
+                                 headers={{"Content-Type": "application/json"}})
+try:
+    answer = json.loads(urllib.request.urlopen(request).read())
+except urllib.error.HTTPError as exc:
+    answer = json.loads(exc.read())
+httpd.shutdown()
+print(json.dumps({{"answer": answer, "mlx": sorted(n for n in sys.modules if n.split(".")[0] == "mlx")}}))
+"""
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                            cwd=str(PROJECT_ROOT), timeout=300)
+    assert result.returncode == 0, f"subprocess failed: {result.stderr}"
+    seen = json.loads(result.stdout.strip().splitlines()[-1])
+    assert seen["answer"].get("ok") is True, (
+        f"the POST never reached submission, so nothing was proven: {seen['answer']}")
+    assert seen["answer"]["job"]["output_stem"].endswith("h3-i-768x768"), (
+        "the canvas must have been derived from the keyframe -- that is the MLX-shaped path")
+    assert seen["mlx"] == [], (
+        f"the server process imported MLX while validating a job: {seen['mlx']}")
+
+
+# -- Step 3: what `validate_args` actually runs ---------------------------------------------------
+
+
+def test_validate_args_puts_dry_run_immediately_after_the_subcommand(tmp_path):
+    """Appended at the end, a `--` in the caller's own arguments would push `--dry-run` past
+    argparse's option terminator. That particular list happens to fail rather than run, but the
+    property "this command line cannot become a real generation" must not rest on a corner case
+    of argparse. Placed second, nothing after it can reach it.
+    """
+    fake = _fake_python(tmp_path, 'print(json.dumps({"dry_run": True, "output_stem": "/x",'
+                                  ' "canvas": "896x512", "argv": sys.argv[1:]}))')
+    report = web.validate_args(["generate", "кот", "--tag", "a", "--"], python=fake)
+    assert report["argv"][:5] == ["-m", "h3_48gb", "generate", "--dry-run", "--json"]
+    assert report["argv"][5:] == ["кот", "--tag", "a", "--"]
+
+
+def test_a_subprocess_that_did_not_dry_run_is_refused(tmp_path):
+    """The assertion that outlives an edit to `validate_args`: a report with no `dry_run: true` in
+    it is not a dry run, whatever the command line said, and this server must never treat the
+    output of a real generation as validation.
+    """
+    fake = _fake_python(tmp_path, 'print(json.dumps({"output_stem": "/x", "canvas": "896x512"}))')
+    with pytest.raises(CliError) as excinfo:
+        web.validate_args(["generate", "кот"], python=fake)
+    assert excinfo.value.code == "internal_error"
+
+
+def test_validate_args_reraises_the_clis_own_refusal_with_its_code(tmp_path):
+    fake = _fake_python(tmp_path, 'print(json.dumps({"ok": False, "error": {'
+                                  '"code": "prompt_missing", "message": "нет промпта",'
+                                  ' "detail": {"x": 1}}}))\nsys.exit(1)')
+    with pytest.raises(CliError) as excinfo:
+        web.validate_args(["generate"], python=fake)
+    assert excinfo.value.code == "prompt_missing"
+    assert excinfo.value.detail == {"x": 1}
+
+
+def test_a_refusal_naming_an_undocumented_code_becomes_args_invalid(tmp_path):
+    """A code the shared contract does not list cannot be forwarded: `CliError` asserts membership,
+    so forwarding it blindly would turn a refusal into an `AssertionError` and a 500.
+    """
+    fake = _fake_python(tmp_path, 'print(json.dumps({"ok": False, "error": {"code": "made_up",'
+                                  ' "message": "?"}}))\nsys.exit(1)')
+    with pytest.raises(CliError) as excinfo:
+        web.validate_args(["generate"], python=fake)
+    assert excinfo.value.code == "args_invalid"
+
+
+def test_exit_two_is_args_invalid_with_argparses_own_stderr(tmp_path):
+    fake = _fake_python(tmp_path, 'print("unrecognized arguments: --widht", file=sys.stderr)\n'
+                                  'sys.exit(2)')
+    with pytest.raises(CliError) as excinfo:
+        web.validate_args(["generate"], python=fake)
+    assert excinfo.value.code == "args_invalid"
+    assert "--widht" in excinfo.value.detail["stderr"]
+
+
+def test_a_dry_run_that_never_returns_is_not_a_wedged_http_thread(tmp_path):
+    fake = _fake_python(tmp_path, "import time\ntime.sleep(30)")
+    with pytest.raises(CliError) as excinfo:
+        web.validate_args(["generate"], python=fake, timeout=0.5)
+    assert excinfo.value.code == "internal_error"
+
+
+def test_an_empty_argument_list_is_a_refusal_not_a_crash():
+    with pytest.raises(CliError) as excinfo:
+        web.validate_args([])
+    assert excinfo.value.code == "args_invalid"
+
+
+# -- Step 5: editing, promoting, deleting ----------------------------------------------------------
+
+
+def _queue_a_job(live: _Live, *extra, tag="ночь", note=""):
+    status, answer = _call(live, "POST", "/api/jobs",
+                           {"args": _job_args(live, *extra, tag=tag), "note": note})
+    assert status == 200, answer
+    return answer["job"]
+
+
+def test_editing_a_pending_job_replaces_it(queue_server):
+    source = queue_server.repo / "prompts" / "scene.txt"
+    source.write_text("первый", encoding="utf-8")
+    job = _queue_a_job(queue_server, "--prompt-file", str(source), note="было")
+
+    source.write_text("второй", encoding="utf-8")
+    status, answer = _call(queue_server, "PUT", f"/api/jobs/{job['id']}",
+                           {"args": _job_args(queue_server, "--prompt-file", str(source),
+                                              "--duration", "12"),
+                            "note": "стало"})
+    assert status == 200, answer
+    edited = answer["job"]
+    assert edited["id"] == job["id"], "an edit keeps the id: the log and the snapshot hang off it"
+    assert edited["note"] == "стало"
+    assert "12" in edited["args"] and edited["estimate"] != job["estimate"]
+    snapshot = queue_server.queue_root / "prompts" / f"{job['id']}.txt"
+    assert snapshot.read_text(encoding="utf-8") == "второй"
+    assert len(_pending(queue_server)) == 1
+
+
+def test_editing_a_job_the_worker_took_is_a_conflict(queue_server):
+    """409 rather than 400: the request was valid and lost a race. The job left `pending/` between
+    the page's last poll and this click, and the only honest answer is to say so.
+    """
+    job = _queue_a_job(queue_server)
+    assert q.claim(queue_server.queue_root).id == job["id"]
+
+    status, answer = _call(queue_server, "PUT", f"/api/jobs/{job['id']}",
+                           {"args": _job_args(queue_server, "--duration", "12"), "note": ""})
+    assert status == 409, answer
+    assert answer["error"]["code"] == "job_not_pending", answer
+
+
+def test_posting_a_job_whose_output_name_is_taken_is_refused(queue_server):
+    """The output name carries no seed, so two jobs with one tag write the same `.mp4`, `.wav`,
+    `.npz` and report -- and the second silently overwrites the first.
+    """
+    first = _queue_a_job(queue_server, tag="одна")
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, tag="одна"), "note": ""})
+    assert status == 400, answer
+    assert answer["error"]["code"] == "output_stem_conflict", answer
+    assert answer["error"]["detail"]["output_stem"] == first["output_stem"], (
+        "the only useful thing to say is which name is taken")
+    assert len(_pending(queue_server)) == 1
+
+
+def test_editing_a_job_into_a_name_another_job_holds_is_refused(queue_server):
+    _queue_a_job(queue_server, tag="первая")
+    second = _queue_a_job(queue_server, tag="вторая")
+    status, answer = _call(queue_server, "PUT", f"/api/jobs/{second['id']}",
+                           {"args": _job_args(queue_server, tag="первая"), "note": ""})
+    assert status == 400 and answer["error"]["code"] == "output_stem_conflict", answer
+
+
+def test_editing_a_job_without_renaming_it_is_not_a_conflict(queue_server):
+    """The paired case, and the common one: changing a seed or a note leaves the output name where
+    it was, and a conflict check that did not exclude the job being edited would refuse it.
+    """
+    job = _queue_a_job(queue_server, tag="та-же")
+    status, answer = _call(queue_server, "PUT", f"/api/jobs/{job['id']}",
+                           {"args": _job_args(queue_server, "--seed", "7", tag="та-же"),
+                            "note": ""})
+    assert status == 200, answer
+    assert answer["job"]["output_stem"] == job["output_stem"]
+
+
+def test_deleting_and_promoting_work_only_while_pending(queue_server):
+    first = _queue_a_job(queue_server, tag="первая")
+    second = _queue_a_job(queue_server, tag="вторая")
+
+    status, answer = _call(queue_server, "POST", f"/api/jobs/{second['id']}/top")
+    assert status == 200, answer
+    assert answer["job"]["priority"] > first["priority"]
+    state = _json(queue_server, "/api/state")[1]
+    assert [row["id"] for row in state["queue"]["pending"]][0] == second["id"], (
+        "the page's first job must be the job the worker takes next")
+
+    status, answer = _call(queue_server, "DELETE", f"/api/jobs/{first['id']}")
+    assert status == 200, answer
+    assert [job.id for job in _pending(queue_server)] == [second["id"]]
+
+    assert q.claim(queue_server.queue_root).id == second["id"]
+    for method, url in (("POST", f"/api/jobs/{second['id']}/top"),
+                        ("DELETE", f"/api/jobs/{second['id']}")):
+        status, answer = _call(queue_server, method, url)
+        assert status == 409, (method, answer)
+        assert answer["error"]["code"] == "job_not_pending", answer
+
+
+def test_deleting_a_job_removes_its_prompt_snapshot(queue_server):
+    source = queue_server.repo / "prompts" / "scene.txt"
+    source.write_text("текст", encoding="utf-8")
+    job = _queue_a_job(queue_server, "--prompt-file", str(source))
+    snapshot = queue_server.queue_root / "prompts" / f"{job['id']}.txt"
+    assert snapshot.exists()
+    assert _call(queue_server, "DELETE", f"/api/jobs/{job['id']}")[0] == 200
+    assert not snapshot.exists()
+
+
+@pytest.mark.parametrize("raw_id", ["../../../../tmp/pwned", "..%2f..%2fescape",
+                                    "sub/nested", ""])
+def test_a_job_id_that_is_really_a_path_is_refused(queue_server, raw_id):
+    """The id arrives in a URL and becomes a filename. `cancel` unlinks what it is given, so this
+    is the check standing between a URL and `rm` on an arbitrary file.
+    """
+    victim = queue_server.outdir / "pwned.json"
+    victim.write_text("{}")
+    status, answer = _call(queue_server, "DELETE", f"/api/jobs/{raw_id}")
+    assert status in (400, 404), answer
+    if status == 400:
+        assert answer["error"]["code"] == "path_outside_root", answer
+    assert victim.exists()
+
+
+def test_a_job_id_that_does_not_exist_is_a_conflict_not_a_crash(queue_server):
+    quoted = urllib.parse.quote("20260811-000000-нет-abcd")
+    assert quoted != "20260811-000000-нет-abcd", "the id must arrive percent-encoded"
+    status, answer = _call(queue_server, "DELETE", f"/api/jobs/{quoted}")
+    assert status == 409 and answer["error"]["code"] == "job_not_pending", answer
+
+
+# -- Step 4: /api/estimate --------------------------------------------------------------------------
+
+
+def test_the_estimate_route_answers_without_starting_a_subprocess(queue_server, monkeypatch):
+    """The form recomputes this on every keystroke. A subprocess per keystroke would make typing
+    in a number a fork bomb; the estimate is a formula and stays one.
+    """
+    monkeypatch.setattr(web, "validate_args", lambda *a, **k: pytest.fail(
+        "/api/estimate must not run the dry-run subprocess"))
+    status, answer = _call(queue_server, "POST", "/api/estimate",
+                           {"args": _job_args(queue_server, "--width", "896", "--height", "576",
+                                              "--duration", "15", "--steps", "8")})
+    assert status == 200, answer
+    assert answer["estimate"]["forwards"] == 7
+    assert 100 < answer["estimate"]["seconds"] / 60 < 200
+    assert _pending(queue_server) == [], "/api/estimate must not queue anything"
+
+
+def test_the_estimate_route_refuses_a_path_outside_the_roots(queue_server):
+    """Without the path check this route reads `quant_config.json` from any directory a caller
+    names, which turns an estimate into an existence oracle for the whole filesystem.
+    """
+    status, answer = _call(queue_server, "POST", "/api/estimate",
+                           {"args": ["generate", "x", "--checkpoint", "/etc"]})
+    assert status == 400 and answer["error"]["code"] == "path_outside_root", answer
+
+
+def test_the_estimate_route_refuses_a_command_that_may_not_be_queued(queue_server):
+    status, answer = _call(queue_server, "POST", "/api/estimate", {"args": ["worker"]})
+    assert status == 400 and answer["error"]["code"] == "command_not_allowed", answer
+
+
+# -- Step 6: prompts ---------------------------------------------------------------------------------
+
+
+def test_listing_prompts_returns_names_and_sizes(queue_server):
+    prompts = queue_server.repo / "prompts"
+    (prompts / "b.txt").write_text("два", encoding="utf-8")
+    (prompts / "a.txt").write_text("один", encoding="utf-8")
+    (prompts / "notes.md").write_text("не промпт", encoding="utf-8")
+
+    status, answer = _json(queue_server, "/api/prompts")
+    assert status == 200, answer
+    assert [row["name"] for row in answer["prompts"]] == ["a.txt", "b.txt"], (
+        "sorted by name, and only the names another route would agree to read")
+    assert answer["prompts"][0]["bytes"] == len("один".encode("utf-8"))
+
+
+def test_reading_a_prompt_returns_its_text(queue_server):
+    (queue_server.repo / "prompts" / "scene.txt").write_text("кот\nи пёс\n", encoding="utf-8")
+    status, answer = _json(queue_server, "/api/prompts/scene.txt")
+    assert status == 200, answer
+    assert answer["text"] == "кот\nи пёс\n"
+    assert answer["name"] == "scene.txt"
+
+
+def test_saving_a_prompt_is_durable_and_lands_in_the_repository(queue_server, monkeypatch):
+    """Durable because everything this server confirms is durable: temp file, fsync, replace,
+    fsync the directory. Reused from the queue rather than reimplemented, and asserted by watching
+    that the shared helper is the thing that ran.
+    """
+    calls = []
+    real = q.write_text_durably
+    monkeypatch.setattr(q, "write_text_durably",
+                        lambda path, text: calls.append(Path(path)) or real(path, text))
+
+    status, answer = _call(queue_server, "PUT", "/api/prompts/новый.txt".replace("новый", "new"),
+                           {"text": "свежий промпт"})
+    assert status == 200, answer
+    target = queue_server.repo / "prompts" / "new.txt"
+    assert target.read_text(encoding="utf-8") == "свежий промпт"
+    assert calls == [target], "the prompt was written without the durable protocol"
+    assert _json(queue_server, "/api/prompts/new.txt")[1]["text"] == "свежий промпт"
+
+
+@pytest.mark.parametrize("name", ["../secret.txt", "a/b.txt", "p.py", "p", "..%2fsecret.txt"])
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+def test_prompt_names_with_separators_or_wrong_suffix_are_refused(queue_server, name, method):
+    (queue_server.repo / "secret.txt").write_text("тайна", encoding="utf-8")
+    payload = {"text": "подмена"} if method == "PUT" else None
+    status, answer = _call(queue_server, method, f"/api/prompts/{name}", payload)
+    assert status == 400, answer
+    assert answer["error"]["code"] == "prompt_name_invalid", answer
+    assert (queue_server.repo / "secret.txt").read_text(encoding="utf-8") == "тайна"
+
+
+def test_a_prompt_that_does_not_exist_is_a_json_404(queue_server):
+    status, answer = _json(queue_server, "/api/prompts/absent.txt")
+    assert status == 404 and answer["error"]["code"] == "not_found", answer
+
+
+def test_saving_a_prompt_without_text_is_a_refusal(queue_server):
+    status, answer = _call(queue_server, "PUT", "/api/prompts/x.txt", {"note": "нет текста"})
+    assert status == 400 and answer["error"]["code"] == "args_invalid", answer
+
+
+# -- the write routes are behind Host, and behind Origin as well ---------------------------------------
+
+
+def test_the_host_check_covers_the_write_routes_too(queue_server):
+    """Task 5 left `POST`, `PUT` and `DELETE` answering 501 from the base class, i.e. past
+    `_respond` and past the `Host` check. Adding handlers beside `_respond` rather than through it
+    would have opened writes to DNS rebinding, which is why every one of them is a one-line call.
+    """
+    for method, url in (("POST", "/api/jobs"), ("PUT", "/api/jobs/x"), ("DELETE", "/api/jobs/x"),
+                        ("POST", "/api/estimate")):
+        status, answer = _call(queue_server, method, url, {"args": []},
+                               headers={"Host": "evil.example"})
+        assert status == 403, (method, url, answer)
+        assert answer["error"]["code"] == "host_not_allowed", answer
+
+
+@pytest.mark.parametrize("headers", [
+    {"Origin": "http://evil.example"},
+    {"Origin": "https://127.0.0.1"},
+    {"Origin": "null"},
+    {"Sec-Fetch-Site": "cross-site"},
+    {"Sec-Fetch-Site": "same-site"},
+])
+def test_a_write_asked_for_by_another_site_is_refused(queue_server, headers):
+    """`Host` does not cover this and cannot: a cross-site form posting to
+    `http://127.0.0.1:8765/api/jobs` sends exactly the right `Host`. What the browser adds, and a
+    page cannot forge, is where the request came *from*.
+    """
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server), "note": ""}, headers=headers)
+    assert status == 403, answer
+    assert answer["error"]["code"] == "host_not_allowed", answer
+    assert _pending(queue_server) == []
+
+
+@pytest.mark.parametrize("headers", [
+    {"Origin": "http://127.0.0.1:{port}", "Sec-Fetch-Site": "same-origin"},
+    {"Origin": "http://localhost:{port}"},
+    {"Sec-Fetch-Site": "none"},
+    {},
+])
+def test_a_write_from_this_page_or_from_a_terminal_is_accepted(queue_server, headers):
+    """The other half. A check that refused everything satisfies the test above; this one says the
+    page still works -- and that `curl`, which sends neither header and cannot be a cross-site
+    request, still works too.
+    """
+    sent = {key: value.format(port=queue_server.port) for key, value in headers.items()}
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, tag=f"t{len(sent)}{len(str(sent))}"),
+                            "note": ""}, headers=sent)
+    assert status == 200, answer
+
+
+def test_a_read_does_not_need_an_origin(queue_server):
+    """Reads are not what CSRF steals -- the response never reaches the attacker's script, `Host`
+    already covers rebinding, and requiring `Origin` on `GET` would break every ordinary
+    navigation, `<img>` and `<video>` on the page itself.
+    """
+    status, _ = _json(queue_server, "/api/state")
+    assert status == 200
+
+
+@pytest.mark.parametrize("method,url", [("POST", "/api/nope"), ("PUT", "/api/nope"),
+                                        ("DELETE", "/api/nope"), ("POST", "/api/jobs/x/nope")])
+def test_a_write_method_on_an_unknown_route_is_a_json_404(queue_server, method, url):
+    status, answer = _call(queue_server, method, url, {"args": []})
+    assert status == 404 and answer["error"]["code"] == "not_found", answer
+
+
+# -- request bodies -------------------------------------------------------------------------------
+
+
+def test_a_body_that_is_not_json_is_a_400_not_a_500(queue_server):
+    connection = http.client.HTTPConnection(web.LOOPBACK, queue_server.port, timeout=30)
+    try:
+        connection.request("POST", "/api/jobs", body=b"{not json",
+                           headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        answer = json.loads(response.read())
+        assert response.status == 400, answer
+        assert answer["error"]["code"] == "bad_request", answer
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("payload", [{}, {"args": "generate"}, {"args": [1, 2]},
+                                     {"args": ["generate"], "note": 5}])
+def test_a_body_without_a_usable_args_list_is_args_invalid(queue_server, payload):
+    status, answer = _call(queue_server, "POST", "/api/jobs", payload)
+    assert status == 400, answer
+    assert answer["error"]["code"] in ("args_invalid", "command_not_allowed"), answer
+
+
+def test_a_body_longer_than_the_limit_is_refused(queue_server):
+    connection = http.client.HTTPConnection(web.LOOPBACK, queue_server.port, timeout=30)
+    try:
+        connection.putrequest("POST", "/api/jobs")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", str(web.MAX_BODY_BYTES + 1))
+        connection.endheaders()
+        response = connection.getresponse()
+        answer = json.loads(response.read())
+        assert response.status == 400, answer
+        assert answer["error"]["code"] == "bad_request", answer
+    finally:
+        connection.close()
+
+
+# -- the contract ------------------------------------------------------------------------------------
+
+
+def test_the_four_new_codes_are_in_the_shared_contract():
+    from h3_48gb.cli import ERROR_CODES
+
+    assert {"args_invalid", "command_not_allowed", "output_stem_conflict",
+            "job_not_pending"} <= set(ERROR_CODES)
+
+
+def test_the_planned_code_exemption_is_now_empty():
+    """`job_not_pending` was mapped to 409 a task before it could be raised. It is raised now, so
+    the exemption has done its job and is gone -- and `test_every_status_this_module_maps_belongs_
+    to_a_real_code` covers the entry under the ordinary rule again.
+    """
+    assert web.PLANNED_CODES == frozenset()
+    assert web.ERROR_STATUS["job_not_pending"] == 409
