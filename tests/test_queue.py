@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -567,9 +568,24 @@ def test_move_to_front_on_the_only_pending_job_still_raises_its_priority(tmp_pat
 # -- Step 6: update racing claim, forced deterministically -----------------------------------------
 
 
-def test_update_racing_claim_leaves_one_state_and_consistent_content(tmp_path, monkeypatch):
-    """Force the dangerous interleaving instead of hoping for it: `update` is paused after it
-    has read the job and before it writes it back, and the worker claims during the pause."""
+def test_update_and_claim_are_serialized_end_to_end(tmp_path, monkeypatch):
+    """`update` and `claim` share the queue lock, and the lock is held for `update`'s entire
+    critical section -- validate, prompt snapshot, final write -- not released partway through.
+    So a `claim` attempted while `update` is mid-edit must not run at all until `update` releases
+    the lock: serialization, not "eventually converges to something consistent", is the actual
+    property the lock provides.
+
+    Forced deterministically, not hoped for: `write_json_durably` is paused the first time
+    `update` calls it (i.e. inside its single locked section, committing the new content). While
+    paused, a second thread starts a `claim` and must *not* finish within a short window -- if it
+    does, `update`'s lock is not covering its write and the two operations ran concurrently. Only
+    after the pause is released may `claim` proceed, and by then `update` has already committed:
+    `claim` must take the *edited* job, not the stale one.
+
+    A two-lock-acquisition version of `update` (validate under one lock, write unlocked, verify
+    under a second) cannot pass this: `claim` would run to completion during the pause instead of
+    waiting for it, immediately failing the "must not finish yet" assertion below.
+    """
     root = tmp_path / "queue"
     job = q.submit(root, ["generate", "--tag", "a"], "старая", _DRY, {})
 
@@ -592,85 +608,302 @@ def test_update_racing_claim_leaves_one_state_and_consistent_content(tmp_path, m
                                          _DRY, {}))))
     editor.start()
     assert paused.wait(5)
-    claimed = _try(lambda: q.claim(root))
+
+    claim_finished = threading.Event()
+    claim_outcome: dict = {}
+    claimer = threading.Thread(
+        target=lambda: (claim_outcome.update(result=_try(lambda: q.claim(root))),
+                        claim_finished.set()))
+    claimer.start()
+    assert not claim_finished.wait(0.5), (
+        "claim ran to completion while update was mid-edit: not serialized")
+
     resume.set()
     editor.join(10)
+    claimer.join(10)
 
+    assert isinstance(outcome["result"], q.Job), f"update must have succeeded: {outcome['result']!r}"
     present = [s for s in q.QUEUE_STATES if q.job_path(root, job.id, s).exists()]
-    assert len(present) == 1, f"job exists in {present} at once"
-    if present == ["pending"]:
-        assert json.loads(q.job_path(root, job.id, "pending").read_text())["note"] == "новая", (
-            "update won the race but the file holds the old content")
-    else:
-        assert isinstance(outcome["result"], q.JobNotPending)
-    # Whichever side won, `claim` itself must not have raised or silently returned nothing when a
-    # job genuinely was there to take.
-    assert claimed is not None and not isinstance(claimed, BaseException)
+    assert present == ["running"], f"job exists in {present}, expected exactly ['running']"
+    on_disk = json.loads(q.job_path(root, job.id, "running").read_text())
+    assert on_disk["note"] == "новая", (
+        "claim must have taken update's committed (edited) content, not a stale copy")
+    assert not isinstance(claim_outcome["result"], BaseException) and claim_outcome["result"] is not None
+    assert claim_outcome["result"].note == "новая"
 
 
-def test_update_first_lock_acquisition_blocks_before_any_write_is_attempted(tmp_path, monkeypatch):
-    """`update` takes the queue lock twice (see its docstring): once to validate, once -- after an
-    unlocked write -- to verify. The combined test above and the parametrized one in step 1 only
-    prove that *some* acquisition inside `update` blocks; held against a single, long external
-    lock, the second acquisition alone would make either test pass even if the first never took
-    the lock at all. This isolates the first: an external holder must block `update` before it
-    ever reaches its write, not just block it somewhere eventually because the second acquisition
-    happens to pick up the slack.
+# -- Review circle 1: state transition is a rename, not write+unlink ----------------------------
+
+
+def test_claim_moves_the_job_with_a_single_rename_not_write_then_unlink(tmp_path, monkeypatch):
+    """The design spec requires the pending->running transition to be one `os.rename` (atomic
+    within a filesystem), not a durable write to the new path followed by unlinking the old one:
+    two operations leave a real window -- a crash between them, or an `unlink` that never reaches
+    disk -- where the job exists in both directories *after a reboot*, not just during a race.
+    Spy on both `os.rename` and `Path.unlink` around the one call under test: a regression to
+    write-then-unlink would still pass every functional test above while failing this one.
+    """
+    root = tmp_path / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    renamed, unlinked = [], []
+    real_rename = os.rename
+    real_unlink = Path.unlink
+    monkeypatch.setattr(q.os, "rename", lambda src, dst: (renamed.append((str(src), str(dst))),
+                                                           real_rename(src, dst))[1])
+    monkeypatch.setattr(Path, "unlink", lambda self, *a, **k: (unlinked.append(str(self)),
+                                                                real_unlink(self, *a, **k))[1])
+
+    claimed = q.claim(root)
+
+    assert renamed, "claim must move the job with os.rename"
+    assert not unlinked, f"claim must not unlink anything -- it should rename instead: {unlinked}"
+    assert claimed is not None
+
+
+def test_finish_moves_the_job_with_a_single_rename_not_write_then_unlink(tmp_path, monkeypatch):
+    root = tmp_path / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    job = q.claim(root)  # before monkeypatching, so its own rename/unlink calls aren't counted
+    renamed, unlinked = [], []
+    real_rename = os.rename
+    real_unlink = Path.unlink
+    monkeypatch.setattr(q.os, "rename", lambda src, dst: (renamed.append((str(src), str(dst))),
+                                                           real_rename(src, dst))[1])
+    monkeypatch.setattr(Path, "unlink", lambda self, *a, **k: (unlinked.append(str(self)),
+                                                                real_unlink(self, *a, **k))[1])
+
+    finished = q.finish(root, job.id, 0, "ok")
+
+    assert renamed, "finish must move the job with os.rename"
+    assert not unlinked, f"finish must not unlink anything -- it should rename instead: {unlinked}"
+    assert finished.state == "done"
+
+
+def test_claim_fsyncs_both_directories_the_rename_touches(tmp_path, monkeypatch):
+    """The rename's own durability requires fsyncing *both* directories whose listing it changes
+    -- `pending/` (an entry disappeared) and `running/` (one appeared) -- *after* the rename, not
+    merely at some point during `claim`. `write_json_durably` already fsyncs `pending/` earlier,
+    while committing `started_at` into the not-yet-moved file -- a version of `_rename_durably`
+    that fsyncs only `dest.parent` would still make `pending/` appear in a naive "was it fsynced
+    at all" check, purely because of that earlier, unrelated fsync. Recording the *order* of
+    events (rename, then which directories get fsynced) is what actually distinguishes the two:
+    only a fsync recorded strictly after the `rename` event proves the rename's own effect on that
+    directory's listing was made durable. Recover each fsync'd fd's path via the `os.open` call
+    that produced it (macOS has no `/proc/self/fd`), the same way
+    `test_durable_write_fsyncs_the_file_and_its_directory` distinguishes file syncs from directory
+    ones by kind, not just by count.
+    """
+    root = tmp_path / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    paths_by_fd: dict[int, str] = {}
+    real_open, real_fsync, real_rename = os.open, os.fsync, os.rename
+    events: list[tuple] = []
+
+    def spy_open(path, *a, **k):
+        fd = real_open(path, *a, **k)
+        paths_by_fd[fd] = str(path)
+        return fd
+
+    def spy_fsync(fd):
+        path = paths_by_fd.get(fd)
+        if path is not None and Path(path).is_dir():
+            events.append(("fsync", path))
+        return real_fsync(fd)
+
+    def spy_rename(src, dst):
+        events.append(("rename", str(src), str(dst)))
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(q.os, "open", spy_open)
+    monkeypatch.setattr(q.os, "fsync", spy_fsync)
+    monkeypatch.setattr(q.os, "rename", spy_rename)
+
+    q.claim(root)
+
+    rename_at = next(i for i, e in enumerate(events) if e[0] == "rename")
+    fsyncs_after_rename = [e[1] for e in events[rename_at + 1:] if e[0] == "fsync"]
+    assert str(root / "pending") in fsyncs_after_rename, (
+        "pending/'s directory entry, changed by the rename, must itself be fsynced afterward")
+    assert str(root / "running") in fsyncs_after_rename, (
+        "running/'s directory entry, changed by the rename, must itself be fsynced afterward")
+
+
+# -- Review circle 1: bare exceptions must not escape as ValueError/TypeError/KeyError -----------
+
+
+@pytest.mark.parametrize("op", [
+    lambda root, job_id: q.update(root, job_id, ["generate", "--tag", "a"], "", _DRY, {}),
+    lambda root, job_id: q.move_to_front(root, job_id),
+    lambda root, job_id: q.cancel(root, job_id),
+])
+def test_pending_mutators_raise_queue_error_on_a_corrupt_pending_file(tmp_path, op):
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    q.job_path(root, job.id, "pending").write_text("{ not json")
+    with pytest.raises(q.QueueError):
+        op(root, job.id)
+
+
+def test_finish_raises_queue_error_on_a_corrupt_running_file(tmp_path):
+    root = tmp_path / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    job = q.claim(root)
+    q.job_path(root, job.id, "running").write_text("{ not json")
+    with pytest.raises(q.QueueError):
+        q.finish(root, job.id, 0, "ok")
+
+
+def test_update_raises_queue_error_on_a_pending_file_with_an_extra_field(tmp_path):
+    """A shape mismatch -- not just unparseable JSON -- must also come out as `QueueError`, not a
+    bare `TypeError` from `Job(**data)`.
     """
     root = tmp_path / "queue"
     job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
-    reached_write = threading.Event()
-    real_write = q.write_json_durably
-
-    def mark_and_write(path, payload):
-        reached_write.set()
-        return real_write(path, payload)
-
-    monkeypatch.setattr(q, "write_json_durably", mark_and_write)
-    with _external_lock(root, "LOCK_EX"):
-        threading.Thread(target=lambda: q.update(
-            root, job.id, ["generate", "--tag", "a"], "новая", _DRY, {}), daemon=True).start()
-        assert not reached_write.wait(0.5), (
-            "update reached its write before the external lock was released -- its first "
-            "(validating) lock acquisition did not wait")
-    assert reached_write.wait(5), "update never reached its write after the lock was released"
+    data = json.loads(q.job_path(root, job.id, "pending").read_text())
+    data["unexpected_field"] = "surprise"
+    q.write_json_durably(q.job_path(root, job.id, "pending"), data)
+    with pytest.raises(q.QueueError):
+        q.update(root, job.id, ["generate", "--tag", "a"], "", _DRY, {})
 
 
-def test_update_second_lock_acquisition_also_waits_for_the_queue_lock(tmp_path, monkeypatch):
-    """The other half of the isolation above: pause `update` right where the race test pauses it
-    (after its unlocked write is handed to `write_json_durably`), grab the queue lock externally
-    during that pause -- exactly where the post-write verification would need it -- and confirm
-    `update` does not finish until that external lock is released. Without this, the verification
-    that deletes a stale duplicate and raises `JobNotPending` (see `update`'s docstring) could run
-    concurrently with another mutator instead of after it.
+def test_claim_skips_an_unreadable_file_and_still_claims_a_good_one(tmp_path):
+    """One broken file in `pending/` must not jam every valid job behind it -- `scan` is the place
+    that surfaces a broken file; `claim` just needs to move past it.
+    """
+    root = tmp_path / "queue"
+    good = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    (q.layout(root)["pending"] / "20260811-000000-junk-zzzz.json").write_text("{ not json")
+    claimed = q.claim(root)
+    assert claimed.id == good.id
+
+
+def test_claim_skips_a_pending_file_with_a_shape_mismatch(tmp_path):
+    """Valid JSON that does not match `Job`'s shape (an extra field here) must be skipped the same
+    way unparseable JSON is -- not raised, and not silently claimed with a `TypeError` waiting to
+    happen at the end of the function.
+    """
+    root = tmp_path / "queue"
+    good = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    paths = q.layout(root)
+    bad = {
+        "id": "20260811-000000-bad-zzzz", "created_at": "2026-08-11T00:00:00",
+        "args": ["generate"], "note": "", "prompt_source": None, "prompt_sha256": None,
+        "output_stem": "/out/bad", "estimate": {}, "priority": 0, "started_at": None,
+        "finished_at": None, "exit_code": None, "log_tail": None, "unexpected_field": True,
+    }
+    q.write_json_durably(paths["pending"] / "20260811-000000-bad-zzzz.json", bad)
+    claimed = q.claim(root)
+    assert claimed.id == good.id
+    assert q.job_path(root, "20260811-000000-bad-zzzz", "pending").exists(), (
+        "a shape-mismatched file must be left alone, not claimed or destroyed")
+
+
+# -- Review circle 1: durability and the on-disk shape must be tested for every mutator, not -----
+# -- only for submit -------------------------------------------------------------------------------
+
+
+def test_update_writes_the_prompt_snapshot_durably(tmp_path, monkeypatch):
+    """Mirrors `test_submit_writes_the_prompt_snapshot_durably`: `submit`'s snapshot durability
+    was proven by counting fsyncs, but nothing proved `update`'s rewrite of the *same* snapshot
+    goes through `write_text_durably` rather than a plain `Path.write_text`.
+    """
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--prompt-file", "p.txt", "--tag", "a"], "", _DRY, {},
+                   prompt_source="p.txt", prompt_text="one\n")
+    calls: list[int] = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(q.os, "fsync", lambda fd: (calls.append(fd), real_fsync(fd))[1])
+    q.update(root, job.id, ["generate", "--prompt-file", "p.txt", "--tag", "a"], "", _DRY, {},
+             prompt_source="p.txt", prompt_text="two\n")
+    assert len(calls) == 4, (
+        f"expected 2 fsyncs for the rewritten prompt snapshot and 2 for the job file, got {len(calls)}")
+
+
+def test_update_recomputes_prompt_sha256_for_the_new_text(tmp_path):
+    """A hash that stays at the old value after an edit lies about what the snapshot now
+    contains -- exactly the kind of drift the field exists to prevent.
+    """
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--prompt-file", "p.txt", "--tag", "a"], "", _DRY, {},
+                   prompt_source="p.txt", prompt_text="one\n")
+    edited = q.update(root, job.id, ["generate", "--prompt-file", "p.txt", "--tag", "a"], "",
+                      _DRY, {}, prompt_source="p.txt", prompt_text="two\n")
+    assert edited.prompt_sha256 == hashlib.sha256(b"two\n").hexdigest()
+    assert edited.prompt_sha256 != job.prompt_sha256
+
+
+def test_updated_job_file_does_not_persist_the_redundant_state_field(tmp_path):
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    q.update(root, job.id, ["generate", "--tag", "a"], "новая", _DRY, {})
+    on_disk = json.loads(q.job_path(root, job.id, "pending").read_text())
+    assert "state" not in on_disk
+
+
+def test_finished_job_file_does_not_persist_the_redundant_state_field(tmp_path):
+    root = tmp_path / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    job = q.claim(root)
+    q.finish(root, job.id, 0, "ok")
+    on_disk = json.loads(q.job_path(root, job.id, "done").read_text())
+    assert "state" not in on_disk
+
+
+def test_claimed_job_file_does_not_persist_the_redundant_state_field(tmp_path):
+    root = tmp_path / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    job = q.claim(root)
+    on_disk = json.loads(q.job_path(root, job.id, "running").read_text())
+    assert "state" not in on_disk
+
+
+# -- Review circle 1: update must carry forward the lease trail, not zero it ---------------------
+
+
+def test_update_preserves_started_at_left_by_a_reconciled_job(tmp_path):
+    """A job task 4's reconciliation returns to `pending/` after an interrupted run keeps its
+    original `started_at` (the run resumes from its checkpoint, not from zero). `update` touching
+    unrelated fields (`note` here) must not silently erase that trace just because it also
+    rewrites the file.
     """
     root = tmp_path / "queue"
     job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    data = json.loads(q.job_path(root, job.id, "pending").read_text())
+    data["started_at"] = "2026-08-11T10:00:00"
+    q.write_json_durably(q.job_path(root, job.id, "pending"), data)
 
-    paused = threading.Event()
-    resume = threading.Event()
-    real_write = q.write_json_durably
+    edited = q.update(root, job.id, ["generate", "--tag", "a"], "новая", _DRY, {})
+    assert edited.started_at == "2026-08-11T10:00:00"
 
-    def slow_write(path, payload):
-        if paused.is_set():
-            return real_write(path, payload)
-        paused.set()
-        assert resume.wait(5)
-        return real_write(path, payload)
 
-    monkeypatch.setattr(q, "write_json_durably", slow_write)
-    finished = threading.Event()
-    editor = threading.Thread(
-        target=lambda: (q.update(root, job.id, ["generate", "--tag", "a"], "новая", _DRY, {}),
-                        finished.set()))
-    editor.start()
-    assert paused.wait(5)
-    with _external_lock(root, "LOCK_EX"):
-        resume.set()
-        assert not finished.wait(0.5), (
-            "update's post-write verification did not wait for the queue lock")
-    assert finished.wait(5), "update never completed after the external lock was released"
-    editor.join(5)
+# -- Review circle 1: mutators must not recreate a missing queue layout --------------------------
+
+
+@pytest.mark.parametrize("name", ["claim", "finish", "update", "move_to_front", "cancel"])
+def test_mutators_do_not_recreate_missing_queue_subdirectories(tmp_path, name):
+    """`layout(root)` unconditionally creates all eight subdirectories. Task 1 removed the call
+    from `scan` for the same reason this removes it from every mutator here: a job can only exist
+    to be claimed/finished/edited/moved/cancelled because `submit` already ran `layout`, so there
+    is nothing legitimate left for these to create -- and calling it anyway risks silently
+    rebuilding a typo'd `H3_OUTDIR/queue` path into existence. `leases/` and `results/` are
+    untouched by every operation under test, so their disappearance after each call is the signal.
+    """
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    if name == "finish":
+        q.claim(root)
+    shutil.rmtree(root / "leases")
+    shutil.rmtree(root / "results")
+    ops = {
+        "claim": lambda: q.claim(root),
+        "finish": lambda: q.finish(root, job.id, 0, "ok"),
+        "update": lambda: q.update(root, job.id, ["generate", "--tag", "a"], "", _DRY, {}),
+        "move_to_front": lambda: q.move_to_front(root, job.id),
+        "cancel": lambda: q.cancel(root, job.id),
+    }
+    ops[name]()
+    assert not (root / "leases").exists(), "leases/ must not be recreated"
+    assert not (root / "results").exists(), "results/ must not be recreated"
 
 
 # -- Global constraint: queue.py must stay importable without MLX -------------------------------
