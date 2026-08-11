@@ -192,12 +192,12 @@ kernel-enforced exclusion primitive on a local disk, but on network filesystems 
 cloud-sync mounts) it is not: depending on protocol version and mount options, a lock one client
 takes may exclude only other processes on that same client, not a second machine writing the same
 path at all. Put a checkpoint directory on one of those and both halves of this feature degrade at
-once: a second real writer will believe it acquired an exclusive lock when it did not, write its
-checkpoint atomically (via temporary file, `fsync`, and `os.replace`), yet the first writer's
-earlier state survives on the filesystem. The last write wins, and progress rolls backward — a
-second process starting from a checkpoint older than what the first writer's latest run reached
-will overwrite it with earlier state. Meanwhile, `status`/`watch` probing that same unreliable lock
-keep reporting `unknown` or stale `in_flight` instead of detecting the corruption. Keep
+once: a second real writer will believe it acquired an exclusive lock when it did not. Both write
+atomically (via temporary file, `fsync`, and `os.replace`), but the last to replace the file wins.
+Progress can rollback: if the later writer happens to have fewer `completed_steps` than the earlier
+one, its state will overwrite the later progress. The atomic write ensures no file corruption, but
+the stale process's checkpoint will silently become live. Meanwhile, `status`/`watch` probing that
+same unreliable lock keep reporting `unknown` or stale `in_flight` instead of detecting the switch. Keep
 `--checkpoint-dir` (and `--outdir`, for the in-progress lock files `watch` also reads) on a
 genuinely local filesystem.
 

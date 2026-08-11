@@ -459,6 +459,8 @@ def test_format_status_reports_correct_eta_minutes():
     human = format_status(report)
     # 480 seconds / 60 = 8 minutes
     assert "осталось 8 мин" in human
+    # Mutation: using eta_seconds instead of seconds_per_forward would show 480 instead of 120
+    assert "120 с на форвард" in human
 
 
 def test_status_survives_a_checkpoint_with_a_zero_total(tmp_path):
