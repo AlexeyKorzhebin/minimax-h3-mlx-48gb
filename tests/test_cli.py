@@ -1450,6 +1450,83 @@ def test_main_doctor_json_reports_failure_with_nonzero_exit(tmp_path, capsys):
     assert payload["ok"] is False
 
 
+# -- --dry-run: report what a run would do, without loading weights -----------------------------
+#
+# A future local server validates a queued request by shelling out to `h3 generate --dry-run
+# --json` rather than calling `spec_from_args` in-process: with `--image` and no explicit canvas,
+# `spec_from_args` reaches `resolve_canvas`, which imports `minimax_h3_mlx.packing` -- and that
+# pulls in `mlx.core`. Running validation as a subprocess keeps the server itself free of MLX
+# while still sharing the one, real set of validation rules with a live run.
+
+
+def test_dry_run_reports_what_would_run_without_loading_weights(tmp_path, capsys):
+    """`--dry-run` reports the request `run_generate` would act on, without acting on it.
+
+    `--steps 8` needs its own AdaLN cache here: the checkpoint's own table (whatever
+    `DEFAULT_CHECKPOINT` resolves to on this machine) is baked for a different grid, and
+    `RunSpec.__post_init__` -- which a dry run must also go through -- refuses a step count that
+    does not match. `--adaln-cache` is what makes an alternate grid count valid regardless of
+    which checkpoint happens to be installed locally (see
+    `test_an_alternate_adaln_cache_decides_the_step_count`).
+    """
+    import struct
+
+    def table(points: int) -> Path:
+        header = {"video_sigmas": {"dtype": "F32", "shape": [points],
+                                   "data_offsets": [0, 4 * points]}}
+        packed = json.dumps(header).encode()
+        path = tmp_path / f"table{points}.safetensors"
+        with open(path, "wb") as fh:
+            fh.write(struct.pack("<Q", len(packed)))
+            fh.write(packed)
+            fh.write(b"\x00" * 4 * points)
+        return path
+
+    path = tmp_path / "p.txt"
+    path.write_text("a centaur\n")
+    code = main(["generate", "--prompt-file", str(path), "--tag", "cent",
+                "--width", "896", "--height", "576", "--duration", "10", "--steps", "8",
+                "--adaln-cache", str(table(8)),
+                "--outdir", str(tmp_path), "--dry-run", "--json"])
+    assert code == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["dry_run"] is True
+    assert report["canvas"] == "896x576"
+    assert report["forwards"] == 7
+    assert report["output_stem"] == str(tmp_path / "h3-cent-896x576")
+    assert "generate_seconds" not in report, "a dry run has no runtime to report"
+    assert "video" not in report, "a dry run never produces a clip"
+    assert "audio" not in report, "a dry run never produces audio"
+
+
+def test_dry_run_refuses_what_a_real_run_refuses_with_the_same_code(tmp_path, capsys):
+    """`main` catches `CliError` and returns 1 -- assert on the exit code and the JSON body,
+    not on a raised exception, since `--dry-run` must go through the exact same refusal path a
+    real run does."""
+    code = main(["generate", "x", "--width", "900", "--height", "576",
+                "--outdir", str(tmp_path), "--dry-run", "--json"])
+    assert code != 0
+    body = json.loads(capsys.readouterr().out)
+    assert body["ok"] is False
+    assert body["error"]["code"] == "geometry_not_multiple_of_32"
+
+
+def test_dry_run_in_a_fresh_process_does_not_import_mlx(tmp_path):
+    """The property the module docstring's rationale depends on, checked for real: a fresh
+    interpreter that runs `--dry-run` must never have pulled `mlx.core` into `sys.modules`, not
+    merely never have imported some module believed to be MLX-free."""
+    path = tmp_path / "p.txt"
+    path.write_text("a centaur\n")
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import sys, h3_48gb.cli as c\n"
+         f"c.main(['generate', '--prompt-file', {str(path)!r}, '--tag', 't',\n"
+         f"        '--outdir', {str(tmp_path)!r}, '--dry-run', '--json'])\n"
+         "print('MLX' if 'mlx.core' in sys.modules else 'CLEAN', file=sys.stderr)"],
+        capture_output=True, text=True)
+    assert "CLEAN" in out.stderr, out.stderr
+
+
 def test_error_codes_are_documented_in_one_place():
     """`ERROR_CODES` is the whole machine-readable contract (module docstring): every code the CLI
     can actually raise must be listed there, and -- the direction a hand-picked sample of names

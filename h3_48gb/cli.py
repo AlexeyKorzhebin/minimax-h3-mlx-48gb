@@ -355,6 +355,14 @@ def build_parser() -> argparse.ArgumentParser:
                           "(the way out of a checkpoint_mismatch refusal)")
     gen.add_argument("--no-checkpoint", action="store_true",
                      help="do not write a resume checkpoint at all; a crash then costs the whole run")
+    # Runs `spec_from_args` -- so every refusal a real run would raise (bad geometry, an
+    # unbaked schedule, a missing keyframe, ...) still fires here, with the same code -- but
+    # returns before `run_generate` touches a checkpoint or loads any weights. This is what lets
+    # a caller validate a request through `RunSpec.__post_init__`'s one set of rules without
+    # importing MLX itself: only `generate` (not `resume`) needs it, since a caller validating a
+    # request before it exists has no resume target to speak of.
+    gen.add_argument("--dry-run", action="store_true",
+                     help="report what would run, without loading weights or writing anything")
 
     res = _subcommand(sub, "resume", help="continue an interrupted run")
     # No `--restart` / `--no-checkpoint` here on purpose: `resume` exists precisely to *assert*
@@ -590,6 +598,35 @@ def load_keyframes(spec: RunSpec) -> tuple[list, tuple[str, ...]]:
                 {"patch": "patches/0001-keyframe-masked-scatter.patch"},
             )
     return images, tuple(anchors)
+
+
+def run_dry(spec: RunSpec) -> dict:
+    """Report what `run_generate(spec)` would do, without loading weights or writing anything.
+
+    `spec` has already been through `RunSpec.__post_init__` by the time it reaches here (built by
+    `spec_from_args`, same as a real run), so every refusal a real run would raise has already had
+    its chance to fire with the same code -- a dry run is not a separate, laxer set of rules.
+
+    The report is a subset of `run_generate`'s: `video`, `audio`, and `generate_seconds` are
+    absent rather than empty, because nothing has run yet to fill them in, and a placeholder value
+    would be indistinguishable from a real one to a caller that only checks the key exists.
+    """
+    return {
+        "tag": spec.tag,
+        "canvas": f"{spec.width}x{spec.height}",
+        "duration_seconds": spec.duration,
+        "grid_points": spec.steps,
+        "forwards": spec.steps - 1,
+        "seed": spec.seed,
+        "prompt_file": spec.prompt_file,
+        "checkpoint": str(spec.checkpoint),
+        "adaln_cache": str(spec.adaln_cache) if spec.adaln_cache else None,
+        "turbo_lora": str(spec.turbo_lora) if spec.turbo_lora else None,
+        "turbo_strength": spec.turbo_strength if spec.turbo_lora else None,
+        "mode": actual_mode(spec.image, spec.end_image),
+        "dry_run": True,
+        "output_stem": str(spec.output_stem()),
+    }
 
 
 def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wav_fn=None,
@@ -1000,12 +1037,19 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "generate":
-            # Under --json, stdout has exactly one contract: one JSON document. verbose=False
-            # keeps the pipeline and the checkpoint writer from printing progress onto it.
-            report = run_generate(spec_from_args(args), resume=not args.restart,
-                                  verbose=not as_json)
-            ok = True
-            human = f"done in {report['generate_seconds'] / 60:.1f} min -> {report['video']}"
+            spec = spec_from_args(args)
+            if getattr(args, "dry_run", False):
+                # No weights loaded, nothing written: `spec_from_args` above already ran every
+                # refusal a real run would, so reaching here means this request would proceed.
+                report = run_dry(spec)
+                ok = True
+                human = f"would generate -> {report['output_stem']}"
+            else:
+                # Under --json, stdout has exactly one contract: one JSON document. verbose=False
+                # keeps the pipeline and the checkpoint writer from printing progress onto it.
+                report = run_generate(spec, resume=not args.restart, verbose=not as_json)
+                ok = True
+                human = f"done in {report['generate_seconds'] / 60:.1f} min -> {report['video']}"
         elif args.command == "resume":
             report = run_resume(spec_from_args(args), verbose=not as_json)
             ok = True
