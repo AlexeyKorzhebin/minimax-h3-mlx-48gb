@@ -17,6 +17,7 @@ from h3_48gb.cli import (
     run_generate,
     run_list,
     run_resume,
+    run_status,
     spec_from_args,
 )
 from h3_48gb.cli import _checkpoint_path_for, DEFAULT_OUTDIR
@@ -38,6 +39,95 @@ def test_spec_carries_every_field_that_identifies_a_run():
         checkpoint=Path.home() / "models/h3-converted",
         outdir=DEFAULT_OUTDIR, tag="demo",
     )
+
+
+def test_prompt_file_matches_the_shell(tmp_path):
+    """`$(cat file)` strips every trailing newline, and every measured run to date was launched
+    that way. Leaving one on would change the prompt by a character, change identity_digest, and
+    orphan every checkpoint on disk.
+
+    The text comparison below is diagnostically useful but is not what is actually at stake:
+    identity is built from arguments bound to the pipeline's own `__call__` signature (a stray
+    argument there raises `TypeError`, so that source is guarded) plus the free-form
+    `checkpoint_identity_extra()` dict, which is an ordinary dict a text-only comparison would not
+    notice a leak through. Comparing `_checkpoint_path_for`'s output directly is what actually
+    confirms a run started with `--prompt-file` resumes the same checkpoint as one started
+    positionally -- the same direct-comparison pattern
+    `test_resume_checkpoint_path_changes_with_the_request` already uses.
+    """
+    path = tmp_path / "p.txt"
+    path.write_text("a cat\n\n\n")
+
+    from_file = spec_from_args(build_parser().parse_args(
+        ["generate", "--prompt-file", str(path), "--outdir", str(tmp_path)]))
+    positional = spec_from_args(build_parser().parse_args(
+        ["generate", "a cat", "--outdir", str(tmp_path)]))
+
+    assert from_file.prompt == positional.prompt
+
+    pipe = _StubPipe()
+    assert (_checkpoint_path_for(from_file, pipe, tmp_path / "checkpoints")
+            == _checkpoint_path_for(positional, pipe, tmp_path / "checkpoints"))
+
+
+def test_prompt_and_prompt_file_together_are_refused(tmp_path):
+    path = tmp_path / "p.txt"
+    path.write_text("a cat\n")
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "a dog", "--prompt-file", str(path), "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "prompt_both_given"
+
+
+def test_dash_dash_prompt_is_not_an_abbreviation_of_prompt_file(tmp_path, capsys):
+    """`--prompt` must not be silently read as `--prompt-file`.
+
+    `prompt` is positional and `--prompt-file` is the only flag starting with those letters, so
+    argparse's abbreviation matching would otherwise accept `--prompt "a dog"` and hand "a dog" to
+    the file reader — which then fails with "no such file", blaming the prompt text. `run_bench.py`
+    spells the flag exactly this way, so the misreading is reachable by a plausible command.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(
+            ["generate", "--prompt", "a dog", "--outdir", str(tmp_path)])
+    assert excinfo.value.code == 2
+    assert "--prompt" in capsys.readouterr().err
+
+
+def test_no_prompt_at_all_is_refused(tmp_path):
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(["generate", "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "prompt_missing"
+
+
+def test_prompt_file_pointing_nowhere_is_refused(tmp_path):
+    missing = tmp_path / "missing.txt"
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "--prompt-file", str(missing), "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "prompt_file_not_found"
+
+
+def test_prompt_file_that_is_not_valid_utf8_is_refused(tmp_path):
+    path = tmp_path / "bad.txt"
+    path.write_bytes(b"\xff\xfe\x00\x01")
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "--prompt-file", str(path), "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "prompt_file_unreadable"
+
+
+def test_prompt_file_of_only_newlines_is_refused_as_empty(tmp_path):
+    """The shell equivalent, `P="$(cat file)"`, would silently substitute an empty string, and a
+    run would spend hours generating a clip of nothing -- exactly the zone
+    `test_prompt_file_matches_the_shell` exists to police, seen from the other side.
+    """
+    path = tmp_path / "empty.txt"
+    path.write_text("\n\n\n")
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(
+            ["generate", "--prompt-file", str(path), "--outdir", str(tmp_path)]))
+    assert excinfo.value.code == "prompt_file_empty"
 
 
 def test_rejects_geometry_the_port_cannot_pack():
@@ -196,6 +286,22 @@ def test_dir_returns_only_public_api():
     assert not extra, f"dir(h3_48gb) returns non-__all__ names: {extra}"
 
 
+def test_checkpoint_locked_is_importable_from_the_package_root():
+    """`CheckpointLocked` is a sibling of `CheckpointCorrupt`/`CheckpointMismatch` -- raised the
+    same way in `checkpoint.py`, caught the same way in `cli.py`'s handler -- but was added to
+    `checkpoint.py` without the two places that make a name part of the public API:
+    `_LAZY_IMPORTS` and `__all__` in `h3_48gb/__init__.py`. Without both,
+    `from h3_48gb import CheckpointLocked` raises `AttributeError` even though
+    `h3_48gb.checkpoint.CheckpointLocked` exists and works fine -- only the shortcut a caller
+    would actually reach for is broken.
+    """
+    import h3_48gb
+    from h3_48gb.checkpoint import CheckpointLocked as direct
+
+    assert h3_48gb.CheckpointLocked is direct, "must be the very same class, not a re-implementation"
+    assert "CheckpointLocked" in h3_48gb.__all__
+
+
 # -- list --------------------------------------------------------------------------------------
 
 def test_list_reports_finished_runs(tmp_path):
@@ -206,6 +312,198 @@ def test_list_reports_finished_runs(tmp_path):
 
 def test_list_is_empty_for_an_outdir_with_no_finished_runs(tmp_path):
     assert run_list(tmp_path) == []
+
+
+# -- status --------------------------------------------------------------------------------------
+
+def test_status_json_lists_runs(tmp_path, capsys):
+    """The machine contract: one JSON document, ok true, a runs array."""
+    from tests.test_runs import write_checkpoint
+
+    write_checkpoint(tmp_path / "r" / "checkpoints" / "h3-a.safetensors",
+                     completed=3, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:30:00")
+
+    assert main(["status", "--outdir", str(tmp_path), "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    run = payload["runs"][0]
+    assert run["completed"] == 3
+    assert run["total"] == 7
+    assert run["identity_digest"] == "deadbeef"
+    assert run["started_at"] == "2026-08-10T21:00:00"
+    assert run["written_at"] == "2026-08-10T21:30:00"
+    assert run["fraction"] == 3 / 7
+
+
+def test_status_refuses_a_missing_outdir(tmp_path, capsys):
+    assert main(["status", "--outdir", str(tmp_path / "nope"), "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "outdir_not_found"
+
+
+def test_status_orders_in_flight_before_stale(tmp_path):
+    """`run_status` sorts in-flight runs first, so a human scanning the report sees what is
+    actually happening before what has died.
+
+    The live run's directory name (`z-alive`) sorts *after* the dead one's (`a-dead`)
+    alphabetically -- `scan` itself returns runs in path order, so if `run_status` ever drops its
+    `.sort(...)` this fails instead of passing by the coincidence of matching names to path order.
+    """
+    from h3_48gb.cli import run_status
+    from tests.test_runs import held_lock, write_checkpoint, write_free_lock_file
+
+    dead = write_checkpoint(tmp_path / "a-dead" / "checkpoints" / "h3-a.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:20:00")
+    write_free_lock_file(dead)
+    alive = write_checkpoint(tmp_path / "z-alive" / "checkpoints" / "h3-b.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:59:00",
+                     completed_at_start=0, written_at="2026-08-10T22:00:00")
+
+    with held_lock(alive):
+        report = run_status(tmp_path)
+
+    assert [r["state"] for r in report["runs"]] == ["in_flight", "stale"]
+    assert [Path(r["outdir"]).name for r in report["runs"]] == ["z-alive", "a-dead"]
+
+
+def test_format_status_reports_progress_for_an_in_flight_run():
+    from h3_48gb.cli import format_status
+
+    report = {
+        "ok": True, "outdir": "/x",
+        "runs": [{
+            "outdir": "/x/r", "state": "in_flight", "completed": 3, "total": 7,
+            "fraction": 3 / 7, "seconds_per_forward": 120.0, "eta_seconds": 480.0,
+        }],
+    }
+    human = format_status(report)
+    assert "r" in human
+    assert "3/7" in human
+    assert "43%" in human
+
+
+def test_format_status_reports_a_stale_run_as_stopped():
+    from h3_48gb.cli import format_status
+
+    report = {
+        "ok": True, "outdir": "/x",
+        "runs": [{
+            "outdir": "/x/r", "state": "stale", "completed": 3, "total": 7,
+            "fraction": 3 / 7, "seconds_per_forward": None, "eta_seconds": None,
+        }],
+    }
+    human = format_status(report)
+    assert "остановлен" in human
+    assert "3/7" in human
+
+
+def test_format_status_says_nothing_is_running_when_the_report_is_empty():
+    from h3_48gb.cli import format_status
+
+    human = format_status({"ok": True, "outdir": "/x", "runs": []})
+    assert "ничего не идёт" in human
+    assert "/x" in human
+
+
+def test_format_status_reports_an_unreadable_run_with_its_error():
+    """`unreadable` is the whole reason `scan`'s protected `try` exists -- dropping it from the
+    human report makes the command lie: "ничего не идёт" when a broken run is sitting right there,
+    with a diagnosis already computed and thrown away.
+    """
+    from h3_48gb.cli import format_status
+
+    report = {
+        "ok": True, "outdir": "/x",
+        "runs": [{
+            "outdir": "/x/bad", "state": "unreadable", "completed": None, "total": None,
+            "fraction": None, "seconds_per_forward": None, "eta_seconds": None,
+            "age_seconds": None, "error": "ValueError: header length 999 exceeds the file",
+        }],
+    }
+    human = format_status(report)
+    assert "bad" in human
+    assert "header length 999" in human
+    assert "ничего не идёт" not in human
+
+
+def test_format_status_reports_an_unknown_rate_run_without_a_verdict():
+    """`unknown` states what is known (forwards done, time since the last write) and passes no
+    judgment on whether the run is alive -- unlike `stale`, which asserts it is dead."""
+    from h3_48gb.cli import format_status
+
+    report = {
+        "ok": True, "outdir": "/x",
+        "runs": [{
+            "outdir": "/x/old", "state": "unknown", "completed": 8, "total": 19,
+            "fraction": 8 / 19, "age_seconds": 1004.76, "seconds_per_forward": None,
+            "eta_seconds": None,
+        }],
+    }
+    human = format_status(report)
+    assert "8/19" in human
+    assert "остановлен" not in human
+
+
+def test_format_status_does_not_crash_when_total_is_unknown():
+    """`eta_seconds` is `None` not only when the rate is unknown but also when `total` is -- a
+    checkpoint whose `total_forwards` is missing or zero. Guarding on `seconds_per_forward` alone
+    divides `None / 60` and crashes the whole report over one such file; guard on `eta_seconds`
+    itself instead. `total=None` must also not render as the literal string "None"."""
+    from h3_48gb.cli import format_status
+
+    report = {
+        "ok": True, "outdir": "/x",
+        "runs": [{
+            "outdir": "/x/r", "state": "in_flight", "completed": 8, "total": None,
+            "fraction": None, "seconds_per_forward": 120.0, "eta_seconds": None,
+        }],
+    }
+    human = format_status(report)  # must not raise
+    assert "8/?" in human
+    assert "None" not in human
+
+
+def test_format_status_reports_correct_eta_minutes():
+    """Regression: dividing `eta_seconds` by 3600 instead of 60 would show 0 minutes for short ETAs.
+    This test ensures the value shown is correct, not just its presence."""
+    from h3_48gb.cli import format_status
+
+    report = {
+        "ok": True, "outdir": "/x",
+        "runs": [{
+            "outdir": "/x/r", "state": "in_flight", "completed": 3, "total": 7,
+            "fraction": 3 / 7, "seconds_per_forward": 120.0, "eta_seconds": 480.0,
+        }],
+    }
+    human = format_status(report)
+    # 480 seconds / 60 = 8 minutes
+    assert "осталось 8 мин" in human
+    # Mutation: using eta_seconds instead of seconds_per_forward would show 480 instead of 120
+    assert "120 с на форвард" in human
+
+
+def test_status_survives_a_checkpoint_with_a_zero_total(tmp_path):
+    """End-to-end: `total_forwards: 0` reaches `scan` as `total=None` (see `runs.py`'s `... or
+    None`), while the rate can still be known -- exactly the shape `format_status` must not choke
+    on.
+
+    The lock is held for the duration so this deterministically lands in `in_flight`, the branch
+    that divides by `eta_seconds`.
+    """
+    from h3_48gb.cli import format_status, run_status
+    from tests.test_runs import held_lock, write_checkpoint
+
+    checkpoint = write_checkpoint(tmp_path / "r" / "checkpoints" / "h3-a.safetensors",
+                     completed=3, total=0, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:10:00")
+
+    with held_lock(checkpoint):
+        report = run_status(tmp_path)
+
+    assert report["runs"][0]["state"] == "in_flight"
+    format_status(report)  # must not raise
 
 
 # -- doctor ------------------------------------------------------------------------------------
@@ -231,6 +529,202 @@ def test_doctor_reports_the_baked_adaln_cache_separately_from_the_component_dirs
     report = run_doctor(tmp_path)
     assert report["ok"] is False
     assert report["missing"] == ["transformer/adaln_cache.safetensors"]
+
+
+# -- watch ------------------------------------------------------------------------------------
+
+def test_watch_exits_when_nothing_is_running(tmp_path, capsys):
+    """It has to terminate on its own, or it cannot end a queue script."""
+    assert main(["watch", "--outdir", str(tmp_path), "--interval", "0"]) == 0
+    assert "ничего не идёт" in capsys.readouterr().out
+
+
+def test_watch_reports_in_flight_before_any_checkpoint_is_written(tmp_path):
+    """The blind window between a writer taking its lock and its first checkpoint write (task 6) --
+    a single forward can run for minutes -- must read as a run in progress through the whole CLI
+    path (`run_status` and `format_status`), not just at the `scan()` level.
+    """
+    import fcntl
+    from h3_48gb.cli import format_status, run_status
+
+    checkpoints = tmp_path / "warming-up" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    handle = open(checkpoints / "h3-abc.safetensors.lock", "wb")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    try:
+        report = run_status(tmp_path)
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+    assert report["runs"][0]["state"] == "in_flight"
+    assert report["runs"][0]["completed"] is None
+    assert report["runs"][0]["total"] is None
+    text = format_status(report)
+    assert "ничего не идёт" not in text, "a live run must not be reported as nothing running"
+    assert "warming-up" in text
+
+
+def test_watch_continues_while_a_writer_holds_the_lock_then_terminates(tmp_path, monkeypatch):
+    """`in_flight` is the one state `WATCH_RUNNING_STATES` may never lose: it is the only state
+    backed by a signal that can actually change between two polls (the companion lock file), so it
+    is the only one worth polling again for. This is the test the task's mutation list calls for:
+    delete `"in_flight"` from `WATCH_RUNNING_STATES` and this fails, because `run_watch` would
+    return on the first pass without ever sleeping.
+    """
+    import fcntl
+    import time
+    from tests.test_runs import lock_path_for, write_checkpoint
+    from h3_48gb.cli import run_watch
+
+    checkpoint = write_checkpoint(tmp_path / "live" / "checkpoints" / "h3-a.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:20:00")
+    handle = open(lock_path_for(checkpoint), "wb")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # matches the real writer's exclusive lock
+
+    sleep_calls = []
+
+    def stub_sleep(duration: float) -> None:
+        sleep_calls.append(duration)
+        # Simulate the writer finishing between polls: release the lock so the next scan reads
+        # this run as `stale`, which is what actually lets the loop end.
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+    monkeypatch.setattr(time, "sleep", stub_sleep)
+
+    try:
+        report = run_watch(tmp_path, interval=0.1)
+    finally:
+        if not handle.closed:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+    assert len(sleep_calls) >= 1, "watch must sleep at least once while the lock is held"
+    assert report["runs"][0]["state"] == "stale", \
+        "run_watch must have re-scanned after the lock was released, not just slept once and stopped"
+
+
+def _sleep_stub_that_must_not_be_called(monkeypatch):
+    """Install a `time.sleep` that fails the test instead of hanging it.
+
+    Every test below expects `run_watch` to return on its *first* pass through the loop -- no
+    running states left, so no reason to sleep. If a regression puts the run back into a state
+    `run_watch` treats as still-running, the naive failure mode is an infinite loop with a fixed
+    `_now` (nothing ever changes state between iterations), which would hang the whole suite. This
+    stub turns that into an immediate, readable assertion failure instead.
+    """
+    import time
+
+    def stub_sleep(duration: float) -> None:
+        raise AssertionError(
+            f"run_watch slept ({duration}s) instead of terminating on the first pass -- a run "
+            "that should have read as finished is still being treated as running")
+
+    monkeypatch.setattr(time, "sleep", stub_sleep)
+
+
+def test_watch_terminates_immediately_on_unknown_state(tmp_path, monkeypatch):
+    """`unknown` no longer keeps `watch` polling (task 4): without a lock file there is nothing
+    that could change between one poll and the next, so looping is pure waiting for an answer that
+    is never coming. Print it once and return control to the caller instead.
+    """
+    from tests.test_runs import write_checkpoint
+    from h3_48gb.cli import run_watch
+
+    write_checkpoint(tmp_path / "old-format" / "checkpoints" / "h3-a.safetensors",
+                     completed=3, total=7, written_at="2026-08-10T21:00:00")
+    # No companion lock file at all -- what an old-format checkpoint looks like.
+
+    _sleep_stub_that_must_not_be_called(monkeypatch)
+
+    report = run_watch(tmp_path, interval=0.1)
+    assert report["runs"][0]["state"] == "unknown"
+
+
+def test_watch_terminates_on_a_stale_run(tmp_path, monkeypatch):
+    """The base case: a checkpoint whose writer is confirmed gone (lock file present, unlocked)
+    must not keep `watch` polling.
+
+    This is the test that must fail if `stale` is ever added back to `WATCH_RUNNING_STATES`.
+    """
+    from tests.test_runs import write_checkpoint, write_free_lock_file
+    from h3_48gb.cli import run_watch
+
+    checkpoint = write_checkpoint(tmp_path / "dead" / "checkpoints" / "h3-a.safetensors",
+                     completed=2, total=7, started_at="2026-08-10T21:00:00",
+                     completed_at_start=0, written_at="2026-08-10T21:20:00")
+    write_free_lock_file(checkpoint)
+
+    _sleep_stub_that_must_not_be_called(monkeypatch)
+
+    report = run_watch(tmp_path, interval=0.1)
+    assert report["runs"][0]["state"] == "stale"
+
+
+def test_watch_terminates_when_written_at_is_missing(tmp_path, monkeypatch):
+    """A checkpoint with no `written_at` and no lock file reads as `unknown` -- and `unknown` must
+    not keep `watch` polling (task 4). Pinned to the exact value rather than a bare `!=
+    "in_flight"`: a regression to `stale` here is exactly the overclaim task 3 exists to remove
+    (missing `written_at` proves the file predates the current writer, not that its writer died),
+    and a loose assertion would not catch it.
+    """
+    from tests.test_runs import write_checkpoint
+    from h3_48gb.cli import run_watch
+
+    write_checkpoint(tmp_path / "no-written-at" / "checkpoints" / "h3-a.safetensors",
+                     completed=2, total=7, written_at=None)
+
+    _sleep_stub_that_must_not_be_called(monkeypatch)
+
+    report = run_watch(tmp_path, interval=0.1)
+    assert report["runs"][0]["state"] == "unknown"
+
+
+def test_watch_terminates_on_an_unreadable_checkpoint(tmp_path, monkeypatch):
+    """A corrupt checkpoint reads as `unreadable`, which must stay out of `WATCH_RUNNING_STATES` --
+    this is the test the task's mutation list calls for: add `"unreadable"` back into it and this
+    fails, recreating an infinite loop on exactly the kind of file that motivated this feature.
+    """
+    from h3_48gb.cli import run_watch
+
+    checkpoints = tmp_path / "bad" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / "h3-bad.safetensors").write_bytes(b"\x01\x02\x03")
+
+    _sleep_stub_that_must_not_be_called(monkeypatch)
+
+    report = run_watch(tmp_path, interval=0.1)
+    assert report["runs"][0]["state"] == "unreadable"
+
+
+def test_watch_terminates_when_flock_cannot_judge_a_lock_only_run(tmp_path, monkeypatch):
+    """End-to-end version of `test_a_lock_file_flock_cannot_judge_is_not_reported_as_in_flight`
+    (test_runs.py): a lock file with no checkpoint yet, on a filesystem where `flock` cannot judge
+    it (`ENOTSUP`), must not park `watch` in a loop it can never leave. The mutation this guards is
+    `runs.py`'s `if _writer_alive(checkpoint) is not True: continue` rewritten as `is False` --
+    under that mutation `scan()` fabricates an `in_flight` run from the unjudged lock file and this
+    test's sleep stub fires, because `run_watch` would poll a "run" that can never change state.
+    """
+    import errno
+
+    import h3_48gb.runs as runs_mod
+    from h3_48gb.cli import run_watch
+
+    checkpoints = tmp_path / "warming-up" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / "h3-abc.safetensors.lock").write_bytes(b"")
+
+    def fake_flock(fd, operation):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(runs_mod.fcntl, "flock", fake_flock)
+
+    _sleep_stub_that_must_not_be_called(monkeypatch)
+
+    report = run_watch(tmp_path, interval=0.1)
+    assert report["runs"] == [], f"expected no runs reported, got {report['runs']}"
 
 
 # -- resume ------------------------------------------------------------------------------------
@@ -539,6 +1033,99 @@ def test_parser_accepts_the_two_flags(tmp_path):
     assert args.end_image == tmp_path / "b.png"
 
 
+# -- mode ----------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("mode,argv_extra,expected", [
+    ("i2v", [], "mode_mismatch"),                       # i2v without a picture
+    ("t2v", ["--image", "IMG"], "mode_mismatch"),       # t2v with a picture
+    ("flf", ["--image", "IMG"], "mode_mismatch"),       # flf without a second one
+])
+def test_mode_refuses_flags_that_contradict_it(tmp_path, mode, argv_extra, expected):
+    """The point is the typo: without this, a mistyped --image gives you t2va and you find out an
+    hour later by watching the clip."""
+    img = _png(tmp_path / "a.png", size=(512, 512))
+    argv = ["generate", "a cat", "--mode", mode, "--outdir", str(tmp_path),
+            "--width", "512", "--height", "512"]
+    argv += [str(img) if a == "IMG" else a for a in argv_extra]
+
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(argv))
+    assert excinfo.value.code == expected
+
+
+def test_mode_does_not_change_the_identity(tmp_path):
+    """It is fully derivable from flags already in the identity, so it must not enter it.
+
+    The `==` comparisons below only catch a regression that stores the *raw* `--mode` string on
+    `RunSpec` (`None` vs `"t2v"`/`"i2v"` would then differ). A regression that instead stores the
+    *derived* mode would pass both comparisons silently, since the derived value is identical with
+    or without `--mode` in each case here -- that is what the `dataclasses.fields` assertion below
+    is for: it fails regardless of which value a hypothetical field would hold, because it checks
+    that no field named `mode` exists on `RunSpec` at all.
+    """
+    import dataclasses
+
+    assert "mode" not in {f.name for f in dataclasses.fields(RunSpec)}
+
+    base = ["generate", "a cat", "--outdir", str(tmp_path)]
+    without = spec_from_args(build_parser().parse_args(base))
+    with_mode = spec_from_args(build_parser().parse_args(base + ["--mode", "t2v"]))
+    assert without == with_mode
+
+    img = _png(tmp_path / "a.png", size=(512, 512))
+    base_with_image = ["generate", "a cat", "--outdir", str(tmp_path), "--image", str(img),
+                       "--width", "512", "--height", "512"]
+    without_i2v = spec_from_args(build_parser().parse_args(base_with_image))
+    with_i2v = spec_from_args(build_parser().parse_args(base_with_image + ["--mode", "i2v"]))
+    assert without_i2v == with_i2v
+
+
+def test_mode_t2va_is_accepted_as_a_synonym_for_t2v(tmp_path):
+    """`t2va` (text-to-video-with-audio) is what a text-only run actually produces; it must not be
+    refused as a mismatch against the `t2v` the flags imply."""
+    spec_from_args(build_parser().parse_args(
+        ["generate", "a cat", "--mode", "t2va", "--outdir", str(tmp_path)]))
+
+
+def test_mode_accepts_flags_that_match_it(tmp_path):
+    img = _png(tmp_path / "a.png", size=(512, 512))
+    end = _png(tmp_path / "b.png", size=(512, 512), colour=(30, 30, 200))
+    spec_from_args(build_parser().parse_args(
+        ["generate", "a cat", "--mode", "flf", "--image", str(img), "--end-image", str(end),
+         "--outdir", str(tmp_path), "--width", "512", "--height", "512"]))
+
+
+def test_mode_refuses_before_a_missing_image_is_ever_opened(tmp_path):
+    """A mismatched --mode must fail before `resolve_canvas` ever touches the path it names.
+
+    `--image` here points at a file that does not exist. If `check_mode` ran after
+    `resolve_canvas`, this would fail as `image_not_found` instead -- the mismatch would never
+    even be reported, because the missing file wins the race. The code below has to be
+    `mode_mismatch`, proving the mode is checked first.
+    """
+    missing = tmp_path / "does-not-exist.png"
+    argv = ["generate", "a cat", "--mode", "t2v", "--image", str(missing),
+            "--outdir", str(tmp_path)]
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(argv))
+    assert excinfo.value.code == "mode_mismatch"
+
+
+def test_mode_refuses_before_a_corrupt_image_is_ever_decoded(tmp_path):
+    """The same race, with a file that exists but is not a readable image.
+
+    If `check_mode` ran after `resolve_canvas`, this would fail as `image_unreadable` (PIL
+    choking on a text file wearing a `.png` extension) instead of `mode_mismatch`.
+    """
+    corrupt = tmp_path / "not-really-a-png.png"
+    corrupt.write_text("this is text, not image bytes")
+    argv = ["generate", "a cat", "--mode", "t2v", "--image", str(corrupt),
+            "--outdir", str(tmp_path)]
+    with pytest.raises(CliError) as excinfo:
+        spec_from_args(build_parser().parse_args(argv))
+    assert excinfo.value.code == "mode_mismatch"
+
+
 def test_one_image_anchors_the_first_frame(tmp_path):
     from h3_48gb.cli import load_keyframes
 
@@ -783,6 +1370,53 @@ def test_checkpoint_corrupt_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path
         raise AssertionError("a CheckpointCorrupt must surface as a machine-readable CliError")
 
 
+def test_checkpoint_locked_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path):
+    """The third sibling of the two tests above: a second writer refused the lock (round 2's fix
+    to `CheckpointStore.acquire_lock`) must reach the caller the same way `CheckpointMismatch` and
+    `CheckpointCorrupt` do, not as a bare exception `run_generate` forgot to catch."""
+    from h3_48gb.checkpoint import CheckpointLocked
+
+    def exploding_pipe(**kwargs):
+        raise CheckpointLocked("another process already holds the lock for this checkpoint")
+
+    spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
+                   checkpoint=tmp_path, outdir=tmp_path, tag="t")
+    try:
+        run_generate(spec, pipeline_factory=lambda _: exploding_pipe)
+    except CliError as exc:
+        assert exc.code == "checkpoint_locked"
+    else:
+        raise AssertionError("a CheckpointLocked must surface as a machine-readable CliError")
+
+
+def test_second_writer_reports_checkpoint_locked_not_internal_error_under_json(tmp_path, capsys):
+    """The task's literal scenario: a second writer hitting an already-occupied checkpoint, under
+    `--json`. Without the `except CheckpointLocked` handler in `run_generate` (`cli.py`), this
+    exception is not a `CliError` at all -- it falls through `main`'s last-resort
+    `except Exception` and stdout reports `error.code == "internal_error"` instead of something an
+    MCP wrapper could branch on. Deleting that one handler and rerunning this test is the
+    mutation check for this fix: it must fail with `checkpoint_locked != internal_error`.
+    """
+    import unittest.mock as mock
+
+    from h3_48gb.checkpoint import CheckpointLocked
+
+    def exploding_pipe(**kwargs):
+        raise CheckpointLocked("another process already holds the lock for this checkpoint")
+
+    argv = ["generate", "a cat", "--width", "64", "--height", "64", "--outdir", str(tmp_path),
+            "--json"]
+    with mock.patch("h3_48gb.cli._default_pipeline_factory", return_value=exploding_pipe):
+        code = main(argv)
+
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "checkpoint_locked", (
+        f"a second writer must report checkpoint_locked on stdout under --json, got "
+        f"{payload['error']['code']!r}")
+
+
 def test_main_emits_a_json_error_on_stdout_with_nonzero_exit(capsys):
     code = main(["generate", "a cat", "--height", "433", "--json"])
     assert code == 1
@@ -817,12 +1451,39 @@ def test_main_doctor_json_reports_failure_with_nonzero_exit(tmp_path, capsys):
 
 
 def test_error_codes_are_documented_in_one_place():
-    """Codes are part of the public contract; this is the "list them in one place" the task asked for."""
+    """`ERROR_CODES` is the whole machine-readable contract (module docstring): every code the CLI
+    can actually raise must be listed there, and -- the direction a hand-picked sample of names
+    cannot catch -- every code listed there must correspond to a real `raise CliError(...)` site,
+    or the list is quietly promising something `--json` can never produce.
+
+    Checked by scanning `cli.py`'s own source for every `CliError("code", ...)` call site, rather
+    than a fixed sample: a hand-maintained list of five names would keep passing forever even if a
+    sixth call site raised a code nobody added to `ERROR_CODES` -- which is exactly what happened
+    to `checkpoint_locked` when it was added to the `except` handler in `run_generate` but not
+    here. `CliError.__init__` already asserts membership, but only for whichever branch a given
+    test happens to exercise; this test needs none of them to run.
+
+    Limitations: this regex-based scan catches only double-quoted string literals. It will miss
+    single-quoted strings, error codes passed via variables, or calls in other files; a true proof
+    would require AST-based scanning or runtime monitoring. Treat as a convention guard, not a
+    completeness proof.
+    """
+    import inspect
+    import re
+
+    from h3_48gb import cli as cli_mod
     from h3_48gb.cli import ERROR_CODES
 
-    for code in ("geometry_not_multiple_of_32", "schedule_not_baked", "checkpoint_not_found",
-                 "checkpoint_mismatch", "checkpoint_corrupt"):
-        assert code in ERROR_CODES
+    source = inspect.getsource(cli_mod)
+    raised_codes = set(re.findall(r'CliError\(\s*"([a-z0-9_]+)"', source))
+
+    undocumented = raised_codes - set(ERROR_CODES)
+    assert not undocumented, f"raised via CliError but missing from ERROR_CODES: {undocumented}"
+
+    unraised = set(ERROR_CODES) - raised_codes
+    assert not unraised, (
+        f"listed in ERROR_CODES but no `raise CliError(...)` site in cli.py produces them: "
+        f"{unraised}")
 
 
 # -- verbose: the --json stdout contract must survive a chatty pipeline -------------------------
@@ -1362,6 +2023,109 @@ def test_bad_turbo_inputs_are_refused_before_any_weight_loads(tmp_path):
     with pytest.raises(CliError) as excinfo:
         _turbo_spec(tmp_path, adaln_cache=junk)
     assert excinfo.value.code == "adaln_cache_unreadable"
+
+
+# -- the report records what produced the run --------------------------------------------------
+
+def _run_generate_with_fakes(tmp_path, spec_fn=_turbo_spec, **overrides):
+    """Run `run_generate` end to end through a faked pipeline; return `(report, spec)`.
+
+    The brief for this test named `_run_generate_with_fakes(tmp_path, turbo_strength=0.45)`, but
+    no such helper existed — this is that helper, built from the two patterns already proven
+    elsewhere in this file rather than a third reimplementation: `spec_fn` (default `_turbo_spec`,
+    which always sets `turbo_lora`, so a run through here always has an adapter to record — pass
+    `spec_fn=_spec` for the no-adapter, no-keyframe scenario) and the `FakePipe`/`dit` shape
+    `test_the_lora_is_installed_once_even_when_resume_asks_twice` uses to satisfy
+    `install_turbo_lora`'s `pipe.dit.__dict__["_loader"]` access. That test's `FakePipe` is not
+    callable; this one is, so `run_generate` can run its full path instead of stopping at adapter
+    installation. The spec is returned alongside the report so callers can assert the report's
+    values against what actually produced the run, not just that the keys exist.
+    """
+    class FakeLoader:
+        def __call__(self):
+            return object()
+
+    class FakePipe:
+        def __init__(self):
+            self.dit = type("P", (), {"__dict__": {"_loader": FakeLoader()}})()
+
+        def __call__(self, **kwargs):
+            return _StubResult()
+
+    spec = spec_fn(tmp_path, **overrides)
+    report = run_generate(spec, pipeline_factory=lambda _: FakePipe(),
+                          save_mp4_fn=lambda *a: None, save_wav_fn=lambda *a: None)
+    return report, spec
+
+
+def test_the_report_records_what_produced_the_run(tmp_path):
+    """On 2026-08-10 two runs of the same prompt, canvas, duration, steps and seed measured 349
+    and 265, and the cause was unrecoverable because none of this was written down.
+
+    Checks values, not just key presence: a `key in report` check alone stays true no matter what
+    a field holds, so it cannot catch a swapped `image`/`end_image`, a strength that never reached
+    the report, or a `Path` slipping in where `json.dumps` needs a string.
+    """
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("a cat\n")
+    report, spec = _run_generate_with_fakes(tmp_path, turbo_strength=0.45,
+                                            prompt_file=str(prompt_file))
+
+    assert report["prompt"] == spec.prompt
+    assert report["prompt_file"] == str(prompt_file)
+    assert report["checkpoint"] == str(spec.checkpoint)
+    assert isinstance(report["checkpoint"], str), (
+        "a Path here passes every dict check and then breaks json.dumps hours into a real run, "
+        "after the video is already rendered")
+    assert report["turbo_lora"] == str(spec.turbo_lora)
+    assert report["turbo_strength"] == 0.45
+    # Not set on this spec: must be present as null, not merely absent from the dict. Both are
+    # None here, so a swapped image/end_image would pass this line too — that distinction needs
+    # two *different* images to be observable, which is what
+    # test_the_report_does_not_swap_image_and_end_image below is for.
+    assert report["adaln_cache"] is None
+    assert report["image"] is None
+    assert report["end_image"] is None
+    assert report["forwards"] == report["grid_points"] - 1
+
+    # The one line that catches a non-JSON value anywhere in the report before it ever reaches
+    # disk, rather than hours into a real run when the write finally happens.
+    json.dumps(report)
+
+
+def test_the_report_writes_null_not_a_missing_key_when_there_was_no_lora_or_image(tmp_path):
+    """`turbo_lora`/`turbo_strength`/`image`/`end_image`/`prompt_file` must let a reader tell
+    "this run had none of this" apart from "the field was never recorded" -- only an explicit
+    `null` can do that; a missing key cannot. `_spec` builds its `RunSpec` with a positional
+    prompt (no `--prompt-file`), so `spec.prompt_file` is `None` here.
+    """
+    report, spec = _run_generate_with_fakes(tmp_path, spec_fn=_spec)
+
+    assert (spec.turbo_lora is None and spec.image is None and spec.end_image is None
+            and spec.prompt_file is None)
+    for key in ("turbo_lora", "turbo_strength", "image", "end_image", "prompt_file"):
+        assert key in report and report[key] is None, f"{key} must be present and null, not omitted"
+
+    json.dumps(report)
+
+
+def test_the_report_does_not_swap_image_and_end_image(tmp_path):
+    """`report["image"] == str(spec.end_image)` (and vice versa) would pass every other test in
+    this file, since the two other report tests above use no keyframes at all -- with both None,
+    a swap is invisible. Only two *different* real images make it observable, so this writes two
+    (the same `_png` helper `test_two_images_anchor_both_ends` and friends already use) and checks
+    each report field against the specific file it names, not just against "not None".
+    """
+    first = _png(tmp_path / "first.png", colour=(200, 30, 30))
+    last = _png(tmp_path / "last.png", colour=(30, 30, 200))
+
+    report, spec = _run_generate_with_fakes(tmp_path, spec_fn=_spec, image=first, end_image=last)
+
+    assert report["image"] == str(first)
+    assert report["end_image"] == str(last)
+    assert report["image"] != report["end_image"]
+
+    json.dumps(report)
 
 
 def test_the_lora_side_path_is_numerically_unchanged_by_its_optimizations(tmp_path):

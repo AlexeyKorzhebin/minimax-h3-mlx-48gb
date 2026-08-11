@@ -1,78 +1,136 @@
 ---
 name: generating-h3-video
-description: Use when generating video or audio with MiniMax H3 on this Apple Silicon Mac, sizing a run's resolution/duration/step count, or diagnosing a slow, interrupted, refused-to-start, or schedule/memory-error H3 run
+description: Use when generating video or audio with MiniMax H3 on this Apple Silicon Mac, choosing a run's mode/resolution/duration/step count, conditioning on a keyframe, or diagnosing a slow, interrupted, refused-to-start, or schedule/memory-error H3 run
 ---
 
 # Generating video with MiniMax H3 on a 48 GB Mac
 
-A native 1344x768, 5-second clip takes about five hours end to end, and nothing about this run is
-cheap to cancel and restart. Get resolution, duration and `--steps` right *before* you launch —
-the wrong choice costs a night, not a retry.
+Runs are minutes to hours and cost the same whether the flags were right. Decide the mode, the
+canvas and the step count *before* launching, and say the predicted cost out loud first.
 
-## Symptom -> cause
+## Never launch a run outside `caffeinate`
 
-| Symptom | Cause | What to do |
+```bash
+caffeinate -dimsu <the run, or the queue script driving several>
+```
+
+Wrap the whole script, not one `generate`, so the assertion covers the gaps between runs. Nothing
+here takes a sleep assertion, and a run pins the GPU while the keyboard and display sit idle —
+which `powerd` reads as an idle machine. On 2026-08-10 that cost a 1344x768 run at step 2 of 7: the
+Mac idle-slept and the GPU firmware panicked coming out of it, `agx_power failed to transition to
+state 0`. Check `pmset -g` first; `sleep 1` and `displaysleep 30` are the defaults and both are
+fatal. Logs go on disk, never `/tmp` — the reboot that kills the run wipes the evidence with it.
+
+## The three modes
+
+One checkpoint (`fl2va` partition) serves all of them; the mode is decided by which flags appear.
+
+| Mode | Flags | What it does |
 |---|---|---|
-| `ScheduleMismatch`, or `--json` error code `schedule_not_baked` | The shipped AdaLN table is baked for exactly one schedule: `num_inference_steps=31` (31 grid points, 30 forwards), sigma shifts 12.0/3.0. No other step count can be evaluated. | Always pass `--steps 31` (the default). Never change it. |
-| `--json` error code `geometry_not_multiple_of_32` | `--width`/`--height` must each be a multiple of 32 — checked before any weight loads. | Round the requested resolution to the nearest multiple of 32 first. |
-| Not sure a checkpoint is usable, or a run refuses to start | The converted checkpoint is missing a required component or the AdaLN cache. | Run `h3 doctor --checkpoint <dir> --json` before anything else — it costs seconds, not hours. |
-| `--json` error code `checkpoint_not_found` from `h3 resume` | No checkpoint under `<outdir>/checkpoints` matches this run's prompt/geometry/duration/steps/seed/tag. | Check every flag matches the interrupted `generate` call exactly, or just re-run the identical `generate` command — it auto-resumes on its own. |
-| `--json` error code `checkpoint_mismatch` / `checkpoint_corrupt` | A checkpoint file exists but was written for a different request, or cannot be read. | Re-run the same command with `--restart`: it ignores whatever is on disk and starts from step 0, still checkpointing. That is the intended recovery — the file is named after a digest you cannot compute by hand. The error message does name the exact path (`<checkpoint-dir>/h3-<digest>.safetensors`) if you would rather move it aside as evidence; a fresh `--tag` also gets a new file but leaves the stale one behind. |
-| Run looks stalled, no output for a long time | Expected — a native step is ~586 s, and plain `h3 generate` (no `--json`) prints only one `checkpoint: N/M steps` line per completed step. | Wait, or check the checkpoint file's mtime under `<outdir>/checkpoints`; see "watch a run" below. |
+| **t2va** — text to video+audio | no `--image` | The whole clip from the prompt. |
+| **i2v** — first frame conditioning | `--image photo.jpg` | The clip starts from that frame. The canvas is *derived from the image* unless both `--width` and `--height` are given; passing only one is refused (`partial_canvas_with_image`). |
+| **first+last** | `--image a.jpg --end-image b.jpg` | Interpolates between two anchors. `--end-image` alone is refused. |
 
-## Workflow
+The model was trained on exactly those two keyframe arrangements, so the flags deliberately cannot
+express a third. **`ref2va`** — conditioning on reference images of a character or style rather
+than on frames — is a different weight partition this fork does not convert. There is no flag for
+it and adding one would silently produce nonsense.
 
-1. **Validate before spending any compute.** `h3 doctor --checkpoint <dir> --json` checks that all
-   four required components (`transformer`, `text_encoder`, `video_vae`, `audio_vae`) and the AdaLN
-   cache are present. Seconds, versus discovering a bad checkpoint hours into a run.
-2. **Decide the shape of the run out loud before launching.** Only width, height, duration, seed
-   and tag are yours to choose — `--steps` must stay `31`, and width/height must be multiples of
-   32. Use the runtime cost table below to say how long this specific run will take and how much
-   memory it will hold at peak before you start it.
-3. **Watch a run instead of waiting blind.** Pass `--preview-every N` to `h3 generate`. It writes
-   `<stem>-preview-stepNN.jpg` every N steps, next to where `<stem>.mp4` will land once the run
-   finishes, so you can judge composition and prompt adherence long before the run ends. It is off
-   by default because one preview costs roughly 49 s at native resolution; `--preview-every 5` at
-   1344x768 is a frame roughly every 49 minutes, which is cheap against a five-hour render:
-   ```
-   h3 generate "<prompt>" --checkpoint <ckpt> --outdir <outdir> \
-       --width <w> --height <h> --duration <d> --seed <seed> --tag <tag> --preview-every 5
-   ```
-   Without it, default (non-`--json`) mode prints only a `checkpoint: N/M steps` line per step,
-   which confirms the run is alive but shows you nothing. **The checkpoint identity is the prompt,
-   `--width`, `--height`, `--duration`, `--steps`, `--seed`, `--tag`, plus which `--checkpoint` and
-   `--outdir` (or `--checkpoint-dir`) you point at** — every one of those must match between a run
-   and the `h3 resume` that continues it, or resume will not recognise it as the same run
-   (`checkpoint_not_found`). Previewing no longer requires switching to `run_bench.py`, which
-   removes the seed trap that used to come with it (`run_bench.py --seed` defaults to `314159`,
-   `h3 generate --seed` to `0`).
-4. **Resume after an interruption; never restart blind.** Every step is checkpointed under
-   `<outdir>/checkpoints`. Re-running the exact same `h3 generate` command after a crash or Ctrl-C
-   picks the run back up bit-identically, because it auto-resumes whenever the checkpoint's
-   identity (prompt + geometry + duration + steps + seed + tag + checkpoint/outdir) matches. Use
-   `h3 resume` instead when you want that to be a hard assertion rather than an assumption: it
-   fails loudly with `checkpoint_not_found` if nothing matches, instead of silently starting over
-   from step 0.
+A keyframe is *stretched* onto the canvas without preserving aspect, which is why the canvas
+follows the image by default. EXIF rotation is applied before the size is read.
 
-## Runtime cost — decide before you launch
+## Step count is free, but each count needs its own AdaLN table
 
-Measured on a MacBook Pro M4 Pro, 48 GB unified memory, the one schedule the baked AdaLN table
-supports (`--steps 31`, sigma shifts 12.0/3.0):
+The old rule "always `--steps 31`, never change it" is retired and was wrong. What is true: this
+build ships no AdaLN modulation projections at all — they are precomputed into a table — so a run
+can only use a step count some table covers. The checkpoint's own table is 31 grid points; anything
+else needs one baked first:
 
-| Resolution | Requested | Per step | Total | Peak RSS |
+```bash
+python scripts/bake_adaln.py 8 --out ~/models/turbo/adaln_8_plain.safetensors
+h3 generate "<prompt>" --steps 8 --adaln-cache ~/models/turbo/adaln_8_plain.safetensors
+```
+
+Baking is seconds and a few hundred MB. `--steps N` counts **grid points**, and the run does N-1
+forward passes: `--steps 8` is 7 forwards. A mismatch between `--steps` and the table is refused
+before any weight loads (`schedule_not_baked`).
+
+`--schedule tail-split` bakes a grid whose prefix is bit-identical to `simple`'s and subdivides only
+the final Euler step — the way to change the tail without changing the composition.
+
+## Sizing a run
+
+```
+rows    ~ (5.53 + 1.641 * (seconds - 2.4)) * (W/16) * (H/16) + 81 * seconds + text_rows
+seconds ~ 5.699e-3 * rows + 2.671e-7 * rows**2      # one forward
+```
+
+Fitted on five measured forwards from 6,671 to 73,061 rows, every point within 3%. Multiply by
+(grid points - 1) for the diffusion time; loading is a couple of minutes and decoding scales on its
+own. Worked points, 8 grid points:
+
+| Canvas | Duration | Rows | Diffusion | Wall clock |
 |---|---|---|---|---|
-| 512x512 | 2.4 s (73 frames) | 46 s | 24 min | 11.5 GB |
-| 1344x768 (native) | 5 s (124 frames) | 586 s | 299 min (~5 h) | 10.1 GB |
-| 1344x768 (native) | 10 s (243 frames) | 1881 s | ~15.7 h (extrapolated; measured for 2 steps, then stopped deliberately) | not measured |
+| 896x512 (default) | 2.4 s | 10,375 | 10.3 min | 12.5 min |
+| 768x768 | 2.4 s | 13,191 | 14.2 min | 16.3 min |
+| 896x576 | 10 s | 37,657 | 69 min | 78 min |
+| 1344x768 (native) | 5 s | 40,202 | 77 min | not measured |
+| 1344x768 (native) | 10 s | 73,686 | 218 min | not measured |
 
-`--duration` is snapped up to the latent grid, so a 2.4 s request yields 73 frames = 3.04 s at
-24 fps. Peak RSS covers the diffusion phase only; the ~10-second text-encoding phase that precedes
-it peaks at 28.2 GB by MLX's own counter. See `docs/RESULTS.md` in the repository for how each of
-those numbers was measured, and which of them were not.
+Wall clock is diffusion plus loading and decoding, and those two are a couple of minutes at
+2.4 s and much more at ten. Quote the column you actually mean.
 
-Cost does not scale linearly with resolution or duration: attention is dense and MiniMax has not
-released a sparse-attention implementation for H3, so this is an attention-FLOPs bottleneck, not a
-memory one. A 10 s clip is not ~2x a 5 s clip — it measured over 3x the per-step cost.
+Attention is quadratic and everything else linear, which is why no single exponent ever fit: the
+quadratic term is 21% of the cost at 512x512 and 77% at native resolution. Ten seconds is not twice
+five; it is nearly three times.
 
-See `reference.md` for the complete flag list of every subcommand and the full `--json` error code
-table.
+Width and height must each be a multiple of 32, checked before any weight loads.
+
+## Memory is not the constraint; wall clock is
+
+The peak is **27 GB on every canvas tried**, from 512x512 to 1344x768, and it belongs to the text
+encoding phase — not to diffusion, which runs at 13-15 GB on small canvases and 24 GB on an 8-bit
+build. Nothing in that range is memory-limited.
+
+The exception worth knowing: an 8-bit DiT is 21.35 GB resident, and a 15 s native clip is projected
+past 24 GB of activations. That sum is ~46 GB on a 48 GB machine, so at native resolution *and*
+long duration the 8-bit build becomes the peak. Short clips on middling canvases pay nothing for it.
+
+## Getting quality for the money
+
+Measured against reference renders of the same prompt from a working ComfyUI install (see
+`reference/README.md`), the gap was never excess noise — it was missing mid-scale detail, and it
+split roughly evenly between step count and this fork's own quantization. The levers, cheapest
+first:
+
+- **Use the 8-bit DiT build.** Same wall clock, same peak memory, and at 8 steps it reaches what 16
+  steps reached on the 4-bit build. Point `--checkpoint` at it.
+- **Turbo LoRA at strength 1.0** (`--turbo-lora <path>`, the default strength). Adds roughly what
+  doubling the steps adds, for free, and lands motion at 113% of a 31-step reference where 8 steps
+  alone manage 52%. Lower toward 0.8 only if the image over-sharpens.
+- **Spend pixels before steps when steps are short.** Rendering bigger recovers most of what few
+  steps cost: on the reference model, 896x576 gains 31% of mid-scale detail going 8 -> 20 steps,
+  while 1248x832 gains 3% — it already had it. Faces specifically need pixels and are not helped by
+  steps at all: over three seeds, 768x768 beat 512x512 on the mean and had a third of the spread.
+- **More steps, last.** They saturate before 31, and 50 measured slightly *worse* than 31 at almost
+  six times the cost. Upstream's advice to use 50 did not reproduce here.
+
+## Watching and resuming
+
+Previews are on by default every 5 steps, decoded by TAE in 0.125 s — the flag exists mostly to
+turn them off (`--preview-every 0`) or to pay 49 s for a real VAE preview (`--preview-decoder vae`).
+They land as `<stem>-preview-stepNN.jpg` beside where the mp4 will be.
+
+Every step is checkpointed under `<outdir>/checkpoints`. Re-running the identical `generate`
+command resumes bit-identically; `h3 resume` does the same but *asserts* a matching checkpoint
+exists instead of silently starting over. The identity is prompt + width + height + duration +
+steps + seed + tag + which `--checkpoint`, `--outdir`/`--checkpoint-dir`, adaln table, LoRA and
+strength — change any of them and it is a different run. `--restart` is the way out of a
+`checkpoint_mismatch` refusal.
+
+## Before spending compute
+
+`h3 doctor --checkpoint <dir> --json` verifies all four components and the AdaLN cache in seconds.
+Run it against a checkpoint you have not used before, rather than discovering a gap an hour in.
+
+`reference.md` has the complete flag list for every subcommand and the full `--json` error table.

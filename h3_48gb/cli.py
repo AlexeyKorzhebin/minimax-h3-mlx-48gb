@@ -97,6 +97,7 @@ ERROR_CODES = {
     "checkpoint_not_found": "`resume` was asked for, but no checkpoint matches this run's identity",
     "checkpoint_mismatch": "a checkpoint exists but was written for a different request or model",
     "checkpoint_corrupt": "a checkpoint exists but could not be read",
+    "checkpoint_locked": "another process already holds the lock for this checkpoint",
     "preview_interval_negative": "--preview-every is negative; 0 disables previews, N > 0 sets a cadence",
     "end_image_without_image": "--end-image was given without --image; the end frame anchors a run that must also have a start frame",
     "image_not_found": "a keyframe path does not exist",
@@ -107,6 +108,13 @@ ERROR_CODES = {
     "turbo_strength_invalid": "--turbo-strength is not a finite number",
     "adaln_cache_unreadable": "--adaln-cache exists but is not a readable AdaLN table",
     "upstream_patch_missing": "a keyframe was given but the vendored upstream/ checkout is unpatched",
+    "outdir_not_found": "--outdir does not exist or cannot be read",
+    "prompt_file_not_found": "--prompt-file points at a file that does not exist",
+    "prompt_file_unreadable": "--prompt-file exists but could not be read as UTF-8",
+    "prompt_file_empty": "--prompt-file is empty once trailing newlines are stripped",
+    "prompt_both_given": "both a positional prompt and --prompt-file were given; pass exactly one",
+    "prompt_missing": "no prompt: pass one positionally or with --prompt-file",
+    "mode_mismatch": "--mode contradicts the --image/--end-image flags given",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 
@@ -183,6 +191,13 @@ class RunSpec:
     #: An AdaLN table baked for a grid other than the checkpoint's own — this is what makes
     #: `--steps 8` possible. `scripts/bake_adaln.py` produces one.
     adaln_cache: Path | None = None
+    #: The file `prompt` was read from, when it came from `--prompt-file` rather than the
+    #: positional argument; `None` otherwise. Record-only, like `preview_every`: it is never
+    #: passed to `pipe(...)` (only the resolved `prompt` text is), so it never reaches
+    #: `request_identity` and does not enter `identity_digest` — resuming a run started with
+    #: `--prompt-file prompts/x.txt` and one started with the positional argument for the same
+    #: text must land on the same checkpoint.
+    prompt_file: str | None = None
 
     def __post_init__(self) -> None:
         """Every refusal that depends only on the request, checked once, at construction.
@@ -255,7 +270,12 @@ class RunSpec:
 
 def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     """The flags `generate` and `resume` share — every one of them identifies or locates a run."""
-    sub.add_argument("prompt")
+    # `nargs="?"` rather than required: a caller now may pass the prompt via `--prompt-file`
+    # instead, and `resolve_prompt` (called from `spec_from_args`) is what actually requires
+    # exactly one of the two.
+    sub.add_argument("prompt", nargs="?", default=None)
+    sub.add_argument("--prompt-file", type=Path, default=None,
+                     help="read the prompt from a file instead of the positional argument")
     # `None` rather than the default canvas so `spec_from_args` can tell "the caller wants the
     # default" from "the caller asked for exactly that size" — with a keyframe, the default
     # comes from the frame instead. See `DEFAULT_CANVAS`.
@@ -276,6 +296,11 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
                      help="condition the first frame on this image")
     sub.add_argument("--end-image", type=Path, default=None,
                      help="also condition the last frame; requires --image")
+    # This sets nothing: the mode is fully determined by --image/--end-image (see `check_mode`
+    # below `resolve_prompt`). It exists so a typo in a filename or a flag is refused in the
+    # first second, rather than discovered an hour later by watching the finished clip.
+    sub.add_argument("--mode", choices=("t2v", "t2va", "i2v", "flf"), default=None,
+                     help="assert the mode the image flags imply, refusing before any weight loads")
     # Previews are what makes a multi-hour render watchable, and they stopped being expensive: TAE
     # decodes one in 0.125 s against the real VAE's 49.3 s at 1344x768, so six previews now cost
     # 0.75 s of a run measured in hours. Off by default made sense at 49 s a frame; it does not now.
@@ -302,11 +327,25 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--json", action="store_true", help="emit a machine-readable report")
 
 
+def _subcommand(sub, name: str, help: str) -> argparse.ArgumentParser:
+    """A subparser that requires flags to be spelled in full.
+
+    `allow_abbrev=False` is the point. With argparse's default, `--prompt` is an unambiguous
+    abbreviation of `--prompt-file` — so `h3 generate --prompt "a dog"` passes the prompt text to
+    the file reader and fails with "no such file", naming the prompt as the missing path.
+    `run_bench.py` spells its flag exactly `--prompt`, so this is a command someone will type.
+    Refusing every abbreviation is better than adding an alias: it fails on the flag rather than
+    on a file, and it removes the same trap from every future flag pair.
+    """
+    return sub.add_parser(name, help=help, allow_abbrev=False)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="h3", description="MiniMax H3 on a 48 GB Mac")
+    parser = argparse.ArgumentParser(prog="h3", description="MiniMax H3 on a 48 GB Mac",
+                                     allow_abbrev=False)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    gen = sub.add_parser("generate", help="generate a clip")
+    gen = _subcommand(sub, "generate", help="generate a clip")
     _add_run_flags(gen)
     # `--restart` is the recovery path for this CLI's own hardest refusal, not a convenience.
     # `checkpoint_mismatch` is a hard stop, and without this flag the only way out is to find and
@@ -317,16 +356,25 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--no-checkpoint", action="store_true",
                      help="do not write a resume checkpoint at all; a crash then costs the whole run")
 
-    res = sub.add_parser("resume", help="continue an interrupted run")
+    res = _subcommand(sub, "resume", help="continue an interrupted run")
     # No `--restart` / `--no-checkpoint` here on purpose: `resume` exists precisely to *assert*
     # that a run is being continued, so a flag that turns it into a fresh start would defeat it.
     _add_run_flags(res)
 
-    lst = sub.add_parser("list", help="list finished runs")
+    lst = _subcommand(sub, "list", help="list finished runs")
     lst.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     lst.add_argument("--json", action="store_true", help="emit a machine-readable report")
 
-    doc = sub.add_parser("doctor", help="verify a converted checkpoint")
+    st = _subcommand(sub, "status", help="what is running under an outdir, and how far along")
+    st.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
+    st.add_argument("--json", action="store_true", help="emit a machine-readable report")
+
+    wt = _subcommand(sub, "watch", help="redraw a run's progress until nothing is running")
+    wt.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
+    wt.add_argument("--interval", type=float, default=20.0,
+                    help="seconds between redraws (default 20); 0 renders once and exits")
+
+    doc = _subcommand(sub, "doctor", help="verify a converted checkpoint")
     doc.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     doc.add_argument("--json", action="store_true", help="emit a machine-readable report")
     return parser
@@ -399,15 +447,83 @@ def resolve_canvas(image: Path | None, width: int | None, height: int | None) ->
     return derived_width, derived_height
 
 
+def resolve_prompt(prompt: str | None, prompt_file: Path | None) -> tuple[str, str | None]:
+    """The prompt text and the file it came from, or a refusal.
+
+    Trailing newlines are stripped -- all of them, exactly as `$(cat file)` does. This is a
+    compatibility requirement, not a preference: every measured run so far was launched through
+    that substitution, and one surviving newline would change identity_digest and orphan every
+    checkpoint on disk.
+    """
+    if prompt is not None and prompt_file is not None:
+        raise CliError("prompt_both_given",
+                       "pass either a positional prompt or --prompt-file, not both")
+    if prompt is not None:
+        return prompt, None
+    if prompt_file is None:
+        raise CliError("prompt_missing",
+                       "no prompt: pass one positionally or with --prompt-file")
+    path = Path(prompt_file)
+    if not path.is_file():
+        raise CliError("prompt_file_not_found", f"--prompt-file does not exist: {path}",
+                       {"prompt_file": str(path)})
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CliError("prompt_file_unreadable",
+                       f"--prompt-file could not be read: {path} ({exc})",
+                       {"prompt_file": str(path)}) from exc
+    text = text.rstrip("\n")
+    if not text:
+        raise CliError("prompt_file_empty", f"--prompt-file is empty: {path}",
+                       {"prompt_file": str(path)})
+    return text, str(path.resolve())
+
+
+def actual_mode(image: Path | None, end_image: Path | None) -> str:
+    """The mode these keyframe flags imply, with no reference to `--mode` at all.
+
+    This is the one place that derivation happens; `check_mode` and the run report both call it
+    rather than repeating the three-way `if`, so they cannot drift apart.
+    """
+    return "flf" if end_image else ("i2v" if image else "t2v")
+
+
+def check_mode(mode: str | None, image: Path | None, end_image: Path | None) -> str:
+    """Validate the declared mode against the flags, and return the effective one either way.
+
+    The mode is never *set* by this flag -- it is fully determined by the images. `--mode` exists
+    so a typo in a filename or a flag fails in the first second rather than an hour later, when
+    the clip turns out to be text-to-video.
+    """
+    actual = actual_mode(image, end_image)
+    if mode is None:
+        return actual
+    wanted = "t2v" if mode == "t2va" else mode
+    if wanted != actual:
+        raise CliError(
+            "mode_mismatch",
+            f"--mode {mode} but the flags say {actual}: "
+            f"--image {'given' if image else 'absent'}, "
+            f"--end-image {'given' if end_image else 'absent'}",
+            {"declared": mode, "actual": actual})
+    return actual
+
+
 def spec_from_args(args: argparse.Namespace) -> RunSpec:
     """Build a `RunSpec` from parsed args, shared by `generate` and `resume` (identical flags).
 
     Validation lives in `RunSpec.__post_init__`, so it happens here for both subcommands, before
-    either one touches a checkpoint path or a weight file.
+    either one touches a checkpoint path or a weight file. Resolving the prompt happens first of
+    all, ahead of the canvas: a bad `--prompt-file` must refuse before anything else does. `--mode`
+    is checked next, still ahead of the canvas, so a mismatched `--mode` refuses before
+    `resolve_canvas` ever opens the keyframe file.
     """
+    prompt, prompt_file = resolve_prompt(args.prompt, args.prompt_file)
+    check_mode(getattr(args, "mode", None), args.image, args.end_image)
     width, height = resolve_canvas(args.image, args.width, args.height)
     return RunSpec(
-        prompt=args.prompt, width=width, height=height,
+        prompt=prompt, width=width, height=height,
         duration=args.duration, steps=args.steps, seed=args.seed,
         checkpoint=args.checkpoint, outdir=args.outdir, tag=args.tag,
         checkpoint_dir=args.checkpoint_dir,
@@ -417,6 +533,7 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
         preview_decoder=args.preview_decoder,
         turbo_lora=args.turbo_lora, turbo_strength=args.turbo_strength,
         adaln_cache=args.adaln_cache,
+        prompt_file=prompt_file,
     )
 
 
@@ -521,7 +638,7 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
     # would not read) — CliError just gives them a stable code so `--json` does not have to
     # string-match the sentence. Imported here rather than at module scope to keep `import
     # h3_48gb` from pulling in mlx.core (see the module docstring / test_import_h3_48gb_...).
-    from h3_48gb.checkpoint import CheckpointCorrupt, CheckpointMismatch
+    from h3_48gb.checkpoint import CheckpointCorrupt, CheckpointLocked, CheckpointMismatch
 
     started = time.perf_counter()
     try:
@@ -551,6 +668,8 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
         ) from exc
     except CheckpointCorrupt as exc:
         raise CliError("checkpoint_corrupt", str(exc)) from exc
+    except CheckpointLocked as exc:
+        raise CliError("checkpoint_locked", str(exc)) from exc
     elapsed = time.perf_counter() - started
 
     # Raw first: an encoder failure then costs seconds, not a fifteen-hour run.
@@ -589,7 +708,35 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
 
     report = {
         "tag": spec.tag, "canvas": f"{spec.width}x{spec.height}",
-        "duration_seconds": spec.duration, "grid_points": spec.steps, "seed": spec.seed,
+        "duration_seconds": spec.duration, "grid_points": spec.steps,
+        # Written out because "steps" is easy to misread: an N-point grid takes N-1 forward
+        # passes (the first grid point is the starting noise, not a pass) — this off-by-one is
+        # what cost a whole rerun on 2026-08-10, when nothing on disk said which count a "349"
+        # or a "265" actually meant.
+        "forwards": spec.steps - 1,
+        "seed": spec.seed,
+        "prompt": spec.prompt,
+        # `None` when the prompt came from the positional argument; already a plain string
+        # (resolved in `resolve_prompt`) when it came from `--prompt-file`, so no `str()` needed
+        # here the way the other optional path fields below need one.
+        "prompt_file": spec.prompt_file,
+        # Paths as strings: `json.dumps` cannot serialize a `Path`, and `h3 list` /
+        # analysis scripts read these back as plain text anyway.
+        "checkpoint": str(spec.checkpoint),
+        "adaln_cache": str(spec.adaln_cache) if spec.adaln_cache else None,
+        "turbo_lora": str(spec.turbo_lora) if spec.turbo_lora else None,
+        # `turbo_strength` only describes something that happened when an adapter was actually
+        # applied. With no `turbo_lora`, `spec.turbo_strength` is just RunSpec's unused default
+        # (1.0) — writing it would look like a real, chosen strength instead of a field the run
+        # never touched. `null` here must mean "no LoRA on this run," distinguishable from a
+        # forgotten field, so the key stays present rather than being omitted.
+        "turbo_strength": spec.turbo_strength if spec.turbo_lora else None,
+        "image": str(spec.image) if spec.image else None,
+        "end_image": str(spec.end_image) if spec.end_image else None,
+        # Derived, not stored: `mode` is fully implied by `image`/`end_image`, which are already
+        # part of the run's identity, so a separate `RunSpec` field would just be a second place
+        # for the same fact to drift. This is a reader's convenience, nothing more.
+        "mode": actual_mode(spec.image, spec.end_image),
         "generate_seconds": round(elapsed, 1),
         "seconds_per_step": round(result.seconds_per_step, 1),
         "frames": int(result.video.shape[0]),
@@ -726,6 +873,107 @@ def run_list(outdir: Path) -> list[dict]:
     return rows
 
 
+#: States for which `watch` should continue polling the outdir. Only `in_flight` -- the one state
+#: backed by an actual liveness signal (a companion lock file a writer holds; see
+#: `h3_48gb.runs._writer_alive`). `unknown` means "no lock file to check, nothing to say" and
+#: `stale`/`unreadable` are already-settled outcomes; polling any of them again can never turn them
+#: into new information; only `in_flight` can, when the lock is eventually released.
+WATCH_RUNNING_STATES = {"in_flight"}
+
+
+def run_status(outdir: Path) -> dict:
+    """Every run under `outdir`, scanned recursively — in-flight ones first."""
+    from .runs import scan
+
+    outdir = Path(outdir)
+    if not outdir.is_dir():
+        raise CliError("outdir_not_found", f"--outdir does not exist: {outdir}",
+                       {"outdir": str(outdir)})
+    runs = scan(outdir)
+    # "unknown" ranks ahead of "stale": "confirmed gone" (stale) needs less attention than "cannot
+    # be judged at all" (unknown, no lock file to check). See `_state_of` in runs.py.
+    order = {"in_flight": 0, "unknown": 1, "stale": 2, "unreadable": 3, "finished": 4}
+    runs.sort(key=lambda r: (order.get(r.state, 9), str(r.outdir)))
+    return {"ok": True, "outdir": str(outdir), "runs": [r.as_dict() for r in runs]}
+
+
+def _progress(row: dict) -> str:
+    """`completed/total`, with either half rendered as `?` rather than the literal `None` -- a
+    run caught by its lock file before its first checkpoint write has neither yet (see
+    `h3_48gb.runs.scan`)."""
+    completed = row["completed"] if row["completed"] is not None else "?"
+    total = row["total"] if row["total"] is not None else "?"
+    return f"{completed}/{total}"
+
+
+def format_status(report: dict) -> str:
+    """One block per in-flight run, one line per run whose rate is unknown (forwards done and
+    time since the last write, no verdict on whether it is alive), one line per stale run, and
+    one line per unreadable run with its error -- every run `scan` found gets one line here, none
+    silently dropped, which is the whole point of a status command over a broken checkpoint.
+    """
+    lines = []
+    for row in report["runs"]:
+        if row["state"] != "in_flight":
+            continue
+        pct = f"{row['fraction'] * 100:.0f}%" if row["fraction"] is not None else "?"
+        lines.append(f"{Path(row['outdir']).name}    {_progress(row)} форвардов, {pct}")
+        # Guard on `eta_seconds` itself, not on `seconds_per_forward`: the rate can be known while
+        # `eta_seconds` is still None because `total` is -- a checkpoint missing or zero
+        # `total_forwards`. Guarding on the rate alone divides `None / 60` and crashes the whole
+        # report over one such file, the same class of regression commit dae41090 fixed for `scan`.
+        if row["eta_seconds"] is not None:
+            left = row["eta_seconds"] / 60
+            lines.append(f"  {row['seconds_per_forward']:.0f} с на форвард, осталось {left:.0f} мин")
+
+    for row in report["runs"]:
+        if row["state"] != "unknown":
+            continue
+        age = (f"{row['age_seconds']:.0f} с назад" if row["age_seconds"] is not None
+               else "неизвестно когда")
+        lines.append(f"{Path(row['outdir']).name}: {_progress(row)}, последняя запись {age}, "
+                     "скорость неизвестна")
+
+    for row in report["runs"]:
+        if row["state"] != "stale":
+            continue
+        lines.append(f"{Path(row['outdir']).name}: остановлен на {_progress(row)}")
+
+    for row in report["runs"]:
+        if row["state"] != "unreadable":
+            continue
+        lines.append(f"{Path(row['outdir']).name}: не читается ({row['error']})")
+
+    if not lines:
+        lines.append(f"ничего не идёт в {report['outdir']}")
+    return "\n".join(lines)
+
+
+def run_watch(outdir: Path, interval: float) -> dict:
+    """Redraw the status block until no run is `in_flight`, then return the final state.
+
+    A run in `unknown` is printed once and then left alone: there is no lock file to say whether
+    its writer is still around, and polling a question with no new answer coming is just spinning.
+    `stale` and `unreadable` are already-settled outcomes for the same reason. Only `in_flight` can
+    change into something else while `watch` is looking at it -- the lock either stays held or it
+    doesn't -- so it is the only state worth another pass. See `WATCH_RUNNING_STATES`.
+
+    Not a TUI: the block is reprinted with a leading escape that clears the previous one, so a
+    dumb terminal and a redirected log both stay readable.
+    """
+    import time as _time
+
+    while True:
+        report = run_status(outdir)
+        text = format_status(report)
+        print(text, flush=True)
+        running = [r for r in report["runs"] if r["state"] in WATCH_RUNNING_STATES]
+        if not running or interval <= 0:
+            return report
+        _time.sleep(interval)
+        print(f"\033[{text.count(chr(10)) + 1}A\033[J", end="")
+
+
 def run_doctor(checkpoint: Path) -> dict:
     """Check a converted checkpoint before a multi-hour run rather than during it."""
     checkpoint = Path(checkpoint)
@@ -768,6 +1016,14 @@ def main(argv: list[str] | None = None) -> int:
             human = ("\n".join(f"{row.get('tag', '?')}: {row.get('frames', '?')} frames"
                                for row in report)
                      or f"no finished runs in {args.outdir}")
+        elif args.command == "status":
+            report = run_status(args.outdir)
+            ok = True
+            human = format_status(report)
+        elif args.command == "watch":
+            report = run_watch(args.outdir, args.interval)
+            ok = True
+            human = ""
         elif args.command == "doctor":
             report = run_doctor(args.checkpoint)
             ok = report["ok"]
@@ -787,7 +1043,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         raise
 
-    print(json.dumps(report, indent=2) if as_json else human)
+    if as_json or human:
+        print(json.dumps(report, indent=2) if as_json else human)
     return 0 if ok else 1
 
 

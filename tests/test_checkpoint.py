@@ -686,16 +686,294 @@ def test_the_scheduler_stays_a_real_scheduler():
     assert scheduler.shift == 12.0
 
 
+def _read_checkpoint_meta(path: Path) -> dict:
+    """Parse the safetensors JSON header by hand, the way `runs.scan` and an operator's `head` do."""
+    with open(path, "rb") as fh:
+        length = int.from_bytes(fh.read(8), "little")
+        header = json.loads(fh.read(length))
+    return json.loads(header["__metadata__"]["h3_checkpoint"])
+
+
 def test_metadata_is_readable_without_mlx(tmp_path):
     """The identity lives in the safetensors JSON header, so an operator can inspect it with `head`."""
     path = tmp_path / "meta.safetensors"
     run(ToyPipeline(), checkpoint_path=path, keep_checkpoint=True)
-    with open(path, "rb") as fh:
-        length = int.from_bytes(fh.read(8), "little")
-        header = json.loads(fh.read(length))
-    meta = json.loads(header["__metadata__"]["h3_checkpoint"])
+    meta = _read_checkpoint_meta(path)
     assert meta["identity"]["request"]["seed"] == SEED
     assert meta["completed_steps"] == STEPS - 1
+    # `h3_48gb.runs.scan` reads a live run's speed from these two fields without importing MLX —
+    # `test_a_resumed_run_rates_only_this_session` in test_runs.py depends on both being present
+    # and correct on a real, written-by-the-pipeline checkpoint, not just on a hand-built dict.
+    assert meta["started_at"] is not None
+    assert meta["completed_at_start"] == 0
+
+
+def test_resumed_checkpoint_records_previous_session_progress(tmp_path):
+    """A resume must record how many forwards the *previous* session already paid for.
+
+    `runs.seconds_per_forward` divides this session's elapsed wall time by
+    `completed_steps - completed_at_start` — the forwards *this* session actually did. If a
+    resumed run wrote `completed_at_start=0` instead of the forward count at load time, a run
+    resumed at step 4 of 8 that then does one more forward would look like it did all 5 in this
+    session, reporting a rate and an ETA several times too optimistic.
+    """
+    path = tmp_path / "resume.safetensors"
+    try:
+        run(ToyPipeline(fail_at=4), checkpoint_path=path)
+        raise AssertionError("expected a crash")
+    except Interrupt:
+        pass
+
+    before_resume = _read_checkpoint_meta(path)
+    assert before_resume["completed_steps"] == 4
+    assert before_resume["completed_at_start"] == 0, "the first session started at forward 0"
+
+    run(ToyPipeline(), checkpoint_path=path, keep_checkpoint=True)
+    after_resume = _read_checkpoint_meta(path)
+    assert after_resume["completed_steps"] == STEPS - 1
+    assert after_resume["completed_at_start"] == 4, (
+        "a resumed session must record the forwards already done when it began, not zero")
+
+
+def test_started_at_is_constant_across_every_write_in_one_session(tmp_path, monkeypatch):
+    """`started_at` marks when *this session* began, once — not the moment of each write.
+
+    `test_metadata_is_readable_without_mlx` only checks `started_at is not None`, which a mutation
+    that overwrites `started_at` with `written_at` (or blanks it to `""`) on every write would
+    still pass. This pins the actual value across several writes in one uninterrupted session,
+    using a fake clock so the assertion does not depend on every write happening to land in the
+    same wall-clock second (STEPS - 1 = 8 writes is comfortably faster than that on a real machine,
+    which would otherwise mask exactly the "written_at every time" mutation this test exists to
+    catch).
+    """
+    import h3_48gb.checkpoint as checkpoint_mod
+
+    clock = iter(f"2026-08-10T21:00:{i:02d}" for i in range(60))
+    monkeypatch.setattr(checkpoint_mod.time, "strftime", lambda _fmt: next(clock))
+
+    metas: list[dict] = []
+    original_write = checkpoint_mod.CheckpointStore.write
+
+    def spy_write(self, arrays, meta):
+        metas.append(dict(meta))
+        original_write(self, arrays, meta)
+
+    monkeypatch.setattr(checkpoint_mod.CheckpointStore, "write", spy_write)
+
+    path = tmp_path / "session.safetensors"
+    run(ToyPipeline(), checkpoint_path=path, keep_checkpoint=True)  # one full, uncrashed session
+
+    assert len(metas) == STEPS - 1, "expected one checkpoint write per forward"
+    # Call 0 of the fake clock is spent on `ResumableRun.started_at`'s default factory, at
+    # construction, before any write; calls 1..8 are `written_at` on each of the eight writes.
+    assert metas[0]["started_at"] == "2026-08-10T21:00:00"
+    assert {m["started_at"] for m in metas} == {"2026-08-10T21:00:00"}, (
+        "started_at must be the same value on every write in a session, not re-stamped per write")
+    assert [m["written_at"] for m in metas] == [
+        f"2026-08-10T21:00:{i:02d}" for i in range(1, len(metas) + 1)
+    ], "written_at must advance on every write, or the fixture cannot tell it apart from started_at"
+
+
+def test_writer_holds_an_exclusive_lock_for_the_life_of_the_run(tmp_path):
+    """The liveness signal `h3_48gb.runs._writer_alive` reads is a real, held `flock` on a
+    companion file next to the checkpoint — proved here with the reader's own probe technique
+    (a non-blocking shared `flock` attempt), not a mocked stand-in, while a real run is mid-flight.
+
+    The companion file must survive the run ending, unlocked but present -- see
+    `CheckpointStore.release_lock`'s docstring for why deleting it here would be exactly the race
+    task 3's fix exists to close: a reader (or the next writer for the same identity) that has the
+    path open at the moment of an unlink can end up holding a lock on an inode nobody can reach by
+    that name any more.
+    """
+    import fcntl
+    from h3_48gb.checkpoint import CheckpointStore
+
+    path = tmp_path / "live.safetensors"
+    store = CheckpointStore(path)
+    observed: list[bool] = []
+
+    class ObserveMidRun(ToyPipeline):
+        def _decode_video(self, rows, *args, **kwargs):
+            assert store.lock_path.exists(), "no companion lock file while the run is in progress"
+            probe = open(store.lock_path, "rb")
+            try:
+                try:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    observed.append(True)  # acquired -- would mean no writer holds it
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    observed.append(False)  # blocked -- the writer's own exclusive lock is held
+            finally:
+                probe.close()
+            return super()._decode_video(rows, *args, **kwargs)
+
+    run(ObserveMidRun(), checkpoint_path=path, keep_checkpoint=True)
+
+    assert observed == [False], "a non-blocking shared probe must fail while the run is live"
+    assert store.lock_path.exists(), "the companion lock file must survive the run ending"
+    # And it must actually be unlocked now -- proof `release_lock` dropped the flock, not just
+    # that the file happens to still be there.
+    probe = open(store.lock_path, "rb")
+    try:
+        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        raise AssertionError("the lock must be released once the run ends, even though the file "
+                              "stays")
+    finally:
+        probe.close()
+
+
+def test_lock_is_released_but_kept_after_a_crash_python_catches(tmp_path):
+    """A crash that unwinds through Python (unlike a hard process kill) still runs
+    `CheckpointStore.release_lock` from the `finally` wrapping the whole call, so a graceful
+    failure drops its own flock exactly like a graceful success does. The checkpoint itself is
+    untouched — it is still there for the next resume — and so, deliberately, is the lock file:
+    see `release_lock`'s docstring for why removing it would reopen the very race it exists to
+    close.
+    """
+    import fcntl
+    from h3_48gb.checkpoint import CheckpointStore
+
+    path = tmp_path / "crash.safetensors"
+    store = CheckpointStore(path)
+    try:
+        run(ToyPipeline(fail_at=3), checkpoint_path=path)
+        raise AssertionError("expected a crash")
+    except Interrupt:
+        pass
+
+    assert path.exists(), "the checkpoint should survive a crash, for the next resume"
+    assert store.lock_path.exists(), "a Python-level crash must not delete the lock file"
+    probe = open(store.lock_path, "rb")
+    try:
+        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        raise AssertionError("a Python-level crash must still release the flock")
+    finally:
+        probe.close()
+
+
+def test_a_second_writer_is_refused_the_lock(tmp_path):
+    """Two writers on the same checkpoint must not both proceed -- a shared lock (the bug this
+    fixes) lets both hold it at once; the fix is an exclusive lock, and the second `acquire_lock`
+    must fail loudly instead of silently succeeding beside the first.
+    """
+    from h3_48gb.checkpoint import CheckpointError, CheckpointLocked, CheckpointStore
+
+    path = tmp_path / "race.safetensors"
+    first = CheckpointStore(path)
+    first.acquire_lock()
+    try:
+        second = CheckpointStore(path)
+        try:
+            second.acquire_lock()
+        except CheckpointLocked:
+            pass
+        except CheckpointError as exc:
+            raise AssertionError(f"expected CheckpointLocked specifically, got {type(exc)}: {exc}")
+        else:
+            raise AssertionError(
+                "a second writer must not acquire the lock while the first still holds it")
+    finally:
+        first.release_lock()
+
+    # And once the first writer releases, a second writer must be able to acquire it -- this is
+    # not a permanent refusal, only a concurrent one.
+    third = CheckpointStore(path)
+    third.acquire_lock()
+    third.release_lock()
+
+
+def test_the_lock_is_held_before_the_checkpoint_is_read_for_resume(tmp_path, monkeypatch):
+    """The lock must be acquired before `_load_for_resume` reads anything off disk -- taking it
+    any later would let two processes both read the same `completed_steps` and then race each
+    other to `os.replace`, walking the checkpoint's progress backwards. Proved here by having
+    `_load_for_resume` itself probe the lock with an independent file handle: if the real writer's
+    own lock is not already held by the time this runs, the probe would succeed.
+    """
+    import fcntl
+
+    import h3_48gb.checkpoint as checkpoint_mod
+
+    path = tmp_path / "order.safetensors"
+    # A first, uninterrupted session, so the second run below actually has something to resume.
+    run(ToyPipeline(), checkpoint_path=path, keep_checkpoint=True)
+
+    observed: list[str] = []
+    original_load = checkpoint_mod._load_for_resume
+
+    def spy(store, *args, **kwargs):
+        probe = open(store.lock_path, "rb")
+        try:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                observed.append("free")  # would mean nothing holds the lock yet
+                fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                observed.append("held")  # the running writer's own lock is already in place
+        finally:
+            probe.close()
+        return original_load(store, *args, **kwargs)
+
+    monkeypatch.setattr(checkpoint_mod, "_load_for_resume", spy)
+
+    run(ToyPipeline(), checkpoint_path=path, keep_checkpoint=True)
+
+    assert observed == ["held"], (
+        "the lock must already be held by the time the checkpoint is read for resume, "
+        f"got {observed}")
+
+
+def test_a_real_write_is_visible_to_the_reader_end_to_end(tmp_path):
+    """Exercises the whole liveness contract through both real modules at once: a genuine
+    pipeline run under `run()` (through `checkpoint.py`'s writer), and the genuine reader entry
+    point `h3_48gb.runs.scan()` -- not a hand-built lock path.
+
+    `test_writer_holds_an_exclusive_lock_for_the_life_of_the_run` above proves the writer's own
+    flock, but does so by reading `store.lock_path` -- the writer's own property -- so the writer
+    and the probe travel together if that suffix ever changes. `test_runs.py`'s fixtures build the
+    reader's lock path as a literal `".lock"` suffix, independent of `CheckpointStore.lock_path` --
+    correct in isolation, but they never touch a real writer either. This is the one test in the
+    suite that would turn red if `checkpoint.py`'s writer and `runs.py`'s reader ever disagreed on
+    the filename convention, because it is the only one that drives a real instance of each and
+    asks whether they still agree.
+    """
+    from h3_48gb import runs as runs_mod
+
+    outdir = tmp_path / "outdir"
+    path = outdir / "checkpoints" / "h3-live.safetensors"
+    observed: list[str | None] = []
+
+    class ObserveMidRun(ToyPipeline):
+        def _decode_video(self, rows, *args, **kwargs):
+            states = {r.outdir: r.state for r in runs_mod.scan(outdir)}
+            observed.append(states.get(outdir))
+            return super()._decode_video(rows, *args, **kwargs)
+
+    run(ObserveMidRun(), checkpoint_path=path, keep_checkpoint=True)
+
+    assert observed == ["in_flight"], (
+        f"runs.scan() must see the real writer as in_flight mid-run, got {observed}")
+
+
+def test_session_timing_is_not_part_of_the_identity():
+    """A run resumed tomorrow must still match the checkpoint it wrote today.
+
+    `started_at` changes every session by construction. If it reached `identity_digest`, every
+    resume would be a fresh run and the checkpoint would be dead weight.
+    """
+    from h3_48gb.checkpoint import identity_digest
+
+    identity = {"request": {"prompt": "a cat", "seed": 7}}
+    before = identity_digest(identity)
+    identity_with_timing = dict(identity, started_at="2026-08-10T21:00:00",
+                                completed_at_start=5)
+
+    assert identity_digest(identity) == before
+    assert identity_digest(identity_with_timing) != before, (
+        "the fixture is pointless if the digest ignores extra keys")
 
 
 # -- standalone runner ------------------------------------------------------------------------------
