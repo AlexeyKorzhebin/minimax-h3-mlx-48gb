@@ -1,0 +1,811 @@
+/* ===========================================================================
+   h3 — панель прогонов. Оформление, светлая редакция.
+
+   Правила, из которых выведено всё остальное:
+
+   1. Инструмент, а не витрина, но инструмент современный: содержимое лежит
+      карточками на подложке чуть темнее их самих, группы разделяются
+      воздухом, линия остаётся только там, где воздух не справляется —
+      между однотипными строками списка.
+   2. Числа времени и памяти сравниваются глазами между строками — значит
+      табличные цифры, выравнивание по правому краю и одна колоночная сетка,
+      общая для всех трёх списков. Моноширинный шрифт оставлен там, где он
+      действительно нужен: пути, идентификаторы, имена файлов, текст промпта.
+      Числа набраны системным шрифтом с табличными цифрами — они и ровнее,
+      и легче на вид.
+   3. Четыре состояния (ждёт, идёт, сделано, упало) различаются формой знака:
+      полое кольцо, залитая точка с пульсом, галочка, крестик. Цвет — только
+      подтверждение, чтобы читалось и на чёрно-белой печати, и при дальтонизме.
+   4. Шрифты только системные: страница должна открыться через пять лет
+      без сети и без тулчейна. Ни одного внешнего файла, ни одной картинки
+      извне — стрелки у списков нарисованы data-URI прямо здесь.
+   5. Движение только служебное и короткое: пульс текущего шага, пульс
+      идущей задачи, 120 мс на смену состояния наведения. Всё остальное
+      статично — на эту страницу смотрят по десять раз за день.
+   =========================================================================== */
+
+/* ---------- токены: светлая тема ---------------------------------------
+   Нейтральная база с лёгким холодком, единственный акцент — системный
+   синий. Сигнальные цвета взяты в пастельной заливке и тёмной обводке
+   текста: заливка видна издали, текст читается вблизи.
+   ----------------------------------------------------------------------- */
+:root {
+  --bg:            #f1f2f5;   /* подложка страницы, чуть темнее карточек */
+  --card:          #ffffff;
+  --card-2:        #f7f8fa;   /* вложенная плоскость внутри карточки      */
+
+  --fill:          rgba(118,122,133,.08);   /* заливка полей и кнопок     */
+  --fill-2:        rgba(118,122,133,.14);
+  --fill-3:        rgba(118,122,133,.20);
+  --hairline:      rgba(60,60,67,.10);
+  --hairline-2:    rgba(60,60,67,.16);
+
+  --ink:           #15171c;
+  --ink-2:         #5b606c;
+  --ink-3:         #8b909c;
+
+  --accent:        #007aff;                 /* системный синий            */
+  --accent-ink:    #0062d6;                 /* он же, но пригодный в текст */
+  --accent-soft:   #e8f1ff;
+  --accent-ring:   rgba(0,122,255,.28);
+
+  --run:           var(--accent);
+  --run-soft:      var(--accent-soft);
+  --wait:          #a2a7b2;
+  --done:          #2fa84f;
+  --done-ink:      #1e7f3b;
+  --done-soft:     #e7f6ec;
+  --fail:          #ff3b30;
+  --fail-ink:      #c62a20;
+  --fail-soft:     #ffedec;
+  --warn:          #ff9f0a;
+  --warn-ink:      #9a5b00;
+  --warn-soft:     #fff4e2;
+
+  --sel:           rgba(0,122,255,.20);
+
+  /* Тень едва заметна: карточка должна отделяться от подложки, а не
+     висеть над ней. Полупиксельная обводка держит край на ретине. */
+  --shadow: 0 0 0 .5px rgba(16,20,32,.05), 0 1px 2px rgba(16,20,32,.05),
+            0 10px 24px -18px rgba(16,20,32,.22);
+  --shadow-pop: 0 1px 2px rgba(16,20,32,.16), 0 0 0 .5px rgba(16,20,32,.06);
+
+  --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1.5L5 5.5L9 1.5' stroke='%235b606c' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E");
+
+  color-scheme: light;
+}
+
+/* ---------- токены: тёмная тема ----------------------------------------
+   Не инверсия светлой: подложка темнее карточек так же, как в светлой,
+   но контраст мягче, тени заменены обводкой, а сигнальные цвета взяты
+   светлее и приглушённее — на тёмном они иначе жгут глаз.
+   ----------------------------------------------------------------------- */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:          #101114;
+    --card:        #1c1e22;
+    --card-2:      #24262b;
+
+    --fill:        rgba(142,148,163,.14);
+    --fill-2:      rgba(142,148,163,.22);
+    --fill-3:      rgba(142,148,163,.30);
+    --hairline:    rgba(255,255,255,.09);
+    --hairline-2:  rgba(255,255,255,.15);
+
+    --ink:         #f0f1f4;
+    --ink-2:       #a3a8b4;
+    --ink-3:       #7b8090;
+
+    --accent:      #0a84ff;
+    --accent-ink:  #6cb4ff;
+    --accent-soft: rgba(10,132,255,.18);
+    --accent-ring: rgba(10,132,255,.40);
+
+    --wait:        #767c8a;
+    --done:        #30d158;
+    --done-ink:    #6ede8c;
+    --done-soft:   rgba(48,209,88,.15);
+    --fail:        #ff453a;
+    --fail-ink:    #ff8f85;
+    --fail-soft:   rgba(255,69,58,.16);
+    --warn:        #ff9f0a;
+    --warn-ink:    #f2b662;
+    --warn-soft:   rgba(255,159,10,.15);
+
+    --sel:         rgba(10,132,255,.35);
+
+    --shadow: 0 0 0 .5px rgba(255,255,255,.07), 0 1px 2px rgba(0,0,0,.35);
+    --shadow-pop: 0 1px 2px rgba(0,0,0,.5), 0 0 0 .5px rgba(255,255,255,.10);
+
+    --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1.5L5 5.5L9 1.5' stroke='%23a3a8b4' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E");
+
+    color-scheme: dark;
+  }
+}
+/* ---------- основа ---------- */
+:root {
+  --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, "DejaVu Sans Mono", monospace;
+
+  --pad: 28px;          /* поле страницы            */
+  --cardpad: 22px;      /* поле карточки            */
+  --r-card: 14px;       /* скругление карточки      */
+  --r-inner: 10px;      /* скругление вложенного    */
+  --r-ctl: 7px;         /* скругление элемента ввода */
+
+  /* Одна колоночная сетка на все списки — иначе числа не сравнить взглядом.
+     Последняя колонка шире содержимого трёх кнопок: у грид-элемента
+     min-width auto, и узкая дорожка заставила бы кнопки залезть на память. */
+  --cols: 16px minmax(180px, 1fr) 52px 92px 50px 34px 92px 100px 208px;
+}
+
+* { box-sizing: border-box; }
+/* [hidden] обязан побеждать любой display ниже по файлу: иначе галочка
+   «всё равно поставить» вылезает при пике, который её не требует. */
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 13px/1.5 var(--ui);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  padding-bottom: 64px;
+}
+::selection { background: var(--sel); }
+
+.mono { font-family: var(--mono); font-size: .93em; font-variant-numeric: tabular-nums; }
+.num  { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+.dim  { color: var(--ink-3); }
+b { font-weight: 600; }
+
+main { max-width: 1440px; margin: 0 auto; padding: 24px var(--pad) 0; }
+
+/* ===========================================================================
+   ПРИБОРНАЯ СТРОКА
+   Полупрозрачная панель с размытием: под ней проезжает содержимое, и это
+   единственное место, где полупрозрачность что-то сообщает.
+   =========================================================================== */
+.rail {
+  position: sticky; top: 0; z-index: 20;
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px);
+  box-shadow: 0 .5px 0 var(--hairline-2);
+  transition: background .2s ease;
+}
+.rail-main {
+  max-width: 1440px; margin: 0 auto;
+  padding: 11px var(--pad) 10px;
+  display: flex; align-items: center; gap: 28px;
+}
+.rail-id { display: flex; align-items: baseline; gap: 8px; flex: none; }
+.mark {
+  font: 600 15px/1 var(--ui); letter-spacing: -.01em;
+  padding: 3px 8px; border-radius: 7px;
+  background: var(--fill-2); color: var(--ink);
+}
+.mark-sub { font-size: 13px; color: var(--ink-3); }
+
+/* состояние работника: лампа + слово, читается с метра */
+.worker { display: flex; align-items: center; gap: 9px; flex: none; }
+.worker-txt { display: flex; flex-direction: column; line-height: 1.25; }
+.lamp {
+  position: relative; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--done); flex: none;
+  box-shadow: 0 0 0 3.5px var(--done-soft);
+}
+.worker-state { font-weight: 600; font-size: 13px; }
+.worker-pid { color: var(--ink-3); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+
+/* Не запущен: лампа перечёркнута — состояние видно и без цвета */
+.rail[data-worker="stopped"] { background: color-mix(in srgb, var(--fail-soft) 82%, transparent); }
+.rail[data-worker="stopped"] .lamp { background: var(--fail); box-shadow: 0 0 0 3.5px var(--fail-soft); }
+.rail[data-worker="stopped"] .lamp::before {
+  content: ""; position: absolute; left: 1.5px; right: 1.5px; top: 4.2px;
+  height: 1.6px; background: #fff; border-radius: 1px;
+}
+.rail[data-worker="stopped"] .worker-state { color: var(--fail-ink); }
+/* Неизвестно: полое кольцо */
+.rail[data-worker="unknown"] { background: color-mix(in srgb, var(--warn-soft) 82%, transparent); }
+.rail[data-worker="unknown"] .lamp {
+  background: transparent; box-shadow: inset 0 0 0 2px var(--warn);
+}
+.rail[data-worker="unknown"] .worker-state { color: var(--warn-ink); }
+
+.rail-run {
+  display: flex; align-items: baseline; gap: 16px; min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+.run-tag { font-weight: 600; font-family: var(--mono); font-size: 12.5px; }
+.run-step, .run-share { color: var(--ink-2); }
+.run-left { color: var(--ink-2); }
+.run-left b { font-size: 15px; color: var(--ink); }
+.rail-run.idle { color: var(--ink-3); }
+
+.rail-clock { margin-left: auto; display: flex; align-items: baseline; gap: 14px; flex: none; }
+.clock { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.poll { font-size: 11.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
+/* шаги как деления шкалы: доля считается, а не читается */
+.steps {
+  display: flex; gap: 3px; max-width: 1440px;
+  margin: 0 auto; padding: 0 var(--pad) 8px;
+}
+.steps i { display: block; height: 4px; flex: 1; border-radius: 2px; background: var(--fill-2); }
+.steps i.done { background: var(--accent); }
+.steps i.now  { background: var(--accent); animation: breathe 2.4s ease-in-out infinite; }
+@keyframes breathe { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
+.rail[data-worker="stopped"] .steps i.done,
+.rail[data-worker="stopped"] .steps i.now { background: var(--wait); animation: none; }
+
+/* ===========================================================================
+   КАРТОЧКИ
+   =========================================================================== */
+.card {
+  background: var(--card);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow);
+  padding: var(--cardpad);
+  margin-bottom: 24px;
+}
+.card-h {
+  display: flex; align-items: baseline; gap: 12px;
+  margin: 0 0 18px;
+}
+.card-h h2, .card-h h3 {
+  margin: 0; font-weight: 600; letter-spacing: -.01em; color: var(--ink);
+}
+.card-h h2 { font-size: 16px; }
+.card-h h3 { font-size: 15px; }
+.block-note { font-size: 12.5px; color: var(--accent-ink); }
+.sum { font-size: 12.5px; color: var(--ink-2); margin-left: auto; font-variant-numeric: tabular-nums; }
+
+.section-h {
+  font: 600 17px/1.3 var(--ui); letter-spacing: -.015em;
+  margin: 34px 0 14px; color: var(--ink);
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: minmax(460px, 1.2fr) minmax(392px, 1fr);
+  gap: 32px;
+  align-items: start;
+}
+@media (max-width: 1040px) { .form-grid { grid-template-columns: 1fr; } }
+
+/* ===========================================================================
+   ЭЛЕМЕНТЫ ВВОДА
+   Мягкая заливка вместо рамки; рамка появляется только у фокуса, и вместе
+   с ней — кольцо, как в системных приложениях.
+   =========================================================================== */
+label { color: var(--ink-2); }
+input, textarea, select, button { font-family: var(--ui); font-size: 13px; color: var(--ink); }
+input, textarea, select {
+  background: var(--fill);
+  border: 1px solid transparent;
+  border-radius: var(--r-ctl);
+  padding: 5px 9px;
+  transition: background .12s ease, box-shadow .12s ease, border-color .12s ease;
+}
+input:hover, textarea:hover, select:hover { background: var(--fill-2); }
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  background: var(--card);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3.5px var(--accent-ring);
+}
+input::placeholder, textarea::placeholder { color: var(--ink-3); }
+input.num, input[type=number], textarea.num {
+  font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1;
+}
+input.mono, textarea.mono { font-family: var(--mono); font-size: 12px; }
+
+select {
+  appearance: none; -webkit-appearance: none;
+  padding-right: 26px;
+  background-image: var(--chev);
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  cursor: pointer;
+}
+
+.field-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 9px; gap: 12px;
+}
+.field-head label { font-weight: 600; color: var(--ink); font-size: 14px; }
+.field-side { display: flex; gap: 8px; align-items: center; }
+.pick { font-family: var(--mono); font-size: 11.5px; padding: 4px 24px 4px 8px; max-width: 230px; }
+
+/* ---------- редактор промпта: слой подсветки под прозрачным полем ------- */
+.editor {
+  position: relative;
+  height: 336px;
+  border: 1px solid transparent;
+  border-radius: var(--r-inner);
+  background: var(--fill);
+  overflow: hidden;
+  transition: background .12s ease, box-shadow .12s ease, border-color .12s ease;
+}
+.hl, .editor textarea {
+  /* Всё, что влияет на раскладку строк, обязано совпадать в обоих слоях */
+  position: absolute; inset: 0;
+  margin: 0; border: 0; padding: 13px 15px;
+  font: 12.5px/1.62 var(--mono);
+  letter-spacing: 0;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  tab-size: 4;
+  overflow: auto;
+}
+/* Слой подсветки не прокручивается пользователем и не показывает полосу
+   прокрутки: иначе ширина строки в нём и в поле разошлась бы на её толщину. */
+.hl { color: var(--ink); pointer-events: none; overflow: hidden; }
+.editor textarea {
+  background: transparent; color: transparent; caret-color: var(--accent);
+  resize: none; outline: none; border-radius: 0;
+}
+.editor textarea:hover, .editor textarea:focus { background: transparent; box-shadow: none; border: 0; }
+.editor:focus-within {
+  background: var(--card);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3.5px var(--accent-ring);
+}
+
+.hl mark { background: none; color: inherit; }
+.hl mark.blk   { background: var(--accent-soft); color: var(--accent-ink); font-weight: 700; border-radius: 4px; }
+.hl mark.blk.bad { background: var(--fail-soft); color: var(--fail-ink); }
+.hl mark.head  { color: var(--ink-2); background: var(--fill-2); border-radius: 4px; }
+.hl mark.sec   { font-weight: 700; color: var(--ink); border-bottom: 1.5px solid var(--hairline-2); }
+.hl mark.snd   { font-weight: 700; color: var(--done-ink); border-bottom: 1.5px solid var(--done); }
+/* Ни одного свойства, меняющего метрику: разрядка, размер и семейство здесь
+   запрещены — от них слой уехал бы относительно поля на длинных строках. */
+.hl mark.shot  { color: var(--ink-2); }
+
+/* ---------- шкала покрытия таймингов ---------- */
+.scale {
+  position: relative; height: 30px; margin: 12px 0 4px;
+  border-radius: var(--r-ctl); background: var(--fill);
+  overflow: hidden;
+}
+.scale .seg {
+  position: absolute; top: 3px; bottom: 3px;
+  background: var(--accent-soft);
+  border-radius: 5px;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
+  color: var(--accent-ink);
+  font: 500 10.5px/24px var(--ui); font-variant-numeric: tabular-nums;
+  text-align: center; overflow: hidden;
+}
+.scale .gap {
+  position: absolute; top: 3px; bottom: 3px; border-radius: 5px;
+  background: repeating-linear-gradient(45deg,
+    transparent 0 5px, color-mix(in srgb, var(--warn) 55%, transparent) 5px 6.5px);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 50%, transparent);
+}
+.scale .over {
+  position: absolute; top: 3px; bottom: 3px; border-radius: 5px;
+  background: repeating-linear-gradient(-45deg,
+    transparent 0 4px, color-mix(in srgb, var(--fail) 60%, transparent) 4px 5.5px);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fail) 55%, transparent);
+}
+.scale .tail {
+  position: absolute; top: 3px; bottom: 3px; right: 3px; border-radius: 5px;
+  background: var(--fill-2);
+  color: var(--ink-3); font: 10.5px/24px var(--ui); text-align: center;
+  overflow: hidden;
+}
+
+/* ---------- разбор промпта ---------- */
+.parse { list-style: none; margin: 4px 0 0; padding: 0; font-size: 12.5px; }
+/* Строка разбора — обычный текстовый абзац с висячим знаком слева.
+   Ни flex, ни grid: внутри строки есть подстроки <span class="num">,
+   и в контейнере-флексе каждая из них стала бы отдельной колонкой. */
+.parse li {
+  position: relative;
+  padding: 7px 0 7px 25px;
+  line-height: 1.45;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--ink-2);
+}
+.parse li:last-child { border-bottom: 0; }
+.parse li::before {
+  content: ""; position: absolute; left: 0; top: 9px;
+  width: 13px; height: 13px; border-radius: 50%;
+}
+.parse li::after { content: ""; position: absolute; }
+
+/* сделано: галочка */
+.parse li.ok::before { background: var(--done-soft); }
+.parse li.ok::after {
+  left: 4.6px; top: 11px; width: 3.6px; height: 7px;
+  border: solid var(--done-ink); border-width: 0 1.7px 1.7px 0;
+  transform: rotate(45deg); border-radius: 1px;
+}
+/* внимание: треугольник */
+.parse li.warn::before {
+  background: var(--warn); border-radius: 0;
+  clip-path: polygon(50% 4%, 100% 96%, 0 96%);
+}
+.parse li.warn { color: var(--warn-ink); }
+/* ошибка: крестик в круге */
+.parse li.bad::before { background: var(--fail); }
+.parse li.bad::after {
+  left: 3.5px; top: 12.5px; width: 6px; height: 6px;
+  background:
+    linear-gradient(45deg, transparent 42%, #fff 42% 58%, transparent 58%),
+    linear-gradient(-45deg, transparent 42%, #fff 42% 58%, transparent 58%);
+}
+.parse li.bad  { color: var(--fail-ink); font-weight: 500; }
+.parse .num { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--ink); }
+.parse li.warn .num { color: var(--warn-ink); }
+.parse li.bad  .num { color: var(--fail-ink); }
+
+/* ===========================================================================
+   ПАРАМЕТРЫ
+   Три группы, разделённые воздухом. Внутри группы строки разделены
+   волосяной линией, вдвинутой под колонку значений.
+   =========================================================================== */
+.params { display: flex; flex-direction: column; gap: 22px; }
+.pgroup { display: flex; flex-direction: column; }
+.params .row {
+  display: grid; grid-template-columns: 118px 1fr; gap: 14px;
+  align-items: center;
+  padding: 7px 0;
+  position: relative;
+}
+.params .row + .row::before {
+  content: ""; position: absolute; left: 132px; right: 0; top: 0;
+  height: 1px; background: var(--hairline);
+}
+.params .row.top { align-items: start; }
+.params .row.top > label { padding-top: 6px; }
+.params .row > label { font-size: 13px; text-align: right; }
+
+.ctl { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.ctl input[type=number] { width: 84px; text-align: right; }
+.ctl input.narrow { width: 70px; text-align: right; }
+.ctl input.path { flex: 1; min-width: 0; }
+.ctl input#seed { width: 168px; }
+.ctl input#tag { width: 168px; }
+.ctl textarea { flex: 1; resize: vertical; font-size: 12.5px; line-height: 1.45; }
+.ctl select { flex: 0 1 auto; min-width: 0; }
+.canvas input { width: 84px; text-align: right; }
+.x { color: var(--ink-3); }
+.unit { color: var(--ink-2); }
+.hint { font-size: 11.5px; color: var(--ink-3); min-width: 0; }
+.hint.bad { color: var(--fail-ink); font-weight: 500; }
+
+/* ===========================================================================
+   ОЦЕНКА — главный ответ формы
+   =========================================================================== */
+.estimate {
+  margin-top: 24px; padding: 18px;
+  background: var(--card-2);
+  border-radius: var(--r-inner);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
+.est-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.est-time {
+  font-size: 30px; font-weight: 600; letter-spacing: -.025em;
+  font-variant-numeric: tabular-nums;
+}
+.est-sub { font-size: 12.5px; color: var(--ink-2); }
+
+.mem { margin-top: 18px; }
+.mem-top { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; color: var(--ink-2); }
+.mem-top .num { font-size: 15px; font-weight: 600; color: var(--ink); }
+/* Шкала не обрезает содержимое: подписи рисок 40 и 46 стоят под ней,
+   а сама заливка скруглена по своему правому краю. */
+.gauge {
+  position: relative; height: 10px; margin: 8px 0 26px;
+  background: var(--fill-2); border-radius: 5px;
+  overflow: visible;
+}
+.gauge .fill {
+  position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px;
+  background: var(--accent); transition: width .18s ease, background-color .18s ease;
+}
+.gauge .fill.warn { background: var(--warn); }
+.gauge .fill.bad  { background: var(--fail); }
+/* Риски 40 и 46 из 48 — те же места, что и на микрошкале в строках очереди */
+.gauge .tick { position: absolute; top: 0; bottom: 0; width: 1.5px; background: var(--card); opacity: .9; }
+.gauge .tick span {
+  position: absolute; top: 13px; left: -6px;
+  font: 10.5px/1 var(--ui); color: var(--ink-3); font-variant-numeric: tabular-nums;
+}
+.gauge .t40 { left: 83.33%; }
+.gauge .t46 { left: 95.83%; }
+.mem-warn {
+  margin: 4px 0 0; font-size: 12.5px; line-height: 1.45;
+  color: var(--warn-ink); font-weight: 500;
+  background: var(--warn-soft); padding: 9px 12px; border-radius: 8px;
+}
+.mem-warn.bad { color: var(--fail-ink); background: var(--fail-soft); }
+.force {
+  display: inline-flex; align-items: center; gap: 9px;
+  margin-top: 10px; font-size: 12.5px; color: var(--fail-ink); font-weight: 500;
+  cursor: pointer;
+}
+/* Переключатель в системном духе — он же единственный «тяжёлый» контрол
+   на странице, и это правильно: он снимает защиту по памяти. */
+.force input[type=checkbox] {
+  appearance: none; -webkit-appearance: none;
+  position: relative; width: 36px; height: 22px; border-radius: 11px;
+  background: var(--fill-3); border: 0; padding: 0; flex: none;
+  cursor: pointer; transition: background .16s ease;
+}
+.force input[type=checkbox]::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3);
+  transition: transform .16s ease;
+}
+.force input[type=checkbox]:checked { background: var(--fail); }
+.force input[type=checkbox]:checked::after { transform: translateX(14px); }
+.force input[type=checkbox]:focus-visible { box-shadow: 0 0 0 3.5px var(--accent-ring); outline: none; }
+
+.est-actions { display: flex; align-items: center; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
+.est-foot { margin: 12px 0 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.45; }
+.est-said { font-size: 12.5px; color: var(--done-ink); font-weight: 500; }
+
+/* ---------- кнопки ---------- */
+button {
+  border-radius: var(--r-ctl); cursor: pointer;
+  border: 0; background: var(--fill-2); color: var(--ink);
+  padding: 6px 12px; font-size: 13px;
+  transition: background .12s ease, opacity .12s ease;
+}
+button:hover { background: var(--fill-3); }
+button:focus-visible { outline: none; box-shadow: 0 0 0 3.5px var(--accent-ring); }
+button.primary {
+  background: var(--accent); color: #fff;
+  font-weight: 600; padding: 8px 18px; border-radius: 8px;
+}
+button.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000); }
+button.primary:disabled {
+  background: var(--fill-2); color: var(--ink-3); cursor: not-allowed;
+}
+button.ghost { background: var(--fill); font-size: 12.5px; padding: 5px 11px; color: var(--ink-2); }
+button.ghost:hover { background: var(--fill-2); color: var(--ink); }
+
+/* ===========================================================================
+   ОЧЕРЕДЬ
+   Три карточки с одинаковыми внутренними полями — колонки в них стоят
+   на одной вертикали, и числа сравниваются между списками.
+   =========================================================================== */
+.queue .sub:last-child { margin-bottom: 0; }
+.empty { font-size: 12.5px; color: var(--ink-3); margin: 6px 0; }
+.badfiles {
+  display: flex; gap: 9px; align-items: baseline;
+  margin: 14px 0 0; padding: 10px 12px;
+  background: var(--warn-soft); border-radius: 8px;
+  font-size: 12.5px; color: var(--warn-ink); line-height: 1.45;
+}
+.badfiles::before {
+  content: ""; width: 13px; height: 13px; flex: none;
+  background: var(--warn); clip-path: polygon(50% 4%, 100% 96%, 0 96%);
+  align-self: flex-start; margin-top: 3px;
+}
+.badfiles .mono { color: var(--warn-ink); opacity: .85; }
+
+/* ---- идущая задача ---- */
+.running {
+  display: grid; grid-template-columns: 200px 1fr; gap: 20px;
+  padding: 16px;
+  background: var(--accent-soft);
+  border-radius: var(--r-inner);
+}
+.running.none, .running.stale {
+  display: block; position: relative; padding: 16px 18px;
+  font-size: 12.5px; line-height: 1.5;
+}
+.running.none {
+  background: var(--fill); color: var(--ink-3);
+}
+/* Задача в running/ без работника — не «идёт», а «неизвестно»: знак тот же
+   треугольник, что у нечитаемых файлов очереди, и заливка та же. */
+.running.stale {
+  background: var(--warn-soft); color: var(--warn-ink); font-size: 13px;
+  padding-left: 42px;
+}
+.running.stale::before {
+  content: ""; position: absolute; left: 18px; top: 19px;
+  width: 14px; height: 14px; background: var(--warn);
+  clip-path: polygon(50% 4%, 100% 96%, 0 96%);
+}
+.running.stale .mono { color: inherit; }
+.running img {
+  width: 200px; display: block; border-radius: 8px;
+  box-shadow: 0 0 0 1px var(--hairline), 0 1px 3px rgba(16,20,32,.12);
+}
+.run-cap { font-size: 11.5px; color: var(--ink-2); margin-top: 7px; }
+.run-body { min-width: 0; }
+.run-line1 { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.run-name { font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
+.run-spec { font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.run-num { display: flex; gap: 28px; margin: 16px 0 12px; flex-wrap: wrap; }
+.run-num div { display: flex; flex-direction: column; gap: 2px; }
+.run-num .k { font-size: 11.5px; color: var(--ink-2); }
+.run-num .v {
+  font: 600 19px/1.15 var(--ui); letter-spacing: -.02em;
+  font-variant-numeric: tabular-nums;
+}
+.run-num .v.over { color: var(--warn-ink); }
+.bar {
+  height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--accent) 18%, transparent);
+  position: relative; overflow: hidden;
+}
+.bar i {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  background: var(--accent); border-radius: 3px;
+}
+.run-foot { margin-top: 12px; font-size: 12px; color: var(--ink-2); line-height: 1.5; }
+.run-note { color: var(--ink-2); }
+
+/* ---- таблицы ---- */
+.table { overflow-x: auto; margin: 0 calc(var(--cardpad) * -1); padding: 0 var(--cardpad); }
+.r {
+  min-width: 800px;
+  display: grid; grid-template-columns: var(--cols);
+  gap: 12px; align-items: center;
+  padding: 9px 8px 9px 8px; margin: 0 -8px;
+  border-radius: 8px;
+  position: relative;
+  transition: background-color .12s ease;
+}
+/* Разделитель вдвинут: он начинается там, где начинается имя, и не
+   разрезает колонку знака состояния. */
+.r + .r:not(.fail)::before {
+  content: ""; position: absolute; left: 34px; right: 8px; top: 0;
+  height: 1px; background: var(--hairline);
+}
+.r:hover { background: var(--fill); }
+.r:hover::before, .r:hover + .r::before { background: transparent; }
+.r .name { font-weight: 600; min-width: 0; letter-spacing: -.005em; }
+.r .name .note {
+  display: block; font-weight: 400; font-size: 11.5px; color: var(--ink-3);
+  margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.r .c {
+  font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1;
+  font-size: 12.5px; text-align: right; color: var(--ink-2);
+}
+.r .c.l { text-align: left; font-family: var(--mono); font-size: 11.5px; }
+.r .acts { display: flex; gap: 6px; justify-content: flex-end; }
+.r .acts button { font-size: 12px; padding: 4px 10px; background: var(--fill); color: var(--ink-2); }
+.r .acts button:hover { background: var(--fill-2); color: var(--ink); }
+.r .acts button[data-act="del"]:hover { background: var(--fail-soft); color: var(--fail-ink); }
+.r .why {
+  grid-column: 2 / -1; font-family: var(--mono); font-size: 11.5px;
+  color: var(--fail-ink); padding-top: 4px; overflow-wrap: anywhere; line-height: 1.5;
+}
+
+/* ---- знаки четырёх состояний: форма важнее цвета ---- */
+.m {
+  position: relative; display: block; width: 14px; height: 14px;
+  border-radius: 50%; flex: none;
+}
+/* ждёт — полое кольцо */
+.m.wait { box-shadow: inset 0 0 0 1.7px var(--wait); }
+/* идёт — залитая точка с пульсирующим ореолом */
+.m.run  { background: var(--accent); }
+.m.run::after {
+  content: ""; position: absolute; inset: -4px; border-radius: 50%;
+  box-shadow: 0 0 0 1.5px var(--accent); opacity: .45;
+  animation: pulse 2.4s ease-out infinite;
+}
+@keyframes pulse {
+  0%   { transform: scale(.72); opacity: .55; }
+  70%  { transform: scale(1.12); opacity: 0; }
+  100% { transform: scale(1.12); opacity: 0; }
+}
+/* сделано — галочка */
+.m.done { background: var(--done); }
+.m.done::before {
+  content: ""; position: absolute; left: 4.6px; top: 3px;
+  width: 4px; height: 7.5px; border: solid #fff; border-width: 0 1.7px 1.7px 0;
+  transform: rotate(45deg); border-radius: 1px;
+}
+/* упало — крестик */
+.m.fail { background: var(--fail); }
+.m.fail::before, .m.fail::after {
+  content: ""; position: absolute; left: 3px; top: 6.2px;
+  width: 8px; height: 1.7px; background: #fff; border-radius: 1px;
+}
+.m.fail::before { transform: rotate(45deg); }
+.m.fail::after  { transform: rotate(-45deg); }
+
+.r.done { color: var(--ink-3); }
+.r.done .name { font-weight: 500; color: var(--ink-2); }
+.r.fail { background: var(--fail-soft); }
+.r.fail .name { color: var(--fail-ink); }
+.r.fail + .r::before, .r.fail::before { background: transparent; }
+.r.wait .c.mem.over { color: var(--warn-ink); font-weight: 600; }
+
+/* Микрошкала памяти: число сравнивается точно, полоска — мгновенно.
+   Риска на 40 из 48 стоит на том же месте, что и на большой шкале формы. */
+.mg {
+  display: block; height: 3px; margin-top: 4px; position: relative;
+  background: var(--fill-2); border-radius: 2px; overflow: hidden;
+}
+.mg::after {
+  content: ""; position: absolute; left: 83.33%; top: 0; bottom: 0;
+  width: 1px; background: var(--card);
+}
+.mg b { position: absolute; left: 0; top: 0; bottom: 0; background: var(--wait); border-radius: 2px; }
+.r.wait .c.mem.over .mg b { background: var(--warn); }
+.r.editing { background: var(--accent-soft); box-shadow: inset 0 0 0 1.5px var(--accent); }
+.r .prio { font-size: 11px; color: var(--accent-ink); font-weight: 600; }
+
+/* ===========================================================================
+   ЧЕГО В МАКЕТЕ НЕ БЫЛО
+   Макет знал ответ сервера заранее. У живой страницы есть ещё три состояния:
+   сервер не отвечает, запрос отказал, промпт разошёлся с файлом.
+   =========================================================================== */
+
+/* Сервер не отвечает. Полоса во всю приборную строку — её нельзя не заметить,
+   а цифры выше неё в этот момент устарели и об этом сказано словами. */
+.conn {
+  max-width: 1440px; margin: 0 auto; padding: 0 var(--pad) 9px;
+  display: flex; gap: 9px; align-items: baseline;
+  font-size: 12.5px; color: var(--fail-ink); font-weight: 500; line-height: 1.45;
+}
+.rail:has(.conn:not([hidden])) { background: color-mix(in srgb, var(--fail-soft) 82%, transparent); }
+.conn::before {
+  content: ""; width: 13px; height: 13px; flex: none; align-self: flex-start; margin-top: 3px;
+  background: var(--fail); clip-path: polygon(50% 4%, 100% 96%, 0 96%);
+}
+/* Пока сервер молчит, цифры очереди — прошлогодний снег. Приборная строка
+   остаётся яркой: там висит объяснение, почему всё остальное поблёкло. */
+body[data-stale] main { opacity: .55; }
+
+/* Отказ на запрос. Текст stderr от argparse показывается как есть,
+   моноширинным: «unrecognized arguments: --widht 896» точнее пересказа. */
+.err {
+  margin: 12px 0 0; padding: 10px 12px;
+  background: var(--fail-soft); border-radius: 8px;
+  font-size: 12.5px; color: var(--fail-ink); line-height: 1.5; overflow-wrap: anywhere;
+}
+.err b { display: block; margin-bottom: 3px; }
+.err pre {
+  margin: 6px 0 0; font-family: var(--mono); font-size: 11.5px;
+  white-space: pre-wrap; color: var(--fail-ink); opacity: .9;
+}
+
+/* Откуда уйдёт промпт: из файла (тогда очередь снимет с него копию) или
+   текстом в командной строке (тогда снимка не будет). */
+.src { margin: 8px 0 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.45; }
+.src.dirty { color: var(--warn-ink); }
+
+/* Ссылка на готовый ролик. Именно ссылка, а не <video>: сервер читает файл
+   в память целиком и перемотки не поддерживает, так что сорок мегабайт
+   грузятся только тогда, когда человек этого действительно захотел. */
+.r .clip { color: var(--accent-ink); text-decoration: none; }
+.r .clip:hover { text-decoration: underline; }
+
+/* Превью может не существовать: кадр пишется раз в несколько проходов, а
+   первый появляется не сразу. Пустая рамка вместо картинки честнее битой. */
+.running .noshot {
+  display: grid; place-items: center; width: 200px; height: 116px;
+  background: var(--fill-2); border-radius: 8px;
+  font-size: 11.5px; color: var(--ink-3); text-align: center; padding: 8px;
+}
+
+/* ---------- узкие окна ---------- */
+@media (max-width: 1180px) {
+  :root { --pad: 20px; --cardpad: 18px; }
+  .rail-main { gap: 20px; }
+  .rail-run { gap: 12px; }
+}
+@media (max-width: 1040px) {
+  .running { grid-template-columns: 1fr; }
+  .running img { width: 100%; max-width: 320px; }
+}
+
+/* ---------- уважение к системной настройке движения ---------- */
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

@@ -20,6 +20,8 @@ import argparse
 import http.client
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -2094,3 +2096,427 @@ def test_two_browsers_posting_the_same_tag_at_once_produce_one_job(queue_server)
     refused = next(answer for status, answer in results if status == 400)
     assert refused["error"]["code"] == "output_stem_conflict", refused
     assert len(_pending(queue_server)) == 1
+
+
+# -- Step 7: the page -----------------------------------------------------------------------------
+
+WEBUI = PROJECT_ROOT / "h3_48gb" / "webui"
+PAGE_FILES = ("index.html", "style.css", "app.js")
+
+#: A `data:` URI is a literal, not a request. The stylesheet draws the select chevron as inline
+#: SVG, and inline SVG carries the XML namespace `http://www.w3.org/2000/svg` -- a name, never
+#: fetched. Stripping the URIs before looking for external addresses is what keeps the check from
+#: flagging the very technique that makes the page self-contained.
+_DATA_URI = re.compile(r"""url\(\s*["']?data:[^)]*\)""", re.IGNORECASE)
+_EXTERNAL = re.compile(r"""(?:https?:)?//[A-Za-z0-9]""")
+
+
+def _page_text(name: str) -> str:
+    return (WEBUI / name).read_text(encoding="utf-8")
+
+
+def test_the_page_is_exactly_three_files_with_the_names_the_server_serves():
+    """`index.html` names the other two by URL, so a rename that missed one would ship a page
+    with no stylesheet and no behaviour, and every other test here would still pass.
+    """
+    assert sorted(p.name for p in WEBUI.iterdir() if p.is_file()) == sorted(PAGE_FILES)
+
+
+def test_index_is_served_and_references_only_local_assets(server):
+    """The page arrives at `/`, and every address in it is this server's own.
+
+    Both halves matter. A page that loads is not enough -- one `<link>` to a CDN and the whole
+    thing stops working on the machine it was written for, which has no route to the internet
+    while a generation is running and may have none at all in five years.
+    """
+    status, headers, body = _request(server, "/")
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    page = body.decode("utf-8")
+
+    referenced = re.findall(r"""(?:href|src)=["']([^"']+)["']""", page)
+    assert referenced, "the page references neither a stylesheet nor a script"
+    for url in referenced:
+        assert url.startswith("/static/"), f"{url} is not served by this server"
+        assert _request(server, url)[0] == 200, f"{url} is referenced but not served"
+
+    assert "/static/style.css" in referenced
+    assert "/static/app.js" in referenced
+
+
+@pytest.mark.parametrize("name", PAGE_FILES)
+def test_no_page_file_names_an_address_off_this_machine(name):
+    """No font, no library, no image from the network -- in any of the three files.
+
+    Checked on the bytes rather than on a rendered page: a `fetch("https://...")` inside a branch
+    nobody took would never show up in a browser test, and it is exactly as fatal.
+    """
+    text = _DATA_URI.sub("", _page_text(name))
+    found = _EXTERNAL.findall(text)
+    assert not found, f"{name} names an external address: {found}"
+
+
+def test_the_page_follows_the_system_theme_and_stops_moving_when_asked():
+    """Two media queries, both required by the brief and neither visible to any other test here.
+
+    Presentation only, so no mutation was run against this one -- it is a spelling check on the
+    stylesheet, not a claim about behaviour.
+    """
+    css = _page_text("style.css")
+    assert "@media (prefers-color-scheme: dark)" in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
+
+
+def test_the_page_asks_for_its_own_routes_in_a_way_the_provenance_check_accepts():
+    """Every request the page makes is same-origin and left alone for the browser to stamp.
+
+    The server refuses a write whose `Origin` or `Sec-Fetch-Site` names another site. A browser
+    fills both in correctly by itself; the ways to break that are all things the page would have
+    to *add* -- an absolute URL to another host, `mode: "no-cors"` (which strips the body and the
+    headers), `credentials: "omit"`, or a hand-written `Origin`. None of them appear, and a future
+    edit that adds one fails here rather than at three in the morning with a 403.
+    """
+    script = _page_text("app.js")
+    urls = re.findall(r"""(?:fetch|api)\(\s*(?:"[A-Z]+",\s*)?["'`]([^"'`$]*)""", script)
+    assert urls, "no request in the page at all"
+    for url in urls:
+        assert url.startswith("/"), f"{url!r} is not a same-origin path"
+    assert '"/api/state"' in script, "the page has to poll the one route it redraws from"
+    for forbidden in ('no-cors', 'credentials: "omit"', '"Origin"'):
+        assert forbidden not in script, f"{forbidden} would break the server's provenance check"
+
+
+# -- Step 7: the page's behaviour, without a browser ----------------------------------------------
+
+_NODE = shutil.which("node")
+_needs_node = pytest.mark.skipif(
+    _NODE is None,
+    reason="`node` is not in PATH; the page's pure functions cannot be called outside a browser, "
+           "so requirements 2-10 would have to be checked by eye instead")
+
+
+def _node_eval(body: str, timeout: float = 60):
+    """Run `body` as an ES module with the page's own `app.js` imported, and parse what it prints.
+
+    The real file is imported -- not a copy, not a re-implementation -- which is the only reason
+    a green test here says anything about the page a browser gets. `app.js` guards its DOM half
+    behind `typeof document`, so importing it outside a browser wires nothing up.
+    """
+    source = f'import * as app from {json.dumps((WEBUI / "app.js").as_uri())};\n{body}'
+    result = subprocess.run([_NODE, "--input-type=module", "-e", source],
+                            capture_output=True, text=True, timeout=timeout)
+    assert result.returncode == 0, f"node refused the module:\n{result.stderr}"
+    return json.loads(result.stdout)
+
+
+@_needs_node
+def test_the_page_module_imports_outside_a_browser():
+    """The precondition of every test below it: if this fails they all pass vacuously by never
+    running, so it is asserted separately and first.
+    """
+    names = _node_eval("console.log(JSON.stringify(Object.keys(app).sort()));")
+    assert "analysePrompt" in names and "pendingSummary" in names
+
+
+@_needs_node
+def test_the_poll_interval_is_the_twenty_seconds_the_spec_asks_for():
+    assert _node_eval("console.log(JSON.stringify(app.POLL_MS));") == 20000
+
+
+@_needs_node
+def test_a_server_that_stops_answering_is_said_so_in_words():
+    """Requirement 1. The failure mode this guards against is not a blank page -- it is a page
+    that keeps showing the numbers from twenty seconds ago as if they were current.
+    """
+    quiet, talking = _node_eval("""
+      const at = new Date("2026-08-12T21:00:00");
+      const later = new Date("2026-08-12T21:02:00");
+      console.log(JSON.stringify([app.offlineNotice(1, at, later),
+                                  app.offlineNotice(0, at, later)]));
+    """)
+    assert talking is None, "a page whose last poll succeeded must say nothing"
+    assert "не отвечает" in quiet
+    assert "2 мин" in quiet, quiet
+
+
+@_needs_node
+def test_the_form_keeps_its_values_and_moves_on_to_the_next_seed_and_tag():
+    """Requirement 2. The tag carries the seed because the output name is built from the tag:
+    without it the second seed of one scene is refused as `output_stem_conflict`.
+    """
+    first, second = _node_eval("""
+      const a = app.advanceAfterSubmit({seed: 7, tag: "centaur-15s"});
+      const b = app.advanceAfterSubmit(a);
+      console.log(JSON.stringify([a, b]));
+    """)
+    assert first == {"seed": 8, "tag": "centaur-15s-s8"}
+    assert second == {"seed": 9, "tag": "centaur-15s-s9"}, "the seed must not accumulate in the tag"
+
+
+@_needs_node
+def test_forty_gigabytes_warns_and_forty_six_demands_the_checkbox():
+    """Requirement 4. Three outcomes, and the middle one is the one a two-branch implementation
+    loses: above 40 the page must speak without blocking.
+    """
+    low, warn, block = _node_eval("""
+      console.log(JSON.stringify([35.7, 42.0, 47.2].map((gb) => app.memoryVerdict(gb))));
+    """)
+    assert (low["level"], low["needsConfirm"]) == ("ok", False)
+    assert (warn["level"], warn["needsConfirm"]) == ("warn", False)
+    assert warn["text"], "a warning nobody can read is not a warning"
+    assert (block["level"], block["needsConfirm"]) == ("block", True)
+
+
+@_needs_node
+def test_the_button_does_not_work_above_forty_six_until_the_checkbox_is_ticked():
+    """Requirement 4, the other half: the checkbox has to actually gate the button."""
+    without, with_tick, warn_only = _node_eval("""
+      const block = app.memoryVerdict(47.2), warn = app.memoryVerdict(42);
+      console.log(JSON.stringify([
+        app.submitAllowed({verdict: block, forced: false, canvasOk: true, busy: false}),
+        app.submitAllowed({verdict: block, forced: true,  canvasOk: true, busy: false}),
+        app.submitAllowed({verdict: warn,  forced: false, canvasOk: true, busy: false}),
+      ]));
+    """)
+    assert without is False
+    assert with_tick is True
+    assert warn_only is True, "a warning must not block the button; only 46 does"
+
+
+@_needs_node
+def test_the_prompt_parse_reports_the_sum_the_gaps_and_the_missing_sound():
+    """Requirement 5. One prompt carrying all four findings at once, because a parser can get any
+    one of them right while dropping the rest.
+    """
+    kinds, text = _node_eval("""
+      const prompt = [
+        "[0.0-2.5s] WIDE SHOT",
+        "[3.0-5.0s] MEDIUM",
+        "[4.5-8.0s] CLOSE",
+        "Characters: C1",
+      ].join("\\n");
+      const a = app.analysePrompt(prompt, 15, {audio: true});
+      console.log(JSON.stringify([a.notes.map(n => [n.k, n.t.replace(/<[^>]+>/g, "")]), prompt]));
+    """)
+    flat = " | ".join(f"{k}:{t}" for k, t in kinds)
+    assert "Блоков 3" in flat and "расхождение" in flat, flat
+    assert "Разрыв" in flat, flat
+    assert "Перехлёст" in flat, flat
+    assert "Нет overall_soundscape" in flat and "Нет non_diegetic_music" in flat, flat
+    assert any(k == "bad" for k, _ in kinds), "a t2va prompt with no sound sections is not a nit"
+
+
+@_needs_node
+def test_the_prompt_parse_rewrites_nothing():
+    """Requirement 5's second sentence. The highlight layer is the only thing the parse produces
+    that a human could mistake for the prompt itself, so it is what gets compared back.
+    """
+    same = _node_eval(r"""
+      const prompt = "[0.0-2.5s] A & B <tag>\n\noverall_soundscape: wind\n";
+      const html = app.highlightHtml(prompt, app.analysePrompt(prompt, 2.5, {audio: true}));
+      const back = html.replace(/<\/?mark[^>]*>/g, "")
+        .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"').replace(/&amp;/g, "&");
+      console.log(JSON.stringify(back === prompt + "\n"));
+    """)
+    assert same is True
+
+
+@_needs_node
+def test_a_prompt_that_lines_up_is_told_so():
+    """The other side of requirement 5: a parse that only ever complains is not a parse."""
+    kinds = _node_eval("""
+      const prompt = [
+        "[0.0-5.0s] WIDE",
+        "[5.0-10.0s] CLOSE",
+        "overall_soundscape: wind",
+        "non_diegetic_music: drums",
+      ].join("\\n");
+      console.log(JSON.stringify(app.analysePrompt(prompt, 10, {audio: true})
+        .notes.map(n => n.k)));
+    """)
+    assert kinds == ["ok", "ok", "ok"], kinds
+
+
+@_needs_node
+def test_only_a_waiting_job_carries_actions():
+    """Requirement 6. Not grey buttons -- no buttons: a grey button promises it will work one day.
+    Checked on the markup both rows really produce.
+    """
+    waiting, finished = _node_eval("""
+      const job = {id: "j1", note: "ночная", priority: 0,
+                   args: ["generate", "--tag", "кот", "--mode", "t2va"],
+                   estimate: {seconds: 3600, peak_gb: 35, width: 896, height: 576,
+                              duration_seconds: 10, steps: 8},
+                   output_stem: "/o/night/h3-кот-896x576", exit_code: 0,
+                   started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
+      console.log(JSON.stringify([app.pendingRowHtml(job), app.finishedRowHtml(job)]));
+    """)
+    assert sorted(re.findall(r'data-act="([a-z]+)"', waiting)) == ["del", "edit", "top"]
+    assert "data-act" not in finished, "a finished run offers nothing to press"
+    assert "<button" not in finished
+
+
+@_needs_node
+def test_the_waiting_summary_counts_the_jobs_the_hours_and_the_hour_it_ends():
+    """Requirement 7 -- the answer to the question the night queue is assembled to ask."""
+    text, seconds, count = _node_eval("""
+      const job = (s) => ({estimate: {seconds: s}});
+      const s = app.pendingSummary([job(3600), job(5400), job(1800)],
+        {now: new Date("2026-08-12T22:00:00"), runningSeconds: 0, workerState: "alive"});
+      console.log(JSON.stringify([s.text, s.seconds, s.count]));
+    """)
+    assert count == 3 and seconds == 10800
+    assert "3 задачи" in text and "3 ч" in text and "до 01:00" in text, text
+
+
+@_needs_node
+def test_the_summary_refuses_to_name_an_end_time_while_the_queue_stands_still():
+    """The same requirement, in the state that makes an end time a lie: nothing is moving."""
+    text = _node_eval("""
+      const s = app.pendingSummary([{estimate: {seconds: 3600}}],
+        {now: new Date("2026-08-12T22:00:00"), workerState: "stopped"});
+      console.log(JSON.stringify([s.text, s.endsAt]));
+    """)[0]
+    assert "очередь стоит" in text and "до " not in text, text
+
+
+@_needs_node
+def test_progress_is_drawn_as_one_division_per_forward():
+    """Requirement 8. Seven forwards, seven divisions -- "three of seven" reads faster than 43 %,
+    and a percentage bar would pass a test that only counted pixels.
+    """
+    html = _node_eval("console.log(JSON.stringify(app.stepsHtml(3, 7)));")
+    assert html.count("<i") == 7
+    assert html.count('class="done"') == 3
+    assert html.count('class="now"') == 1
+
+
+@_needs_node
+def test_the_preview_frame_is_the_last_one_the_run_actually_wrote():
+    """Requirement 8's thumbnail. The name is derived from the cadence and the count of finished
+    forwards, so the page asks for a frame that exists instead of one it hopes for.
+    """
+    at_seven, at_two, from_stem = _node_eval("""
+      const job = {args: ["generate", "--preview-every", "5"],
+                   output_stem: "/o/ночь/h3-кот-896x576"};
+      console.log(JSON.stringify([app.previewUrl(job, 7), app.previewUrl(job, 2),
+                                  app.previewUrl({args: ["generate"],
+                                                  output_stem: "h3-кот"}, 9)]));
+    """)
+    assert at_seven.endswith("-preview-step05.jpg"), at_seven
+    assert at_seven.startswith("/media/%D0%BD%D0%BE%D1%87%D1%8C/"), at_seven
+    assert at_two is None, "before the first frame there is no frame to show"
+    assert from_stem is None, "`/media/<run>/<file>` needs a run segment; a bare stem has none"
+
+
+@_needs_node
+def test_finished_shows_the_exit_code_and_a_failure_shows_why():
+    """Requirement 9. The reason is the worker's own `log_tail`; inventing a friendlier one would
+    hide the only line that says what happened.
+    """
+    ok, failed = _node_eval("""
+      const base = {id: "j", note: "", args: ["generate", "--tag", "кот"],
+                    estimate: {width: 896, height: 576, duration_seconds: 10, steps: 8},
+                    output_stem: "/o/ночь/h3-кот-896x576",
+                    started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
+      console.log(JSON.stringify([
+        app.finishedRowHtml({...base, exit_code: 0}),
+        app.finishedRowHtml({...base, exit_code: 1,
+                             log_tail: "RuntimeError: [metal::malloc] 51.4 GB > 48.0 GB"}),
+      ]));
+    """)
+    assert "код 0" in ok
+    assert "код 1" in failed
+    assert "metal::malloc" in failed, "a failed run with no visible reason is a mystery, not a row"
+    assert 'class="clip"' in ok and ".mp4" in ok, "a finished clip should be reachable"
+
+
+@_needs_node
+def test_only_the_last_day_of_finished_runs_is_shown():
+    """Requirement 9's window. A queue that never forgets grows without bound and buries today."""
+    kept = _node_eval("""
+      const at = new Date("2026-08-12T22:00:00");
+      const rows = app.finishedWithin([
+        {id: "fresh", finished_at: "2026-08-12T20:00:00"},
+        {id: "stale", finished_at: "2026-08-10T20:00:00"},
+        {id: "yesterday", finished_at: "2026-08-12T01:00:00"},
+      ], at);
+      console.log(JSON.stringify(rows.map(r => r.id)));
+    """)
+    assert kept == ["fresh", "yesterday"], kept
+
+
+@_needs_node
+def test_unreadable_queue_files_get_a_line_of_their_own():
+    """Requirement 10. They are in no list above, and a human counts the night's queue by the
+    list -- silence here is a queue that is quietly one job short.
+    """
+    html, empty = _node_eval("""
+      console.log(JSON.stringify([
+        app.brokenHtml([{path: "queue/pending/20260811-2139-x.json", error: "JSONDecodeError"}]),
+        app.brokenHtml([]),
+      ]));
+    """)
+    assert "20260811-2139-x.json" in html and "не прочитался" in html
+    assert empty == "", "no broken files, no line"
+
+
+@_needs_node
+def test_everything_a_human_typed_is_escaped_before_it_reaches_the_markup():
+    """The tag, the note and the worker's `log_tail` are all strings this page did not write."""
+    row = _node_eval("""
+      console.log(JSON.stringify(app.pendingRowHtml({
+        id: "j", priority: 0, note: "<img src=x onerror=alert(1)>",
+        args: ["generate", "--tag", "<script>"], estimate: {seconds: 1, peak_gb: 1},
+        output_stem: "/o/n/h3-x"})));
+    """)
+    assert "<script>" not in row and "&lt;script&gt;" in row
+    assert "<img" not in row and "&lt;img" in row, "the note has to arrive as text, not as a tag"
+
+
+@_needs_node
+def test_the_argument_list_the_form_builds_is_one_the_server_accepts(queue_server):
+    """The seam between the two halves of this task, tested across it.
+
+    `buildArgs` runs in `node`, and its output is posted to the running server. Every other test
+    here checks one side or the other; a rename of `--turbo-lora` to `--lora` would pass all of
+    them and break the only thing the page exists to do.
+    """
+    args = _node_eval("""
+      console.log(JSON.stringify(app.buildArgs({
+        prompt: "кот на подоконнике", width: 896, height: 576, duration: 10, steps: 31,
+        seed: 3, tag: "ночь", mode: "t2va", checkpoint: "CKPT", outdir: "OUT",
+        lora: "", loraStrength: 1, image: "", endImage: "", promptFile: null,
+      })));
+    """)
+    args = [str(queue_server.models / "ckpt") if a == "CKPT"
+            else str(queue_server.outdir) if a == "OUT" else a for a in args]
+
+    status, answer = _call(queue_server, "POST", "/api/estimate", {"args": args})
+    assert status == 200, answer
+    assert answer["estimate"]["width"] == 896 and answer["estimate"]["steps"] == 31, answer
+
+    status, answer = _call(queue_server, "POST", "/api/jobs", {"args": args, "note": "с формы"})
+    assert status == 200, answer
+
+    status, state = _json(queue_server, "/api/state")
+    assert [job["id"] for job in state["queue"]["pending"]] == [answer["job"]["id"]], state
+
+
+def test_a_job_posted_through_the_api_is_in_the_next_state_the_page_polls(queue_server):
+    """The whole loop the page runs on: post, poll, see it. Without this the page could be
+    posting into a queue `/api/state` never reads and nothing would say so.
+    """
+    status, before = _json(queue_server, "/api/state")
+    assert status == 200 and before["queue"]["pending"] == []
+
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, tag="увидеть"), "note": "круг"})
+    assert status == 200, answer
+
+    status, after = _json(queue_server, "/api/state")
+    posted = [job for job in after["queue"]["pending"] if job["id"] == answer["job"]["id"]]
+    assert len(posted) == 1, after
+    assert posted[0]["note"] == "круг"
+    assert posted[0]["estimate"]["seconds"] > 0, "the page draws the queue's totals from this"

@@ -207,6 +207,50 @@ next to the clip, and `night_queue.sh` drives a series of them overnight (light 
 heaviest last) with `memwatch.sh` sampling process RSS and system memory beside each one. Everything
 in "Measured results" below came out of those three.
 
+## Веб-морда
+
+A run takes hours, so the useful unit of work is a *queue* of them, assembled in the evening and
+read in the morning. `h3 web` and `h3 worker` are that queue: **two processes, and both are
+needed.** Neither starts the other, because they fail in different ways and one of them is the one
+holding a 33 GB generation.
+
+```bash
+# 1. The worker: claims one job at a time and runs it. Start it first — it is the half that
+#    actually generates, and it takes the queue's `worker.lock` for as long as it lives.
+h3 worker --outdir ~/video-out
+
+# 2. The page: reads the same queue and writes jobs into it. Prints its address and serves it.
+h3 web --outdir ~/video-out --port 8765
+```
+
+Then open <http://127.0.0.1:8765/>. The order matters only for what you see: a page opened with no
+worker running says so in the top bar, in words, instead of showing a queue that looks like it is
+about to move.
+
+**The queue survives a reboot.** It is a directory of JSON files under `<outdir>/queue/` —
+`pending/`, `running/`, `done/`, `failed/` — written with the usual temporary-file, `fsync`,
+`os.replace` protocol, one file per job, plus a snapshot of the prompt each job was queued with.
+Nothing is held in memory by either process. Kill the worker mid-run, reboot the machine, start it
+again: startup reconciliation puts every job back into the state its files actually justify, and an
+interrupted run resumes from its own checkpoint rather than starting over. The server never has to
+be running for the queue to exist, and a job queued while the worker is down simply waits.
+
+**The page is reachable only from this machine.** The server binds `127.0.0.1` — not `0.0.0.0` —
+so there is nothing to reach from the network, and it additionally refuses any request whose `Host`
+header names something other than loopback (DNS rebinding), and any write whose `Origin` or
+`Sec-Fetch-Site` says it came from another site. There is no authentication and none is needed:
+there is no listener off this machine to authenticate. Do not put it behind a tunnel or a reverse
+proxy expecting it to hold up — it was not built to.
+
+Everything the page can do, the API can do, and it is the same validation either way: a queued job
+is checked by running `h3 generate --dry-run --json` in a subprocess before it is written, so an
+argument list the CLI would refuse is refused at the moment you press the button rather than four
+jobs into the night. `POST /api/jobs`, `PUT /api/jobs/<id>`, `POST /api/jobs/<id>/top`,
+`DELETE /api/jobs/<id>`, `POST /api/estimate`, `GET|PUT /api/prompts/<name>`, `GET /api/state`.
+
+The page itself is three files in `h3_48gb/webui/` — `index.html`, `style.css`, `app.js` — with no
+build step, no dependency and no address off this machine in any of them.
+
 ## Measured results
 
 All runs at the one schedule the baked AdaLN table supports: 31 grid points (30 forwards), sigma
