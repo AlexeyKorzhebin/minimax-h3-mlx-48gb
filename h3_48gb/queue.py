@@ -95,6 +95,20 @@ class Job:
         return asdict(self)
 
 
+def _job_file_payload(job: Job) -> dict:
+    """`Job.as_dict()` minus `state`, for whatever is written to `job_path`.
+
+    The directory a job's file lives in already says its state (see the module docstring); storing
+    it a second time inside the file risks exactly the drift a reader has to guard against, except
+    a *human* running `cat running/<id>.json` gets no such guard -- `write_json_durably`'s own
+    docstring promises the file is meant to be read that way. `Job.as_dict()` itself keeps the
+    field, since in-memory callers (the CLI, a future HTTP response) do want it.
+    """
+    payload = job.as_dict()
+    del payload["state"]
+    return payload
+
+
 @dataclass(frozen=True)
 class Broken:
     """A file `scan` could not parse into a `Job`, reported instead of silently skipped."""
@@ -277,6 +291,15 @@ def submit(root, args: list[str], note: str, dry_run_report: dict, estimate: dic
     id (`O_CREAT|O_EXCL` on the pending job file), write the snapshot durably, rewrite `args`, then
     write the job file itself durably. Without a prompt, nothing under `prompts/` is touched and
     `args` is passed through unchanged.
+
+    `args` is validated to actually contain `--prompt-file` (with a value after it) *before* an id
+    is claimed, whenever `prompt_text` is given: the alternative -- discovering the mismatch only
+    while rewriting `args`, after `O_CREAT|O_EXCL` has already claimed the id -- would raise a bare
+    `ValueError`/`IndexError` out of `submit`'s boundary (indistinguishable from a real bug to a
+    caller matching on `QueueError`) and leave an empty placeholder job file behind forever. Any
+    other failure between the id claim and the final durable write (a full disk, a `write_text_durably`
+    crash) is still possible, so everything from the claim onward is wrapped to unclaim the id and
+    remove any prompt snapshot already written before the failure propagates.
     """
     root = Path(root)
     layout(root)
@@ -285,6 +308,13 @@ def submit(root, args: list[str], note: str, dry_run_report: dict, estimate: dic
     with queue_lock(root, exclusive=True):
         if _stem_taken(root, output_stem):
             raise OutputStemConflict(f"output_stem already claimed: {output_stem}")
+
+        if prompt_text is not None:
+            if "--prompt-file" not in args or args.index("--prompt-file") + 1 >= len(args):
+                raise QueueError(
+                    "prompt_text was given but args has no --prompt-file placeholder to repoint "
+                    "at the snapshot"
+                )
 
         created_at = now() if now is not None else _now()
         stamp = _stamp(created_at)
@@ -300,21 +330,28 @@ def submit(root, args: list[str], note: str, dry_run_report: dict, estimate: dic
             os.close(fd)
             break
 
-        args = list(args)
-        prompt_sha256 = None
-        if prompt_text is not None:
-            snapshot = prompt_path(root, job_id)
-            write_text_durably(snapshot, prompt_text)
-            prompt_sha256 = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
-            args[args.index("--prompt-file") + 1] = str(snapshot)
+        snapshot = None
+        try:
+            args = list(args)
+            prompt_sha256 = None
+            if prompt_text is not None:
+                snapshot = prompt_path(root, job_id)
+                write_text_durably(snapshot, prompt_text)
+                prompt_sha256 = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+                args[args.index("--prompt-file") + 1] = str(snapshot)
 
-        job = Job(
-            id=job_id, state="pending", created_at=created_at, args=args, note=note,
-            prompt_source=prompt_source, prompt_sha256=prompt_sha256,
-            output_stem=output_stem, estimate=dict(estimate), priority=0,
-            started_at=None, finished_at=None, exit_code=None, log_tail=None,
-        )
-        write_json_durably(path, job.as_dict())
+            job = Job(
+                id=job_id, state="pending", created_at=created_at, args=args, note=note,
+                prompt_source=prompt_source, prompt_sha256=prompt_sha256,
+                output_stem=output_stem, estimate=dict(estimate), priority=0,
+                started_at=None, finished_at=None, exit_code=None, log_tail=None,
+            )
+            write_json_durably(path, _job_file_payload(job))
+        except BaseException:
+            path.unlink(missing_ok=True)
+            if snapshot is not None:
+                snapshot.unlink(missing_ok=True)
+            raise
 
     return job
 
@@ -337,15 +374,26 @@ def scan(root) -> tuple[list[Job], list[Broken]]:
     when the rename lands relative to this function's directory listings. A broken file is reported
     in the second list, not skipped: a silently shorter queue would leave a human wondering where a
     job went.
+
+    Read-only: unlike `submit`, `scan` never calls `layout` and never creates a missing state
+    directory -- a caller repeatedly reading `<H3_OUTDIR>/queue/` should not risk quietly building
+    that path into existence out of a typo, and a status endpoint polled every few seconds should
+    not touch the filesystem beyond the reads it actually needs. A directory that does not exist
+    contributes no jobs, same as one that exists and is empty.
     """
     root = Path(root)
-    layout(root)
     jobs: list[Job] = []
     broken: list[Broken] = []
 
+    if not root.is_dir():
+        return jobs, broken
+
     with queue_lock(root, exclusive=False):
         for state in QUEUE_STATES:
-            for file in sorted((root / state).glob("*.json")):
+            directory = root / state
+            if not directory.is_dir():
+                continue
+            for file in sorted(directory.glob("*.json")):
                 try:
                     jobs.append(_job_from_file(file, state))
                 except (OSError, ValueError, TypeError, KeyError) as exc:

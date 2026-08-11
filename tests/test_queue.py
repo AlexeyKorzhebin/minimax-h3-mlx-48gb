@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -72,6 +73,11 @@ def test_durable_write_fsyncs_the_file_and_its_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(q.os, "fsync", lambda fd: (synced.append(os.fstat(fd).st_mode), real_fsync(fd))[1])
     q.write_json_durably(tmp_path / "j.json", {"v": 1})
     assert len(synced) == 2, f"expected fsync of the file and of the directory, got {len(synced)}"
+    # A count of two alone does not prove *which* two: fsyncing the temp file twice (e.g. by
+    # accident, or by a change that dropped the directory fsync and duplicated the file one
+    # instead) leaves this count unchanged. Check the actual kind of each fd fsync was called on.
+    assert sorted(stat.S_ISDIR(mode) for mode in synced) == [False, True], (
+        "expected exactly one fsync of a regular file and one of a directory")
 
 
 # -- Step 4: the queue lock actually blocks ----------------------------------------------------
@@ -103,6 +109,11 @@ def test_the_queue_lock_actually_blocks_a_second_exclusive_holder(tmp_path):
         threading.Thread(target=lambda: (q.queue_lock(root, exclusive=True).__enter__(),
                                          done.set()), daemon=True).start()
         assert not done.wait(0.5), "queue_lock returned while another process held it exclusively"
+    # `done` staying unset above is not, by itself, proof of blocking: a `queue_lock` gutted to
+    # raise instead of acquiring the lock also never sets `done`, and would pass the assertion
+    # above for the wrong reason. Only a genuine wait-then-succeed tells the two apart -- confirm
+    # the background thread actually goes on to enter the lock once the external holder lets go.
+    assert done.wait(5), "queue_lock never returned after the external lock was released"
 
 
 # -- Step 6: submit and scan actually take the lock --------------------------------------------
@@ -121,6 +132,34 @@ def test_the_operation_waits_for_the_queue_lock(tmp_path, operation):
         threading.Thread(target=lambda: (calls[operation](), finished.set()), daemon=True).start()
         assert not finished.wait(0.5), f"{operation} did not take the queue lock"
     assert finished.wait(5), f"{operation} never completed after the lock was released"
+
+
+def test_submit_takes_an_exclusive_lock_not_a_shared_one(tmp_path):
+    """The previous test proves *a* lock is taken, not which mode. Two `LOCK_SH` holders never
+    conflict, so if `submit` ever took `LOCK_SH` instead of `LOCK_EX` -- e.g. `queue_lock`'s
+    `exclusive` flag failing to reach `flock` -- a second, concurrent `submit` could pass the
+    output_stem check before either finished writing, and both land the exact same name: precisely
+    the race this lock exists to prevent (see the module docstring).
+    """
+    root = tmp_path / "queue"; q.layout(root)
+    with _external_lock(root, "LOCK_SH"):
+        finished = threading.Event()
+        threading.Thread(target=lambda: (q.submit(root, ["generate", "--tag", "a"], "", _DRY, {}),
+                                         finished.set()), daemon=True).start()
+        assert not finished.wait(0.5), (
+            "submit proceeded while an external LOCK_SH was held -- it must take LOCK_EX")
+    assert finished.wait(5), "submit never completed after the external lock was released"
+
+
+def test_scan_does_not_conflict_with_a_shared_external_lock(tmp_path):
+    """The companion check to the test above: scan's own LOCK_SH must not be needlessly widened
+    to LOCK_EX either, or a status read would start blocking on another concurrent status read.
+    """
+    root = tmp_path / "queue"; q.layout(root)
+    with _external_lock(root, "LOCK_SH"):
+        finished = threading.Event()
+        threading.Thread(target=lambda: (q.scan(root), finished.set()), daemon=True).start()
+        assert finished.wait(2), "scan waited on a second shared lock holder, which should never conflict"
 
 
 # -- Step 7: submission -------------------------------------------------------------------------
@@ -182,6 +221,100 @@ def test_submit_refuses_a_stem_another_pending_job_already_claims(tmp_path):
         q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
 
 
+def test_submit_refuses_a_stem_a_running_job_already_claims(tmp_path):
+    """`submit` never moves a job to `running/` on its own (that is `claim`, a later task), so this
+    places one there by hand -- the point is that a two-hour-long generation is the one thing an
+    artifact-suffix check on disk cannot see yet, so `running/` is the *only* thing standing between
+    a second submission and clobbering that job's eventual output. A stem check that only looked at
+    `pending/` would miss it entirely.
+    """
+    root = tmp_path / "queue"
+    paths = q.layout(root)
+    running_job = {
+        "id": "20260811-000000-a-run1", "created_at": "2026-08-11T00:00:00",
+        "args": ["generate", "--tag", "a"], "note": "", "prompt_source": None,
+        "prompt_sha256": None, "output_stem": _DRY["output_stem"], "estimate": {},
+        "priority": 0, "started_at": "2026-08-11T00:00:00", "finished_at": None,
+        "exit_code": None, "log_tail": None,
+    }
+    q.write_json_durably(paths["running"] / "20260811-000000-a-run1.json", running_job)
+    with pytest.raises(q.OutputStemConflict):
+        q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+
+
+def test_submit_writes_the_prompt_snapshot_durably(tmp_path, monkeypatch):
+    """No existing test proves the prompt snapshot itself goes through `write_text_durably` rather
+    than a plain `Path.write_text` -- `write_json_durably`'s own tests only ever exercise it on an
+    arbitrary path, never on this specific call site. Counting `fsync` calls across a submit with a
+    prompt catches a downgrade here: 2 for the snapshot, 2 for the job file, 4 total; a plain write
+    for the snapshot would drop that to 2.
+    """
+    root = tmp_path / "queue"
+    calls: list[int] = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(q.os, "fsync", lambda fd: (calls.append(fd), real_fsync(fd))[1])
+    q.submit(root, ["generate", "--prompt-file", "p.txt", "--tag", "a"], "", _DRY, {},
+             prompt_source="p.txt", prompt_text="hi\n")
+    assert len(calls) == 4, (
+        f"expected 2 fsyncs for the prompt snapshot and 2 for the job file, got {len(calls)}")
+
+
+@pytest.mark.parametrize("bad_args", [
+    ["generate", "a dog", "--tag", "a"],                     # no --prompt-file at all
+    ["generate", "--tag", "a", "--prompt-file"],              # --prompt-file with no value after it
+])
+def test_submit_refuses_prompt_text_without_a_prompt_file_placeholder(tmp_path, bad_args):
+    """A bare ValueError/IndexError used to leak out of submit's boundary here -- indistinguishable
+    from a real bug to a caller matching on QueueError -- and left an empty placeholder job file
+    (claimed via O_CREAT|O_EXCL before the mismatch was ever noticed) behind for every later scan
+    to report as Broken forever. The refusal must be a QueueError, and it must happen before an id
+    is ever claimed, so the queue is left exactly as empty as it was.
+    """
+    root = tmp_path / "queue"
+    with pytest.raises(q.QueueError):
+        q.submit(root, bad_args, "", _DRY, {}, prompt_text="hi\n")
+    jobs, broken = q.scan(root)
+    assert jobs == [] and broken == [], "a refused submit must leave no trace in the queue"
+
+
+def test_submit_rolls_back_the_claimed_id_when_the_job_file_write_fails(tmp_path, monkeypatch):
+    """Not every failure between the id claim and the final write is preventable by validating
+    `args` up front -- a full disk or a crash inside `write_text_durably` can still land there. The
+    id (an empty placeholder from O_CREAT|O_EXCL) and, if a prompt was already snapshotted, its now
+    orphaned copy must both be removed rather than left for `scan` to report as Broken forever.
+    """
+    root = tmp_path / "queue"
+    real_replace = os.replace
+    call_count = {"n": 0}
+    def boom(src, dst):
+        call_count["n"] += 1
+        if call_count["n"] == 2:  # 1st replace commits the prompt snapshot; 2nd is the job file
+            raise OSError("simulated crash while writing the job file")
+        return real_replace(src, dst)
+    monkeypatch.setattr(q.os, "replace", boom)
+    with pytest.raises(OSError):
+        q.submit(root, ["generate", "--prompt-file", "p.txt", "--tag", "a"], "", _DRY, {},
+                 prompt_source="p.txt", prompt_text="hi\n")
+    monkeypatch.setattr(q.os, "replace", real_replace)
+
+    assert list(q.layout(root)["pending"].iterdir()) == [], "the claimed placeholder must be rolled back"
+    assert list(q.layout(root)["prompts"].iterdir()) == [], "the orphaned prompt snapshot must be rolled back"
+
+
+def test_submitted_job_file_does_not_persist_the_redundant_state_field(tmp_path):
+    """The directory a job's file lives in already says its state (see the module docstring); a
+    duplicate `"state"` key inside the file itself would drift the moment a future rename-based
+    transition (task 2) moves the file without rewriting it -- `cat running/<id>.json` would still
+    read `"state": "pending"` forever, silently contradicting the very directory it sits in, exactly
+    the kind of gap `write_json_durably`'s "meant to be read with cat" promise cannot survive.
+    """
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    on_disk = json.loads(q.job_path(root, job.id, "pending").read_text())
+    assert "state" not in on_disk, "the on-disk job file must not duplicate what the directory says"
+    assert job.state == "pending", "the in-memory Job returned to the caller still carries it"
+
+
 # -- Step 9: reading ------------------------------------------------------------------------------
 
 
@@ -194,8 +327,11 @@ def test_scan_returns_jobs_from_every_state_directory(tmp_path):
     paths = q.layout(root)
     for state in q.QUEUE_STATES:
         job_id = f"20260811-000000-a-{state[:4]}"
+        # No "state" key here: a real on-disk job file does not carry one (see
+        # test_submitted_job_file_does_not_persist_the_redundant_state_field) -- the directory is
+        # the only thing that says it. _job_from_file must add it back from `state` alone.
         data = {
-            "id": job_id, "state": state, "created_at": "2026-08-11T00:00:00",
+            "id": job_id, "created_at": "2026-08-11T00:00:00",
             "args": ["generate", "--tag", "a"], "note": "", "prompt_source": None,
             "prompt_sha256": None, "output_stem": f"/out/{job_id}", "estimate": {},
             "priority": 0, "started_at": None, "finished_at": None, "exit_code": None,
@@ -218,6 +354,20 @@ def test_scan_reports_an_unreadable_job_instead_of_hiding_it(tmp_path):
     jobs, broken = q.scan(root)
     assert len(jobs) == 1 and len(broken) == 1
     assert "json" in broken[0].error.lower()
+
+
+def test_scan_does_not_write_to_disk(tmp_path):
+    """A read must have no side effects. `scan` used to call `layout(root)` internally, so a status
+    check against a queue path that does not exist yet -- a typo'd H3_OUTDIR being the obvious
+    real-world cause -- would silently create all eight subdirectories and forever after report an
+    "empty queue" instead of anything a human could notice was wrong. A missing directory is an
+    empty list, not a reason to create one, and a polled `/api/state` (task 5) must not touch the
+    filesystem beyond the reads it actually needs.
+    """
+    root = tmp_path / "queue"
+    jobs, broken = q.scan(root)
+    assert jobs == [] and broken == []
+    assert not root.exists(), "scan must not create the queue directory it was asked to read"
 
 
 # -- Global constraint: queue.py must stay importable without MLX -------------------------------
