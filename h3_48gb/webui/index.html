@@ -1,0 +1,26 @@
+<!doctype html>
+<!--
+  Placeholder. The real page (form, prompt editor, queue and runs) is task 7 of the h3-web plan;
+  this file exists so that `GET /` is a route with a file behind it from the moment the server
+  ships, rather than a 404 that nobody can tell apart from a routing bug. Replace it wholesale.
+-->
+<html lang="ru">
+<meta charset="utf-8">
+<title>h3 — очередь</title>
+<style>
+  body { font: 15px/1.5 -apple-system, system-ui, sans-serif; background: #f1f2f5; color: #1c1e22;
+         margin: 0; display: grid; place-items: center; min-height: 100vh; }
+  main { background: #fff; border-radius: 14px; padding: 22px 28px; max-width: 34rem;
+         box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #101114; color: #e7e8ea; } main { background: #1c1e22; box-shadow: none; }
+  }
+</style>
+<main>
+  <h1>Страницы ещё нет</h1>
+  <p>Сервер работает: состояние очереди отдаётся по <code>/api/state</code>, файлы прогонов — по
+     <code>/media/&lt;прогон&gt;/&lt;файл&gt;</code>.</p>
+  <p>Форма постановки задач и список очереди появятся здесь в седьмой задаче плана.</p>
+</main>
+</html>

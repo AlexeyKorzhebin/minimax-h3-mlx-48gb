@@ -116,6 +116,13 @@ ERROR_CODES = {
     "prompt_missing": "no prompt: pass one positionally or with --prompt-file",
     "mode_mismatch": "--mode contradicts the --image/--end-image flags given",
     "worker_already_running": "another worker already holds queue/worker.lock on this machine",
+    # Raised by `h3_48gb.web`, listed here because the contract is one contract: the CLI, the
+    # worker and the server all answer with the same `{"ok": false, "error": {"code", ...}}`
+    # envelope, and a caller matching on `error.code` should not have to know which process
+    # produced it. See `test_error_codes_are_documented_in_one_place`, which scans both modules.
+    "path_outside_root": "a path names something outside every root the server may touch, or writes into the read-only models root",
+    "prompt_name_invalid": "a prompt name is not a bare `[A-Za-z0-9_-]+.txt` -- it names a directory or another suffix",
+    "queue_unwritable": "the queue directory could not be read or written; see `detail.path`",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 
@@ -388,6 +395,14 @@ def build_parser() -> argparse.ArgumentParser:
     wk.add_argument("--poll", type=float, default=5.0,
                     help="seconds between checks of an empty queue (default 5)")
     wk.add_argument("--json", action="store_true", help="emit a machine-readable report")
+
+    # No `--host`: the server binds the loopback and only the loopback (`web.LOOPBACK`), and a flag
+    # that could hold `0.0.0.0` is a flag someone eventually sets on a machine with no auth in
+    # front of it.
+    wb = _subcommand(sub, "web", help="serve the queue page on 127.0.0.1 until stopped")
+    wb.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
+    wb.add_argument("--port", type=int, default=8765,
+                    help="port on 127.0.0.1 (default 8765); 0 asks the kernel for a free one")
 
     doc = _subcommand(sub, "doctor", help="verify a converted checkpoint")
     doc.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
@@ -1059,6 +1074,43 @@ def run_worker(outdir: Path, poll: float = 5.0) -> dict:
     return {"ok": True, "queue": str(root), "jobs_run": ran}
 
 
+def run_web(outdir: Path, port: int = 8765) -> dict:
+    """Serve the queue page on `127.0.0.1:<port>` until the process is stopped.
+
+    Imported lazily for the same reason `run_worker` imports its module lazily: `h3 --help` has no
+    business loading `http.server`. `h3_48gb.web` never imports MLX, so this stays a cheap process
+    even though it sits resident all day next to a generation that is not.
+
+    `--outdir` is validated before anything is bound, exactly as `run_worker` validates it and for
+    the same reason: `queue.scan` deliberately does not create the directory it reads, so a typo'd
+    outdir would otherwise produce a page that serves an empty queue for ever while the real one
+    fills up somewhere else. Nothing here creates the queue layout either -- the worker owns that.
+
+    `Ctrl-C` is the documented way to stop it, so `KeyboardInterrupt` is a normal exit rather than
+    a traceback: the socket is closed and the report is returned.
+    """
+    from h3_48gb.web import LOOPBACK, make_server
+
+    outdir = Path(outdir)
+    if not outdir.is_dir():
+        raise CliError("outdir_not_found", f"--outdir does not exist: {outdir}",
+                       {"outdir": str(outdir)})
+    root = queue_root(outdir)
+    httpd = make_server(root, outdir, port=port, verbose=True)
+    # Not `port`: with `--port 0` the kernel picks, and the number a human has to type is the one
+    # the socket actually got.
+    bound = httpd.server_address[1]
+    url = f"http://{LOOPBACK}:{bound}/"
+    print(f"страница на {url} — очередь в {root}; остановить: Ctrl-C", flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return {"ok": True, "url": url, "queue": str(root)}
+
+
 def run_doctor(checkpoint: Path) -> dict:
     """Check a converted checkpoint before a multi-hour run rather than during it."""
     checkpoint = Path(checkpoint)
@@ -1120,6 +1172,10 @@ def main(argv: list[str] | None = None) -> int:
             report = run_worker(args.outdir, args.poll)
             ok = True
             human = f"работник остановлен, задач выполнено: {report['jobs_run']}"
+        elif args.command == "web":
+            report = run_web(args.outdir, args.port)
+            ok = True
+            human = "сервер остановлен"
         elif args.command == "doctor":
             report = run_doctor(args.checkpoint)
             ok = report["ok"]

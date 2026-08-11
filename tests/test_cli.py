@@ -1533,7 +1533,14 @@ def test_error_codes_are_documented_in_one_place():
     cannot catch -- every code listed there must correspond to a real `raise CliError(...)` site,
     or the list is quietly promising something `--json` can never produce.
 
-    Checked by scanning `cli.py`'s own source for every `CliError("code", ...)` call site, rather
+    **Both directions are checked across every module that raises `CliError`,** not just `cli.py`.
+    `h3_48gb/web.py` raises three of these codes (`path_outside_root`, `prompt_name_invalid`,
+    `queue_unwritable`) and `cli.py` raises none of them, so a scan limited to `cli.py` would call
+    all three "listed but never raised" and force them out of the one contract an MCP wrapper and
+    the page both read. Adding a module here is the price of raising a shared code from it -- which
+    is the point: a code with no raise site anywhere is a promise `--json` cannot keep.
+
+    Checked by scanning each module's own source for every `CliError("code", ...)` call site, rather
     than a fixed sample: a hand-maintained list of five names would keep passing forever even if a
     sixth call site raised a code nobody added to `ERROR_CODES` -- which is exactly what happened
     to `checkpoint_locked` when it was added to the `except` handler in `run_generate` but not
@@ -1549,9 +1556,10 @@ def test_error_codes_are_documented_in_one_place():
     import re
 
     from h3_48gb import cli as cli_mod
+    from h3_48gb import web as web_mod
     from h3_48gb.cli import ERROR_CODES
 
-    source = inspect.getsource(cli_mod)
+    source = "\n".join(inspect.getsource(module) for module in (cli_mod, web_mod))
     raised_codes = set(re.findall(r'CliError\(\s*"([a-z0-9_]+)"', source))
 
     undocumented = raised_codes - set(ERROR_CODES)
@@ -1559,8 +1567,8 @@ def test_error_codes_are_documented_in_one_place():
 
     unraised = set(ERROR_CODES) - raised_codes
     assert not unraised, (
-        f"listed in ERROR_CODES but no `raise CliError(...)` site in cli.py produces them: "
-        f"{unraised}")
+        f"listed in ERROR_CODES but no `raise CliError(...)` site in cli.py or web.py produces "
+        f"them: {unraised}")
 
 
 # -- verbose: the --json stdout contract must survive a chatty pipeline -------------------------
