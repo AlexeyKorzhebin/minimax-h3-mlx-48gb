@@ -1998,7 +1998,14 @@ def test_a_body_without_a_usable_args_list_is_args_invalid(queue_server, payload
 
 
 def test_a_body_longer_than_the_limit_is_refused(queue_server):
-    connection = http.client.HTTPConnection(web.LOOPBACK, queue_server.port, timeout=30)
+    """The `Content-Length` is a promise, and the bytes are never sent.
+
+    The short timeout is the point of the test as much as the assertion is: with the limit
+    removed, `rfile.read` blocks for bytes that will never arrive, and a test that hangs reports
+    nothing at all (task 5 lost a whole mutation run to exactly this). Five seconds turns the
+    missing check into a failure instead of a wedge.
+    """
+    connection = http.client.HTTPConnection(web.LOOPBACK, queue_server.port, timeout=5)
     try:
         connection.putrequest("POST", "/api/jobs")
         connection.putheader("Content-Type", "application/json")
