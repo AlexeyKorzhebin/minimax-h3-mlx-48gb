@@ -313,7 +313,13 @@ def test_status_json_lists_runs(tmp_path, capsys):
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
-    assert payload["runs"][0]["completed"] == 3
+    run = payload["runs"][0]
+    assert run["completed"] == 3
+    assert run["total"] == 7
+    assert run["identity_digest"] == "deadbeef"
+    assert run["started_at"] == "2026-08-10T21:00:00"
+    assert run["written_at"] == "2026-08-10T21:30:00"
+    assert run["fraction"] == 3 / 7
 
 
 def test_status_refuses_a_missing_outdir(tmp_path, capsys):
