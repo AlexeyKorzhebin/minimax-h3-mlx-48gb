@@ -632,6 +632,37 @@ def test_update_and_claim_are_serialized_end_to_end(tmp_path, monkeypatch):
     assert claim_outcome["result"].note == "новая"
 
 
+def test_update_takes_the_queue_lock_exactly_once(tmp_path, monkeypatch):
+    """The race test above forces one specific interleaving and checks its outcome is safe -- its
+    real discriminator is "the final `write_json_durably` runs under the lock", not "there is
+    exactly one acquisition". A version that validates under one acquisition, writes the prompt
+    snapshot unlocked, and writes the job file under a *second* acquisition passes every
+    functional test here, including the race test (nothing in this suite forces a pause between
+    the two acquisitions the way the race test forces one around the single write) -- while
+    reopening precisely the corruption C1 exists to prevent: a job resurrected in `pending/` after
+    `claim` has already moved it to `running/`. Assert the actual invariant directly instead of
+    only its downstream symptom: `update` must acquire `queue_lock` exactly once.
+    """
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--prompt-file", "p.txt", "--tag", "a"], "", _DRY, {},
+                   prompt_source="p.txt", prompt_text="one\n")
+    acquisitions: list[bool] = []
+    real_queue_lock = q.queue_lock
+
+    @contextlib.contextmanager
+    def counting_queue_lock(root_arg, exclusive):
+        acquisitions.append(exclusive)
+        with real_queue_lock(root_arg, exclusive):
+            yield
+
+    monkeypatch.setattr(q, "queue_lock", counting_queue_lock)
+    q.update(root, job.id, ["generate", "--prompt-file", "p.txt", "--tag", "a"], "новая", _DRY, {},
+             prompt_source="p.txt", prompt_text="two\n")
+
+    assert acquisitions == [True], (
+        f"update must take the queue lock exactly once, exclusively; took {acquisitions}")
+
+
 # -- Review circle 1: state transition is a rename, not write+unlink ----------------------------
 
 
@@ -904,6 +935,66 @@ def test_mutators_do_not_recreate_missing_queue_subdirectories(tmp_path, name):
     ops[name]()
     assert not (root / "leases").exists(), "leases/ must not be recreated"
     assert not (root / "results").exists(), "results/ must not be recreated"
+
+
+# -- Review circle 2: the content write before a rename must itself be durable -------------------
+
+
+def test_claim_writes_the_updated_content_durably(tmp_path, monkeypatch):
+    """`claim` writes `started_at` into the *pending* copy before `_rename_durably` moves it (see
+    `claim`'s docstring) -- a step separate from, and before, the rename's own two directory
+    fsyncs. Nothing so far proved that write itself goes through `write_json_durably` rather than
+    a plain `Path.write_text`: `test_claim_fsyncs_both_directories_the_rename_touches` only counts
+    fsyncs recorded *after* the `os.rename` event, so a downgrade to a plain write for the content
+    itself passed the whole suite clean before this test existed. After a crash right there,
+    `running/<id>.json` could be truncated or simply missing bytes.
+    """
+    root = tmp_path / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    calls: list[int] = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(q.os, "fsync", lambda fd: (calls.append(fd), real_fsync(fd))[1])
+    q.claim(root)
+    # 2 fsyncs for the content write (write_json_durably: the file itself, then pending/) + 2 more
+    # for the rename (_rename_durably fsyncs pending/ and running/) = 4 total.
+    assert len(calls) == 4, (
+        f"expected 2 fsyncs for the content write and 2 for the rename, got {len(calls)}")
+
+
+def test_finish_writes_the_updated_content_durably(tmp_path, monkeypatch):
+    """The same gap, the same fix, the second instance: `finish` writes `finished_at`/`exit_code`/
+    `log_tail` into the *running* copy before renaming it into `done/`/`failed/`.
+    """
+    root = tmp_path / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+    job = q.claim(root)
+    calls: list[int] = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(q.os, "fsync", lambda fd: (calls.append(fd), real_fsync(fd))[1])
+    q.finish(root, job.id, 0, "ok")
+    assert len(calls) == 4, (
+        f"expected 2 fsyncs for the content write and 2 for the rename, got {len(calls)}")
+
+
+def test_rename_durably_refuses_to_overwrite_an_existing_destination(tmp_path):
+    """`os.rename` silently replaces an existing destination on POSIX. Every caller here only ever
+    targets a path a correctly functioning queue does not already have an entry at (`claim` into
+    `running/`, `finish` into `done/`/`failed/`); finding one anyway is a desync worth surfacing
+    loudly -- a duplicate id, or a previous crash mid-transition -- not silently clobbering.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    src = root / "pending" / "a.json"
+    dest = root / "running" / "a.json"
+    q.write_json_durably(src, {"v": "new"})
+    q.write_json_durably(dest, {"v": "stale"})
+
+    with pytest.raises(q.QueueError):
+        q._rename_durably(src, dest)
+
+    assert json.loads(dest.read_text()) == {"v": "stale"}, (
+        "the pre-existing destination must survive untouched")
+    assert src.exists(), "the source must not be consumed by a rename that was refused"
 
 
 # -- Global constraint: queue.py must stay importable without MLX -------------------------------

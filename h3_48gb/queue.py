@@ -442,8 +442,16 @@ def _rename_durably(src: Path, dest: Path) -> None:
     layout works as a source of truth in the first place (see the module docstring). Without
     fsyncing both directories afterward, though, the rename itself is not guaranteed to survive a
     power cut even though it is atomic while the machine stays up.
+
+    Refuses if `dest` already exists: `os.rename` would otherwise replace it silently on POSIX,
+    and every caller here (`claim` into `running/`, `finish` into `done/`/`failed/`) only ever
+    targets a path that a correctly functioning queue never already has an entry at. Finding one
+    anyway is a symptom of a desync -- a duplicate id, a previous crash mid-transition -- worth
+    surfacing loudly rather than quietly clobbering.
     """
     src, dest = Path(src), Path(dest)
+    if dest.exists():
+        raise QueueError(f"refusing to overwrite an existing {dest} during a state transition")
     os.rename(src, dest)
     for directory in {src.parent, dest.parent}:
         fd = os.open(directory, os.O_RDONLY)
