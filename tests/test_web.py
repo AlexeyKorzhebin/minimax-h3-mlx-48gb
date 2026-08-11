@@ -2036,3 +2036,61 @@ def test_the_planned_code_exemption_is_now_empty():
     """
     assert web.PLANNED_CODES == frozenset()
     assert web.ERROR_STATUS["job_not_pending"] == 409
+
+
+def test_a_job_that_does_not_name_an_outdir_at_all_is_refused(queue_server):
+    """`--outdir` left out means argparse's default, `H3_OUTDIR` or `~/video-out` -- a directory
+    the running server was never pointed at. No token exists for `check_path_flags` to inspect, so
+    the only thing standing here is the `output_stem` check, judging the path the run would write.
+    """
+    args = ["generate", "кот", "--checkpoint", str(queue_server.models / "ckpt"), "--tag", "нет"]
+    status, answer = _call(queue_server, "POST", "/api/jobs", {"args": args, "note": ""})
+    assert status == 400, answer
+    assert answer["error"]["code"] == "path_outside_root", answer
+    assert _pending(queue_server) == []
+
+
+def test_the_estimate_route_reads_the_bit_width_through_the_resolved_checkpoint(queue_server,
+                                                                                monkeypatch):
+    """One request must not be quoted at 4 bits here and 8 bits on submission. `--checkpoint
+    ~/models/...` is the case: without normalisation `quant_bits` opens a directory literally
+    named `~`, finds nothing, and falls back to four.
+    """
+    monkeypatch.setenv("HOME", str(queue_server.models.parent))
+    (queue_server.models / "ckpt" / "quant_config.json").write_text(json.dumps({"bits": 8}))
+    status, answer = _call(queue_server, "POST", "/api/estimate",
+                           {"args": ["generate", "кот", "--checkpoint", "~/models/ckpt"]})
+    assert status == 200, answer
+    assert answer["estimate"]["bits"] == 8, answer
+
+
+def test_two_browsers_posting_the_same_tag_at_once_produce_one_job(queue_server):
+    """A race checked by racing, as the design spec requires -- two real threads, not "submit,
+    then submit again".
+
+    The output name carries no seed, so two jobs under one tag write the same `.mp4`. The queue's
+    exclusive lock is what makes the check-and-write one step; from up here the only visible proof
+    is that exactly one of two simultaneous submissions wins and the other is told which name is
+    taken.
+    """
+    results = []
+    barrier = threading.Barrier(2)
+
+    def post(seed):
+        barrier.wait(timeout=30)
+        results.append(_call(queue_server, "POST", "/api/jobs",
+                             {"args": _job_args(queue_server, "--seed", str(seed), tag="одна"),
+                              "note": ""}))
+
+    threads = [threading.Thread(target=post, args=(seed,)) for seed in (1, 2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=180)
+        assert not thread.is_alive(), "a submission never finished"
+
+    codes = sorted(status for status, _ in results)
+    assert codes == [200, 400], results
+    refused = next(answer for status, answer in results if status == 400)
+    assert refused["error"]["code"] == "output_stem_conflict", refused
+    assert len(_pending(queue_server)) == 1

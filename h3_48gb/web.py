@@ -1186,11 +1186,13 @@ class _Handler(BaseHTTPRequestHandler):
         """
         payload = self._json_request()
         args = self._args_of(payload)
-        parsed = _parse_args(args)
-        _check_command_allowed(parsed)
-        check_path_flags(args, self.server.roots)
+        _check_command_allowed(_parse_args(args))
+        # The *normalised* list, for the same reason submission uses it: `--checkpoint
+        # ~/models/h3-8bit` reaches `quant_bits` as a directory literally named `~` otherwise, and
+        # the form would be told 4 bits here and 8 bits on submission for one request.
+        argv = check_path_flags(args, self.server.roots)
         return 200, "application/json", _json_bytes(
-            {"ok": True, "estimate": estimate(args, checkpoint=parsed.checkpoint)})
+            {"ok": True, "estimate": estimate(argv, checkpoint=_parse_args(argv).checkpoint)})
 
     # -- prompts ----------------------------------------------------------------------------
 
