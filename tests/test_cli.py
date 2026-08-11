@@ -79,6 +79,21 @@ def test_prompt_and_prompt_file_together_are_refused(tmp_path):
     assert excinfo.value.code == "prompt_both_given"
 
 
+def test_dash_dash_prompt_is_not_an_abbreviation_of_prompt_file(tmp_path, capsys):
+    """`--prompt` must not be silently read as `--prompt-file`.
+
+    `prompt` is positional and `--prompt-file` is the only flag starting with those letters, so
+    argparse's abbreviation matching would otherwise accept `--prompt "a dog"` and hand "a dog" to
+    the file reader — which then fails with "no such file", blaming the prompt text. `run_bench.py`
+    spells the flag exactly this way, so the misreading is reachable by a plausible command.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(
+            ["generate", "--prompt", "a dog", "--outdir", str(tmp_path)])
+    assert excinfo.value.code == 2
+    assert "--prompt" in capsys.readouterr().err
+
+
 def test_no_prompt_at_all_is_refused(tmp_path):
     with pytest.raises(CliError) as excinfo:
         spec_from_args(build_parser().parse_args(["generate", "--outdir", str(tmp_path)]))

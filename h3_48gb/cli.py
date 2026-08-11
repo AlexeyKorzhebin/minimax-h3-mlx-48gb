@@ -327,11 +327,25 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--json", action="store_true", help="emit a machine-readable report")
 
 
+def _subcommand(sub, name: str, help: str) -> argparse.ArgumentParser:
+    """A subparser that requires flags to be spelled in full.
+
+    `allow_abbrev=False` is the point. With argparse's default, `--prompt` is an unambiguous
+    abbreviation of `--prompt-file` — so `h3 generate --prompt "a dog"` passes the prompt text to
+    the file reader and fails with "no such file", naming the prompt as the missing path.
+    `run_bench.py` spells its flag exactly `--prompt`, so this is a command someone will type.
+    Refusing every abbreviation is better than adding an alias: it fails on the flag rather than
+    on a file, and it removes the same trap from every future flag pair.
+    """
+    return sub.add_parser(name, help=help, allow_abbrev=False)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="h3", description="MiniMax H3 on a 48 GB Mac")
+    parser = argparse.ArgumentParser(prog="h3", description="MiniMax H3 on a 48 GB Mac",
+                                     allow_abbrev=False)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    gen = sub.add_parser("generate", help="generate a clip")
+    gen = _subcommand(sub, "generate", help="generate a clip")
     _add_run_flags(gen)
     # `--restart` is the recovery path for this CLI's own hardest refusal, not a convenience.
     # `checkpoint_mismatch` is a hard stop, and without this flag the only way out is to find and
@@ -342,25 +356,25 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--no-checkpoint", action="store_true",
                      help="do not write a resume checkpoint at all; a crash then costs the whole run")
 
-    res = sub.add_parser("resume", help="continue an interrupted run")
+    res = _subcommand(sub, "resume", help="continue an interrupted run")
     # No `--restart` / `--no-checkpoint` here on purpose: `resume` exists precisely to *assert*
     # that a run is being continued, so a flag that turns it into a fresh start would defeat it.
     _add_run_flags(res)
 
-    lst = sub.add_parser("list", help="list finished runs")
+    lst = _subcommand(sub, "list", help="list finished runs")
     lst.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     lst.add_argument("--json", action="store_true", help="emit a machine-readable report")
 
-    st = sub.add_parser("status", help="what is running under an outdir, and how far along")
+    st = _subcommand(sub, "status", help="what is running under an outdir, and how far along")
     st.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     st.add_argument("--json", action="store_true", help="emit a machine-readable report")
 
-    wt = sub.add_parser("watch", help="redraw a run's progress until nothing is running")
+    wt = _subcommand(sub, "watch", help="redraw a run's progress until nothing is running")
     wt.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     wt.add_argument("--interval", type=float, default=20.0,
                     help="seconds between redraws (default 20); 0 renders once and exits")
 
-    doc = sub.add_parser("doctor", help="verify a converted checkpoint")
+    doc = _subcommand(sub, "doctor", help="verify a converted checkpoint")
     doc.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     doc.add_argument("--json", action="store_true", help="emit a machine-readable report")
     return parser
