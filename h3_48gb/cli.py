@@ -120,6 +120,7 @@ ERROR_CODES = {
     # worker and the server all answer with the same `{"ok": false, "error": {"code", ...}}`
     # envelope, and a caller matching on `error.code` should not have to know which process
     # produced it. See `test_error_codes_are_documented_in_one_place`, which scans both modules.
+    "args_invalid": "`h3 generate` will not accept this argument list; `detail.stderr` carries argparse's own sentence",
     "path_outside_root": "a path names something outside every root the server may touch, or writes into the read-only models root",
     "prompt_name_invalid": "a prompt name is not a bare `[A-Za-z0-9_-]+.txt` -- it names a directory or another suffix",
     "queue_unwritable": "the queue directory could not be read or written; see `detail.path`",

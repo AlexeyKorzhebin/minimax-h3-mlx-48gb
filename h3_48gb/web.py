@@ -25,19 +25,23 @@ produced by the page rendering an error `code`, exactly as `queue.py`'s module d
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
 import fcntl
+import io
 import json
 import mimetypes
 import os
 import re
+import subprocess
+import sys
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from h3_48gb import queue as q
 from h3_48gb import runs as runs_module
-from h3_48gb.cli import CliError
+from h3_48gb.cli import DEFAULT_CANVAS, CliError, build_parser
 from h3_48gb.worker import WORKER_LOCK_NAME
 
 #: The only address this server ever binds. Not a parameter, and deliberately not one: a flag that
@@ -359,6 +363,143 @@ def build_state(queue_root, outdir) -> dict:
         "queue": {**grouped,
                   "broken": [{"path": item.path, "error": item.error} for item in broken]},
         "runs": [run.as_dict() for run in runs_module.scan(Path(outdir))],
+    }
+
+
+def _parse_args(args) -> argparse.Namespace:
+    """`args` through the CLI's own parser, or `args_invalid` carrying argparse's own message.
+
+    The parser is `build_parser()` and not a second, similar one: the numbers the estimate needs
+    and the subcommand the allowlist checks have to be read the same way `h3` itself reads them,
+    or the server would be validating a request that differs from the one the worker runs.
+
+    argparse reports a bad argument list by printing usage to stderr and raising `SystemExit(2)`.
+    Left alone that would leave the server's stderr full of usage text and reach the handler's
+    `internal_error` net -- a 500 for what is plainly the caller's mistake. stderr is captured and
+    handed back in `detail`, because argparse's sentence ("unrecognized arguments: --widht 896")
+    names the actual typo and nothing this module could invent would beat it.
+
+    `CliError` is re-raised before the `SystemExit` branch on purpose: it *is* a `SystemExit`
+    subclass (see `cli.CliError`), so a broad `except SystemExit` would relabel a real refusal --
+    a path outside the roots, say -- as `args_invalid` and lose its code.
+
+    Parsing here does not import `mlx`: `build_parser` only describes flags. What would import it
+    is `spec_from_args`, which this module never calls -- see the module docstring and
+    `validate_args`.
+    """
+    args = [str(item) for item in args]
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(captured):
+            return build_parser().parse_args(args)
+    except CliError:
+        raise
+    except SystemExit as exc:
+        raise CliError(
+            "args_invalid",
+            f"h3 will not accept these arguments: {captured.getvalue().strip() or exc}",
+            {"args": args, "stderr": captured.getvalue()},
+        ) from exc
+
+
+#: Where a converted checkpoint keeps the DiT's quantisation record, in the two layouts that
+#: actually exist on this machine. `~/models/h3-converted` is a full pipeline directory and holds
+#: it under `transformer/`; `~/models/h3-8bit` *is* a transformer directory and holds it at its
+#: own root. Both are checked, in that order, so `--checkpoint` may name either -- and the
+#: transformer's own file wins, because it is the DiT's bit width the peak depends on and a
+#: pipeline root could one day grow a file describing something else.
+QUANT_CONFIG_NAMES = ("transformer/quant_config.json", "quant_config.json")
+
+#: What the peak costs beyond activations, by DiT bit width: the resident weights. Four bit is the
+#: assumption when nothing says otherwise, because it is the smaller number -- guessing 8 would
+#: quietly add ten gigabytes to every estimate made against a checkpoint whose record is missing,
+#: and a warning nobody can act on is worse than none.
+WEIGHTS_GB = {8: 22.1, 4: 12.1}
+
+
+def quant_bits(checkpoint) -> int:
+    """The DiT's bit width from the checkpoint's `quant_config.json`, or 4 when there is none.
+
+    Unreadable and absent are the same answer deliberately: this is an estimate shown next to a
+    form, and refusing to draw it because a JSON file is malformed would be a worse outcome than
+    drawing the 4-bit number and being 10 GB low on an 8-bit checkpoint. The bit width is also
+    recorded in the returned estimate (`bits`), so the page can say which assumption it used.
+    """
+    if checkpoint is None:
+        return 4
+    for relative in QUANT_CONFIG_NAMES:
+        try:
+            data = json.loads((Path(checkpoint) / relative).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        bits = data.get("bits") if isinstance(data, dict) else None
+        if bits in WEIGHTS_GB:
+            return int(bits)
+    return 4
+
+
+def estimate(args, checkpoint, *, report=None) -> dict:
+    """How long this request will take and how much memory it will need, by the fitted model.
+
+    The model is the design spec's, fitted in `docs/RESULTS.md` to the four runs of 2026-08-11::
+
+        rows      = (5.53 + 1.641*(sec - 2.4)) * (W/16) * (H/16) + 81*sec + 820
+        s_forward = 5.699e-3*rows + 2.671e-7*rows**2
+        seconds   = s_forward * (steps - 1) + 36 + 7.44e-5 * W * H * sec
+        peak_gb   = 9.3*rows/37657 + weights(bits)
+
+    **The overhead term is not a rounding detail.** The forward-pass model covers diffusion only,
+    and a human waits for the whole run: weights loading, text encoding, video and audio decode,
+    mp4 assembly. Measured, that is 2.2 minutes at 448x288x10s and 10.2 at 896x576x15s -- it
+    scales with `W*H*sec`, the video VAE's work, not with diffusion time. The constant 600 seconds
+    that stood here in an earlier draft doubled the estimate for the small canvas, which is the
+    one case where a crude constant is worse than no estimate at all: an eleven-minute draft
+    advertised as twenty-one minutes changes what a person decides to run.
+
+    `report` is a `generate --dry-run` report, and when it is given the canvas, the duration and
+    the step count come from **it** rather than from `args`. That matters for exactly one case and
+    it is the case this whole module is arranged around: with `--image` and no explicit
+    `--width/--height`, the canvas is derived from the keyframe by `resolve_canvas`, which imports
+    `minimax_h3_mlx.packing` and `mlx` with it. This process must never do that, so without a
+    report the canvas falls back to `DEFAULT_CANVAS` -- right for the form, which posts explicit
+    numbers, and approximate for a keyframe run until the subprocess has answered. On submission
+    the report exists, so what gets stored on the job is the estimate for the real canvas.
+
+    Accuracy is about ten percent (the spec measures 6.3% on the fitted point, with per-forward
+    times drifting upward as swap grows), so the page must round: "≈2 ч 30 мин", never "2 ч 28".
+    """
+    parsed = _parse_args(args)
+    if report is not None:
+        width, height = (int(part) for part in str(report["canvas"]).lower().split("x", 1))
+        duration = float(report["duration_seconds"])
+        steps = int(report["grid_points"])
+    else:
+        width = int(parsed.width if parsed.width is not None else DEFAULT_CANVAS[0])
+        height = int(parsed.height if parsed.height is not None else DEFAULT_CANVAS[1])
+        duration = float(parsed.duration)
+        steps = int(parsed.steps)
+
+    rows = ((5.53 + 1.641 * (duration - 2.4)) * (width / 16) * (height / 16)
+            + 81 * duration + 820)
+    seconds_per_forward = 5.699e-3 * rows + 2.671e-7 * rows ** 2
+    forwards = steps - 1
+    diffusion = seconds_per_forward * forwards
+    overhead = 36 + 7.44e-5 * width * height * duration
+    bits = quant_bits(checkpoint)
+
+    return {
+        "forwards": forwards,
+        "seconds": diffusion + overhead,
+        "peak_gb": 9.3 * rows / 37657 + WEIGHTS_GB[bits],
+        "diffusion_seconds": diffusion,
+        "overhead_seconds": overhead,
+        "seconds_per_forward": seconds_per_forward,
+        "rows": rows,
+        "bits": bits,
+        "width": width,
+        "height": height,
+        "duration_seconds": duration,
+        "steps": steps,
     }
 
 

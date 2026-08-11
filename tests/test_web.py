@@ -16,6 +16,7 @@ it is meant to catch:
   a thread in this one re-acquires its own lock and proves nothing. `tests/test_queue.py` already
   has `_external_lock` for exactly this; it is imported rather than rewritten.
 """
+import argparse
 import http.client
 import json
 import os
@@ -1135,3 +1136,133 @@ def test_no_planned_code_has_already_arrived():
     assert not landed, (
         f"these codes now exist and no longer need an exemption -- drop them from "
         f"PLANNED_CODES: {sorted(landed)}")
+
+
+# == Task 6 ======================================================================================
+#
+# Submission, editing, prompts and the cost estimate. Three rules run through every test below:
+#
+# * **Nothing here runs a real generation.** Validation is a `generate --dry-run --json`
+#   subprocess, which builds a `RunSpec` and returns without loading a weight; where a test needs
+#   to see the command line rather than its answer, it hands `validate_args` a fake interpreter
+#   that only echoes its argv.
+# * **The estimate is checked on four measured points and both bit widths**, not on one. A single
+#   point is satisfied by a function that returns a constant.
+# * **A refusal is checked by its code and its status**, never by "not 200" -- the same rule the
+#   read routes already follow.
+
+
+# -- Step 1: the cost estimate --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("w,h,sec,steps,bits,total_min,peak", [
+    (448, 288, 10, 8, 8, 13.3, 24.8),
+    (896, 576, 10, 8, 8, 72.3, 32.9),
+    (896, 576, 15, 8, 8, 148.8, 35.7),
+    (896, 576, 15, 8, 4, 148.8, 25.7),
+])
+def test_estimate_reproduces_the_measured_runs(tmp_path, w, h, sec, steps, bits, total_min, peak):
+    """The four runs of 2026-08-11 from the design spec, plus the 4-bit reading of the last one.
+
+    Four points and two bit widths on purpose: one point is reproduced exactly as well by
+    `return 13.3`, and one bit width by ignoring `quant_config.json` altogether. The two canvases
+    pin the quadratic in `rows`, the two durations pin the `81*sec` term, and the pair that differs
+    only in `bits` pins the weights constant while everything else is held still.
+    """
+    ckpt = tmp_path / "ckpt"
+    (ckpt / "transformer").mkdir(parents=True)
+    (ckpt / "transformer" / "quant_config.json").write_text(json.dumps({"bits": bits}))
+    got = web.estimate(["generate", "x", "--width", str(w), "--height", str(h),
+                        "--duration", str(sec), "--steps", str(steps)], checkpoint=ckpt)
+    assert got["forwards"] == steps - 1
+    assert abs(got["seconds"] / 60 - total_min) / total_min < 0.12, got
+    assert abs(got["peak_gb"] - peak) < 1.5, got
+
+
+def test_the_overhead_term_is_present_and_grows_with_the_canvas():
+    """Without it the form promises diffusion time and the human waits ten minutes longer.
+
+    Both halves matter. A fixed constant satisfies "the overhead is there"; only the comparison
+    between two canvases says it tracks `W*H*sec`, which is what the four measured runs show and
+    what the rejected constant-600 model got wrong.
+    """
+    small = web.estimate(["generate", "x", "--width", "448", "--height", "288",
+                          "--duration", "10", "--steps", "8"], checkpoint=None)
+    large = web.estimate(["generate", "x", "--width", "896", "--height", "576",
+                          "--duration", "10", "--steps", "8"], checkpoint=None)
+    assert small["overhead_seconds"] < large["overhead_seconds"]
+    assert 100 < small["overhead_seconds"] < 200
+    assert small["seconds"] > small["diffusion_seconds"], (
+        "`seconds` must be the whole run, not the diffusion the forward model covers")
+
+
+def test_a_checkpoint_without_quant_config_is_treated_as_four_bit(tmp_path):
+    """The smaller guess is the safe one: assuming 8 bits would add ten gigabytes to every
+    estimate made against a checkpoint whose record is simply missing.
+    """
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    assert web.quant_bits(ckpt) == 4
+    assert web.quant_bits(None) == 4
+    baseline = web.estimate(["generate", "x", "--width", "896", "--height", "576",
+                             "--duration", "15", "--steps", "8"], checkpoint=ckpt)
+    assert baseline["bits"] == 4
+    assert abs(baseline["peak_gb"] - 25.7) < 1.5, baseline
+
+
+@pytest.mark.parametrize("relative", ["transformer/quant_config.json", "quant_config.json"])
+def test_both_real_checkpoint_layouts_are_read(tmp_path, relative):
+    """`~/models/h3-converted` is a pipeline directory and keeps the record under `transformer/`;
+    `~/models/h3-8bit` *is* a transformer directory and keeps it at its own root. Both exist on
+    this machine, so `--checkpoint` may legitimately name either.
+    """
+    ckpt = tmp_path / "ckpt"
+    (ckpt / relative).parent.mkdir(parents=True, exist_ok=True)
+    (ckpt / relative).write_text(json.dumps({"bits": 8, "group_size": 64}))
+    assert web.quant_bits(ckpt) == 8
+
+
+def test_a_malformed_quant_config_does_not_break_the_estimate(tmp_path):
+    """An estimate is drawn beside a form. Refusing to draw it because a JSON file is truncated
+    would be a worse outcome than drawing the 4-bit number and saying so in `bits`.
+    """
+    ckpt = tmp_path / "ckpt"
+    (ckpt / "transformer").mkdir(parents=True)
+    (ckpt / "transformer" / "quant_config.json").write_text("{not json")
+    assert web.quant_bits(ckpt) == 4
+
+
+def test_the_estimate_prefers_the_dry_run_reports_canvas(tmp_path):
+    """With `--image` and no explicit canvas, only `resolve_canvas` knows the size -- and it
+    imports mlx. The report from the subprocess is where the real numbers come from, so a job's
+    stored estimate describes the canvas that will actually run rather than the default.
+    """
+    args = ["generate", "x", "--image", str(tmp_path / "frame.png")]
+    default = web.estimate(args, checkpoint=None)
+    from_report = web.estimate(args, checkpoint=None,
+                               report={"canvas": "448x288", "duration_seconds": 10.0,
+                                       "grid_points": 8})
+    assert (default["width"], default["height"]) == (896, 512)
+    assert (from_report["width"], from_report["height"]) == (448, 288)
+    assert from_report["forwards"] == 7
+    assert from_report["seconds"] < default["seconds"]
+
+
+def test_estimating_an_unparseable_argument_list_is_args_invalid():
+    with pytest.raises(CliError) as excinfo:
+        web.estimate(["generate", "x", "--widht", "896"], checkpoint=None)
+    assert excinfo.value.code == "args_invalid"
+    assert "--widht" in excinfo.value.detail["stderr"]
+
+
+def test_the_parser_helper_does_not_swallow_a_real_refusal(monkeypatch):
+    """`CliError` subclasses `SystemExit`, so a blanket `except SystemExit` around `parse_args`
+    would relabel every refusal raised underneath it as `args_invalid` and lose its code.
+    """
+    def explode(self, argv):
+        raise CliError("path_outside_root", "boom", {})
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", explode)
+    with pytest.raises(CliError) as excinfo:
+        web._parse_args(["generate", "x"])
+    assert excinfo.value.code == "path_outside_root"
