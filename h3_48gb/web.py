@@ -1461,6 +1461,16 @@ class _Handler(BaseHTTPRequestHandler):
         The source's own `output_stem`, unchanged, would collide -- see
         `_duplicate_tag_candidates` -- so candidates from it are tried in order until one of
         them clears `queue.submit`'s conflict check.
+
+        If the source used `--prompt-file`, its value by now names *the source's own* snapshot
+        (`queue/prompts/<source-id>.txt` -- `submit` repoints it there the first time, and an
+        edit or a duplicate that never passes `prompt_text` leaves it alone, see `queue.submit`'s
+        docstring). Left as-is, the duplicate would depend on a file `queue.cancel` deletes the
+        moment the source job is withdrawn -- fine right up until the worker actually claims the
+        duplicate and finds `--prompt-file` unreadable, long after anyone would think to connect
+        the two. So the snapshot's *content* is read here and passed through as `prompt_text`:
+        `submit` then snapshots it again, to `queue/prompts/<new-id>.txt`, and repoints `args`
+        itself -- the duplicate ends up with a copy of its own, independent of the source's.
         """
         jobs, _broken = q.scan(self.server.queue_root)
         job = next((candidate for candidate in jobs if candidate.id == raw_id
@@ -1468,6 +1478,18 @@ class _Handler(BaseHTTPRequestHandler):
         if job is None:
             return 404, "application/json", _error_bytes(
                 "not_found", f"нет такой задачи: {raw_id}", {"id": raw_id})
+
+        prompt_text = None
+        if "--prompt-file" in job.args and job.args.index("--prompt-file") + 1 < len(job.args):
+            snapshot = Path(job.args[job.args.index("--prompt-file") + 1])
+            try:
+                prompt_text = snapshot.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise CliError(
+                    "prompt_file_unreadable",
+                    f"--prompt-file could not be read: {snapshot} ({exc})",
+                    {"path": str(snapshot)},
+                ) from exc
 
         last_error: CliError | None = None
         candidates = _duplicate_tag_candidates(job.args, job.output_stem)
@@ -1477,7 +1499,8 @@ class _Handler(BaseHTTPRequestHandler):
                 with queue_write_errors(self.server.queue_root, what="the job id",
                                         output_stem=output_stem):
                     new_job = q.submit(self.server.queue_root, args, job.note,
-                                       {"output_stem": output_stem}, dict(job.estimate))
+                                       {"output_stem": output_stem}, dict(job.estimate),
+                                       prompt_source=job.prompt_source, prompt_text=prompt_text)
             except CliError as exc:
                 if exc.code != "output_stem_conflict":
                     raise

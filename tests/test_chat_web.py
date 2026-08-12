@@ -569,3 +569,38 @@ def test_duplicating_an_unknown_job_is_a_named_404(_serve):
     status, answer = srv.post_json_raw("/api/jobs/does-not-exist/duplicate", None)
     assert status == 404, answer
     assert answer["error"]["code"] == "not_found", answer
+
+
+def test_duplicating_a_job_with_a_prompt_file_gets_its_own_snapshot_not_the_sources(_serve):
+    """Fix round 1. `queue.submit` only re-snapshots the prompt when `prompt_text` is given;
+    without it, `args` pass through untouched, and untouched here means `--prompt-file` still
+    names the SOURCE job's own snapshot (`queue/prompts/<source-id>.txt`). `queue.cancel` deletes
+    that file the moment the source job is withdrawn from `pending/`, so a duplicate that kept
+    pointing at it would sit fine until the worker actually claimed it, then fail on an unreadable
+    `--prompt-file` -- long after whoever clicked "Копия" had walked away.
+    """
+    srv = _serve()
+    stem = srv.root / "h3-сцена-896x512"
+    job = q.submit(srv.queue_root,
+                   ["generate", "--tag", "сцена", "--prompt-file", "PLACEHOLDER"],
+                   "", {"output_stem": str(stem)}, {"seconds": 1},
+                   prompt_source="prompts/scene.txt", prompt_text="Кот на подоконнике.")
+    source_snapshot = Path(job.args[job.args.index("--prompt-file") + 1])
+    assert source_snapshot == srv.queue_root / "prompts" / f"{job.id}.txt"
+
+    status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/duplicate", None)
+    assert status == 200, answer
+    new_id = answer["id"]
+
+    q.cancel(srv.queue_root, job.id)  # a real "cancel the source" -- deletes source_snapshot
+    assert not source_snapshot.exists()
+
+    jobs, broken = q.scan(srv.queue_root)
+    assert broken == []
+    new_job = next(j for j in jobs if j.id == new_id)
+    new_snapshot = Path(new_job.args[new_job.args.index("--prompt-file") + 1])
+    assert new_snapshot != source_snapshot, (
+        "the duplicate must not point at the source job's own snapshot")
+    assert new_snapshot == srv.queue_root / "prompts" / f"{new_id}.txt"
+    assert new_snapshot.exists(), "cancelling the source must not break the duplicate"
+    assert new_snapshot.read_text(encoding="utf-8") == "Кот на подоконнике."

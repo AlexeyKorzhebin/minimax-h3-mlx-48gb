@@ -2656,6 +2656,66 @@ def test_only_a_waiting_job_carries_edit_top_and_delete():
 
 
 @_needs_node
+def test_the_finished_rows_copy_button_has_an_explicit_place_in_the_row_grid():
+    """Task 7 fix round 1. `.r` is one CSS grid (`--cols` in `style.css`) sized for exactly as
+    many columns as `pendingRowHtml` has direct children -- that is the whole point of one shared
+    grid across three different row shapes (see `--cols`'s own comment). `finishedRowHtml`'s
+    `<span class="acts">` is always one child *past* that count (two, on a failed row, next to
+    `.why`), so without an explicit `grid-column`/`grid-row` in the stylesheet it silently falls
+    into the next implicit row's first (16px, meant for the status dot) column and its text gets
+    clipped -- exactly the "опия" bug a browser render caught.
+
+    This is checked from both ends, neither of them the literal number 10: the column count comes
+    from parsing `--cols` itself, and the child count is measured on the actual HTML the row
+    functions produce, not asserted as a constant.
+    """
+    css = _page_text("style.css")
+    cols_match = re.search(r"--cols:\s*([^;]+);", css)
+    assert cols_match, "style.css must still define --cols for the row grid"
+    # A plain `.split()` would cut `minmax(180px, 1fr)` in two at its internal comma-space --
+    # `minmax(...)` is kept as one token the same way a naive split would wrongly break it apart.
+    column_count = len(re.findall(r"minmax\([^)]*\)|\S+", cols_match.group(1)))
+
+    ok_children, failed_children = _node_eval("""
+      // Counts *direct* children of the single outer <div>: a depth-aware tag scan, because the
+      // row's own children (.name, the memory gauge, ...) nest further tags inside themselves.
+      function directChildCount(rowHtml) {
+        const inner = rowHtml.replace(/^<div[^>]*>/, "").replace(/<\\/div>$/, "");
+        const tagRe = /<(\\/?)([a-zA-Z][a-zA-Z0-9]*)\\b[^>]*?(\\/)?>/g;
+        let depth = 0, count = 0, m;
+        while ((m = tagRe.exec(inner))) {
+          const closing = m[1], selfClosing = m[3];
+          if (selfClosing) continue;
+          if (closing) { depth -= 1; }
+          else { if (depth === 0) count += 1; depth += 1; }
+        }
+        return count;
+      }
+      const base = {id: "j", note: "", args: ["generate", "--tag", "кот"],
+                    estimate: {width: 896, height: 576, duration_seconds: 10, steps: 8},
+                    output_stem: "/o/n/h3-кот-896x576",
+                    started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
+      const ok = app.finishedRowHtml({...base, exit_code: 0});
+      const failed = app.finishedRowHtml({...base, exit_code: 1, log_tail: "boom"});
+      console.log(JSON.stringify([directChildCount(ok), directChildCount(failed)]));
+    """)
+    assert ok_children == column_count + 1, (
+        f"a finished/succeeded row must have exactly one child ({{.acts}}) past the grid's own "
+        f"{column_count} columns -- got {ok_children}; the count this test derives its "
+        f"expectation from, and the row's own shape, must have drifted apart")
+    assert failed_children == column_count + 2, (
+        f"a failed row adds .why on top of that -- got {failed_children}")
+
+    # The structural overflow above is real and expected (that many children never fit one row);
+    # what must not be true is that the browser is left to place the overflow on its own.
+    assert re.search(r"\.r\.done\s+\.acts\s*\{[^}]*grid-column", css), (
+        "the succeeded row's .acts needs an explicit grid-column in style.css, or it wraps into "
+        "the next implicit row's 16px marker column and gets clipped")
+    assert re.search(r"\.r\.fail\s+\.acts\s*\{[^}]*grid-column", css), (
+        "same for the failed row's .acts")
+
+
+@_needs_node
 def test_the_waiting_summary_counts_the_jobs_the_hours_and_the_hour_it_ends():
     """Requirement 7 -- the answer to the question the night queue is assembled to ask."""
     text, seconds, count = _node_eval("""
