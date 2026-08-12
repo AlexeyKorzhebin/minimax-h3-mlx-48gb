@@ -3600,3 +3600,28 @@ def test_dismissing_the_banner_holds_until_the_state_actually_changes():
     assert after_pending_changed is True, "a new pending job must ask again"
     assert after_llm_changed is False, (
         "llm going down on its own makes unloadBanner().show false already -- nothing to show")
+
+
+@_needs_node
+def test_a_dismissal_burns_off_once_the_state_moves_past_it():
+    """Fix round 1 (review, Important). `bannerKey` alone remembers only the *value* that was
+    dismissed, never that the page ever left it: pending 2 -> «пусть ждёт» (dismissedKey "2:up")
+    -> pending 3 (banner correctly reappears, unrelated to the fix) -> a job gets deleted and
+    pending drops back to 2 -- the stale `dismissedKey` matches "2:up" again and the banner goes
+    silent on a warning nobody has dismissed *this time*. The fix has to notice the state moved on
+    and let the old dismissal expire, which only a function carrying the previous render's
+    dismissal forward (not a pure `(state, dismissedKey) -> bool`) can do.
+    """
+    trace = _node_eval("""
+      let banner = {dismissedKey: null};
+      const step = (state) => { banner = app.nextBannerState(banner, state); return banner.show; };
+      const seen = [];
+      seen.push(step({pending: 2, llm: "up"}));                                    // first sight
+      banner = {dismissedKey: app.bannerKey({pending: 2, llm: "up"})};             // «пусть ждёт»
+      seen.push(step({pending: 2, llm: "up"}));                                    // held down
+      seen.push(step({pending: 3, llm: "up"}));                                    // state moved
+      seen.push(step({pending: 2, llm: "up"}));                                    // back again
+      console.log(JSON.stringify(seen));
+    """)
+    assert trace == [True, False, True, True], (
+        f"a return to the exact dismissed value after the state moved on must warn again: {trace}")

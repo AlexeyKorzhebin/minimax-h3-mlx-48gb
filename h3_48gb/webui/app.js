@@ -861,16 +861,35 @@ export function bannerKey(state) {
 }
 
 /**
- * Показывать ли плашку прямо сейчас, с учётом «пусть ждёт».
+ * Показывать ли плашку прямо сейчас, при фиксированном «отклонено на ключе X».
  *
- * «Пусть ждёт» — не крестик, который навсегда прячет плашку, и не снуз на
- * пять минут: она молчит, пока `{pending, llm}` не изменится хоть чем-то —
- * ещё одна задача, снятая модель, — а на следующем опросе с тем же состоянием
- * появляться заново не должна. Появляться заново на *каждый* опрос значило бы
- * научить нажатие ничего не значить.
+ * Не то, чем страница пользуется (см. `nextBannerState`): сравнение по одному застывшему
+ * `dismissedKey` не замечает, что состояние успело уйти от отклонённого значения и вернуться —
+ * оно смотрит только «совпадает ключ сейчас или нет», а не «был ли между двумя одинаковыми
+ * ключами хоть один другой». Оставлена как более простой строительный блок и потому, что раунд
+ * ревью нашёл дыру именно в этом различии — пусть тест на неё виден рядом с тем, что было не так.
  */
 export function unloadBannerVisible(state, dismissedKey) {
   return unloadBanner(state).show && bannerKey(state) !== dismissedKey;
+}
+
+/**
+ * Переход дисмисс-состояния плашки на один опрос — то, чем страница пользуется на самом деле.
+ *
+ * `prev` — `{dismissedKey}`, посчитанный на предыдущем опросе (или `{dismissedKey: null}` до
+ * первого клика «пусть ждёт»); `state` — свежий `{pending, llm}`. Отличие от `unloadBannerVisible`
+ * ровно в том, что тут нашло ревью первого раунда: `dismissedKey` не переживает уход состояния от
+ * себя. Без сгорания цикл «2 задачи, up → пусть ждёт → 3 задачи (плашка снова видна, задачу
+ * добавили) → одну из трёх удалили, снова 2 задачи, up» молча гасил предупреждение во второй раз —
+ * ключ `"2:up"` совпадал с тем, что отклонили в первый раз, хотя именно это повторное появление
+ * никто не отклонял. Сгорание чинит это: как только ключ хоть раз разошёлся с `dismissedKey`,
+ * старый дисмисс забывается, и попадание обратно в то же `{pending, llm}` снова спрашивает.
+ */
+export function nextBannerState(prev, state) {
+  const key = bannerKey(state);
+  const previous = (prev && prev.dismissedKey) ?? null;
+  const dismissedKey = previous !== null && previous !== key ? null : previous;
+  return { dismissedKey, show: unloadBanner(state).show && dismissedKey !== key };
 }
 
 /* ===========================================================================
@@ -1198,8 +1217,11 @@ function startPage() {
   let runningLeft = 0;         // сколько осталось идущему прогону — им объясняется gpu_busy
   let llmStatus = "";          // последний известный `/api/llm`'s `status` — своя переменная,
                                 // отдельная от `chat.llmStatus` модалки, чтобы не путать их опрос
-  let dismissedBannerKey = null;  // `bannerKey` состояния, на котором нажали «пусть ждёт»
-  let unloadBannerKey = null;     // ключ, посчитанный на последней отрисовке — им отвечает клик
+  // Дисмисс плашки выгрузки — состояние `nextBannerState` переносит с опроса на опрос, а не
+  // застывший ключ: без этого возврат к уже отклонённому `{pending, llm}` после промежуточного
+  // изменения молча гасил бы предупреждение, которое в этот раз никто не отклонял.
+  let bannerState = { dismissedKey: null };
+  let unloadBannerInput = { pending: 0, llm: "" };  // вход последней отрисовки — им отвечает клик
 
   const readForm = () => ({
     width: Math.round(Number($("width").value) || 0),
@@ -1341,14 +1363,14 @@ function startPage() {
       : "";
   }
 
-  /** Плашка выгрузки над списком ждущих: см. `unloadBanner`/`unloadBannerVisible`. `pendingCount`
-   *  приходит от вызывающего — он уже разобрал `queue.pending`, второй раз разбирать незачем. */
+  /** Плашка выгрузки над списком ждущих: см. `nextBannerState`. `pendingCount` приходит от
+   *  вызывающего — он уже разобрал `queue.pending`, второй раз разбирать незачем. */
   function renderUnloadBanner(pendingCount) {
-    const bannerState = { pending: pendingCount, llm: llmStatus };
-    unloadBannerKey = bannerKey(bannerState);
-    const visible = unloadBannerVisible(bannerState, dismissedBannerKey);
-    $("unload-banner").hidden = !visible;
-    $("unload-banner-text").textContent = visible ? unloadBanner(bannerState).text : "";
+    unloadBannerInput = { pending: pendingCount, llm: llmStatus };
+    bannerState = nextBannerState(bannerState, unloadBannerInput);
+    $("unload-banner").hidden = !bannerState.show;
+    $("unload-banner-text").textContent = bannerState.show
+      ? unloadBanner(unloadBannerInput).text : "";
   }
 
   function renderRunning(job, workerState, now) {
@@ -2047,9 +2069,10 @@ function startPage() {
   }
 
   /** «Пусть ждёт»: прячет плашку до того момента, когда `{pending, llm}` действительно
-   *  изменится (см. `unloadBannerVisible`) — не крестик навсегда и не снуз до следующего опроса. */
+   *  изменится (см. `nextBannerState`) — не крестик навсегда и не снуз до следующего опроса, и не
+   *  забывает об этом, если состояние потом вернётся к тому же значению другим путём. */
   function dismissUnloadBanner() {
-    dismissedBannerKey = unloadBannerKey;
+    bannerState = { dismissedKey: bannerKey(unloadBannerInput) };
     renderQueue();
   }
 
