@@ -355,16 +355,18 @@ select {
 }
 
 .hl mark { background: none; color: inherit; }
-.hl mark.blk   { background: var(--accent-soft); color: var(--accent-ink); font-weight: 700; border-radius: 4px; }
-.hl mark.blk.bad { background: var(--fail-soft); color: var(--fail-ink); }
-.hl mark.head  { color: var(--ink-2); background: var(--fill-2); border-radius: 4px; }
-.hl mark.sec   { font-weight: 700; color: var(--ink); border-bottom: 1.5px solid var(--hairline-2); }
-.hl mark.snd   { font-weight: 700; color: var(--done-ink); border-bottom: 1.5px solid var(--done); }
+/* Пять видов разметки документированного формата: планы, три поля, теги
+   речи, идентификаторы говорящих — и шестой, остатки старого, красным. */
+.hl mark.shot  { background: var(--accent-soft); color: var(--accent-ink); font-weight: 700; border-radius: 4px; }
+.hl mark.shot.bad { background: var(--fail-soft); color: var(--fail-ink); }
+.hl mark.fld   { font-weight: 700; color: var(--done-ink); border-bottom: 1.5px solid var(--done); }
+.hl mark.dlg   { font-weight: 700; color: var(--ink); border-bottom: 1.5px solid var(--hairline-2); }
+.hl mark.spk   { color: var(--ink-2); }
 /* Ни одного свойства, меняющего метрику: разрядка, размер и семейство здесь
    запрещены — от них слой уехал бы относительно поля на длинных строках. */
-.hl mark.shot  { color: var(--ink-2); }
+.hl mark.old   { background: var(--fail-soft); color: var(--fail-ink); border-radius: 4px; }
 
-/* ---------- шкала покрытия таймингов ---------- */
+/* ---------- полоска планов ---------- */
 .scale {
   position: relative; height: 30px; margin: 12px 0 4px;
   border-radius: var(--r-ctl); background: var(--fill);
@@ -378,24 +380,6 @@ select {
   color: var(--accent-ink);
   font: 500 10.5px/24px var(--ui); font-variant-numeric: tabular-nums;
   text-align: center; overflow: hidden;
-}
-.scale .gap {
-  position: absolute; top: 3px; bottom: 3px; border-radius: 5px;
-  background: repeating-linear-gradient(45deg,
-    transparent 0 5px, color-mix(in srgb, var(--warn) 55%, transparent) 5px 6.5px);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 50%, transparent);
-}
-.scale .over {
-  position: absolute; top: 3px; bottom: 3px; border-radius: 5px;
-  background: repeating-linear-gradient(-45deg,
-    transparent 0 4px, color-mix(in srgb, var(--fail) 60%, transparent) 4px 5.5px);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fail) 55%, transparent);
-}
-.scale .tail {
-  position: absolute; top: 3px; bottom: 3px; right: 3px; border-radius: 5px;
-  background: var(--fill-2);
-  color: var(--ink-3); font: 10.5px/24px var(--ui); text-align: center;
-  overflow: hidden;
 }
 
 /* ---------- разбор промпта ---------- */

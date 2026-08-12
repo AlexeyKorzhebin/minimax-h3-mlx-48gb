@@ -43,8 +43,11 @@ export const DEFAULT_PREVIEW_EVERY = 5;
  *  были бы обещанием, которого никто не давал. */
 export function formatDuration(seconds) {
   const s = Math.max(0, Math.round(Number(seconds) || 0));
-  const h = Math.floor(s / 3600);
-  const m = Math.round((s % 3600) / 60);
+  // Rounded to whole minutes *first*, then split: rounding the remainder on its own printed
+  // 3599 seconds as "60 мин" and 7199 as "1 ч 60 мин".
+  const total = Math.round(s / 60);
+  const h = Math.floor(total / 60);
+  const m = total % 60;
   if (h && m) return `${h} ч ${String(m).padStart(2, "0")} мин`;
   if (h) return `${h} ч`;
   if (m) return `${m} мин`;
@@ -198,17 +201,44 @@ export function canvasIsPacked(width, height) {
 
 /* ===========================================================================
    РАЗБОР ПРОМПТА
-   Ничего не переписывает: только показывает, что видит. Формат задан моделью,
-   а не нами, и правило, которого мы не знаем, не должно превращаться в запрет.
+
+   The format is MiniMax's own, written down in `docs/upstream-guides/`; what
+   follows is a reading of that document and nothing else. Everything this
+   project wrote before those guides were found -- `[0.0-2.5s]` blocks, a
+   `Characters:` section, a `[10s, ...]` header -- is a format we invented, and
+   the model has no such fields; leftovers of it are reported, not corrected.
+
+   Nothing here rewrites the prompt: it only shows what it sees. The format is
+   the model's, not ours, and a rule we do not know must not become a ban.
    =========================================================================== */
 
+/** The eleven languages the model speaks, spelled as they go inside `<d>[...]`. */
+export const LANGUAGES = ["Arabic", "Chinese", "English", "French", "German", "Italian",
+                          "Japanese", "Korean", "Portuguese", "Russian", "Spanish"];
+
+/** The three top-level fields the documented format is made of. */
+export const PROMPT_FIELDS = ["integrated_multimodal_description", "overall_soundscape",
+                              "non_diegetic_music"];
+
+const FIELD_HEAD = "(?:" + PROMPT_FIELDS.join("|") + ")";
+
 const RX = {
-  head: /\[\s*\d+(?:\.\d+)?\s*s\s*,[^\]]*\]/g,
-  block: /\[\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*s\s*\]/g,
-  sec: /^(Characters|Breast physics|Camera|Style)\s*:/gm,
-  snd: /^(overall_soundscape|non_diegetic_music)\s*:/gm,
-  shot: /\b[A-Z][A-Z]+(?:[ ]+[A-Z]+)*\b(?=[ ,:])/g,
+  fld: new RegExp("^" + FIELD_HEAD + "\\s*:", "gm"),
+  // `[Shot 1]` carries no timestamp; every later one opens with `At MM:SS.mmm,`.
+  shot: /\[Shot\s+(\d+)\](?:\s+At\s+(\d{1,3}):(\d{2}(?:\.\d{1,3})?)\s*,?)?/g,
+  // The opening tag is highlighted together with its language tag, the way it is written.
+  dlg: /<d>(?:[ \t]*\[[^\]\n]*\])?|<\/d>/g,
+  spk: /\(\s*S\d+(?:\s*,\s*S\d+)*\s*\)/g,
+  // Markup of the format this project used before the guides were found.
+  old: /\[\s*\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*s\s*\]|\[\s*\d+(?:\.\d+)?\s*s\s*,[^\]\n]*\]|^Characters\s*:/gm,
 };
+
+/** `2.5` as the format writes it: `00:02.500`. */
+export function formatStamp(seconds) {
+  const s = Math.max(0, Number(seconds) || 0);
+  return String(Math.floor(s / 60)).padStart(2, "0") + ":"
+       + (s % 60).toFixed(3).padStart(6, "0");
+}
 
 /** Непересекающиеся куски текста, которые надо подсветить. */
 export function collectSpans(text) {
@@ -218,11 +248,11 @@ export function collectSpans(text) {
     let m;
     while ((m = rx.exec(text))) found.push({ a: m.index, b: m.index + m[0].length, cls });
   };
-  push(RX.head, "head");
-  push(RX.block, "blk");
-  push(RX.sec, "sec");
-  push(RX.snd, "snd");
+  push(RX.fld, "fld");
   push(RX.shot, "shot");
+  push(RX.dlg, "dlg");
+  push(RX.spk, "spk");
+  push(RX.old, "old");
   found.sort((x, y) => x.a - y.a || (y.b - y.a) - (x.b - x.a));
   const out = [];
   let last = -1;
@@ -230,9 +260,105 @@ export function collectSpans(text) {
   return out;
 }
 
+/** One top-level field: where its header starts, and the text that follows it up to the next
+ *  header. `null` when the prompt does not carry the field at all. */
+export function fieldValue(text, name) {
+  const body = String(text == null ? "" : text);
+  const head = new RegExp("^" + name + "\\s*:", "m").exec(body);
+  if (!head) return null;
+  const from = head.index + head[0].length;
+  const rest = body.slice(from);
+  const next = new RegExp("^" + FIELD_HEAD + "\\s*:", "m").exec(rest);
+  return { at: head.index, from, text: next ? rest.slice(0, next.index) : rest };
+}
+
+/** Sentences, counted the way a reader counts them: by the stops between them. The lookahead is
+ *  what keeps `00:02.500` and `0.00 seconds` from being read as two sentences each. */
+export function countSentences(text) {
+  return String(text == null ? "" : text)
+    .split(/[.!?]+(?=\s|$)/)
+    .map((piece) => piece.trim())
+    .filter((piece) => piece !== "").length;
+}
+
+/** Every `[Shot N]` of the description, with its cut time in seconds or `null` for the first.
+ *
+ *  The search starts where `integrated_multimodal_description:` does, because the keyframe
+ *  instruction above the fields says `(from [Shot 1])` -- a reference to a shot, not a shot.
+ */
+export function collectShots(text) {
+  const body = String(text == null ? "" : text);
+  const description = fieldValue(body, "integrated_multimodal_description");
+  const from = description ? description.from : 0;
+  const shots = [];
+  RX.shot.lastIndex = 0;
+  let m;
+  while ((m = RX.shot.exec(body))) {
+    if (m.index < from) continue;
+    shots.push({
+      n: Number(m[1]),
+      at: m[2] === undefined ? null : Number(m[2]) * 60 + Number(m[3]),
+      index: m.index,
+    });
+  }
+  return shots;
+}
+
+/** Which speaker IDs the prompt names, and which of them ever open a `<d>`.
+ *
+ *  A character who never vocalises gets no ID, so an ID with no line behind it is either a
+ *  silent character who was numbered by mistake or a line that was dropped. The stretch a mark
+ *  owns runs to the next mark or to the next `[Shot`, whichever comes first: `(S1,S2) shout
+ *  together, <d>...` gives the line to both, and `(S1) stands still. [Shot 2] ... (S2) says
+ *  <d>...` gives it to neither but the second.
+ */
+export function collectSpeakers(text, shots) {
+  const body = String(text == null ? "" : text);
+  const cuts = (Array.isArray(shots) ? shots : []).map((shot) => shot.index);
+  const marks = [];
+  RX.spk.lastIndex = 0;
+  let m;
+  while ((m = RX.spk.exec(body))) {
+    marks.push({ ids: m[0].match(/S\d+/g) || [], a: m.index, b: m.index + m[0].length });
+  }
+  const all = [];
+  const speaking = new Set();
+  marks.forEach((mark, i) => {
+    for (const id of mark.ids) if (!all.includes(id)) all.push(id);
+    const nextMark = i + 1 < marks.length ? marks[i + 1].a : body.length;
+    const nextCut = cuts.find((at) => at >= mark.b);
+    const until = Math.min(nextMark, nextCut === undefined ? body.length : nextCut);
+    if (body.slice(mark.b, until).includes("<d>")) for (const id of mark.ids) speaking.add(id);
+  });
+  return { all, speaking: all.filter((id) => speaking.has(id)),
+           silent: all.filter((id) => !speaking.has(id)) };
+}
+
+/** One of the two sound fields, checked against its sentence budget. */
+function soundNote(body, name, most, { audio, extra = () => [] }) {
+  const tail = audio ? " — у режима t2va без него пропадает звук" : "";
+  const field = fieldValue(body, name);
+  if (!field) return { k: audio ? "bad" : "warn", t: `Нет <span class="mono">${name}</span>` + tail };
+  const value = field.text.trim();
+  const sentences = countSentences(value);
+  const trouble = [];
+  if (value === "") trouble.push("поле пустое");
+  else if (value !== "N/A" && (sentences < 1 || sentences > most)) {
+    trouble.push(`${sentences} ${plural(sentences, "предложение", "предложения", "предложений")}, `
+               + `а формат просит ${most === 4 ? "от одного до четырёх" : "от одного до трёх"}`);
+  }
+  trouble.push(...extra(value));
+  return trouble.length
+    ? { k: "warn", t: `<span class="mono">${name}</span>: ${trouble.join("; ")}` }
+    : { k: "ok", t: `<span class="mono">${name}</span> на месте`
+                  + (value === "N/A" ? " — <span class=\"mono\">N/A</span>"
+                                     : `, <span class="num">${sentences}</span> `
+                                       + plural(sentences, "предложение", "предложения",
+                                                "предложений")) };
+}
+
 /**
- * Разбор промпта: блоки, сумма таймингов против заявленной длительности,
- * разрывы и перехлёсты, наличие звуковых секций.
+ * Разбор промпта по документированному формату.
  *
  * `audio` — правда ли, что режим озвучен (`t2va`): без звуковых секций у
  * него пропадает звук, а у `t2v` их отсутствие ничего не ломает.
@@ -241,71 +367,160 @@ export function analysePrompt(text, declaredSeconds, { audio = true } = {}) {
   const body = String(text == null ? "" : text);
   const declared = Number(declaredSeconds) || 0;
   const spans = collectSpans(body);
-  const blocks = [];
-  RX.block.lastIndex = 0;
-  let m;
-  while ((m = RX.block.exec(body))) blocks.push({ a: +m[1], b: +m[2], at: m.index });
-
+  const shots = collectShots(body);
   const notes = [];
   const bad = new Set();
 
-  // Пустое поле — не промпт без звука, а промпт, которого ещё нет. Три красных
-  // замечания на чистой странице учат не читать этот список вовсе.
+  // Пустое поле — не промпт без звука, а промпт, которого ещё нет. Пять красных
+  // замечаний на чистой странице учат не читать этот список вовсе.
   if (!body.trim()) {
-    return { spans, blocks, notes: [{ k: "warn", t: "Промпт пуст" }], bad };
+    return { spans, shots, timeline: [],
+             notes: [{ k: "warn", t: "Промпт пуст" }], bad };
   }
 
-  if (!blocks.length) {
-    notes.push({ k: "warn", t: "Блоков вида [0.0-2.5s] не найдено — вся сцена одним куском" });
-  } else {
-    const coverage = blocks.reduce((s, x) => s + Math.max(0, x.b - x.a), 0);
-    const span = blocks[blocks.length - 1].b - blocks[0].a;
-    const diff = declared - span;
-    const k = Math.abs(diff) < 0.05 ? "ok" : (Math.abs(diff) <= 0.5 ? "warn" : "bad");
-    notes.push({
-      k,
-      t: `Блоков ${blocks.length}, покрывают <span class="num">${coverage.toFixed(1)}</span> с `
-       + `на промежутке <span class="num">${blocks[0].a.toFixed(1)}–`
-       + `${blocks[blocks.length - 1].b.toFixed(1)}</span> с; `
-       + `в поле «длительность» <span class="num">${declared.toFixed(1)}</span> с`
-       + (k === "ok" ? " — сходится"
-                     : ` — расхождение <span class="num">${Math.abs(diff).toFixed(1)}</span> с`),
-    });
+  // -- the field the whole format hangs off
+  notes.push(fieldValue(body, "integrated_multimodal_description")
+    ? { k: "ok", t: `Поле <span class="mono">integrated_multimodal_description</span> на месте` }
+    : { k: "bad", t: `Нет поля <span class="mono">integrated_multimodal_description:</span> — `
+                   + `описание планов должно идти под ним` });
 
-    for (let i = 1; i < blocks.length; i++) {
-      const p = blocks[i - 1];
-      const c = blocks[i];
-      if (c.a - p.b > 0.001) {
-        notes.push({
-          k: "warn",
-          t: `Разрыв <span class="num">${(c.a - p.b).toFixed(1)}</span> с между `
-           + `<span class="num">${p.b.toFixed(1)}</span> и `
-           + `<span class="num">${c.a.toFixed(1)}</span>`,
-        });
-        bad.add(c.at);
-      } else if (p.b - c.a > 0.001) {
-        notes.push({
-          k: "bad",
-          t: `Перехлёст <span class="num">${(p.b - c.a).toFixed(1)}</span> с: блок с `
-           + `<span class="num">${c.a.toFixed(1)}</span> начинается раньше конца предыдущего`,
-        });
-        bad.add(c.at);
+  // -- shots and their cut times
+  const timeline = [];
+  if (!shots.length) {
+    notes.push({ k: "warn", t: `Планов <span class="mono">[Shot N]</span> не найдено — `
+                              + `вся сцена одним куском` });
+  } else {
+    const trouble = [];
+    let previous = 0;
+    if (shots[0].at !== null) {
+      trouble.push("у первого плана есть метка времени, а её быть не должно");
+      bad.add(shots[0].index);
+      previous = shots[0].at;
+    }
+    for (let i = 1; i < shots.length; i++) {
+      const shot = shots[i];
+      if (shot.at === null) {
+        trouble.push(`у плана ${shot.n} нет метки <span class="mono">At MM:SS.mmm,</span>`);
+        bad.add(shot.index);
+        continue;
       }
-      if (c.b < c.a) bad.add(c.at);
+      if (!(shot.at > previous)) {
+        trouble.push(`метка ${formatStamp(shot.at)} у плана ${shot.n} не позже предыдущей`);
+        bad.add(shot.index);
+      }
+      if (declared > 0 && shot.at >= declared) {
+        trouble.push(`метка ${formatStamp(shot.at)} у плана ${shot.n} за пределами `
+                   + `заявленных ${declared.toFixed(1)} с`);
+        bad.add(shot.index);
+      }
+      previous = shot.at;
+    }
+    if (shots.some((shot, i) => shot.n !== i + 1)) {
+      trouble.push("планы пронумерованы не подряд с единицы");
+    }
+    const cuts = shots.slice(1).filter((shot) => shot.at !== null).map((shot) => shot.at);
+    notes.push(trouble.length
+      ? { k: "bad", t: `Планов ${shots.length}, но ${trouble.join("; ")}` }
+      : { k: "ok", t: `Планов ${shots.length}`
+                    + (cuts.length
+                        ? `, склейки в <span class="num">`
+                          + `${cuts.map(formatStamp).join(", ")}</span> — возрастают`
+                          + (declared > 0
+                              ? ` и укладываются в <span class="num">`
+                                + `${declared.toFixed(1)}</span> с`
+                              : "")
+                        : " — один план, склеек нет") });
+    // The bar under the editor is drawn only from a timeline that holds together; when it does
+    // not, the note above already says why, and a drawing of nonsense would say it worse.
+    if (!trouble.length && declared > 0 && cuts.every((at) => at < declared)) {
+      const starts = shots.map((shot, i) => (i === 0 ? 0 : shot.at));
+      starts.forEach((a, i) => timeline.push({
+        n: shots[i].n, a, b: i + 1 < starts.length ? starts[i + 1] : declared,
+      }));
     }
   }
 
-  const hasSound = /^overall_soundscape\s*:/m.test(body);
-  const hasMusic = /^non_diegetic_music\s*:/m.test(body);
-  const tail = audio ? " — у режима t2va без него пропадает звук" : "";
-  notes.push(hasSound
-    ? { k: "ok", t: "overall_soundscape на месте" }
-    : { k: audio ? "bad" : "warn", t: "Нет overall_soundscape" + tail });
-  notes.push(hasMusic
-    ? { k: "ok", t: "non_diegetic_music на месте" }
-    : { k: audio ? "bad" : "warn", t: "Нет non_diegetic_music" + tail });
+  // -- <d> ... </d>, and the language inside
+  const opens = (body.match(/<d>/g) || []).length;
+  const closes = (body.match(/<\/d>/g) || []).length;
+  let depth = 0;
+  let tangled = false;
+  const pairs = /<\/?d>/g;
+  let tag;
+  while ((tag = pairs.exec(body))) {
+    depth += tag[0] === "<d>" ? 1 : -1;
+    if (depth > 1 || depth < 0) { tangled = true; depth = Math.max(0, depth); }
+  }
+  const languages = [];
+  const openings = /<d>/g;
+  let open;
+  while ((open = openings.exec(body))) {
+    const named = /^[ \t]*\[([^\]\n]*)\]/.exec(body.slice(open.index + 3));
+    languages.push(named ? named[1].trim() : null);
+  }
+  const unknown = languages.filter((name) => name === null || !LANGUAGES.includes(name));
+  if (!opens && !closes) {
+    notes.push({ k: "ok", t: `Реплик нет: тегов <span class="mono">&lt;d&gt;</span> в промпте `
+                            + `не встречается` });
+  } else if (opens !== closes) {
+    notes.push({ k: "bad", t: `Теги речи не парные: <span class="mono">&lt;d&gt;</span> `
+                            + `<span class="num">${opens}</span>, `
+                            + `<span class="mono">&lt;/d&gt;</span> `
+                            + `<span class="num">${closes}</span>` });
+  } else if (tangled) {
+    notes.push({ k: "bad", t: `Теги речи стоят не по порядку: закрывающий раньше открывающего `
+                            + `или вложенные <span class="mono">&lt;d&gt;</span>` });
+  } else if (unknown.length) {
+    const names = unknown.map((name) => name === null ? "язык не назван"
+                                                      : `«${escapeHtml(name)}»`);
+    notes.push({ k: "bad", t: `Реплик <span class="num">${opens}</span>, но ${names.join(", ")}: `
+                            + `внутри <span class="mono">&lt;d&gt;</span> язык из одиннадцати — `
+                            + `${LANGUAGES.join(", ")}` });
+  } else {
+    const seen = [...new Set(languages)];
+    notes.push({ k: "ok", t: `Реплик <span class="num">${opens}</span>, язык${seen.length > 1
+                              ? "и" : ""} ${seen.join(", ")}` });
+  }
 
-  return { spans, blocks, notes, bad };
+  // -- (S1), (S2): only for those who actually vocalise
+  const speakers = collectSpeakers(body, shots);
+  if (speakers.silent.length) {
+    notes.push({ k: "warn", t: `Идентификаторы без единой реплики: `
+                              + `${speakers.silent.map((id) => `(${id})`).join(", ")} — `
+                              + `по формату ID даётся только говорящему` });
+  } else if (speakers.all.length) {
+    notes.push({ k: "ok", t: `Говорящих <span class="num">${speakers.all.length}</span>: `
+                            + `${speakers.all.map((id) => `(${id})`).join(", ")}` });
+  }
+
+  // -- the two sound fields
+  notes.push(soundNote(body, "overall_soundscape", 4, {
+    audio,
+    // Speech belongs to the description; repeating it here is the mistake the guide names.
+    extra: (value) => value.includes("<d>")
+      ? [`внутри стоит <span class="mono">&lt;d&gt;</span>, а речь описывается `
+         + `в <span class="mono">integrated_multimodal_description</span>`]
+      : [],
+  }));
+  notes.push(soundNote(body, "non_diegetic_music", 3, { audio }));
+
+  // -- leftovers of the format this project invented
+  RX.old.lastIndex = 0;
+  const leftovers = [];
+  let stale;
+  while ((stale = RX.old.exec(body))) {
+    const seen = stale[0].trim();
+    if (!leftovers.includes(seen)) leftovers.push(seen);
+  }
+  if (leftovers.length) {
+    const shown = leftovers.slice(0, 3)
+      .map((seen) => `<span class="mono">${escapeHtml(seen)}</span>`).join(", ");
+    notes.push({ k: "warn", t: `Разметка старого формата: ${shown}`
+                              + (leftovers.length > 3 ? ` и ещё ${leftovers.length - 3}` : "")
+                              + ` — документированный формат таких блоков не знает` });
+  }
+
+  return { spans, shots, timeline, notes, bad };
 }
 
 /** Слой подсветки: тот же текст, что в поле, с обёрнутыми кусками. */
@@ -315,42 +530,25 @@ export function highlightHtml(text, analysis) {
   let i = 0;
   for (const s of analysis.spans) {
     html += escapeHtml(body.slice(i, s.a));
-    const cls = s.cls === "blk" && analysis.bad.has(s.a) ? "blk bad" : s.cls;
+    const cls = s.cls === "shot" && analysis.bad.has(s.a) ? "shot bad" : s.cls;
     html += `<mark class="${cls}">${escapeHtml(body.slice(s.a, s.b))}</mark>`;
     i = s.b;
   }
   return html + escapeHtml(body.slice(i)) + "\n";
 }
 
-/** Полоска покрытия под полем: блоки, разрывы, перехлёсты и неописанный хвост. */
-export function scaleHtml(analysis, declaredSeconds) {
-  const blocks = analysis.blocks;
-  if (!blocks.length) return "";
-  const declared = Number(declaredSeconds) || 0;
-  const end = Math.max(declared, blocks[blocks.length - 1].b) || 1;
+/** Полоска планов под полем: сколько секунд держится каждый до следующей склейки.
+ *  Рисуется только по сходящейся раскадровке — на разъезжающейся её нет вовсе,
+ *  а замечание над ней уже сказало почему. */
+export function scaleHtml(analysis) {
+  const timeline = (analysis && analysis.timeline) || [];
+  if (!timeline.length) return "";
+  const end = timeline[timeline.length - 1].b || 1;
   const pc = (x) => (x / end) * 100 + "%";
-  let html = "";
-  blocks.forEach((b, n) => {
-    html += `<div class="seg" style="left:${pc(b.a)};width:${pc(Math.max(0, b.b - b.a))}"`
-          + ` title="блок ${n + 1}: ${b.a}–${b.b} с">${(b.b - b.a).toFixed(1)}</div>`;
-  });
-  for (let i = 1; i < blocks.length; i++) {
-    const p = blocks[i - 1];
-    const c = blocks[i];
-    if (c.a - p.b > 0.001) {
-      html += `<div class="gap" style="left:${pc(p.b)};width:${pc(c.a - p.b)}"`
-            + ` title="разрыв ${(c.a - p.b).toFixed(1)} с"></div>`;
-    } else if (p.b - c.a > 0.001) {
-      html += `<div class="over" style="left:${pc(c.a)};width:${pc(p.b - c.a)}"`
-            + ` title="перехлёст ${(p.b - c.a).toFixed(1)} с"></div>`;
-    }
-  }
-  const lastEnd = blocks[blocks.length - 1].b;
-  if (declared - lastEnd > 0.001) {
-    html += `<div class="tail" style="left:${pc(lastEnd)};width:${pc(declared - lastEnd)}">`
-          + `не описано ${(declared - lastEnd).toFixed(1)} с</div>`;
-  }
-  return html;
+  return timeline.map((seg) =>
+    `<div class="seg" style="left:${pc(seg.a)};width:${pc(Math.max(0, seg.b - seg.a))}"`
+    + ` title="план ${seg.n}: ${formatStamp(seg.a)}–${formatStamp(seg.b)}">`
+    + `${(seg.b - seg.a).toFixed(1)}</div>`).join("");
 }
 
 /* ===========================================================================
@@ -399,15 +597,23 @@ export function pendingSummary(jobs, { now, runningSeconds = 0, workerState = "a
   };
 }
 
-/** Завершённые за сутки, свежие сверху. Задача без `finished_at` не
- *  отбрасывается: она закончилась, момент просто не записан. */
+/** Завершённые за сутки, свежие сверху.
+ *
+ *  Задача без разбираемого `finished_at` не отбрасывается сразу: она закончилась,
+ *  момент просто не записан. Но и держать её вечно нельзя — список «за сутки»,
+ *  который никогда ничего не забывает, растёт без предела и хоронит сегодняшнее.
+ *  Поэтому дата берётся по первой разобравшейся из трёх, и только задача, у которой
+ *  не читается ни одна, остаётся в списке насовсем: такой в очереди не бывает —
+ *  `created_at` пишется при постановке. */
 export function finishedWithin(jobs, now, hours = FINISHED_WINDOW_HOURS) {
   const at = (now instanceof Date ? now : new Date(now || Date.now())).getTime();
   const window = hours * 3600 * 1000;
   return (Array.isArray(jobs) ? jobs : [])
     .filter((job) => {
-      const stamp = Date.parse(job.finished_at || "");
-      return Number.isNaN(stamp) ? true : at - stamp <= window;
+      const stamps = [job.finished_at, job.started_at, job.created_at]
+        .map((value) => Date.parse(value || ""))
+        .filter((stamp) => !Number.isNaN(stamp));
+      return stamps.length === 0 ? true : at - Math.max(...stamps) <= window;
     })
     .sort((a, b) => String(b.finished_at || "").localeCompare(String(a.finished_at || "")));
 }
@@ -559,7 +765,12 @@ export function errorText(payload) {
       return { title: "Имя промпта должно быть вида имя.txt без каталогов", pre: null };
     case "queue_unwritable":
       return { title: "Каталог очереди недоступен на запись", pre: detail.path || error.message };
+    // Two codes, one sentence: `host_not_allowed` is a `Host:` that names another machine, and
+    // `origin_not_allowed` is a write from another site. The second is the only one a browser
+    // can actually produce, and before it was listed here it fell through to `default:` and
+    // showed the server's English text on a Russian page.
     case "host_not_allowed":
+    case "origin_not_allowed":
       return { title: "Запрос пришёл не с этой страницы", pre: error.message };
     case "internal_error":
       return { title: "Сервер споткнулся — смотрите его вывод в терминале",
@@ -720,6 +931,10 @@ function startPage() {
     } catch {
       failures += 1;
     }
+    // Outside the `try`: the prompt list has its own route and its own failure, and it is
+    // refreshed on every poll rather than once at startup because prompts are written into
+    // `prompts/` by hand while the page is open.
+    await loadPromptList($("prompt-file").value);
     renderConnection();
     renderQueue();
   }
@@ -885,7 +1100,7 @@ function startPage() {
     const declared = Number(String($("duration").value).replace(",", ".")) || 0;
     const analysis = analysePrompt(text, declared, { audio: $("mode").value === "t2va" });
     $("hl").innerHTML = highlightHtml(text, analysis);
-    const scale = scaleHtml(analysis, declared);
+    const scale = scaleHtml(analysis);
     $("scale").innerHTML = scale;
     $("scale").hidden = scale === "";   // пустая полоска покрытия ничего не покрывает
     $("parse").innerHTML = analysis.notes.map((n) => `<li class="${n.k}">${n.t}</li>`).join("");
@@ -987,6 +1202,17 @@ function startPage() {
 
   // -- промпты ----------------------------------------------------------------------------
 
+  /* The sentinel of the "new file" entry has to be a value no prompt name can take, and it also
+     has to survive the HTML parser: NUL does not. The standard makes the parser replace NUL in
+     an attribute value with U+FFFD, so the entry reached the page with a different value than
+     the one compared against, every comparison was false, and picking it wedged the select
+     instead of asking for a name. `__new__` is printable, cannot be a prompt name (the server
+     demands a `.txt` suffix), and keeps `app.js` a text file for `grep`. */
+  const NEW_PROMPT = "__new__";
+
+  /* Called on every poll, not once at startup: prompts are written by hand into `prompts/`
+     while the page is open, and a list that never grows is a file that cannot be picked.
+     The current choice is passed back in, or reloading would silently reset the select. */
   async function loadPromptList(selected) {
     let answer;
     try {
@@ -999,11 +1225,8 @@ function startPage() {
       + answer.prompts.map((p) =>
           `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)} · ${p.bytes} Б</option>`)
         .join("")
-      + `<option value=" new">— новый файл… —</option>`;
+      + `<option value="${NEW_PROMPT}">— новый файл… —</option>`;
     select.value = selected || "";
-    // Каталог промптов сервер называет сам; путь во флаге должен быть его,
-    // а не собранным здесь из догадок.
-    select.dataset.dir = answer.dir;
   }
 
   async function loadPrompt(name) {
@@ -1022,7 +1245,7 @@ function startPage() {
 
   async function savePrompt() {
     let name = $("prompt-file").value;
-    if (!name || name === " new") {
+    if (!name || name === NEW_PROMPT) {
       name = window.prompt("Имя файла в prompts/ (латиница, цифры, дефис, .txt)", "scene.txt");
       if (!name) return;
     }
@@ -1069,7 +1292,12 @@ function startPage() {
       const job = (state.queue.pending || []).find((x) => x.id === id);
       if (job) {
         fillFormFrom(job);
-        window.scrollTo({ top: 0, behavior: "smooth" });
+        /* `prefers-reduced-motion` is honoured by the stylesheet for everything the stylesheet
+           animates, but a smooth scroll asked for in script is not one of those things: the
+           media query cannot reach it, so the query is asked here instead. */
+        const still = typeof window.matchMedia === "function"
+          && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        window.scrollTo({ top: 0, behavior: still ? "auto" : "smooth" });
       }
     }
     renderQueue();
@@ -1147,7 +1375,7 @@ function startPage() {
   $("save-prompt").addEventListener("click", savePrompt);
   $("prompt-file").addEventListener("change", (event) => {
     const name = event.target.value;
-    if (name === " new") { event.target.value = ""; promptFromFile = null; renderPrompt(); }
+    if (name === NEW_PROMPT) { event.target.value = ""; promptFromFile = null; renderPrompt(); }
     else loadPrompt(name);
   });
   $("prompt").addEventListener("input", renderPrompt);
@@ -1169,7 +1397,6 @@ function startPage() {
   syncModeRows();
   renderPrompt();
   renderConnection();
-  loadPromptList();
   poll().then(() => { requestEstimate(); });
   setInterval(poll, POLL_MS);
   setInterval(renderConnection, 1000);

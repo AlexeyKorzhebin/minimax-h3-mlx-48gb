@@ -2153,7 +2153,10 @@ PAGE_FILES = ("index.html", "style.css", "app.js")
 #: fetched. Stripping the URIs before looking for external addresses is what keeps the check from
 #: flagging the very technique that makes the page self-contained.
 _DATA_URI = re.compile(r"""url\(\s*["']?data:[^)]*\)""", re.IGNORECASE)
-_EXTERNAL = re.compile(r"""(?:https?:)?//[A-Za-z0-9]""")
+#: A host name, not any two slashes: the first version matched `//` followed by a letter, which
+#: is every `//TODO` and every `// note` in the script. See
+#: `test_the_external_address_detector_knows_a_host_from_a_comment` for both sides of the line.
+_EXTERNAL = re.compile(r"""(?:\bhttps?:)?//[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+""")
 
 
 def _page_text(name: str) -> str:
@@ -2329,59 +2332,248 @@ def test_the_button_does_not_work_above_forty_six_until_the_checkbox_is_ticked()
     assert warn_only is True, "a warning must not block the button; only 46 does"
 
 
-@_needs_node
-def test_the_prompt_parse_reports_the_sum_the_gaps_and_the_missing_sound():
-    """Requirement 5. One prompt carrying all four findings at once, because a parser can get any
-    one of them right while dropping the rest.
+#: A whole prompt in the documented format, written out so that the tests below can break one
+#: thing at a time against a body that is otherwise beyond reproach. Four shots, two speakers,
+#: two languages, both sound fields -- and, in the first line, the keyframe instruction whose
+#: `(from [Shot 1])` is a *reference* to a shot rather than a fifth shot.
+_GOOD_PROMPT = """\
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is \
+fully referenced.
+
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, a wide shot frames two \
+figures on a ridge. The bearded man with a low, hoarse voice (S1) raises a bronze sword. \
+[Shot 2] At 00:02.500, the shot cuts to a medium tracking shot as the woman with a clear, \
+carrying voice (S2) shouts, <d>[Russian] Сдавайся!</d> [Shot 3] At 00:05.000, the camera cuts \
+to a low-angle shot; the man (S1) answers, <d>[English] Never!</d> [Shot 4] At 00:07.000, the \
+shot cuts to a close action shot as the spear clashes against the raised sword.
+
+overall_soundscape: Gusting mountain wind carries across the open ridge throughout. Bare feet \
+scrape on gravel and bronze rings against wood at the clash.
+
+non_diegetic_music: Orchestral score at a fast tempo, opening with low war drums on a steady \
+pulse. The music ends on a single loud hit.
+"""
+
+#: The same scene in the format this project invented before the guides were found: a duration
+#: header, a `Characters:` block, and `[0.0-2.5s]` shots. Every one of those is markup the model
+#: has no field for, and the parse has to say so rather than add them up.
+_OLD_FORMAT_PROMPT = """\
+[10s, multi-shot dynamic action sequence] Live-action, cinematic realism, a rocky ridge.
+
+Characters: A warrior man (M1) with a bronze sword. A warrior woman (W1) with a spear.
+
+[0.0-2.5s] WIDE SHOT: he slashes, she dodges.
+[2.5-10.0s] CLOSE ACTION SHOT: the spear clashes against the sword.
+
+overall_soundscape: Bronze on wood, gravel underfoot, gusting wind.
+
+non_diegetic_music: A driving epic orchestral battle theme with pounding war drums.
+"""
+
+
+def _parse(prompt: str, seconds: float = 10, audio: bool = True):
+    """`[(kind, text)]` for one prompt, with the markup inside each note stripped.
+
+    The notes carry `<span class="num">` and escaped `&lt;d&gt;`, neither of which is what the
+    test is about; what a human reads is the text, so that is what is asserted on.
     """
-    kinds, text = _node_eval("""
-      const prompt = [
-        "[0.0-2.5s] WIDE SHOT",
-        "[3.0-5.0s] MEDIUM",
-        "[4.5-8.0s] CLOSE",
-        "Characters: C1",
-      ].join("\\n");
-      const a = app.analysePrompt(prompt, 15, {audio: true});
-      console.log(JSON.stringify([a.notes.map(n => [n.k, n.t.replace(/<[^>]+>/g, "")]), prompt]));
-    """)
-    flat = " | ".join(f"{k}:{t}" for k, t in kinds)
-    assert "Блоков 3" in flat and "расхождение" in flat, flat
-    assert "Разрыв" in flat, flat
-    assert "Перехлёст" in flat, flat
-    assert "Нет overall_soundscape" in flat and "Нет non_diegetic_music" in flat, flat
-    assert any(k == "bad" for k, _ in kinds), "a t2va prompt with no sound sections is not a nit"
+    notes = _node_eval("""
+      const a = app.analysePrompt(%s, %s, {audio: %s});
+      console.log(JSON.stringify(a.notes.map(n => [n.k, n.t])));
+    """ % (json.dumps(prompt), seconds, "true" if audio else "false"))
+    unescape = (lambda t: re.sub(r"<[^>]+>", "", t)
+                .replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"))
+    return [(kind, unescape(text)) for kind, text in notes]
+
+
+def _flat(parsed) -> str:
+    return " | ".join(f"{k}:{t}" for k, t in parsed)
+
+
+@_needs_node
+def test_a_prompt_in_the_documented_format_draws_not_one_remark():
+    """The other side of requirement 5, and the first thing that has to hold after the parse was
+    rewritten: a parse that only ever complains is not a parse, and a parse that complains about
+    a correct prompt is worse than none -- it teaches the human to stop reading the list.
+
+    Both halves of the format's own example are here: the instruction line above the fields, and
+    four shots whose cut times rise inside the ten seconds the form declares.
+    """
+    parsed = _parse(_GOOD_PROMPT, 10)
+    assert [k for k, _ in parsed] == ["ok"] * 6, _flat(parsed)
+    assert "Планов 4" in _flat(parsed), (
+        "`(from [Shot 1])` in the instruction line is a reference, not a fifth shot")
+
+
+@_needs_node
+def test_the_official_format_prompt_in_this_repository_parses_clean():
+    """The same claim against a file nobody wrote for a test.
+
+    `prompts/tango-dancers-official.txt` was rewritten from the guides by hand; if the parse and
+    the guides ever drift apart, one of the two is wrong and this is where it shows.
+    """
+    text = (PROJECT_ROOT / "prompts" / "tango-dancers-official.txt").read_text(encoding="utf-8")
+    parsed = _parse(text, 5)
+    assert [k for k, _ in parsed] == ["ok"] * 5, _flat(parsed)
+
+
+@_needs_node
+def test_the_prompt_the_project_used_to_write_is_called_out_as_the_wrong_format():
+    """Requirement 5, re-aimed. The old prompts are still in `prompts/`, and opening one has to
+    say what is wrong with it rather than silently adding up blocks the model never reads.
+    """
+    parsed = _parse(_OLD_FORMAT_PROMPT, 10)
+    flat = _flat(parsed)
+    assert any(k == "bad" and "integrated_multimodal_description" in t for k, t in parsed), flat
+    assert any(k == "warn" and "[Shot N] не найдено" in t for k, t in parsed), flat
+    stale = [t for k, t in parsed if "старого формата" in t]
+    assert stale, flat
+    for leftover in ("[10s,", "Characters:", "[0.0-2.5s]"):
+        assert leftover in stale[0], (leftover, stale[0])
+
+
+@_needs_node
+@pytest.mark.parametrize("was,becomes,expect,kind", [
+    # The first shot is the one the format spells without a time; a time on it is the mistake the
+    # old format made by construction.
+    ("[Shot 1] Live-action", "[Shot 1] At 00:00.000, live-action",
+     "у первого плана есть метка времени", "bad"),
+    # Strictly increasing, and each inside the declared duration -- both, not either.
+    ("[Shot 3] At 00:05.000", "[Shot 3] At 00:02.000", "не позже предыдущей", "bad"),
+    ("[Shot 4] At 00:07.000", "[Shot 4] At 00:11.000", "за пределами", "bad"),
+    # A cut exactly at the end cuts to nothing: ten seconds of video end at 00:10.000.
+    ("[Shot 4] At 00:07.000", "[Shot 4] At 00:10.000", "за пределами", "bad"),
+    # A later shot with no time has nowhere to cut to.
+    ("[Shot 2] At 00:02.500,", "[Shot 2]", "нет метки", "bad"),
+    # Numbered by hand, and one lost in an edit.
+    ("[Shot 3] At 00:05.000", "[Shot 5] At 00:05.000", "не подряд", "bad"),
+])
+def test_every_way_a_shot_line_can_break_the_format_is_named(was, becomes, expect, kind):
+    """Each of these passes on a parser that only checks the others, which is why they are
+    separate rows rather than one prompt carrying all six at once.
+    """
+    prompt = _GOOD_PROMPT.replace(was, becomes)
+    assert prompt != _GOOD_PROMPT, f"{was!r} is no longer in the prompt these rows edit"
+    parsed = _parse(prompt, 10)
+    assert any(k == kind and expect in t for k, t in parsed), _flat(parsed)
+
+
+@_needs_node
+def test_speech_tags_have_to_close_and_name_a_language_the_model_speaks():
+    """Three ways one `<d>` goes wrong, and the same prompt with none of them.
+
+    The language list is the model's, not ours: eleven names, and a twelfth is not a typo the
+    page may quietly accept -- the line would come out in whatever the model guessed instead.
+    """
+    unclosed = _parse(_GOOD_PROMPT.replace("Never!</d>", "Never!"), 10)
+    assert any(k == "bad" and "не парные" in t for k, t in unclosed), _flat(unclosed)
+
+    nested = _parse(_GOOD_PROMPT.replace("<d>[English] Never!</d>",
+                                         "<d>[English] <d>Never!</d></d>"), 10)
+    assert any(k == "bad" and "не по порядку" in t for k, t in nested), _flat(nested)
+
+    foreign = _parse(_GOOD_PROMPT.replace("[English] Never!", "[Klingon] Never!"), 10)
+    assert any(k == "bad" and "Klingon" in t for k, t in foreign), _flat(foreign)
+
+    nameless = _parse(_GOOD_PROMPT.replace("<d>[English] Never!", "<d>Never!"), 10)
+    assert any(k == "bad" and "язык не назван" in t for k, t in nameless), _flat(nameless)
+
+    good = _parse(_GOOD_PROMPT, 10)
+    assert any(k == "ok" and "Реплик 2" in t and "Russian" in t and "English" in t
+               for k, t in good), _flat(good)
+
+
+@_needs_node
+def test_an_identifier_on_a_character_who_never_speaks_is_a_remark():
+    """`(S1)` is the model's handle for a *voice*; the guide gives one only to a character who
+    speaks, sings, or is heard off-screen. An ID with no line behind it is either a silent
+    character numbered by mistake or a line that fell out of an edit, and both are worth saying.
+
+    A remark, not a refusal: the rule is the guide's, and the prompt still runs.
+    """
+    silenced = _parse(_GOOD_PROMPT.replace("<d>[English] Never!</d>", "nothing at all"), 10)
+    assert any(k == "warn" and "(S1)" in t and "без единой реплики" in t
+               for k, t in silenced), _flat(silenced)
+    assert not any(k == "warn" and "(S2)" in t for k, t in silenced), (
+        "S2 still speaks; only the silent one is named")
+
+
+@_needs_node
+@pytest.mark.parametrize("field,over,under", [
+    ("overall_soundscape", 5, 4),
+    ("non_diegetic_music", 4, 3),
+])
+def test_each_sound_field_is_held_to_the_sentence_budget_the_guide_gives_it(field, over, under):
+    """Four sentences for the soundscape and three for the music -- different numbers, so a
+    parser holding both to one of them passes half of this and fails the other half.
+    """
+    line = f"{field}: " + " ".join(f"Sentence number {i}." for i in range(over))
+    prompt = re.sub(rf"^{field}:.*?(?=\n\n|\Z)", line, _GOOD_PROMPT,
+                    flags=re.MULTILINE | re.DOTALL)
+    assert line in prompt
+    parsed = _parse(prompt, 10)
+    assert any(k == "warn" and field in t and f"{over} предлож" in t
+               for k, t in parsed), _flat(parsed)
+
+    fits = _parse(prompt.replace(line, " ".join(line.split(" ")[:-3])), 10)
+    assert any(k == "ok" and field in t for k, t in fits), _flat(fits)
+
+
+@_needs_node
+def test_a_line_of_speech_copied_into_the_soundscape_is_a_remark():
+    """The guide says it in as many words: dialogue and singing already live in the multimodal
+    description and are not repeated in `overall_soundscape`. Our old prompts listed the shouts
+    there, so this is the mistake this project is most likely to make again.
+    """
+    parsed = _parse(_GOOD_PROMPT.replace("overall_soundscape: Gusting",
+                                         "overall_soundscape: <d>[Russian] Сдавайся!</d> Gusting"),
+                    10)
+    assert any(k == "warn" and "overall_soundscape" in t and "<d>" in t
+               for k, t in parsed), _flat(parsed)
+
+
+@_needs_node
+def test_a_music_field_that_says_there_is_no_music_is_accepted():
+    """`N/A` is what the guide writes when there is no non-diegetic score, and a sentence count
+    applied to it would turn the documented spelling into a complaint.
+    """
+    prompt = re.sub(r"^non_diegetic_music:.*?(?=\n\n|\Z)", "non_diegetic_music: N/A",
+                    _GOOD_PROMPT, flags=re.MULTILINE | re.DOTALL)
+    parsed = _parse(prompt, 10)
+    assert [k for k, _ in parsed] == ["ok"] * 6, _flat(parsed)
+
+
+@_needs_node
+def test_the_bar_under_the_editor_holds_one_segment_per_shot():
+    """The shots partition the video: shot N runs from its own cut to the next one, and the last
+    one to the end. Drawn only from a timeline that holds together -- on a prompt whose times go
+    backwards the note above says so, and a drawing of nonsense would say it worse.
+    """
+    good, broken = _node_eval("""
+      const good = app.analysePrompt(%s, 10, {audio: true});
+      const broken = app.analysePrompt(%s, 10, {audio: true});
+      console.log(JSON.stringify([good.timeline, broken.timeline]));
+    """ % (json.dumps(_GOOD_PROMPT),
+           json.dumps(_GOOD_PROMPT.replace("[Shot 3] At 00:05.000", "[Shot 3] At 00:02.000"))))
+    assert [(seg["a"], seg["b"]) for seg in good] == [(0, 2.5), (2.5, 5), (5, 7), (7, 10)]
+    assert broken == [], "a timeline that does not hold together is not drawn at all"
 
 
 @_needs_node
 def test_the_prompt_parse_rewrites_nothing():
-    """Requirement 5's second sentence. The highlight layer is the only thing the parse produces
-    that a human could mistake for the prompt itself, so it is what gets compared back.
+    """Requirement 5's second sentence, unchanged by the new format. The highlight layer is the
+    only thing the parse produces that a human could mistake for the prompt itself, so it is what
+    gets compared back -- and it now has to survive `<d>`, `</d>` and `&` all at once.
     """
-    same = _node_eval(r"""
-      const prompt = "[0.0-2.5s] A & B <tag>\n\noverall_soundscape: wind\n";
-      const html = app.highlightHtml(prompt, app.analysePrompt(prompt, 2.5, {audio: true}));
-      const back = html.replace(/<\/?mark[^>]*>/g, "")
+    same = _node_eval("""
+      const prompt = %s;
+      const html = app.highlightHtml(prompt, app.analysePrompt(prompt, 10, {audio: true}));
+      const back = html.replace(/<\\/?mark[^>]*>/g, "")
         .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
         .replace(/&quot;/g, '"').replace(/&amp;/g, "&");
-      console.log(JSON.stringify(back === prompt + "\n"));
-    """)
+      console.log(JSON.stringify(back === prompt + "\\n"));
+    """ % json.dumps(_GOOD_PROMPT + "\nA & B <tag>\n"))
     assert same is True
-
-
-@_needs_node
-def test_a_prompt_that_lines_up_is_told_so():
-    """The other side of requirement 5: a parse that only ever complains is not a parse."""
-    kinds = _node_eval("""
-      const prompt = [
-        "[0.0-5.0s] WIDE",
-        "[5.0-10.0s] CLOSE",
-        "overall_soundscape: wind",
-        "non_diegetic_music: drums",
-      ].join("\\n");
-      console.log(JSON.stringify(app.analysePrompt(prompt, 10, {audio: true})
-        .notes.map(n => n.k)));
-    """)
-    assert kinds == ["ok", "ok", "ok"], kinds
 
 
 @_needs_node
@@ -2879,3 +3071,160 @@ def test_every_body_route_refuses_a_field_it_does_not_take(queue_server, method,
         "the refusal happened after the write")
     assert all("2" not in job.args for job in _pending(queue_server)), (
         "the refusal happened after the edit was applied")
+
+
+# -- Circle 1 of task 7: the page's own review ----------------------------------------------------
+
+
+def _js_function(script: str, header: str) -> str:
+    """The body of one function in `app.js`, cut out by matching braces from its declaration.
+
+    A few claims about the page are about the DOM half, which `node` cannot call: what `submit`
+    does *not* touch, which function `poll` calls, whether a scroll asks the system first. Those
+    are checked on the source, the same way `test_the_page_asks_for_its_own_routes...` is. A check
+    on the bytes is weaker than a call; it is also the difference between a claim that is checked
+    and a claim that is asserted in a report and never looked at again.
+    """
+    opening = script.index("{", script.index(header) + len(header))
+    depth = 0
+    for i in range(opening, len(script)):
+        depth += {"{": 1, "}": -1}.get(script[i], 0)
+        if depth == 0:
+            return script[opening + 1:i]
+    raise AssertionError(f"{header} never closes")
+
+
+def test_the_new_file_entry_carries_a_sentinel_that_survives_the_html_parser():
+    """Found on the live page: choosing «— новый файл… —» turned red and wedged the select.
+
+    The value was `"\\0new"`, and by the standard a parser must replace a NUL in an attribute
+    value with U+FFFD -- in the browser the option's value really did arrive as `[65533, 110,
+    101, 119]`, so both comparisons against `"\\0new"` were false forever. Python's `html.parser`
+    does not perform that replacement, so the browser's behaviour cannot be reproduced here; what
+    can be asserted is the thing that made it possible, which is a NUL in the markup at all.
+
+    The second half matters as much: one literal, named once, compared against everywhere. Three
+    copies of a sentinel is how one of them gets edited alone.
+    """
+    script = _page_text("app.js")
+    assert "\0" not in script, (
+        "a NUL in an attribute value is replaced by U+FFFD before any comparison sees it "
+        "-- and it makes app.js a binary file for grep besides")
+
+    named = re.search(r'const NEW_PROMPT = "([^"]+)";', script)
+    assert named, "the sentinel has to be one named constant, not a literal repeated three times"
+    sentinel = named.group(1)
+    assert sentinel.isprintable() and sentinel == "__new__", sentinel
+    assert not web.PROMPT_NAME.fullmatch(sentinel), (
+        f"{sentinel!r} would collide with a real prompt file name")
+    assert '<option value="${NEW_PROMPT}">' in script
+    assert script.count("NEW_PROMPT") == 4, (
+        "the constant, the option, and the two comparisons -- no fourth spelling")
+
+
+def test_a_posted_job_leaves_every_field_but_the_seed_and_the_tag_alone():
+    """Requirement 2's other half. `advanceAfterSubmit` is tested above and says what the seed and
+    the tag become; nothing said what happens to the other twelve fields, and the report claimed
+    the requirement was checked automatically on the strength of that one test.
+
+    The main use of this page is five jobs in an evening with one field changed each time. A
+    `$("prompt").value = ""` added to `submit` would break exactly that, and until now nothing
+    would have noticed.
+    """
+    body = _js_function(_page_text("app.js"), "async function submit()")
+    written = set(re.findall(r"""\$\("([^"]+)"\)\.value\s*=[^=]""", body))
+    assert written == {"seed", "tag"}, written
+
+
+def test_the_prompt_list_is_reread_on_every_poll_and_not_only_at_startup():
+    """A file written into `prompts/` while the page is open was invisible until a reload: the
+    list was fetched once, in the startup block. The page already polls every twenty seconds, and
+    the list belongs on that clock.
+    """
+    script = _page_text("app.js")
+    assert "loadPromptList(" in _js_function(script, "async function poll()")
+    startup = script[script.index("// -- запуск"):]
+    assert "loadPromptList(" not in startup, "once at startup is the bug this replaced"
+    assert 'loadPromptList($("prompt-file").value)' in script, (
+        "rereading the list must keep the current choice, or every poll resets the select")
+
+
+def test_the_page_stops_scrolling_smoothly_when_the_system_asks_it_to():
+    """`@media (prefers-reduced-motion: reduce)` in the stylesheet covers everything the
+    stylesheet animates. It cannot reach `window.scrollTo({behavior: "smooth"})`, which is asked
+    for in script -- so the one animation the page starts by hand ignored the setting entirely.
+    """
+    body = _js_function(_page_text("app.js"), "function setEditing(id)")
+    assert "prefers-reduced-motion" in body and "matchMedia" in body
+    assert 'behavior: "smooth"' not in body, "the behaviour has to depend on the query"
+    assert '"auto"' in body and '"smooth"' in body
+
+
+@pytest.mark.parametrize("text,external", [
+    ('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter">', True),
+    ('<script src="//cdn.jsdelivr.net/npm/chart.js"></script>', True),
+    ("await fetch('http://192.168.1.5/api/state')", True),
+    ("//TODO: the sentinel below", False),
+    ("// the note explains why", False),
+    ("const half = width//2", False),
+])
+def test_the_external_address_detector_knows_a_host_from_a_comment(text, external):
+    """The detector above is the whole of `test_no_page_file_names_an_address_off_this_machine`,
+    and it used to match any `//` followed by a letter -- `//TODO` included. A false positive
+    there is not a harmless nit: the next person to hit it deletes the assertion, and the check
+    that keeps a CDN out of this page goes with it.
+    """
+    assert bool(_EXTERNAL.search(text)) is external, text
+
+
+@_needs_node
+def test_an_hour_short_of_an_hour_is_not_printed_as_sixty_minutes():
+    """The minutes were rounded inside the hour they belong to, so 3599 seconds came out as
+    «60 мин» and 7199 as «1 ч 60 мин». Both are numbers no clock shows.
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify([3599, 7199, 3660, 59, 30, 29, 0].map(app.formatDuration)));
+    """)
+    assert got == ["1 ч", "2 ч", "1 ч 01 мин", "1 мин", "1 мин", "29 с", "0 с"], got
+
+
+@_needs_node
+def test_every_refusal_the_server_answers_with_403_has_a_russian_sentence():
+    """Task 6 split the provenance refusal in two, and the page learned only the first half.
+
+    The list is read out of `ERROR_STATUS` rather than written here, so the failure mode -- a
+    third 403 arriving with no Russian text and falling through to the English one the server
+    sent -- fails this test on the commit that adds it, not in a browser at three in the morning.
+    """
+    forbidden = sorted(code for code, status in web.ERROR_STATUS.items() if status == 403)
+    assert len(forbidden) >= 2, forbidden
+    titles, fallback = _node_eval("""
+      const say = (code) => app.errorText({error: {code, message: "cross-site request"}}).title;
+      console.log(JSON.stringify([%s.map(say), say("something_new")]));
+    """ % json.dumps(forbidden))
+    assert titles == ["Запрос пришёл не с этой страницы"] * len(forbidden), (forbidden, titles)
+    assert fallback not in titles, "the sentence has to be chosen, not inherited from `default:`"
+
+
+@_needs_node
+def test_a_finished_job_whose_timestamp_cannot_be_read_still_leaves_the_window():
+    """«Закончилось за сутки» that never forgets grows without bound and buries today.
+
+    A job whose `finished_at` will not parse is not thrown away -- it did finish, the moment is
+    just not written down -- but it is dated by the next stamp that does parse. Only a job with
+    no readable date at all stays, and the queue does not make those: `created_at` is written at
+    submission.
+    """
+    kept = _node_eval("""
+      const at = new Date("2026-08-12T22:00:00");
+      console.log(JSON.stringify(app.finishedWithin([
+        {id: "fresh", finished_at: "2026-08-12T20:00:00"},
+        {id: "unreadable-but-recent", finished_at: "не время", created_at: "2026-08-12T19:00:00"},
+        {id: "unreadable-and-old", finished_at: "", started_at: "2026-08-01T10:00:00"},
+        {id: "no-date-at-all", finished_at: null},
+      ], at).map((row) => row.id)));
+    """)
+    assert "fresh" in kept and "unreadable-but-recent" in kept, kept
+    assert "unreadable-and-old" not in kept, (
+        "a job that started eleven days ago did not finish in the last twenty-four hours")
+    assert "no-date-at-all" in kept, "nothing to date it by is not a reason to hide it"
