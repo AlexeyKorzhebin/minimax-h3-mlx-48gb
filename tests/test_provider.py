@@ -205,3 +205,11 @@ def test_chat_with_no_provider_listening_raises_a_named_error(tmp_path):
     with pytest.raises(provider.ProviderError) as err:
         provider.chat(_llama_cfg(port), {}, [{"role": "user", "content": "x"}])
     assert err.value.code == "chat_unreachable"
+
+
+def test_system_prompt_carries_the_format_and_the_preservation_rule():
+    text = provider.system_prompt()
+    for anchor in ("integrated_multimodal_description", "overall_soundscape",
+                   "non_diegetic_music", "[Shot 1]", "<scenetrans>", "Arc Shot",
+                   "preserve", "JSON"):
+        assert anchor in text, anchor

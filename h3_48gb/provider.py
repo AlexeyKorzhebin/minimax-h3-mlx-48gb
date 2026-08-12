@@ -48,6 +48,17 @@ PROMPT_SCHEMA = {
 }
 
 
+_SYSTEM_PROMPT_CACHE: str | None = None
+
+
+def system_prompt() -> str:
+    global _SYSTEM_PROMPT_CACHE
+    if _SYSTEM_PROMPT_CACHE is None:
+        path = Path(__file__).parent.parent / "docs" / "h3-prompt-system.md"
+        _SYSTEM_PROMPT_CACHE = path.read_text(encoding="utf-8")
+    return _SYSTEM_PROMPT_CACHE
+
+
 def load_env(root) -> dict[str, str]:
     path = Path(root) / ".env"
     if not path.is_file():
