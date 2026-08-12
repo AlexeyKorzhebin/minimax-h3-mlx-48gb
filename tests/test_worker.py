@@ -38,6 +38,7 @@ from h3_48gb import worker
 # `flock` is only honest when the holder is a separate process; `_external_lock` is the queue
 # suite's helper for exactly that, extended there with `name=` so it can hold `worker.lock` and
 # `leases/<id>.lock` as well as `queue.lock`.
+from _fake_llama import _FakeLlama
 from test_queue import _DRY, _answer_within, _external_lock, _stem
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -374,6 +375,53 @@ def test_worker_leaves_the_queue_alone_while_the_llm_holds_the_gpu(tmp_path, mon
     stop.set()
     thread.join(timeout=5)
     assert spawned, "the worker never resumed once the LLM released the GPU"
+
+
+@pytest.mark.parametrize("pass_outdir", [True, False],
+                         ids=["outdir_explicit", "outdir_default_via_roots_parent"])
+def test_worker_reads_providers_json_from_outdir_not_the_queue_root(tmp_path, pass_outdir):
+    """`cli.run_worker` passes `queue_root(outdir) == outdir/"queue"` as `root`, while
+    `providers.json` lives in `outdir` itself (`provider.load_providers`, and `_Live.root` in
+    `test_chat_web.py`). Stubbing `_llm_holds_gpu` the way the test above does cannot catch that
+    mismatch -- it has to be driven end to end, through a real (fake) llama-server's `/health`,
+    with `providers.json` sitting where the web server actually puts it.
+
+    Parametrized over whether `outdir` is passed explicitly or left to default to `root.parent`:
+    both must resolve to the same directory, because `cli.run_worker` is only one of the two
+    callers -- anything that calls `main_loop` directly with `root == queue_root(outdir)` and no
+    `outdir=` must keep working exactly as before this fix.
+    """
+    outdir = tmp_path
+    root = outdir / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _stem(_DRY, str(tmp_path / "h3-a-1x1")), {})
+    llama = _FakeLlama()
+    (outdir / "providers.json").write_text(json.dumps({
+        "active": "qwen-local",
+        "providers": {"qwen-local": {"type": "llama-local", "port": llama.port}},
+    }), encoding="utf-8")
+    spawned: list[list[str]] = []
+    stop = threading.Event()
+    kwargs = {"poll": 0.05, "stop": stop, "spawn": _recording(spawned)}
+    if pass_outdir:
+        kwargs["outdir"] = outdir
+
+    thread = threading.Thread(target=lambda: worker.main_loop(root, **kwargs), daemon=True)
+    thread.start()
+    closed = False
+    try:
+        time.sleep(0.3)
+        assert spawned == [], "the worker took a job while the fake llama-server was still up"
+        llama.close()
+        closed = True
+        deadline = time.time() + 5
+        while not spawned and time.time() < deadline:
+            time.sleep(0.05)
+        assert spawned, "the worker never resumed once providers.json's LLM went down"
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        if not closed:
+            llama.close()
 
 
 # -- Step 9: stopping ----------------------------------------------------------------------------

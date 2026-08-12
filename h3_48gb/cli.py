@@ -1080,6 +1080,12 @@ def run_worker(outdir: Path, poll: float = 5.0) -> dict:
     layout under it, so an outdir that does not exist would otherwise be silently built out of a
     typo, and the worker would then sit for ever on an empty queue while jobs pile up in the real
     one.
+
+    `outdir=outdir` is passed explicitly rather than left to `main_loop`'s default: it is what
+    `provider.load_providers` reads `providers.json` from (the same directory `h3 web` treats as
+    its own `--outdir`), and `main_loop`'s `root` here is `queue_root(outdir)`, one level below
+    that. Relying on the default (`Path(root).parent`) would happen to work today only because the
+    two calls agree by construction -- passing it here says so instead of leaving it implicit.
     """
     from h3_48gb.worker import WorkerAlreadyRunning, main_loop
 
@@ -1089,7 +1095,7 @@ def run_worker(outdir: Path, poll: float = 5.0) -> dict:
                        {"outdir": str(outdir)})
     root = queue_root(outdir)
     try:
-        ran = main_loop(root, poll=poll)
+        ran = main_loop(root, poll=poll, outdir=outdir)
     except WorkerAlreadyRunning as exc:
         raise CliError(
             "worker_already_running",

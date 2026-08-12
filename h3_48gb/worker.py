@@ -266,22 +266,23 @@ def _stop_signals(stop: threading.Event):
             signal.signal(sig, old)
 
 
-def _llm_holds_gpu(root) -> bool:
+def _llm_holds_gpu(outdir) -> bool:
     """A resident local LLM and a 27 GB generation cannot share 48 GB. The chat page owns the
     *decision* to free the GPU -- it asks the human and, on confirmation, calls
     `POST /api/llm/unload` -- the worker only ever observes whether the port still answers.
 
-    Reads `providers.json` from `root`, the exact value `main_loop` was called with: it is the
-    caller's job to pass the same root the web server treats as its `outdir` (where
-    `provider.load_providers` looks), not a queue subdirectory underneath it -- a `root` one level
-    too deep would find no roster and this check would silently never fire.
+    `outdir` is where `provider.load_providers` looks for `providers.json` -- the web server's
+    `--outdir`, not the queue directory underneath it (`cli.queue_root(outdir) ==
+    outdir / "queue"`). `main_loop` is the only caller and resolves that distinction once; a
+    second caller passing the queue root here would find no roster and this check would silently
+    never fire, exactly the bug fixed in this round.
     """
-    roster = provider.load_providers(root)
+    roster = provider.load_providers(outdir)
     cfg = roster["providers"].get(roster["active"] or "", {})
     return cfg.get("type") == "llama-local" and provider.port_alive(cfg.get("port", 0))
 
 
-def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen) -> int:
+def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir=None) -> int:
     """Run queued jobs until asked to stop. Returns how many jobs were run to completion.
 
     Each pass reconciles first (`queue.reconcile`), because the previous worker may have been
@@ -305,8 +306,15 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen) -> int
 
     `spawn` is declared here, not added later, because every recovery test in `tests/test_worker.py`
     has to substitute it: the real one launches a 36 GB generation.
+
+    `outdir` is where `_llm_holds_gpu` reads `providers.json` from -- the web server's `--outdir`,
+    which is `root`'s *parent* whenever `root` is `cli.queue_root(outdir)`, the only shape `root`
+    actually takes in this codebase. Defaulting to `Path(root).parent` keeps every existing direct
+    caller of `main_loop` working unchanged; `cli.run_worker` passes it explicitly so the intent
+    does not depend on that default staying correct if the queue ever moves.
     """
     root = Path(root)
+    outdir = Path(outdir) if outdir is not None else root.parent
     # The worker owns this directory, unlike `scan`, which deliberately refuses to create it: the
     # lock file it is about to take lives inside it, and `h3 worker` on a machine whose queue has
     # never been used must work.
@@ -327,7 +335,7 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen) -> int
                 if stop.wait(poll):
                     break
                 continue
-            if _llm_holds_gpu(root):
+            if _llm_holds_gpu(outdir):
                 if stop.wait(poll):
                     break
                 continue
