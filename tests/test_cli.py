@@ -2314,3 +2314,15 @@ def test_worker_refuses_an_outdir_that_does_not_exist(tmp_path, capsys):
     body = json.loads(capsys.readouterr().out)
     assert body["error"]["code"] == "outdir_not_found"
     assert not (missing / "queue").exists(), "a refused worker must not create anything"
+
+
+# -- start/stop scripts: not exercised live here (they spawn resident processes), just the shape
+# a CI checkout can verify without a GPU: present, executable, and syntactically valid bash -------
+
+
+@pytest.mark.parametrize("script", ["scripts/web-start.sh", "scripts/web-stop.sh"])
+def test_web_scripts_exist_are_executable_and_parse(script):
+    path = Path(__file__).parent.parent / script
+    assert path.is_file(), script
+    assert path.stat().st_mode & 0o111, "не исполняемый"
+    subprocess.run(["bash", "-n", str(path)], check=True)
