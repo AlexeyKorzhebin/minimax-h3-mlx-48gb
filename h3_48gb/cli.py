@@ -128,6 +128,15 @@ ERROR_CODES = {
     "prompt_name_invalid": "a prompt name is not a bare `[A-Za-z0-9_-]+.txt` -- it names a directory or another suffix",
     "queue_unwritable": "the queue directory could not be read or written; see `detail.path`",
     "media_type_not_allowed": "/media serves only finished clips and preview frames, and that is not one",
+    # The chat prompt editor. The first three are the server's own refusals; the last three are
+    # raised inside `h3_48gb.provider` and reach the wire unchanged, because a failure of the model
+    # is not a failure of this server and a page that has to tell them apart matches on the code.
+    "chat_not_found": "there is no chat session with that id under `<outdir>/chat/`",
+    "provider_unavailable": "the chat provider is missing or unusable; `detail.provider` names it and the message says why",
+    "gpu_busy": "a generation is running, so the local chat model is not raised: it would want the same 31 GB",
+    "llama_did_not_start": "llama-server was spawned but never answered /health; the log tail is in the message",
+    "chat_unreachable": "the chat provider did not answer at all -- not started, crashed, or the wrong address",
+    "bad_model_json": "the chat model would not hold the answer schema, twice in a row",
     # Router-level refusals: produced by `web._router_code` (and by the standard library's own
     # error path behind it) rather than by a `raise CliError(...)`, which is why the contract test
     # reads `web.ROUTER_CODES` instead of only scanning source for raise sites. They belong in this

@@ -26,6 +26,7 @@ produced by the page rendering an error `code`, exactly as `queue.py`'s module d
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import errno
 import fcntl
@@ -34,12 +35,14 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import subprocess
 import sys
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from h3_48gb import provider
 from h3_48gb import queue as q
 from h3_48gb import runs as runs_module
 from h3_48gb.cli import DEFAULT_CANVAS, ERROR_CODES, CliError, build_parser
@@ -124,6 +127,26 @@ PROMPT_NAME = re.compile(r"[A-Za-z0-9_-]+\.txt\Z")
 #: in git on purpose (see the design spec): a comparison only means something when the prompt is
 #: byte-identical.
 PROMPTS_DIR = "prompts"
+
+#: Where a chat session lives, relative to the output directory: `<outdir>/chat/<id>.json`. Under
+#: the outdir and not in the repository, because a session is a working note about one machine's
+#: runs -- it names local files and holds half-finished text -- while `prompts/` is in git on
+#: purpose. `llama.log` lands in the same directory (see `provider.LlamaLocal.ensure_up`).
+CHAT_DIR = "chat"
+
+#: What a chat session may say it was opened from. A closed list, and checked on creation: a
+#: session whose `kind` the page does not know is one the page can never open again, and the honest
+#: moment to say so is the moment it is written. `clip` is accepted and stored but not yet acted on
+#: -- the "проекты" spec is what gives it meaning.
+CHAT_SOURCE_KINDS = frozenset({"new", "prompt", "job", "clip"})
+
+#: The keys a `source` may carry beside `kind`: which prompt file, or which job/clip id.
+CHAT_SOURCE_KEYS = frozenset({"kind", "name", "id"})
+
+#: The mode a session is assumed to be about when it does not say. `t2va` is what `h3 generate`
+#: itself defaults to, and the difference matters to the model: an `i2v` prompt opens with a
+#: sentence about the given first frame, a `t2va` one must not.
+DEFAULT_CHAT_MODE = "t2va"
 
 #: HTTP status for each `CliError` code that is not a plain refusal of the request. Everything
 #: absent from here is 400: the caller asked for something this server will not do.
@@ -936,6 +959,30 @@ def _serve_file(root, relative: str, *, suffixes) -> tuple[int, str, bytes]:
             {"path": relative, "error": f"{type(exc).__name__}: {exc}"})
 
 
+def _generation_running(queue_root):
+    """The jobs a worker is running right now -- empty when the GPU is free.
+
+    A module-level function rather than a line inside the chat route for two reasons. It is the
+    single place that decides what "the GPU is busy" means, so the rule cannot drift between the
+    route that refuses a turn and whatever later asks the same question; and a test can replace it,
+    which is the only way to exercise the refusal without starting a twenty-minute generation.
+
+    `reconcile` rather than `scan`: a job left in `running/` by a worker that died is not a live
+    generation, and only reconciliation can tell the two apart (it is what checks the lease).
+    """
+    return q.reconcile(queue_root).alive
+
+
+def _running_ids(running) -> list[str]:
+    """Job ids out of whatever `_generation_running` returned, for an error's `detail`.
+
+    `detail` is JSON on the wire, and `reconcile().alive` is a list of `Job` dataclasses, which
+    `json.dumps` cannot take. Written to survive anything iterable so that the refusal itself
+    cannot be the thing that raises.
+    """
+    return [str(getattr(job, "id", job)) for job in running]
+
+
 class _Handler(BaseHTTPRequestHandler):
     """One request. Every route returns `(status, content_type, body_bytes)`; every failure is
     funnelled through `_respond` so that a refusal looks the same whichever route raised it.
@@ -1099,6 +1146,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._list_prompts()
         if path.startswith("/api/prompts/"):
             return self._read_prompt(path[len("/api/prompts/"):])
+        if path == "/api/providers":
+            return self._providers()
+        if path == "/api/llm":
+            return self._llm_status()
+        if path.startswith("/api/chat/"):
+            return self._read_chat(path[len("/api/chat/"):])
         if path.startswith("/media/"):
             return self._media(path[len("/media/"):])
         return 404, "application/json", _error_bytes(
@@ -1114,6 +1167,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._estimate_only()
         if path.startswith("/api/jobs/") and path.endswith("/top"):
             return self._promote_job(path[len("/api/jobs/"):-len("/top")])
+        if path == "/api/chat":
+            return self._create_chat()
+        if path == "/api/llm/unload":
+            return self._llm_unload()
+        if path.startswith("/api/chat/") and path.endswith("/message"):
+            return self._chat_message(path[len("/api/chat/"):-len("/message")])
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for POST {path}", {"path": path})
 
@@ -1351,6 +1410,285 @@ class _Handler(BaseHTTPRequestHandler):
                            {"path": str(path), "error": f"{type(exc).__name__}: {exc}"}) from exc
         return 200, "application/json", _json_bytes(
             {"ok": True, "name": name, "bytes": len(text.encode("utf-8")), "path": str(path)})
+
+    # -- the chat editor: providers, the local model, sessions, turns -------------------------
+
+    @staticmethod
+    def _string_of(payload: dict, key: str) -> str:
+        """`payload[key]` as a string, or `args_invalid`. Absent and `null` are both the empty
+        string: the page sends an empty prompt window as `""` and an untouched one not at all, and
+        neither is a mistake worth a refusal.
+        """
+        value = payload.get(key)
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise CliError("args_invalid", f"`{key}` must be a string",
+                           {"field": key, "type": type(value).__name__})
+        return value
+
+    def _providers(self) -> tuple[int, str, bytes]:
+        """`GET /api/providers`: the roster, exactly as the page may show it.
+
+        Only the four keys the page needs, and no secret can reach this response even by accident:
+        `load_providers` computes `available`/`reason` from the *name* of an .env variable and
+        never copies its value (task 1), and nothing here forwards the rest of the config.
+        """
+        roster = provider.load_providers(self.server.outdir)
+        listed = [{"name": name, "type": cfg.get("type"), "available": cfg.get("available"),
+                   "reason": cfg.get("reason")} for name, cfg in roster["providers"].items()]
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "active": roster["active"], "providers": listed})
+
+    def _active_provider(self) -> tuple[str | None, dict]:
+        """`(name, cfg)` of the active provider -- `(None, {})` when there is no roster at all.
+
+        A missing `providers.json` is an ordinary state, not a failure: it is what this machine
+        looks like before anyone configures a chat model, and every route here still has to answer.
+        """
+        roster = provider.load_providers(self.server.outdir)
+        name = roster["active"]
+        return name, roster["providers"].get(name) or {}
+
+    def _llama_for(self, name: str | None, cfg: dict):
+        """The `LlamaLocal` for one provider, or `None` when it is not a local one. External
+        providers own no process, so there is nothing to be up or down and nothing to unload.
+        """
+        if cfg.get("type") != "llama-local":
+            return None
+        return provider.LlamaLocal(name, cfg, self.server.outdir)
+
+    def _llm_state(self, name: str | None = None, cfg: dict | None = None) -> dict:
+        """`{"status", "provider"}` for the model plate on the page.
+
+        `down` for an external provider is not a lie by omission: the plate answers "are 31 GB of
+        this machine's memory currently held by a chat model", and for openrouter the answer is no.
+        """
+        if cfg is None:
+            name, cfg = self._active_provider()
+        lam = self._llama_for(name, cfg)
+        return {"status": lam.status() if lam else "down", "provider": name}
+
+    def _llm_status(self) -> tuple[int, str, bytes]:
+        return 200, "application/json", _json_bytes({"ok": True, **self._llm_state()})
+
+    def _llm_unload(self) -> tuple[int, str, bytes]:
+        """`POST /api/llm/unload`: give the memory back before a generation needs it.
+
+        Answers `down` even when there was nothing to stop -- the caller asked for a state, not for
+        an action, and "there was no local provider" is not a failure to report.
+        """
+        self._json_request(allowed=())
+        lam = self._llama_for(*self._active_provider())
+        if lam is not None:
+            lam.shutdown()
+        return 200, "application/json", _json_bytes({"ok": True, "status": "down"})
+
+    def _chat_dir(self) -> Path:
+        directory = Path(self.server.outdir) / CHAT_DIR
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def _chat_path(self, sid: str) -> Path:
+        """`<outdir>/chat/<sid>.json`, or `path_outside_root`.
+
+        The id arrives in a URL and becomes a filename, so it is a path component in everything but
+        name and is checked the way `_job_id_of` checks a job id: resolve it, then require the
+        result to be one file directly inside the chat directory. `../../etc/passwd` and `sub/dir`
+        are both refused before anything opens a file, and the refusal carries a code rather than
+        being a 404 indistinguishable from an unrecognised URL.
+        """
+        directory = self._chat_dir()
+        target = resolve_within(directory / f"{sid}.json", {"chat": directory}, write=True)
+        if target.parent != directory.expanduser().resolve() or target.suffix != ".json":
+            raise CliError(
+                "path_outside_root",
+                f"a chat id names one file in the chat directory, and {sid!r} does not",
+                {"id": sid, "resolved": str(target)},
+            )
+        return target
+
+    def _chat_image(self, raw: str) -> str:
+        """A keyframe path from a request body, checked against the same roots a run's `--image`
+        is checked against, and stored resolved.
+
+        The check is not a formality here. The bytes of this file are base64'd into a chat turn and
+        sent to whichever provider is active -- possibly one on the internet -- so an unchecked path
+        would turn one POST into "read any file on this machine and upload it". `--image` is a
+        `read` flag in `PATH_FLAGS` for a run; a chat about that same frame cannot be laxer.
+
+        Resolved on the way in, like `check_path_flags` does, so the session stores the path the
+        server will actually open rather than one that means something else from another directory.
+        """
+        if not raw:
+            return ""
+        return str(resolve_within(raw, self.server.roots, write=False))
+
+    def _create_chat(self) -> tuple[int, str, bytes]:
+        """`POST /api/chat`: one new session on disk, and its id.
+
+        The id is `secrets.token_hex(4)` -- the queue's own `_suffix()` shape, unguessable and
+        short enough to read out of a URL. Written durably for the same reason every other file
+        this server confirms is: the page navigates to `/#chat/<id>` the moment it gets the id, and
+        a session that is not on disk by then is a page that opens on a 404.
+        """
+        payload = self._json_request(allowed=("source", "prompt", "mode", "image"))
+        source = payload.get("source") or {"kind": "new"}
+        if not isinstance(source, dict) or source.get("kind") not in CHAT_SOURCE_KINDS \
+                or not set(source) <= CHAT_SOURCE_KEYS:
+            raise CliError(
+                "args_invalid",
+                f"`source` is an object with `kind` in {sorted(CHAT_SOURCE_KINDS)} and nothing "
+                f"outside {sorted(CHAT_SOURCE_KEYS)}",
+                {"source": source if isinstance(source, (dict, str)) else None,
+                 "kinds": sorted(CHAT_SOURCE_KINDS), "keys": sorted(CHAT_SOURCE_KEYS)},
+            )
+        session = {"id": secrets.token_hex(4),
+                   "source": source,
+                   "mode": self._string_of(payload, "mode"),
+                   "image": self._chat_image(self._string_of(payload, "image")),
+                   "messages": [],
+                   "prompt": self._string_of(payload, "prompt")}
+        self._write_session(self._chat_path(session["id"]), session)
+        return 200, "application/json", _json_bytes({"ok": True, "id": session["id"]})
+
+    @staticmethod
+    def _write_session(path: Path, session: dict) -> None:
+        """The session file, written durably -- the same protocol, and the same refusal on failure,
+        as `_save_prompt`. Durable because the page navigates to the session as soon as it has the
+        id, and a half-written file is a conversation that opens truncated.
+        """
+        try:
+            q.write_json_durably(path, session)
+        except OSError as exc:
+            raise CliError("queue_unwritable", f"сессия не сохранилась: {path} ({exc})",
+                           {"path": str(path), "error": f"{type(exc).__name__}: {exc}"}) from exc
+
+    def _read_session(self, sid: str) -> tuple[Path, dict | None]:
+        """`(path, session)` for `sid`, with `session` `None` when there is no such file.
+
+        `ENAMETOOLONG` is a refusal naming the id (`name_too_long_is_a_refusal`), not a 500: a
+        400-character id in a URL is the caller's input, exactly as it is for a job id.
+        """
+        path = self._chat_path(sid)
+        try:
+            with name_too_long_is_a_refusal("a chat id"):
+                return path, json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return path, None
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            raise CliError("queue_unwritable", f"сессия не читается: {path} ({exc})",
+                           {"id": sid, "path": str(path)}) from exc
+
+    def _read_chat(self, sid: str) -> tuple[int, str, bytes]:
+        path, session = self._read_session(sid)
+        if session is None:
+            return 404, "application/json", _error_bytes(
+                "chat_not_found", f"нет сессии {sid}", {"id": sid})
+        return 200, "application/json", _json_bytes({"ok": True, **session})
+
+    def _turn_content(self, text: str, image: str):
+        """The user's turn: plain text, or `[text, image_url]` when the session has a keyframe.
+
+        The two parts are what a vision model needs to see the frame, and the same shape works for
+        llama-server with an mmproj and for the external OpenAI-protocol providers.
+
+        A frame that cannot be read is a **warning, not a refusal**: the file may have been moved
+        since the session was opened, and refusing the turn would strand a conversation that has
+        nothing else wrong with it. The page writes the warning into the transcript so nobody spends
+        a turn wondering why the model is describing a frame it never received.
+
+        The image never enters the session's history -- it is attached again on every turn instead.
+        A base64 PNG in `messages` would grow the session file by a megabyte per turn and would be
+        re-sent by every later turn anyway.
+        """
+        if not image:
+            return text, None
+        path = Path(self._chat_image(image))
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return text, f"кадр не прочитался: {image}"
+        url = f"data:{_content_type(path)};base64,{base64.b64encode(data).decode('ascii')}"
+        return [{"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": url}}], None
+
+    def _chat_message(self, sid: str) -> tuple[int, str, bytes]:
+        """`POST /api/chat/<id>/message`: one turn, synchronously.
+
+        Synchronous on purpose: `ensure_up` can take a minute on a cold model, and the alternative
+        -- a job, a poll, a second state machine -- is a great deal of machinery for a page that
+        has nothing else to do while it waits.
+
+        **The queue outranks the chat.** A local model holds 31 GB, so raising one while a
+        generation is running is how both die; the turn is refused with `gpu_busy` and, since the
+        refusal must leave nothing behind, the message is not written to the session either. An
+        external provider takes none of this machine's memory and is therefore not refused -- the
+        check is on the provider's kind, not on the queue alone.
+
+        **The prompt in the system message comes from the request body, never from the session.**
+        The person may have edited the text in the window since the last turn, and a model shown
+        the saved copy would "restore" every hand edit it did not know about.
+
+        A `ProviderError` becomes a 502 carrying the provider's own code (`chat_unreachable`,
+        `bad_model_json`, `llama_did_not_start`). That mapping is this method's job and not
+        `provider`'s: the domain layer raises a named failure, and the HTTP boundary decides what
+        that is worth as a status -- the same shape as `queue.JobNotPending` -> `CliError` above.
+        """
+        path, session = self._read_session(sid)
+        if session is None:
+            return 404, "application/json", _error_bytes(
+                "chat_not_found", f"нет сессии {sid}", {"id": sid})
+        payload = self._json_request(allowed=("text", "prompt", "provider"))
+        text = self._string_of(payload, "text")
+        roster = provider.load_providers(self.server.outdir)
+        name = self._string_of(payload, "provider") or roster["active"]
+        cfg = roster["providers"].get(name)
+        if not cfg or not cfg.get("available"):
+            return 409, "application/json", _error_bytes(
+                "provider_unavailable",
+                (cfg or {}).get("reason")
+                or (f"нет провайдера {name}" if name else "активный LLM-провайдер не выбран"),
+                {"provider": name})
+        lam = self._llama_for(name, cfg)
+        if lam is not None:
+            running = _generation_running(self.server.queue_root)
+            if running:
+                return 409, "application/json", _error_bytes(
+                    "gpu_busy", "идёт прогон — модель поднимется после него",
+                    {"running": _running_ids(running)})
+        system = (provider.system_prompt()
+                  + "\n\n## Context\nmode: " + (session.get("mode") or DEFAULT_CHAT_MODE)
+                  + "\n\n## Current prompt\n" + self._string_of(payload, "prompt"))
+        content, warning = self._turn_content(text, session.get("image") or "")
+        messages = ([{"role": "system", "content": system}]
+                    + [{"role": message["role"], "content": message["content"]}
+                       for message in session["messages"]]
+                    + [{"role": "user", "content": content}])
+        try:
+            if lam is not None:
+                lam.ensure_up()
+            turn = provider.chat(cfg, provider.load_env(self.server.outdir), messages)
+        except provider.ProviderError as exc:
+            return 502, "application/json", _error_bytes(exc.code, str(exc), {"provider": name})
+        if not isinstance(turn, dict):
+            # `null`, a bare string or a list are all valid JSON and none of them is a turn.
+            # `provider.chat` parses rather than validates, so the shape is checked once here,
+            # where the alternative is `None.get("reply")` reaching the `internal_error` net and
+            # reporting the model's mistake as a bug in this server.
+            return 502, "application/json", _error_bytes(
+                "bad_model_json", f"модель вернула не объект: {type(turn).__name__}",
+                {"provider": name, "type": type(turn).__name__})
+        reply = turn.get("reply") or ""
+        # Only the text of the turn is kept: see `_turn_content` on why the frame is not.
+        session["messages"] += [{"role": "user", "content": text},
+                                {"role": "assistant", "content": reply}]
+        if turn.get("prompt"):
+            session["prompt_struct"] = turn["prompt"]
+        self._write_session(path, session)
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "reply": reply, "prompt": turn.get("prompt"), "warning": warning,
+             "llm": self._llm_state(name, cfg)})
 
     def _media(self, relative: str) -> tuple[int, str, bytes]:
         """A preview frame or a finished clip from **one** run's directory under the outdir.

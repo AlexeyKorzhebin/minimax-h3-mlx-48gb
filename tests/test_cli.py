@@ -1556,19 +1556,29 @@ def test_error_codes_are_documented_in_one_place():
     import re
 
     from h3_48gb import cli as cli_mod
+    from h3_48gb import provider as provider_mod
     from h3_48gb import web as web_mod
     from h3_48gb.cli import ERROR_CODES
 
-    source = "\n".join(inspect.getsource(module) for module in (cli_mod, web_mod))
-    # Three sources, not one, because there are three ways a code reaches a caller. A `CliError`
+    source = "\n".join(inspect.getsource(module)
+                       for module in (cli_mod, web_mod, provider_mod))
+    # Four sources, not one, because there are four ways a code reaches a caller. A `CliError`
     # raise site is the original one. `web._error_bytes("code", ...)` writes a refusal the router
     # made before any exception existed -- scanned as a literal so a typo in one shows up here as
     # an undocumented code. And `web.ROUTER_CODES` is read back at runtime rather than matched in
     # source: it is the mapping `_router_code` answers from, so its values are on the wire by
     # construction, including for statuses the standard library raises on this server's behalf and
     # no line in this repository mentions.
+    #
+    # `provider.ProviderError` is the fourth, and it is here because `web._chat_message` answers
+    # `_error_bytes(exc.code, ...)` -- the provider's own code, forwarded verbatim with a 502. The
+    # variable is invisible to the literal scan above, so without this line `chat_unreachable`,
+    # `bad_model_json` and `llama_did_not_start` would be on the wire and out of the contract, and
+    # the page would have to fall into its catch-all on the three most ordinary failures a chat
+    # has: no server, a crashed server, and a model that will not hold the schema.
     raised_codes = (set(re.findall(r'CliError\(\s*"([a-z0-9_]+)"', source))
                     | set(re.findall(r'_error_bytes\(\s*"([a-z0-9_]+)"', source))
+                    | set(re.findall(r'ProviderError\(\s*"([a-z0-9_]+)"', source))
                     | set(web_mod.ROUTER_CODES.values()))
 
     undocumented = raised_codes - set(ERROR_CODES)
