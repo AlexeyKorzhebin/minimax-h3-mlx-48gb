@@ -2541,6 +2541,44 @@ def test_a_music_field_that_says_there_is_no_music_is_accepted():
                     _GOOD_PROMPT, flags=re.MULTILINE | re.DOTALL)
     parsed = _parse(prompt, 10)
     assert [k for k, _ in parsed] == ["ok"] * 6, _flat(parsed)
+    assert any(k == "ok" and "non_diegetic_music" in t and "N/A" in t for k, t in parsed), (
+        "the note has to say the field was read as N/A, not that one sentence was counted")
+
+
+@_needs_node
+def test_a_decimal_number_inside_a_sound_field_is_not_a_full_stop():
+    """Sentences are counted by the stops between them, and `4.5` is not one. Three sentences
+    counted as four is `non_diegetic_music` complaining about a field the guide would accept.
+    """
+    counted = _node_eval("""
+      console.log(JSON.stringify(["One. Two. Three at 4.5 metres per second.",
+                                  "Only one sentence.", "", "N/A"].map(app.countSentences)));
+    """)
+    assert counted == [3, 1, 0, 1], counted
+
+
+@_needs_node
+def test_mood_words_in_the_music_field_are_named_and_flagged():
+    """The guide forbids them outright: instrumentation, tempo, rhythm and dynamics are what
+    `non_diegetic_music` is for. "A driving epic ... tense and fast-paced" is verbatim what this
+    project used to write -- difference #14 of PROMPT-FORMAT-PLAN.md -- so the page has to name
+    the words it objects to, not just disapprove of the field.
+    """
+    line = "non_diegetic_music: A driving epic orchestral score, tense and fast-paced."
+    prompt = re.sub(r"^non_diegetic_music:.*?(?=\n\n|\Z)", line, _GOOD_PROMPT,
+                    flags=re.MULTILINE | re.DOTALL)
+    assert line in prompt
+    parsed = _parse(prompt, 10)
+    note = next((t for k, t in parsed if k == "warn" and "non_diegetic_music" in t), None)
+    assert note is not None, _flat(parsed)
+    for word in ("epic", "tense", "fast-paced"):
+        assert word in note, note
+
+    # The guide's own good example is instruments, tempo and dynamics -- it has to pass clean.
+    fits = _parse(prompt.replace(line, "non_diegetic_music: Sparse piano notes at a slow tempo, "
+                                       "joined by sustained low strings that gradually increase "
+                                       "in volume before fading out."), 10)
+    assert any(k == "ok" and "non_diegetic_music" in t for k, t in fits), _flat(fits)
 
 
 @_needs_node

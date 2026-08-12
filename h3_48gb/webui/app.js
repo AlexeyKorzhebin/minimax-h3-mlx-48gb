@@ -231,6 +231,9 @@ const RX = {
   spk: /\(\s*S\d+(?:\s*,\s*S\d+)*\s*\)/g,
   // Markup of the format this project used before the guides were found.
   old: /\[\s*\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*s\s*\]|\[\s*\d+(?:\.\d+)?\s*s\s*,[^\]\n]*\]|^Characters\s*:/gm,
+  // Abstract mood words the guide bans from `non_diegetic_music`. Physical descriptors that name
+  // an audible property (soft, low, warm, gentle) are welcome there and deliberately absent here.
+  mood: /\b(?:epic|tense|dramatic|emotional|melanchol(?:y|ic)|somber|joyful|uplifting|haunting|eerie|ominous|romantic|mysterious|suspenseful|triumphant|heroic|nostalgic|hopeful|wistful|sentimental|majestic|moody|sad|happy|fast-paced)\b/gi,
 };
 
 /** `2.5` as the format writes it: `00:02.500`. */
@@ -502,7 +505,18 @@ export function analysePrompt(text, declaredSeconds, { audio = true } = {}) {
          + `в <span class="mono">integrated_multimodal_description</span>`]
       : [],
   }));
-  notes.push(soundNote(body, "non_diegetic_music", 3, { audio }));
+  notes.push(soundNote(body, "non_diegetic_music", 3, {
+    audio,
+    // The guide bans abstract mood words outright: the field is instruments, tempo, dynamics.
+    extra: (value) => {
+      RX.mood.lastIndex = 0;
+      const seen = [...new Set((value.match(RX.mood) || []).map((w) => w.toLowerCase()))];
+      return seen.length
+        ? [`слова о настроении (${seen.map((w) => `<span class="mono">${w}</span>`).join(", ")}) `
+           + `— формат просит инструменты, темп и динамику`]
+        : [];
+    },
+  }));
 
   // -- leftovers of the format this project invented
   RX.old.lastIndex = 0;

@@ -2,4 +2,4 @@ integrated_multimodal_description: [Shot 1] Live-action, cinematic, a medium sho
 
 overall_soundscape: Leather soles pivot and scrape against polished parquet in sharp rhythmic bursts. Fabric rustles as the dress sweeps through each turn, punctuated by two quick exhales and the faint creak of the wooden floor beneath them.
 
-non_diegetic_music: A tango for bandoneón and violin at a moderate tempo, the bandoneón carrying a heavy accented pulse while the violin holds long tense lines above it, tightening toward a sharp accent on the final head turn.
+non_diegetic_music: A tango for bandoneón and violin at a moderate tempo, the bandoneón carrying a heavy accented pulse while the violin holds long high lines above it, tightening toward a sharp accent on the final head turn.
