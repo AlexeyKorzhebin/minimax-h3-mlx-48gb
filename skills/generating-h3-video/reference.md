@@ -1,8 +1,69 @@
-# Reference: `h3` CLI flags and error codes
+# Reference: prompt-format lookups, `h3` CLI flags and error codes
 
-Deferred out of `SKILL.md` so it is only loaded when a flag's exact name or default is needed.
-Source of truth: `h3_48gb/cli.py` (`build_parser`, `ERROR_CODES`) in this repository. Defaults below
-were read out of the parser, not transcribed.
+Deferred out of `SKILL.md` so it is only loaded when a flag's exact name or default is needed, or
+when a prompt-format question goes past what fits in the skill. Two sources of truth, and neither
+is this file: `docs/upstream-guides/` for the prompt format, and `h3_48gb/cli.py` (`build_parser`,
+`ERROR_CODES`) for everything below the format section. Defaults were read out of the parser, not
+transcribed.
+
+## Which guide section answers which prompt question
+
+`VIDEO_PROMPT_WRITING_GUIDE_base_en.md` is the one to open for an ordinary run. Its four worked
+cases at the end — one per mode — are usually faster to copy the shape of than the rules are to
+re-read.
+
+| Question | Section |
+|---|---|
+| what each mode's body has to accomplish | 1, and 3.1–3.3 per mode |
+| the verbatim first-line instruction for a keyframe run | 2.1 |
+| what the three fields mean | 2.2 |
+| style words, and where the style goes | 4.1 |
+| timestamps, cut verbs, when a cut is justified at all | 4.2 |
+| the twelve camera motions, amplitude, speed | 4.3 (table) |
+| speaker IDs, group speech, voiceover, `<scenetrans>`, `<cutoff>` | 4.4 |
+| text visible in frame | 4.5 |
+| what may and may not appear in the two sound fields | 4.6, 4.7 |
+| a complete t2va / i2v / flf / last-frame prompt | 5, cases 1–4 |
+
+## Full-reference mode is documented but not runnable here
+
+`VIDEO_PROMPT_WRITING_GUIDE_ref_en.md` describes a **different output format** for `ref2va` —
+conditioning on reference assets rather than on frames. That partition is not converted by this
+fork and no flag reaches it, so a prompt written in this format will be fed to the wrong parser.
+Read it to understand a MiniMax example that arrives in this shape; do not write one.
+
+Its six sections, in order, are `subject_definitions`, `summary`, `retention_analysis`,
+`detailed_description`, `overall_soundscape`, `non_diegetic_music`. The main body is
+`detailed_description`, not `integrated_multimodal_description`; the style opener sits on its own
+line *before* `[Shot 1]` rather than inside it; and reference labels `<Subject N>`, `<Picture N>`,
+`<Video N>`, `<Audio N>` are threaded through every section. Shots, camera, speakers, dialogue and
+the two sound fields are shared with the base guide unchanged.
+
+## Speech: the eleven stable languages
+
+Arabic, Chinese, English, French, German, Italian, Japanese, Korean, Portuguese, Russian, Spanish.
+Others are supported to varying degrees. The tag inside `<d>` is always the English name of the
+language, whatever language the line is in.
+
+## Checklist for a finished prompt
+
+Cheap to run, and each line is an hour of GPU time if it is wrong.
+
+- [ ] `integrated_multimodal_description:`, `overall_soundscape:`, `non_diegetic_music:` present, in
+      that order, one blank line apart.
+- [ ] With `--image` or `--end-image`: the matching instruction is the first line, verbatim, followed
+      by a blank line, with `N` and `S.SS` substituted and `S.SS` at exactly two decimals.
+- [ ] `[Shot 1]` has no timestamp and opens with the style words.
+- [ ] Later shots read `[Shot N] At MM:SS.mmm, …`, numbered consecutively, times strictly
+      increasing, the last one inside the run's duration.
+- [ ] No header line, no `Characters:` block, nothing trailing the third field.
+- [ ] Camera movement uses the vocabulary from guide 4.3, inside a sentence.
+- [ ] `<d>` and `</d>` are balanced; every one carries a language tag from the eleven; only the
+      spoken words are inside.
+- [ ] `(S…)` appears only on subjects that vocalise, and the same subject keeps the same number.
+- [ ] Every voiceover is followed by the closed-lips statement.
+- [ ] `overall_soundscape` is 1–4 sentences and repeats nothing that is spoken or sung.
+- [ ] `non_diegetic_music` is 1–3 sentences, no mood words.
 
 ## `h3 generate <prompt>`
 

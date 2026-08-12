@@ -1,6 +1,6 @@
 ---
 name: generating-h3-video
-description: Use when generating video or audio with MiniMax H3 on this Apple Silicon Mac, choosing a run's mode/resolution/duration/step count, conditioning on a keyframe, or diagnosing a slow, interrupted, refused-to-start, or schedule/memory-error H3 run
+description: Use when generating video or audio with MiniMax H3 on this Apple Silicon Mac, writing or reviewing an H3 prompt, choosing a run's mode/resolution/duration/step count, conditioning on a keyframe, or diagnosing a slow, interrupted, refused-to-start, or schedule/memory-error H3 run
 ---
 
 # Generating video with MiniMax H3 on a 48 GB Mac
@@ -38,6 +38,178 @@ it and adding one would silently produce nonsense.
 
 A keyframe is *stretched* onto the canvas without preserving aspect, which is why the canvas
 follows the image by default. EXIF rotation is applied before the size is read.
+
+## Writing the prompt: the documented format, not ours
+
+The markup below is MiniMax's own and is what the model was trained to parse. Everything this
+project wrote before 2026-08-12 used a house format invented here; the last section of this chapter
+lists the fourteen ways the two differ, and every one of them is a way to get it wrong again.
+
+Source of truth, both in `docs/upstream-guides/`:
+`VIDEO_PROMPT_WRITING_GUIDE_base_en.md` covers t2va / i2v / flf / last-frame, and
+`VIDEO_PROMPT_WRITING_GUIDE_ref_en.md` covers full-reference mode, which this fork cannot run.
+Read the section of the guide that a question actually belongs to instead of guessing — this
+chapter is what to hold in your head while writing, not a replacement for it.
+`prompts/greek-official.txt` is a worked ten-second, four-shot example. Write the prompt to a file
+under `prompts/` and pass `--prompt-file`: a multi-paragraph prompt does not survive shell quoting,
+and two runs are only comparable if the prompt is byte-identical between them.
+
+### Three fields, in this order
+
+```text
+integrated_multimodal_description: [Shot 1] ...
+
+overall_soundscape: ...
+
+non_diegetic_music: ...
+```
+
+Field names verbatim, colon included, one blank line between fields. Every shot lives inline inside
+the first field as one continuous paragraph — `[Shot 2]` does not start a new line. Nothing else is
+a field: no duration header, no `Characters:` block, no trailing notes after `non_diegetic_music`.
+
+For a keyframe run, one fixed instruction comes first, then a blank line, then the three fields:
+
+| Mode | First line, verbatim |
+|---|---|
+| **t2va** | none — the prompt starts at `integrated_multimodal_description:` |
+| **i2v** (`--image`) | `For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.` |
+| **flf** (`--image` + `--end-image`) | `How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot N) aligns with the S.SS-second mark of the target video.` |
+| **last frame only** | `How the reference pictures align with the target video — <Picture 1> (from [Shot N]) aligns with the S.SS-second mark of the target video.` |
+
+Substitute `N`, the index of the real final shot, and `S.SS`, the effective duration to exactly two
+decimals — the *snapped* duration, since `--duration 2.4` yields 73 frames = 3.04 s. Leave every
+other word alone, including the em dash. The last row has no flag: `--end-image` without `--image`
+is refused, so a last-frame-only run is not reachable from this CLI today.
+
+What the body then has to do differs by mode: **i2v** anchors on the image (style, subjects,
+composition, scene) and develops forward — anchor, action onset, continuous development, result;
+**flf** prefers a single shot and describes the *path* between the two frames rather than two static
+descriptions, landing Picture 2 at the end of the final shot.
+
+### Shots and cuts
+
+- `[Shot 1]` carries no timestamp. It opens with the style words, then the framing, then the
+  *initial composition* — where the subjects stand relative to each other and to the frame — and
+  only then lets anything move: `[Shot 1] Live-action, cinematic, a wide side-profile shot frames
+  two figures facing each other on a rocky ridge… On the left stands… On the right stands… The
+  camera holds a static shot as the man slashes…`. Establish before you move; this holds for t2va
+  as much as for a keyframe run. Usual styles: `Cinematic`, `live-action`, `2D-animated`, `3D CG`,
+  `claymation`, `watercolor`, `vintage film`. With a keyframe, take the style from the image.
+- Every later shot is `[Shot N] At MM:SS.mmm, <cut verb> …`. Cut times strictly increase and all
+  fall inside the duration the run will actually have.
+- Cut verbs: `the camera cuts to`, `the shot cuts to`, `the shot transitions to`, `the shot changes
+  to`, `the shot switches to`. Cross-dissolve, fade and wipe only when explicitly asked for.
+- **Framing and camera motion are two different slots.** Framing is a noun phrase — the thing the
+  cut verb lands on: `cuts to a close action shot as…`, `cuts to a medium tracking shot that
+  follows the woman`, `cuts to a low-angle shot of the man planting his feet`. Motion is a verb
+  from the table below, one clause per shot, with the beat of the shot hung off it (`as she
+  lifts…`, `as the runner exits…`). Do not append a second, thinner camera sentence restating
+  framing already given.
+- A cut must introduce new information — subject, space, state, viewpoint or time. If only distance
+  or a slight angle changes, that is camera motion inside the shot, not a cut.
+- There is nowhere to describe a character up front. Introduce a subject where it first enters the
+  frame, and in later shots restate only what would otherwise visibly drift where it shows — the
+  reference example carries "skin damp and matte" and "hair and braid flying" into the last shot
+  and re-lists nothing else.
+- Every detail has to correspond to something visible or audible. Production notes that name no
+  image — "filmed with crisp motion", "shot on…", "epic battle ambience" — describe nothing the
+  model can render, and the format has no slot for them. Drop them rather than rehousing them.
+
+### Camera: motion type, then amplitude, then speed
+
+| Dimension | Expressions |
+|---|---|
+| Motion type | `Zoom In / Zoom Out` (focal length changes, body still), `Push In / Pull Out` (body moves forward/back), `Pan Left / Pan Right` (lens pivots horizontally), `Truck Left / Truck Right` (body translates horizontally), `Tilt Up / Tilt Down` (lens pivots vertically), `Pedestal Up / Pedestal Down` (body moves vertically), `Arc Shot`, `Tracking Shot`, `Static Shot`, `Shake Slightly / Shake Strongly`, `POV`, `Roll Clockwise / Roll Counterclockwise` |
+| Amplitude | `with small amplitude`, `with large amplitude` — omit for medium |
+| Speed | `at slow speed`, `at fast speed` — omit for normal |
+
+Conjugate it into the sentence as an action of the camera; never stack labels at the end of a line
+and never invent a term (`whip-pan`, `LOW ANGLE fast shot` are not in the vocabulary — a low angle
+is framing, and a fast pan is `pans right with large amplitude at fast speed`). Amplitude and speed
+are meaning, not decoration: add them where the brief actually calls for a wide or quick move, and
+leave them off otherwise rather than qualifying every motion out of habit.
+
+```text
+The camera pushes in with small amplitude at slow speed toward the folded letter in her hands.
+The camera holds a static shot as the runner exits the frame.
+```
+
+### Speakers and dialogue
+
+An ID goes only to a subject that speaks, sings, or produces an off-screen human voice: `(S1)`,
+`(S2)`, and `(S1,S2)` for a line delivered together by two already-numbered speakers. The ID is
+stable across shots. **Characters who never vocalise get no ID at all.** At a speaker's first
+appearance, establish the voice: type, age, gender, on- or off-screen, pitch, timbre, rate, accent.
+
+Outside `<d>`: who is speaking, the ID, the action, the delivery. Inside `<d>`: the language tag and
+the words themselves, verbatim down to the punctuation, never translated or rewritten.
+
+```text
+The young woman with a quiet, breathy voice (S1) says: <d>[English] I get off at the next station.</d>
+The two children (S1,S2) shout together, <d>[English] Wait for us!</d>
+```
+
+Eleven languages are stably supported — Arabic, Chinese, English, French, German, Italian,
+Japanese, Korean, Portuguese, Russian, Spanish — and others to a lesser degree. The tag is always
+the English name of the language; the line itself is in that language: `<d>[Russian] Сдавайся!</d>`.
+
+- **Voiceover** uses the exact phrase `says in an off-screen voiceover`, and immediately after the
+  closing `</d>` the on-screen character's lips must be stated closed:
+  `<d>[English] I still remember that road.</d> while his lips remain completely closed.`
+- **A line crossing a cut** takes `<scenetrans>` at the connecting point in *both* halves, plus an
+  explicit continuity phrase: `continues seamlessly across the cut`, `continues uninterrupted into
+  the next shot`, `carries over from the previous shot`, `remains audible across the transition`.
+- **A line the end of the clip truncates** takes `<cutoff>`.
+
+### Text visible in the frame
+
+Any banner, sign, label, subtitle or neon text that is actually legible on screen goes in double
+quotation marks, verbatim and untranslated: `A red neon sign reading "营业中" glows above the doorway.`
+
+### The two sound fields
+
+`overall_soundscape` — 1–4 English sentences, one paragraph, covering the whole clip: ambience,
+physical action sounds, and non-verbal human sounds (wind, footsteps, fabric, impacts, breathing,
+panting, laughter, grunting). **Dialogue, singing and diegetic music do not go here** — they are
+already in the description, and repeating them doubles them. The line is words: effort sounds stay,
+and anything with words in it, a shouted order included, is dialogue and belongs in a `<d>` tag in
+the description. `N/A` only when total silence was asked for.
+
+`non_diegetic_music` — 1–3 English sentences on music only the audience hears: instrumentation,
+tempo, rhythm, dynamic change. **Abstract mood words are forbidden outright**, as is explaining what
+the score does emotionally: not "epic, tense, fast-paced", but "orchestral score at a fast tempo,
+opening with low war drums on a steady pulse… ends on a single loud hit". Pinning a change to a
+visible beat is not a mood word and is welcome — "joined by brass at the clash", "ending
+immediately after the glass breaks". Music the characters can hear — singing, an instrument, a
+radio, a phone — is diegetic and belongs in the description instead. `N/A` when there is none.
+
+For scale, `prompts/greek-official.txt` spends 380 words on four shots across ten seconds and
+about forty on each sound field. Nearly all of the prompt is the description; the two sound fields
+are short by rule.
+
+### The fourteen ways this project got it wrong
+
+Left column is what our own prompts did, and the next agent will do it again unless it reads this.
+`prompts/greek-warrior-battle-overcast.txt` is the old format and `prompts/greek-official.txt` the
+same scene rewritten; diffing them shows all of it at once.
+
+| # | Don't | Do |
+|---|---|---|
+| 1 | start with a bare paragraph of description | name the field: `integrated_multimodal_description: [Shot 1] …` |
+| 2 | `[10s, multi-shot dynamic action sequence]` as a header | no such line exists; duration is carried by `--duration` and by the cut times |
+| 3 | `[0.0-2.5s]`, `[2.5-5.0s]` ranges, one per line | `[Shot 1]` untimed, then `[Shot 2] At 00:02.500, the shot cuts to …`, all inline |
+| 4 | style declared in the header | style as the first words inside `[Shot 1]` |
+| 5 | a `Characters:` block, or a trailing `Breast physics:` note | nothing outside the three fields; fold each detail into the shot where it is visible |
+| 6 | `WIDE SHOT`, `whip-pan`, `LOW ANGLE fast shot` | the twelve motion types plus amplitude and speed, written as a sentence |
+| 7 | `(M1)`, `(W1)`, `(C1)` on every character | `(S1)`, `(S2)` on speakers only; silent figures get no ID |
+| 8 | speech left as prose, or left out because there was no syntax for it | `<d>[Russian] Сдавайся!</d>`, speaker and delivery outside the tag |
+| 9 | a line running across a cut with nothing marking it | `<scenetrans>` in both halves plus a continuity phrase |
+| 10 | speech that the clip's end chops off, unmarked | `<cutoff>` |
+| 11 | narration described loosely | the exact phrase `says in an off-screen voiceover`, then lips stated closed |
+| 12 | on-screen text paraphrased or translated | in double quotes, verbatim |
+| 13 | `overall_soundscape: Epic battle ambience — … sharp grunts and battle cries from both` | only what is audible: grunts and hard breathing stay, words do not, and "epic ambience" names no sound at all |
+| 14 | `non_diegetic_music: a driving epic … tense and fast-paced` | instruments, tempo, rhythm, dynamics; no mood words |
 
 ## Step count is free, but each count needs its own AdaLN table
 
@@ -133,4 +305,6 @@ strength — change any of them and it is a different run. `--restart` is the wa
 `h3 doctor --checkpoint <dir> --json` verifies all four components and the AdaLN cache in seconds.
 Run it against a checkpoint you have not used before, rather than discovering a gap an hour in.
 
-`reference.md` has the complete flag list for every subcommand and the full `--json` error table.
+`reference.md` has the complete flag list for every subcommand, the full `--json` error table, and
+the prompt-format lookups — which guide section answers which question, the full-reference sections
+this fork cannot use, and the checklist to run over a finished prompt before spending an hour on it.
