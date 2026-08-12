@@ -1019,6 +1019,13 @@ name, which is also what keeps the build resident in 21.5 GB instead of 35.3.
 
 ## Words do not move the centaur
 
+> **Retracted 2026-08-12.** The words were in the wrong place, not powerless. All three revisions
+> kept the anatomy in a `Characters:` block — a section that does not exist in MiniMax's own prompt
+> format, which the guides in `docs/upstream-guides/` define and which the model was trained to
+> parse. The same anatomy moved inside `[Shot 1]` produced a correct centaur on the first run.
+> See "The centaur moves when the words are where the model looks" below. The observations about
+> repetition spreading concepts across figures stand on their own evidence and are not retracted.
+
 Three prompt revisions, ten drafts, and the model's idea of a centaur did not budge. Recorded here
 because the negative result is the useful part: it says which lever to stop pulling.
 
@@ -1059,6 +1066,35 @@ One consequence for the numbers already recorded: the 27% seed-to-seed spread me
 centaur is inflated by the model's own uncertainty about the creature, and should not be read as the
 recipe's instability alone. The Greek's spread, measured on the same canvas, is the number to
 compare against the reference's 4-9%.
+
+## The centaur moves when the words are where the model looks
+
+2026-08-12. The discovery of MiniMax's own prompt-writing guides (`docs/upstream-guides/`) exposed
+the flaw in the centaur experiments above: every revision carried its anatomy in a `Characters:`
+block placed before any shot — a section the documented format does not have. The format introduces
+a subject inside the shot where it first appears, and that is presumably where the model learned to
+look for descriptions.
+
+`prompts/centaur-official.txt` is the same creature with the anatomy folded into `[Shot 1]`,
+rendered as a 448x288 draft — 8 steps, seed 20260821, the standard 8-bit + Turbo recipe, 13.3
+minutes. The topology came back correct on the first run: one horse body, the human torso rising
+from the withers, one head and it is human (bearded, holding the bow the prompt gave him), the
+second figure fully human with no horse parts bleeding onto her. The seam sits where a centaur's
+seam goes — the exact error called "a prior, not a misunderstanding" above.
+
+What survives from the retracted section: the repetition effect (a dozen "horse" mentions spreading
+horse-ness across both figures) was observed directly and is consistent with how the format's own
+rules behave — introduce once, restate only what would drift. What does not survive is the
+conclusion that words were the wrong instrument. They were the right instrument aimed at a section
+the parser never reads.
+
+One run, one seed, draft resolution — the usual caveats. But the old conclusion rested on runs with
+the same budget, and a single clean counterexample is enough to retire "stop pulling this lever."
+
+The companion test — the same-seed Greek battle rewritten into the documented format
+(`prompts/greek-official.txt`, 896x576, versus `23-пластик-896/h3-greek-896-overcast`) — came back
+at minimum no worse on stills, and follows its own shot list more visibly: the scripted third-shot
+spear spin appears on schedule. Whether motion quality moved is for the viewing, not for stills.
 
 ## The plastic skin was the lighting, not the recipe
 
