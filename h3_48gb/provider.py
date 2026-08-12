@@ -166,8 +166,14 @@ def chat(cfg: dict, env: dict, messages: list[dict]) -> dict:
         req = urllib.request.Request(_base_url(cfg) + "/v1/chat/completions",
                                      data=json.dumps({**body, "messages": msgs}).encode(),
                                      headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=600) as r:
-            payload = json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req, timeout=600) as r:
+                payload = json.loads(r.read())
+        except (urllib.error.URLError, OSError) as err:
+            # Connection refused (server not up / crashed), timeout, or any
+            # other transport failure -- never leak the raw urllib exception
+            # (or headers, which may carry the bearer token) to the caller.
+            raise ProviderError("chat_unreachable", f"провайдер недоступен: {err}")
         return payload["choices"][0]["message"]["content"]
 
     raw = ask(messages)

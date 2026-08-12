@@ -196,3 +196,12 @@ def test_external_provider_authorises_with_its_env_token(tmp_path):
         assert fake.requests[0]["headers"].get("Authorization") == "Bearer sk-t"
     finally:
         fake.close()
+
+
+def test_chat_with_no_provider_listening_raises_a_named_error(tmp_path):
+    fake = _FakeLlama()
+    port = fake.port
+    fake.close()  # никто больше не слушает этот порт -> connection refused
+    with pytest.raises(provider.ProviderError) as err:
+        provider.chat(_llama_cfg(port), {}, [{"role": "user", "content": "x"}])
+    assert err.value.code == "chat_unreachable"
