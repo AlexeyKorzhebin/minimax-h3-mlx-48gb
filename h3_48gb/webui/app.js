@@ -828,6 +828,52 @@ export function errorText(payload) {
 }
 
 /* ===========================================================================
+   ПЛАШКА ВЫГРУЗКИ
+
+   Задача 6 учит работника не браться за следующую задачу, пока жив порт llama:
+   поднятая модель и непустая очередь означают не «сейчас начнётся», а «стоит»,
+   и разговор в модалке — не единственный способ снять модель с GPU, плашка
+   в очереди — второй, для того, кто вообще не собирался открывать чат.
+   =========================================================================== */
+
+/**
+ * Чистая функция: `{pending, llm}` — сколько задач ждёт и в каком состоянии
+ * локальная модель (`/api/llm`'s `status`) — в решение, показывать ли плашку.
+ *
+ * `llm !== "up"` включает и `"down"`, и `"busy"`, и внешнего провайдера, у
+ * которого `/api/llm` тоже отвечает `down` (см. `_llm_state` в `web.py`):
+ * ни то ни другое не держит память этой машины, снимать нечего.
+ */
+export function unloadBanner(state) {
+  const pending = Number(state && state.pending) || 0;
+  const llm = state && state.llm;
+  if (pending > 0 && llm === "up") {
+    return { show: true,
+             text: "Модель в памяти держит GPU — выгрузить и начать генерацию?" };
+  }
+  return { show: false };
+}
+
+/** Ключ состояния, по которому «пусть ждёт» узнаёт, что ждать больше нечего:
+ *  тот же `{pending, llm}`, что решает, показывать ли плашку. */
+export function bannerKey(state) {
+  return `${Number(state && state.pending) || 0}:${(state && state.llm) || ""}`;
+}
+
+/**
+ * Показывать ли плашку прямо сейчас, с учётом «пусть ждёт».
+ *
+ * «Пусть ждёт» — не крестик, который навсегда прячет плашку, и не снуз на
+ * пять минут: она молчит, пока `{pending, llm}` не изменится хоть чем-то —
+ * ещё одна задача, снятая модель, — а на следующем опросе с тем же состоянием
+ * появляться заново не должна. Появляться заново на *каждый* опрос значило бы
+ * научить нажатие ничего не значить.
+ */
+export function unloadBannerVisible(state, dismissedKey) {
+  return unloadBanner(state).show && bannerKey(state) !== dismissedKey;
+}
+
+/* ===========================================================================
    ФОРМА
    =========================================================================== */
 
@@ -1150,6 +1196,10 @@ function startPage() {
   let estimateTimer = null;
   let chat = null;             // состояние открытой модалки диалога, или null
   let runningLeft = 0;         // сколько осталось идущему прогону — им объясняется gpu_busy
+  let llmStatus = "";          // последний известный `/api/llm`'s `status` — своя переменная,
+                                // отдельная от `chat.llmStatus` модалки, чтобы не путать их опрос
+  let dismissedBannerKey = null;  // `bannerKey` состояния, на котором нажали «пусть ждёт»
+  let unloadBannerKey = null;     // ключ, посчитанный на последней отрисовке — им отвечает клик
 
   const readForm = () => ({
     width: Math.round(Number($("width").value) || 0),
@@ -1210,6 +1260,14 @@ function startPage() {
     } catch {
       failures += 1;
     }
+    // Опрашивается вместе с `/api/state`, а не только когда открыта модалка чата: очередь
+    // стоит именно тогда, когда её никто не смотрит через диалог, и плашке нужно собственное
+    // знание о модели, не завязанное на `chat` (см. `unloadBanner`).
+    try {
+      llmStatus = (await api("GET", "/api/llm")).status;
+    } catch {
+      llmStatus = "";
+    }
     // Outside the `try`: the prompt list has its own route and its own failure, and it is
     // refreshed on every poll rather than once at startup because prompts are written into
     // `prompts/` by hand while the page is open.
@@ -1260,6 +1318,7 @@ function startPage() {
 
     // -- ждут
     const pending = queue.pending || [];
+    renderUnloadBanner(pending.length);
     $("pending").innerHTML = pending
       .map((job) => pendingRowHtml(job, { editingId: editing })).join("");
     $("pending-empty").hidden = pending.length > 0;
@@ -1280,6 +1339,16 @@ function startPage() {
     $("done-sum").textContent = finished.length
       ? `${finished.length}, из них упало ${failed}`
       : "";
+  }
+
+  /** Плашка выгрузки над списком ждущих: см. `unloadBanner`/`unloadBannerVisible`. `pendingCount`
+   *  приходит от вызывающего — он уже разобрал `queue.pending`, второй раз разбирать незачем. */
+  function renderUnloadBanner(pendingCount) {
+    const bannerState = { pending: pendingCount, llm: llmStatus };
+    unloadBannerKey = bannerKey(bannerState);
+    const visible = unloadBannerVisible(bannerState, dismissedBannerKey);
+    $("unload-banner").hidden = !visible;
+    $("unload-banner-text").textContent = visible ? unloadBanner(bannerState).text : "";
   }
 
   function renderRunning(job, workerState, now) {
@@ -1970,6 +2039,20 @@ function startPage() {
     $("row-end-image").hidden = mode !== "flf";
   }
 
+  /** «Выгрузить и начать»: `POST /api/llm/unload`, затем то же перечитывание состояния, что и
+   *  после любого действия над очередью (`withQueue`) — работник берёт освободившуюся задачу
+   *  сам, странице нужно только увидеть это на следующем `poll()`. */
+  async function unloadAndStart() {
+    await withQueue(() => api("POST", "/api/llm/unload", {}));
+  }
+
+  /** «Пусть ждёт»: прячет плашку до того момента, когда `{pending, llm}` действительно
+   *  изменится (см. `unloadBannerVisible`) — не крестик навсегда и не снуз до следующего опроса. */
+  function dismissUnloadBanner() {
+    dismissedBannerKey = unloadBannerKey;
+    renderQueue();
+  }
+
   // -- подписки ---------------------------------------------------------------------------
 
   document.addEventListener("click", (event) => {
@@ -2008,6 +2091,8 @@ function startPage() {
   });
 
   $("submit").addEventListener("click", submit);
+  $("unload-banner-go").addEventListener("click", unloadAndStart);
+  $("unload-banner-wait").addEventListener("click", dismissUnloadBanner);
   $("cancel-edit").addEventListener("click", () => setEditing(null));
   $("force").addEventListener("change", refreshSubmitState);
   $("save-prompt").addEventListener("click", savePrompt);

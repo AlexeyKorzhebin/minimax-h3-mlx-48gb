@@ -3560,3 +3560,43 @@ def test_an_empty_window_refuses_to_overwrite_the_prompt_or_the_job():
     assert empty and "пуст" in empty, empty
     assert blank == empty, "whitespace is not a prompt either"
     assert real is None, "a real prompt is saved without a word"
+
+
+@_needs_node
+def test_the_unload_banner_shows_only_when_jobs_wait_on_a_loaded_model():
+    """Task 9. The worker will not take a job while llama's port is alive (Task 6), so a pending
+    queue with the model up is not "about to start" -- it is stuck, and the banner is the only way
+    off that short of the chat modal.
+    """
+    waiting_and_up, empty_and_up, waiting_and_down = _node_eval("""
+      console.log(JSON.stringify([
+        app.unloadBanner({pending: 2, llm: "up"}),
+        app.unloadBanner({pending: 0, llm: "up"}),
+        app.unloadBanner({pending: 2, llm: "down"}),
+      ]));
+    """)
+    assert waiting_and_up["show"] is True
+    assert waiting_and_up["text"] == "Модель в памяти держит GPU — выгрузить и начать генерацию?"
+    assert empty_and_up["show"] is False
+    assert waiting_and_down["show"] is False
+
+
+@_needs_node
+def test_dismissing_the_banner_holds_until_the_state_actually_changes():
+    """«Пусть ждёт» must not be a snooze that reappears on the very next poll: the page reruns
+    `unloadBanner` every twenty seconds against the same `{pending, llm}` while nothing else has
+    happened, and popping the banner back up on an unchanged state trains the click to be ignored.
+    A real change -- another job queued, the model unloaded some other way -- has to bring it back.
+    """
+    same_state_again, after_pending_changed, after_llm_changed = _node_eval("""
+      const state = {pending: 2, llm: "up"};
+      const dismissedKey = app.bannerKey(state);
+      const rerender = app.unloadBannerVisible(state, dismissedKey);
+      const grew = app.unloadBannerVisible({pending: 3, llm: "up"}, dismissedKey);
+      const unloaded = app.unloadBannerVisible({pending: 2, llm: "down"}, dismissedKey);
+      console.log(JSON.stringify([rerender, grew, unloaded]));
+    """)
+    assert same_state_again is False, "an unchanged state must not re-show a dismissed banner"
+    assert after_pending_changed is True, "a new pending job must ask again"
+    assert after_llm_changed is False, (
+        "llm going down on its own makes unloadBanner().show false already -- nothing to show")

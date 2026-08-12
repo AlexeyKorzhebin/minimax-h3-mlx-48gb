@@ -216,6 +216,16 @@
       <h3>Ждут</h3>
       <span class="sum" id="pending-sum"></span>
     </div>
+    <!-- Работник не берёт задачу, пока жив порт llama (см. app.js, unloadBanner):
+         непустая очередь при поднятой модели реально стоит, и это второй, помимо
+         модалки чата, способ снять модель с GPU и дать очереди пойти. -->
+    <div class="mem-warn unload-banner" id="unload-banner" hidden>
+      <span id="unload-banner-text"></span>
+      <span class="unload-banner-acts">
+        <button class="primary" type="button" id="unload-banner-go">выгрузить и начать</button>
+        <button class="ghost" type="button" id="unload-banner-wait">пусть ждёт</button>
+      </span>
+    </div>
     <div class="table" id="pending"></div>
     <p class="empty" id="pending-empty" hidden>Очередь пуста</p>
     <!-- Файлы, которые лежат в queue/, но не разобрались: их нет в списке
