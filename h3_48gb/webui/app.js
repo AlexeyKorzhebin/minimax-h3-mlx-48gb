@@ -942,6 +942,119 @@ export function applyTurn(state, turn) {
   return state;
 }
 
+/** Предупреждение хода — по коду, как и отказ: сервер шлёт `{code, message}` именно затем,
+ *  чтобы страница не разбирала его предложение. Ход при этом состоялся — просто без кадра. */
+const WARNING_TEXT = {
+  image_not_found: "Кадр не нашёлся — ход ушёл без картинки",
+  image_unreadable: "Кадр не прочитался — ход ушёл без картинки",
+  bad_image: "Кадр не годится в картинку — ход ушёл без него",
+};
+
+export function chatWarningText(warning) {
+  const it = warning || {};
+  const head = WARNING_TEXT[it.code] || "Ход прошёл с оговоркой";
+  return it.message ? `${head}: ${it.message}` : head;
+}
+
+/**
+ * Ответ хода — в ту сессию, которая его и просила, или никуда.
+ *
+ * Ход длится десятки секунд, и всё это время модалку можно закрыть (Esc, подложка, «закрыть»)
+ * и открыть заново на другой сессии. Оба исхода были живыми ошибками. Ответ, пришедший на
+ * закрытую модалку, ронял `TypeError` внутри `try` самого `await`, `catch` падал повторно на
+ * `chat.log`, и `finally` не успевал вернуть кнопку «отправить» — она оставалась мёртвой до
+ * перезагрузки. Ответ, пришедший на *другую* сессию, дописывал ей чужую реплику и переписывал
+ * её окно промпта.
+ *
+ * Правило одно: ответ принадлежит тому объекту состояния, который его заказал. Сравнение по
+ * ссылке, а не по `id`: закрыть и открыть ту же сессию заново — это тоже новое состояние, и
+ * лента у него уже перечитана с диска.
+ *
+ * `savedText` двигается вместе с окном: ответ модели — не «несохранённая правка руками»
+ * (см. `hasUnsavedEdits`).
+ */
+export function landTurn(current, expected, answer) {
+  if (!current || current !== expected) return false;
+  applyTurn(current, answer);
+  const warning = answer && answer.warning;
+  if (warning) current.log.push({ role: "note", kind: "warn", text: chatWarningText(warning) });
+  current.savedText = current.promptText;
+  return true;
+}
+
+/**
+ * Отказ хода — туда же, куда лёг бы ответ, и по тому же правилу (см. `landTurn`).
+ *
+ * Реплика уходит из ленты обратно: сервер её не записал, а в поле ввода она осталась. И
+ * состояние модели ставится по коду: `gpu_busy` — это `busy` («идёт прогон»), а не `down`
+ * («поднимется при первом сообщении»); плашка со вторым текстом прямо над записью о прогоне
+ * отвечает на тот же вопрос второй раз и неверно.
+ */
+export function landFailure(current, expected, payload, runningSeconds = 0) {
+  if (!current || current !== expected) return false;
+  if (!Array.isArray(current.log)) current.log = [];
+  const last = current.log[current.log.length - 1];
+  if (last && last.role === "user") current.log.pop();
+  current.log.push({ role: "note", kind: "bad",
+                     text: chatFailureText(payload, runningSeconds) });
+  const code = ((payload && payload.error) || {}).code;
+  current.llmStatus = code === "gpu_busy" ? "busy" : "down";
+  return true;
+}
+
+const LLM_TEXT = {
+  up: "модель поднята",
+  down: "модель не поднята — поднимется при первом сообщении",
+};
+
+/**
+ * Текст плашки модели.
+ *
+ * `external` — активен провайдер в интернете: тридцать гигабайт держит только локальная модель,
+ * `/api/llm` для внешнего честно отвечает `down`, но «модель не поднята» на openrouter читается
+ * как «что-то не готово», хотя готово всё.
+ *
+ * `busy` — GPU занят прогоном; остаток берётся из того же прогресса работника, что печатается
+ * в приборной строке. Прогон без оценки молчит, а не обещает «~0 мин».
+ */
+export function llmPlateText(status, { external = false, runningSeconds = 0 } = {}) {
+  if (external) return "внешний провайдер — память этой машины не занимает";
+  if (status === "busy") {
+    const left = Number(runningSeconds) || 0;
+    return "идёт прогон — модель поднимется после него"
+         + (left > 0 ? ` (~${formatDuration(left)})` : "");
+  }
+  return LLM_TEXT[status] || "состояние модели неизвестно";
+}
+
+/**
+ * Есть ли в окне работа, которой нет больше нигде.
+ *
+ * Сессия на диске хранит ответы модели (`prompt_struct`) и текст, с которым её открыли, — и
+ * ничего между ними: правка руками живёт только в браузере. Esc и клик по подложке — один
+ * жест, поэтому перед ними этот вопрос задаётся, а после ответа модели (`landTurn` двигает
+ * `savedText`) — нет: спрашивать о том, что и так сохранено, значит научить отвечать «да» не
+ * читая.
+ */
+export function hasUnsavedEdits(state) {
+  if (!state) return false;
+  return String(state.promptText || "") !== String(state.savedText || "");
+}
+
+/**
+ * Причина, по которой кнопку завершения нажимать нельзя, или `null`.
+ *
+ * Пустое окно одним кликом обнуляло файл в `prompts/` и ставило в очередь `["generate", ""]`.
+ * Ни то, ни другое не отменяется, и ни то, ни другое не могло быть намерением: разговор,
+ * который нечем закончить, — это разговор, который ещё не начался.
+ */
+export function finishRefusal(state) {
+  if (!state) return null;
+  return String(state.promptText || "").trim() === ""
+    ? "Окно промпта пустое — сохранять нечего."
+    : null;
+}
+
 /**
  * Русская строка отказа хода — по коду, как и везде на этой странице.
  *
@@ -1453,19 +1566,6 @@ function startPage() {
   const FINISH_LABEL = { new: "в Редактор", clip: "в Редактор",
                          prompt: "сохранить промпт", job: "обновить задачу" };
 
-  const LLM_TEXT = {
-    up: "модель поднята",
-    down: "модель не поднята — поднимется при первом сообщении",
-  };
-
-  /* Предупреждение хода — по коду, как и отказ: сервер шлёт `{code, message}` именно затем,
-     чтобы страница не разбирала его предложение. Ход при этом состоялся — просто без кадра. */
-  const WARNING_TEXT = {
-    image_not_found: "Кадр не нашёлся — ход ушёл без картинки",
-    image_unreadable: "Кадр не прочитался — ход ушёл без картинки",
-    bad_image: "Кадр не годится в картинку — ход ушёл без него",
-  };
-
   function chatSourceText(source) {
     const it = source || {};
     if (it.kind === "prompt") return `промпт ${it.name || "?"}`;
@@ -1474,27 +1574,18 @@ function startPage() {
     return "новый промпт";
   }
 
-  function chatWarningText(warning) {
-    const it = warning || {};
-    const head = WARNING_TEXT[it.code] || "Ход прошёл с оговоркой";
-    return it.message ? `${head}: ${it.message}` : head;
-  }
-
   /**
    * Плашка модели. `override` — строка на один случай («жду ответа…»), без него плашка
-   * собирается из выбранного провайдера и последнего известного состояния.
-   *
-   * У внешнего провайдера подниматься нечему: тридцать гигабайт держит только локальная
-   * модель, и `/api/llm` честно отвечает `down` — но «модель не поднята» на openrouter звучит
-   * как «что-то не готово», хотя готово всё.
+   * собирается из выбранного провайдера и последнего известного состояния (`llmPlateText`).
    */
   function renderLlmPlate(override) {
     if (override) { $("chat-llm").textContent = override; return; }
     const row = ((chat && chat.providers) || [])
       .find((item) => item.name === $("chat-provider").value);
-    $("chat-llm").textContent = row && row.type !== "llama-local"
-      ? "внешний провайдер — память этой машины не занимает"
-      : (LLM_TEXT[(chat && chat.llmStatus) || ""] || "состояние модели неизвестно");
+    $("chat-llm").textContent = llmPlateText((chat && chat.llmStatus) || "", {
+      external: Boolean(row) && row.type !== "llama-local",
+      runningSeconds: runningLeft,
+    });
   }
 
   function renderChatPrompt() {
@@ -1552,7 +1643,8 @@ function startPage() {
   }
 
   /** Новая сессия от источника и переход в неё. `opened` — что видно только странице:
-   *  текст промпта, режим и путь кадра (сервер сам их не знает). */
+   *  текст промпта, режим, путь кадра (сервер сам их не знает) и `notice` — строка, которую
+   *  надо показать в ленте сразу (например, что промпт задачи прочитать не удалось). */
   async function openChatModal(source, opened = {}) {
     try {
       const answer = await api("POST", "/api/chat", {
@@ -1564,6 +1656,10 @@ function startPage() {
       clearError();
       window.location.hash = `#chat/${answer.id}`;
       await syncChatFromHash();
+      if (opened.notice && chat && chat.id === answer.id) {
+        chat.log.push({ role: "note", kind: "warn", text: opened.notice });
+        renderChatLog();
+      }
     } catch (error) {
       if (error.payload) showError(error.payload);
     }
@@ -1588,6 +1684,10 @@ function startPage() {
          ходом и возвращаются в ответе. */
       promptText: session.prompt_struct ? buildPromptText(session.prompt_struct)
                                         : (session.prompt || ""),
+      /* Что из этого текста переживёт закрытие модалки: всё, что человек напечатает сверху,
+         не живёт нигде, кроме браузера, — на этом стоит вопрос перед Esc (`hasUnsavedEdits`). */
+      savedText: session.prompt_struct ? buildPromptText(session.prompt_struct)
+                                       : (session.prompt || ""),
       log: (session.messages || []).map((m) => ({ role: m.role, text: m.content })),
       sending: false,
       providers: [],       // роспись из /api/providers — по ней собирается плашка модели
@@ -1608,6 +1708,15 @@ function startPage() {
     if (CHAT_HASH.test(window.location.hash || "")) window.location.hash = "";
   }
 
+  /* Закрытие по жесту человека — Esc, подложка, «закрыть». Правка руками нигде, кроме этого
+     окна, не живёт (сервер хранит ответы модели), поэтому одним нажатием она не выбрасывается.
+     `finishChat` спрашивать не должен: он этот текст как раз и сохраняет. */
+  function requestCloseChat() {
+    if (hasUnsavedEdits(chat)
+        && !window.confirm("Правки промпта не сохранены и пропадут. Закрыть?")) return;
+    closeChat();
+  }
+
   async function syncChatFromHash() {
     const match = CHAT_HASH.exec(window.location.hash || "");
     if (!match) {
@@ -1618,42 +1727,52 @@ function startPage() {
     await enterChat(match[1]);
   }
 
+  /**
+   * Один ход: реплика уходит на сервер, ответ приземляется туда, откуда ушёл.
+   *
+   * `session` — состояние на момент отправки. Пока идёт ход (десятки секунд), модалку можно
+   * закрыть и открыть на другой сессии, поэтому приземление обоих исходов идёт через
+   * `landTurn`/`landFailure`, а рисуется только то, что приземлилось (см. их докстроки).
+   *
+   * Кнопка отпускается до этой проверки и без всяких условий: она принадлежит модалке, а не
+   * сессии, и оставить её мёртвой — значит потребовать перезагрузки страницы.
+   */
   async function sendChatMessage() {
     if (!chat || chat.sending) return;
     const text = $("chat-input").value.trim();
     if (!text) return;
-    chat.sending = true;
+    const session = chat;
+    session.sending = true;
     $("chat-send").disabled = true;
     renderLlmPlate("жду ответа — на холодной модели это до минуты");
-    chat.log.push({ role: "user", text });
+    session.log.push({ role: "user", text });
     renderChatLog();
+
+    let answer = null;
+    let failure = null;
     try {
-      const answer = await api("POST", `/api/chat/${encodeURIComponent(chat.id)}/message`,
-                               { text, prompt: chat.promptText,
-                                 provider: $("chat-provider").value });
-      applyTurn(chat, answer);
-      if (answer.warning) {
-        chat.log.push({ role: "note", kind: "warn", text: chatWarningText(answer.warning) });
-      }
+      answer = await api("POST", `/api/chat/${encodeURIComponent(session.id)}/message`,
+                         { text, prompt: session.promptText,
+                           provider: $("chat-provider").value });
+    } catch (error) {
+      failure = error;
+    }
+    session.sending = false;
+    $("chat-send").disabled = false;
+
+    if (answer) {
+      if (!landTurn(chat, session, answer)) return;
+      // Поле очищается только когда ответ и правда лёг в эту сессию: иначе человек лишится
+      // текста, которого он в этой ленте даже не видел.
       $("chat-input").value = "";
       chat.llmStatus = (answer.llm || {}).status || chat.llmStatus;
-      renderLlmPlate();
       clearError();
-    } catch (error) {
-      /* Ход не состоялся: сервер ничего не записал, поэтому реплика уходит из ленты обратно —
-         и остаётся в поле ввода. Текст, который человек написал, теряться не должен ни при
-         занятом GPU, ни при упавшем провайдере. */
-      chat.log.pop();
-      chat.log.push({ role: "note", kind: "bad",
-                      text: chatFailureText(error.payload, runningLeft) });
-      chat.llmStatus = "down";
-      renderLlmPlate();
-    } finally {
-      chat.sending = false;
-      $("chat-send").disabled = false;
-      renderChatPrompt();
-      renderChatLog();
+    } else if (!landFailure(chat, session, failure && failure.payload, runningLeft)) {
+      return;
     }
+    renderLlmPlate();
+    renderChatPrompt();
+    renderChatLog();
   }
 
   /** Промпт поставленной задачи, насколько его вообще видно странице.
@@ -1679,10 +1798,18 @@ function startPage() {
     const job = ((state && state.queue && state.queue.pending) || [])
       .find((row) => row.id === id);
     if (!job) return;
+    const prompt = await jobPromptText(job);
     await openChatModal({ kind: "job", id }, {
-      prompt: await jobPromptText(job),
+      prompt,
       mode: argValue(job.args, "--mode") || "t2va",
       image: argValue(job.args, "--image") || "",
+      // Пустое окно у задачи, у которой промпт точно есть, — это не «промпт пуст», а «страница
+      // его не достала». Молчать здесь значит предложить сохранить пустоту поверх работы.
+      notice: prompt.trim() === ""
+        ? "Промпт этой задачи странице не виден: он ушёл снимком в очередь, и маршрута к нему "
+          + "нет. Вставьте текст в окно слева или соберите заново — «обновить задачу» перепишет "
+          + "промпт задачи тем, что будет в окне."
+        : "",
     });
   }
 
@@ -1694,6 +1821,14 @@ function startPage() {
    */
   async function finishChat() {
     if (!chat) return;
+    const refusal = finishRefusal(chat);
+    if (refusal) {
+      // Плашкой в ленте, а не молча и не окном: отказ виден там же, где всё остальное, что
+      // модалка отвечает, и модалка при этом остаётся открытой.
+      chat.log.push({ role: "note", kind: "bad", text: refusal });
+      renderChatLog();
+      return;
+    }
     const source = chat.source || { kind: "new" };
     const text = chat.promptText;
 
@@ -1926,7 +2061,7 @@ function startPage() {
 
   // Смена провайдера меняет и смысл плашки: у внешнего поднимать нечего.
   $("chat-provider").addEventListener("change", () => renderLlmPlate());
-  $("chat-close").addEventListener("click", closeChat);
+  $("chat-close").addEventListener("click", requestCloseChat);
   $("chat-finish").addEventListener("click", finishChat);
   $("chat-form").addEventListener("submit", (event) => {
     event.preventDefault();
@@ -1952,13 +2087,14 @@ function startPage() {
     $("chat-hl").scrollTop = $("chat-prompt-text").scrollTop;
     $("chat-hl").scrollLeft = $("chat-prompt-text").scrollLeft;
   });
-  // Клик по подложке и Esc закрывают модалку — привычные два жеста, оба ничего не теряют:
-  // сессия остаётся на диске, и `#chat/<id>` открывает её обратно.
+  /* Клик по подложке и Esc закрывают модалку — привычные два жеста. Ход и лента при этом не
+     теряются (сессия на диске, `#chat/<id>` открывает её обратно), а вот правка руками живёт
+     только здесь — о ней `requestCloseChat` спрашивает. */
   $("chat-modal").addEventListener("click", (event) => {
-    if (event.target === $("chat-modal")) closeChat();
+    if (event.target === $("chat-modal")) requestCloseChat();
   });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && chat) closeChat();
+    if (event.key === "Escape" && chat) requestCloseChat();
   });
   window.addEventListener("hashchange", syncChatFromHash);
 

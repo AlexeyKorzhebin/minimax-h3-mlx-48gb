@@ -3447,3 +3447,116 @@ def test_finishing_a_chat_about_a_job_puts_the_new_text_into_its_arguments():
         "--prompt-file must not survive: the worker reads the snapshot, not the new text")
     assert glued == ["generate", "новый", "--tag", "кот"], "--prompt-file=x is the same flag"
     assert read_back == ["старый текст", None]
+
+
+@_needs_node
+def test_an_answer_that_arrives_after_the_modal_moved_on_lands_nowhere():
+    """Fix round 1, C1 and C2. A turn takes tens of seconds, and the modal is closeable (Esc, the
+    backdrop, «закрыть») and re-openable on another session the whole time.
+
+    Both halves were live bugs. Landing on a closed modal threw `TypeError` inside the `await`'s
+    own `try`, so the `catch` threw again on `chat.log` and the `finally` never re-enabled
+    «отправить» -- the button stayed dead until a reload. Landing on a *different* session wrote
+    someone else's reply into it and overwrote its prompt window.
+
+    Both are one rule -- the answer belongs to the state object that asked for it -- so both
+    landings are checked here, on the same three cases.
+    """
+    dropped_closed, dropped_other, other_text, other_entries, landed, text = _node_eval("""
+      const turn = {reply: "ок", prompt: {instruction: null,
+        integrated_multimodal_description: "[Shot 1] X.",
+        overall_soundscape: "Wind.", non_diegetic_music: "N/A"}};
+      const expected = {id: "aaa", promptText: "свой", savedText: "свой", log: []};
+      const other = {id: "bbb", promptText: "чужой", savedText: "чужой", log: []};
+      const closed = app.landTurn(null, expected, turn);
+      const foreign = app.landTurn(other, expected, turn);
+      const ours = app.landTurn(expected, expected, turn);
+      console.log(JSON.stringify([closed, foreign, other.promptText, other.log.length,
+                                  ours, expected.promptText]));
+    """)
+    assert dropped_closed is False, "a closed modal takes no answer -- and must not throw"
+    assert dropped_other is False and other_text == "чужой" and other_entries == 0, (
+        "the answer of one session must not land in another")
+    assert landed is True and text.startswith("integrated_multimodal_description")
+
+    closed, foreign, other_entries, landed, log = _node_eval("""
+      const payload = {error: {code: "chat_unreachable", message: "connection refused"}};
+      const expected = {id: "aaa", promptText: "свой", savedText: "свой",
+                        log: [{role: "user", text: "мрачнее"}]};
+      const other = {id: "bbb", promptText: "чужой", savedText: "чужой", log: []};
+      console.log(JSON.stringify([
+        app.landFailure(null, expected, payload, 0),
+        app.landFailure(other, expected, payload, 0),
+        other.log.length,
+        app.landFailure(expected, expected, payload, 0),
+        expected.log.map((entry) => entry.role + "/" + (entry.kind || "")),
+      ]));
+    """)
+    assert closed is False and foreign is False and other_entries == 0
+    assert landed is True
+    assert log == ["note/bad"], (
+        "the message goes back to the input box, so its optimistic line leaves the transcript")
+
+
+@_needs_node
+def test_the_plate_says_the_run_is_in_the_way_rather_than_the_model_being_down():
+    """Fix round 1, I1 (the brief's own wording). `gpu_busy` used to leave the plate saying «модель
+    не поднята — поднимется при первом сообщении» directly above a transcript entry saying a
+    generation is in the way. Two answers to one question, and the wrong one is the bigger one.
+    """
+    status, busy, busy_blind, down, external = _node_eval("""
+      const payload = {error: {code: "gpu_busy", message: "идёт прогон"}};
+      const state = {id: "a", promptText: "п", savedText: "п", log: []};
+      app.landFailure(state, state, payload, 4200);
+      console.log(JSON.stringify([state.llmStatus,
+        app.llmPlateText("busy", {runningSeconds: 4200}),
+        app.llmPlateText("busy", {runningSeconds: 0}),
+        app.llmPlateText("down", {}),
+        app.llmPlateText("down", {external: true})]));
+    """)
+    assert status == "busy", "a turn refused by the queue must not leave the plate saying `down`"
+    assert "прогон" in busy and "1 ч 10 мин" in busy, busy
+    assert "~" not in busy_blind, "a run with no estimate promises no minutes"
+    assert "не поднята" in down and down != busy
+    assert "внешний" in external, "there is nothing to raise for a provider on the internet"
+
+
+@_needs_node
+def test_hand_edits_in_the_window_are_noticed_before_the_modal_closes():
+    """Fix round 1, I2. The session on disk holds the model's own answers (`prompt_struct`) and
+    nothing else: an edit made by hand between two turns exists in the browser and nowhere else.
+    Esc and a click on the backdrop are one keystroke away, so the page has to know it is about to
+    throw work away.
+    """
+    fresh, edited, gone, after_turn = _node_eval("""
+      const state = {id: "a", promptText: "текст", savedText: "текст", log: []};
+      const before = app.hasUnsavedEdits(state);
+      state.promptText = "текст, поправленный руками";
+      const after = app.hasUnsavedEdits(state);
+      const turn = {reply: "ок", prompt: {instruction: null,
+        integrated_multimodal_description: "[Shot 1] X.",
+        overall_soundscape: "Wind.", non_diegetic_music: "N/A"}};
+      app.landTurn(state, state, turn);
+      console.log(JSON.stringify([before, after, app.hasUnsavedEdits(null),
+                                  app.hasUnsavedEdits(state)]));
+    """)
+    assert fresh is False and gone is False
+    assert edited is True, "an edit nobody has seen but the browser is unsaved work"
+    assert after_turn is False, (
+        "the model's own answer is not an unsaved edit -- asking about it would train the person "
+        "to dismiss the question")
+
+
+@_needs_node
+def test_an_empty_window_refuses_to_overwrite_the_prompt_or_the_job():
+    """Fix round 1, I3. «сохранить промпт» on an empty window truncated a file in `prompts/` to
+    zero bytes, and «обновить задачу» queued `args = ["generate", ""]`. One click each, no
+    confirmation, nothing to undo it with.
+    """
+    empty, blank, real = _node_eval("""
+      const of = (text) => app.finishRefusal({id: "a", promptText: text, savedText: "", log: []});
+      console.log(JSON.stringify([of(""), of("   \\n  "), of("integrated_multimodal_description: X")]));
+    """)
+    assert empty and "пуст" in empty, empty
+    assert blank == empty, "whitespace is not a prompt either"
+    assert real is None, "a real prompt is saved without a word"
