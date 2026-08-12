@@ -2848,16 +2848,34 @@ def test_two_sec_fetch_site_headers_are_refused_as_well(queue_server):
      "prompt_source"),
     ("PUT", "/api/prompts/new.txt", {"text": "сохрани", "note": "заодно"}, "note"),
     ("POST", "/api/estimate", {"args": ["generate", "кот"], "note": "заодно"}, "note"),
+    # The fourth route, and the one the first version of this test missed: jobs are *posted*
+    # through `POST /api/jobs` and *edited* through `PUT /api/jobs/<id>`, and the rule had only
+    # ever been checked on the first of the pair. `{job}` is filled in below with a job that
+    # really is pending, and `{args}` with an argument list that really would be accepted --
+    # without both, a widened allowlist would fail on the next check instead and the mutation
+    # would come back green for the second time in this task.
+    ("PUT", "/api/jobs/{job}", {"args": "{args}", "note": "", "prompt_text": "подложенный"},
+     "prompt_text"),
 ])
 def test_every_body_route_refuses_a_field_it_does_not_take(queue_server, method, url, body,
                                                             unknown):
-    """Also found by a green mutation: widening the prompt route's allowlist changed nothing,
-    because the only test touching that route sent a body that failed the *next* check anyway.
-    A rule that holds on one route out of three is not a rule.
+    """Found twice by green mutations, on two routes, for the same reason both times: the only
+    test touching the route sent a body that failed the **next** check anyway, so widening the
+    allowlist changed nothing any assertion could see.
+
+    Hence the setup below. A rule that holds on three routes out of four is not a rule, and a
+    case whose request would be refused for a second reason does not test the first one.
     """
+    if "{job}" in url:
+        pending = _queue_a_job(queue_server, "--seed", "1", tag="правка")
+        url = url.format(job=pending["id"])
+        body = {**body, "args": _job_args(queue_server, "--seed", "2", tag="правка")}
+
     status, answer = _call(queue_server, method, url, body)
     assert status == 400, answer
     assert answer["error"]["code"] == "args_invalid", answer
     assert answer["error"]["detail"]["unknown"] == [unknown]
     assert not (queue_server.repo / "prompts" / "new.txt").exists(), (
         "the refusal happened after the write")
+    assert all("2" not in job.args for job in _pending(queue_server)), (
+        "the refusal happened after the edit was applied")
