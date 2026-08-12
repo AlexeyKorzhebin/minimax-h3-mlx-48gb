@@ -1096,6 +1096,30 @@ The companion test — the same-seed Greek battle rewritten into the documented 
 at minimum no worse on stills, and follows its own shot list more visibly: the scripted third-shot
 spear spin appears on schedule. Whether motion quality moved is for the viewing, not for stills.
 
+## A line of dialogue survives a cut between independent renders
+
+2026-08-12, the ballad (`docs/ballad-scenario.md`): three ten-second clips — the battle, the
+mercy, the embrace — chained by i2v conditioning, each keyframe taken from the penultimate
+second of the previous clip, one seed for all three, concatenated without re-encoding into
+`27-баллада/ballad-full-30s.mp4`. This was the plan's montage experiment and its speech
+experiment folded into one story, and every mechanism under test worked:
+
+- **Speech, in two languages.** Her Russian «Сдавайся!» and his English "Never!" land in their
+  scripted windows (voiced harmonics at 4.1–4.9 s and 6.0–6.7 s of clip 2, mouths open on the
+  matching frames).
+- **A line split across the splice.** Clip 2 ends on "I will not" (voiced segment right at the
+  9.5 s boundary), marked `<scenetrans>` in both prompts; clip 3 opens with "hurt you." inside
+  its first 0.7 s. The clips were rendered independently — nothing but the prompt text and the
+  keyframe connects them — and the phrase reads as one sentence across the cut.
+- **Identity across two i2v hops.** Faces, builds and the overcast light hold through both
+  splices; the final wide embrace is recognisably the same two people who crossed weapons
+  twenty seconds and two renders earlier.
+
+The viewer's verdict on the assembled thirty seconds: it came out as planned. Worth keeping
+for next time: clips 2 and 3 deliberately end in near-static poses so their final frames make
+clean conditioning targets, and the penultimate-second rule (`-sseof -1.5`) dodged the motion
+blur of true last frames — neither choice has been varied yet, both are recorded as fixed.
+
 ## The plastic skin was the lighting, not the recipe
 
 A viewer described skin on the 896x576 Greek clips as plastic — overexposed, oiled. Four runs at
