@@ -148,6 +148,25 @@ CHAT_SOURCE_KEYS = frozenset({"kind", "name", "id"})
 #: sentence about the given first frame, a `t2va` one must not.
 DEFAULT_CHAT_MODE = "t2va"
 
+#: The only file types a chat turn will attach as a keyframe. An **allowlist**, and the same shape
+#: as `MEDIA_SUFFIXES` for the same reason -- with one addition that is not a formality.
+#:
+#: `resolve_within` bounds *where* a keyframe may live; it says nothing about *what* the file is,
+#: and `<outdir>/.env` -- the file that holds this machine's provider tokens -- lives inside one of
+#: those roots. Review circle 1 of this task pointed a session at it and watched the bytes leave
+#: base64'd inside a chat turn, to an external provider. The bound and the type are two different
+#: questions and both have to be asked.
+#:
+#: No `.mp4` and no `.wav`, unlike `/media`: this list is what a *vision model* is sent, not what
+#: the page may display.
+CHAT_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
+
+#: The biggest keyframe a turn will carry. Not a security bound -- `CHAT_IMAGE_SUFFIXES` is that --
+#: but a limit on what is worth sending: base64 inflates by a third, and a 40 MB frame becomes 53 MB
+#: of context that a local model spends minutes on before answering. Bigger than `MAX_BODY_BYTES`
+#: on purpose: that one bounds what a *request* may carry, and a keyframe arrives as a path.
+CHAT_IMAGE_MAX_BYTES = 16 * 1024 * 1024
+
 #: HTTP status for each `CliError` code that is not a plain refusal of the request. Everything
 #: absent from here is 400: the caller asked for something this server will not do.
 #:
@@ -164,6 +183,9 @@ ERROR_STATUS = {
     # precisely the "match on the code, never on the message" contract these codes exist to keep.
     "origin_not_allowed": 403,
     "job_not_pending": 409,
+    # 409 for the same reason `job_not_pending` is: the request was valid and lost a race -- with
+    # another turn of the same session, which is holding its lock and talking to the model.
+    "chat_busy": 409,
     "queue_unwritable": 500,
     "internal_error": 500,
 }
@@ -959,6 +981,48 @@ def _serve_file(root, relative: str, *, suffixes) -> tuple[int, str, bytes]:
             {"path": relative, "error": f"{type(exc).__name__}: {exc}"})
 
 
+@contextlib.contextmanager
+def chat_session_lock(path):
+    """Hold `<sid>.lock` for one turn, or refuse with `chat_busy`.
+
+    A turn is a read-modify-write of the session file with a call to a language model in the
+    middle of it, and `ThreadingHTTPServer` runs two of them in two threads. Two tabs -- or one
+    double click -- therefore both read the session before either writes, both pay for the model,
+    and the second write silently erases the first exchange.
+
+    It is worse than lost text. `queue.write_text_durably` names its temp file after the **pid**,
+    not the thread, so two turns of one process collide on a single `.tmp-<pid>`: whichever loses
+    the `os.replace` gets `FileNotFoundError` cleaning up a file the other one already renamed --
+    a 500 handed to the caller *after* the model was called and paid for. Review circle 1
+    reproduced exactly that, `[200, 500]`.
+
+    **Non-blocking, unlike `queue.queue_lock`.** That one waits because it guards milliseconds of
+    file I/O; this one guards a minute of a model thinking, and a request that waits a minute to
+    then do the same work is not a queue anyone asked for. `LOCK_NB` turns the second turn into an
+    immediate, honest 409 -- and, because the lock is taken before the provider is called, into one
+    that costs nothing.
+
+    The lock file sits beside the session (`<sid>.lock`, never `<sid>.json`), so the lock survives
+    the `os.replace` that swaps the session file underneath it: `flock` follows the inode, and
+    locking the file being replaced would leave the two turns holding locks on two different
+    inodes.
+    """
+    lock_file = Path(path).with_suffix(".lock")
+    fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CliError("chat_busy", "ход уже идёт — дождитесь ответа модели",
+                           {"id": Path(path).stem}) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _generation_running(queue_root):
     """The jobs a worker is running right now -- empty when the GPU is free.
 
@@ -1508,21 +1572,32 @@ class _Handler(BaseHTTPRequestHandler):
             )
         return target
 
-    def _chat_image(self, raw: str) -> str:
-        """A keyframe path from a request body, checked against the same roots a run's `--image`
-        is checked against, and stored resolved.
+    def _chat_image_path(self, raw: str) -> Path:
+        """A keyframe path from a session or a request body: inside a root, and an image.
 
-        The check is not a formality here. The bytes of this file are base64'd into a chat turn and
-        sent to whichever provider is active -- possibly one on the internet -- so an unchecked path
-        would turn one POST into "read any file on this machine and upload it". `--image` is a
-        `read` flag in `PATH_FLAGS` for a run; a chat about that same frame cannot be laxer.
+        Neither check is a formality. The bytes of this file are base64'd into a chat turn and sent
+        to whichever provider is active -- possibly one on the internet -- so an unchecked path
+        turns one POST into "read any file on this machine and upload it". `--image` is a `read`
+        flag in `PATH_FLAGS` for a run; a chat about that same frame cannot be laxer.
 
-        Resolved on the way in, like `check_path_flags` does, so the session stores the path the
+        And the root bound alone is not enough, which is what review circle 1 found: `<outdir>/.env`
+        is *inside* a root and holds the provider tokens. The type allowlist is the second question
+        (`CHAT_IMAGE_SUFFIXES`), asked of the **resolved** path, so a link named `frame.png`
+        pointing at `.env` is judged as `.env` -- the same rule, and the same reasoning, as
+        `_serve_file`.
+
+        Resolved on the way out, like `check_path_flags` does, so the session stores the path the
         server will actually open rather than one that means something else from another directory.
         """
-        if not raw:
-            return ""
-        return str(resolve_within(raw, self.server.roots, write=False))
+        target = resolve_within(raw, self.server.roots, write=False)
+        if target.suffix.lower() not in CHAT_IMAGE_SUFFIXES:
+            raise CliError(
+                "bad_image",
+                f"кадром может быть только {sorted(CHAT_IMAGE_SUFFIXES)}, а {target.name!r} — нет",
+                {"path": str(raw), "suffix": target.suffix,
+                 "allowed": sorted(CHAT_IMAGE_SUFFIXES)},
+            )
+        return target
 
     def _create_chat(self) -> tuple[int, str, bytes]:
         """`POST /api/chat`: one new session on disk, and its id.
@@ -1543,10 +1618,11 @@ class _Handler(BaseHTTPRequestHandler):
                 {"source": source if isinstance(source, (dict, str)) else None,
                  "kinds": sorted(CHAT_SOURCE_KINDS), "keys": sorted(CHAT_SOURCE_KEYS)},
             )
+        image = self._string_of(payload, "image")
         session = {"id": secrets.token_hex(4),
                    "source": source,
                    "mode": self._string_of(payload, "mode"),
-                   "image": self._chat_image(self._string_of(payload, "image")),
+                   "image": str(self._chat_image_path(image)) if image else "",
                    "messages": [],
                    "prompt": self._string_of(payload, "prompt")}
         self._write_session(self._chat_path(session["id"]), session)
@@ -1588,15 +1664,21 @@ class _Handler(BaseHTTPRequestHandler):
         return 200, "application/json", _json_bytes({"ok": True, **session})
 
     def _turn_content(self, text: str, image: str):
-        """The user's turn: plain text, or `[text, image_url]` when the session has a keyframe.
+        """The user's turn, and a warning: plain text, or `[text, image_url]` plus `None`.
 
         The two parts are what a vision model needs to see the frame, and the same shape works for
         llama-server with an mmproj and for the external OpenAI-protocol providers.
 
-        A frame that cannot be read is a **warning, not a refusal**: the file may have been moved
-        since the session was opened, and refusing the turn would strand a conversation that has
-        nothing else wrong with it. The page writes the warning into the transcript so nobody spends
-        a turn wondering why the model is describing a frame it never received.
+        **Anything wrong with the frame is a warning, not a refusal.** The file may have been moved
+        since the session was opened, or the session may be older than a rule this server has since
+        learned; refusing the turn would throw away text the person already wrote for a reason that
+        has nothing to do with it. The warning is `{"code", "message"}` rather than a sentence, so
+        the page matches on the code like it does everywhere else, and writes it into the transcript
+        -- nobody should spend a turn wondering why the model is describing a frame it never got.
+
+        **The checks are repeated here even though `_create_chat` already made them.** A session
+        lives on disk between the two, and the file it names can change under it; the decision to
+        send bytes belongs where the bytes are read.
 
         The image never enters the session's history -- it is attached again on every turn instead.
         A base64 PNG in `messages` would grow the session file by a megabyte per turn and would be
@@ -1604,11 +1686,22 @@ class _Handler(BaseHTTPRequestHandler):
         """
         if not image:
             return text, None
-        path = Path(self._chat_image(image))
         try:
+            path = self._chat_image_path(image)
+            size = path.stat().st_size
+            if size > CHAT_IMAGE_MAX_BYTES:
+                raise CliError(
+                    "bad_image",
+                    f"кадр больше {CHAT_IMAGE_MAX_BYTES} байт ({size}): {image}",
+                    {"path": image, "bytes": size, "limit": CHAT_IMAGE_MAX_BYTES})
             data = path.read_bytes()
-        except OSError:
-            return text, f"кадр не прочитался: {image}"
+        except CliError as exc:
+            return text, {"code": exc.code, "message": exc.message}
+        except FileNotFoundError:
+            return text, {"code": "image_not_found", "message": f"кадр не прочитался: {image}"}
+        except OSError as exc:
+            return text, {"code": "image_unreadable",
+                          "message": f"кадр не прочитался: {image} ({exc})"}
         url = f"data:{_content_type(path)};base64,{base64.b64encode(data).decode('ascii')}"
         return [{"type": "text", "text": text},
                 {"type": "image_url", "image_url": {"url": url}}], None
@@ -1634,12 +1727,33 @@ class _Handler(BaseHTTPRequestHandler):
         `bad_model_json`, `llama_did_not_start`). That mapping is this method's job and not
         `provider`'s: the domain layer raises a named failure, and the HTTP boundary decides what
         that is worth as a status -- the same shape as `queue.JobNotPending` -> `CliError` above.
+
+        **One turn of one session at a time** (`chat_session_lock`): the whole read-modify-write,
+        the model call included, happens under the session's own lock, and a second turn of the
+        same session is refused with `chat_busy` before it costs anything. The body is parsed
+        first, so a malformed request is still a 400 rather than a lock contention report; the
+        session is re-read *inside* the lock, because the copy read before it may be a turn out of
+        date by the time the lock is granted.
         """
-        path, session = self._read_session(sid)
-        if session is None:
+        path = self._chat_path(sid)
+        # `is_file` before the lock, so a bogus id does not leave a `.lock` file behind -- and
+        # inside `name_too_long_is_a_refusal`, because `pathlib` swallows `ENOENT` but not
+        # `ENAMETOOLONG`, and a 400-character id in a URL is the caller's input, not a bug here.
+        with name_too_long_is_a_refusal("a chat id"):
+            exists = path.is_file()
+        if not exists:
             return 404, "application/json", _error_bytes(
                 "chat_not_found", f"нет сессии {sid}", {"id": sid})
         payload = self._json_request(allowed=("text", "prompt", "provider"))
+        with chat_session_lock(path):
+            return self._locked_turn(sid, path, payload)
+
+    def _locked_turn(self, sid: str, path: Path, payload: dict) -> tuple[int, str, bytes]:
+        """One turn, with this session's lock already held. See `_chat_message`."""
+        _, session = self._read_session(sid)
+        if session is None:
+            return 404, "application/json", _error_bytes(
+                "chat_not_found", f"нет сессии {sid}", {"id": sid})
         text = self._string_of(payload, "text")
         roster = provider.load_providers(self.server.outdir)
         name = self._string_of(payload, "provider") or roster["active"]

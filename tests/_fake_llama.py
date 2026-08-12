@@ -12,16 +12,21 @@ than one imported by name, and this is a class, not a fixture.
 import http.server
 import json
 import threading
+import time
 
 
 class _FakeLlama:
     """llama-server, который ничего не грузит: /health 200 и захардкоженный чат-ответ.
 
     Поток обрывается close(); порт выдаёт ядро (port=0), чтобы тесты не дрались.
+
+    `delay` — сколько секунд «думать» перед ответом. Настоящий ход занимает десятки секунд, и
+    ровно в это окно приходит второй запрос той же сессии; без задержки гонку не поймать —
+    первый ход успевает закончиться раньше, чем второй начнётся.
     """
 
-    def __init__(self, chat_payload=None, health: int = 200):
-        handler_cls = self._make_handler(chat_payload, health)
+    def __init__(self, chat_payload=None, health: int = 200, delay: float = 0.0):
+        handler_cls = self._make_handler(chat_payload, health, delay)
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
         self.port = self.httpd.server_address[1]
         self.requests: list[dict] = []
@@ -29,7 +34,7 @@ class _FakeLlama:
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
 
-    def _make_handler(self, chat_payload, health):
+    def _make_handler(self, chat_payload, health, delay=0.0):
         class Handler(http.server.BaseHTTPRequestHandler):
             seen: list = []
 
@@ -44,6 +49,8 @@ class _FakeLlama:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 type(self).seen.append({"path": self.path, "body": body,
                                          "headers": dict(self.headers)})
+                if delay:
+                    time.sleep(delay)
                 out = json.dumps(chat_payload or {}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

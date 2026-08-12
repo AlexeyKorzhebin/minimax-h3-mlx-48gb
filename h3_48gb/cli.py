@@ -132,6 +132,8 @@ ERROR_CODES = {
     # raised inside `h3_48gb.provider` and reach the wire unchanged, because a failure of the model
     # is not a failure of this server and a page that has to tell them apart matches on the code.
     "chat_not_found": "there is no chat session with that id under `<outdir>/chat/`",
+    "chat_busy": "a turn of this session is already in flight; one at a time, so neither erases the other",
+    "bad_image": "the keyframe is not one of the image types a chat turn may attach, or is over the size limit",
     "provider_unavailable": "the chat provider is missing or unusable; `detail.provider` names it and the message says why",
     "gpu_busy": "a generation is running, so the local chat model is not raised: it would want the same 31 GB",
     "llama_did_not_start": "llama-server was spawned but never answered /health; the log tail is in the message",

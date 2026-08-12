@@ -184,6 +184,18 @@ def test_a_session_id_cannot_climb_out_of_the_chat_directory(_serve, sid):
     assert (status, payload["error"]["code"]) == (400, "path_outside_root")
 
 
+def test_a_chat_id_too_long_to_be_a_filename_is_a_refusal_not_a_500(_serve):
+    """`pathlib` глотает ENOENT, но не ENAMETOOLONG: 400-символьный id в URL — ввод снаружи, и
+    отвечать на него «в сервере баг» нечестно. Тот же класс ошибок, что чинит
+    `name_too_long_is_a_refusal` для id задачи."""
+    srv = _serve()
+    sid = "a" * 400
+    for status, payload in (srv.get_json_raw(f"/api/chat/{sid}"),
+                            srv.post_json_raw(f"/api/chat/{sid}/message",
+                                              {"text": "x", "prompt": ""})):
+        assert (status, payload["error"]["code"]) == (400, "path_outside_root")
+
+
 def test_a_message_to_a_session_that_does_not_exist_is_a_named_404(_serve):
     srv = _serve()
     status, payload = srv.get_json_raw("/api/chat/deadbeef")
@@ -258,6 +270,45 @@ def test_the_history_of_the_session_travels_with_the_next_turn(_serve, fake_llam
     assert contents[1:] == ["мрачнее", "Сделал мрачнее.", "а теперь наоборот"]
 
 
+def test_two_turns_of_one_session_at_the_same_time_leave_one_answer_and_no_500(_serve):
+    """Две вкладки (или двойной клик) шлют ход одной сессии одновременно.
+
+    Без замка обе читают файл сессии до записи любой из них, обе платят за вызов модели, и
+    победитель затирает проигравшего — обмен исчезает молча. Хуже: `write_text_durably` называет
+    временный файл по **pid**, а не по потоку, так что два потока одного процесса дерутся за один
+    `.tmp-<pid>`, и проигравший получает `FileNotFoundError` → 500 уже *после* оплаченного ответа
+    модели. Правильный ответ — честный 409 `chat_busy` **до** обращения к модели.
+
+    Проверяется всё три сразу: ровно один 200 и ровно один 409, ровно один обмен в сессии, ровно
+    один запрос к модели. Без последней строчки тест проходил бы и на реализации, которая просто
+    выполняет ходы по очереди — а это уже не отказ, а очередь, и страница о ней не знает.
+    """
+    fake = _FakeLlama(chat_payload=_TURN, delay=0.3)
+    try:
+        srv = _serve(providers=_external(fake.port), active="openrouter")
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        answers: list[tuple[int, dict]] = []
+        lock = threading.Lock()
+
+        def turn():
+            got = srv.post_json_raw(f"/api/chat/{sid}/message", {"text": "мрачнее", "prompt": "п"})
+            with lock:
+                answers.append(got)
+
+        threads = [threading.Thread(target=turn) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        assert sorted(status for status, _ in answers) == [200, 409], answers
+        assert [payload["error"]["code"] for status, payload in answers if status == 409] \
+            == ["chat_busy"]
+        assert len(srv.get_json(f"/api/chat/{sid}")["messages"]) == 2, "обмен ровно один"
+        assert len(fake.requests) == 1, "проигравший не должен был звать модель"
+    finally:
+        fake.close()
+
+
 def test_the_reply_and_the_prompt_are_saved_and_survive_a_reload(_serve, fake_llama):
     srv = _serve(providers_port=fake_llama.port)
     sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
@@ -301,8 +352,60 @@ def test_a_keyframe_that_stopped_being_readable_is_a_warning_not_a_refusal(_serv
     png.unlink()
     answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "опиши кадр", "prompt": ""})
     assert answer["reply"] == "Сделал мрачнее."
-    assert "gone.png" in answer["warning"]
+    assert answer["warning"]["code"] == "image_not_found"
+    assert "gone.png" in answer["warning"]["message"]
     assert isinstance(fake_llama.requests[-1]["body"]["messages"][-1]["content"], str)
+
+
+def test_a_keyframe_that_is_not_an_image_is_refused_when_the_session_opens(_serve):
+    """`resolve_within` ограничивает *где* лежит файл, но не *что это за файл*, а `<outdir>/.env`
+    лежит внутри корня и хранит токены. Без allowlist типов один POST выгружал его base64-ом
+    активному провайдеру — воспроизведено зондом ревью."""
+    srv = _serve()
+    secret = Path(srv.root) / ".env"
+    secret.write_text("OPENROUTER_API_KEY=sk-very-secret\n", encoding="utf-8")
+    status, payload = srv.post_json_raw("/api/chat", {"source": {"kind": "new"}, "prompt": "",
+                                                      "mode": "i2v", "image": str(secret)})
+    assert (status, payload["error"]["code"]) == (400, "bad_image")
+
+
+def test_a_session_pointing_at_a_file_that_is_not_an_image_sends_the_turn_without_it(_serve,
+                                                                                     fake_llama):
+    """Та же проверка второй раз — уже при чтении файла, а не при создании сессии.
+
+    Сессия на диске переживает и правки руками, и версию сервера без проверки на входе, поэтому
+    решение «прикладывать ли кадр» принимается там, где читаются байты. Ход при этом не срывается:
+    отказывать в разговоре из-за кадра — потерять уже написанный текст.
+    """
+    srv = _serve(providers_port=fake_llama.port)
+    secret = Path(srv.root) / ".env"
+    secret.write_text("OPENROUTER_API_KEY=sk-very-secret\n", encoding="utf-8")
+    sid = "beefbeef"
+    (Path(srv.root) / "chat").mkdir(exist_ok=True)
+    (Path(srv.root) / "chat" / f"{sid}.json").write_text(json.dumps(
+        {"id": sid, "source": {"kind": "new"}, "mode": "i2v", "image": str(secret),
+         "messages": [], "prompt": ""}), encoding="utf-8")
+    answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "опиши кадр", "prompt": ""})
+    sent = fake_llama.requests[-1]["body"]["messages"][-1]["content"]
+    assert isinstance(sent, str), "к ходу приложили не картинку"
+    assert "sk-very-secret" not in json.dumps(fake_llama.requests[-1]["body"], ensure_ascii=False)
+    assert answer["warning"]["code"] == "bad_image"
+    assert ".env" in answer["warning"]["message"]
+
+
+def test_a_keyframe_bigger_than_the_limit_is_dropped_with_a_warning(_serve, fake_llama,
+                                                                    monkeypatch):
+    """Потолок размера — не про безопасность, а про то, что 40-мегабайтный кадр в base64 уходит
+    в контекст модели и возвращается таймаутом через десять минут."""
+    monkeypatch.setattr(web, "CHAT_IMAGE_MAX_BYTES", 8)
+    srv = _serve(providers_port=fake_llama.port)
+    png = Path(srv.root) / "big.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": "",
+                                      "mode": "i2v", "image": str(png)})["id"]
+    answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "опиши кадр", "prompt": ""})
+    assert isinstance(fake_llama.requests[-1]["body"]["messages"][-1]["content"], str)
+    assert answer["warning"]["code"] == "bad_image"
 
 
 def test_a_keyframe_outside_every_root_is_refused_when_the_session_opens(_serve, tmp_path):
