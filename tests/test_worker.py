@@ -347,6 +347,35 @@ def test_the_worker_waits_for_a_live_job_then_picks_the_queue_back_up(tmp_path):
     assert spawned, "the worker never resumed after the other job's lease was released"
 
 
+# -- Task 6: a resident LLM holding the GPU defers the queue too ---------------------------------
+
+
+def test_worker_leaves_the_queue_alone_while_the_llm_holds_the_gpu(tmp_path, monkeypatch):
+    """A resident local LLM and a 27 GB generation cannot share 48 GB. The page is the one that
+    asks the human and calls `POST /api/llm/unload` -- the worker only ever watches the port, so
+    this test drives `_llm_holds_gpu` directly rather than standing up a real llama-server.
+    """
+    root = tmp_path / "queue"
+    _queued(root, tmp_path, tag="a")
+    holds = {"value": True}
+    monkeypatch.setattr(worker, "_llm_holds_gpu", lambda r: holds["value"])
+    spawned: list[list[str]] = []
+    stop = threading.Event()
+
+    thread = threading.Thread(target=lambda: worker.main_loop(
+        root, poll=0.05, stop=stop, spawn=_recording(spawned)), daemon=True)
+    thread.start()
+    time.sleep(0.3)
+    assert spawned == [], "the worker took a job while the LLM still held the GPU"
+    holds["value"] = False  # the page confirmed with the human and called /api/llm/unload
+    deadline = time.time() + 5
+    while not spawned and time.time() < deadline:
+        time.sleep(0.05)
+    stop.set()
+    thread.join(timeout=5)
+    assert spawned, "the worker never resumed once the LLM released the GPU"
+
+
 # -- Step 9: stopping ----------------------------------------------------------------------------
 
 

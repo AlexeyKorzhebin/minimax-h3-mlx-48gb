@@ -41,6 +41,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from h3_48gb import provider
 from h3_48gb import queue as q
 
 #: The file whose `flock` means "a worker is running on this machine". Probed by the web server
@@ -265,6 +266,21 @@ def _stop_signals(stop: threading.Event):
             signal.signal(sig, old)
 
 
+def _llm_holds_gpu(root) -> bool:
+    """A resident local LLM and a 27 GB generation cannot share 48 GB. The chat page owns the
+    *decision* to free the GPU -- it asks the human and, on confirmation, calls
+    `POST /api/llm/unload` -- the worker only ever observes whether the port still answers.
+
+    Reads `providers.json` from `root`, the exact value `main_loop` was called with: it is the
+    caller's job to pass the same root the web server treats as its `outdir` (where
+    `provider.load_providers` looks), not a queue subdirectory underneath it -- a `root` one level
+    too deep would find no roster and this check would silently never fire.
+    """
+    roster = provider.load_providers(root)
+    cfg = roster["providers"].get(roster["active"] or "", {})
+    return cfg.get("type") == "llama-local" and provider.port_alive(cfg.get("port", 0))
+
+
 def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen) -> int:
     """Run queued jobs until asked to stop. Returns how many jobs were run to completion.
 
@@ -274,6 +290,13 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen) -> int
     is another live generation, and a second one means two 36 GB processes on a 48 GB machine.
     It sleeps `poll` and reconciles again instead of waiting for ever -- once the other run is
     gone, the queue has to move.
+
+    The same "take nothing, sleep, look again" shape applies when a resident local LLM holds the
+    GPU instead of another lease (`_llm_holds_gpu`): a 27 GB generation cannot start next to a
+    30 GB model. Unlike a live lease, nothing here ever unloads the LLM -- only a human, confirming
+    on the chat page, does that via `POST /api/llm/unload` -- so the check sits right after
+    `reconcile` and before `claim`, purely observing the port until the human's confirmation makes
+    it go quiet.
 
     `stop` is anything with `is_set()`/`wait()`; `_stop_signals` sets the one created here when the
     first `SIGTERM`/`SIGINT` arrives. It stops the *selection* of new jobs only -- a job already
@@ -301,6 +324,10 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen) -> int
         while not stop.is_set():
             state = q.reconcile(root)
             if state.alive:
+                if stop.wait(poll):
+                    break
+                continue
+            if _llm_holds_gpu(root):
                 if stop.wait(poll):
                     break
                 continue
