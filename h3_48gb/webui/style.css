@@ -788,6 +788,68 @@ body[data-stale] main { opacity: .55; }
   font-size: 11.5px; color: var(--ink-3); text-align: center; padding: 8px;
 }
 
+/* ===========================================================================
+   ДИАЛОГОВЫЙ РЕДАКТОР ПРОМПТА
+
+   Модалка поверх страницы: слева окно промпта, справа лента диалога. Обе
+   половины видны разом от 1100 px — правка промпта и реплика, которая её
+   объясняет, читаются вместе или не читаются вовсе. Ниже этой ширины окна
+   встают колонкой, промпт сверху: он главный, лента — способ его получить.
+
+   Подложка прокручивается сама (`overflow: auto`), а окно центрируется
+   полями `margin: auto` внутри флекса: на коротком экране модалка не
+   обрезается снизу, а уезжает вверх вместе с прокруткой.
+   =========================================================================== */
+.modal-back {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(0, 0, 0, .55);
+  overflow: auto;
+  display: flex; padding: var(--pad);
+}
+.modal {
+  margin: auto; width: min(1440px, 100%);
+  background: var(--card); border-radius: var(--r-card);
+  box-shadow: var(--shadow-pop); padding: var(--cardpad);
+}
+.modal.chat { display: grid; grid-template-columns: 1fr; gap: 26px; }
+@media (min-width: 1100px) {
+  .modal.chat { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+}
+
+.chat-prompt, .chat-talk { min-width: 0; display: flex; flex-direction: column; }
+/* Окно промпта ниже, чем в форме: рядом с ним лента, и обе половины должны
+   уместиться в экран целиком. */
+.chat-prompt .editor { height: min(44vh, 420px); min-height: 220px; }
+
+.chat-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 12px; }
+.chat-head #chat-llm { margin-right: auto; }   /* кнопки завершения — к правому краю */
+.chat-head #chat-provider { max-width: 200px; }
+
+/* Лента занимает всё, что осталось от колонки после шапки и поля ввода: `flex: 1` вместо
+   заданной высоты — иначе на широком экране под полем ввода зияет пустота, а на узком лента
+   упирается в потолок раньше, чем в край экрана. */
+.chat-log {
+  list-style: none; margin: 0; padding: 2px 0;
+  flex: 1; min-height: 180px; max-height: 60vh; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 8px;
+}
+/* Реплика — абзац, а не строка таблицы: переносы модели значимы (она пишет
+   промпт блоками), поэтому pre-wrap, а длинное имя файла в предупреждении
+   рвётся где придётся, лишь бы не растягивало колонку. */
+.chat-log .turn {
+  max-width: 92%; padding: 9px 12px; border-radius: var(--r-inner);
+  line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.chat-log .user { align-self: flex-end; background: var(--accent-soft); color: var(--accent-ink); }
+.chat-log .assistant { background: var(--fill); }
+.chat-log .note { max-width: 100%; font-size: 12.5px; background: var(--fill); color: var(--ink-3); }
+.chat-log .note.warn { background: var(--warn-soft); color: var(--warn-ink); }
+.chat-log .note.bad { background: var(--fail-soft); color: var(--fail-ink); }
+
+#chat-form { display: flex; gap: 9px; align-items: flex-end; margin-top: 12px; }
+#chat-input { flex: 1; resize: vertical; line-height: 1.45; }
+#chat-send:disabled { background: var(--fill-2); color: var(--ink-3); cursor: not-allowed; }
+
 /* ---------- узкие окна ---------- */
 @media (max-width: 1180px) {
   :root { --pad: 20px; --cardpad: 18px; }

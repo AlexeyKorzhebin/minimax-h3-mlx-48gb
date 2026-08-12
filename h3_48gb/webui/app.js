@@ -681,12 +681,13 @@ const SPEC_CELLS = (job) => {
 };
 
 /**
- * Ждущая задача: четыре действия — править, наверх, копия, удалить.
+ * Ждущая задача: пять действий — обсудить, править, наверх, копия, удалить.
  *
  * Править/наверх/удалить есть только здесь: у идущей и завершённой их нет вовсе — не серые
- * кнопки, а их отсутствие, серая кнопка обещает, что когда-нибудь нажмётся. Копия — исключение:
- * она ничего не меняет в этой задаче, только читает её `args`/`note`, поэтому уместна и у
- * завершённой тоже (см. `finishedRowHtml`).
+ * кнопки, а их отсутствие, серая кнопка обещает, что когда-нибудь нажмётся. Обсудить — из той
+ * же породы: разговор кончается `PUT /api/jobs/<id>`, а он бывает только у ждущей. Копия —
+ * исключение: она ничего не меняет в этой задаче, только читает её `args`/`note`, поэтому
+ * уместна и у завершённой тоже (см. `finishedRowHtml`).
  */
 export function pendingRowHtml(job, { editingId = null } = {}) {
   const peak = jobPeak(job);
@@ -704,6 +705,7 @@ export function pendingRowHtml(job, { editingId = null } = {}) {
     + `<i class="mg" title="из ${PHYSICAL_GB} ГБ, риска на ${WARN_GB}">`
     + `<b style="width:${Math.min(100, peak / PHYSICAL_GB * 100)}%"></b></i></span>`
     + `<span class="acts">`
+    + `<button data-act="chat" data-id="${id}">Обсудить</button>`
     + `<button data-act="edit" data-id="${id}">Править</button>`
     + `<button data-act="top" data-id="${id}">Наверх</button>`
     + `<button data-act="dup" data-id="${id}">Копия</button>`
@@ -891,6 +893,124 @@ export function defaultOutdir(state, today = new Date()) {
 }
 
 /* ===========================================================================
+   ДИАЛОГ
+
+   The modal's own logic, kept here rather than inside `startPage()` for the
+   reason the whole top half of this file exists: a conversation that rewrites
+   the prompt window is checkable by `node` only while the rewriting is a
+   function of its arguments.
+   =========================================================================== */
+
+/**
+ * Ответ модели, собранный в текст промпта.
+ *
+ * The three fields and their order are fixed by the JSON schema the model answers under
+ * (`provider.PROMPT_SCHEMA`), so the model cannot lose a field or reorder them and this
+ * function does not have to guess at either. `instruction` carries no header of its own --
+ * it is the keyframe sentence an `i2v` prompt opens with -- and is separated from the fields
+ * by a blank line, the way the format document writes it. `null` there means `t2v`/`t2va`,
+ * where such a sentence must not appear at all.
+ */
+export function buildPromptText(prompt) {
+  const turn = prompt || {};
+  const blocks = [];
+  const instruction = turn.instruction == null ? "" : String(turn.instruction).trim();
+  if (instruction) blocks.push(instruction);
+  for (const name of PROMPT_FIELDS) {
+    blocks.push(`${name}: ${turn[name] == null ? "" : String(turn[name])}`);
+  }
+  // A trailing newline: the text goes into a file and into `--prompt-file`, and every other
+  // prompt in `prompts/` ends with one.
+  return blocks.join("\n\n") + "\n";
+}
+
+/**
+ * Состояние модалки после одного ответа модели.
+ *
+ * `turn.prompt === null` — реплика без правки (уточняющий вопрос, обсуждение): в ленту она
+ * попадает, окна промпта не касается. Иначе окно переписывается целиком — модель отвечает
+ * промптом полностью, а не куском, и склеивать её ответ с прошлым текстом было бы догадкой.
+ *
+ * Правка руками не теряется по построению: следующий ход уходит с текстом окна, а не с тем,
+ * что модель прислала в прошлый раз (см. `sendChatMessage`).
+ */
+export function applyTurn(state, turn) {
+  const answer = turn || {};
+  if (!Array.isArray(state.log)) state.log = [];
+  state.log.push({ role: "assistant", text: String(answer.reply == null ? "" : answer.reply) });
+  if (answer.prompt) state.promptText = buildPromptText(answer.prompt);
+  return state;
+}
+
+/**
+ * Русская строка отказа хода — по коду, как и везде на этой странице.
+ *
+ * `runningSeconds` — остаток идущего прогона, тот самый, что приборная строка печатает наверху
+ * (`renderRunning`). Без него `gpu_busy` — факт без совета: человек не знает, ждать минуту или
+ * три часа. Прогон без оценки молчит, а не обещает «~0 мин».
+ *
+ * Сообщение при любом отказе остаётся в поле ввода (см. `sendChatMessage`) — об этом сказано
+ * словами, потому что поле выглядит одинаково и когда текст цел, и когда его стёрли.
+ */
+export function chatFailureText(payload, runningSeconds = 0) {
+  const error = (payload && payload.error) || {};
+  const message = error.message || "";
+  switch (error.code) {
+    case "gpu_busy": {
+      const left = Number(runningSeconds) || 0;
+      return "Идёт прогон — модель поднимется после него"
+           + (left > 0 ? ` (~${formatDuration(left)})` : "")
+           + ". Сообщение осталось в поле ввода.";
+    }
+    case "chat_busy":
+      return "Ход уже идёт — дождитесь ответа модели.";
+    case "provider_unavailable":
+      return message || "Активный LLM-провайдер недоступен.";
+    case "llama_did_not_start":
+      return `Модель не поднялась: ${message}`;
+    case "chat_unreachable":
+      return `Провайдер не ответил: ${message}`;
+    case "bad_model_json":
+      return `Модель не удержала формат: ${message}`;
+    default: {
+      const { title, pre } = errorText(payload);
+      return pre ? `${title}: ${pre}` : title;
+    }
+  }
+}
+
+/** Позиционный промпт списка аргументов, или `null`, если промпт уходит файлом. */
+export function promptOfArgs(args) {
+  const list = (Array.isArray(args) ? args : []).map(String);
+  return list.length > 1 && !list[1].startsWith("-") ? list[1] : null;
+}
+
+/**
+ * Те же аргументы задачи, но с промптом `text`.
+ *
+ * `--prompt-file` **убирается**, а не переписывается: у поставленной задачи он показывает на
+ * снимок `queue/prompts/<id>.txt`, который делает сама очередь, и оставить его значило бы
+ * получить 200 на правку и прогон по старому тексту — снимок читает работник, а не страница.
+ * Новый текст уходит позиционно, ровно как его кладёт `buildArgs`, а очередь снимет с него
+ * собственную копию при `PUT /api/jobs/<id>`.
+ */
+export function argsWithPrompt(args, text) {
+  const list = (Array.isArray(args) ? args : []).map(String);
+  const head = list.length ? list[0] : "generate";
+  const rest = [];
+  for (let i = 1; i < list.length; i++) {
+    const item = list[i];
+    if (item === "--prompt-file") { i += 1; continue; }      // флаг вместе со своим значением
+    if (item.startsWith("--prompt-file=")) continue;
+    // Позиционный промпт ставит эта же страница и всегда сразу за подкомандой (`buildArgs`);
+    // ничто другое на этом месте без ведущего дефиса не стоит.
+    if (i === 1 && !item.startsWith("-")) continue;
+    rest.push(item);
+  }
+  return [head, String(text), ...rest];
+}
+
+/* ===========================================================================
    СТРАНИЦА
    Ниже — единственная половина файла, которая знает про DOM и про сеть.
    Вне браузера модуль импортируется ради функций выше и не делает ничего.
@@ -915,6 +1035,8 @@ function startPage() {
   let lastEstimate = null;     // последняя удавшаяся оценка
   let promptFromFile = null;   // {name, text} — что было загружено из файла
   let estimateTimer = null;
+  let chat = null;             // состояние открытой модалки диалога, или null
+  let runningLeft = 0;         // сколько осталось идущему прогону — им объясняется gpu_busy
 
   const readForm = () => ({
     width: Math.round(Number($("width").value) || 0),
@@ -1019,6 +1141,9 @@ function startPage() {
     // -- идёт сейчас
     const running = (queue.running || [])[0] || null;
     const progress = renderRunning(running, workerState, now);
+    // Тот же остаток, что печатается в приборной строке, нужен модалке: `gpu_busy` без него —
+    // отказ без совета, ждать минуту или три часа по нему не понять.
+    runningLeft = progress.left;
 
     // -- ждут
     const pending = queue.pending || [];
@@ -1139,15 +1264,23 @@ function startPage() {
     return { left: remaining };
   }
 
-  function renderPrompt() {
-    const text = $("prompt").value;
+  /* Разбор, подсветка и полоска планов — одни и те же для формы и для модалки: `ids` называет
+     тройку элементов, в которые рисовать (`hl`/`scale`/`parse` у формы, `chat-*` у модалки).
+     Длительность берётся из формы в обоих случаях — сессия чата её не хранит, а разбору нужна
+     одна цифра, чтобы сказать, укладываются ли склейки в ролик. */
+  function paintPrompt(ids, text, { audio }) {
     const declared = Number(String($("duration").value).replace(",", ".")) || 0;
-    const analysis = analysePrompt(text, declared, { audio: $("mode").value === "t2va" });
-    $("hl").innerHTML = highlightHtml(text, analysis);
+    const analysis = analysePrompt(text, declared, { audio });
+    $(ids.hl).innerHTML = highlightHtml(text, analysis);
     const scale = scaleHtml(analysis);
-    $("scale").innerHTML = scale;
-    $("scale").hidden = scale === "";   // пустая полоска покрытия ничего не покрывает
-    $("parse").innerHTML = analysis.notes.map((n) => `<li class="${n.k}">${n.t}</li>`).join("");
+    $(ids.scale).innerHTML = scale;
+    $(ids.scale).hidden = scale === "";   // пустая полоска покрытия ничего не покрывает
+    $(ids.parse).innerHTML = analysis.notes.map((n) => `<li class="${n.k}">${n.t}</li>`).join("");
+  }
+
+  function renderPrompt() {
+    paintPrompt({ hl: "hl", scale: "scale", parse: "parse" }, $("prompt").value,
+                { audio: $("mode").value === "t2va" });
 
     const box = $("prompt-src");
     const file = promptFileArg();
@@ -1306,6 +1439,314 @@ function startPage() {
     renderPrompt();
   }
 
+  // -- диалог -----------------------------------------------------------------------------
+
+  /* Адрес — часть состояния модалки. Обрыв связи или перезагрузка страницы во время хода не
+     теряет разговор: сессия лежит в `<outdir>/chat/<id>.json`, а `#chat/<id>` открывает её
+     заново с историей с диска. Идентификатор — `secrets.token_hex(4)`, шестнадцатеричный. */
+  const CHAT_HASH = /^#chat\/([0-9a-f]+)$/;
+
+  /* Кнопка завершения зависит от источника: разговор о промпте библиотеки кончается файлом,
+     о задаче — правкой задачи, а начатый из формы — текстом в редакторе. `clip` (ролик проекта)
+     сервер уже хранит, а страница открывать пока не умеет — до спеки «проекты» он ведёт себя
+     как новый промпт. */
+  const FINISH_LABEL = { new: "в Редактор", clip: "в Редактор",
+                         prompt: "сохранить промпт", job: "обновить задачу" };
+
+  const LLM_TEXT = {
+    up: "модель поднята",
+    down: "модель не поднята — поднимется при первом сообщении",
+  };
+
+  /* Предупреждение хода — по коду, как и отказ: сервер шлёт `{code, message}` именно затем,
+     чтобы страница не разбирала его предложение. Ход при этом состоялся — просто без кадра. */
+  const WARNING_TEXT = {
+    image_not_found: "Кадр не нашёлся — ход ушёл без картинки",
+    image_unreadable: "Кадр не прочитался — ход ушёл без картинки",
+    bad_image: "Кадр не годится в картинку — ход ушёл без него",
+  };
+
+  function chatSourceText(source) {
+    const it = source || {};
+    if (it.kind === "prompt") return `промпт ${it.name || "?"}`;
+    if (it.kind === "job") return `задача ${it.id || "?"}`;
+    if (it.kind === "clip") return `ролик ${it.id || "?"}`;
+    return "новый промпт";
+  }
+
+  function chatWarningText(warning) {
+    const it = warning || {};
+    const head = WARNING_TEXT[it.code] || "Ход прошёл с оговоркой";
+    return it.message ? `${head}: ${it.message}` : head;
+  }
+
+  /**
+   * Плашка модели. `override` — строка на один случай («жду ответа…»), без него плашка
+   * собирается из выбранного провайдера и последнего известного состояния.
+   *
+   * У внешнего провайдера подниматься нечему: тридцать гигабайт держит только локальная
+   * модель, и `/api/llm` честно отвечает `down` — но «модель не поднята» на openrouter звучит
+   * как «что-то не готово», хотя готово всё.
+   */
+  function renderLlmPlate(override) {
+    if (override) { $("chat-llm").textContent = override; return; }
+    const row = ((chat && chat.providers) || [])
+      .find((item) => item.name === $("chat-provider").value);
+    $("chat-llm").textContent = row && row.type !== "llama-local"
+      ? "внешний провайдер — память этой машины не занимает"
+      : (LLM_TEXT[(chat && chat.llmStatus) || ""] || "состояние модели неизвестно");
+  }
+
+  function renderChatPrompt() {
+    if (!chat) return;
+    // Присваивание только при расхождении: `value = value` во время набора сбрасывает каретку
+    // в конец строки.
+    if ($("chat-prompt-text").value !== chat.promptText) {
+      $("chat-prompt-text").value = chat.promptText;
+    }
+    paintPrompt({ hl: "chat-hl", scale: "chat-scale", parse: "chat-parse" }, chat.promptText,
+                { audio: (chat.mode || $("mode").value) === "t2va" });
+  }
+
+  function renderChatLog() {
+    if (!chat) return;
+    const box = $("chat-log");
+    box.innerHTML = chat.log.length
+      ? chat.log.map((entry) =>
+          `<li class="turn ${entry.role}${entry.kind ? " " + entry.kind : ""}">`
+          + `${escapeHtml(entry.text)}</li>`).join("")
+      : `<li class="turn note">Опишите идею словами — модель соберёт промпт по формату. `
+        + `Уже готовый текст можно вставить в окно слева и попросить привести к стандарту.</li>`;
+    box.scrollTop = box.scrollHeight;   // свежая реплика видна без прокрутки
+  }
+
+  /* Роспись провайдеров и состояние локальной модели. Недоступный провайдер остаётся в списке
+     серым со своей причиной («нет токена OPENROUTER_API_KEY»): исчезнувший из списка выглядит
+     как не настроенный вовсе. */
+  async function loadProviders() {
+    let roster;
+    try {
+      roster = await api("GET", "/api/providers");
+    } catch {
+      renderLlmPlate("роспись провайдеров не прочиталась");
+      return;
+    }
+    const rows = roster.providers || [];
+    if (chat) chat.providers = rows;
+    $("chat-provider").innerHTML = rows.map((row) =>
+      `<option value="${escapeHtml(row.name)}"${row.available ? "" : " disabled"}>`
+      + `${escapeHtml(row.name)}`
+      + (row.available ? "" : ` · ${escapeHtml(row.reason || "недоступен")}`)
+      + `</option>`).join("");
+    $("chat-provider").value = roster.active || "";
+    if (!rows.length) {
+      renderLlmPlate("провайдеров нет — заполните providers.json");
+      return;
+    }
+    try {
+      if (chat) chat.llmStatus = (await api("GET", "/api/llm")).status;
+    } catch {
+      if (chat) chat.llmStatus = "";
+    }
+    renderLlmPlate();
+  }
+
+  /** Новая сессия от источника и переход в неё. `opened` — что видно только странице:
+   *  текст промпта, режим и путь кадра (сервер сам их не знает). */
+  async function openChatModal(source, opened = {}) {
+    try {
+      const answer = await api("POST", "/api/chat", {
+        source,
+        prompt: opened.prompt || "",
+        mode: opened.mode || "",
+        image: opened.image || "",
+      });
+      clearError();
+      window.location.hash = `#chat/${answer.id}`;
+      await syncChatFromHash();
+    } catch (error) {
+      if (error.payload) showError(error.payload);
+    }
+  }
+
+  async function enterChat(id) {
+    let session;
+    try {
+      session = await api("GET", "/api/chat/" + encodeURIComponent(id));
+    } catch (error) {
+      if (error.payload) showError(error.payload);
+      closeChat();
+      return;
+    }
+    chat = {
+      id,
+      source: session.source || { kind: "new" },
+      mode: session.mode || "",
+      /* Окно восстанавливается из последнего ответа модели, а не из `prompt` сессии: `prompt`
+         — это текст, с которым сессию открыли, и ходы его не переписывают (так устроен
+         сервер). Правки руками между ходами в сессии не живут вовсе — они уходят следующим
+         ходом и возвращаются в ответе. */
+      promptText: session.prompt_struct ? buildPromptText(session.prompt_struct)
+                                        : (session.prompt || ""),
+      log: (session.messages || []).map((m) => ({ role: m.role, text: m.content })),
+      sending: false,
+      providers: [],       // роспись из /api/providers — по ней собирается плашка модели
+      llmStatus: "",
+    };
+    $("chat-modal").hidden = false;
+    $("chat-finish").textContent = FINISH_LABEL[chat.source.kind] || FINISH_LABEL.new;
+    $("chat-source").textContent = chatSourceText(chat.source);
+    renderChatPrompt();
+    renderChatLog();
+    await loadProviders();
+    $("chat-input").focus();
+  }
+
+  function closeChat() {
+    chat = null;
+    $("chat-modal").hidden = true;
+    if (CHAT_HASH.test(window.location.hash || "")) window.location.hash = "";
+  }
+
+  async function syncChatFromHash() {
+    const match = CHAT_HASH.exec(window.location.hash || "");
+    if (!match) {
+      if (chat) closeChat();
+      return;
+    }
+    if (chat && chat.id === match[1]) return;
+    await enterChat(match[1]);
+  }
+
+  async function sendChatMessage() {
+    if (!chat || chat.sending) return;
+    const text = $("chat-input").value.trim();
+    if (!text) return;
+    chat.sending = true;
+    $("chat-send").disabled = true;
+    renderLlmPlate("жду ответа — на холодной модели это до минуты");
+    chat.log.push({ role: "user", text });
+    renderChatLog();
+    try {
+      const answer = await api("POST", `/api/chat/${encodeURIComponent(chat.id)}/message`,
+                               { text, prompt: chat.promptText,
+                                 provider: $("chat-provider").value });
+      applyTurn(chat, answer);
+      if (answer.warning) {
+        chat.log.push({ role: "note", kind: "warn", text: chatWarningText(answer.warning) });
+      }
+      $("chat-input").value = "";
+      chat.llmStatus = (answer.llm || {}).status || chat.llmStatus;
+      renderLlmPlate();
+      clearError();
+    } catch (error) {
+      /* Ход не состоялся: сервер ничего не записал, поэтому реплика уходит из ленты обратно —
+         и остаётся в поле ввода. Текст, который человек написал, теряться не должен ни при
+         занятом GPU, ни при упавшем провайдере. */
+      chat.log.pop();
+      chat.log.push({ role: "note", kind: "bad",
+                      text: chatFailureText(error.payload, runningLeft) });
+      chat.llmStatus = "down";
+      renderLlmPlate();
+    } finally {
+      chat.sending = false;
+      $("chat-send").disabled = false;
+      renderChatPrompt();
+      renderChatLog();
+    }
+  }
+
+  /** Промпт поставленной задачи, насколько его вообще видно странице.
+   *
+   *  Снимок `queue/prompts/<id>.txt` маршрутом не отдаётся, поэтому читаются два случая:
+   *  промпт, ушедший позиционно (он лежит прямо в `args`), и задача из библиотеки — у неё
+   *  `prompt_source` называет файл `prompts/<имя>.txt`. Иначе окно открывается пустым:
+   *  пустое честнее чужого текста.
+   */
+  async function jobPromptText(job) {
+    const positional = promptOfArgs(job.args);
+    if (positional !== null) return positional;
+    const match = /^prompts\/([^/]+\.txt)$/.exec(String(job.prompt_source || ""));
+    if (!match) return "";
+    try {
+      return (await api("GET", "/api/prompts/" + encodeURIComponent(match[1]))).text;
+    } catch {
+      return "";
+    }
+  }
+
+  async function openChatFromJob(id) {
+    const job = ((state && state.queue && state.queue.pending) || [])
+      .find((row) => row.id === id);
+    if (!job) return;
+    await openChatModal({ kind: "job", id }, {
+      prompt: await jobPromptText(job),
+      mode: argValue(job.args, "--mode") || "t2va",
+      image: argValue(job.args, "--image") || "",
+    });
+  }
+
+  /**
+   * Кнопка завершения. Что она делает, решает вид источника — и только он.
+   *
+   * Неудача оставляет модалку открытой: текст в окне — единственная копия работы, и закрывать
+   * его после отказа значит терять её.
+   */
+  async function finishChat() {
+    if (!chat) return;
+    const source = chat.source || { kind: "new" };
+    const text = chat.promptText;
+
+    if (source.kind === "prompt" && source.name) {
+      try {
+        const answer = await api("PUT", "/api/prompts/" + encodeURIComponent(source.name),
+                                 { text });
+        // Форма может смотреть на этот же файл: если да, её текст обязан совпасть с тем, что
+        // теперь на диске, иначе следующая постановка уйдёт строкой вместо --prompt-file.
+        if ($("prompt-file").value === source.name) {
+          promptFromFile = { name: source.name, text, path: answer.path };
+          $("prompt").value = text;
+        }
+        await loadPromptList($("prompt-file").value);
+        renderPrompt();
+        clearError();
+        say(`Сохранено · ${answer.bytes} Б`);
+      } catch (error) {
+        if (error.payload) showError(error.payload);
+        return;
+      }
+    } else if (source.kind === "job" && source.id) {
+      const job = ((state && state.queue && state.queue.pending) || [])
+        .find((row) => row.id === source.id);
+      if (!job) {
+        showError({ error: { code: "job_not_pending" } });
+        return;
+      }
+      let failed = false;
+      await withQueue(async () => {
+        try {
+          await api("PUT", "/api/jobs/" + encodeURIComponent(source.id),
+                    { args: argsWithPrompt(job.args, text), note: job.note || "" });
+          say("Задача обновлена");
+        } catch (error) {
+          failed = true;
+          throw error;
+        }
+      });
+      if (failed) return;
+    } else {
+      /* «в Редактор»: дальше обычная постановка. Промпт перестаёт быть файловым — текст
+         разошёлся с файлом ровно в тот момент, когда его переписала модель, и уйти он должен
+         строкой, а не как --prompt-file на старое содержимое. */
+      $("prompt").value = text;
+      promptFromFile = null;
+      $("prompt-file").value = "";
+      renderPrompt();
+      scheduleEstimate();
+    }
+    closeChat();
+  }
+
   // -- действия ---------------------------------------------------------------------------
 
   function fillFormFrom(job) {
@@ -1413,6 +1854,7 @@ function startPage() {
     const button = event.target.closest("button[data-act]");
     if (!button) return;
     const id = button.dataset.id;
+    if (button.dataset.act === "chat") { openChatFromJob(id); return; }
     if (button.dataset.act === "edit") { setEditing(id); return; }
     if (button.dataset.act === "top") {
       withQueue(() => api("POST", `/api/jobs/${encodeURIComponent(id)}/top`, {}));
@@ -1453,12 +1895,79 @@ function startPage() {
     scheduleEstimate();
   });
 
+  // -- подписки модалки -------------------------------------------------------------------
+
+  $("chat-new").addEventListener("click", () => {
+    const mode = $("mode").value;
+    openChatModal({ kind: "new" }, {
+      prompt: $("prompt").value,
+      mode,
+      // Кадр есть только у двух режимов, и только у них он уходит в сессию: модель смотрит на
+      // него глазами, а t2v-разговору показывать нечего.
+      image: (mode === "i2v" || mode === "flf") ? $("image").value.trim() : "",
+    });
+  });
+
+  $("chat-prompt-open").addEventListener("click", async () => {
+    const name = $("prompt-file").value;
+    if (!name || name === NEW_PROMPT) {
+      say("Сначала выберите промпт в списке");
+      return;
+    }
+    let text;
+    try {
+      text = (await api("GET", "/api/prompts/" + encodeURIComponent(name))).text;
+    } catch (error) {
+      if (error.payload) showError(error.payload);
+      return;
+    }
+    openChatModal({ kind: "prompt", name }, { prompt: text, mode: $("mode").value });
+  });
+
+  // Смена провайдера меняет и смысл плашки: у внешнего поднимать нечего.
+  $("chat-provider").addEventListener("change", () => renderLlmPlate());
+  $("chat-close").addEventListener("click", closeChat);
+  $("chat-finish").addEventListener("click", finishChat);
+  $("chat-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    sendChatMessage();
+  });
+  /* Enter отправляет, Shift+Enter переносит строку: поле на две строки — это реплика, а не
+     редактор; сам промпт правится слева. */
+  $("chat-input").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      sendChatMessage();
+    }
+  });
+  /* Правка руками живёт в состоянии модалки и уходит следующим ходом: сервер собирает
+     системное сообщение из тела запроса, а не из сессии, поэтому модель видит именно то, что
+     сейчас в окне. */
+  $("chat-prompt-text").addEventListener("input", () => {
+    if (!chat) return;
+    chat.promptText = $("chat-prompt-text").value;
+    renderChatPrompt();
+  });
+  $("chat-prompt-text").addEventListener("scroll", () => {
+    $("chat-hl").scrollTop = $("chat-prompt-text").scrollTop;
+    $("chat-hl").scrollLeft = $("chat-prompt-text").scrollLeft;
+  });
+  // Клик по подложке и Esc закрывают модалку — привычные два жеста, оба ничего не теряют:
+  // сессия остаётся на диске, и `#chat/<id>` открывает её обратно.
+  $("chat-modal").addEventListener("click", (event) => {
+    if (event.target === $("chat-modal")) closeChat();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && chat) closeChat();
+  });
+  window.addEventListener("hashchange", syncChatFromHash);
+
   // -- запуск -----------------------------------------------------------------------------
 
   syncModeRows();
   renderPrompt();
   renderConnection();
-  poll().then(() => { requestEstimate(); });
+  poll().then(() => { requestEstimate(); syncChatFromHash(); });
   setInterval(poll, POLL_MS);
   setInterval(renderConnection, 1000);
 }

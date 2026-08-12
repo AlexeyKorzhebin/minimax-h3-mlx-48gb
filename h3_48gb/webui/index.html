@@ -66,7 +66,11 @@
         <label for="prompt">Промпт</label>
         <span class="field-side">
           <select id="prompt-file" class="pick" aria-label="файл промпта"></select>
+          <!-- «Обсудить» относится к выбранному в списке файлу, поэтому стоит вплотную
+               к нему; «Новый через диалог» начинает разговор с того, что сейчас в поле. -->
+          <button class="ghost" id="chat-prompt-open" type="button">Обсудить</button>
           <button class="ghost" id="save-prompt" type="button">Сохранить в файл</button>
+          <button class="ghost" id="chat-new" type="button">Новый через диалог</button>
         </span>
       </div>
 
@@ -232,6 +236,49 @@
 </section>
 
 </main>
+
+<!-- ===================================================================
+     3. ДИАЛОГОВЫЙ РЕДАКТОР ПРОМПТА. Модалка, а не отдельная страница:
+     разговор с моделью — продолжение работы над той же задачей, и
+     возвращаться из него некуда.
+
+     Внутри две половины. Слева окно промпта — редактируемое руками, с тем
+     же живым разбором, подсветкой и полоской планов, что и в форме (те же
+     функции рисуют в элементы chat-*). Справа лента диалога с полем ввода.
+     Раскладка адаптивная: от 1100 px обе половины видны разом, ниже —
+     колонкой, промпт сверху.
+     =================================================================== -->
+<div class="modal-back" id="chat-modal" hidden>
+  <div class="modal chat" role="dialog" aria-modal="true"
+       aria-label="Диалоговый редактор промпта">
+
+    <div class="chat-prompt">
+      <div class="field-head">
+        <label for="chat-prompt-text">Промпт</label>
+        <span class="hint" id="chat-source">новый промпт</span>
+      </div>
+      <div class="editor"><pre class="hl" id="chat-hl" aria-hidden="true"></pre>
+        <textarea id="chat-prompt-text" spellcheck="false" wrap="soft"></textarea></div>
+      <div class="scale" id="chat-scale" aria-label="планы и склейки"></div>
+      <ul class="parse" id="chat-parse"></ul>
+    </div>
+
+    <div class="chat-talk">
+      <div class="chat-head">
+        <select id="chat-provider" class="pick" aria-label="провайдер модели"></select>
+        <span id="chat-llm" class="hint">модель не поднята</span>
+        <!-- Надпись зависит от источника: «в Редактор», «сохранить промпт»
+             или «обновить задачу» — её ставит app.js при открытии. -->
+        <button class="ghost" id="chat-finish" type="button">в Редактор</button>
+        <button class="ghost" id="chat-close" type="button">закрыть</button>
+      </div>
+      <ol class="chat-log" id="chat-log"></ol>
+      <form id="chat-form"><textarea id="chat-input" rows="2"
+        placeholder="Опиши идею или попроси переделать…"></textarea>
+        <button class="primary" id="chat-send" type="submit">отправить</button></form>
+    </div>
+  </div>
+</div>
 
 <script type="module" src="/static/app.js"></script>
 </body>

@@ -507,6 +507,39 @@ def test_every_chat_route_names_the_body_fields_it_takes(_serve):
     assert (status, payload["error"]["code"]) == (400, "args_invalid")
 
 
+# -- сквозной путь модалки -----------------------------------------------------------------------
+
+
+def test_a_chat_opened_from_a_library_prompt_survives_a_turn_end_to_end(_serve, fake_llama):
+    """Задача 8, весь путь модалки сразу: открыть сессию от промпта библиотеки, сделать ход и
+    получить назад то, из чего страница рисует обе половины окна.
+
+    Проверяется не только ответ. После перезагрузки модалка восстанавливает окно промпта из
+    `prompt_struct` сессии — и `prompt` при этом обязан остаться тем текстом, с которым сессию
+    открыли: ход его не переписывает (так устроен маршрут), и страница, читающая `prompt`
+    вместо `prompt_struct`, показала бы промпт до правки. Обе половины этого правила стоят
+    рядом здесь, потому что порознь каждая выглядит верной.
+    """
+    srv = _serve(providers_port=fake_llama.port)
+    opened = srv.post_json("/api/chat", {"source": {"kind": "prompt", "name": "x.txt"},
+                                         "prompt": "старый текст", "mode": "t2va"})
+    sid = opened["id"]
+
+    answer = srv.post_json(f"/api/chat/{sid}/message",
+                           {"text": "сделай мрачнее", "prompt": "старый текст"})
+    assert answer["reply"] == "Сделал мрачнее."
+    assert answer["prompt"]["integrated_multimodal_description"] == "[Shot 1] Live-action…"
+    assert answer["warning"] is None, "кадра у t2va-сессии нет, и оговорке взяться неоткуда"
+
+    saved = json.loads((Path(srv.root) / "chat" / f"{sid}.json").read_text(encoding="utf-8"))
+    assert saved["source"] == {"kind": "prompt", "name": "x.txt"}, (
+        "источник решает, что делает кнопка завершения, и обязан пережить ход")
+    assert [(m["role"], m["content"]) for m in saved["messages"]] == [
+        ("user", "сделай мрачнее"), ("assistant", "Сделал мрачнее.")]
+    assert saved["prompt_struct"] == answer["prompt"]
+    assert saved["prompt"] == "старый текст"
+
+
 # -- дублирование задачи -------------------------------------------------------------------------
 
 

@@ -2636,10 +2636,12 @@ def test_the_prompt_parse_rewrites_nothing():
 
 @_needs_node
 def test_only_a_waiting_job_carries_edit_top_and_delete():
-    """Requirement 6, refined by task 7's duplicate button: not grey buttons -- no buttons, a grey
-    button promises it will work one day. That still holds for edit/top/delete, which only ever
-    make sense for a job still waiting to run -- but duplicate reads a job without changing it, so
-    it is offered on the finished row too (see `finishedRowHtml`'s own docstring).
+    """Requirement 6, refined by task 7's duplicate button and task 8's chat: not grey buttons --
+    no buttons, a grey button promises it will work one day. That still holds for
+    edit/top/delete/chat, which only ever make sense for a job still waiting to run (the chat ends
+    in a `PUT /api/jobs/<id>`, and that route refuses a job the worker has already claimed) -- but
+    duplicate reads a job without changing it, so it is offered on the finished row too (see
+    `finishedRowHtml`'s own docstring).
     """
     waiting, finished = _node_eval("""
       const job = {id: "j1", note: "ночная", priority: 0,
@@ -2650,7 +2652,8 @@ def test_only_a_waiting_job_carries_edit_top_and_delete():
                    started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
       console.log(JSON.stringify([app.pendingRowHtml(job), app.finishedRowHtml(job)]));
     """)
-    assert sorted(re.findall(r'data-act="([a-z]+)"', waiting)) == ["del", "dup", "edit", "top"]
+    assert sorted(re.findall(r'data-act="([a-z]+)"', waiting)) == [
+        "chat", "del", "dup", "edit", "top"]
     assert re.findall(r'data-act="([a-z]+)"', finished) == ["dup"], (
         "a finished run offers nothing but a copy of itself")
 
@@ -3238,8 +3241,9 @@ def test_the_new_file_entry_carries_a_sentinel_that_survives_the_html_parser():
     assert not web.PROMPT_NAME.fullmatch(sentinel), (
         f"{sentinel!r} would collide with a real prompt file name")
     assert '<option value="${NEW_PROMPT}">' in script
-    assert script.count("NEW_PROMPT") == 4, (
-        "the constant, the option, and the two comparisons -- no fourth spelling")
+    assert script.count("NEW_PROMPT") == 5, (
+        "the constant, the option, and the three comparisons (the two in the select's own handler "
+        "and the one that refuses to open a chat about «— новый файл… —») -- no other spelling")
 
 
 def test_a_posted_job_leaves_every_field_but_the_seed_and_the_tag_alone():
@@ -3348,3 +3352,98 @@ def test_a_finished_job_whose_timestamp_cannot_be_read_still_leaves_the_window()
     assert "unreadable-and-old" not in kept, (
         "a job that started eleven days ago did not finish in the last twenty-four hours")
     assert "no-date-at-all" in kept, "nothing to date it by is not a reason to hide it"
+
+
+# -- Task 8: the chat modal -----------------------------------------------------------------------
+
+
+@_needs_node
+def test_a_model_turn_with_a_prompt_replaces_the_editor_text():
+    """The whole point of the chat: a turn that carries a prompt rewrites the window, and the
+    schema's fixed field order is what makes "collect them into text" a client-side job at all.
+    """
+    out = _node_eval("""
+      const turn = {reply: "ок", prompt: {instruction: null,
+        integrated_multimodal_description: "[Shot 1] X.",
+        overall_soundscape: "Wind.", non_diegetic_music: "N/A"}};
+      const state = {promptText: "старый", log: []};
+      app.applyTurn(state, turn);
+      console.log(JSON.stringify([state.promptText, state.log.length]));
+    """)
+    text, entries = out
+    assert text.startswith("integrated_multimodal_description: [Shot 1] X.")
+    assert "overall_soundscape: Wind." in text and text.endswith("non_diegetic_music: N/A\n")
+    assert entries == 1
+
+
+@_needs_node
+def test_a_null_prompt_turn_leaves_the_editor_alone():
+    """`prompt: null` is a reply without an edit -- a question back, a discussion. Wiping the
+    window on one of those would throw away text nobody asked to change.
+    """
+    out = _node_eval("""
+      const state = {promptText: "нетронутый", log: []};
+      app.applyTurn(state, {reply: "а какой свет?", prompt: null});
+      console.log(JSON.stringify(state.promptText));
+    """)
+    assert out == "нетронутый"
+
+
+@_needs_node
+def test_an_i2v_prompt_puts_the_instruction_first_with_a_blank_line():
+    """The keyframe instruction is not one of the three fields and carries no header of its own:
+    it opens the prompt and is separated from the fields by a blank line, exactly as the format
+    document writes it.
+    """
+    out = _node_eval("""
+      console.log(JSON.stringify(app.buildPromptText({
+        instruction: "For the target video, at 0.00 seconds …",
+        integrated_multimodal_description: "[Shot 1] X.",
+        overall_soundscape: "Wind.", non_diegetic_music: "N/A"})));
+    """)
+    assert out.startswith("For the target video") and "\n\nintegrated_multimodal_description:" in out
+
+
+@_needs_node
+def test_a_turn_refused_because_the_gpu_is_busy_says_how_long_the_run_still_has():
+    """`gpu_busy` on its own is a fact with no advice in it. The page already holds the running
+    job's remaining seconds -- it prints them in the rail every twenty seconds -- so the plate
+    says when the model *will* be able to answer, and a run with no estimate says nothing rather
+    than «~0 мин».
+    """
+    with_estimate, without, unreachable = _node_eval("""
+      const busy = {error: {code: "gpu_busy", message: "идёт прогон"}};
+      console.log(JSON.stringify([
+        app.chatFailureText(busy, 4200),
+        app.chatFailureText(busy, 0),
+        app.chatFailureText({error: {code: "chat_unreachable", message: "connection refused"}}, 0),
+      ]));
+    """)
+    assert "прогон" in with_estimate and "1 ч 10 мин" in with_estimate, with_estimate
+    assert "~" not in without, without
+    assert "connection refused" in unreachable, "a 502 shows the provider's own words"
+
+
+@_needs_node
+def test_finishing_a_chat_about_a_job_puts_the_new_text_into_its_arguments():
+    """«обновить задачу» is a `PUT /api/jobs/<id>` with the job's own arguments, and the queue
+    takes the prompt from those arguments alone. A job queued from a file carries
+    `--prompt-file <снимок>` pointing at `queue/prompts/<id>.txt`; leaving that flag in place
+    would answer 200 and run the old text, because the snapshot is what the worker reads.
+    """
+    positional, from_file, glued, read_back = _node_eval("""
+      console.log(JSON.stringify([
+        app.argsWithPrompt(["generate", "старый текст", "--tag", "кот"], "новый"),
+        app.argsWithPrompt(["generate", "--prompt-file", "/q/prompts/j1.txt", "--tag", "кот"],
+                           "новый"),
+        app.argsWithPrompt(["generate", "--prompt-file=/q/prompts/j1.txt", "--tag", "кот"],
+                           "новый"),
+        [app.promptOfArgs(["generate", "старый текст", "--tag", "кот"]),
+         app.promptOfArgs(["generate", "--prompt-file", "/q/p.txt"])],
+      ]));
+    """)
+    assert positional == ["generate", "новый", "--tag", "кот"]
+    assert from_file == ["generate", "новый", "--tag", "кот"], (
+        "--prompt-file must not survive: the worker reads the snapshot, not the new text")
+    assert glued == ["generate", "новый", "--tag", "кот"], "--prompt-file=x is the same flag"
+    assert read_back == ["старый текст", None]
