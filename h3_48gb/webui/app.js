@@ -199,6 +199,28 @@ export function canvasIsPacked(width, height) {
       && width > 0 && height > 0 && width % 32 === 0 && height % 32 === 0;
 }
 
+/** Три готовых канваса, за черновик/предпросмотр/финал. Ровно эти три —
+ *  форма не растёт списком пресетов, у неё есть ручной ввод для всего
+ *  остального. */
+export const CANVAS_PRESETS = [
+  { key: "draft", label: "черновик", w: 448, h: 288 },
+  { key: "small", label: "малое", w: 896, h: 576 },
+  { key: "large", label: "большое", w: 1344, h: 768 },
+];
+
+/**
+ * `{width, height}` для пресета `key`, или `null`, если такого пресета нет.
+ *
+ * Чистая функция — ни одного обращения к DOM, поэтому её проверяет узел без браузера, как и
+ * весь остальной пул чистых функций этого модуля. Заполнение `#width`/`#height` и пересчёт
+ * оценки после клика делает обработчик в `startPage()`, тем же путём, что и ручной ввод (см.
+ * подписку `FIELDS` на `input`).
+ */
+export function applyCanvasPreset(key) {
+  const preset = CANVAS_PRESETS.find((p) => p.key === key);
+  return preset ? { width: preset.w, height: preset.h } : null;
+}
+
 /* ===========================================================================
    РАЗБОР ПРОМПТА
 
@@ -659,10 +681,12 @@ const SPEC_CELLS = (job) => {
 };
 
 /**
- * Ждущая задача: три действия — править, наверх, удалить.
+ * Ждущая задача: четыре действия — править, наверх, копия, удалить.
  *
- * Действия есть только здесь. У идущей и завершённой их нет вовсе — не серые
- * кнопки, а их отсутствие: серая кнопка обещает, что когда-нибудь нажмётся.
+ * Править/наверх/удалить есть только здесь: у идущей и завершённой их нет вовсе — не серые
+ * кнопки, а их отсутствие, серая кнопка обещает, что когда-нибудь нажмётся. Копия — исключение:
+ * она ничего не меняет в этой задаче, только читает её `args`/`note`, поэтому уместна и у
+ * завершённой тоже (см. `finishedRowHtml`).
  */
 export function pendingRowHtml(job, { editingId = null } = {}) {
   const peak = jobPeak(job);
@@ -682,6 +706,7 @@ export function pendingRowHtml(job, { editingId = null } = {}) {
     + `<span class="acts">`
     + `<button data-act="edit" data-id="${id}">Править</button>`
     + `<button data-act="top" data-id="${id}">Наверх</button>`
+    + `<button data-act="dup" data-id="${id}">Копия</button>`
     + `<button data-act="del" data-id="${id}">Удалить</button>`
     + `</span>`
     + `</div>`;
@@ -689,7 +714,8 @@ export function pendingRowHtml(job, { editingId = null } = {}) {
 
 /**
  * Завершённая задача: код возврата виден всегда, причина — у упавших.
- * Ни одного действия: прогон уже случился, отменять и поднимать нечего.
+ * Единственное действие — копия (см. `pendingRowHtml`): прогон уже случился,
+ * отменять и поднимать нечего, а вот повторить теми же параметрами — обычное дело.
  */
 export function finishedRowHtml(job) {
   const code = job.exit_code;
@@ -697,6 +723,7 @@ export function finishedRowHtml(job) {
   const clip = ok ? clipUrl(job) : null;
   const stem = String(job.output_stem || "");
   const name = stem.slice(stem.lastIndexOf("/") + 1);
+  const id = escapeHtml(job.id);
   const note = ok
     ? (clip ? `<a class="clip" href="${clip}">${escapeHtml(name)}.mp4</a>`
             : escapeHtml(name))
@@ -712,6 +739,9 @@ export function finishedRowHtml(job) {
     + `<span class="c">${job.finished_at ? formatClock(new Date(job.finished_at)) : "—"}</span>`
     + `<span class="c l">код ${escapeHtml(code == null ? "?" : code)}</span>`
     + (ok ? "" : `<span class="why">${escapeHtml(job.log_tail || "причина не записана")}</span>`)
+    + `<span class="acts">`
+    + `<button data-act="dup" data-id="${id}">Копия</button>`
+    + `</span>`
     + `</div>`;
 }
 
@@ -1367,12 +1397,29 @@ function startPage() {
   // -- подписки ---------------------------------------------------------------------------
 
   document.addEventListener("click", (event) => {
+    const presetButton = event.target.closest("button[data-preset]");
+    if (presetButton) {
+      const preset = applyCanvasPreset(presetButton.dataset.preset);
+      if (preset) {
+        $("width").value = preset.width;
+        $("height").value = preset.height;
+        // Тот же путь, что и ручной ввод в поля из FIELDS — см. подписку ниже.
+        scheduleEstimate();
+        renderPrompt();
+      }
+      return;
+    }
+
     const button = event.target.closest("button[data-act]");
     if (!button) return;
     const id = button.dataset.id;
     if (button.dataset.act === "edit") { setEditing(id); return; }
     if (button.dataset.act === "top") {
       withQueue(() => api("POST", `/api/jobs/${encodeURIComponent(id)}/top`, {}));
+      return;
+    }
+    if (button.dataset.act === "dup") {
+      withQueue(() => api("POST", `/api/jobs/${encodeURIComponent(id)}/duplicate`, {}));
       return;
     }
     if (button.dataset.act === "del") {

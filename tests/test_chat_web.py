@@ -505,3 +505,67 @@ def test_every_chat_route_names_the_body_fields_it_takes(_serve):
     status, payload = srv.post_json_raw(f"/api/chat/{sid}/message",
                                         {"text": "x", "prompt": "", "sytem": "нет"})
     assert (status, payload["error"]["code"]) == (400, "args_invalid")
+
+
+# -- дублирование задачи -------------------------------------------------------------------------
+
+
+def _submit_job(queue_root, outdir, tag: str, note: str = "") -> q.Job:
+    """A pending job whose `output_stem` follows the real `outdir/h3-<tag>-<W>x<H>` shape, so
+    `/duplicate`'s tag rewrite (`_duplicate_tag_candidates` in `web.py`) is exercised the same way
+    it would be against a job a real submission produced.
+    """
+    stem = outdir / f"h3-{tag}-896x512"
+    return q.submit(queue_root, ["generate", "--tag", tag], note,
+                    {"output_stem": str(stem)}, {"seconds": 1})
+
+
+def test_duplicating_a_pending_job_adds_a_second_pending_job_with_the_same_note(_serve):
+    """The source job is untouched, and the copy keeps the note but not the output name -- that
+    name is always taken, by the source job itself, still sitting in `pending/`.
+    """
+    srv = _serve()
+    job = _submit_job(srv.queue_root, srv.root, "ждёт", note="заметка")
+
+    status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/duplicate", None)
+    assert status == 200, answer
+    new_id = answer["id"]
+    assert new_id != job.id
+
+    jobs, broken = q.scan(srv.queue_root)
+    assert broken == []
+    by_id = {row.id: row for row in jobs}
+    assert by_id[job.id].state == "pending"
+    assert by_id[new_id].state == "pending"
+    assert by_id[new_id].note == "заметка"
+    assert by_id[new_id].output_stem != by_id[job.id].output_stem
+
+
+def test_duplicating_a_finished_job_lands_a_new_pending_job(_serve):
+    """A `done` source is found (not just `pending`), left exactly as it was, and its own artifact
+    on disk -- what "finished" means in practice -- does not stop the copy from queueing.
+    """
+    srv = _serve()
+    job = _submit_job(srv.queue_root, srv.root, "готово", note="из готовой")
+    running = q.claim(srv.queue_root)
+    q.finish(srv.queue_root, running.id, 0, "ok")
+    Path(f"{job.output_stem}.mp4").write_bytes(b"video")
+
+    status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/duplicate", None)
+    assert status == 200, answer
+    new_id = answer["id"]
+
+    jobs, broken = q.scan(srv.queue_root)
+    assert broken == []
+    by_id = {row.id: row for row in jobs}
+    assert by_id[job.id].state == "done", "duplicating a finished job does not touch it"
+    assert by_id[new_id].state == "pending"
+    assert by_id[new_id].note == "из готовой"
+    assert by_id[new_id].output_stem != job.output_stem
+
+
+def test_duplicating_an_unknown_job_is_a_named_404(_serve):
+    srv = _serve()
+    status, answer = srv.post_json_raw("/api/jobs/does-not-exist/duplicate", None)
+    assert status == 404, answer
+    assert answer["error"]["code"] == "not_found", answer

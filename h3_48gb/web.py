@@ -842,6 +842,56 @@ def queue_write_errors(queue_root, *, what="the request", output_stem=None):
         ) from exc
 
 
+def _duplicate_tag_candidates(args: list[str], output_stem: str):
+    """`(args, output_stem)` pairs for `_duplicate_job` to try, in order, forever.
+
+    The source job's own `--tag` (the CLI's default, `"run"`, if `args` has none) with `-copy`
+    appended, then `-copy2`, `-copy3`, ... -- **never the untouched tag**, because the untouched
+    tag means the untouched `output_stem`, and that name is always taken: by the source job
+    itself, if it is still `pending`/`running` (`_stem_taken` does not exclude the id being
+    duplicated the way `queue.update` excludes the id being edited), or by its own artifact
+    already on disk, if it is `done`/`failed`.
+
+    `output_stem` is `outdir / f"h3-{tag}-{W}x{H}"` (`RunSpec.output_stem`), so the new one is
+    built the same way, with the new tag spliced in; the `WxH` tail is recovered from the
+    source's own stem rather than re-derived from `args`, so this works the same whether the
+    canvas came from `--width`/`--height` or, with `--image`, from the keyframe. If the source
+    stem does not have the expected shape (hand-written test fixture, future format change), the
+    suffix is appended to the whole name instead -- still unique, just not as tidy.
+    """
+    args = list(args)
+    if "--tag" in args and args.index("--tag") + 1 < len(args):
+        tag_index = args.index("--tag") + 1
+        old_tag = args[tag_index]
+    else:
+        tag_index = None
+        old_tag = "run"
+
+    stem_path = Path(output_stem)
+    prefix = f"h3-{old_tag}-"
+    name = stem_path.name
+    tail = name[len(prefix):] if name.startswith(prefix) else None
+
+    attempt = 1
+    while True:
+        suffix = "-copy" if attempt == 1 else f"-copy{attempt}"
+        new_tag = f"{old_tag}{suffix}"
+        new_args = list(args)
+        if tag_index is not None:
+            new_args[tag_index] = new_tag
+        else:
+            new_args.extend(["--tag", new_tag])
+        new_name = f"h3-{new_tag}-{tail}" if tail is not None else f"{name}{suffix}"
+        yield new_args, str(stem_path.with_name(new_name))
+        attempt += 1
+
+
+#: How many `-copyN` output names `_duplicate_job` tries before giving up and answering the last
+#: `output_stem_conflict` it saw -- generous, since a real queue never has more than a handful of
+#: duplicates of the same job sitting around at once.
+DUPLICATE_ATTEMPTS = 200
+
+
 def _json_bytes(payload) -> bytes:
     """`payload` as the bytes of one JSON document. `ensure_ascii=False` because half the tags and
     notes on this machine are Russian and escaping them makes the wire format unreadable in a log.
@@ -1231,6 +1281,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._estimate_only()
         if path.startswith("/api/jobs/") and path.endswith("/top"):
             return self._promote_job(path[len("/api/jobs/"):-len("/top")])
+        if path.startswith("/api/jobs/") and path.endswith("/duplicate"):
+            return self._duplicate_job(path[len("/api/jobs/"):-len("/duplicate")])
         if path == "/api/chat":
             return self._create_chat()
         if path == "/api/llm/unload":
@@ -1389,6 +1441,50 @@ class _Handler(BaseHTTPRequestHandler):
         with queue_write_errors(self.server.queue_root, what="the job id"):
             job = q.move_to_front(self.server.queue_root, job_id)
         return 200, "application/json", _json_bytes({"ok": True, "job": job.as_dict()})
+
+    def _duplicate_job(self, raw_id: str) -> tuple[int, str, bytes]:
+        """`POST /api/jobs/<id>/duplicate`: re-queue a `pending`, `done` or `failed` job's `args`
+        and `note` as a new `pending` job. Answers `{"id": <the new job's id>}`.
+
+        The source is looked up with `q.scan`, not with `_job_id_of` (which only ever builds a
+        path inside `pending/`): the source's state is not known up front, so which directory to
+        build a path into is not either, and `raw_id` is only ever compared against `Job.id` --
+        it never becomes a path itself, so there is nothing here for a traversal id to reach.
+
+        `dry_run_report`/`estimate` are **not** recomputed by re-running `prepare_submission`'s
+        dry-run subprocess: they are read straight off the source job's own file (`estimate`,
+        `output_stem`), the same numbers that job queued with the first time, because args that
+        have not changed dry-run to the same report every time. This also means a duplicate is
+        never re-validated against the command allowlist or the roots -- the source already
+        passed both once, or it would not be sitting in the queue at all.
+
+        The source's own `output_stem`, unchanged, would collide -- see
+        `_duplicate_tag_candidates` -- so candidates from it are tried in order until one of
+        them clears `queue.submit`'s conflict check.
+        """
+        jobs, _broken = q.scan(self.server.queue_root)
+        job = next((candidate for candidate in jobs if candidate.id == raw_id
+                   and candidate.state in ("pending", "done", "failed")), None)
+        if job is None:
+            return 404, "application/json", _error_bytes(
+                "not_found", f"нет такой задачи: {raw_id}", {"id": raw_id})
+
+        last_error: CliError | None = None
+        candidates = _duplicate_tag_candidates(job.args, job.output_stem)
+        for _ in range(DUPLICATE_ATTEMPTS):
+            args, output_stem = next(candidates)
+            try:
+                with queue_write_errors(self.server.queue_root, what="the job id",
+                                        output_stem=output_stem):
+                    new_job = q.submit(self.server.queue_root, args, job.note,
+                                       {"output_stem": output_stem}, dict(job.estimate))
+            except CliError as exc:
+                if exc.code != "output_stem_conflict":
+                    raise
+                last_error = exc
+                continue
+            return 200, "application/json", _json_bytes({"id": new_job.id})
+        raise last_error
 
     def _cancel_job(self, raw_id: str) -> tuple[int, str, bytes]:
         job_id = self._job_id_of(raw_id)

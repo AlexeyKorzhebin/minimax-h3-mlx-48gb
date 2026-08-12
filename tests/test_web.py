@@ -2303,6 +2303,26 @@ def test_the_form_keeps_its_values_and_moves_on_to_the_next_seed_and_tag():
 
 
 @_needs_node
+def test_there_are_exactly_three_canvas_presets_draft_small_large():
+    presets = _node_eval("console.log(JSON.stringify(app.CANVAS_PRESETS));")
+    assert [(p["key"], p["w"], p["h"]) for p in presets] == [
+        ("draft", 448, 288), ("small", 896, 576), ("large", 1344, 768),
+    ]
+
+
+@_needs_node
+def test_applying_the_draft_preset_sets_448_by_288():
+    got = _node_eval('console.log(JSON.stringify(app.applyCanvasPreset("draft")));')
+    assert got == {"width": 448, "height": 288}
+
+
+@_needs_node
+def test_an_unknown_preset_key_is_not_silently_accepted():
+    got = _node_eval('console.log(JSON.stringify(app.applyCanvasPreset("huge")));')
+    assert got is None
+
+
+@_needs_node
 def test_forty_gigabytes_warns_and_forty_six_demands_the_checkbox():
     """Requirement 4. Three outcomes, and the middle one is the one a two-branch implementation
     loses: above 40 the page must speak without blocking.
@@ -2615,9 +2635,11 @@ def test_the_prompt_parse_rewrites_nothing():
 
 
 @_needs_node
-def test_only_a_waiting_job_carries_actions():
-    """Requirement 6. Not grey buttons -- no buttons: a grey button promises it will work one day.
-    Checked on the markup both rows really produce.
+def test_only_a_waiting_job_carries_edit_top_and_delete():
+    """Requirement 6, refined by task 7's duplicate button: not grey buttons -- no buttons, a grey
+    button promises it will work one day. That still holds for edit/top/delete, which only ever
+    make sense for a job still waiting to run -- but duplicate reads a job without changing it, so
+    it is offered on the finished row too (see `finishedRowHtml`'s own docstring).
     """
     waiting, finished = _node_eval("""
       const job = {id: "j1", note: "ночная", priority: 0,
@@ -2628,9 +2650,9 @@ def test_only_a_waiting_job_carries_actions():
                    started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
       console.log(JSON.stringify([app.pendingRowHtml(job), app.finishedRowHtml(job)]));
     """)
-    assert sorted(re.findall(r'data-act="([a-z]+)"', waiting)) == ["del", "edit", "top"]
-    assert "data-act" not in finished, "a finished run offers nothing to press"
-    assert "<button" not in finished
+    assert sorted(re.findall(r'data-act="([a-z]+)"', waiting)) == ["del", "dup", "edit", "top"]
+    assert re.findall(r'data-act="([a-z]+)"', finished) == ["dup"], (
+        "a finished run offers nothing but a copy of itself")
 
 
 @_needs_node
