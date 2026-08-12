@@ -3,8 +3,11 @@
 llama-server здесь всегда фальшивый: настоящий грузит 30 ГБ. Мок — обычный
 http.server в потоке, отвечающий на /health и /v1/chat/completions.
 """
+import http.server
 import json
 import textwrap
+import threading
+import urllib.request
 
 import pytest
 
@@ -65,3 +68,87 @@ def test_the_loaded_roster_never_carries_the_secret_itself(tmp_path):
                                      "model": "m", "api_key_env": "OPENROUTER_API_KEY"}},
     }), encoding="utf-8")
     assert "sk-very-secret" not in json.dumps(provider.load_providers(tmp_path))
+
+
+class _FakeLlama:
+    """llama-server, который ничего не грузит: /health 200 и захардкоженный чат-ответ.
+
+    Поток обрывается close(); порт выдаёт ядро (port=0), чтобы тесты не дрались.
+    """
+
+    def __init__(self, chat_payload=None, health: int = 200):
+        handler_cls = self._make_handler(chat_payload, health)
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        self.port = self.httpd.server_address[1]
+        self.requests: list[dict] = []
+        handler_cls.seen = self.requests
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def _make_handler(self, chat_payload, health):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            seen: list = []
+
+            def log_message(self, *a):  # тишина в выводе pytest
+                pass
+
+            def do_GET(self):
+                code = health if self.path == "/health" else 404
+                self.send_response(code); self.end_headers()
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                type(self).seen.append({"path": self.path, "body": body})
+                out = json.dumps(chat_payload or {}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+        return Handler
+
+    def close(self):
+        self.httpd.shutdown(); self.httpd.server_close()
+
+
+def _llama_cfg(port: int) -> dict:
+    return {"type": "llama-local", "llama_server": "/usr/bin/true",
+            "presets_ini": "/tmp/presets.ini", "preset": "qwen", "port": port,
+            "ctx": 4096, "resident_gb": 31}
+
+
+def test_status_reflects_health_endpoint(tmp_path):
+    fake = _FakeLlama()
+    try:
+        assert provider.LlamaLocal("q", _llama_cfg(fake.port), tmp_path).status() == "up"
+    finally:
+        fake.close()
+    assert provider.LlamaLocal("q", _llama_cfg(fake.port), tmp_path).status() == "down"
+
+
+def test_ensure_up_spawns_llama_with_the_preset_flags(tmp_path):
+    """Не поднимаем настоящего: spawn подменён, health отвечает мок, а тест
+    проверяет ровно командную строку — то, что сломается молча."""
+    fake = _FakeLlama()
+    spawned: list[list[str]] = []
+
+    def spawn(cmd, **kw):
+        spawned.append(cmd)
+        class P: pid = 1
+        return P()
+
+    try:
+        lam = provider.LlamaLocal("q", _llama_cfg(fake.port), tmp_path)
+        lam.ensure_up(timeout=5, spawn=spawn)   # health уже 200 -> spawn не нужен
+        assert spawned == []
+    finally:
+        fake.close()
+
+    lam = provider.LlamaLocal("q", _llama_cfg(0), tmp_path)  # порт 0 всегда down
+    with pytest.raises(provider.ProviderError) as err:
+        lam.ensure_up(timeout=0.3, spawn=spawn)
+    assert err.value.code == "llama_did_not_start"
+    (cmd,) = spawned
+    assert cmd[0] == "/usr/bin/true"
+    assert "--models-preset" in cmd and "/tmp/presets.ini" in cmd
+    assert "--models-max" in cmd and "1" in cmd[cmd.index("--models-max") + 1]

@@ -8,6 +8,10 @@ variable does, so the roster can be shown to the page verbatim.
 from __future__ import annotations
 
 import json
+import subprocess
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -77,3 +81,59 @@ def load_providers(root) -> dict:
             cfg["available"], cfg["reason"] = True, None
         providers[name] = cfg
     return {"active": data.get("active"), "providers": providers}
+
+
+def port_alive(port: int) -> bool:
+    if not port:
+        return False
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as r:
+            return r.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+class LlamaLocal:
+    """Owns one llama-server process: spawn, health-poll, kill.
+
+    The worker (Task 6) reuses `port_alive` directly to avoid re-spawning
+    when the server is already up.
+    """
+
+    def __init__(self, name: str, cfg: dict, root):
+        self.name, self.cfg, self.root = name, cfg, Path(root)
+
+    def status(self) -> str:
+        return "up" if port_alive(self.cfg.get("port", 0)) else "down"
+
+    def ensure_up(self, timeout: float = 90.0, spawn=subprocess.Popen) -> None:
+        if self.status() == "up":
+            return
+        log = self.root / "chat" / "llama.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        presets = str(Path(self.cfg["presets_ini"]).expanduser())
+        cmd = [self.cfg["llama_server"],
+               "--models-dir", str(Path(presets).parent),
+               "--models-preset", presets,
+               "--models-max", "1",
+               "--host", "127.0.0.1", "--port", str(self.cfg["port"])]
+        with open(log, "ab") as sink:
+            spawn(cmd, stdout=sink, stderr=sink)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.status() == "up":
+                return
+            time.sleep(0.2)
+        tail = ""
+        if log.is_file():
+            tail = "\n".join(log.read_text(encoding="utf-8", errors="replace").splitlines()[-10:])
+        raise ProviderError("llama_did_not_start",
+                            f"llama-server не ответил /health за {timeout:.0f} с\n{tail}")
+
+    def shutdown(self) -> None:
+        # pkill matches "llama-server" only (matches the binary name printed
+        # in `ps`, not our helper's --llama_server flag value).
+        subprocess.run(["pkill", "-f", "llama-server"], check=False)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and self.status() == "up":
+            time.sleep(0.2)
