@@ -98,7 +98,8 @@ class _FakeLlama:
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                type(self).seen.append({"path": self.path, "body": body})
+                type(self).seen.append({"path": self.path, "body": body,
+                                         "headers": dict(self.headers)})
                 out = json.dumps(chat_payload or {}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -152,3 +153,46 @@ def test_ensure_up_spawns_llama_with_the_preset_flags(tmp_path):
     assert cmd[0] == "/usr/bin/true"
     assert "--models-preset" in cmd and "/tmp/presets.ini" in cmd
     assert "--models-max" in cmd and "1" in cmd[cmd.index("--models-max") + 1]
+
+
+_TURN = {"choices": [{"message": {"content": json.dumps({
+    "reply": "Сделал мрачнее.",
+    "prompt": {"instruction": None,
+               "integrated_multimodal_description": "[Shot 1] Live-action…",
+               "overall_soundscape": "Wind.",
+               "non_diegetic_music": "N/A"}})}}]}
+
+
+def test_chat_sends_schema_and_returns_parsed_turn(tmp_path):
+    fake = _FakeLlama(chat_payload=_TURN)
+    try:
+        turn = provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "мрачнее"}])
+    finally:
+        fake.close()
+    assert turn["reply"] == "Сделал мрачнее."
+    assert turn["prompt"]["non_diegetic_music"] == "N/A"
+    (req,) = fake.requests
+    assert req["path"] == "/v1/chat/completions"
+    assert req["body"]["response_format"]["json_schema"] == provider.PROMPT_SCHEMA
+
+
+def test_invalid_model_json_gets_one_retry_then_a_named_error(tmp_path):
+    fake = _FakeLlama(chat_payload={"choices": [{"message": {"content": "не json"}}]})
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_model_json"
+        assert len(fake.requests) == 2, "должен быть ровно один повтор"
+    finally:
+        fake.close()
+
+
+def test_external_provider_authorises_with_its_env_token(tmp_path):
+    fake = _FakeLlama(chat_payload=_TURN)
+    cfg = {"type": "openai", "base_url": f"http://127.0.0.1:{fake.port}",
+           "model": "m", "api_key_env": "K"}
+    try:
+        provider.chat(cfg, {"K": "sk-t"}, [{"role": "user", "content": "x"}])
+        assert fake.requests[0]["headers"].get("Authorization") == "Bearer sk-t"
+    finally:
+        fake.close()

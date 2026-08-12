@@ -137,3 +137,48 @@ class LlamaLocal:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and self.status() == "up":
             time.sleep(0.2)
+
+
+def _base_url(cfg: dict) -> str:
+    if cfg.get("type") == "openai":
+        return cfg["base_url"].rstrip("/")
+    return f"http://127.0.0.1:{cfg['port']}"
+
+
+def chat(cfg: dict, env: dict, messages: list[dict]) -> dict:
+    """One turn of the OpenAI chat protocol, response shaped by PROMPT_SCHEMA.
+
+    Both provider kinds speak the same wire format; only the base URL and
+    the optional bearer token differ. A model that fails to hold the JSON
+    shape gets exactly one retry with a system reminder appended, then a
+    named ProviderError carrying the raw text for diagnosis.
+    """
+    body = {"model": cfg.get("model", cfg.get("preset", "default")),
+            "messages": messages,
+            "temperature": cfg.get("temperature", 0.7),
+            "response_format": {"type": "json_schema", "json_schema": PROMPT_SCHEMA}}
+    headers = {"Content-Type": "application/json"}
+    key_env = cfg.get("api_key_env")
+    if cfg.get("type") == "openai" and key_env:
+        headers["Authorization"] = f"Bearer {env.get(key_env, '')}"
+
+    def ask(msgs):
+        req = urllib.request.Request(_base_url(cfg) + "/v1/chat/completions",
+                                     data=json.dumps({**body, "messages": msgs}).encode(),
+                                     headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=600) as r:
+            payload = json.loads(r.read())
+        return payload["choices"][0]["message"]["content"]
+
+    raw = ask(messages)
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        reminder = {"role": "system",
+                    "content": "Ответ строго одним JSON-объектом по схеме "
+                               "{reply: string, prompt: object|null}. Без другого текста."}
+        raw2 = ask([reminder, *messages])
+        try:
+            return json.loads(raw2)
+        except (json.JSONDecodeError, TypeError):
+            raise ProviderError("bad_model_json", f"модель не удержала формат: {raw2[:400]}")
