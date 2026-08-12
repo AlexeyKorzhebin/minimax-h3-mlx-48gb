@@ -1100,3 +1100,39 @@ three are the same lever, and it is a free one: no steps, no bits, no pixels, no
   at 448x288, where a face is fifty pixels tall and there is no skin to be plastic. Drafts answer
   questions about meaning and composition; questions about surface must be asked at the working
   canvas. This cost one wasted pair of drafts.
+
+## The seed-spread number is withdrawn
+
+Every "our spread is N% against the reference's M%" line written on 2026-08-11 and 08-12 should be
+read as retired. The comparison was unsound at both ends, and the person watching the clips is the
+one who found it.
+
+**Our end: the metric measures staging, not stability.** The spectral band ratio is a global
+statistic over the frame — how much of it is sky, how much is bodies, how much is ground. Seeds of
+this prompt stage the scene differently: the figures swap sides, one seed frames them close and
+another goes wide. That moves the mid-scale band by a factor while the *quality* is identical, and
+the viewer's verdict on the night's four clips was "excellent in every one of them". So a 20% spread
+across seeds is a measurement of how freely the prompt lets the model direct, not of how steadily
+the recipe renders.
+
+**Their end: nothing says the reference trio are three seeds.** `reference/README.md` records their
+seeds as "not recorded", and then asserts they provide "a measured seed-to-seed spread". That
+sentence was an assumption written as a fact, and it has been withdrawn. Three renders of one seed
+would produce exactly the 1% we measured, and we cannot rule it out.
+
+Two withdrawals in one: the numbers on both sides of the comparison, and the claim that the
+comparison was possible.
+
+### What replaces it
+
+Nothing, for now, and saying so is better than quoting a number that measures the wrong thing.
+This is the fourth metric this project has had to retire — flat-region residual and the temporal
+second difference both said our clips were *cleaner* than the reference; motion compensation
+produced a residual larger than the plain frame difference; the spectral bands matched the eye on
+grain but were blind to anatomy, and are now shown to be sensitive to staging as well.
+
+If a number is wanted later, it has to be invariant to staging. Two candidates, neither tried:
+measure inside a detected face or body crop rather than over the whole frame, so composition cannot
+move it; or compare seeds under a prompt that pins the camera to a single static shot, so there is
+nothing left for the model to direct. Until one of those exists, the honest instrument for questions
+about surface quality is a person looking at the clip at the working canvas.

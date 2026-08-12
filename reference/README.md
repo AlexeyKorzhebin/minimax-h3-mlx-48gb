@@ -65,9 +65,13 @@ All 10.125 s, 243 frames, 24 fps, H.264.
 | `centaur-8step-896x576-seed635988198379787.mp4` | 8 | 896x576 | 635988198379787 |
 | `centaur-8step-1248x832-seed635988198379787.mp4` | 8 | 1248x832 | 635988198379787 |
 
-The three legacy 896x576 clips are what give the reference a **measured seed-to-seed spread** rather
-than a single number, and that is most of their value: a comparison against one sample cannot say
-whether a difference is real.
+The three legacy 896x576 clips were long described here as giving the reference a *measured
+seed-to-seed spread*. **They do not, and that claim is withdrawn.** Their seeds are "not
+recorded" — the table above says so — so nothing establishes that they are three seeds rather
+than three renders of one. Every number this file's last section quotes as the reference's
+spread rests on that unverified assumption, and `docs/RESULTS.md` explains why the measurement
+it fed was unsound at the other end too. What the three clips are still good for is the thing
+they were always good for: three samples of what a working build produces from this prompt.
 
 The seed does **not** reproduce these renders here. `minimax_h3_mlx.pipeline` notes it directly —
 MLX's RNG is not torch's, so the same integer draws different noise. What the fixed seed buys is a
