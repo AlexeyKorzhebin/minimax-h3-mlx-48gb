@@ -111,25 +111,31 @@ def server(tmp_path):
     live.httpd.server_close()
 
 
-def _request(live: _Live, url: str, method: str = "GET", host=_KEEP):
+def _request(live: _Live, url: str, method: str = "GET", host=_KEEP, headers=None):
     """`(status, headers, body_bytes)` for a raw URL, sent verbatim.
 
     `http.client` does not normalise the request target, which is what makes `/static/../cli.py`
     reach the server as written instead of being collapsed by the client.
 
     `host` replaces the `Host` header (`None` removes it), for the rebinding tests; left alone it
-    is whatever `http.client` builds, i.e. this server's real address.
+    is whatever `http.client` builds, i.e. this server's real address. `headers` (a plain dict) is
+    the Range-header seam task 2 needed and nothing before it did -- extra headers sent verbatim,
+    beside whichever `Host` spelling this call already chose.
     """
     connection = http.client.HTTPConnection(web.LOOPBACK, live.port, timeout=10)
     try:
         if host is _KEEP:
-            connection.request(method, url)
+            connection.request(method, url, headers=headers or {})
         elif host is None:
             connection.putrequest(method, url, skip_host=True, skip_accept_encoding=True)
+            for name, value in (headers or {}).items():
+                connection.putheader(name, value)
             connection.endheaders()
         else:
             connection.putrequest(method, url, skip_host=True, skip_accept_encoding=True)
             connection.putheader("Host", host)
+            for name, value in (headers or {}).items():
+                connection.putheader(name, value)
             connection.endheaders()
         response = connection.getresponse()
         return response.status, dict(response.getheaders()), response.read()
@@ -1051,6 +1057,211 @@ def test_a_refused_media_url_is_not_cached_either(server):
     status, headers, _ = _request(server, "/media/../../etc/passwd")
     assert status == 400
     assert headers["Cache-Control"] == "no-store"
+
+
+# -- task 2: Range support (Safari will not show a poster frame without a real 206) ---------------
+
+
+@pytest.mark.parametrize("header,total,expected", [
+    (None, 10, None),
+    ("", 10, None),
+    ("bytes=0-1", 10, (0, 1)),
+    ("bytes=100-", 500, (100, 499)),
+    ("bytes=-50", 500, (450, 499)),
+    ("bytes=-50", 10, (0, 9)),  # suffix longer than the file: the whole thing, per RFC 7233 §2.1.
+    ("bytes=0-999999", 10, (0, 9)),  # a last-byte-pos past the end clamps to the real end.
+    ("bytes=9-9", 10, (9, 9)),  # the very last byte, exactly.
+])
+def test_parse_range_the_three_satisfiable_spellings(header, total, expected):
+    assert web._parse_range(header, total) == expected
+
+
+@pytest.mark.parametrize("header,total", [
+    ("bytes=1000-2000", 10),   # first-byte-pos past the end.
+    ("bytes=10-20", 10),       # first-byte-pos == total is still past the end (0-indexed).
+    ("bytes=-0", 10),          # a zero-length suffix asks for nothing.
+    ("bytes=0-1", 0),          # nothing to range over at all.
+    ("bytes=-5", 0),           # same, spelled as a suffix.
+])
+def test_parse_range_unsatisfiable_cases_are_distinct_from_ignored_ones(header, total):
+    assert web._parse_range(header, total) is web.RANGE_UNSATISFIABLE
+
+
+@pytest.mark.parametrize("header", [
+    "bytes=5-3",              # last-byte-pos < first-byte-pos: RFC 7233 §2.1 calls this invalid.
+    "bytes=-",                # neither a start nor a suffix.
+    "bytes=0-1,2-3",          # a list of ranges: this route serves one clip to one <video> tag.
+    "items=0-1",              # a unit this route does not understand.
+    "bytes=abc-def",          # not digits at all.
+    "bytes 0-1",              # missing the '='.
+])
+def test_parse_range_ignored_cases_answer_full_content_not_416(header):
+    """The RFC 7233 choice this task's brief left open, made and pinned here: a syntactically
+    invalid or unsupported `Range` is *ignored* (the caller answers a plain 200 with the whole
+    file), not rejected with 416. §2.1 says a byte-range-spec with `last < first` is invalid and
+    "the header field MUST be ignored"; §3.1 lets a server that does not implement
+    `multipart/byteranges` treat a multi-range request the same way. 416 is reserved for a request
+    that *is* well-formed but that this file cannot satisfy (`RANGE_UNSATISFIABLE`, tested above).
+    """
+    assert web._parse_range(header, 10) is None
+
+
+def test_a_repeated_range_header_is_a_bad_request(server):
+    """Two `Range` headers on one request is the same ambiguity `_sole_header` already refuses for
+    `Host` and `Origin` -- reused here rather than reinvented, and for the same reason: a value
+    read as "the" one when two arrived is a check the next reader disagrees with.
+    """
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    (run / "clip.mp4").write_bytes(b"0123456789")
+    connection = http.client.HTTPConnection(web.LOOPBACK, server.port, timeout=10)
+    try:
+        connection.putrequest("GET", "/media/19-real-run/clip.mp4")
+        connection.putheader("Range", "bytes=0-1")
+        connection.putheader("Range", "bytes=2-3")
+        connection.endheaders()
+        response = connection.getresponse()
+        status, body = response.status, json.loads(response.read())
+    finally:
+        connection.close()
+    assert status == 400 and body["error"]["code"] == "bad_request"
+
+
+def test_range_bytes_0_1_answers_206_with_exactly_two_bytes(server):
+    """The mutation this test exists to kill: drop the `Range` branch out of `_media` (or its
+    `_range_response` helper) entirely, and every request -- Safari's opening probe included --
+    answers 200 with the whole file. Safari's `<video>` tag never gets the 206 it is waiting for,
+    and the poster frame stays blank. This is the exact request Safari sends.
+    """
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    (run / "clip.mp4").write_bytes(b"0123456789")
+    status, headers, body = _request(server, "/media/19-real-run/clip.mp4",
+                                     headers={"Range": "bytes=0-1"})
+    assert status == 206, f"Safari's probe answered {status}, not 206: {body!r}"
+    assert body == b"01"
+    assert headers["Content-Range"] == "bytes 0-1/10"
+    assert headers["Content-Length"] == "2"
+    assert headers["Accept-Ranges"] == "bytes"
+
+
+def test_range_from_an_offset_to_the_end(server):
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    (run / "clip.mp4").write_bytes(b"0123456789")
+    status, headers, body = _request(server, "/media/19-real-run/clip.mp4",
+                                     headers={"Range": "bytes=4-"})
+    assert status == 206
+    assert body == b"456789"
+    assert headers["Content-Range"] == "bytes 4-9/10"
+    assert headers["Content-Length"] == "6"
+
+
+def test_range_suffix_the_last_n_bytes(server):
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    (run / "clip.mp4").write_bytes(b"0123456789")
+    status, headers, body = _request(server, "/media/19-real-run/clip.mp4",
+                                     headers={"Range": "bytes=-3"})
+    assert status == 206
+    assert body == b"789"
+    assert headers["Content-Range"] == "bytes 7-9/10"
+
+
+def test_range_out_of_bounds_is_416_with_content_range_star_total(server):
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    (run / "clip.mp4").write_bytes(b"0123456789")
+    status, headers, body = _request(server, "/media/19-real-run/clip.mp4",
+                                     headers={"Range": "bytes=1000-2000"})
+    assert status == 416
+    assert headers["Content-Range"] == "bytes */10"
+    assert headers["Accept-Ranges"] == "bytes"
+    assert json.loads(body)["error"]["code"] == "range_not_satisfiable"
+
+
+def test_a_malformed_range_is_ignored_and_serves_the_whole_file(server):
+    """Paired with the 416 test above: the two must not collapse onto the same status, or a Safari
+    probe and a broken client would be indistinguishable to the page.
+    """
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    (run / "clip.mp4").write_bytes(b"0123456789")
+    status, headers, body = _request(server, "/media/19-real-run/clip.mp4",
+                                     headers={"Range": "bytes=0-1,4-5"})
+    assert status == 200
+    assert body == b"0123456789"
+    assert headers["Accept-Ranges"] == "bytes"
+    assert "Content-Range" not in headers
+
+
+def test_an_ordinary_get_without_range_is_unchanged_and_still_carries_accept_ranges(server):
+    """The fix must not regress the common case: no `Range` header at all is still a plain 200
+    with the whole file, now advertising `Accept-Ranges: bytes` so a client that inspects it
+    before ever sending a `Range` request knows it may.
+    """
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    (run / "clip.mp4").write_bytes(b"0123456789")
+    status, headers, body = _request(server, "/media/19-real-run/clip.mp4")
+    assert status == 200
+    assert body == b"0123456789"
+    assert headers["Accept-Ranges"] == "bytes"
+    assert "Content-Range" not in headers
+
+
+def test_a_206_response_is_cached_exactly_like_its_200(server):
+    """Task 2's own requirement: cache headers on a Range answer match the whole-file 200 --
+    `immutable`, because the byte range is cut from the same never-rewritten-in-place file.
+    """
+    run = server.outdir / "19-run"
+    run.mkdir()
+    (run / "h3-x-preview-step05.jpg").write_bytes(b"\xff\xd8" + b"x" * 20)
+    status, headers, _ = _request(server, "/media/19-run/h3-x-preview-step05.jpg",
+                                  headers={"Range": "bytes=0-1"})
+    assert status == 206
+    cache = headers["Cache-Control"]
+    assert "immutable" in cache, f"a range answer must cache exactly like its 200: {cache!r}"
+    assert "no-store" not in cache
+
+
+def test_a_416_response_is_never_cached(server):
+    """Unlike 206, 416 carries no bytes of the file -- caching `Content-Range: bytes */<total>`
+    would freeze a stale length in the browser for the next, real range request.
+    """
+    run = server.outdir / "19-run"
+    run.mkdir()
+    (run / "clip.mp4").write_bytes(b"short")
+    status, headers, _ = _request(server, "/media/19-run/clip.mp4",
+                                  headers={"Range": "bytes=1000-2000"})
+    assert status == 416
+    assert headers["Cache-Control"] == "no-store"
+
+
+def test_range_on_a_missing_file_still_answers_404_not_416(server):
+    """A `Range` header is irrelevant to a file that is not there at all -- `_media` must resolve
+    and size the file *before* `_parse_range` ever runs, or a preview frame the run has not
+    written yet would answer 416 instead of the ordinary, pollable 404.
+    """
+    run = server.outdir / "19-run"
+    run.mkdir()
+    status, headers, body = _request(server, "/media/19-run/h3-x-preview-step05.jpg",
+                                     headers={"Range": "bytes=0-1"})
+    assert status == 404
+    assert json.loads(body)["error"]["code"] == "not_found"
+
+
+def test_range_does_not_bypass_the_suffix_allowlist(server):
+    """A `Range` header must not become a second way past `media_type_not_allowed`: the file type
+    is still checked before anything about a byte range is.
+    """
+    run = server.outdir / "19-real-run"
+    run.mkdir(exist_ok=True)
+    (run / "notes.txt").write_bytes(b"secret plans")
+    status, headers, body = _request(server, "/media/19-real-run/notes.txt",
+                                     headers={"Range": "bytes=0-1"})
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == "media_type_not_allowed"
 
 
 # -- Step 7: the socket ---------------------------------------------------------------------------
@@ -2025,6 +2236,151 @@ def test_a_job_id_that_does_not_exist_is_a_conflict_not_a_crash(queue_server):
     assert quoted != "20260811-000000-нет-abcd", "the id must arrive percent-encoded"
     status, answer = _call(queue_server, "DELETE", f"/api/jobs/{quoted}")
     assert status == 409 and answer["error"]["code"] == "job_not_pending", answer
+
+
+# -- task 2: deleting a finished job's own record and artifacts ------------------------------------
+
+
+def _write_finished_job(live: _Live, state: str, *, output_stem: str, job_id: str, args=None,
+                        exit_code=0) -> "q.Job":
+    """A `done`/`failed` job written straight into the queue, bypassing real submission -- these
+    tests need `output_stem` to name files they control directly, which real submission (and its
+    own relocation into a fresh, timestamped subdirectory) does not let them pick.
+    """
+    job = q.Job(
+        id=job_id, state=state, created_at="2026-08-12T00:00:00", args=args or ["generate"],
+        note="", prompt_source=None, prompt_sha256=None, output_stem=output_stem, estimate={},
+        priority=0, started_at="2026-08-12T00:00:00", finished_at="2026-08-12T00:05:00",
+        exit_code=exit_code, log_tail="",
+    )
+    q.write_json_durably(q.job_path(live.queue_root, job_id, state), q._job_file_payload(job))
+    return job
+
+
+def test_deleting_a_finished_job_removes_its_relocated_subdirectory(queue_server):
+    """Task A6 shape: `output_stem`'s own directory is this job's and nothing else's, so the whole
+    directory -- checkpoints and all -- is removed with one `rmtree`.
+    """
+    # ASCII only: `queue._JOB_SUBDIR_RE` (`_slug`'s own alphabet, `[a-z0-9-]`) is what tells this
+    # directory apart from a flat one, and a Cyrillic slug would never match it in real life
+    # either -- `_slug` transliterates nothing, it strips.
+    run_dir = queue_server.outdir / "20260812-0000-kot"
+    run_dir.mkdir()
+    stem = run_dir / "h3-кот-896x576"
+    (run_dir / "h3-кот-896x576.mp4").write_bytes(b"clip")
+    (run_dir / "h3-кот-896x576.wav").write_bytes(b"wav")
+    (run_dir / "h3-кот-896x576.json").write_text("{}")
+    (run_dir / "checkpoints").mkdir()
+    (run_dir / "checkpoints" / "h3-deadbeef.safetensors").write_bytes(b"ckpt")
+    job = _write_finished_job(queue_server, "done", output_stem=str(stem), job_id="j-reloc")
+
+    status, answer = _call(queue_server, "DELETE", f"/api/jobs/{job.id}")
+    assert status == 200 and answer["ok"] is True, answer
+    assert not run_dir.exists(), "the job's own subdirectory must be gone entirely"
+    jobs, _broken = q.scan(queue_server.queue_root)
+    assert job.id not in [candidate.id for candidate in jobs], "the finished record must be gone"
+
+
+def test_deleting_a_flat_finished_job_removes_only_its_own_files(queue_server):
+    """The mutation this test exists to kill: `rmtree` the flat outdir the way the relocated
+    branch does, without first checking `_is_relocated_job_subdir`. A flat job's directory is
+    shared -- with another old job's own files, and with the `queue/` directory itself -- and a
+    delete that does not tell the two shapes apart takes every one of them down with it.
+    """
+    stem = queue_server.outdir / "h3-кот-896x576"
+    (queue_server.outdir / "h3-кот-896x576.mp4").write_bytes(b"clip")
+    (queue_server.outdir / "h3-кот-896x576.wav").write_bytes(b"wav")
+    (queue_server.outdir / "h3-кот-896x576.json").write_text("{}")
+    (queue_server.outdir / "h3-кот-896x576-raw.npz").write_bytes(b"raw")
+    (queue_server.outdir / "h3-кот-896x576-preview-step05.jpg").write_bytes(b"jpg")
+    neighbor = queue_server.outdir / "h3-другая-896x576.mp4"
+    neighbor.write_bytes(b"unrelated job's clip")
+    stray = queue_server.outdir / "notes.txt"
+    stray.write_text("keep me")
+    job = _write_finished_job(queue_server, "failed", output_stem=str(stem), job_id="j-flat")
+
+    status, answer = _call(queue_server, "DELETE", f"/api/jobs/{job.id}")
+    assert status == 200 and answer["ok"] is True, answer
+    assert queue_server.outdir.exists(), "a flat job's shared directory must never be rmtree'd"
+    for suffix in (".mp4", ".wav", ".json", "-raw.npz", "-preview-step05.jpg"):
+        assert not Path(f"{stem}{suffix}").exists(), f"{suffix} must be gone"
+    assert neighbor.exists(), "another job's own clip must survive"
+    assert stray.exists(), "an unrelated file in the shared outdir must survive"
+    jobs, _broken = q.scan(queue_server.queue_root)
+    assert job.id not in [candidate.id for candidate in jobs]
+
+
+def test_deleting_a_flat_job_removes_its_one_unambiguous_checkpoint(queue_server):
+    """A lone leftover `h3-*.safetensors` in the job's own (default) checkpoint directory is safe
+    to call this job's -- nothing else could plausibly have written it there.
+    """
+    stem = queue_server.outdir / "h3-кот-896x576"
+    (queue_server.outdir / "h3-кот-896x576.mp4").write_bytes(b"clip")
+    checkpoint_dir = queue_server.outdir / "checkpoints"
+    checkpoint_dir.mkdir()
+    checkpoint = checkpoint_dir / "h3-deadbeef.safetensors"
+    checkpoint.write_bytes(b"ckpt")
+    job = _write_finished_job(queue_server, "failed", output_stem=str(stem), job_id="j-ckpt-one")
+
+    status, answer = _call(queue_server, "DELETE", f"/api/jobs/{job.id}")
+    assert status == 200, answer
+    assert not checkpoint.exists()
+
+
+def test_deleting_a_flat_job_leaves_an_ambiguous_checkpoint_directory_alone(queue_server):
+    """Two or more `h3-*.safetensors` files in the shared checkpoint directory: which one (if any)
+    is this job's cannot be told apart without the request's identity digest, which would need a
+    loaded model to compute. Neither is touched -- guessing wrong deletes a stranger's resume file.
+    """
+    stem = queue_server.outdir / "h3-кот-896x576"
+    (queue_server.outdir / "h3-кот-896x576.mp4").write_bytes(b"clip")
+    checkpoint_dir = queue_server.outdir / "checkpoints"
+    checkpoint_dir.mkdir()
+    mine = checkpoint_dir / "h3-deadbeef.safetensors"
+    other = checkpoint_dir / "h3-c0ffee.safetensors"
+    mine.write_bytes(b"a")
+    other.write_bytes(b"b")
+    job = _write_finished_job(queue_server, "failed", output_stem=str(stem), job_id="j-ckpt-ambi")
+
+    status, answer = _call(queue_server, "DELETE", f"/api/jobs/{job.id}")
+    assert status == 200, answer
+    assert mine.exists() and other.exists(), "an ambiguous checkpoint directory must be untouched"
+
+
+def test_deleting_a_flat_job_honours_an_explicit_checkpoint_dir(queue_server):
+    """`--checkpoint-dir` in the job's own `args`, when it gave one, wins over the default
+    `<outdir>/checkpoints` -- mirroring `RunSpec.resume_checkpoint_dir`.
+    """
+    stem = queue_server.outdir / "h3-кот-896x576"
+    (queue_server.outdir / "h3-кот-896x576.mp4").write_bytes(b"clip")
+    explicit_dir = queue_server.outdir / "custom-ckpt"
+    explicit_dir.mkdir()
+    checkpoint = explicit_dir / "h3-deadbeef.safetensors"
+    checkpoint.write_bytes(b"ckpt")
+    (queue_server.outdir / "checkpoints").mkdir()  # the default dir stays empty -- must be ignored
+    job = _write_finished_job(
+        queue_server, "failed", output_stem=str(stem), job_id="j-ckpt-explicit",
+        args=["generate", "--checkpoint-dir", str(explicit_dir)])
+
+    status, answer = _call(queue_server, "DELETE", f"/api/jobs/{job.id}")
+    assert status == 200, answer
+    assert not checkpoint.exists()
+
+
+def test_deleting_a_running_job_is_refused_and_touches_nothing(queue_server):
+    """The worker is mid-generation; stopping it is a different feature. The refusal is the same
+    `job_not_pending` this route already answered before this button existed, and nothing about
+    the job -- its record or its files -- may move.
+    """
+    job = _queue_a_job(queue_server)
+    claimed = q.claim(queue_server.queue_root)
+    assert claimed.id == job["id"]
+
+    status, answer = _call(queue_server, "DELETE", f"/api/jobs/{job['id']}")
+    assert status == 409 and answer["error"]["code"] == "job_not_pending", answer
+    jobs, _broken = q.scan(queue_server.queue_root)
+    assert any(candidate.id == job["id"] and candidate.state == "running" for candidate in jobs), (
+        "a refused delete must leave the running job exactly where it was")
 
 
 # -- Step 4: /api/estimate --------------------------------------------------------------------------
@@ -3380,13 +3736,17 @@ def test_the_prompt_parse_rewrites_nothing():
 
 @_needs_node
 def test_only_a_waiting_job_carries_edit_top_and_delete():
-    """Requirement 6, refined by task 7's duplicate button, task 8's chat, and the reveal-in-Finder
-    button: not grey buttons -- no buttons, a grey button promises it will work one day. Edit/top/
-    delete only ever make sense for a job still waiting to run, and stay pending-only. Chat,
-    duplicate and reveal all only *read* a job (chat's own finishing PUT is refused by the server
-    for anything but a pending job -- `job_not_pending` -- which is a sensible answer, not a hole),
-    so all three are offered on the finished row too, for both outcomes (see `finishedRowHtml`'s
-    own docstring).
+    """Requirement 6, refined by task 7's duplicate button, task 8's chat, the reveal-in-Finder
+    button, and task 2's "Удалить" for a finished run: not grey buttons -- no buttons, a grey
+    button promises it will work one day. Edit/top stay pending-only: they only ever make sense
+    for a job still waiting to run. Chat, duplicate and reveal all only *read* a job (chat's own
+    finishing PUT is refused by the server for anything but a pending job -- `job_not_pending` --
+    which is a sensible answer, not a hole), so all three are offered on the finished row too, for
+    both outcomes (see `finishedRowHtml`'s own docstring). Delete is offered on *both* rows now,
+    but under two different `data-act` values (`del` for pending, `delrun` for finished) -- one
+    cancels a job that never ran, the other erases a run's own files from disk, and the page must
+    be able to tell the two apart (its own `confirm()` text differs) exactly as easily as the
+    tests below do.
     """
     waiting, done, failed = _node_eval("""
       const job = {id: "j1", note: "ночная", priority: 0,
@@ -3404,9 +3764,10 @@ def test_only_a_waiting_job_carries_edit_top_and_delete():
     assert sorted(re.findall(r'data-act="([a-z]+)"', waiting)) == [
         "chat", "del", "dup", "edit", "top"]
     for finished in (done, failed):
-        assert sorted(re.findall(r'data-act="([a-z]+)"', finished)) == ["chat", "dup", "reveal"], (
-            "a finished run offers discuss, reveal-in-Finder and copy -- never edit/top/delete:\n"
-            + finished)
+        assert sorted(re.findall(r'data-act="([a-z]+)"', finished)) == [
+            "chat", "delrun", "dup", "reveal"], (
+            "a finished run offers discuss, reveal-in-Finder, copy and delete-run -- never "
+            "edit/top, and never the pending job's own `del`:\n" + finished)
 
 
 @_needs_node

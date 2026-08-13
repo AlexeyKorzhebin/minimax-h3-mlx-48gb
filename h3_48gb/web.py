@@ -37,6 +37,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import urllib.parse
@@ -103,6 +104,82 @@ MEDIA_SUFFIXES = frozenset({".mp4", ".jpg", ".jpeg", ".png", ".wav"})
 #: (`...-preview-step05.jpg`) and a clip is written once, when the run ends. Nothing under a run
 #: is rewritten in place, so a cache hit is always the same bytes. See `_cache_control`.
 MEDIA_MAX_AGE = 31_536_000
+
+#: One `bytes=` byte-range-spec, RFC 7233 §2.1's three spellings: `<start>-<end>`, `<start>-` and
+#: `-<suffix-length>`. Deliberately does not match a comma-separated *list* of ranges -- `/media`
+#: serves one clip to one `<video>` tag, never a `multipart/byteranges` response, and RFC 7233
+#: §3.1 lets a server that does not implement multipart ranges answer a request it does not
+#: understand as if `Range` were absent, which is the choice `_parse_range` makes for anything
+#: this regex does not match at all.
+_RANGE_RE = re.compile(r"\Abytes=(\d*)-(\d*)\Z")
+
+
+class _RangeUnsatisfiable:
+    """Sentinel `_parse_range` returns for a syntactically valid byte-range-spec this file cannot
+    satisfy (RFC 7233 §2.1: a first-byte-pos at or past the end of the file, or a zero-length
+    suffix against any file, or any range at all against an empty one) -- distinct from `None`
+    ("no `Range`, or one this route does not understand at all -- ignore it and answer 200") so a
+    caller cannot confuse "unsupported" with "out of bounds": the two answer different statuses,
+    200 and 416.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "RANGE_UNSATISFIABLE"
+
+
+#: The one instance `_parse_range` ever returns; compared by identity (`is`), never constructed
+#: again, the same shape as `ANY_SUFFIX`.
+RANGE_UNSATISFIABLE = _RangeUnsatisfiable()
+
+
+def _parse_range(header: str | None, total: int) -> tuple[int, int] | _RangeUnsatisfiable | None:
+    """The inclusive `(start, end)` byte range `header` (a raw `Range` header value, or `None` if
+    the request had none) asks for, out of a resource `total` bytes long.
+
+    Three outcomes, and the caller (`_Handler._range_response`) answers a different status for
+    each:
+
+    * `None` -- **answer 200 with the whole file**, exactly as if `Range` had never been sent.
+      Chosen for a missing header, for anything `_RANGE_RE` does not match at all (multiple
+      ranges, an unknown unit, stray characters), and for a single byte-range-spec that is itself
+      syntactically invalid -- `bytes=5-3` (RFC 7233 §2.1: "invalid if the last-byte-pos value is
+      present and less than the first-byte-pos"). RFC 7233 §2.1 says the whole header field must
+      then be ignored, not rejected, which is the rule this function applies uniformly rather than
+      picking 416 for the cases that merely looked more suspicious.
+    * `RANGE_UNSATISFIABLE` -- **answer 416.** A syntactically valid byte-range-spec whose
+      first-byte-pos is at or past `total` (`bytes=100000-` on a 10-byte file), or a suffix of `0`
+      or more bytes than exist against an empty file (`bytes=-N` when `total == 0`) -- the request
+      was well-formed, it is the file that cannot satisfy it.
+    * `(start, end)` -- **answer 206** with exactly those bytes, inclusive. A `last-byte-pos` that
+      names or exceeds `total` (`bytes=0-999999` on a 10-byte file) is clamped to `total - 1`,
+      per RFC 7233 §2.1's "the byte range is interpreted as the remainder of the representation".
+
+    `bytes=-0` (a suffix-length of zero) is `RANGE_UNSATISFIABLE` rather than a 200: it is
+    syntactically a valid `1*DIGIT`, so §2.1's "invalid, ignore the field" rule for a malformed
+    byte-range-spec does not apply, but zero bytes is nothing a 206 could honestly serve either.
+    """
+    if not header:
+        return None
+    match = _RANGE_RE.match(header.strip())
+    if not match:
+        return None
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        return None  # `bytes=-` names neither a start nor a suffix; nothing was really asked for.
+    if not start_text:
+        suffix = int(end_text)
+        if suffix == 0 or total == 0:
+            return RANGE_UNSATISFIABLE
+        return (max(0, total - suffix), total - 1)
+    start = int(start_text)
+    end = int(end_text) if end_text else None
+    if end is not None and end < start:
+        return None  # a malformed byte-range-spec: ignore the whole field, per RFC 7233 §2.1.
+    if start >= total:
+        return RANGE_UNSATISFIABLE
+    return (start, total - 1 if end is None or end >= total else end)
 
 
 class _AnySuffix:
@@ -343,6 +420,11 @@ ERROR_STATUS = {
     "chat_corrupt": 409,
     "queue_unwritable": 500,
     "internal_error": 500,
+    # RFC 7233 §4.4: the request was well-formed, `Range` and all -- it is the file that cannot
+    # satisfy it (a first-byte-pos at or past the file's own length). Not 400: the caller made no
+    # mistake a page could tell someone to fix, and not 404: `_media` already resolved a real file
+    # before this triggers.
+    "range_not_satisfiable": 416,
 }
 
 #: Codes `ERROR_STATUS` maps ahead of the commit that raises them, so that the failure mode
@@ -1113,6 +1195,100 @@ def _duplicate_tag_candidates(args: list[str], output_stem: str):
 DUPLICATE_ATTEMPTS = 200
 
 
+def _explicit_flag_value(args: list[str], flag: str) -> str | None:
+    """The value `flag` was last given in `args`, either spelling (`--flag value` or
+    `--flag=value`) -- the same "a repeated flag, last spelling wins" rule
+    `queue._last_outdir_token` already applies to `--outdir`. `None` if `flag` never appears.
+    """
+    value = None
+    for index, token in enumerate(args):
+        if token == flag and index + 1 < len(args):
+            value = args[index + 1]
+        elif token.startswith(f"{flag}="):
+            value = token[len(flag) + 1:]
+    return value
+
+
+def _checkpoint_dir_for_job(job) -> Path:
+    """Where `job`'s own resume checkpoint would live, mirroring `RunSpec.resume_checkpoint_dir`
+    (`cli.py`): an explicit `--checkpoint-dir` in the job's own `args` if it gave one, or
+    `output_stem`'s own directory plus `checkpoints/` otherwise -- `resume_checkpoint_dir`'s own
+    default, `self.outdir / "checkpoints"`, and `outdir` *is* `output_stem`'s parent by
+    construction (`RunSpec.output_stem`).
+    """
+    explicit = _explicit_flag_value(job.args, "--checkpoint-dir")
+    if explicit:
+        return Path(explicit)
+    return Path(job.output_stem).parent / "checkpoints"
+
+
+def _is_relocated_job_subdir(run_dir: Path, resolved_run_dir: Path, outdir: Path) -> bool:
+    """Whether `run_dir` (`Path(job.output_stem).parent`) is the job's own subdirectory that
+    `queue.submit` (task A6) relocates every *new* job into, rather than a shared or date-only
+    directory a job from before that feature existed was written straight into.
+
+    Both conditions are required. The directory's own *name* must match `queue._JOB_SUBDIR_RE`
+    (`YYYYMMDD-HHMM-<slug>`, the exact string `_relocate_to_job_subdir` builds) -- but the name
+    alone is not proof: a human could have pointed `--outdir` at a folder that merely happens to
+    look like one (`--outdir ~/out/20260101-0000-notreal`) before this feature existed, and a job
+    written by *that* invocation must not have its neighbours inside `~/out` treated as if they
+    were this job's own subdirectory's exclusive contents. Requiring `resolved_run_dir != outdir`
+    is what refuses exactly that coincidence: it never calls the server's own outdir itself a
+    job's subdirectory, no matter what its name happens to match.
+    """
+    return q._JOB_SUBDIR_RE.fullmatch(run_dir.name) is not None and resolved_run_dir != outdir
+
+
+def _delete_flat_artifacts(stem: Path, job) -> None:
+    """Remove only the files a flat (pre-A6, or hand-pointed at a shared/date folder) job's own
+    `output_stem` names -- never the directory around them, which this job does not own alone.
+
+    `<stem>.mp4`, `.wav` and `.json` (the run's own report, `cli.py`'s `run_generate`) are every
+    suffix a completed or half-finished run writes *directly* named after its stem, plus
+    `-raw.npz` (the uncompressed video+audio `run_generate` saves just before the two encoders
+    run) and the whole `-preview-stepNN.jpg` family (`preview.py`'s `preview_path`), globbed
+    because there is one per interval rather than one fixed name.
+
+    **The checkpoint is the one artifact `output_stem` does not name at all.** `checkpoint.py`
+    names a resume file after the *request's identity digest*, not the output stem, precisely so
+    two differently-tagged runs of the same prompt/seed/geometry can share one resume file rather
+    than each keeping a redundant copy (`checkpoint.request_identity`). Computing that digest here
+    would need a loaded model (`identity_digest` needs `pipe.checkpoint_identity_extra()`), which
+    this server does not have and must not load just to answer a delete click. Instead: only when
+    the job's own checkpoint directory (`_checkpoint_dir_for_job`) holds **exactly one**
+    `h3-*.safetensors` file is it safe to call that file this job's -- a lone leftover in a
+    directory only this job (as far as this server can tell) could have written a checkpoint into.
+    Two or more is ambiguous -- which of several old, unrelated jobs left which file cannot be
+    told apart without the digest -- and this function leaves all of them rather than guess. A
+    checkpoint whose companion lock file (`runs_module._LOCK_SUFFIX`) proves a writer still holds
+    it is left alone too, on the same "never guess, never touch what might still be live"
+    principle, however unlikely a live writer is for a directory only a *finished* job's flat
+    layout would still be pointing at.
+
+    (In practice a checkpoint only survives a *successful* run's own clean-up when
+    `--keep-checkpoint` was passed -- `checkpoint.py`'s `CheckpointingPipeline.__call__` discards
+    it on every ordinary success -- so what this usually finds, if anything, is the one checkpoint
+    a *failed* run left behind.)
+    """
+    for suffix in (".mp4", ".wav", ".json"):
+        Path(f"{stem}{suffix}").unlink(missing_ok=True)
+    Path(f"{stem}-raw.npz").unlink(missing_ok=True)
+    for shot in stem.parent.glob(f"{stem.name}-preview-step*.jpg"):
+        shot.unlink(missing_ok=True)
+
+    checkpoint_dir = _checkpoint_dir_for_job(job)
+    if not checkpoint_dir.is_dir():
+        return
+    checkpoints = sorted(checkpoint_dir.glob("h3-*.safetensors"))
+    if len(checkpoints) != 1:
+        return
+    checkpoint = checkpoints[0]
+    if runs_module._writer_alive(checkpoint) is True:
+        return
+    checkpoint.unlink(missing_ok=True)
+    checkpoint.with_name(checkpoint.name + runs_module._LOCK_SUFFIX).unlink(missing_ok=True)
+
+
 def _json_bytes(payload) -> bytes:
     """`payload` as the bytes of one JSON document. `ensure_ascii=False` because half the tags and
     notes on this machine are Russian and escaping them makes the wire format unreadable in a log.
@@ -1239,6 +1415,54 @@ def _content_type(path: Path) -> str:
     return f"{guess}; charset=utf-8" if guess.startswith("text/") else guess
 
 
+def _resolve_servable(root, relative: str, *, suffixes) -> Path | None:
+    """`relative` resolved under `root` and checked against `suffixes`, or `None` if there is no
+    such *readable file* there -- factored out of `_serve_file` so a caller that wants the file's
+    own path without paying for `read_bytes()` on the whole thing (`_media`'s Range support:
+    answering Safari's two-byte probe must not mean reading a 40 MB clip into memory first) can
+    reuse the exact same resolve/suffix/existence policy `_serve_file` already enforces.
+
+    `suffixes` is the allowlist of file types this route serves, and it is **required and
+    keyword-only**: it used to default to `None` meaning "anything", so a future route that forgot
+    the argument would serve the whole directory and say nothing. Forgetting it is now a
+    `TypeError` at the call site. `/static` passes `ANY_SUFFIX` explicitly -- a decision written
+    down rather than an omission -- because its root is a directory nothing writes into at run
+    time. Mutation C2b is exactly the old default, which is why the class had to go and not just
+    the instance.
+
+    **The suffix is taken from `target`, the resolved path -- the same path a caller then reads.**
+    That single fact is what defeats symbolic links: a link named `frame.mp4` pointing at
+    `notes.txt` is resolved by `resolve_within` before anything looks at its name, so the suffix
+    check sees `.txt` and the escape out of the root is caught by the same resolution. Taking the
+    suffix from `relative` instead would check the link's name and read the target's bytes -- two
+    different files, one decision. `test_the_suffix_and_the_bytes_come_from_the_same_path` pins it.
+
+    The order is `resolve` -> `suffix` -> `is_file`, so a refusal never doubles as an answer to
+    "does this file exist". A refusal for an escape is still `path_outside_root` (raised by
+    `resolve_within`) or `media_type_not_allowed` (raised here); only "the file is not there or
+    cannot be read" collapses to `None`, so a caller can turn that into its own 404.
+
+    `OSError` from `is_file` becomes `None`, not a crash. `pathlib` swallows `ENOENT` and friends
+    but not `ENAMETOOLONG`, so a name over 255 bytes used to reach the handler's `internal_error`
+    net -- reporting caller-controlled input as a bug in this server, which is the exact failure
+    `resolve_within`'s own docstring calls out. It made an absurd asymmetry visible once the suffix
+    check moved ahead of it: a 300-character `.json` answered 400 and a 300-character `.mp4`
+    answered 500.
+    """
+    target = resolve_within(Path(root) / relative, {"served": Path(root)}, write=False)
+    if target.suffix.lower() not in suffixes:
+        raise CliError(
+            "media_type_not_allowed",
+            f"this route serves only {sorted(suffixes)}, and {target.name!r} is none of them",
+            {"path": relative, "suffix": target.suffix, "allowed": sorted(suffixes)},
+        )
+    try:
+        exists = target.is_file()
+    except OSError:
+        return None
+    return target if exists else None
+
+
 def _serve_file(root, relative: str, *, suffixes) -> tuple[int, str, bytes]:
     """A file from under `root`, or a 404 -- never anything from outside `root`.
 
@@ -1250,42 +1474,15 @@ def _serve_file(root, relative: str, *, suffixes) -> tuple[int, str, bytes]:
     indistinguishable from a router that simply did not recognise the URL, so a traversal test
     written against it passes on a server with no path checking at all.
 
-    `suffixes` is the allowlist of file types this route serves, and it is **required and
-    keyword-only**: it used to default to `None` meaning "anything", so a future route that forgot
-    the argument would serve the whole directory and say nothing. Forgetting it is now a
-    `TypeError` at the call site. `/static` passes `ANY_SUFFIX` explicitly -- a decision written
-    down rather than an omission -- because its root is a directory nothing writes into at run
-    time. Mutation C2b is exactly the old default, which is why the class had to go and not just
-    the instance.
-
-    **The suffix is taken from `target`, the resolved path -- the same path that is then read.**
-    That single fact is what defeats symbolic links: a link named `frame.mp4` pointing at
-    `notes.txt` is resolved by `resolve_within` before anything looks at its name, so the suffix
-    check sees `.txt` and the escape out of the root is caught by the same resolution. Taking the
-    suffix from `relative` instead would check the link's name and read the target's bytes -- two
-    different files, one decision. `test_the_suffix_and_the_bytes_come_from_the_same_path` pins it.
-
-    The order is `resolve` -> `suffix` -> `is_file`, so a refusal never doubles as an answer to
-    "does this file exist".
-
-    `OSError` from `is_file`/`read_bytes` is a 404, not a crash. `pathlib` swallows `ENOENT` and
-    friends but not `ENAMETOOLONG`, so a name over 255 bytes used to reach the handler's
-    `internal_error` net -- reporting caller-controlled input as a bug in this server, which is the
-    exact failure `resolve_within`'s own docstring calls out. It made an absurd asymmetry visible
-    once the suffix check moved ahead of it: a 300-character `.json` answered 400 and a
-    300-character `.mp4` answered 500.
+    Path policy and the allowlist both live in `_resolve_servable`; this wrapper only adds the
+    whole-file read `_media`'s Range support (`_Handler._range_response`) no longer wants paid on
+    every request.
     """
-    target = resolve_within(Path(root) / relative, {"served": Path(root)}, write=False)
-    if target.suffix.lower() not in suffixes:
-        raise CliError(
-            "media_type_not_allowed",
-            f"this route serves only {sorted(suffixes)}, and {target.name!r} is none of them",
-            {"path": relative, "suffix": target.suffix, "allowed": sorted(suffixes)},
-        )
+    target = _resolve_servable(root, relative, suffixes=suffixes)
+    if target is None:
+        return 404, "application/json", _error_bytes(
+            "not_found", f"no such file: {relative}", {"path": relative})
     try:
-        if not target.is_file():
-            return 404, "application/json", _error_bytes(
-                "not_found", f"no such file: {relative}", {"path": relative})
         return 200, _content_type(target), target.read_bytes()
     except OSError as exc:
         # Unreadable and non-existent are one answer on purpose: the alternative distinguishes
@@ -1513,7 +1710,16 @@ class _Handler(BaseHTTPRequestHandler):
         `internal_error` with the exception's *type* in `detail` -- the type, not the message,
         because the message can contain a path or a prompt and this is the one response nobody
         anticipated the contents of.
+
+        `self._extra_headers` is reset here, to an empty dict, on **every** request -- not only
+        once per connection. `ThreadingHTTPServer` reuses one `_Handler` instance across every
+        request a keep-alive connection sends (`handle_one_request` loops), so a `Content-Range`
+        `_media` set answering request 1's `Range` probe would otherwise still be sitting on
+        `self` when request 2, an unrelated `/api/state` poll on the same socket, reaches `_send`.
+        Resetting before `route()` runs, rather than only when `_media` itself is about to set one,
+        also means a route that raises before ever touching the dict still gets a clean one.
         """
+        self._extra_headers: dict[str, str] = {}
         try:
             # Before the route, not inside it: every route this server has -- the mutating ones
             # included -- is behind these two, and a check a route has to remember to call is a
@@ -1963,10 +2169,90 @@ class _Handler(BaseHTTPRequestHandler):
         return 200, "application/json", _json_bytes({"ok": True, "path": str(resolved)})
 
     def _cancel_job(self, raw_id: str) -> tuple[int, str, bytes]:
+        """`DELETE /api/jobs/<id>`: cancel a job still in `pending/`, or -- task 2's "Удалить" on
+        a finished card -- remove a `done`/`failed` job's own record and its run's artifacts.
+
+        Two different operations behind one route on purpose: `_route_delete` dispatches only on
+        the URL, and the page cannot know a job's state without first asking, so the state decides
+        which one runs here rather than the caller having to pick a different URL for each. A job
+        in `running/` gets neither -- the worker is mid-generation, and stopping it is a different,
+        harder feature nobody asked for here -- so it answers exactly what this route always
+        answered before this button existed: `job_not_pending`.
+
+        `pending/<id>.json` existing right now is only the routing decision; the real authority
+        for the cancel branch is still `q.cancel`'s own lock (a job claimed between this check and
+        that call raises `JobNotPending` there, same as it always could).
+
+        `job_id` -- not `raw_id` -- is what the second branch matches against `q.scan`'s own
+        `Job.id`: `_job_id_of` already proved `raw_id` is a bare id with no `/` or `..` in it (the
+        same check `job_path(..., "pending")` needs to be safe), and that proof holds for
+        `done/<id>.json` and `failed/<id>.json` exactly as it does for `pending/<id>.json` --
+        `job_id` has no directory components at all, in any of the three. Matching by identity
+        (`==`) rather than trusting `q.scan`'s own `Job.id` blind matters here in a way it does
+        not for `_reveal_job`: that route only ever compares `Job.id` to a string, but this one
+        goes on to build filesystem paths from it (the record file, the prompt snapshot), and
+        `Job.id` is read straight out of the job's own JSON *content* by `queue._job_from_file`,
+        not derived from the filename that scan found it under.
+        """
         job_id = self._job_id_of(raw_id)
-        with queue_write_errors(self.server.queue_root, what="the job id"):
-            job = q.cancel(self.server.queue_root, job_id)
-        return 200, "application/json", _json_bytes({"ok": True, "job": job.as_dict()})
+        # `name_too_long_is_a_refusal` around the routing check too, not only around `q.cancel`:
+        # `.exists()` on a 400-character `pending/<id>.json` raises the same `ENAMETOOLONG` this
+        # context manager already turns into a 400 for `q.cancel` -- without it here, that OSError
+        # reached the handler's `internal_error` net one line before the check that used to catch
+        # it, and a caller-controlled length answered 500 again.
+        with name_too_long_is_a_refusal("the job id"):
+            pending = q.job_path(self.server.queue_root, job_id, "pending").exists()
+        if pending:
+            with queue_write_errors(self.server.queue_root, what="the job id"):
+                job = q.cancel(self.server.queue_root, job_id)
+            return 200, "application/json", _json_bytes({"ok": True, "job": job.as_dict()})
+
+        jobs, _broken = q.scan(self.server.queue_root)
+        job = next((candidate for candidate in jobs if candidate.id == job_id
+                   and candidate.state in ("done", "failed")), None)
+        if job is None:
+            raise CliError(
+                "job_not_pending",
+                f"эта задача не ждёт в очереди и ещё не завершилась (возможно, уже идёт): {job_id}",
+                {"id": job_id},
+            )
+        return self._delete_finished_job(job)
+
+    def _delete_finished_job(self, job) -> tuple[int, str, bytes]:
+        """The second half of `_cancel_job`: `job` is already `done` or `failed`. Removes its run's
+        own artifacts from disk, then its record from the queue -- in that order, so a failure
+        partway through artifact cleanup (a permission error, a half-mounted disk) leaves the
+        record in `done/`/`failed/` rather than a job whose files silently outlived the row that
+        named them; the click is then retryable instead of having quietly done half its job.
+
+        Two shapes of run, told apart by `_is_relocated_job_subdir`:
+
+        * **Relocated** (task A6, every job queued since): `output_stem`'s own directory is that
+          job's, and nothing else's -- `shutil.rmtree` is correct and complete. Already gone
+          (a person cleaned it up by hand, or clicked delete twice) is not an error here: the
+          desired end state, "the directory does not exist", already holds.
+        * **Flat** (queued before A6, or a `--outdir` a person pointed at a shared or date-only
+          folder by hand): the directory can hold other runs' files, or a person's own, so only
+          the files `output_stem` itself names are removed (`_delete_flat_artifacts`) -- the
+          directory itself is never touched.
+
+        `resolve_within` bounds `run_dir` to the outdir the same way `/media` and `_reveal_job`
+        bound their own reads: `output_stem` is job data read back off disk, not re-validated
+        against the roots the way a fresh submission is.
+        """
+        outdir = Path(self.server.outdir).resolve()
+        stem = Path(job.output_stem)
+        run_dir = stem.parent
+        resolved_run_dir = resolve_within(run_dir, {"outdir": outdir}, write=True)
+        if _is_relocated_job_subdir(run_dir, resolved_run_dir, outdir):
+            if resolved_run_dir.exists():
+                shutil.rmtree(resolved_run_dir)
+        else:
+            _delete_flat_artifacts(stem, job)
+
+        q.job_path(self.server.queue_root, job.id, job.state).unlink(missing_ok=True)
+        q.prompt_path(self.server.queue_root, job.id).unlink(missing_ok=True)
+        return 200, "application/json", _json_bytes({"ok": True, "id": job.id})
 
     def _estimate_only(self) -> tuple[int, str, bytes]:
         """`POST /api/estimate`: the cost of an argument list, without queueing anything.
@@ -2685,7 +2971,7 @@ class _Handler(BaseHTTPRequestHandler):
            fix for the exact-match case; walking every ancestor is what makes `queue/logs/x.jpg`
            refused exactly as `queue` itself already was, now that "inside the queue" is not
            bounded to one level either;
-        5. and the file itself must be one of `MEDIA_SUFFIXES` (in `_serve_file`), which is what
+        5. and the file itself must be one of `MEDIA_SUFFIXES` (in `_resolve_servable`), which is what
            makes the whole set survive a directory nobody thought of -- check 4 is a denylist by
            identity, and a denylist only ever covers the names someone listed.
 
@@ -2736,7 +3022,71 @@ class _Handler(BaseHTTPRequestHandler):
                 {"path": relative, "run": directory, "resolved": str(run_dir),
                  "outdir": str(outdir)},
             )
-        return _serve_file(run_dir, filename, suffixes=MEDIA_SUFFIXES)
+        target = _resolve_servable(run_dir, filename, suffixes=MEDIA_SUFFIXES)
+        if target is None:
+            return 404, "application/json", _error_bytes(
+                "not_found", f"no such file: {filename}", {"path": relative})
+        try:
+            total = target.stat().st_size
+        except OSError as exc:
+            return 404, "application/json", _error_bytes(
+                "not_found", f"no such file: {filename}",
+                {"path": relative, "error": f"{type(exc).__name__}: {exc}"})
+        return self._range_response(target, total, relative)
+
+    def _range_response(self, target: Path, total: int, relative: str) -> tuple[int, str, bytes]:
+        """The 200/206/416 answer for one `/media` file already resolved (by `_media`) and sized,
+        honouring a single `Range: bytes=...` request.
+
+        This is the whole fix for the bug that started task 2: Safari's `<video>` tag probes a
+        source with `Range: bytes=0-1` before it will show a poster frame at all, and this route
+        used to answer every request -- probe included -- with a flat 200 and the entire file.
+        Safari never got the 206 it was waiting for, so the first frame in a finished card's video
+        tag stayed blank until playback was pressed by hand.
+
+        `self._extra_headers["Accept-Ranges"] = "bytes"` is set on **every** answer this method
+        gives -- 200, 206 and 416 alike -- because all three are honest statements about a file
+        this route resolved and sized; `_send` writes it alongside the fixed three headers every
+        response already carries, and `_respond` resets `self._extra_headers` before each request
+        so it cannot leak onto an unrelated response on the same keep-alive connection.
+
+        `_parse_range` (see its own docstring for the RFC 7233 reasoning) decides the outcome:
+
+        * `None` -- no `Range`, or one this route ignores -- the ordinary whole-file 200.
+        * `RANGE_UNSATISFIABLE` -- `range_not_satisfiable`, mapped to 416, with
+          `Content-Range: bytes */<total>` so the client learns the real length without any body.
+        * `(start, end)` -- 206, `Content-Range: bytes <start>-<end>/<total>`, and exactly that
+          slice of bytes, read with a seek rather than `target.read_bytes()` -- the two-byte probe
+          that started this task must cost two bytes of I/O, not the whole clip.
+
+        `OSError` (a permission bit flipped between `_media`'s `stat()` and this method's own
+        `open`/`read`, the same race `_serve_file` already answers with 404 rather than a 500) is
+        caught around both read paths and turned into the same `not_found` `_serve_file` gives --
+        an unreadable file must not be an oracle for "this file exists but you may not have it".
+        """
+        self._extra_headers["Accept-Ranges"] = "bytes"
+        range_header = self._sole_header("Range", "bad_request")
+        outcome = _parse_range(range_header, total)
+        if outcome is RANGE_UNSATISFIABLE:
+            self._extra_headers["Content-Range"] = f"bytes */{total}"
+            raise CliError(
+                "range_not_satisfiable",
+                f"the requested Range {range_header!r} is outside the {total}-byte file",
+                {"path": relative, "total": total, "range": range_header},
+            )
+        try:
+            if outcome is None:
+                return 200, _content_type(target), target.read_bytes()
+            start, end = outcome
+            with open(target, "rb") as handle:
+                handle.seek(start)
+                body = handle.read(end - start + 1)
+            self._extra_headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+            return 206, _content_type(target), body
+        except OSError as exc:
+            return 404, "application/json", _error_bytes(
+                "not_found", f"no such file: {relative}",
+                {"path": relative, "error": f"{type(exc).__name__}: {exc}"})
 
     def send_error(self, code, message=None, explain=None) -> None:
         """JSON, never the HTML page `BaseHTTPRequestHandler` would otherwise produce.
@@ -2768,18 +3118,24 @@ class _Handler(BaseHTTPRequestHandler):
         preview frames three times a minute for bytes that cannot have changed. `MEDIA_MAX_AGE`
         says why they cannot.
 
-        **Only 200, and only under `/media`.** A refusal is never cached, and the case that
-        makes that matter rather than a formality is the 404: the commonest one this route
+        **Only 200 or 206, and only under `/media`.** A refusal is never cached, and the case
+        that makes that matter rather than a formality is the 404: the commonest one this route
         answers is a preview frame the run has not written *yet*, and a cached one would keep
         that card blank for the rest of the evening -- the browser would stop asking, and the
-        frame that appeared two minutes later would never be fetched.
+        frame that appeared two minutes later would never be fetched. 206 joins 200 (task 2's
+        Range support): a byte range out of a run's own clip is exactly as immutable as the whole
+        file it was cut from -- same path, same never-rewritten-in-place guarantee -- and Safari
+        re-issues its own opening `bytes=0-1` probe on every card redraw exactly like the `<img>`
+        tags this exception already exists for. 416 is deliberately excluded: it carries no bytes
+        of the file at all, just `Content-Range: bytes */<total>`, and caching that would freeze a
+        stale `<total>` in the browser the next time the same URL is asked for a real range.
 
         The path is unquoted first, exactly as `_route_get` unquotes it before matching, so this
         answer cannot disagree with the route that produced the body. `getattr` because
         `send_error` reaches `_send` on a request line the base class failed to parse, where
         there is no `self.path` at all.
         """
-        if status != 200:
+        if status not in (200, 206):
             return "no-store"
         path = urllib.parse.unquote(urllib.parse.urlsplit(getattr(self, "path", "")).path)
         if not path.startswith("/media/"):
@@ -2787,11 +3143,19 @@ class _Handler(BaseHTTPRequestHandler):
         return f"public, max-age={MEDIA_MAX_AGE}, immutable"
 
     def _send(self, status: int, content_type: str, body: bytes) -> None:
-        """One place that writes a response, so `Content-Length` cannot be forgotten on one path."""
+        """One place that writes a response, so `Content-Length` cannot be forgotten on one path.
+
+        `self._extra_headers` (`Accept-Ranges`, `Content-Range` -- see `_media`'s
+        `_range_response`) is read with `getattr`, not a bare attribute access: `send_error` can
+        reach this method on a request line the base class failed to parse, before `_respond` ever
+        ran and set the dict up, and a response to *that* carries no extra headers at all.
+        """
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", self._cache_control(status))
+        for name, value in getattr(self, "_extra_headers", {}).items():
+            self.send_header(name, value)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)

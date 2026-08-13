@@ -129,6 +129,7 @@ ERROR_CODES = {
     "prompt_name_invalid": "a prompt name is not a bare `[A-Za-z0-9_-]+.txt` -- it names a directory or another suffix",
     "queue_unwritable": "the queue directory could not be read or written; see `detail.path`",
     "media_type_not_allowed": "/media serves only finished clips and preview frames, and that is not one",
+    "range_not_satisfiable": "the request's Range header names bytes outside the file `/media` resolved; `detail.total` is the file's real length",
     # The chat prompt editor. The first three are the server's own refusals; the last three are
     # raised inside `h3_48gb.provider` and reach the wire unchanged, because a failure of the model
     # is not a failure of this server and a page that has to tell them apart matches on the code.
