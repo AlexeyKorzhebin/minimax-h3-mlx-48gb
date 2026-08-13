@@ -1259,6 +1259,40 @@ export function chatHashAction(hash, current) {
   return { act: "enter", id: match[1] };
 }
 
+/** Реплика по умолчанию для хода, в который брошена картинка без единого слова (A8, требование
+ *  2) — видна в ленте как обычная реплика `user`, а не выдумывается молча: человек должен знать,
+ *  о чём в итоге спросили модель. Текст — та же формулировка, что и абзац для модели в
+ *  `docs/h3-prompt-system.md` («опиши её и предложи промпт от неё»), только от первого лица
+ *  просьбы, а не от лица инструкции. */
+export const DEFAULT_IMAGE_TURN_TEXT = "Опиши кадр и предложи промпт от него";
+
+/**
+ * Тело хода, приложенного кадром (A8) — чистая функция, которую `sendChatMessage` зовёт перед
+ * `api()`, чтобы собрать `image`/`set_mode`/(при нужде) `text` для тела запроса.
+ *
+ * `state` — `{text, pendingImage, mode}`: `text` уже обрезан (`.trim()`), `pendingImage` —
+ * `{path, name}` только что загруженного через `/api/uploads` кадра или `null` (ничего не
+ * приложено), `mode` — текущий режим сессии (`chat.mode`), из того же списка, что и
+ * `web.CHAT_MODES` на сервере.
+ *
+ * Без кадра — пустой объект: обычный ход ничего не примешивает к телу, которое строит сам
+ * `sendChatMessage`. С кадром: `image` — путь, который вернул аплоад, и он уходит всегда; `text`
+ * подставляется, только когда поле ввода было пустым (см. `DEFAULT_IMAGE_TURN_TEXT`) — печатный
+ * текст едет как есть, без правки. `set_mode: "i2v"` появляется, только если режим сессии ещё
+ * не решил, каким кадром пользоваться (пустой или `t2va`); `i2v`/`flf` не трогаются — кадр там
+ * уже учтён, и незачем переписывать то, что сервер и так знает.
+ */
+export function attachmentBody(state) {
+  const pending = (state && state.pendingImage) || null;
+  if (!pending || !pending.path) return {};
+  const body = { image: pending.path };
+  const mode = (state && state.mode) || "";
+  if (!mode || mode === "t2va") body.set_mode = "i2v";
+  const text = String((state && state.text) || "").trim();
+  if (!text) body.text = DEFAULT_IMAGE_TURN_TEXT;
+  return body;
+}
+
 /**
  * Плейсхолдер-запись хода, пока ответ модели не пришёл.
  *
@@ -1992,9 +2026,14 @@ function startPage() {
           // тем же `prefers-reduced-motion`, что и остальная страница.
           const dots = entry.kind === "pending"
             ? '<span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>' : "";
+          // A8, требование 2: ход, к которому приложен кадр, несёт пометку с именем файла —
+          // `sendChatMessage` кладёт его в `entry.attachment` в момент отправки, только для
+          // хода, который его реально приложил (история с диска этого поля не знает вовсе).
+          const attach = entry.attachment
+            ? `<span class="turn-attach">📎 ${escapeHtml(entry.attachment)}</span>` : "";
           return `<li class="turn ${escapeHtml(entry.role)}`
             + `${entry.kind ? " " + escapeHtml(entry.kind) : ""}">`
-            + `${escapeHtml(entry.text)}${dots}</li>`;
+            + `${attach}${escapeHtml(entry.text)}${dots}</li>`;
         }).join("")
       : `<li class="turn note">Опишите идею словами — модель соберёт промпт по формату. `
         + `Уже готовый текст можно вставить в окно слева и попросить привести к стандарту.</li>`;
@@ -2075,6 +2114,14 @@ function startPage() {
       id,
       source: session.source || { kind: "new" },
       mode: session.mode || "",
+      // A8: кадр сессии — тот, с которым её открыли, или тот, что подложил более ранний ход
+      // этой же модалки (`sendChatMessage`'s own `image`, приземлённый после ответа). Читается
+      // отсюда «в Редактор» (`finishChat`), той же дорогой, какой `slug` доезжает до `#tag`.
+      image: session.image || "",
+      // A8: кадр, который только что загрузился через `/api/uploads` (скрепка/dnd в поле
+      // ввода), но ещё не ушёл ходом — `null`, пока ничего не приложено; `sendChatMessage`
+      // сбрасывает его в начале хода, а `attachmentBody` читает как `state.pendingImage`.
+      pendingImage: null,
       // A3: длительность сессии — редактируется прямо в шапке модалки (`chat-duration`) и
       // уходит каждым ходом (`sendChatMessage`); `chatDuration` отвечает за дефолт, если сессия
       // почему-то ничего не сказала.
@@ -2110,6 +2157,9 @@ function startPage() {
     $("chat-duration").value = chat.duration;
     renderChatPrompt();
     renderChatLog();
+    renderChatAttachment();   // A8: сбрасывает бейдж прошлой сессии -- новый `chat` начинается
+                               // с пустого `pendingImage`, а DOM без этого мог остаться на её
+                               // последнем состоянии (открытая/ошибочная загрузка).
     await loadProviders();
     $("chat-input").focus();
   }
@@ -2175,32 +2225,45 @@ function startPage() {
    * старая реплика летела; затирать его старым текстом молча нельзя (см. `restoredInput`). Ход
    * при этом должен ещё и правда лечь в эту сессию, а не в чужую, на которую модалка успела
    * перескочить.
+   *
+   * A8: кадр, приложенный скрепкой/dnd (`chat.pendingImage`, уже загруженный на сервер
+   * `/api/uploads` к этому моменту — см. `uploadChatImage`), уходит этим же ходом через
+   * `attachmentBody`: `image`/`set_mode`, и, если поле ввода было пустым, дефолтный текст
+   * реплики вместо неё. Кадр снимается с состояния модалки до отправки, той же логикой, что и
+   * поле ввода строкой выше, — а не по ответу, чтобы новый кадр можно было прикладывать, пока
+   * этот ход ещё летит.
    */
   async function sendChatMessage() {
     if (!chat || chat.sending) return;
     const typed = $("chat-input").value;
     const text = typed.trim();
-    if (!text) return;
+    const attachment = chat.pendingImage;
+    if (!text && !attachment) return;
+    const extra = attachmentBody({ text, pendingImage: attachment, mode: chat.mode });
+    const outgoingText = extra.text !== undefined ? extra.text : text;
     const session = chat;
     session.sending = true;
     $("chat-send").disabled = true;
     renderLlmPlate("жду ответа — на холодной модели это до минуты");
-    session.log.push({ role: "user", text });
+    session.log.push({ role: "user", text: outgoingText,
+                       attachment: attachment ? attachment.name : "" });
     // Плейсхолдер хода — точки, что ход идёт, пока сервер ничего не прислал (см. `pendingEntry`).
     session.log.push(pendingEntry(session.llmStatus));
     $("chat-input").value = "";
+    clearChatAttachment();
     renderChatLog();
 
     let answer = null;
     let failure = null;
     try {
       answer = await api("POST", `/api/chat/${encodeURIComponent(session.id)}/message`,
-                         { text, prompt: session.promptText,
+                         { text: outgoingText, prompt: session.promptText,
                            provider: $("chat-provider").value,
                            // A3: длительность из состояния модалки, не из формы — она может
                            // расходиться с сессией с самого открытия, а с этого хода и сама
                            // могла подвинуться в `chat-duration`.
-                           duration: chatDuration(session) });
+                           duration: chatDuration(session),
+                           image: extra.image, set_mode: extra.set_mode });
     } catch (error) {
       failure = error;
     }
@@ -2209,6 +2272,11 @@ function startPage() {
 
     if (answer) {
       if (!landTurn(chat, session, answer)) return;
+      // Сервер уже применил `image`/`set_mode` к сессии (`_locked_turn`) -- состояние модалки
+      // догоняет тем же значением, которое сама и отправила, а не ждёт следующего перечитывания
+      // сессии, которого может не случиться до самого «в Редактор».
+      if (extra.image) chat.image = extra.image;
+      if (extra.set_mode) chat.mode = extra.set_mode;
       chat.llmStatus = (answer.llm || {}).status || chat.llmStatus;
       clearError();
     } else if (!landFailure(chat, session, failure && failure.payload, runningLeft)) {
@@ -2216,8 +2284,10 @@ function startPage() {
     } else {
       // Ход не удался: `landFailure` уже вернул реплику в ленту, и поле получает обратно тот же
       // текст, который в нём был до отправки — но только если человек не начал печатать что-то
-      // новое, пока ход летел (см. `restoredInput`).
+      // новое, пока ход летел (см. `restoredInput`). Кадр — тем же правилом: отказ не должен
+      // заставлять грузить файл заново.
       $("chat-input").value = restoredInput($("chat-input").value, typed);
+      if (attachment && !chat.pendingImage) restoreChatAttachment(attachment);
     }
     renderLlmPlate();
     renderChatPrompt();
@@ -2337,6 +2407,20 @@ function startPage() {
       $("prompt").value = text;
       promptFromFile = null;
       $("prompt-file").value = "";
+      // A8: режим и кадр сессии — только когда сессия их действительно назвала. Пустой `chat.mode`
+      // ничего не значит (форма уже показывает свой собственный выбор, и `<select>` не умеет
+      // пустое значение), а непустой — это либо режим, с которым открыли сессию, либо `i2v`,
+      // которым её обновил дропнутый в диалог кадр (`_locked_turn`'s own `set_mode`); в обоих
+      // случаях форма обязана увидеть его так же безусловно, как несколькими строками выше
+      // видит текст промпта.
+      if (chat.mode) {
+        $("mode").value = chat.mode;
+        syncModeRows();
+      }
+      if (chat.image) {
+        $("image").value = chat.image;
+        updateUploadZone("image");
+      }
       // Запоминается только тогда, когда `tagFromSessionSlug` действительно что-то подставила:
       // безусловная память приняла бы и оставленный как есть ручной тег за «свой» автослаг, и
       // тот же баг вернулся бы на следующем ходе этой сессии — только на шаг позже.
@@ -2552,6 +2636,104 @@ function startPage() {
     updateUploadZone(id);
   }
 
+  /* -- кадр в диалог (A8): скрепка и dnd в поле ввода чата -----------------------------------
+     Тот же `POST /api/uploads`, что и `uploadFrame` выше (A7), но результат не садится в поле
+     формы: до следующего хода он ждёт в `chat.pendingImage`, а бейдж под полем ввода — то, что
+     человек видит вместо него до отправки (`sendChatMessage`/`attachmentBody` решают, что с
+     ним сделать, когда ход действительно уходит). */
+
+  /** Бейдж загруженного, но ещё не отправленного кадра — из `chat.pendingImage`, тем же
+   *  правилом «состояние решает, DOM только рисует», что и весь остальной модаль. Снимает
+   *  `error`/`busy` при каждой перерисовке, чтобы след прошлой попытки не пережил следующую. */
+  function renderChatAttachment() {
+    const badge = $("chat-attachment");
+    const pending = chat && chat.pendingImage;
+    badge.hidden = !pending;
+    badge.classList.remove("error", "busy");
+    if (pending) $("chat-attachment-label").textContent = `📎 ${pending.name}`;
+  }
+
+  /** Кадр снят — либо ходом, который его унёс (`sendChatMessage`), либо крестиком бейджа. */
+  function clearChatAttachment() {
+    if (chat) chat.pendingImage = null;
+    renderChatAttachment();
+  }
+
+  /** Кадр возвращается в состояние модалки после отказавшего хода (`sendChatMessage`) — та же
+   *  логика, что `restoredInput` даёт полю ввода: отказ не должен заставлять грузить файл
+   *  заново, только чтобы повторить ту же реплику. */
+  function restoreChatAttachment(attachment) {
+    if (!chat) return;
+    chat.pendingImage = attachment;
+    renderChatAttachment();
+  }
+
+  /** Один POST, сырыми байтами -- тот же протокол, что и `uploadFrame` (см. его докстринг про
+   *  `X-Filename`), только пункт назначения другой: не поле формы, а `chat.pendingImage`. */
+  async function uploadChatImage(file) {
+    if (!chat) return;
+    const badge = $("chat-attachment");
+    badge.hidden = false;
+    badge.classList.remove("error");
+    badge.classList.add("busy");
+    $("chat-attachment-label").textContent = `загружаю ${file.name}…`;
+    try {
+      const response = await fetch("/api/uploads", {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream",
+                  "X-Filename": encodeURIComponent(file.name) },
+        body: file,
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const error = new Error("upload");
+        error.payload = payload;
+        throw error;
+      }
+      if (!chat) return;   // модалку закрыли, пока файл ещё грузился
+      chat.pendingImage = { path: payload.path, name: file.name };
+      renderChatAttachment();
+    } catch (error) {
+      badge.classList.remove("busy");
+      badge.classList.add("error");
+      $("chat-attachment-label").textContent = error.payload
+        ? errorText(error.payload).title : "Кадр не загрузился";
+      return;
+    }
+    badge.classList.remove("busy");
+  }
+
+  /** Скрепка `#chat-attach` (клик открывает `#chat-attach-file`), перетаскивание — прямо на
+   *  `#chat-input`, крестик бейджа снимает кадр без отправки. */
+  function wireChatAttach() {
+    const button = $("chat-attach");
+    const fileInput = $("chat-attach-file");
+    const input = $("chat-input");
+    const clear = $("chat-attachment-clear");
+
+    button.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (file) uploadChatImage(file);
+      fileInput.value = "";   // тот же файл второй раз подряд тоже должен дать событие change
+    });
+    input.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      input.classList.add("dragover");
+    });
+    input.addEventListener("dragleave", () => input.classList.remove("dragover"));
+    input.addEventListener("drop", (event) => {
+      event.preventDefault();
+      input.classList.remove("dragover");
+      const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+      if (file) uploadChatImage(file);
+    });
+    clear.addEventListener("click", (event) => {
+      event.preventDefault();
+      clearChatAttachment();
+    });
+  }
+
   /** «Выгрузить и начать»: `POST /api/llm/unload`, затем то же перечитывание состояния, что и
    *  после любого действия над очередью (`withQueue`) — работник берёт освободившуюся задачу
    *  сам, странице нужно только увидеть это на следующем `poll()`.
@@ -2665,6 +2847,7 @@ function startPage() {
   }
   wireUploadZone("image");
   wireUploadZone("end-image");
+  wireChatAttach();
   $("mode").addEventListener("change", () => {
     syncModeRows();
     renderPrompt();     // t2va без звуковых секций — отказ, t2v без них — нет

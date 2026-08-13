@@ -918,6 +918,37 @@ body[data-stale] main { opacity: .55; }
 #chat-input { flex: 1; resize: vertical; line-height: 1.45; }
 #chat-send:disabled { background: var(--fill-2); color: var(--ink-3); cursor: not-allowed; }
 
+/* A8: скрепка — квадратная, той же высоты, что и первая строка поля ввода, не растягивается
+   вместе с ним при resize (в отличие от #chat-input, у которого flex:1). */
+.chat-attach { flex: 0 0 auto; padding: 5px 10px; font-size: 15px; line-height: 1.45; }
+/* Перетаскивание кадра прямо на поле ввода (A8, требование 1) — та же подсветка рамкой, что и
+   у `.dropzone.dragover` в форме постановки, чтобы приём файла читался одинаково в обоих
+   местах страницы. */
+#chat-input.dragover {
+  outline: 2px dashed var(--accent); outline-offset: -2px; background: var(--accent-soft);
+}
+
+/* Бейдж загруженного, но ещё не отправленного кадра (`chat.pendingImage`) — между лентой и
+   полем ввода, тем же тоном, что и служебные строки ленты (`.chat-log .note`). */
+.chat-attachment {
+  display: flex; align-items: center; gap: 8px; margin: 8px 0 0;
+  padding: 6px 10px; border-radius: var(--r-inner);
+  background: var(--fill); color: var(--ink-2); font-size: 12.5px;
+}
+.chat-attachment.busy { opacity: .7; }
+.chat-attachment.error { background: var(--fail-soft); color: var(--fail-ink); }
+#chat-attachment-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-attachment-clear {
+  margin-left: auto; background: none; border: none; padding: 0 2px;
+  font-size: 15px; line-height: 1; color: inherit; cursor: pointer;
+}
+.chat-attachment-clear:hover { color: var(--fail-ink); }
+
+/* Пометка кадра внутри реплики ленты (`entry.attachment`, задача A8, требование 2). */
+.chat-log .turn-attach {
+  display: block; font-size: 11.5px; opacity: .75; margin-bottom: 2px;
+}
+
 /* ---------- узкие окна ---------- */
 @media (max-width: 1180px) {
   :root { --pad: 20px; --cardpad: 18px; }

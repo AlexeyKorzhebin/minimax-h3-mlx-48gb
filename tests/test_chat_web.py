@@ -722,6 +722,76 @@ def test_a_keyframe_outside_every_root_is_refused_when_the_session_opens(_serve,
     assert (status, payload["error"]["code"]) == (400, "path_outside_root")
 
 
+# -- A8: кадр приложен ходом (скрепка/dnd в поле чата) -------------------------------------------
+
+
+def test_a_turn_with_an_image_updates_the_session_and_attaches_the_new_frame(_serve, fake_llama):
+    """Кадр, приложенный самим ходом (`image` в теле `message`, задача A8) — не только уходит
+    модели этим же ходом (существующий механизм `_turn_content`), но и переживает ход: следующее
+    сообщение, которое вовсе не называет кадр, обязано снова увидеть именно его, а не пустоту.
+    `set_mode` идёт тем же ходом и должен обновить сохранённый режим сессии ровно так, как если
+    бы сессию открыли заново с этим режимом.
+    """
+    srv = _serve(providers_port=fake_llama.port)
+    png = Path(srv.root) / "dropped.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n0000")
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    answer = srv.post_json(f"/api/chat/{sid}/message",
+                           {"text": "опиши кадр", "prompt": "", "image": str(png),
+                            "set_mode": "i2v"})
+    assert answer.get("warning") is None, answer
+    sent = fake_llama.requests[-1]["body"]["messages"][-1]["content"]
+    kinds = [part["type"] for part in sent]
+    assert kinds == ["text", "image_url"]
+    assert sent[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    saved = srv.get_json(f"/api/chat/{sid}")
+    assert Path(saved["image"]) == png.resolve()
+    assert saved["mode"] == "i2v"
+
+    # Второй ход ничего не говорит про кадр — сессия обязана помнить прошлый.
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "ещё", "prompt": ""})
+    second = fake_llama.requests[-1]["body"]["messages"][-1]["content"]
+    assert [part["type"] for part in second] == ["text", "image_url"]
+
+
+def test_an_invalid_image_in_a_turn_is_a_hard_refusal_and_the_session_is_untouched(_serve,
+                                                                                   fake_llama):
+    """`image` в теле `message` — явное действие человека (скрепка, dnd), не «кадр из прошлого,
+    который мог протухнуть» (`_turn_content`'s own warning). Тот же файл, отклонённый как кадр
+    при создании сессии (`_chat_image_path`), отклоняется здесь так же жёстко: 400, а не ход,
+    отправленный без картинки с оговоркой. И, раз это отказ, ни сессия, ни счётчик обращений к
+    модели не должны были измениться.
+    """
+    srv = _serve(providers_port=fake_llama.port)
+    not_an_image = Path(srv.root) / "notes.txt"
+    not_an_image.write_text("не кадр", encoding="utf-8")
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    status, payload = srv.post_json_raw(
+        f"/api/chat/{sid}/message",
+        {"text": "опиши кадр", "prompt": "", "image": str(not_an_image)})
+    assert (status, payload["error"]["code"]) == (400, "bad_image"), payload
+    saved = srv.get_json(f"/api/chat/{sid}")
+    assert saved["image"] == "", "невалидный кадр не должен был попасть в сессию"
+    assert saved["messages"] == [], "отказанный ход не должен был лечь в историю"
+    assert fake_llama.requests == [], "модель не должна была получить платный вызов на отказе"
+
+
+def test_a_garbage_set_mode_in_a_turn_is_args_invalid(_serve, fake_llama):
+    """`set_mode` — тот же закрытый список, что и `mode` при создании сессии (`CHAT_MODES`), и
+    та же причина: мусор здесь становится либо инструкцией для модели, которую она честно
+    выполнит, либо решением страницы «звука нет», принятым по опечатке."""
+    srv = _serve(providers_port=fake_llama.port)
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": "", "mode": "t2va"})["id"]
+    status, payload = srv.post_json_raw(
+        f"/api/chat/{sid}/message", {"text": "х", "prompt": "", "set_mode": "видео"})
+    assert (status, payload["error"]["code"]) == (400, "args_invalid"), payload
+    assert sorted(payload["error"]["detail"]["modes"]) == sorted(web.CHAT_MODES), payload
+    saved = srv.get_json(f"/api/chat/{sid}")
+    assert saved["mode"] == "t2va", "отказанный set_mode не должен был перезаписать режим сессии"
+    assert saved["messages"] == [], "отказанный ход не должен был лечь в историю"
+
+
 # -- загрузка кадра (A7) ------------------------------------------------------------------------
 
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"0" * 32

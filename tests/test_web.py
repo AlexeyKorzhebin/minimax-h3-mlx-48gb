@@ -4193,6 +4193,11 @@ def test_finishing_a_chat_to_the_editor_writes_the_sessions_slug_into_the_tag_fi
     round 2) -- `chat.lastAutoTag` alone (fix round 1) does not survive `closeChat()`, so a session
     reopened later would forget its own earlier auto-tag and never be able to move it forward (see
     `test_a_reopened_sessions_auto_tag_survives_where_the_chat_object_itself_does_not`).
+
+    A8: the same branch also has to carry `mode`/`image` into the form -- a frame dropped mid-
+    conversation (`sendChatMessage`'s own `image`/`set_mode`) updates `chat.mode`/`chat.image`,
+    and «в Редактор» is the one moment that state reaches `#mode`/`#image`, the same way the
+    session's own slug reaches `#tag` a few lines above it.
     """
     app_js = (WEBUI / "app.js").read_text(encoding="utf-8")
     start = app_js.index("async function finishChat()")
@@ -4205,6 +4210,12 @@ def test_finishing_a_chat_to_the_editor_writes_the_sessions_slug_into_the_tag_fi
     assert "rememberAutoTag(autoTagBySession" in body, (
         "finishChat must persist an actual substitution into the module-level map, not only "
         "onto the doomed `chat` object:\n" + body)
+    assert '$("mode").value = chat.mode' in body, (
+        "«в Редактор» must carry the session's own mode (i2v after a dropped frame, A8) into "
+        "the form:\n" + body)
+    assert '$("image").value = chat.image' in body, (
+        "«в Редактор» must carry the session's own keyframe path (A8) into the form, the same "
+        "way it already carries the slug into #tag:\n" + body)
 
     enter_start = app_js.index("async function enterChat(id)")
     enter_end = app_js.index("function closeChat()", enter_start)
@@ -4215,6 +4226,10 @@ def test_finishing_a_chat_to_the_editor_writes_the_sessions_slug_into_the_tag_fi
         "enterChat must recover lastAutoTag from the module-level map -- reading only `session` "
         "(which never carried this field) or defaulting to \"\" is exactly the bug fix round 2 "
         "closes:\n" + enter_body)
+    assert "image: session.image" in enter_body, (
+        "A8: enterChat must read the session's own keyframe into `chat.image`, or a turn that "
+        "updated it server-side (`_locked_turn`'s `image`) would have nowhere client-side to "
+        "land before «в Редактор» reads it back out:\n" + enter_body)
 
 
 def test_submit_falls_back_to_the_heuristic_slug_when_the_tag_is_still_the_default():
@@ -4554,3 +4569,74 @@ def test_a_failed_turn_only_restores_the_field_if_nobody_has_started_a_new_draft
     assert restored == "старое", "an empty field gets its unsent text back"
     assert left_alone == "новый черновик", (
         "a field that already has something in it must not be overwritten by the old draft")
+
+
+# -- Task A8: a keyframe dropped straight into the chat's own input -------------------------------
+
+
+@_needs_node
+def test_attachment_body_is_empty_without_a_pending_image():
+    """`attachmentBody` only has an opinion once a frame has actually been uploaded -- an ordinary
+    text-only turn must not pick up `image`/`set_mode` keys it never asked for (`_json_request`
+    on the server side would refuse `image: undefined`... except `JSON.stringify` drops it, which
+    is exactly why an *absent* key here, not merely a falsy one, is what this pins)."""
+    out = _node_eval("""
+      console.log(JSON.stringify(
+        app.attachmentBody({text: "мрачнее", pendingImage: null, mode: "t2va"})));
+    """)
+    assert out == {}, out
+
+
+@_needs_node
+def test_attachment_body_defaults_the_text_and_claims_i2v_when_the_mode_is_still_undecided():
+    """The two rules requirement 2 (A8) names for a frame dropped with no words at all: the turn
+    still needs *some* text (so it shows up in the transcript like any other turn, not as a blank
+    bubble), and the session's mode moves to `i2v` -- but only when it was not already saying
+    something else on purpose (`t2va`, or a session that never declared one)."""
+    undecided, was_t2va = _node_eval("""
+      console.log(JSON.stringify([
+        app.attachmentBody({text: "", pendingImage: {path: "/out/uploads/1-a.png", name: "a.png"},
+                            mode: ""}),
+        app.attachmentBody({text: "  ", pendingImage: {path: "/out/uploads/1-a.png", name: "a.png"},
+                            mode: "t2va"}),
+      ]));
+    """)
+    for body in (undecided, was_t2va):
+        assert body["image"] == "/out/uploads/1-a.png", body
+        assert body["set_mode"] == "i2v", body
+        assert body["text"] == "Опиши кадр и предложи промпт от него", body
+
+
+@_needs_node
+def test_attachment_body_keeps_the_typed_text_and_leaves_a_decided_mode_alone():
+    """The mirror of the case above: text the person actually typed travels as-is (no default
+    substitution), and a mode that already names a keyframe (`i2v`/`flf`) is not overwritten --
+    the frame is already accounted for, and there is nothing for `set_mode` to decide."""
+    for mode in ("i2v", "flf"):
+        body = _node_eval(f"""
+          console.log(JSON.stringify(
+            app.attachmentBody({{text: "переделай фон", pendingImage:
+              {{path: "/out/uploads/2-b.png", name: "b.png"}}, mode: {json.dumps(mode)}}})));
+        """)
+        assert body == {"image": "/out/uploads/2-b.png"}, (mode, body)
+
+
+def test_the_chat_log_marks_a_turn_that_carried_an_attached_frame():
+    """Requirement 2 (A8): «в ленте у хода с кадром — пометка с именем файла». `renderChatLog` is
+    DOM-only and cannot run under `node` (see `_node_eval`'s own docstring) -- pinned on the
+    source instead, the same way the pending-dots markup a few lines above it in the real
+    function is."""
+    body = _js_function((WEBUI / "app.js").read_text(encoding="utf-8"), "function renderChatLog()")
+    assert "entry.attachment" in body, (
+        "a log entry carrying an attached frame's name must be rendered as a mark the person can "
+        "see, not silently dropped on the way to innerHTML:\n" + body)
+
+
+def test_send_chat_message_wires_the_attachment_into_the_outgoing_turn():
+    """`attachmentBody` is only worth the tests above if `sendChatMessage` actually calls it --
+    a pure function nobody wires up passes every test in this file and ships nothing."""
+    body = _js_function((WEBUI / "app.js").read_text(encoding="utf-8"), "async function sendChatMessage()")
+    assert "attachmentBody(" in body, body
+    assert "pendingImage" in body, (
+        "sendChatMessage must read the frame the attach button/dnd just uploaded "
+        "(`chat.pendingImage`) to build the turn's body:\n" + body)

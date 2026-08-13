@@ -311,7 +311,18 @@
         <button class="ghost" id="chat-close" type="button">закрыть</button>
       </div>
       <ol class="chat-log" id="chat-log"></ol>
-      <form id="chat-form"><textarea id="chat-input" rows="2"
+      <!-- A8: кадр в диалог — бейдж загруженного, но ещё не отправленного кадра
+           (`chat.pendingImage`, app.js); скрыт, пока ничего не приложено. -->
+      <p class="chat-attachment" id="chat-attachment" hidden>
+        <span id="chat-attachment-label"></span>
+        <button type="button" class="chat-attachment-clear" id="chat-attachment-clear"
+                aria-label="Убрать кадр">×</button>
+      </p>
+      <form id="chat-form">
+        <button type="button" class="ghost chat-attach" id="chat-attach"
+                aria-label="Приложить кадр" title="Приложить кадр">📎</button>
+        <input type="file" id="chat-attach-file" accept="image/*" hidden>
+        <textarea id="chat-input" rows="2"
         placeholder="Опиши идею или попроси переделать…"></textarea>
         <button class="primary" id="chat-send" type="submit">отправить</button></form>
     </div>

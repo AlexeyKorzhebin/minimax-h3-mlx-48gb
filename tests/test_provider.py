@@ -204,7 +204,10 @@ def test_system_prompt_carries_the_format_and_the_preservation_rule():
                    "How the reference pictures align with the target video",
                    # A4: the doc has to tell the model to hand back a slug, and show it the
                    # shape the example is supposed to take.
-                   "slug", "cat-italian-noon"):
+                   "slug", "cat-italian-noon",
+                   # A8: a keyframe dropped on the chat with no words at all still has to get a
+                   # full answer -- a description and a prompt, not a description and a stop.
+                   "attaches an image and writes no words"):
         assert anchor in text, anchor
 
 

@@ -2431,6 +2431,13 @@ class _Handler(BaseHTTPRequestHandler):
         first, so a malformed request is still a 400 rather than a lock contention report; the
         session is re-read *inside* the lock, because the copy read before it may be a turn out of
         date by the time the lock is granted.
+
+        **`image`/`set_mode` (A8): a keyframe dropped on the chat's own input, mid-conversation.**
+        The page uploads the file first (`POST /api/uploads`, A7) and hands this route the path
+        it got back, in the same turn as the text -- one user action, one request, exactly the way
+        `mode`/`image` arrive together at `_create_chat`. Both are optional and both update the
+        session (`_locked_turn`) before this turn's own system/user messages are built, so the
+        frame the model is shown and the frame the session remembers afterward are the same one.
         """
         path = self._chat_path(sid)
         # `is_file` before the lock, so a bogus id does not leave a `.lock` file behind -- and
@@ -2441,7 +2448,8 @@ class _Handler(BaseHTTPRequestHandler):
         if not exists:
             return 404, "application/json", _error_bytes(
                 "chat_not_found", f"нет сессии {sid}", {"id": sid})
-        payload = self._json_request(allowed=("text", "prompt", "provider", "duration"))
+        payload = self._json_request(
+            allowed=("text", "prompt", "provider", "duration", "image", "set_mode"))
         with chat_session_lock(path):
             return self._locked_turn(sid, path, payload)
 
@@ -2452,6 +2460,32 @@ class _Handler(BaseHTTPRequestHandler):
             return 404, "application/json", _error_bytes(
                 "chat_not_found", f"нет сессии {sid}", {"id": sid})
         text = self._string_of(payload, "text")
+        # `image` (A8): a keyframe the person just dropped on the chat's own input, not one that
+        # has been sitting in the session since it opened. That difference is why this is a hard
+        # refusal (`_chat_image_path` raises straight through, uncaught) rather than folded into
+        # `_turn_content`'s warning below -- the warning is for a frame that *used to* be valid and
+        # stopped being one between turns; this is a path the person handed the server this very
+        # second, and an unreadable or wrong-suffix one is a mistake worth stopping the turn for,
+        # not a footnote on a reply they never asked to send it without a picture. Checked, and the
+        # session updated, before anything about this turn reaches the model or `_write_session`:
+        # a refusal here must leave the session exactly as it was (see `_chat_message`'s docstring
+        # on `image`/`set_mode`), which holds for free as long as nothing is written before it.
+        image = self._string_of(payload, "image")
+        if image:
+            session["image"] = str(self._chat_image_path(image))
+        # `set_mode` (A8): rides the same turn as the frame, because a dropped image and the mode
+        # it implies are one user action -- the same closed list `mode` is checked against at
+        # `_create_chat`, refused the same way (`args_invalid`), for the same two readers (the
+        # model's `## Context` line, and the page's own sound-section guess).
+        set_mode = self._string_of(payload, "set_mode")
+        if set_mode and set_mode not in CHAT_MODES:
+            raise CliError(
+                "args_invalid",
+                f"`set_mode` is one of {sorted(CHAT_MODES)} or empty, and {set_mode!r} is not",
+                {"set_mode": set_mode, "modes": sorted(CHAT_MODES)},
+            )
+        if set_mode:
+            session["mode"] = set_mode
         # `duration` (A3): editable in the modal's own header (`chat-duration`), and re-sent with
         # every turn -- a person may move the number after the session opened, and the next turn
         # has to see what is in the field *now*, the same reasoning `_locked_turn`'s own docstring
