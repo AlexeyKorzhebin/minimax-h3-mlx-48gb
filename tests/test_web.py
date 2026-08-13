@@ -2482,6 +2482,44 @@ def test_every_way_a_shot_line_can_break_the_format_is_named(was, becomes, expec
 
 
 @_needs_node
+def test_chat_duration_reads_the_sessions_own_state_not_the_forms_default():
+    """A3: `chatDuration` — чистая функция, и её сигнатура — всё требование сразу. Она берёт число
+    только из переданного состояния (`state.duration`), а не из формы: она не видит DOM вовсе (нет
+    `document`, значит и `$("duration")` из неё позвать нельзя), так что подменить сессию формой
+    внутри неё физически негде. Дефолт — десять секунд, тот же, с которым ставится `#duration`."""
+    default_no_state, default_no_duration, explicit = _node_eval("""
+      console.log(JSON.stringify([
+        app.chatDuration(null),
+        app.chatDuration({}),
+        app.chatDuration({duration: 7}),
+      ]));
+    """)
+    assert default_no_state == 10
+    assert default_no_duration == 10
+    assert explicit == 7
+
+
+@_needs_node
+def test_the_modal_parse_flags_a_cut_past_the_chat_sessions_own_duration():
+    """A3: длительность разбора в модалке идёт из состояния чата (`chatDuration`), не из формы —
+    та может показывать любое число, пока сессия объявила своё. Здесь сессия говорит «семь
+    секунд» (`chat.duration`), склейка четвёртого плана подвинута на 00:09.000, и разбор обязан
+    назвать её «за пределами» ровно как назвал бы declared-параметр напрямую (тот же путь, каким
+    `_locked_turn` кладёт `duration: 7 s` в системный контекст на сервере)."""
+    prompt = _GOOD_PROMPT.replace("[Shot 4] At 00:07.000", "[Shot 4] At 00:09.000")
+    notes = _node_eval("""
+      const state = {duration: 7};   // сессия чата, не форма
+      const a = app.analysePrompt(%s, app.chatDuration(state), {audio: true});
+      console.log(JSON.stringify(a.notes.map(n => [n.k, n.t])));
+    """ % json.dumps(prompt))
+    unescape = (lambda t: re.sub(r"<[^>]+>", "", t)
+                .replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"))
+    parsed = [(kind, unescape(text)) for kind, text in notes]
+    assert any(k == "bad" and "за пределами" in t and "00:09.000" in t for k, t in parsed), \
+        _flat(parsed)
+
+
+@_needs_node
 def test_speech_tags_have_to_close_and_name_a_language_the_model_speaks():
     """Three ways one `<d>` goes wrong, and the same prompt with none of them.
 

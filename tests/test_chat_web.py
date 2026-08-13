@@ -165,6 +165,35 @@ def test_a_session_remembers_the_mode_and_the_keyframe_it_was_opened_with(_serve
     assert Path(got["image"]) == png.resolve()
 
 
+def test_a_session_without_a_declared_duration_defaults_to_ten_seconds(_serve):
+    """A3: the field's own default (`index.html`'s `#duration` ships with `value="10"`), and the
+    number the modal's parse falls back to when nobody has ever set one -- a session opened before
+    this field existed, or one whose creator forgot the flag, still reads as a plain ten seconds
+    rather than an absent field the model has no line for."""
+    srv = _serve()
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    assert srv.get_json(f"/api/chat/{sid}")["duration"] == 10
+
+
+def test_a_session_opened_from_a_job_carries_the_jobs_declared_duration(_serve):
+    """A3, and the same client-side pattern `mode`/`image`/`end_image` already use (T4b):
+    `openChatFromJob` reads `--duration` out of the job's own `args` and hands it to this route
+    exactly the way it hands `--mode`, so this is the server half of that contract -- whatever
+    number arrives with a `source.kind == "job"` creation is the number the session remembers, not
+    the form's own `#duration`, which the page never even reads for this path."""
+    srv = _serve()
+    sid = srv.post_json("/api/chat", {"source": {"kind": "job", "id": "j-9"},
+                                      "prompt": "", "duration": 7})["id"]
+    assert srv.get_json(f"/api/chat/{sid}")["duration"] == 7
+
+
+def test_a_declared_duration_that_is_not_a_number_is_refused_the_way_a_bad_mode_is(_serve):
+    srv = _serve()
+    status, payload = srv.post_json_raw("/api/chat", {"source": {"kind": "new"}, "prompt": "",
+                                                      "duration": "10"})
+    assert (status, payload["error"]["code"]) == (400, "args_invalid")
+
+
 def test_a_session_remembers_the_end_image_and_mentions_it_in_the_turns_context(_serve,
                                                                                 fake_llama):
     """T4b: `openChatFromJob` did not carry `--end-image` into the session, so a chat opened from
@@ -380,6 +409,24 @@ def test_the_system_message_carries_the_format_doc_and_the_mode(_serve, fake_lla
     other = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
     srv.post_json(f"/api/chat/{other}/message", {"text": "опиши", "prompt": "п"})
     assert "mode: t2va" in fake_llama.requests[-1]["body"]["messages"][0]["content"]
+
+
+def test_the_system_message_carries_the_turns_declared_duration(_serve, fake_llama):
+    """A3: the modal's «Длительность, с» field lives in the page's own state, not the session it
+    was opened with, and it has to reach the model on *every* turn it changes, not only the first
+    -- a person may move the number after the session was already open. The session's own default
+    (ten, from `_create_chat`) is what the very first turn falls back to when it says nothing."""
+    srv = _serve(providers_port=fake_llama.port)
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "опиши", "prompt": "п", "duration": 7})
+    system = fake_llama.requests[-1]["body"]["messages"][0]["content"]
+    assert "duration: 7 s" in system
+    # persisted: the session file itself carries the edited number now, not only this one turn.
+    assert srv.get_json(f"/api/chat/{sid}")["duration"] == 7
+    # a second turn that says nothing about `duration` keeps the session's own last-known number,
+    # not the ten-second default `_create_chat` used when the session was first opened.
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "ещё", "prompt": ""})
+    assert "duration: 7 s" in fake_llama.requests[-1]["body"]["messages"][0]["content"]
 
 
 def test_the_history_of_the_session_travels_with_the_next_turn(_serve, fake_llama):

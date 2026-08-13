@@ -268,7 +268,11 @@
     <div class="chat-prompt">
       <div class="field-head">
         <label for="chat-prompt-text">Промпт</label>
-        <span class="hint" id="chat-source">новый промпт</span>
+        <span class="field-side">
+          <label for="chat-duration" class="hint">Длительность, с</label>
+          <input class="num" id="chat-duration" type="number" step="0.5" min="0.5" value="10">
+          <span class="hint" id="chat-source">новый промпт</span>
+        </span>
       </div>
       <div class="editor"><pre class="hl" id="chat-hl" aria-hidden="true"></pre>
         <textarea id="chat-prompt-text" spellcheck="false" wrap="soft"></textarea></div>

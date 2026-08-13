@@ -587,6 +587,21 @@ export function scaleHtml(analysis) {
     + `${(seg.b - seg.a).toFixed(1)}</div>`).join("");
 }
 
+/**
+ * A3: длительность, против которой модалка проверяет склейки — из состояния диалога
+ * (`chat.duration`), не из формы. Форма и модалка — два разных ролика: форма ставит задачу
+ * с одной длительностью, модалка тем временем может обсуждать совсем другую (например, чат
+ * открыт от задачи с её собственным `--duration`), и `paintPrompt` модалки обязан спорить с
+ * планами по числу, которое видел сервер в системном контексте (`duration: N s`,
+ * `_locked_turn`), а не по тому, что сейчас в поле `#duration` где-то ещё на странице.
+ *
+ * Чистая функция ровно потому, что от неё это и нужно: она не имеет доступа к DOM (`chat`
+ * само по себе — обычный объект), так что её нельзя случайно свести обратно к чтению формы.
+ */
+export function chatDuration(state) {
+  return (state && Number(state.duration)) || 10;
+}
+
 /* ===========================================================================
    ОЧЕРЕДЬ: СВОДКИ И СТРОКИ
    =========================================================================== */
@@ -1588,10 +1603,10 @@ function startPage() {
 
   /* Разбор, подсветка и полоска планов — одни и те же для формы и для модалки: `ids` называет
      тройку элементов, в которые рисовать (`hl`/`scale`/`parse` у формы, `chat-*` у модалки).
-     Длительность берётся из формы в обоих случаях — сессия чата её не хранит, а разбору нужна
-     одна цифра, чтобы сказать, укладываются ли склейки в ролик. */
-  function paintPrompt(ids, text, { audio }) {
-    const declared = Number(String($("duration").value).replace(",", ".")) || 0;
+     Длительность приходит от вызывающего (A3): у формы это `#duration`, у модалки — состояние
+     чата через `chatDuration` (`renderChatPrompt`), а не общее поле формы — сессия и форма могут
+     говорить о ролике разной длины. */
+  function paintPrompt(ids, text, { audio, declared }) {
     const analysis = analysePrompt(text, declared, { audio });
     $(ids.hl).innerHTML = highlightHtml(text, analysis);
     const scale = scaleHtml(analysis);
@@ -1602,7 +1617,8 @@ function startPage() {
 
   function renderPrompt() {
     paintPrompt({ hl: "hl", scale: "scale", parse: "parse" }, $("prompt").value,
-                { audio: $("mode").value === "t2va" });
+                { audio: $("mode").value === "t2va",
+                  declared: Number(String($("duration").value).replace(",", ".")) || 0 });
 
     const box = $("prompt-src");
     const file = promptFileArg();
@@ -1805,7 +1821,8 @@ function startPage() {
       $("chat-prompt-text").value = chat.promptText;
     }
     paintPrompt({ hl: "chat-hl", scale: "chat-scale", parse: "chat-parse" }, chat.promptText,
-                { audio: (chat.mode || $("mode").value) === "t2va" });
+                { audio: (chat.mode || $("mode").value) === "t2va",
+                  declared: chatDuration(chat) });
   }
 
   function renderChatLog() {
@@ -1862,8 +1879,10 @@ function startPage() {
   }
 
   /** Новая сессия от источника и переход в неё. `opened` — что видно только странице:
-   *  текст промпта, режим, путь кадра (сервер сам их не знает) и `notice` — строка, которую
-   *  надо показать в ленте сразу (например, что промпт задачи прочитать не удалось). */
+   *  текст промпта, режим, путь кадра, длительность (сервер сам их не знает) и `notice` —
+   *  строка, которую надо показать в ленте сразу (например, что промпт задачи прочитать не
+   *  удалось). `opened.duration` — A3: `#duration` формы у нового диалога, `--duration` задачи
+   *  у диалога от неё (`openChatFromJob`); без источника — дефолт того же поля сервера. */
   async function openChatModal(source, opened = {}) {
     try {
       const answer = await api("POST", "/api/chat", {
@@ -1872,6 +1891,7 @@ function startPage() {
         mode: opened.mode || "",
         image: opened.image || "",
         end_image: opened.endImage || "",
+        duration: chatDuration(opened),
       });
       clearError();
       window.location.hash = `#chat/${answer.id}`;
@@ -1901,6 +1921,10 @@ function startPage() {
       id,
       source: session.source || { kind: "new" },
       mode: session.mode || "",
+      // A3: длительность сессии — редактируется прямо в шапке модалки (`chat-duration`) и
+      // уходит каждым ходом (`sendChatMessage`); `chatDuration` отвечает за дефолт, если сессия
+      // почему-то ничего не сказала.
+      duration: chatDuration(session),
       /* Окно восстанавливается из последнего ответа модели, а не из `prompt` сессии: `prompt`
          — это текст, с которым сессию открыли, и ходы его не переписывают (так устроен
          сервер). Правки руками между ходами в сессии не живут вовсе — они уходят следующим
@@ -1919,6 +1943,7 @@ function startPage() {
     $("chat-modal").hidden = false;
     $("chat-finish").textContent = FINISH_LABEL[chat.source.kind] || FINISH_LABEL.new;
     $("chat-source").textContent = chatSourceText(chat.source);
+    $("chat-duration").value = chat.duration;
     renderChatPrompt();
     renderChatLog();
     await loadProviders();
@@ -2007,7 +2032,11 @@ function startPage() {
     try {
       answer = await api("POST", `/api/chat/${encodeURIComponent(session.id)}/message`,
                          { text, prompt: session.promptText,
-                           provider: $("chat-provider").value });
+                           provider: $("chat-provider").value,
+                           // A3: длительность из состояния модалки, не из формы — она может
+                           // расходиться с сессией с самого открытия, а с этого хода и сама
+                           // могла подвинуться в `chat-duration`.
+                           duration: chatDuration(session) });
     } catch (error) {
       failure = error;
     }
@@ -2062,6 +2091,10 @@ function startPage() {
       // `flf`-задача несёт второй кадр отдельным флагом — без него чат от такой задачи не видит
       // последний кадр вовсе, и модель не может написать инструкцию `mode: flf` (T4b).
       endImage: argValue(job.args, "--end-image") || "",
+      // A3: длительность задачи-источника, тем же путём, каким приходят режим и кадр выше —
+      // не форма, а сама задача решает, о скольких секундах будет разговор в модалке. Дефолт —
+      // тот же, что у `chatDuration`, когда `--duration` в её `args` не нашлось.
+      duration: Number(argValue(job.args, "--duration")) || 10,
       // Пустое окно у задачи, у которой промпт точно есть, — это не «промпт пуст», а «страница
       // его не достала». Молчать здесь значит предложить сохранить пустоту поверх работы.
       notice: prompt.trim() === ""
@@ -2331,6 +2364,9 @@ function startPage() {
       // Кадр есть только у двух режимов, и только у них он уходит в сессию: модель смотрит на
       // него глазами, а t2v-разговору показывать нечего.
       image: (mode === "i2v" || mode === "flf") ? $("image").value.trim() : "",
+      // A3: сессия открывается со значением формы — то, что человек только что набрал в
+      // `#duration`, а не десять секунд по умолчанию.
+      duration: Number(String($("duration").value).replace(",", ".")) || 10,
     });
   });
 
@@ -2366,6 +2402,14 @@ function startPage() {
       event.preventDefault();
       sendChatMessage();
     }
+  });
+  /* A3: длительность модалки — своё состояние, не форма (`chatDuration`, `paintPrompt`). Правка
+     живёт в `chat.duration` и уходит следующим ходом (`sendChatMessage`) ровно как правка
+     промпта ниже — сервер обновляет сессию из тела запроса, а не читает старое значение с диска. */
+  $("chat-duration").addEventListener("input", () => {
+    if (!chat) return;
+    chat.duration = Number(String($("chat-duration").value).replace(",", ".")) || 10;
+    renderChatPrompt();
   });
   /* Правка руками живёт в состоянии модалки и уходит следующим ходом: сервер собирает
      системное сообщение из тела запроса, а не из сессии, поэтому модель видит именно то, что

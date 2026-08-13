@@ -166,6 +166,13 @@ CHAT_MODES = frozenset({"t2v", "t2va", "i2v", "flf"})
 #: sentence about the given first frame, a `t2va` one must not.
 DEFAULT_CHAT_MODE = "t2va"
 
+#: The duration (seconds) a chat session is assumed to be about when neither it nor a turn says
+#: otherwise -- the same 10 the page's own `#duration` field ships with (`index.html`). It reaches
+#: the model as `## Context\nduration: <value> s` (`_locked_turn`), the number `analysePrompt`
+#: needs to say whether a shot's cut lands inside the declared runtime; a session that has never
+#: been told a duration must still give the model *some* answer rather than an absent field.
+DEFAULT_CHAT_DURATION = 10
+
 #: The only file types a chat turn will attach as a keyframe. An **allowlist**, and the same shape
 #: as `MEDIA_SUFFIXES` for the same reason -- with one addition that is not a formality.
 #:
@@ -1668,6 +1675,24 @@ class _Handler(BaseHTTPRequestHandler):
                            {"field": key, "type": type(value).__name__})
         return value
 
+    @staticmethod
+    def _number_of(payload: dict, key: str, default):
+        """`payload[key]` as a number, or `default` when the field is absent or `null`.
+
+        Present and the wrong shape is `args_invalid`, the same rule `_string_of` applies to text
+        fields: a chat `duration` reaches the system context verbatim as `duration: <value> s`
+        (`_locked_turn`), and a malformed value there is a malformed instruction handed to the
+        model, not a UI nuance this route can silently paper over. `bool` is excluded even though
+        `isinstance(True, int)` is true in Python -- `true`/`false` are not seconds.
+        """
+        value = payload.get(key)
+        if value is None:
+            return default
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise CliError("args_invalid", f"`{key}` must be a number",
+                           {"field": key, "type": type(value).__name__})
+        return value
+
     def _providers(self) -> tuple[int, str, bytes]:
         """`GET /api/providers`: the roster, exactly as the page may show it.
 
@@ -1845,7 +1870,8 @@ class _Handler(BaseHTTPRequestHandler):
         this server confirms is: the page navigates to `/#chat/<id>` the moment it gets the id, and
         a session that is not on disk by then is a page that opens on a 404.
         """
-        payload = self._json_request(allowed=("source", "prompt", "mode", "image", "end_image"))
+        payload = self._json_request(
+            allowed=("source", "prompt", "mode", "image", "end_image", "duration"))
         source = payload.get("source") or {"kind": "new"}
         if not isinstance(source, dict) or source.get("kind") not in CHAT_SOURCE_KINDS \
                 or not set(source) <= CHAT_SOURCE_KEYS:
@@ -1874,11 +1900,19 @@ class _Handler(BaseHTTPRequestHandler):
         # mentions the path in the system context): the model does not need to *see* the last
         # frame to reason about it, and sending it would double the per-turn upload for no benefit.
         end_image = self._string_of(payload, "end_image")
+        # `duration` (A3): the seconds the modal's parse (`analysePrompt`, on the page) checks
+        # shot cuts against. The page decides *which* number to send -- `#duration` on a session
+        # opened from the form, `--duration` out of a job's own `args` on one opened from the
+        # queue (`openChatFromJob`, the same client-side pattern `mode`/`image`/`end_image` use) --
+        # this route only stores whatever number arrives, defaulting the same way an absent
+        # `mode` does.
+        duration = self._number_of(payload, "duration", DEFAULT_CHAT_DURATION)
         session = {"id": secrets.token_hex(4),
                    "source": source,
                    "mode": mode,
                    "image": str(self._chat_image_path(image)) if image else "",
                    "end_image": str(self._chat_image_path(end_image)) if end_image else "",
+                   "duration": duration,
                    "messages": [],
                    "prompt": self._string_of(payload, "prompt")}
         self._write_session(self._chat_path(session["id"], create=True), session)
@@ -2035,7 +2069,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not exists:
             return 404, "application/json", _error_bytes(
                 "chat_not_found", f"нет сессии {sid}", {"id": sid})
-        payload = self._json_request(allowed=("text", "prompt", "provider"))
+        payload = self._json_request(allowed=("text", "prompt", "provider", "duration"))
         with chat_session_lock(path):
             return self._locked_turn(sid, path, payload)
 
@@ -2046,6 +2080,15 @@ class _Handler(BaseHTTPRequestHandler):
             return 404, "application/json", _error_bytes(
                 "chat_not_found", f"нет сессии {sid}", {"id": sid})
         text = self._string_of(payload, "text")
+        # `duration` (A3): editable in the modal's own header (`chat-duration`), and re-sent with
+        # every turn -- a person may move the number after the session opened, and the next turn
+        # has to see what is in the field *now*, the same reasoning `_locked_turn`'s own docstring
+        # gives for `prompt` never coming from the saved session. Absent from this turn's body
+        # (a request built by hand, or an older page), the session's own last-known number stands;
+        # only a session that has never been told one at all falls back to the ten-second default.
+        duration = self._number_of(payload, "duration",
+                                   session.get("duration", DEFAULT_CHAT_DURATION))
+        session["duration"] = duration
         roster = provider.load_providers(self.server.outdir)
         name = self._string_of(payload, "provider") or roster["active"]
         cfg = roster["providers"].get(name)
@@ -2070,6 +2113,7 @@ class _Handler(BaseHTTPRequestHandler):
                           else "")
         system = (provider.system_prompt()
                   + "\n\n## Context\nmode: " + (session.get("mode") or DEFAULT_CHAT_MODE)
+                  + f"\nduration: {duration:g} s"
                   + end_image_line
                   + "\n\n## Current prompt\n" + self._string_of(payload, "prompt"))
         content, warning = self._turn_content(text, session.get("image") or "")
