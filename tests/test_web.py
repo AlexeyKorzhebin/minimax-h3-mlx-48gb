@@ -1844,20 +1844,38 @@ def test_posting_a_job_whose_output_name_is_taken_is_refused(queue_server):
 
 
 def test_editing_a_job_into_a_name_another_job_holds_is_refused(queue_server):
-    _queue_a_job(queue_server, tag="первая")
+    """Task A6: `submit` gives every job its own output subdirectory, so two jobs no longer share
+    one just by sharing a tag (`_job_args` always names a fresh `--outdir`, and `update` never
+    relocates it -- see `queue._relocate_to_job_subdir`'s docstring). The collision this test is
+    about still has to be refusable, though -- a human can still point an edit at *another job's*
+    own directory by hand -- so the edit below names `first`'s own `--outdir` explicitly, which is
+    exactly what the page's edit form would send (it pre-fills `#outdir` from `argValue(job.args,
+    "--outdir")`, i.e. the job's own, already-relocated directory).
+    """
+    first = _queue_a_job(queue_server, tag="первая")
     second = _queue_a_job(queue_server, tag="вторая")
+    first_outdir = str(Path(first["output_stem"]).parent)
     status, answer = _call(queue_server, "PUT", f"/api/jobs/{second['id']}",
-                           {"args": _job_args(queue_server, tag="первая"), "note": ""})
+                           {"args": _job_args(queue_server, "--outdir", first_outdir, tag="первая"),
+                            "note": ""})
     assert status == 400 and answer["error"]["code"] == "output_stem_conflict", answer
+    assert answer["error"]["detail"]["output_stem"] == first["output_stem"]
 
 
 def test_editing_a_job_without_renaming_it_is_not_a_conflict(queue_server):
     """The paired case, and the common one: changing a seed or a note leaves the output name where
     it was, and a conflict check that did not exclude the job being edited would refuse it.
+
+    The edit names the job's *own* `--outdir` explicitly (task A6): `update` never relocates it on
+    its own, so an edit built the way the page really builds one -- reusing `argValue(job.args,
+    "--outdir")` -- is what actually leaves the output name unchanged, not `_job_args`'s own flat
+    default.
     """
     job = _queue_a_job(queue_server, tag="та-же")
+    own_outdir = str(Path(job["output_stem"]).parent)
     status, answer = _call(queue_server, "PUT", f"/api/jobs/{job['id']}",
-                           {"args": _job_args(queue_server, "--seed", "7", tag="та-же"),
+                           {"args": _job_args(queue_server, "--seed", "7", "--outdir", own_outdir,
+                                              tag="та-же"),
                             "note": ""})
     assert status == 200, answer
     assert answer["job"]["output_stem"] == job["output_stem"]
@@ -2327,6 +2345,34 @@ def test_the_page_module_imports_outside_a_browser():
     """
     names = _node_eval("console.log(JSON.stringify(Object.keys(app).sort()));")
     assert "analysePrompt" in names and "pendingSummary" in names
+
+
+@_needs_node
+def test_media_serves_the_clip_from_a_jobs_own_subdirectory(server):
+    """Task A6, end to end: `submit` gave this job its own subdirectory, and the page's own
+    `clipUrl` (app.js) -- not a hand-rolled reimplementation of it -- has to build a URL `/media`
+    actually serves, not merely one that looks plausible.
+
+    `--outdir` here is the server's own outdir directly, exactly as every other submission fixture
+    in this suite builds it (`_job_args`, `_submit_job` in `test_chat_web.py`): task A6 nests the
+    job's own subdirectory one level under that, which is the one level `/media` itself supports
+    (`_media`'s own docstring: the *first* URL segment is the run directory, a direct child of the
+    outdir). A job whose `--outdir` already names a deeper directory of the caller's own choosing
+    -- unrelated to this task -- is not covered here.
+    """
+    job = q.submit(server.queue_root, ["generate", "--tag", "kot-italy"], "",
+                   {"output_stem": str(server.outdir / "h3-kot-italy-896x576")}, {})
+    result_dir = Path(job.output_stem).parent
+    assert result_dir.parent == server.outdir, (
+        "the fixture must produce a job whose own subdirectory sits directly under the outdir")
+    result_dir.mkdir(parents=True, exist_ok=True)
+    Path(f"{job.output_stem}.mp4").write_bytes(b"\x00mp4")
+
+    url = _node_eval(f"console.log(JSON.stringify(app.clipUrl({json.dumps(job.as_dict())})));")
+    assert url is not None, "clipUrl must still build a link for a relocated job"
+
+    status, headers, body = _request(server, url)
+    assert status == 200 and body == b"\x00mp4", (status, url, body[:40])
 
 
 @_needs_node

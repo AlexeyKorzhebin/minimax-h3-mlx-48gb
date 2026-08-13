@@ -998,6 +998,10 @@ def test_duplicating_a_finished_job_lands_a_new_pending_job(_serve):
     job = _submit_job(srv.queue_root, srv.root, "готово", note="из готовой")
     running = q.claim(srv.queue_root)
     q.finish(srv.queue_root, running.id, 0, "ok")
+    # `job.output_stem` now sits inside the job's own subdirectory (task A6); a real run would
+    # have created it (`RunSpec.outdir.mkdir(...)` -- see `test_run_generate_creates_a_nonexistent_
+    # outdir` in `test_cli.py`), so this stands in for that.
+    Path(job.output_stem).parent.mkdir(parents=True, exist_ok=True)
     Path(f"{job.output_stem}.mp4").write_bytes(b"video")
 
     status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/duplicate", None)
@@ -1043,6 +1047,36 @@ def test_duplicating_a_failed_job_lands_a_new_pending_job(_serve):
     assert by_id[new_id].state == "pending"
     assert by_id[new_id].note == "из упавшей"
     assert by_id[new_id].output_stem != job.output_stem
+
+
+def test_duplicating_a_job_gets_its_own_subdirectory_not_the_sources(_serve):
+    """Task A6, through the actual `/duplicate` route (`_duplicate_job` in `web.py`), which
+    resubmits the source job's own `args` -- already carrying `--outdir <source's own
+    subdirectory>` -- with only `--tag` rewritten. Without `queue._base_outdir` stripping that
+    existing subdirectory first, the copy would nest one level *inside* the source's own directory
+    rather than land beside it: `output_stem != output_stem` alone (already asserted by the other
+    duplicate tests) does not catch that, since a nested path is unequal too.
+    """
+    srv = _serve()
+    job = _submit_job(srv.queue_root, srv.root, "kot-italy", note="")
+    source_dir = Path(job.output_stem).parent
+    assert source_dir.parent == srv.root, (
+        "the fixture must submit a job whose own subdirectory sits directly under the outdir, or "
+        "this test cannot tell 'beside' from 'nested inside' apart")
+
+    status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/duplicate", None)
+    assert status == 200, answer
+    new_id = answer["id"]
+
+    jobs, broken = q.scan(srv.queue_root)
+    assert broken == []
+    by_id = {row.id: row for row in jobs}
+    duplicate_dir = Path(by_id[new_id].output_stem).parent
+
+    assert duplicate_dir != source_dir, "the duplicate must not reuse the source's own directory"
+    assert duplicate_dir.parent == srv.root, (
+        f"the duplicate's directory must be a sibling of the source's, directly under the outdir "
+        f"-- got {duplicate_dir}, nested under {duplicate_dir.parent}")
 
 
 def test_duplicating_an_unknown_job_is_a_named_404(_serve):

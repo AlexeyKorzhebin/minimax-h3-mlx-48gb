@@ -872,7 +872,7 @@ def name_too_long_is_a_refusal(what: str):
 
 
 @contextlib.contextmanager
-def queue_write_errors(queue_root, *, what="the request", output_stem=None):
+def queue_write_errors(queue_root, *, what="the request"):
     """`queue_errors` plus the three refusals that are not "the queue directory is unusable".
 
     Two are races with the worker or with another submission, not mistakes in the request, and
@@ -880,6 +880,13 @@ def queue_write_errors(queue_root, *, what="the request", output_stem=None):
     the page's last poll and this click) and `output_stem_conflict` is 400 with the taken name in
     `detail`, because the only useful thing to tell someone is which name to change. The third is
     a name the filesystem itself refuses -- see `name_too_long_is_a_refusal`.
+
+    The taken name comes from `exc.output_stem`, not from a value the caller precomputed and
+    passed in (task A6 removed that parameter): `submit` now raises `OutputStemConflict` against
+    the *relocated* stem -- the job's own subdirectory included -- decided only once `submit` is
+    actually running, under its own lock. A value the caller had ready beforehand is, at best, the
+    unrelocated one `prepare_submission`'s dry run reported, which names a path that was never
+    really the one in conflict.
     """
     try:
         with queue_errors(queue_root):
@@ -895,7 +902,7 @@ def queue_write_errors(queue_root, *, what="the request", output_stem=None):
         raise CliError(
             "output_stem_conflict",
             f"выходное имя уже занято: {exc}",
-            {"output_stem": str(output_stem) if output_stem is not None else None},
+            {"output_stem": exc.output_stem},
         ) from exc
 
 
@@ -1505,8 +1512,7 @@ class _Handler(BaseHTTPRequestHandler):
         # a number is the caller's mistake and should not cost a fork to discover.
         args, note = self._args_of(payload), self._note_of(payload)
         prepared = prepare_submission(args, self.server.roots)
-        with queue_write_errors(self.server.queue_root, what="--tag",
-                                output_stem=prepared["report"]["output_stem"]):
+        with queue_write_errors(self.server.queue_root, what="--tag"):
             job = q.submit(self.server.queue_root, prepared["args"], note,
                            prepared["report"], prepared["estimate"],
                            prompt_source=prepared["prompt_source"],
@@ -1524,8 +1530,7 @@ class _Handler(BaseHTTPRequestHandler):
         payload = self._json_request(allowed=("args", "note"))
         args, note = self._args_of(payload), self._note_of(payload)
         prepared = prepare_submission(args, self.server.roots)
-        with queue_write_errors(self.server.queue_root, what="the job id",
-                                output_stem=prepared["report"]["output_stem"]):
+        with queue_write_errors(self.server.queue_root, what="the job id"):
             job = q.update(self.server.queue_root, job_id, prepared["args"],
                            note, prepared["report"], prepared["estimate"],
                            prompt_source=prepared["prompt_source"],
@@ -1593,8 +1598,7 @@ class _Handler(BaseHTTPRequestHandler):
         for _ in range(DUPLICATE_ATTEMPTS):
             args, output_stem = next(candidates)
             try:
-                with queue_write_errors(self.server.queue_root, what="the job id",
-                                        output_stem=output_stem):
+                with queue_write_errors(self.server.queue_root, what="the job id"):
                     new_job = q.submit(self.server.queue_root, args, job.note,
                                        {"output_stem": output_stem}, dict(job.estimate),
                                        prompt_source=job.prompt_source, prompt_text=prompt_text)

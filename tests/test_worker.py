@@ -94,9 +94,12 @@ def _queued(root, tmp_path, tag="a"):
 def test_job_command_wraps_the_job_in_caffeinate_and_this_interpreter(tmp_path):
     root = tmp_path / "queue"
     job = _queued(root, tmp_path)
+    # `job.args` itself, not a hard-coded list: `submit` (task A6) appends the job's own
+    # `--outdir`, whose value is a timestamp this test does not pin. What this test is actually
+    # about -- the caffeinate/python/module wrapping -- does not depend on that value.
     assert worker.job_command(job, python="/venv/bin/python") == [
-        "caffeinate", "-dimsu", "/venv/bin/python", "-m", "h3_48gb",
-        "generate", "--tag", "a"]
+        "caffeinate", "-dimsu", "/venv/bin/python", "-m", "h3_48gb", *job.args]
+    assert job.args[:3] == ["generate", "--tag", "a"], "the job's own args must pass through"
     assert worker.job_command(job)[2] == sys.executable, (
         "the child must run in the worker's own virtualenv, not whichever python is on PATH")
 
@@ -138,6 +141,41 @@ def test_run_job_files_the_exit_code_and_the_log_tail(tmp_path):
     assert "OOM" in on_disk["log_tail"], "the tail of the run's log must reach the job file"
     assert q.log_path(root, job.id).read_text() == "OOM\n", (
         "the subprocess's output must go to queue/logs/<id>.log, not to the worker's own stdout")
+
+
+def test_run_job_lands_the_result_inside_the_jobs_own_subdirectory(tmp_path):
+    """Task A6, end to end through the worker: `submit` rewrote `--outdir` in `job.args` to the
+    job's own subdirectory (`<outdir>/<YYYYMMDD-HHMM>-<slug>/`), and the fake `spawn` below plays
+    the part of `h3 generate` -- it reads `--outdir` out of the command line it is actually given
+    (not a path this test already knows, which would prove nothing about `job.args` reaching the
+    child) and creates that directory before writing into it, exactly as `RunSpec.outdir.mkdir(...)`
+    does for a real run (see `test_run_generate_creates_a_nonexistent_outdir` in `test_cli.py`).
+    The result must land there, and `run_job`/`reconcile` must find it there.
+    """
+    root = tmp_path / "queue"
+    outdir = tmp_path / "out"
+    job = q.submit(root, ["generate", "--tag", "kot-italy", "--outdir", str(outdir)], "",
+                   {"output_stem": str(outdir / "h3-kot-italy-1x1")}, {})
+    assert Path(job.output_stem).parent != outdir, (
+        "the fixture must actually exercise a relocated job, or this test proves nothing")
+    claimed = q.claim(root)
+
+    def spawn(cmd, **kw):
+        job_outdir = Path(cmd[cmd.index("--outdir") + 1])
+        job_outdir.mkdir(parents=True, exist_ok=True)
+        (job_outdir / "h3-kot-italy-1x1.mp4").write_bytes(b"video")
+        return _FakeProcess(0, "готово\n", kw)
+
+    code = worker.run_job(root, claimed, spawn=spawn)
+
+    assert code == 0
+    assert q.job_path(root, job.id, "done").exists()
+    result_clip = Path(f"{job.output_stem}.mp4")
+    assert result_clip.exists(), f"the clip must land at the job's own output_stem: {result_clip}"
+    assert result_clip.parent == Path(job.output_stem).parent
+    assert result_clip.read_bytes() == b"video"
+    # And it is really the job's *own* subdirectory, not the plain outdir the form named.
+    assert result_clip.parent.parent == outdir
 
 
 # -- Step 4: the lease covers the child, and the marker lands before the lease is released -------
@@ -314,7 +352,10 @@ def test_main_loop_runs_the_queue_in_order_and_counts_what_it_ran(tmp_path):
         root, poll=0.01, stop=_stop_after(1.0), spawn=_recording(spawned)))
 
     assert ran == 2, f"the loop must run both queued jobs, ran {ran}"
-    assert [cmd[-1] for cmd in spawned[:2]] == ["a", "b"], "jobs must run in queue order"
+    # `--tag`'s value, not the command's last token: `submit` (task A6) now appends the job's own
+    # `--outdir` after `--tag`, so the last token is a path, not the tag.
+    assert [cmd[cmd.index("--tag") + 1] for cmd in spawned[:2]] == ["a", "b"], (
+        "jobs must run in queue order")
     assert q.job_path(root, first.id, "done").exists()
     assert q.job_path(root, second.id, "done").exists()
 
@@ -732,10 +773,15 @@ def test_a_crash_between_the_child_exiting_and_the_marker_keeps_a_finished_mp4(t
     before recording that. Re-running the job would overwrite the very file being rescued.
     """
     root = tmp_path / "queue"
-    stem = tmp_path / "h3-a-1x1"
-    job = q.submit(root, ["generate", "--tag", "a"], "", _stem(_DRY, str(stem)), {})
+    job = q.submit(root, ["generate", "--tag", "a"], "", _stem(_DRY, str(tmp_path / "h3-a-1x1")), {})
+    # `job.output_stem`, not the flat path handed to `submit` -- `submit` (task A6) relocates it
+    # into the job's own subdirectory, and that is where the crashed run's `.mp4` really lands.
+    # `h3 generate` creates this directory itself (`RunSpec.outdir.mkdir(...)` in `cli.py`, see
+    # `test_run_generate_creates_a_nonexistent_outdir` in `test_cli.py`); the fake child here
+    # stands in for the real one, so it has to do the same.
+    Path(job.output_stem).parent.mkdir(parents=True, exist_ok=True)
 
-    _crash_at(root, "before_marker", stem, make_mp4=True)
+    _crash_at(root, "before_marker", job.output_stem, make_mp4=True)
 
     assert not q.result_path(root, job.id).exists(), "the crash must land before the marker"
     result = q.reconcile(root)
@@ -743,7 +789,8 @@ def test_a_crash_between_the_child_exiting_and_the_marker_keeps_a_finished_mp4(t
     assert q.job_path(root, job.id, "done").exists()
     assert result.changed[0].exit_code == 0
     assert result.changed[0].log_tail == q.RESULT_RECOVERED_NOTE
-    assert Path(f"{stem}.mp4").read_bytes() == b"video", "the rescued result must be untouched"
+    assert Path(f"{job.output_stem}.mp4").read_bytes() == b"video", (
+        "the rescued result must be untouched")
 
 
 def test_a_crash_between_the_marker_and_the_rename_finishes_from_the_marker(tmp_path):

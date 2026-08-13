@@ -194,6 +194,25 @@ def test_raw_arrays_are_written_before_encoding(tmp_path):
     assert (tmp_path / "h3-t-64x64-raw.npz").exists(), "raw arrays must survive an encoder failure"
 
 
+def test_run_generate_creates_a_nonexistent_outdir(tmp_path):
+    """`h3 generate` itself creates `--outdir` if it does not exist yet -- checked here (task A6)
+    because `queue.submit`'s new per-job subdirectory (`<outdir>/<YYYYMMDD-HHMM>-<slug>/`) has
+    never been created by anything by the time the worker spawns `h3 generate`: `submit` only
+    rewrites `args`, it never touches the filesystem for it (a queued job can be cancelled before
+    the worker ever runs it, so creating the directory there would litter `--outdir` with folders
+    for jobs that never ran). If `run_generate` stopped creating its own `--outdir`, this would be
+    the one place responsible for it -- and this test would need to move into `worker.run_job`.
+    """
+    outdir = tmp_path / "20260813-1435-kot-italy"
+    assert not outdir.exists(), "the fixture must start without the directory this test creates"
+    spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
+                   checkpoint=bake_adaln_table(tmp_path / "ckpt"), outdir=outdir, tag="t")
+    run_generate(spec, pipeline_factory=lambda _: (lambda **kw: _StubResult()))
+    assert outdir.is_dir(), "run_generate must create --outdir itself if it does not exist"
+    assert (outdir / "h3-t-64x64.mp4").exists() or (outdir / "h3-t-64x64-raw.npz").exists(), (
+        "the run must have actually written its output inside the directory it created")
+
+
 def test_truncated_raw_file_is_not_left_at_destination(tmp_path):
     """Crash after temp write but before rename must not corrupt destination.
 

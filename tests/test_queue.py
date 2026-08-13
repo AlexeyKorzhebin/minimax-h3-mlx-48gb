@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -35,6 +36,36 @@ def _stem(report: dict, new_stem: str) -> dict:
     with distinct output names but otherwise identical reports.
     """
     return {**report, "output_stem": new_stem}
+
+
+#: A job's own output subdirectory, exactly the shape `submit` produces: `YYYYMMDD-HHMM-<slug>`.
+#: Used to assert on it without hard-coding `submit`'s internal choice of separators.
+_SUBDIR_RE = re.compile(r"^\d{8}-\d{4}-[a-z0-9-]+$")
+
+
+def _assert_relocated(output_stem: str, base, filename: str, tag: str | None) -> None:
+    """Assert that `output_stem` is `<base>/<a fresh job subdirectory ending in tag's slug>/<filename>`
+    -- what `submit` (task A6) is supposed to produce, checked independently of
+    `queue._relocate_to_job_subdir`'s own implementation rather than by calling it, so a test using
+    this cannot pass merely because it agrees with itself.
+    """
+    stem = Path(output_stem)
+    assert stem.name == filename, f"the filename must survive relocation unchanged: {stem.name!r}"
+    assert stem.parent.parent == Path(base), (
+        f"expected one fresh subdirectory directly under {base}, got {stem.parent.parent}")
+    assert _SUBDIR_RE.fullmatch(stem.parent.name), (
+        f"the job subdirectory {stem.parent.name!r} does not match YYYYMMDD-HHMM-<slug>")
+    assert stem.parent.name.endswith(f"-{q._slug(tag)}"), (
+        f"the job subdirectory {stem.parent.name!r} must end with the tag's own slug")
+
+
+def _predicted_stem(output_stem: str, tag: str, created_at: str) -> str:
+    """Where `submit` will actually place `output_stem`, given a job whose `--tag` is `tag` and
+    whose clock answers `created_at` -- for tests that need to plant a conflicting artifact, or a
+    hand-written job file, at the exact path a real submission would collide with.
+    """
+    _, relocated = q._relocate_to_job_subdir(["generate", "--tag", tag], output_stem, created_at)
+    return relocated
 
 
 def _try(fn):
@@ -202,6 +233,122 @@ def test_scan_does_not_conflict_with_a_shared_external_lock(tmp_path):
         assert finished.wait(2), "scan waited on a second shared lock holder, which should never conflict"
 
 
+# -- Task A6: every job gets its own output subdirectory ----------------------------------------
+
+
+def test_submit_puts_outdir_in_args_as_a_stamped_slug_subdirectory(tmp_path):
+    """The brief's own example: a job tagged `kot-italy` gets `--outdir <outdir>/<stamp>-kot-italy`
+    in its stored `args`, not the flat `<outdir>` the caller (the web form) actually sent.
+    """
+    root = tmp_path / "queue"
+    frozen = lambda: "2026-08-13T14:35:00"
+    job = q.submit(root, ["generate", "--tag", "kot-italy", "--outdir", "/out"], "",
+                   {"output_stem": "/out/h3-kot-italy-896x576"}, {}, now=frozen)
+    assert "--outdir" in job.args
+    assert job.args[job.args.index("--outdir") + 1] == "/out/20260813-1435-kot-italy", (
+        f"expected the minute-stamped, slugged subdirectory in args, got {job.args}")
+    assert job.output_stem == "/out/20260813-1435-kot-italy/h3-kot-italy-896x576"
+
+
+def test_submit_adds_outdir_when_args_names_none(tmp_path):
+    """`args` with no `--outdir` at all (a caller that let the CLI default it) still gets one --
+    `submit` reads the directory to nest under from the dry-run report's own `output_stem`, the
+    only place that value exists when `args` itself does not carry it.
+    """
+    root = tmp_path / "queue"
+    frozen = lambda: "2026-08-13T14:35:00"
+    job = q.submit(root, ["generate", "--tag", "b"], "",
+                   {"output_stem": "/out/h3-b-896x576"}, {}, now=frozen)
+    assert job.args[-2:] == ["--outdir", "/out/20260813-1435-b"]
+
+
+def test_submit_rewrites_the_inline_outdir_spelling(tmp_path):
+    """`--outdir=value`, argparse's other accepted spelling, must be rewritten in place -- not
+    left stale while a second, separate `--outdir value` token is appended after it."""
+    root = tmp_path / "queue"
+    frozen = lambda: "2026-08-13T14:35:00"
+    job = q.submit(root, ["generate", "--tag", "b", "--outdir=/out"], "",
+                   {"output_stem": "/out/h3-b-896x576"}, {}, now=frozen)
+    assert job.args == ["generate", "--tag", "b", "--outdir=/out/20260813-1435-b"]
+
+
+def test_submit_rewrites_only_the_last_of_two_outdir_tokens(tmp_path):
+    """`check_path_flags` (`web.py`) rewrites every occurrence of a repeated flag without removing
+    any, so `submit` can see `--outdir` twice. Only the *last* one is what argparse will actually
+    use -- and it is the only one this module may safely edit; an earlier, dead one must survive
+    untouched so a test asserting on it (`test_the_job_stores_the_resolved_paths_not_what_the_
+    browser_sent` in `test_web.py`) still finds the plain, unrelocated value there.
+    """
+    root = tmp_path / "queue"
+    frozen = lambda: "2026-08-13T14:35:00"
+    job = q.submit(root, ["generate", "--tag", "b", "--outdir", "/dead", "--outdir", "/out"], "",
+                   {"output_stem": "/out/h3-b-896x576"}, {}, now=frozen)
+    assert job.args == ["generate", "--tag", "b", "--outdir", "/dead",
+                        "--outdir", "/out/20260813-1435-b"]
+
+
+def test_duplicating_a_relocated_job_gets_a_sibling_subdirectory_not_a_nested_one(tmp_path):
+    """The scenario `_duplicate_job` (`web.py`) actually creates: it resubmits the source job's own
+    `args`, whose `--outdir` this module already relocated once. A `submit` that blindly appended a
+    fresh subdirectory onto whatever `--outdir` already said would nest the copy one level inside
+    the source's subdirectory instead of beside it -- worse with every duplicate of a duplicate.
+    """
+    root = tmp_path / "queue"
+    frozen_a = lambda: "2026-08-13T14:35:00"
+    source = q.submit(root, ["generate", "--tag", "a"], "",
+                      {"output_stem": "/out/h3-a-896x576"}, {}, now=frozen_a)
+    source_dir = Path(source.output_stem).parent
+    assert source_dir == Path("/out/20260813-1435-a")
+
+    # `_duplicate_job` reuses `source.args` (already carrying `--outdir <source_dir>`) with only
+    # `--tag` rewritten, and an `output_stem` in the same directory with the new tag spliced in --
+    # exactly what `_duplicate_tag_candidates` builds.
+    frozen_b = lambda: "2026-08-13T14:40:00"
+    duplicate_args = ["generate", "--tag", "a-copy", "--outdir", str(source_dir)]
+    duplicate = q.submit(root, duplicate_args, "",
+                         {"output_stem": str(source_dir / "h3-a-copy-896x576")}, {}, now=frozen_b)
+    duplicate_dir = Path(duplicate.output_stem).parent
+
+    assert duplicate_dir != source_dir, "the duplicate must not land in the source's own directory"
+    assert duplicate_dir.parent == source_dir.parent, (
+        f"the duplicate's subdirectory must be a *sibling* of the source's, not nested inside it "
+        f"-- got {duplicate_dir} under {duplicate_dir.parent}, source under {source_dir.parent}")
+    assert duplicate_dir == Path("/out/20260813-1440-a-copy")
+
+
+def test_relocate_to_job_subdir_without_the_slug_is_wrong(tmp_path):
+    """Mutation check: a version of `_relocate_to_job_subdir` that dropped the slug (stamp alone,
+    e.g. because someone "simplified" `subdir = _dir_stamp(created_at)`) would still pass every
+    test above that submits one job at a time. This is the one that would not: two jobs queued in
+    the same minute under different tags must not collide on the *directory*, only ever on the
+    exact same `output_stem` if they also share a tag.
+    """
+    stamp_only = "20260813-1435"  # what a slug-less implementation would produce
+    args_a, stem_a = q._relocate_to_job_subdir(["generate", "--tag", "a"],
+                                                "/out/h3-a-896x576", "2026-08-13T14:35:00")
+    args_b, stem_b = q._relocate_to_job_subdir(["generate", "--tag", "b"],
+                                                "/out/h3-b-896x576", "2026-08-13T14:35:00")
+    assert Path(stem_a).parent != Path(stem_b).parent, (
+        "two different tags in the same minute must not share a subdirectory")
+    assert Path(stem_a).parent.name != stamp_only and Path(stem_b).parent.name != stamp_only, (
+        "the subdirectory must carry the tag's slug, not just the timestamp")
+
+
+def test_stem_taken_is_unaffected_by_relocation(tmp_path):
+    """`_stem_taken` itself does not know about subdirectories -- it never needs to, since
+    `submit` (task A6) already resolves `output_stem` to its final, relocated form before calling
+    it. This pins that `_stem_taken` still finds a collision when given two paths that really are
+    the same, subdirectory included, guarding against a future edit that started passing it the
+    pre-relocation stem instead.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    (tmp_path / "run").mkdir()
+    (tmp_path / "run" / "h3-a-896x576.mp4").write_bytes(b"")
+    assert q._stem_taken(root, str(tmp_path / "run" / "h3-a-896x576")) is True
+    assert q._stem_taken(root, str(tmp_path / "run" / "h3-b-896x576")) is False
+
+
 # -- Step 7: submission -------------------------------------------------------------------------
 
 
@@ -218,13 +365,19 @@ def test_submit_snapshots_the_prompt_and_repoints_the_args_at_it(tmp_path):
     assert job.args[job.args.index("--prompt-file") + 1] == str(snapshot), (
         "the queued job still points at the shared prompts/ file")
     assert job.prompt_sha256 == hashlib.sha256(b"a centaur\n").hexdigest()
-    assert job.output_stem == _DRY["output_stem"]
+    _assert_relocated(job.output_stem, "/out", "h3-a-896x576", "a")
 
 
 def test_submit_without_a_prompt_text_leaves_the_args_alone(tmp_path):
+    """"Alone" now excludes `--outdir`: `submit` still appends the job's own subdirectory (task
+    A6) when the caller's `args` name none, exactly as it would if `--outdir` had been present and
+    needed rewriting. Everything else about `args` -- and everything about the prompt -- is
+    untouched.
+    """
     root = tmp_path / "queue"
     job = q.submit(root, ["generate", "a dog", "--tag", "a"], "", _DRY, {})
-    assert job.args == ["generate", "a dog", "--tag", "a"]
+    assert job.args[:4] == ["generate", "a dog", "--tag", "a"]
+    assert job.args[4:] == ["--outdir", str(Path(job.output_stem).parent)]
     assert job.prompt_sha256 is None
     assert not q.prompt_path(root, job.id).exists()
 
@@ -246,12 +399,20 @@ def test_two_submissions_in_the_same_second_retry_until_the_id_is_free(tmp_path,
 
 @pytest.mark.parametrize("suffix", [".mp4", ".wav", ".npz", ".json"])
 def test_submit_refuses_when_any_artifact_of_that_stem_exists(tmp_path, suffix):
-    """A leftover .wav means the name is taken just as surely as a leftover .mp4."""
+    """A leftover .wav means the name is taken just as surely as a leftover .mp4.
+
+    The artifact is planted at the *relocated* stem -- `submit` (task A6) checks the path the run
+    will actually write, subdirectory included, not the flat one `dry_run_report` names. `now=` is
+    pinned so the planted path and the one `submit` computes for real agree.
+    """
     root = tmp_path / "queue"
-    stem = tmp_path / "h3-a-896x576"
-    (stem.parent / f"{stem.name}{suffix}").write_bytes(b"")
+    frozen = lambda: "2026-08-11T13:05:00"
+    flat_stem = str(tmp_path / "h3-a-896x576")
+    relocated = _predicted_stem(flat_stem, "a", frozen())
+    Path(relocated).parent.mkdir(parents=True, exist_ok=True)
+    Path(f"{relocated}{suffix}").write_bytes(b"")
     with pytest.raises(q.OutputStemConflict):
-        q.submit(root, ["generate", "--tag", "a"], "", _stem(_DRY, str(stem)), {})
+        q.submit(root, ["generate", "--tag", "a"], "", _stem(_DRY, flat_stem), {}, now=frozen)
 
 
 def test_submit_refuses_a_stem_another_pending_job_already_claims(tmp_path):
@@ -270,16 +431,18 @@ def test_submit_refuses_a_stem_a_running_job_already_claims(tmp_path):
     """
     root = tmp_path / "queue"
     paths = q.layout(root)
+    frozen = lambda: "2026-08-11T00:00:00"
     running_job = {
         "id": "20260811-000000-a-run1", "created_at": "2026-08-11T00:00:00",
         "args": ["generate", "--tag", "a"], "note": "", "prompt_source": None,
-        "prompt_sha256": None, "output_stem": _DRY["output_stem"], "estimate": {},
+        "prompt_sha256": None, "output_stem": _predicted_stem(_DRY["output_stem"], "a", frozen()),
+        "estimate": {},
         "priority": 0, "started_at": "2026-08-11T00:00:00", "finished_at": None,
         "exit_code": None, "log_tail": None,
     }
     q.write_json_durably(paths["running"] / "20260811-000000-a-run1.json", running_job)
     with pytest.raises(q.OutputStemConflict):
-        q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
+        q.submit(root, ["generate", "--tag", "a"], "", _DRY, {}, now=frozen)
 
 
 def test_submit_writes_the_prompt_snapshot_durably(tmp_path, monkeypatch):
@@ -546,11 +709,16 @@ def test_update_without_new_prompt_text_leaves_the_existing_snapshot_untouched(t
 
 
 def test_update_refuses_a_stem_conflict_with_another_pending_job(tmp_path):
+    """`update` never relocates `--outdir` itself (task A6's rule is `submit`-only), so the
+    conflict it must catch is against `other`'s real, already-relocated `output_stem` -- not the
+    flat one `_stem(_DRY, "/out/other")` on its own would name.
+    """
     root = tmp_path / "queue"
     job = q.submit(root, ["generate", "--tag", "a"], "", _DRY, {})
     other = q.submit(root, ["generate", "--tag", "b"], "", _stem(_DRY, "/out/other"), {})
     with pytest.raises(q.OutputStemConflict):
-        q.update(root, job.id, ["generate", "--tag", "a"], "", _stem(_DRY, "/out/other"), {})
+        q.update(root, job.id, ["generate", "--tag", "a"], "",
+                 {"output_stem": other.output_stem}, {})
     # the collision check must not have touched the other job or corrupted this one
     assert q.job_path(root, other.id, "pending").exists()
     assert json.loads(q.job_path(root, job.id, "pending").read_text())["note"] == ""
@@ -1132,9 +1300,9 @@ def test_reconcile_treats_an_mp4_without_a_marker_as_success(tmp_path):
     re-running the job would overwrite exactly the result being rescued.
     """
     root = tmp_path / "queue"
-    stem = tmp_path / "h3-a-1x1"
-    job = _claimed(root, stem)
-    Path(f"{stem}.mp4").write_bytes(b"video")
+    job = _claimed(root, tmp_path / "h3-a-1x1")
+    Path(job.output_stem).parent.mkdir(parents=True, exist_ok=True)
+    Path(f"{job.output_stem}.mp4").write_bytes(b"video")
 
     result = q.reconcile(root)
 
@@ -1152,9 +1320,9 @@ def test_reconcile_believes_the_marker_over_the_artifact_when_both_exist(tmp_pat
     non-zero exit code the marker knows about is lost for good.
     """
     root = tmp_path / "queue"
-    stem = tmp_path / "h3-a-1x1"
-    job = _claimed(root, stem)
-    Path(f"{stem}.mp4").write_bytes(b"video from an earlier attempt")
+    job = _claimed(root, tmp_path / "h3-a-1x1")
+    Path(job.output_stem).parent.mkdir(parents=True, exist_ok=True)
+    Path(f"{job.output_stem}.mp4").write_bytes(b"video from an earlier attempt")
     q.write_result_marker(root, job.id, 137, "2020-01-01T00:00:00")
 
     q.reconcile(root)
