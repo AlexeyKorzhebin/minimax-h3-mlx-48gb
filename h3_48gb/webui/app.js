@@ -1062,13 +1062,72 @@ export function buildPromptText(prompt) {
  *
  * Правка руками не теряется по построению: следующий ход уходит с текстом окна, а не с тем,
  * что модель прислала в прошлый раз (см. `sendChatMessage`).
+ *
+ * `turn.slug` (A4) следует тому же правилу, что и `session["slug"]` на сервере
+ * (`web._locked_turn`): ход, ничего не назвавший, не стирает то, что назвал предыдущий —
+ * `state.slug` переписывается только непустой строкой.
  */
 export function applyTurn(state, turn) {
   const answer = turn || {};
   if (!Array.isArray(state.log)) state.log = [];
   state.log.push({ role: "assistant", text: String(answer.reply == null ? "" : answer.reply) });
   if (answer.prompt) state.promptText = buildPromptText(answer.prompt);
+  if (typeof answer.slug === "string" && answer.slug) state.slug = answer.slug;
   return state;
+}
+
+/** Кириллица → латиница, буква в букву. Тег ограничен `[a-z0-9-]`
+ *  (см. `heuristicSlug`), и это единственное место, где кириллица в него превращается. */
+const SLUG_TRANSLIT = {
+  а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "e", ж: "zh", з: "z", и: "i",
+  й: "y", к: "k", л: "l", м: "m", н: "n", о: "o", п: "p", р: "r", с: "s", т: "t",
+  у: "u", ф: "f", х: "h", ц: "ts", ч: "ch", ш: "sh", щ: "sch", ъ: "", ы: "y",
+  ь: "", э: "e", ю: "yu", я: "ya",
+};
+
+/** Слова, которые `heuristicSlug` пропускает: не суть сцены, а разметка и грамматика вокруг
+ *  неё. `[Shot 1]` вырезается отдельным проходом (см. ниже) — здесь только стиль-слова, которыми
+ *  формат открывает `[Shot 1]` (docs/h3-prompt-system.md, «Cinematic, live-action, ...»), и три
+ *  английских артикля. */
+const SLUG_SKIP_WORDS = new Set(["live-action", "cinematic", "a", "an", "the"]);
+
+/**
+ * Эвристический тег из промпта, когда модель не прислала свой `slug` (A4).
+ *
+ * Источник текста — поле `integrated_multimodal_description`, размеченное так же, как его читает
+ * подсветка (`fieldValue`): если заголовок поля есть, берётся текст до следующего заголовка;
+ * иначе (промпт ещё не разбит на поля) читается весь текст как есть. `[Shot N]` и стиль-слова, с
+ * которых `[Shot 1]` начинается по документу, значимого о сцене не говорят и пропускаются вместе
+ * с артиклями; первые три оставшихся слова транслитерируются, склеиваются дефисом и обрезаются до
+ * 24 символов — предела, которым сервер ограничивает `--tag`-подобные имена.
+ */
+export function heuristicSlug(promptText) {
+  const text = String(promptText == null ? "" : promptText);
+  const field = fieldValue(text, "integrated_multimodal_description");
+  const body = (field ? field.text : text).replace(/\[Shot\s+\d+\]/gi, " ");
+  const words = body.match(/[\p{L}\p{N}]+(?:-[\p{L}\p{N}]+)*/gu) || [];
+  const picked = [];
+  for (const raw of words) {
+    const lower = raw.toLowerCase();
+    if (SLUG_SKIP_WORDS.has(lower)) continue;
+    const romanized = Array.from(lower).map((ch) => (ch in SLUG_TRANSLIT ? SLUG_TRANSLIT[ch] : ch))
+      .join("")
+      .replace(/[^a-z0-9-]/g, "");
+    if (!romanized) continue;
+    picked.push(romanized);
+    if (picked.length === 3) break;
+  }
+  return picked.join("-").slice(0, 24).replace(/-+$/, "");
+}
+
+/**
+ * Тег поля `#tag` после «в Редактор»: слаг сессии, если он вообще есть — так A4 (слаг от LLM)
+ * долетает до имени вывода без лишнего клика. Пустой или отсутствующий слаг оставляет поле
+ * как есть: нечего подставлять — нечего и менять.
+ */
+export function tagFromSessionSlug(currentTag, slug) {
+  const clean = String(slug == null ? "" : slug).trim();
+  return clean || currentTag;
 }
 
 /** Предупреждение хода — по коду, как и отказ: сервер шлёт `{code, message}` именно затем,
@@ -1939,6 +1998,10 @@ function startPage() {
       sending: false,
       providers: [],       // роспись из /api/providers — по ней собирается плашка модели
       llmStatus: "",
+      // A4: последний известный слаг сессии — сервер хранит его тем же правилом, каким хранит
+      // `prompt_struct` (только непустая строка переписывает), `applyTurn` держит его свежим на
+      // каждом ходе, а «в Редактор» (`finishChat`) подставляет его в `#tag`.
+      slug: session.slug || "",
     };
     $("chat-modal").hidden = false;
     $("chat-finish").textContent = FINISH_LABEL[chat.source.kind] || FINISH_LABEL.new;
@@ -2164,10 +2227,12 @@ function startPage() {
     } else {
       /* «в Редактор»: дальше обычная постановка. Промпт перестаёт быть файловым — текст
          разошёлся с файлом ровно в тот момент, когда его переписала модель, и уйти он должен
-         строкой, а не как --prompt-file на старое содержимое. */
+         строкой, а не как --prompt-file на старое содержимое. Тег — слаг сессии (A4), если
+         модель его назвала: `tagFromSessionSlug` оставляет поле как есть, когда слага нет. */
       $("prompt").value = text;
       promptFromFile = null;
       $("prompt-file").value = "";
+      $("tag").value = tagFromSessionSlug($("tag").value, chat.slug);
       renderPrompt();
       scheduleEstimate();
     }
@@ -2238,6 +2303,14 @@ function startPage() {
 
   async function submit() {
     const form = readForm();
+    // A4: `readForm` уже свело пустое `#tag` к «run» (`tag: $("tag").value.trim() || "run"`), так
+    // что «пуст или run» из требования — это ровно `form.tag === "run"` здесь. Эвристика молчит
+    // (пустая строка), когда в тексте не нашлось ни одного значимого слова — тогда тег остаётся
+    // тем же «run», который уже лежит в форме.
+    if (form.tag === "run") {
+      const slug = heuristicSlug(form.prompt);
+      if (slug) form.tag = slug;
+    }
     const body = { args: buildArgs(form), note: form.note };
     await withQueue(async () => {
       if (editing) {

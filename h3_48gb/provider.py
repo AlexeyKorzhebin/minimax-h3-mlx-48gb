@@ -41,6 +41,11 @@ PROMPT_SCHEMA = {
                              "overall_soundscape", "non_diegetic_music"],
                 "additionalProperties": False,
             },
+            # A4: a short slug for the scene (`cat-italian-noon`), used to name the run instead of
+            # the generic "run" tag. Optional and outside `required` on purpose -- every response
+            # this schema ever produced before A4 had no such key, and a schema that suddenly
+            # demanded one would make every one of those old, already-saved turns invalid.
+            "slug": {"type": ["string", "null"]},
         },
         "required": ["reply", "prompt"],
         "additionalProperties": False,

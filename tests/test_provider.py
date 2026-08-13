@@ -201,5 +201,45 @@ def test_system_prompt_carries_the_format_and_the_preservation_rule():
                    # this is the literal instruction line from the upstream guide
                    # (VIDEO_PROMPT_WRITING_GUIDE_base_en.md), verbatim except for its N/S.SS
                    # placeholders.
-                   "How the reference pictures align with the target video"):
+                   "How the reference pictures align with the target video",
+                   # A4: the doc has to tell the model to hand back a slug, and show it the
+                   # shape the example is supposed to take.
+                   "slug", "cat-italian-noon"):
         assert anchor in text, anchor
+
+
+# -- A4: slug -----------------------------------------------------------------------------------
+
+
+def test_prompt_schema_carries_an_optional_slug_field_outside_required():
+    """The schema is what a provider validates a completion against, so a `slug` this server can
+    read has to be *in* it -- and outside `required`, or every turn the model answered before A4
+    (none of them carrying the key at all) would stop being a valid answer to this same schema.
+    """
+    schema = provider.PROMPT_SCHEMA["schema"]
+    assert schema["properties"]["slug"]["type"] == ["string", "null"]
+    assert "slug" not in schema["required"]
+
+
+def test_chat_returns_the_slug_the_model_answered_with(tmp_path):
+    payload = {"choices": [{"message": {"content": json.dumps(
+        {"reply": "ок", "prompt": None, "slug": "cat-italian-noon"})}}]}
+    fake = _FakeLlama(chat_payload=payload)
+    try:
+        turn = provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn["slug"] == "cat-italian-noon"
+
+
+def test_a_turn_with_no_slug_at_all_is_still_a_valid_parse(tmp_path):
+    """`_TURN` is the shape every other provider test answers with, and it carries no `slug` key
+    -- exactly what a pre-A4 saved turn, or a provider that never learned the new field, looks
+    like. `chat` must not choke on its absence.
+    """
+    fake = _FakeLlama(chat_payload=_TURN)
+    try:
+        turn = provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn.get("slug") is None

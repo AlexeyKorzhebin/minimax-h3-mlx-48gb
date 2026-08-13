@@ -2201,10 +2201,24 @@ class _Handler(BaseHTTPRequestHandler):
                                 {"role": "assistant", "content": reply}]
         if turn.get("prompt"):
             session["prompt_struct"] = turn["prompt"]
+        # A4: `slug` is optional metadata (`PROMPT_SCHEMA`'s own `required` leaves it out), and
+        # deliberately held to a looser standard than `reply` a few lines up. `reply` is
+        # structural -- it becomes `messages[-1]["content"]`, and a wrong type there bricks the
+        # session the moment `_check_session_shape` reads it back, which is why it earns a 502.
+        # `slug` never touches `messages` or anything shape-checked; a model that ignores
+        # `response_format` and sends `slug: 42` costs nothing to treat as if it had sent nothing
+        # at all. So it is: not saved, not echoed, and the turn still answers 200 -- the same
+        # "absent is not an error" the field's own place outside `required` already promises,
+        # whether the absence is real or just a type this server declined to trust.
+        slug = turn.get("slug")
+        if isinstance(slug, str) and slug:
+            session["slug"] = slug
+        else:
+            slug = None
         self._write_session(path, session)
         return 200, "application/json", _json_bytes(
-            {"ok": True, "reply": reply, "prompt": turn.get("prompt"), "warning": warning,
-             "llm": self._llm_state(name, cfg)})
+            {"ok": True, "reply": reply, "prompt": turn.get("prompt"), "slug": slug,
+             "warning": warning, "llm": self._llm_state(name, cfg)})
 
     def _media(self, relative: str) -> tuple[int, str, bytes]:
         """A preview frame or a finished clip from **one** run's directory under the outdir.

@@ -3740,6 +3740,136 @@ def test_finishing_a_chat_about_a_job_puts_the_new_text_into_its_arguments():
     assert read_back == ["старый текст", None]
 
 
+# -- A4: слаг --------------------------------------------------------------------------------
+
+
+@_needs_node
+def test_heuristic_slug_takes_the_first_three_content_words_skipping_shot_tag_style_and_articles():
+    """A4: when the model does not send its own `slug`, the page builds one from whatever prompt
+    text is on screen -- specifically from `integrated_multimodal_description`, the field that
+    actually names the scene. `[Shot 1]`, the two style words the format opens every `[Shot 1]`
+    with (`Live-action`, `cinematic`; see docs/h3-prompt-system.md), and English articles carry no
+    scene content and must not end up as words of the tag.
+    """
+    got = _node_eval(r"""
+      console.log(JSON.stringify(app.heuristicSlug(
+        "integrated_multimodal_description: [Shot 1] Live-action, cinematic, a wide shot " +
+        "captures a sun-drenched Italian cobblestone street at noon.\n\n" +
+        "overall_soundscape: Wind.")));
+    """)
+    assert got == "wide-shot-captures", got
+
+
+@_needs_node
+def test_heuristic_slug_reads_the_whole_text_when_there_is_no_field_header():
+    """A prompt still in plain text (nothing typed yet went through the model) has no
+    `integrated_multimodal_description:` header at all -- the whole string is read instead of
+    coming back empty because a header never showed up.
+    """
+    got = _node_eval('console.log(JSON.stringify(app.heuristicSlug("A quiet harbor at dawn.")));')
+    # "A" is the one word the skip list drops (an article); "at" is a preposition, not one of the
+    # three literal skip categories (`[Shot N]`, the two named style words, a/an/the) -- so it is
+    # the third word kept, not "dawn".
+    assert got == "quiet-harbor-at", got
+
+
+@_needs_node
+def test_heuristic_slug_transliterates_cyrillic_into_latin():
+    got = _node_eval("""
+      console.log(JSON.stringify(app.heuristicSlug(
+        "integrated_multimodal_description: Кошка сидит на подоконнике итальянского дома.")));
+    """)
+    assert got == "koshka-sidit-na", got
+    assert re.fullmatch(r"[a-z0-9-]+", got), "тег обязан остаться в [a-z0-9-]"
+
+
+@_needs_node
+def test_heuristic_slug_is_capped_at_twenty_four_characters():
+    got = _node_eval("""
+      console.log(JSON.stringify(app.heuristicSlug(
+        "integrated_multimodal_description: An elephant construction site worker walks by.")));
+    """)
+    assert got == "elephant-construction-si", got
+    assert len(got) <= 24, got
+
+
+@_needs_node
+def test_heuristic_slug_is_empty_when_only_tags_style_words_and_articles_remain():
+    """Mutation guard: an implementation that forgets to filter (or forgets the three-word cap
+    entirely and just joins everything) would not produce an empty string here -- this is the
+    input every word of which the spec names as something to skip.
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify(app.heuristicSlug(
+        "integrated_multimodal_description: [Shot 1] Live-action, cinematic, a an the")));
+    """)
+    assert got == "", got
+
+
+@_needs_node
+def test_heuristic_slug_of_empty_or_missing_text_is_the_empty_string():
+    got = _node_eval(
+        'console.log(JSON.stringify([app.heuristicSlug(""), app.heuristicSlug(null)]));')
+    assert got == ["", ""], got
+
+
+@_needs_node
+def test_a_turn_with_a_slug_updates_the_chat_state_and_an_absent_one_leaves_it_alone():
+    """The mirror of `applyTurn`'s handling of `prompt` (see
+    `test_a_null_prompt_turn_leaves_the_editor_alone`): a turn naming a scene updates `state.slug`,
+    and a later turn that says nothing about it does not wipe out what an earlier one set.
+    """
+    out = _node_eval("""
+      const state = {promptText: "", log: [], slug: ""};
+      app.applyTurn(state, {reply: "ок", prompt: null, slug: "cat-italian-noon"});
+      const afterFirst = state.slug;
+      app.applyTurn(state, {reply: "ещё", prompt: null, slug: null});
+      console.log(JSON.stringify([afterFirst, state.slug]));
+    """)
+    assert out == ["cat-italian-noon", "cat-italian-noon"], out
+
+
+@_needs_node
+def test_tag_from_session_slug_replaces_the_tag_only_when_a_slug_exists():
+    out = _node_eval("""
+      console.log(JSON.stringify([
+        app.tagFromSessionSlug("run", "cat-italian-noon"),
+        app.tagFromSessionSlug("my-own-tag", ""),
+        app.tagFromSessionSlug("my-own-tag", null),
+        app.tagFromSessionSlug("my-own-tag", undefined),
+      ]));
+    """)
+    assert out == ["cat-italian-noon", "my-own-tag", "my-own-tag", "my-own-tag"], out
+
+
+def test_finishing_a_chat_to_the_editor_writes_the_sessions_slug_into_the_tag_field():
+    """The DOM half cannot run under `node` (see `_node_eval`'s own docstring and the identical
+    reasoning in `test_the_library_prompt_dialog_button_hands_the_forms_duration_to_the_new_session`
+    just above it in this file) -- this pins the handler's own source instead: the «в Редактор»
+    branch of `finishChat` has to route `chat.slug` through `tagFromSessionSlug` into `#tag`.
+    """
+    app_js = (WEBUI / "app.js").read_text(encoding="utf-8")
+    start = app_js.index("async function finishChat()")
+    assert start != -1
+    end = app_js.index("function fillFormFrom(job)", start)
+    body = app_js[start:end]
+    assert "tagFromSessionSlug(" in body and '$("tag").value' in body, body
+
+
+def test_submit_falls_back_to_the_heuristic_slug_when_the_tag_is_still_the_default():
+    """Same reasoning as the test above, pinned on `submit()`: requirement 4 (A4) is that a tag
+    left at the empty/`"run"` default is replaced by `heuristicSlug` of the form's own prompt text
+    at the moment a job is queued -- `readForm` already collapses an empty `#tag` to `"run"`
+    (`tag: $("tag").value.trim() || "run"`), so `"run"` alone is the condition to pin here.
+    """
+    app_js = (WEBUI / "app.js").read_text(encoding="utf-8")
+    start = app_js.index("async function submit()")
+    assert start != -1
+    end = app_js.index("function syncModeRows()", start)
+    body = app_js[start:end]
+    assert "heuristicSlug(" in body, body
+
+
 @_needs_node
 def test_an_answer_that_arrives_after_the_modal_moved_on_lands_nowhere():
     """Fix round 1, C1 and C2. A turn takes tens of seconds, and the modal is closeable (Esc, the

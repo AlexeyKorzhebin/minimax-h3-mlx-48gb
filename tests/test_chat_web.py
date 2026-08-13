@@ -517,6 +517,82 @@ def test_the_reply_and_the_prompt_are_saved_and_survive_a_reload(_serve, fake_ll
     assert saved["prompt_struct"]["non_diegetic_music"] == "N/A"
 
 
+# -- A4: слаг ------------------------------------------------------------------------------------
+
+
+def _turn_with_slug(slug):
+    """A well-formed turn (the shape `_TURN` fixes) carrying `slug` as given -- whatever type."""
+    return {"choices": [{"message": {"content": json.dumps(
+        {"reply": "ок", "prompt": None, "slug": slug})}}]}
+
+
+def test_a_turn_with_a_slug_is_saved_to_the_session_and_returned_to_the_client(_serve):
+    fake = _FakeLlama(chat_payload=_turn_with_slug("cat-italian-noon"))
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "правь", "prompt": ""})
+        assert answer["slug"] == "cat-italian-noon", answer
+        assert srv.get_json(f"/api/chat/{sid}")["slug"] == "cat-italian-noon"
+    finally:
+        fake.close()
+
+
+def test_a_later_turn_with_no_slug_keeps_the_sessions_last_known_one(_serve):
+    """The model does not owe a `slug` on every turn -- only when it hands back a `prompt` at all
+    (see the doc paragraph this pins). A turn that answers with `prompt: null` and no `slug` must
+    not erase what an earlier turn already named the session.
+
+    One fake server for both turns, mutated in place between them (`_FakeLlama` reads
+    `chat_payload` fresh out of its own closure on every request, so mutating the same dict the
+    handler already holds a reference to changes what the *next* request gets back, without
+    tearing down and re-pointing the roster at a second port mid-session).
+    """
+    payload = _turn_with_slug("cat-italian-noon")
+    fake = _FakeLlama(chat_payload=payload)
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "правь", "prompt": ""})
+        assert srv.get_json(f"/api/chat/{sid}")["slug"] == "cat-italian-noon"
+
+        payload.clear()
+        payload.update({"choices": [{"message": {"content": json.dumps(
+            {"reply": "ещё", "prompt": None})}}]})
+        answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "ещё раз", "prompt": ""})
+        assert answer.get("slug") is None, "этот ход ничего не назвал"
+        assert srv.get_json(f"/api/chat/{sid}")["slug"] == "cat-italian-noon", (
+            "второй ход без slug не должен был стереть слаг первого")
+    finally:
+        fake.close()
+
+
+@pytest.mark.parametrize("slug", [42, True, ["cat", "noon"], {"x": 1}, ""])
+def test_a_non_string_or_empty_slug_is_ignored_quietly_not_a_502(_serve, slug):
+    """A `slug` that ignores its own type -- a provider outside `response_format`'s reach can send
+    anything -- is the same situation `reply`'s own type check exists for (see
+    `test_a_reply_that_is_not_a_string_is_refused_instead_of_bricking_the_session`), but the
+    resolution is the opposite one, on purpose.
+
+    `reply` is required and structural: it becomes `messages[-1]["content"]`, and a bad type there
+    would brick the session the next time `_check_session_shape` reads it back -- so it is a 502.
+    `slug` is optional metadata that never reaches `messages` or the session-shape check at all;
+    treating a malformed one as "absent" costs nothing and keeps the promise `slug` not being in
+    `required` already makes -- its absence, however it came about, is never an error.
+    """
+    fake = _FakeLlama(chat_payload=_turn_with_slug(slug))
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        status, answer = srv.post_json_raw(f"/api/chat/{sid}/message",
+                                           {"text": "правь", "prompt": ""})
+        assert status == 200, answer
+        assert answer.get("slug") is None, answer
+        assert "slug" not in srv.get_json(f"/api/chat/{sid}")
+    finally:
+        fake.close()
+
+
 # -- кадр --------------------------------------------------------------------------------------
 
 
