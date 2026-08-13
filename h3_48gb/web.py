@@ -32,6 +32,7 @@ import errno
 import fcntl
 import io
 import json
+import math
 import mimetypes
 import os
 import re
@@ -172,6 +173,16 @@ DEFAULT_CHAT_MODE = "t2va"
 #: needs to say whether a shot's cut lands inside the declared runtime; a session that has never
 #: been told a duration must still give the model *some* answer rather than an absent field.
 DEFAULT_CHAT_DURATION = 10
+
+#: The longest a chat session may declare itself to be, in seconds. There is no such cap on
+#: `h3 generate --duration` itself (any positive float is a real request), but the chat's own
+#: `duration` is not a generation parameter: it is one line of context a person types into a
+#: plain `<input type=number>` (`#chat-duration`), and its only job past that is bounding what
+#: `analysePrompt`'s shot-cut check considers "past the end" of the clip. Sixty is a full minute
+#: of dialogue-and-shots -- far past anything this project has ever actually generated (see
+#: `prompts/`, all single-digit-to-ten-second scenes) -- and still small enough that a stray extra
+#: digit (`600`, `6000`) reads as obviously wrong rather than merely large.
+CHAT_DURATION_MAX = 60
 
 #: The only file types a chat turn will attach as a keyframe. An **allowlist**, and the same shape
 #: as `MEDIA_SUFFIXES` for the same reason -- with one addition that is not a formality.
@@ -1677,21 +1688,48 @@ class _Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _number_of(payload: dict, key: str, default):
-        """`payload[key]` as a number, or `default` when the field is absent or `null`.
+        """`payload[key]` as a finite number, or `default` when the field is absent or `null`.
 
         Present and the wrong shape is `args_invalid`, the same rule `_string_of` applies to text
         fields: a chat `duration` reaches the system context verbatim as `duration: <value> s`
         (`_locked_turn`), and a malformed value there is a malformed instruction handed to the
         model, not a UI nuance this route can silently paper over. `bool` is excluded even though
         `isinstance(True, int)` is true in Python -- `true`/`false` are not seconds.
+
+        **`NaN`/`Infinity`/`-Infinity` are excluded too** (review circle 1, fix round 1), even
+        though all three are ordinary Python `float`s and `isinstance` alone cannot tell them from
+        a real number. Python's own `json` module accepts those three tokens as an extension of
+        the standard -- `json.loads("NaN")` is `float("nan")`, not a parse error -- so a
+        hand-built request can put one on the wire without breaking anything before this check.
+        `math.isfinite` is what actually excludes them.
         """
         value = payload.get(key)
         if value is None:
             return default
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise CliError("args_invalid", f"`{key}` must be a number",
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value)):
+            raise CliError("args_invalid", f"`{key}` must be a finite number",
                            {"field": key, "type": type(value).__name__})
         return value
+
+    @staticmethod
+    def _check_chat_duration(value) -> None:
+        """`0 < value <= CHAT_DURATION_MAX`, or `args_invalid` -- the same refusal a `mode` the
+        generator does not know already gets (fix round 1, review circle 1, Important).
+
+        Runs on every `duration` this route computes, default included, but only a value this
+        route itself just parsed from a request can ever fail it: `DEFAULT_CHAT_DURATION` (10) and
+        every session's own last-known number were already checked the turn they were written, so
+        the only way to reach a value outside the range is to send one in *this* request's body --
+        `-5` (a browser's own `Number("-5") || 10` keeps a negative sign, it does not clear it),
+        `0`, or `1e300` (finite, and `_number_of` alone has no opinion on "too large").
+        """
+        if not (0 < value <= CHAT_DURATION_MAX):
+            raise CliError(
+                "args_invalid",
+                f"`duration` must be greater than 0 and at most {CHAT_DURATION_MAX}, and "
+                f"{value} is not",
+                {"value": value, "max": CHAT_DURATION_MAX})
 
     def _providers(self) -> tuple[int, str, bytes]:
         """`GET /api/providers`: the roster, exactly as the page may show it.
@@ -1907,6 +1945,7 @@ class _Handler(BaseHTTPRequestHandler):
         # this route only stores whatever number arrives, defaulting the same way an absent
         # `mode` does.
         duration = self._number_of(payload, "duration", DEFAULT_CHAT_DURATION)
+        self._check_chat_duration(duration)
         session = {"id": secrets.token_hex(4),
                    "source": source,
                    "mode": mode,
@@ -2088,6 +2127,7 @@ class _Handler(BaseHTTPRequestHandler):
         # only a session that has never been told one at all falls back to the ten-second default.
         duration = self._number_of(payload, "duration",
                                    session.get("duration", DEFAULT_CHAT_DURATION))
+        self._check_chat_duration(duration)
         session["duration"] = duration
         roster = provider.load_providers(self.server.outdir)
         name = self._string_of(payload, "provider") or roster["active"]

@@ -194,6 +194,30 @@ def test_a_declared_duration_that_is_not_a_number_is_refused_the_way_a_bad_mode_
     assert (status, payload["error"]["code"]) == (400, "args_invalid")
 
 
+@pytest.mark.parametrize("duration", [float("nan"), float("inf"), float("-inf"), -5, 0, 1e300])
+def test_a_declared_duration_outside_the_sane_range_is_refused(_serve, duration):
+    """Fix round 1 (review, Important): `duration` reaches a browser as plain `Number(...)`, and
+    both halves of that are reachable without any special effort. `Number("-5") || 10` from the
+    page's own normalisation keeps `-5` (it is truthy), and Python's `json` module accepts the
+    `NaN`/`Infinity`/`-Infinity` tokens as an extension of the standard, so a hand-built request
+    -- or a bug in a future caller -- can put any of the six values below on the wire. Before this
+    fix `isinstance(value, (int, float))` alone let all of them through, and `duration: nan s`
+    reached the model verbatim (`_locked_turn`'s system context) instead of being refused at 400
+    the way a bad `mode` already is."""
+    srv = _serve()
+    status, payload = srv.post_json_raw("/api/chat", {"source": {"kind": "new"}, "prompt": "",
+                                                      "duration": duration})
+    assert (status, payload["error"]["code"]) == (400, "args_invalid"), (duration, payload)
+
+
+@pytest.mark.parametrize("duration", [2.4, 15])
+def test_a_declared_duration_inside_the_sane_range_is_accepted(_serve, duration):
+    srv = _serve()
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": "",
+                                      "duration": duration})["id"]
+    assert srv.get_json(f"/api/chat/{sid}")["duration"] == duration
+
+
 def test_a_session_remembers_the_end_image_and_mentions_it_in_the_turns_context(_serve,
                                                                                 fake_llama):
     """T4b: `openChatFromJob` did not carry `--end-image` into the session, so a chat opened from
@@ -719,8 +743,16 @@ def test_a_chat_opened_from_a_library_prompt_survives_a_turn_end_to_end(_serve, 
     рядом здесь, потому что порознь каждая выглядит верной.
     """
     srv = _serve(providers_port=fake_llama.port)
+    # `duration: 6` — Fix round 1 (review, Important): `chat-prompt-open` («Обсудить») did not
+    # hand the form's `#duration` to `openChatModal` at all, unlike `mode` right beside it in the
+    # same object literal, so a chat opened from a library prompt always got the server's own
+    # ten-second default regardless of what the form said. This is the server half of that
+    # contract -- whatever number a fixed `chat-prompt-open` sends is the number the session
+    # remembers, the same way `test_a_session_opened_from_a_job_carries_the_jobs_declared_duration`
+    # pins the `job`-source half.
     opened = srv.post_json("/api/chat", {"source": {"kind": "prompt", "name": "x.txt"},
-                                         "prompt": "старый текст", "mode": "t2va"})
+                                         "prompt": "старый текст", "mode": "t2va",
+                                         "duration": 6})
     sid = opened["id"]
 
     answer = srv.post_json(f"/api/chat/{sid}/message",
@@ -732,6 +764,7 @@ def test_a_chat_opened_from_a_library_prompt_survives_a_turn_end_to_end(_serve, 
     saved = json.loads((Path(srv.root) / "chat" / f"{sid}.json").read_text(encoding="utf-8"))
     assert saved["source"] == {"kind": "prompt", "name": "x.txt"}, (
         "источник решает, что делает кнопка завершения, и обязан пережить ход")
+    assert saved["duration"] == 6
     assert [(m["role"], m["content"]) for m in saved["messages"]] == [
         ("user", "сделай мрачнее"), ("assistant", "Сделал мрачнее.")]
     assert saved["prompt_struct"] == answer["prompt"]

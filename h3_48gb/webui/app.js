@@ -2383,7 +2383,14 @@ function startPage() {
       if (error.payload) showError(error.payload);
       return;
     }
-    openChatModal({ kind: "prompt", name }, { prompt: text, mode: $("mode").value });
+    openChatModal({ kind: "prompt", name }, {
+      prompt: text,
+      mode: $("mode").value,
+      // Fix round 1 (review, Important): эта кнопка уже наследовала режим формы, но не
+      // длительность — сессия library-промпта всегда получала десять секунд по умолчанию,
+      // сколько бы ни стояло в `#duration`. Та же нормализация, что у `chat-new` рядом.
+      duration: Number(String($("duration").value).replace(",", ".")) || 10,
+    });
   });
 
   // Смена провайдера меняет и смысл плашки: у внешнего поднимать нечего.

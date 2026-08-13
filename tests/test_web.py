@@ -2519,6 +2519,33 @@ def test_the_modal_parse_flags_a_cut_past_the_chat_sessions_own_duration():
         _flat(parsed)
 
 
+def test_the_library_prompt_dialog_button_hands_the_forms_duration_to_the_new_session():
+    """Fix round 1 (review, Important): `chat-prompt-open` («Обсудить») already reads `#mode` for
+    the session it opens (`mode: $("mode").value`, right beside `openChatModal`'s call) but never
+    read `#duration` at all -- unlike `chat-new`, a few lines below it in the same file, which
+    already sends `duration: Number(String($("duration").value).replace(",", ".")) || 10`. A chat
+    opened from a library prompt therefore always got the server's own ten-second default,
+    whatever the form's own field said.
+
+    The click handler itself cannot be driven from a `node`-only test -- `app.js`'s DOM half is
+    guarded behind `typeof document` (`_node_eval`'s own docstring: importing it outside a browser
+    wires nothing up) -- so this pins the handler's own source instead of its runtime behaviour:
+    the object literal it hands to `openChatModal` has to read `#duration` the same way it already
+    reads `#mode`. `test_a_chat_opened_from_a_library_prompt_survives_a_turn_end_to_end`
+    (`tests/test_chat_web.py`) is the route half of the same fix -- it proves the server stores
+    whatever `duration` a `source.kind == "prompt"` creation sends, exactly as it already does for
+    `job`; this proves the button actually sends the form's own number rather than the default.
+    """
+    app_js = (WEBUI / "app.js").read_text(encoding="utf-8")
+    start = app_js.index('$("chat-prompt-open").addEventListener')
+    assert start != -1
+    end = app_js.index("});", start)
+    handler = app_js[start:end]
+    assert 'mode: $("mode").value' in handler, handler   # the pattern this fix mirrors
+    assert '$("duration")' in handler, (
+        "chat-prompt-open must read #duration, the same way it already reads #mode:\n" + handler)
+
+
 @_needs_node
 def test_speech_tags_have_to_close_and_name_a_language_the_model_speaks():
     """Three ways one `<d>` goes wrong, and the same prompt with none of them.
