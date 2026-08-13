@@ -3851,3 +3851,98 @@ def test_a_dismissal_burns_off_once_the_state_moves_past_it():
     """)
     assert trace == [True, False, True, True], (
         f"a return to the exact dismissed value after the state moved on must warn again: {trace}")
+
+
+# -- Task A2: LLM stages in the chat modal --------------------------------------------------------
+
+
+@_needs_node
+def test_pending_entry_text_depends_on_the_llm_status():
+    """The placeholder line the log gets the instant «отправить» is clicked has no answer to go
+    on yet, so its wording comes from the last known `llmStatus` alone: a cold model says it is
+    being raised, anything else (`up`, `busy`, unknown) just says the model is thinking.
+    """
+    down, up, busy, blank = _node_eval("""
+      console.log(JSON.stringify([
+        app.pendingEntry("down").text,
+        app.pendingEntry("up").text,
+        app.pendingEntry("busy").text,
+        app.pendingEntry("").text,
+      ]));
+    """)
+    assert "поднимаю" in down, down
+    assert "думает" in up and "думает" in busy and "думает" in blank
+    assert "поднимаю" not in up, "only a known-down model gets the cold-start wording"
+
+
+@_needs_node
+def test_landing_a_turn_clears_the_pending_placeholder_first():
+    """`sendChatMessage` pushes a `pendingEntry` right after the user's own line so the dots show
+    while the turn is in flight; `landTurn` has to take it back out before it applies the answer,
+    or the dots animate forever underneath the real reply.
+    """
+    out = _node_eval("""
+      const turn = {reply: "ок", prompt: null};
+      const state = {id: "a", promptText: "п", savedText: "п",
+                     log: [{role: "user", text: "мрачнее"}, app.pendingEntry("up")]};
+      app.landTurn(state, state, turn);
+      console.log(JSON.stringify(state.log.map((e) => e.kind || e.role)));
+    """)
+    assert out == ["user", "assistant"], f"pending must be gone, reply must be there: {out}"
+
+
+@_needs_node
+def test_landing_a_failure_clears_the_pending_placeholder_and_the_optimistic_line():
+    """A failed turn already pops the optimistic `user` line back out of the log (the text
+    returns to the input box instead). The pending placeholder sits *after* that line in the
+    real log, so removing it has to happen before that pop, or the pop's own `last.role ===
+    "user"` check finds the pending note instead and never fires.
+    """
+    out = _node_eval("""
+      const payload = {error: {code: "chat_unreachable", message: "connection refused"}};
+      const state = {id: "a", promptText: "п", savedText: "п",
+                     log: [{role: "user", text: "мрачнее"}, app.pendingEntry("up")]};
+      app.landFailure(state, state, payload, 0);
+      console.log(JSON.stringify(state.log.map((e) => e.role + "/" + (e.kind || ""))));
+    """)
+    assert out == ["note/bad"], out
+
+
+@_needs_node
+def test_a_turn_that_lands_nowhere_still_clears_its_own_pending_line():
+    """`landTurn`'s own docstring: a response arriving after the modal moved to another session
+    lands nowhere and must not touch that other session. But the orphaned `expected` object --
+    the one the dots were actually pushed onto -- must not keep them forever either, in case
+    anything still holds a reference to it.
+    """
+    out = _node_eval("""
+      const turn = {reply: "ок", prompt: null};
+      const expected = {id: "a", promptText: "п", savedText: "п",
+                        log: [{role: "user", text: "х"}, app.pendingEntry("up")]};
+      const other = {id: "b", promptText: "чужой", savedText: "чужой", log: []};
+      const landed = app.landTurn(other, expected, turn);
+      console.log(JSON.stringify([landed, expected.log.map((e) => e.kind || e.role),
+                                  other.log.length]));
+    """)
+    landed, expected_log, other_len = out
+    assert landed is False
+    assert "pending" not in expected_log, f"the orphaned session must not keep its dots: {expected_log}"
+    assert other_len == 0, "the foreign session that is actually on screen must stay untouched"
+
+
+@_needs_node
+def test_a_failure_that_lands_nowhere_still_clears_its_own_pending_line():
+    """Same guard, same rule, for `landFailure` (see the `landTurn` case above)."""
+    out = _node_eval("""
+      const payload = {error: {code: "chat_unreachable", message: "connection refused"}};
+      const expected = {id: "a", promptText: "п", savedText: "п",
+                        log: [{role: "user", text: "х"}, app.pendingEntry("up")]};
+      const other = {id: "b", promptText: "чужой", savedText: "чужой", log: []};
+      const landed = app.landFailure(other, expected, payload, 0);
+      console.log(JSON.stringify([landed, expected.log.map((e) => e.kind || e.role),
+                                  other.log.length]));
+    """)
+    landed, expected_log, other_len = out
+    assert landed is False
+    assert "pending" not in expected_log, f"the orphaned session must not keep its dots: {expected_log}"
+    assert other_len == 0, "the foreign session that is actually on screen must stay untouched"

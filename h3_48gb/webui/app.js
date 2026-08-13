@@ -1097,6 +1097,31 @@ export function chatHashAction(hash, current) {
 }
 
 /**
+ * Плейсхолдер-запись хода, пока ответ модели не пришёл.
+ *
+ * Сервер синхронный (см. докстринг `_chat_message`) и до самого ответа не присылает ничего —
+ * стадии на клиенте больше взять неоткуда, кроме последнего известного `llmStatus`. `"down"` —
+ * единственный статус, за которым стоит настоящее ожидание (холодный старт может занять минуту),
+ * остальное (`"up"`, `"busy"`, пусто) получает менее тревожный текст. `kind: "pending"` — метка,
+ * по которой `landTurn`/`landFailure` находят и убирают эту запись, когда ответ (или отказ)
+ * приземлился; `role: "note"` — чтобы `renderChatLog` собрал ей тот же CSS-класс, что и другим
+ * служебным строкам ленты (`warn`/`bad`).
+ */
+export function pendingEntry(llmStatus) {
+  return { role: "note", kind: "pending",
+           text: llmStatus === "down" ? "поднимаю модель…" : "модель думает…" };
+}
+
+/** Убирает плейсхолдер хода (см. `pendingEntry`) из лога состояния, если он там есть. По
+ *  ссылке и безусловно — до сторожа "чужая сессия", а не после: ответ, приземлившийся не туда,
+ *  всё равно обязан не оставить вечные точки на объекте состояния, который их получил. */
+function dropPending(state) {
+  if (state && Array.isArray(state.log)) {
+    state.log = state.log.filter((entry) => entry.kind !== "pending");
+  }
+}
+
+/**
  * Ответ хода — в ту сессию, которая его и просила, или никуда.
  *
  * Ход длится десятки секунд, и всё это время модалку можно закрыть (Esc, подложка, «закрыть»)
@@ -1114,6 +1139,7 @@ export function chatHashAction(hash, current) {
  * (см. `hasUnsavedEdits`).
  */
 export function landTurn(current, expected, answer) {
+  dropPending(expected);
   if (!current || current !== expected) return false;
   applyTurn(current, answer);
   const warning = answer && answer.warning;
@@ -1131,6 +1157,7 @@ export function landTurn(current, expected, answer) {
  * отвечает на тот же вопрос второй раз и неверно.
  */
 export function landFailure(current, expected, payload, runningSeconds = 0) {
+  dropPending(expected);
   if (!current || current !== expected) return false;
   if (!Array.isArray(current.log)) current.log = [];
   const last = current.log[current.log.length - 1];
@@ -1770,13 +1797,19 @@ function startPage() {
     if (!chat) return;
     const box = $("chat-log");
     box.innerHTML = chat.log.length
-      ? chat.log.map((entry) =>
+      ? chat.log.map((entry) => {
           // `role` и `kind` — свои, не с сервера, но в этом файле экранируется всё, что
           // попадает в разметку, и исключение «тут значение точно наше» — ровно то место, где
           // однажды окажется чужое (`role` приходит из `session.messages` с диска).
-          `<li class="turn ${escapeHtml(entry.role)}`
-          + `${entry.kind ? " " + escapeHtml(entry.kind) : ""}">`
-          + `${escapeHtml(entry.text)}</li>`).join("")
+          // Три точки у `pending`-записи — разметка, не текст: `pendingEntry` остаётся чистой
+          // функцией, а анимация (CSS, `@keyframes pending-dot`) идёт своим ходом и гасится
+          // тем же `prefers-reduced-motion`, что и остальная страница.
+          const dots = entry.kind === "pending"
+            ? '<span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>' : "";
+          return `<li class="turn ${escapeHtml(entry.role)}`
+            + `${entry.kind ? " " + escapeHtml(entry.kind) : ""}">`
+            + `${escapeHtml(entry.text)}${dots}</li>`;
+        }).join("")
       : `<li class="turn note">Опишите идею словами — модель соберёт промпт по формату. `
         + `Уже готовый текст можно вставить в окно слева и попросить привести к стандарту.</li>`;
     box.scrollTop = box.scrollHeight;   // свежая реплика видна без прокрутки
@@ -1929,16 +1962,27 @@ function startPage() {
    *
    * Кнопка отпускается до этой проверки и без всяких условий: она принадлежит модалке, а не
    * сессии, и оставить её мёртвой — значит потребовать перезагрузки страницы.
+   *
+   * Поле ввода чистится сразу, а не по ответу: сервер синхронный и до самого ответа ничего не
+   * шлёт, так что "реплика ушла" и "поле свободно для следующей" должны стать правдой в один и
+   * тот же клик — иначе от «отправить» ждали бы того же ответа, что и от самого хода. Исходный
+   * текст (`typed`, не обрезанный) при этом сохраняется: неудачный ход возвращает его в поле
+   * ровно там, где `landFailure` уже вернул реплику в ленту — и только когда ответ (отказ) и
+   * правда лёг в эту сессию, а не в чужую, на которую модалка успела перескочить.
    */
   async function sendChatMessage() {
     if (!chat || chat.sending) return;
-    const text = $("chat-input").value.trim();
+    const typed = $("chat-input").value;
+    const text = typed.trim();
     if (!text) return;
     const session = chat;
     session.sending = true;
     $("chat-send").disabled = true;
     renderLlmPlate("жду ответа — на холодной модели это до минуты");
     session.log.push({ role: "user", text });
+    // Плейсхолдер хода — точки, что ход идёт, пока сервер ничего не прислал (см. `pendingEntry`).
+    session.log.push(pendingEntry(session.llmStatus));
+    $("chat-input").value = "";
     renderChatLog();
 
     let answer = null;
@@ -1955,13 +1999,14 @@ function startPage() {
 
     if (answer) {
       if (!landTurn(chat, session, answer)) return;
-      // Поле очищается только когда ответ и правда лёг в эту сессию: иначе человек лишится
-      // текста, которого он в этой ленте даже не видел.
-      $("chat-input").value = "";
       chat.llmStatus = (answer.llm || {}).status || chat.llmStatus;
       clearError();
     } else if (!landFailure(chat, session, failure && failure.payload, runningLeft)) {
       return;
+    } else {
+      // Ход не удался: `landFailure` уже вернул реплику в ленту, и поле получает обратно тот же
+      // текст, который в нём был до отправки — из сохранённой переменной, не из ленты.
+      $("chat-input").value = typed;
     }
     renderLlmPlate();
     renderChatPrompt();
