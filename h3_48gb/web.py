@@ -97,6 +97,13 @@ PATH_FLAGS = {
 #: weights through `read_bytes()`, whole, into this process's memory.
 MEDIA_SUFFIXES = frozenset({".mp4", ".jpg", ".jpeg", ".png", ".wav"})
 
+#: How long a browser may keep a file it got from `/media`, in seconds. A year -- the conventional
+#: "forever" of `immutable`, and the reason it is safe here is a property of the run directory
+#: rather than a guess: a preview frame carries its pass number in its own file name
+#: (`...-preview-step05.jpg`) and a clip is written once, when the run ends. Nothing under a run
+#: is rewritten in place, so a cache hit is always the same bytes. See `_cache_control`.
+MEDIA_MAX_AGE = 31_536_000
+
 
 class _AnySuffix:
     """The allowlist that allows everything, for a route whose root is its own bound.
@@ -2688,14 +2695,45 @@ class _Handler(BaseHTTPRequestHandler):
                                 {"status": status, "explain": explain} if explain else
                                 {"status": status}))
 
+    def _cache_control(self, status: int) -> str:
+        """`no-store` for everything, and one exception: a file this route actually served
+        from a run directory.
+
+        `no-store` is the right default and stays the default -- the page is polled every 20
+        seconds and the queue changes under it, so a cached `/api/state` would show a worker
+        that stopped an hour ago, and a cached `app.js` would outlive the `h3 web` restart that
+        shipped a new one.
+
+        The exception is the one place where it cost rather than bought (task C3, C2 review):
+        the page redraws its result cards on every poll and writes the same `<img src>` back
+        into the DOM, so under blanket `no-store` an evening of ten finished runs re-fetched ten
+        preview frames three times a minute for bytes that cannot have changed. `MEDIA_MAX_AGE`
+        says why they cannot.
+
+        **Only 200, and only under `/media`.** A refusal is never cached, and the case that
+        makes that matter rather than a formality is the 404: the commonest one this route
+        answers is a preview frame the run has not written *yet*, and a cached one would keep
+        that card blank for the rest of the evening -- the browser would stop asking, and the
+        frame that appeared two minutes later would never be fetched.
+
+        The path is unquoted first, exactly as `_route_get` unquotes it before matching, so this
+        answer cannot disagree with the route that produced the body. `getattr` because
+        `send_error` reaches `_send` on a request line the base class failed to parse, where
+        there is no `self.path` at all.
+        """
+        if status != 200:
+            return "no-store"
+        path = urllib.parse.unquote(urllib.parse.urlsplit(getattr(self, "path", "")).path)
+        if not path.startswith("/media/"):
+            return "no-store"
+        return f"public, max-age={MEDIA_MAX_AGE}, immutable"
+
     def _send(self, status: int, content_type: str, body: bytes) -> None:
         """One place that writes a response, so `Content-Length` cannot be forgotten on one path."""
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        # The page is polled every 20 seconds and the queue changes under it; a cached `/api/state`
-        # would show a worker that stopped an hour ago.
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", self._cache_control(status))
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)

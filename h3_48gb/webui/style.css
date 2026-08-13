@@ -82,6 +82,14 @@
 
   --sel:           rgba(224,163,62,.24);    /* sel-bg */
 
+  /* Инверсная главная кнопка канона (`.btn.inverse`): светлая плашка на тёмной странице и
+     тёмная на светлой. Акцент на неё не тратится — янтарь на этой странице значит «GPU
+     считает», и кнопка, которая всего лишь ставит задачу в очередь, не имеет права его
+     занимать. Значения — те же, что у --btn-inv-* обоих канонов. */
+  --inverse:       #f7f8f8;
+  --inverse-hover: #ffffff;
+  --inverse-ink:   #0a0b0c;
+
   /* Канон не рисует размытую тень вовсе — глубина только линией и светимостью
      (см. заголовок variant-reference.html). Волосяная обводка — тот же
      приём, что у канона `.panel{border:1px solid var(--line)}`. */
@@ -149,6 +157,10 @@
 
     --sel:           rgba(209,138,18,.22);
 
+    --inverse:       #16181d;
+    --inverse-hover: #000000;
+    --inverse-ink:   #faf9f8;
+
     --shadow:        0 0 0 1px var(--hairline);
     --shadow-pop:    0 28px 64px -20px rgba(20,22,26,.20), 0 2px 8px rgba(20,22,26,.06);
 
@@ -198,6 +210,9 @@
   --warn-ink:      var(--warn);
   --warn-soft:     rgba(162,74,28,.08);
   --sel:           rgba(209,138,18,.22);
+  --inverse:       #16181d;
+  --inverse-hover: #000000;
+  --inverse-ink:   #faf9f8;
   --shadow:        0 0 0 1px var(--hairline);
   --shadow-pop:    0 28px 64px -20px rgba(20,22,26,.20), 0 2px 8px rgba(20,22,26,.06);
   --frame-1:         #3c3f45;
@@ -241,6 +256,9 @@
   --warn-ink:      var(--warn);
   --warn-soft:     rgba(201,120,74,.10);
   --sel:           rgba(224,163,62,.24);
+  --inverse:       #f7f8f8;
+  --inverse-hover: #ffffff;
+  --inverse-ink:   #0a0b0c;
   --shadow:        0 0 0 1px var(--hairline);
   --shadow-pop:    0 32px 72px -20px rgba(0,0,0,.85), 0 0 0 1px rgba(0,0,0,.4);
   --frame-1:         #1c1d20;
@@ -270,14 +288,6 @@
   --r-inner: 10px;      /* скругление вложенного    */
   --r-ctl: 8px;         /* скругление элемента ввода */
   --r-xs: 4px;          /* скругление мелкого       */
-
-  /* Текст на заливке акцента (кнопка `.primary`): --accent — светлый янтарь
-     в обеих темах, тёмный текст читается на нём лучше белого. Тот же
-     near-black, что использует канон для текста на своей светлой инверс-
-     кнопке (`.btn.inverse{color:#0a0b0c}`) — не зависит от темы намеренно,
-     потому что сам --accent не темнеет в тёмной теме настолько, чтобы это
-     потребовалось. */
-  --accent-fg: #0a0b0c;
 }
 /* /tokens */
 * { box-sizing: border-box; }
@@ -353,7 +363,6 @@ b { font-weight: 600; }
 }
 .stat .v.hot { color: var(--accent-ink); }
 .stat .v.warn { color: var(--warn-ink); }
-.stat .v.sub { display: none; }          /* объяснение состояния — в подсказке, не в строке */
 .stat.worker { gap: 8px; }
 
 /* состояние работника: лампа как форма, цвет — только подтверждение */
@@ -452,7 +461,17 @@ body[data-stale] main { opacity: .55; }
 
 /* ===========================================================================
    КНОПКИ
-   Три веса: главная (заливка акцентом), обычная, призрачная.
+   Три веса: главная (инверсная плашка), обычная, призрачная.
+
+   Главная не янтарная (правка по ревью C2). Янтарь на этой странице — не
+   «важно», а «GPU считает»: им горят деления пройденных проходов, знак идущей
+   задачи, шкала памяти и подсветка планов в промпте. Пока им же горели три
+   кнопки — «Поставить в очередь», «Начать расчёт», «Новый через диалог» —
+   первый экран светился акцентом в четырёх местах сразу, и ни одно из них не
+   означало, что что-то считается. Канон решает это иначе и в обеих темах
+   одинаково: главная кнопка — инверсия страницы (`.btn.inverse`), светлая
+   плашка на тёмном и тёмная на светлом. Ни одного янтарного пикселя, и при
+   этом самая громкая вещь на экране.
    =========================================================================== */
 button {
   font: 510 13px/1.2 var(--ui); letter-spacing: -.005em;
@@ -464,15 +483,13 @@ button {
 }
 button:hover { background: var(--fill-2); color: var(--ink); }
 button:focus-visible { outline: none; box-shadow: 0 0 0 3.5px var(--accent-ring); }
-button.primary {
-  background: var(--accent); color: var(--accent-fg); border-color: var(--accent);
-  font-weight: 600;
+button.inverse {
+  background: var(--inverse); color: var(--inverse-ink); border-color: var(--inverse);
+  font-weight: 590;
 }
-/* theme-invariant: color-mix's #000 is a neutral darken operator, not a painted color -- it
-   darkens whatever --accent already resolved to for the active theme */
-button.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000);
-                       border-color: color-mix(in srgb, var(--accent) 88%, #000); }
-button.primary:disabled {
+button.inverse:hover { background: var(--inverse-hover); border-color: var(--inverse-hover);
+                       color: var(--inverse-ink); }
+button.inverse:disabled {
   background: var(--fill-2); color: var(--ink-3); border-color: transparent; cursor: not-allowed;
 }
 button.ghost { background: transparent; border-color: transparent; color: var(--ink-3); }
@@ -825,7 +842,7 @@ details.adv > summary .hint {
 .force input[type=checkbox]:focus-visible { box-shadow: 0 0 0 3.5px var(--accent-ring); outline: none; }
 
 .est-actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
-.est-actions .primary { flex: 1; justify-content: center; }
+.est-actions .inverse { flex: 1; justify-content: center; }
 .est-foot { margin: 12px 0 0; font-size: 11px; color: var(--ink-3); line-height: 1.45; }
 .est-said { font-size: 12.5px; color: var(--done-ink); font-weight: 500; }
 
@@ -1223,7 +1240,9 @@ details.adv > summary .hint {
   .form-grid { grid-template-columns: minmax(0, 1fr); }
   .results { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .chrome-in { gap: 12px; }
-  .stat.worker .k, .host { display: none; }
+  /* Подпись и значение прячутся парой: одинокое «● запущен» без слова «работник» не
+     говорит, что именно запущено, а лампа своей формой и цветом говорит то же самое и одна. */
+  .stat.worker .k, .stat.worker .v, .host { display: none; }
 }
 @media (max-width: 1040px) {
   .running { grid-template-columns: 1fr; }

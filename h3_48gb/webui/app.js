@@ -257,13 +257,20 @@ export function canvasPresetKey(width, height) {
   return preset ? preset.key : "custom";
 }
 
-/** Имя файла без каталога и без расширения — тем же правилом, что и `pathBasename` в DOM-половине:
+/** Последнее звено пути, как есть — тем же правилом, что и `pathBasename` в DOM-половине:
  *  путь мог прийти с сервера (всегда `/`) или быть вписан руками на другой ОС. */
-function stemOfPath(value) {
+function nameOfPath(value) {
   const trimmed = String(value == null ? "" : value).trim();
   if (!trimmed) return "";
   const parts = trimmed.split(/[\\/]/);
-  const name = parts[parts.length - 1];
+  return parts[parts.length - 1];
+}
+
+/** То же, но без расширения. Только для **файлов**: у каталога «расширения» не бывает, и
+ *  отрезать у него хвост по последней точке значит назвать другой каталог (правка по ревью C2 —
+ *  `h3-8bit-full.v2` превращался в `h3-8bit-full`, который у людей лежит рядом). */
+function stemOfPath(value) {
+  const name = nameOfPath(value);
   const dot = name.lastIndexOf(".");
   return dot > 0 ? name.slice(0, dot) : name;
 }
@@ -286,7 +293,9 @@ function stemOfPath(value) {
  */
 export function modelSummary(form) {
   const it = form || {};
-  const checkpoint = stemOfPath(it.checkpoint) || "чекпойнт не указан";
+  // Чекпойнт — каталог (`--checkpoint` указывает на папку с весами), поэтому имя целиком:
+  // см. `stemOfPath` о том, чем это кончалось. Таблица AdaLN ниже — файл, и там стем уместен.
+  const checkpoint = nameOfPath(it.checkpoint) || "чекпойнт не указан";
   const steps = Math.max(0, Math.round(Number(it.steps) || 0));
   const lora = String(it.lora || "").trim()
     ? `LoRA ${(Number(it.loraStrength) || 0).toFixed(2)}`
@@ -829,13 +838,20 @@ export function pendingRowHtml(job, { editingId = null, index = null } = {}) {
  * построит ссылку (см. `mediaParts`), а не упадёт — карточка ещё покажет имя
  * файла текстом, как до этой задачи, если `outdir` почему-то не пришёл.
  *
- * C2: строка стала карточкой `.rcard` из макета, и главное в ней — кадр. Число проходов для
- * `previewUrl` берётся из оценки самой задачи (`estimate.forwards`): прогон закончился, значит
- * прошёл их все, и последний записанный кадр выводится по тому же правилу `--preview-every`,
- * что и у идущей задачи, а не угадывается. Кадра может не быть вовсе (прогон короче одного
- * интервала записи, или упал раньше первого) — тогда рамка пустая: битая картинка хуже пустой.
+ * C2: строка стала карточкой `.rcard` из макета, и главное в ней — кадр.
+ *
+ * Откуда берётся число проходов для `previewUrl` — зависит от исхода, и это не мелочь (ревью C2,
+ * опасение 1). У успешной задачи это её собственная оценка (`estimate.forwards`): прогон дошёл до
+ * конца, значит прошёл их все, и оценка тут — факт, переживающий исчезновение прогона из `runs`
+ * сутки спустя. У упавшей `estimate.forwards` — обещание, а не факт: до последнего прохода она не
+ * дожила, и адрес кадра, построенный по нему, отвечал 404 на каждый опрос, раз в двадцать секунд,
+ * на каждую упавшую карточку. Сколько проходов было на самом деле, знает `runs.scan`
+ * (`run.completed`, посчитанный по чекпойнтам на диске) — отсюда третий аргумент.
+ *
+ * Кадра может не быть вовсе (прогон короче одного интервала записи, упал раньше первого, или его
+ * каталога уже нет в `runs`) — тогда рамка пустая: битая картинка хуже пустой.
  */
-export function finishedRowHtml(job, outdir) {
+export function finishedRowHtml(job, outdir, runs) {
   const code = job.exit_code;
   const ok = code === 0;
   const clip = ok ? clipUrl(job, outdir) : null;
@@ -843,11 +859,14 @@ export function finishedRowHtml(job, outdir) {
   const name = stem.slice(stem.lastIndexOf("/") + 1);
   const id = escapeHtml(job.id);
   const e = job.estimate || {};
-  const shot = previewUrl(job, Number(e.forwards) || 0, outdir);
-  const link = ok
-    ? (clip ? `<a class="clip" href="${clip}">${escapeHtml(name)}.mp4</a>`
-            : escapeHtml(name))
-    : `код возврата ${escapeHtml(code == null ? "неизвестен" : code)}`;
+  const run = ok ? null : runForJob(job, runs);
+  const completed = ok ? Number(e.forwards) || 0 : Number((run && run.completed) || 0);
+  const shot = previewUrl(job, completed, outdir);
+  // Код возврата стоит в `.meta` и только там: до этой правки упавшая карточка называла его
+  // дважды подряд — «код 1» строкой выше и «код возврата 1» строкой ниже.
+  const link = ok && clip
+    ? `<a class="clip" href="${clip}">${escapeHtml(name)}.mp4</a>`
+    : escapeHtml(name);
   const took = job.started_at && job.finished_at
     ? (Date.parse(job.finished_at) - Date.parse(job.started_at)) / 1000
     : NaN;
@@ -871,6 +890,23 @@ export function finishedRowHtml(job, outdir) {
     + `</div>`
     + `</div>`
     + `</article>`;
+}
+
+/**
+ * Одно слово о том, что с очередью, для показания в чроме.
+ *
+ * Четыре исхода, а не три (правка по ревью C2): до неё «идёт» стояло на любой непаузной
+ * очереди при живом работнике — в том числе на пустой, где не идёт ничего, — и спорило с
+ * соседней строкой «Ничего не считается» в той же чроме.
+ *
+ * «Свободна» и «стоит» — разные вещи, и путать их дорого: свободная очередь возьмёт первую же
+ * поставленную задачу, стоящая не возьмёт (некому — работник не запущен или его не проверить).
+ * Пауза называется отдельно и первой: она снимается кнопкой, остальные два — нет.
+ */
+export function queueStateWord({ paused, workerState, running, pending } = {}) {
+  if (paused) return "на паузе";
+  if (workerState !== "alive") return "стоит";
+  return running || Number(pending) > 0 ? "идёт" : "свободна";
 }
 
 /** Нечитаемые файлы очереди. Их нет ни в одном списке, а человек считает
@@ -1802,22 +1838,28 @@ function startPage() {
     const queue = state.queue || {};
     const workerState = (state.worker || {}).state || "unknown";
 
-    // -- чрома: три показания рядом, каждое в два слова (макет: `.readout`)
     const paused = Boolean(state.paused);
+    const running = (queue.running || [])[0] || null;
+    const pending = queue.pending || [];
+
+    // -- чрома: три показания рядом, каждое в два слова (макет: `.readout`)
     $("rail").dataset.worker = workerState;
     $("worker-state").textContent = {
       alive: "запущен", stopped: "не запущен", unknown: "неизвестно",
     }[workerState] || "неизвестно";
-    $("worker-pid").textContent = {
+    // Объяснение — в подсказке самого показания, а не отдельной строкой рядом: на узком окне
+    // от показания остаётся одна лампа, и второму слову там места нет. До правки по ревью C2
+    // этот текст пересчитывался на каждый опрос в элемент с `display: none`, то есть никуда.
+    $("worker").title = {
       alive: "задачи берутся из очереди",
       stopped: "очередь стоит, задачи не берутся",
       unknown: "замок не удалось проверить",
     }[workerState] || "";
-    // «идёт» только когда очередь действительно может пойти: снятая пауза при незапущенном
-    // работнике — это стоящая очередь, и говорить о ней «идёт» рядом с «работник не запущен»
-    // значит спорить с самим собой в одной строке.
-    $("queue-state").textContent = paused ? "на паузе"
-      : workerState === "alive" ? "идёт" : "стоит";
+    // Четыре исхода, а не три (`queueStateWord`): пустая очередь при живом работнике —
+    // «свободна», и говорить о ней «идёт» рядом с «Ничего не считается» значит спорить с
+    // самим собой в одной чроме.
+    $("queue-state").textContent = queueStateWord(
+      { paused, workerState, running: Boolean(running), pending: pending.length });
     $("queue-state").className = "v" + (paused || workerState !== "alive" ? " warn" : "");
     $("llm-state").textContent = {
       up: "поднята", busy: "занята прогоном", down: "выгружена",
@@ -1825,14 +1867,12 @@ function startPage() {
     $("llm-state").className = "v" + (llmStatus === "up" ? " hot" : "");
 
     // -- идёт сейчас
-    const running = (queue.running || [])[0] || null;
     const progress = renderRunning(running, workerState, now);
     // Тот же остаток, что печатается в приборной строке, нужен модалке: `gpu_busy` без него —
     // отказ без совета, ждать минуту или три часа по нему не понять.
     runningLeft = progress.left;
 
     // -- ждут
-    const pending = queue.pending || [];
     renderUnloadBanner(pending.length);
     $("pending").innerHTML = pending
       .map((job, i) => pendingRowHtml(job, { editingId: editing, index: i + 1 })).join("");
@@ -1841,15 +1881,15 @@ function startPage() {
     const summary = pendingSummary(pending, {
       now, runningSeconds: progress.left, workerState,
     });
-    $("pending-sum").textContent = summary.text;
 
     /* -- пауза/старт очереди (A5, место из C2): кнопка вынесена из `<h2>` в собственную полосу
-       состояния над списком. `state.paused` решает подпись, `aria-pressed` и то, какой маршрут
-       бьёт нажатие (см. `toggleQueuePause`) — все три из одного значения, чтобы кнопка не
-       могла выглядеть нажатой и звучать отжатой. Крупная строка рядом отвечает на единственный
-       вопрос, ради которого на эту зону смотрят издалека: считается сейчас или нет. */
+       состояния над списком. `state.paused` решает подпись и то, какой маршрут бьёт нажатие
+       (см. `toggleQueuePause`) — оба из одного значения. Атрибута нажатости тут больше нет
+       (правка по ревью C2): у кнопки с меняющейся подписью он спорит с ней вслух — «Начать
+       расчёт, нажата». Состояние называет сама подпись, и она же читается скринридером.
+       Крупная строка рядом отвечает на единственный вопрос, ради которого на эту зону смотрят
+       издалека: считается сейчас или нет. */
     $("queue-pause-toggle").textContent = paused ? "▶ Начать расчёт" : "⏸ Приостановить";
-    $("queue-pause-toggle").setAttribute("aria-pressed", paused ? "true" : "false");
     $("queue-title").textContent = paused ? "Очередь приостановлена"
       : workerState !== "alive" ? "Работник не запущен"
       : running ? "Идёт расчёт"
@@ -1865,7 +1905,8 @@ function startPage() {
 
     // -- закончилось за сутки
     const finished = finishedWithin([...(queue.done || []), ...(queue.failed || [])], now);
-    $("finished").innerHTML = finished.map((job) => finishedRowHtml(job, state.outdir)).join("");
+    $("finished").innerHTML = finished
+      .map((job) => finishedRowHtml(job, state.outdir, state.runs)).join("");
     $("finished-empty").hidden = finished.length > 0;
     const failed = finished.filter((job) => job.exit_code !== 0).length;
     $("done-sum").textContent = finished.length
@@ -3065,9 +3106,13 @@ function startPage() {
       scheduleEstimate();
       renderPrompt();
       if (id === "image" || id === "end-image") updateUploadZone(id);
-      // Числа в полях решают, какой пункт горит в списке, а не наоборот (см. `syncCanvasPreset`).
-      if (id === "width" || id === "height") $("canvas-preset").value =
-        canvasPresetKey($("width").value, $("height").value);
+      /* Список при этом не трогается, и это правка по ревью C2. Поля канваса доступны только
+         под «своё…» — значит ручной ввод всегда идёт при выбранном «своё…», — а обработчик
+         перекидывал список на пресет, если числа с ним совпали. Список говорил «малое
+         896×576», поля ручного ввода оставались открытыми под ним, и выйти из этого было
+         нельзя: выбрать «малое», чтобы они закрылись, невозможно, оно уже выбрано и `change`
+         не срабатывает. Обратная сторона синхронизации жива в `syncCanvasPreset` — она про
+         числа, пришедшие не из клавиатуры (правка задачи, первая отрисовка). */
     });
   }
   wireUploadZone("image");

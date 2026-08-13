@@ -992,6 +992,67 @@ def test_responses_carry_a_content_length_and_forbid_caching(server):
     assert headers["Cache-Control"] == "no-store"
 
 
+@pytest.mark.parametrize("url", ["/api/state", "/static/app.js", "/static/style.css", "/"])
+def test_everything_the_page_polls_still_refuses_to_be_cached(server, url):
+    """The paired half of the rule below: only `/media` was let out, not caching in general.
+
+    `/api/state` is the whole point of `no-store` -- a cached one shows a worker that stopped an
+    hour ago -- and the three page files are the ones a browser would otherwise keep across a
+    `h3 web` restart that shipped a new `app.js`.
+    """
+    status, headers, _ = _request(server, url)
+    assert status == 200, f"{url} answered {status}, so this test proves nothing about it"
+    assert headers["Cache-Control"] == "no-store", url
+
+
+def test_a_served_media_file_may_be_cached_because_a_run_never_rewrites_one(server):
+    """C2 review: the cards re-requested every preview frame on every 20-second poll.
+
+    The page redraws its cards on each poll and writes the same `<img src>` back into the DOM.
+    Under blanket `no-store` that is one GET per card per poll for bytes that cannot have
+    changed: a preview frame carries its pass number in its own file name and a clip is written
+    once, when the run ends. Nothing under a run directory is rewritten in place, which is
+    exactly the precondition `immutable` states.
+    """
+    run = server.outdir / "19-run"
+    run.mkdir()
+    (run / "h3-x-preview-step05.jpg").write_bytes(b"\xff\xd8jpg")
+    status, headers, body = _request(server, "/media/19-run/h3-x-preview-step05.jpg")
+    assert status == 200 and body == b"\xff\xd8jpg"
+    cache = headers["Cache-Control"]
+    assert "no-store" not in cache, f"the frame is still uncacheable: {cache!r}"
+    assert "immutable" in cache, f"a run's file never changes, and the header must say so: {cache!r}"
+    age = re.search(r"max-age=(\d+)", cache)
+    assert age and int(age.group(1)) >= 3600, (
+        f"a lifetime shorter than an hour re-fetches within one evening's queue: {cache!r}")
+
+
+def test_a_media_frame_that_does_not_exist_yet_is_never_cached(server):
+    """The 404 must stay uncacheable, and this is the case that makes it matter rather than a
+    formality: the commonest 404 this route answers is a preview frame the run has not written
+    **yet**. A cached one would keep that card blank for the rest of the evening -- the browser
+    would stop asking, and the frame that appeared two minutes later would never be fetched.
+    """
+    run = server.outdir / "19-run"
+    run.mkdir()
+    status, headers, _ = _request(server, "/media/19-run/h3-x-preview-step05.jpg")
+    assert status == 404
+    assert headers["Cache-Control"] == "no-store"
+    # And once it lands, the same URL is cacheable -- otherwise the rule above is unreachable.
+    (run / "h3-x-preview-step05.jpg").write_bytes(b"\xff\xd8jpg")
+    status, headers, _ = _request(server, "/media/19-run/h3-x-preview-step05.jpg")
+    assert status == 200 and "immutable" in headers["Cache-Control"]
+
+
+def test_a_refused_media_url_is_not_cached_either(server):
+    """A traversal refusal is a 400, and a cached one would outlive the fix for whatever made the
+    page ask for it. Same reasoning as the 404 above, one status along.
+    """
+    status, headers, _ = _request(server, "/media/../../etc/passwd")
+    assert status == 400
+    assert headers["Cache-Control"] == "no-store"
+
+
 # -- Step 7: the socket ---------------------------------------------------------------------------
 
 
@@ -2671,6 +2732,32 @@ def test_every_canvas_preset_has_its_own_option_in_the_resolution_dropdown():
     assert "data-preset=" not in page, "кнопки-пресеты заменены выпадашкой, а не дополнены ею"
 
 
+def test_typing_a_preset_sized_canvas_by_hand_does_not_lock_the_manual_fields_open():
+    """Правка по ревью C2, и это тупик, а не косметика.
+
+    Поля `#width`/`#height` доступны только под «своё…» — под пресетом их не видно и набрать
+    в них нечего. Значит ручной ввод всегда идёт при выбранном «своё…». Обработчик `input` при
+    этом перекидывал сам список на пресет, если числа с ним совпали: список говорил «малое
+    896×576», а поля ручного ввода оставались открытыми под ним. Хуже того, выйти из этого
+    состояния было уже нельзя — выбрать в списке «малое», чтобы поля закрылись, невозможно:
+    список уже стоит на «малое», `change` не срабатывает, и поля остаются открытыми до
+    перезагрузки страницы.
+
+    Поэтому пока открыт ручной ввод, в списке стоит «своё…» — что бы ни было набрано в полях.
+    Обратная сторона (`canvasPresetKey` в `syncCanvasPreset`) не трогается: она отвечает на
+    другой вопрос — что показать, когда числа пришли не из клавиатуры, а из правки задачи.
+    """
+    script = _page_text("app.js")
+    handler = re.search(r'for \(const id of FIELDS\) \{.*?\n  \}', script, re.S)
+    assert handler, "подписки полей формы на `input` в app.js больше нет"
+    assert "canvasPresetKey" not in handler.group(0), (
+        "ручной ввод не имеет права перекидывать список с «своё…» на пресет:\n"
+        + handler.group(0))
+    body = _js_function(script, "function syncCanvasPreset()")
+    assert "canvasPresetKey" in body, (
+        "вторая сторона синхронизации — числа не из клавиатуры — обязана остаться:\n" + body)
+
+
 @_needs_node
 def test_the_model_summary_folds_the_model_settings_into_one_line():
     """C2, требование 3: свёрнутые «Настройки модели» обязаны сказать, что в них лежит.
@@ -2706,6 +2793,111 @@ def test_the_model_summary_says_out_loud_that_there_is_no_lora():
 
 
 @_needs_node
+def test_the_model_summary_keeps_a_checkpoint_directorys_name_whole():
+    """Правка по ревью C2. Чекпойнт — **каталог**, а не файл: `--checkpoint` указывает на
+    папку с весами. Сводка резала его имя по последней точке тем же правилом, что и таблицу
+    AdaLN (`adaln_8_l100.safetensors` → `l100`), и каталог `h3-8bit-full.v2` превращался в
+    `h3-8bit-full`, то есть в имя **другого** каталога, который у людей рядом и лежит.
+    Прогон по чужому чекпойнту стоит вечера, а сводка — единственное, что о нём говорит,
+    пока `<details>` свёрнут.
+
+    У таблицы AdaLN правило остаётся прежним: она файл, и `.safetensors` в свёрнутой строке —
+    шум. Обе половины проверяются вместе, иначе «не резать вовсе» прошло бы как исправление.
+    """
+    dotted, versioned, table = _node_eval("""
+      const f = (ckpt, adaln) => app.modelSummary(
+        {checkpoint: ckpt, steps: 8, lora: "", loraStrength: 1, adaln: adaln});
+      console.log(JSON.stringify([
+        f("~/models/h3-8bit-full.v2", ""),
+        f("/m/mlx/MiniMax-Hailuo-2.3", ""),
+        f("/m/h3-fp16", "~/models/turbo/adaln_8_l100.safetensors"),
+      ]));
+    """)
+    assert dotted.startswith("h3-8bit-full.v2 · "), (
+        "каталог назван целиком, а не до последней точки: " + dotted)
+    assert versioned.startswith("MiniMax-Hailuo-2.3 · "), versioned
+    assert table.endswith(" · таблица l100"), (
+        "у таблицы AdaLN расширение по-прежнему лишнее: " + table)
+
+
+@_needs_node
+def test_the_queue_calls_itself_free_rather_than_running_when_there_is_nothing_to_run():
+    """Правка по ревью C2. Показание «очередь» в чроме говорило «идёт» на любой непаузной
+    очереди при живом работнике — в том числе на пустой, где не идёт ничего и идти нечему.
+    Рядом при этом стояло «Ничего не считается», и строка спорила с соседкой.
+
+    Четыре исхода, а не три: пауза, некому вести, идёт, свободна. «Свободна» — не то же самое,
+    что «стоит»: работник жив и возьмёт первую же поставленную задачу, а «стоит» означает, что
+    не возьмёт.
+    """
+    got = _node_eval("""
+      const w = (o) => app.queueStateWord(o);
+      console.log(JSON.stringify([
+        w({paused: true,  workerState: "alive",   running: true,  pending: 3}),
+        w({paused: false, workerState: "stopped", running: false, pending: 3}),
+        w({paused: false, workerState: "alive",   running: true,  pending: 0}),
+        w({paused: false, workerState: "alive",   running: false, pending: 3}),
+        w({paused: false, workerState: "alive",   running: false, pending: 0}),
+      ]));
+    """)
+    assert got == ["на паузе", "стоит", "идёт", "идёт", "свободна"], got
+
+    script = _page_text("app.js")
+    body = _js_function(script, "function renderQueue()")
+    assert "queueStateWord(" in body, (
+        "показание в чроме обязано считаться этой функцией, а не вторым набором условий:\n"
+        + body)
+
+
+def test_the_queue_summary_is_not_printed_twice_in_the_same_panel():
+    """Правка по ревью C2. «4 задачи, ≈8 ч 04 мин, до 08:48» стояло разом в двух местах одной
+    панели: строкой `#queue-sub` под крупным состоянием и мелким `eyebrow` в её же шапке, в
+    двадцати сантиметрах выше. Две одинаковые строки в одном экране читаются как две разные —
+    глаз ищет между ними отличие, которого нет.
+    """
+    page = _page_text("index.html")
+    assert 'id="pending-sum"' not in page, (
+        "сводка очереди осталась одна — под крупным состоянием, где на неё и смотрят")
+    script = _page_text("app.js")
+    assert 'pending-sum' not in script, "скрипт не имеет права писать в снятый элемент"
+    body = _js_function(script, "function renderQueue()")
+    assert body.count("summary.text") == 1, (
+        "одна сводка — одно место, где она печатается:\n" + body)
+
+
+def test_the_worker_lamp_keeps_no_orphan_word_when_its_label_goes_away():
+    """Правка по ревью C2. На узком окне из показания работника пряталась подпись «работник»,
+    а значение оставалось: в чроме висело одинокое «● запущен», не сказав, что запущено.
+    Прячется пара целиком — лампа своей формой и цветом говорит то же самое и одна.
+    """
+    css = _page_text("style.css")
+    rule = re.search(r"@media\s*\(max-width:\s*1180px\)\s*\{(.*?)\n\}", css, re.S)
+    assert rule, "правила узкого окна на 1180 в style.css больше нет"
+    hidden = re.search(r"([^{}]*)\{\s*display:\s*none", rule.group(1))
+    assert hidden and ".stat.worker .k" in hidden.group(1) and ".stat.worker .v" in hidden.group(1), (
+        "подпись и значение работника прячутся одним правилом или не прячутся вовсе:\n"
+        + rule.group(1))
+
+
+def test_the_worker_state_explains_itself_where_a_reader_can_actually_see_it():
+    """Правка по ревью C2. Объяснение состояния («задачи берутся из очереди») пересчитывалось
+    на каждый опрос в элемент, у которого в CSS стоит `display: none` — то есть никуда. Мёртвый
+    пересчёт хуже отсутствующего: он выглядит как работающая функция.
+
+    Текст остаётся, но переезжает в `title` самого показания, где его видно по наведению.
+    """
+    page = _page_text("index.html")
+    assert 'id="worker-pid"' not in page, "невидимый элемент снят вместе со своим пересчётом"
+    css = _page_text("style.css")
+    assert ".v.sub" not in css, "правило, прятавшее его, тоже больше ни к чему не относится"
+    body = _js_function(_page_text("app.js"), "function renderQueue()")
+    assert re.search(r'\$\("worker"\)\.title\s*=', body), (
+        "объяснение обязано попасть туда, где его можно прочитать:\n" + body)
+    assert "задачи берутся из очереди" in body, (
+        "сам текст объяснения никуда не делся, он только переехал:\n" + body)
+
+
+@_needs_node
 def test_the_model_settings_are_collapsed_behind_a_summary_that_shows_their_values():
     """Разметка половины требования 3: `<details>` свёрнут по умолчанию, сводка стоит прямо
     в `<summary>`, и пересчитывает её скрипт, а не разметка.
@@ -2728,18 +2920,27 @@ def test_the_model_settings_are_collapsed_behind_a_summary_that_shows_their_valu
         "сводка считается из формы на каждое изменение, а не написана в разметке руками")
 
 
-def test_the_queue_pause_button_stands_outside_the_heading_with_its_state_in_aria():
-    """C2, требование 1 (леджер: aria). Кнопка стояла внутри `<h2>` — временное место из A5.
+def test_the_queue_pause_button_stands_outside_the_heading_and_names_its_own_state():
+    """C2, требование 1 (леджер: aria) + правка по ревью C2.
 
-    Заголовок с кнопкой внутри перестаёт быть заголовком: скринридер читает подпись кнопки как
-    часть названия раздела, а сама кнопка теряет единственное, что о её состоянии говорит —
-    `aria-pressed`. Подпись («▶ Начать расчёт» / «⏸ Приостановить») видна только глазами.
+    Половина первая, из C2: кнопка стояла внутри `<h2>` — временное место из A5. Заголовок с
+    кнопкой внутри перестаёт быть заголовком: скринридер читает подпись кнопки как часть
+    названия раздела.
+
+    Половина вторая — снятие `aria-pressed`, и это не ослабление, а исправление лжи. APG знает
+    два законных устройства кнопки-переключателя, и они взаимоисключающие: либо имя кнопки
+    статично («Пауза») и состояние несёт `aria-pressed`, либо имя само называет состояние и
+    `aria-pressed` не ставится вовсе. У этой кнопки подпись ездит между «▶ Начать расчёт» и
+    «⏸ Приостановить» — то есть второй случай, — и `aria-pressed`, добавленный к меняющемуся
+    имени, читался вслух как «Начать расчёт, нажата»: ровно наоборот тому, что происходит.
+    Вместо снятой проверки встаёт проверка того, что состояние вообще названо словами и что
+    оба слова живут в одном месте, — иначе кнопка снова стала бы немым треугольником.
     """
     page = _page_text("index.html")
     button = re.search(r'<button[^>]*id="queue-pause-toggle"[^>]*>', page)
     assert button, "кнопки паузы очереди нет на странице"
-    assert "aria-pressed=" in button.group(0), (
-        "состояние очереди должно читаться и без картинки треугольника:\n" + button.group(0))
+    assert "aria-pressed" not in button.group(0), (
+        "`aria-pressed` у кнопки с меняющейся подписью спорит с ней вслух:\n" + button.group(0))
     # Комментарии выкидываются до разбора: в них написано, почему кнопка отсюда уехала, и
     # `<h2>` внутри такого объяснения — не заголовок, а слово.
     markup = re.sub(r"<!--.*?-->", "", page, flags=re.S)
@@ -2748,9 +2949,11 @@ def test_the_queue_pause_button_stands_outside_the_heading_with_its_state_in_ari
             "кнопка внутри заголовка — заголовок перестаёт быть заголовком:\n" + heading)
 
     body = _js_function(_page_text("app.js"), "function renderQueue()")
-    assert "aria-pressed" in body, (
-        "aria-pressed обязан двигаться вместе с подписью кнопки, иначе он врёт с первого "
-        "нажатия:\n" + body)
+    assert "aria-pressed" not in body, (
+        "снятый у разметки атрибут, который дорисовывает скрипт, — это тот же атрибут:\n" + body)
+    assert "Начать расчёт" in body and "Приостановить" in body, (
+        "состояние очереди обязано быть названо словами: без aria-pressed подпись — "
+        "единственное, что о нём говорит, и обе её половины ставит эта функция:\n" + body)
 
 
 @_needs_node
@@ -3222,6 +3425,47 @@ def test_a_finished_run_is_a_card_with_its_own_preview_frame():
 
 
 @_needs_node
+def test_a_failed_run_takes_its_frame_from_the_passes_it_actually_reached():
+    """Ревью C2, опасение 1. Кадр упавшей задачи строился из `estimate.forwards` — числа
+    проходов, которые она **должна была** пройти. Упавшая до них не дошла: адрес указывал на
+    кадр, которого нет, и каждый опрос (раз в двадцать секунд, пока карточка видна) отвечал
+    404 на каждую упавшую задачу в списке.
+
+    Сколько проходов задача действительно прошла, знает `runs.scan` — `run.completed`,
+    посчитанный по чекпойнтам на диске. Чекпойнты у упавшей есть: она падает после какого-то
+    прохода, а не до первого, и кадр с него — единственное, что от неё осталось посмотреть.
+    Поэтому не «прятать картинку у упавших», а брать у них правильную.
+
+    У успешной ничего не меняется: она прошла всё, что обещала, и `estimate.forwards` для неё
+    факт (и переживает исчезновение прогона из `runs`, которое сутки спустя обычное дело).
+    """
+    failed, orphan, ok = _node_eval("""
+      const base = {id: "j", note: "",
+                    args: ["generate", "--tag", "кот", "--preview-every", "5",
+                           "--outdir", "/o/ночь"],
+                    estimate: {width: 896, height: 576, duration_seconds: 10, steps: 8,
+                               forwards: 40, seconds: 3600, peak_gb: 35},
+                    output_stem: "/o/ночь/h3-кот-896x576",
+                    started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
+      const runs = [{outdir: "/o/ночь", completed: 12}];
+      console.log(JSON.stringify([
+        app.finishedRowHtml({...base, exit_code: 1}, "/o", runs),
+        app.finishedRowHtml({...base, exit_code: 1}, "/o", []),
+        app.finishedRowHtml({...base, exit_code: 0}, "/o", runs),
+      ]));
+    """)
+    assert "-preview-step10.jpg" in failed, (
+        "двенадцать пройденных проходов при записи раз в пять — последний кадр десятый:\n"
+        + failed)
+    assert "-preview-step40.jpg" not in failed, (
+        "сорок проходов упавшая не прошла, и кадра с сорокового на диске нет:\n" + failed)
+    assert "<img" not in orphan, (
+        "прогона нет в runs — сколько проходов было, неизвестно, и пустая рамка честнее 404")
+    assert "-preview-step40.jpg" in ok, (
+        "успешный прогон прошёл всё, что обещала оценка — у него кадр по-прежнему её:\n" + ok)
+
+
+@_needs_node
 def test_the_waiting_summary_counts_the_jobs_the_hours_and_the_hour_it_ends():
     """Requirement 7 -- the answer to the question the night queue is assembled to ask."""
     text, seconds, count = _node_eval("""
@@ -3362,6 +3606,12 @@ def test_finished_shows_the_exit_code_and_a_failure_shows_why():
     assert "код 1" in failed
     assert "metal::malloc" in failed, "a failed run with no visible reason is a mystery, not a row"
     assert 'href="/media/%D0%BD%D0%BE%D1%87%D1%8C/h3-%D0%BA%D0%BE%D1%82-896x576.mp4"' in ok, ok
+    # Правка по ревью C2: карточка упавшей задачи называла код возврата дважды подряд --
+    # «код 1» в строке чисел и «код возврата 1» строкой ниже, где у успешной стоит ссылка на
+    # ролик. Одно число -- одно место; строка ссылки у упавшей называет имя вывода.
+    assert failed.count("код") == 1, f"код возврата в карточке ровно один раз:\n{failed}"
+    assert "h3-кот-896x576" in failed, (
+        "освободившаяся строка называет имя вывода, а не пустует:\n" + failed)
 
 
 @_needs_node

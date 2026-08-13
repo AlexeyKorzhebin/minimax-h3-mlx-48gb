@@ -42,11 +42,13 @@
     <div class="spacer"></div>
 
     <div class="readout">
+      <!-- Объяснение состояния («задачи берутся из очереди») — в title самого показания,
+           который ставит app.js: на узком окне от показания остаётся одна лампа, и второй
+           строке рядом с ней места нет. -->
       <div class="stat worker" id="worker">
         <span class="lamp" aria-hidden="true"></span>
         <span class="k">работник</span>
         <span class="v" id="worker-state">неизвестно</span>
-        <span class="v sub" id="worker-pid">замок не проверен</span>
       </div>
       <div class="stat">
         <span class="k">очередь</span>
@@ -98,7 +100,7 @@
       <div class="editor-bar">
         <!-- «Новый через диалог» начинает разговор с того, что сейчас в поле; «Обсудить»
              относится к выбранному в списке файлу, поэтому стоит вплотную к нему. -->
-        <button class="primary" id="chat-new" type="button">Новый через диалог</button>
+        <button class="inverse" id="chat-new" type="button">Новый через диалог</button>
         <span class="sel">
           <select id="prompt-file" class="pick" aria-label="библиотека промптов"></select>
         </span>
@@ -284,7 +286,7 @@
         </div>
 
         <div class="est-actions">
-          <button class="primary lg" id="submit" type="button">Поставить в очередь</button>
+          <button class="inverse lg" id="submit" type="button">Поставить в очередь</button>
           <button class="ghost" id="cancel-edit" type="button" hidden>Отменить правку</button>
           <span class="est-said" id="est-said"></span>
         </div>
@@ -305,12 +307,16 @@
     <span class="num" aria-hidden="true">2</span>
     <h2>Очередь</h2>
     <div class="spacer"></div>
-    <span class="eyebrow" id="pending-sum"></span>
   </div>
 
   <!-- A5: пауза/старт очереди. Кнопка вынесена из <h2> (C2): заголовок с кнопкой внутри
-       перестаёт быть заголовком для скринридера, а состояние очереди теперь читается
-       не только треугольником, но и aria-pressed. -->
+       перестаёт быть заголовком для скринридера.
+
+       Без `aria-pressed` (правка по ревью C2). APG знает два законных устройства кнопки-
+       переключателя, и они несовместимы: либо имя не меняется и состояние несёт
+       `aria-pressed`, либо имя само называет состояние и `aria-pressed` не ставится вовсе.
+       Здесь второе — подпись ездит между «Начать расчёт» и «Приостановить», — и добавленный
+       к ней `aria-pressed` читался как «Начать расчёт, нажата», то есть ровно наоборот. -->
   <div class="qstate">
     <div class="qstate-row">
       <div class="qstate-txt">
@@ -318,8 +324,7 @@
         <div class="sub" id="queue-sub">страница ещё не опросила сервер</div>
       </div>
       <div class="spacer"></div>
-      <button class="primary lg" type="button" id="queue-pause-toggle"
-              aria-pressed="false">▶ Начать расчёт</button>
+      <button class="inverse lg" type="button" id="queue-pause-toggle">▶ Начать расчёт</button>
     </div>
   </div>
 
@@ -332,7 +337,7 @@
   <div class="mem-warn unload-banner" id="unload-banner" hidden>
     <span id="unload-banner-text"></span>
     <span class="unload-banner-acts">
-      <button class="primary" type="button" id="unload-banner-go">выгрузить и начать</button>
+      <button class="inverse" type="button" id="unload-banner-go">выгрузить и начать</button>
       <button class="ghost" type="button" id="unload-banner-wait">пусть ждёт</button>
     </span>
   </div>
