@@ -2333,15 +2333,87 @@ def test_no_page_file_names_an_address_off_this_machine(name):
     assert not found, f"{name} names an external address: {found}"
 
 
-def test_the_page_follows_the_system_theme_and_stops_moving_when_asked():
-    """Two media queries, both required by the brief and neither visible to any other test here.
+#: The section of style.css every color has to live inside (task C1, requirement 1 and 4).
+_TOKENS_START = "/* tokens */"
+_TOKENS_END = "/* /tokens */"
+#: A hex triple/quad/hextet/octet, or an `rgb(`/`rgba(` call -- the two shapes a color literal
+#: takes in this file. `#chat-input`-style ID selectors do not match: a hex run has to be at least
+#: three characters and end on a word boundary, and every ID in this file either starts with a
+#: non-hex letter (`t`, `s`, `l`, ...) or the hex-looking run bleeds into more word characters
+#: (`adaln` -> `ada` + `ln`, no boundary) -- see
+#: `test_the_color_literal_pattern_does_not_mistake_an_id_selector_for_a_color`.
+_COLOR_LITERAL = re.compile(r"#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)")
+#: How many lines back a `theme-invariant` comment may sit and still count as documenting the
+#: literal below it -- generous enough for a two-line `linear-gradient(...), linear-gradient(...)`
+#: declaration, tight enough that a marker can't drift away from what it excuses.
+_EXCEPTION_WINDOW = 3
 
-    Presentation only, so no mutation was run against this one -- it is a spelling check on the
-    stylesheet, not a claim about behaviour.
+
+def test_the_page_follows_the_system_theme_and_stops_moving_when_asked():
+    """Dark is the page's native theme (task C1): it sits on bare `:root`, unconditional, and the
+    light palette only ever applies from inside a query -- never as the page's own default.
+
+    The guard matters as much as the query: without `:not([data-theme="dark"])`, a system flip to
+    light would repaint over a person's own choice of dark the next time the OS setting changed,
+    because a media query re-evaluates continuously while an inline style does not.
+
+    Presentation only, so no mutation was run against the media-query assertions -- they are a
+    spelling check on the stylesheet, not a claim about behaviour. `test_next_theme_cycles_...`
+    and `test_theme_label_is_russian_for_all_three_states` below cover the logic with a mutation.
     """
     css = _page_text("style.css")
-    assert "@media (prefers-color-scheme: dark)" in css
+    assert "@media (prefers-color-scheme: light)" in css
+    assert ':root:not([data-theme="dark"])' in css
+    assert ':root[data-theme="light"]' in css, "an explicit light choice must survive a dark system"
+    assert ':root[data-theme="dark"]' in css, "an explicit dark choice must survive a light system"
     assert "@media (prefers-reduced-motion: reduce)" in css
+
+
+def test_the_color_literal_pattern_does_not_mistake_an_id_selector_for_a_color():
+    """`_COLOR_LITERAL` runs over the whole file outside the tokens block, including every `#id`
+    selector style.css writes (`#chat-input`, `#adaln`, `#tag`, ...). This pins the pattern itself
+    against a sample of the real ones, so a future edit to the regex is caught here first instead
+    of silently blinding `test_no_color_literal_lives_outside_the_tokens_block` to a real offender.
+    """
+    ids = ["#chat-input", "#chat-duration", "#adaln", "#tag", "#seed", "#lora-str", "#end-image",
+           "#ckpt", "#chat-attachment-label"]
+    for selector in ids:
+        assert not _COLOR_LITERAL.search(selector), f"{selector!r} was mistaken for a color"
+    # And the pattern still has to catch real literals, or the exclusion above proves nothing.
+    for literal in ["#fff", "#0a0b0c", "rgba(0,0,0,.3)", "rgb(1,2,3)"]:
+        assert _COLOR_LITERAL.search(literal), f"{literal!r} should have matched"
+
+
+def test_no_color_literal_lives_outside_the_tokens_block():
+    """Requirement 4: every hex/rgb(a) literal in style.css has to be a token value. Colors live in
+    exactly one place, so a re-theme is a block swap, not a grep-and-fix across a thousand lines.
+
+    A short, undocumented-by-default exception survives review deliberately: a handful of glyphs
+    (a checkmark on a status dot, the toggle-knob face, the neutral `color-mix` darkening operator)
+    are painted against another *token's* own saturated fill rather than against page ink or
+    background, so they read fine in both themes without inverting. Each survivor is marked
+    `theme-invariant` in an English comment within a few lines of the literal it excuses -- an
+    undocumented literal still fails this test, which is the point: the exception has to be a
+    conscious, reviewable decision each time, not a silent hole in the check.
+    """
+    css = _page_text("style.css")
+    assert css.count(_TOKENS_START) == 1 and css.count(_TOKENS_END) == 1, (
+        "style.css must carry the /* tokens */ ... /* /tokens */ markers exactly once each")
+    start = css.index(_TOKENS_START)
+    end = css.index(_TOKENS_END, start) + len(_TOKENS_END)
+    assert start < end, "the markers must appear in order, open before close"
+    body = css[:start] + css[end:]
+
+    lines = body.splitlines()
+    offenders = []
+    for i, line in enumerate(lines):
+        if not _COLOR_LITERAL.search(line):
+            continue
+        window = "\n".join(lines[max(0, i - _EXCEPTION_WINDOW):i + 1])
+        if "theme-invariant" in window:
+            continue
+        offenders.append((i + 1, line.strip()))
+    assert not offenders, f"undocumented color literal(s) outside /* tokens */: {offenders}"
 
 
 def test_the_page_asks_for_its_own_routes_in_a_way_the_provenance_check_accepts():
@@ -2393,6 +2465,42 @@ def test_the_page_module_imports_outside_a_browser():
     """
     names = _node_eval("console.log(JSON.stringify(Object.keys(app).sort()));")
     assert "analysePrompt" in names and "pendingSummary" in names
+
+
+@_needs_node
+def test_next_theme_cycles_system_dark_light_and_back():
+    """Requirement 2: exactly three states, system -> dark -> light -> system, forever. A fourth
+    click has to land back on `dark`, not drift or repeat a state out of order.
+    """
+    order = _node_eval(
+        'let v = "system"; const seen = [v];'
+        'for (let i = 0; i < 4; i++) { v = app.nextTheme(v); seen.push(v); }'
+        'console.log(JSON.stringify(seen));')
+    assert order == ["system", "dark", "light", "system", "dark"]
+
+
+@_needs_node
+def test_next_theme_recovers_from_an_unrecognised_stored_value():
+    """A `localStorage` value this version of the switcher never wrote (hand-edited, or left by a
+    future version) must not wedge the cycle -- it has to fall back into the loop, never throw and
+    never return `undefined`.
+    """
+    value = _node_eval('console.log(JSON.stringify(app.nextTheme("purple")));')
+    assert value in ("system", "dark", "light")
+
+
+@_needs_node
+def test_theme_label_is_russian_for_all_three_states():
+    """Requirement 2: the switcher's own caption, in the tone of the rest of the page's Russian."""
+    labels = _node_eval(
+        'console.log(JSON.stringify(["system", "dark", "light"].map(app.themeLabel)));')
+    assert labels == ["Системная", "Тёмная", "Светлая"]
+
+
+@_needs_node
+def test_theme_label_falls_back_to_system_for_an_unrecognised_value():
+    label = _node_eval('console.log(JSON.stringify(app.themeLabel("purple")));')
+    assert label == "Системная"
 
 
 @_needs_node

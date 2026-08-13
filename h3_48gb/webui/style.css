@@ -1,5 +1,6 @@
 /* ===========================================================================
-   h3 — панель прогонов. Оформление, светлая редакция.
+   h3 — панель прогонов. Оформление: тёмная тема по умолчанию, светлая —
+   по системному предпочтению или ручному выбору в шапке (task C1).
 
    Правила, из которых выведено всё остальное:
 
@@ -22,106 +23,240 @@
    5. Движение только служебное и короткое: пульс текущего шага, пульс
       идущей задачи, 120 мс на смену состояния наведения. Всё остальное
       статично — на эту страницу смотрят по десять раз за день.
+   6. Палитра — не своя: обе темы скопированы (значениями, не структурой) из
+      двух канонических макетов, `docs/superpowers/design-demos/
+      variant-reference.html` (тёмная, эталон Linear) и `variant-reference-
+      light.html` (светлая бумажная достройка той же школы). Токены этой
+      страницы называются иначе (у неё свой набор компонентов — форма,
+      очередь, диалог, а не панель/редактор канона), но их ЗНАЧЕНИЯ взяты
+      оттуда 1:1 там, где роль совпадает, и выведены по тому же правилу
+      (тот же вид, что у --warn/--warn-weak) там, где канон этой роли не
+      знает вовсе — у макета нет состояния «отказ». Единственный самосто-
+      ятельный кусок палитры — --fill/-2/-3: у канона поля стоят на своей
+      панели и заливаются соседним сплошным шагом лестницы (s2/s3/s4), а
+      здесь поля стоят прямо на --card, и в светлой теме s1 и s3 совпадают
+      (у обоих одно значение, белая бумага) — сплошной заливкой поле слилось
+      бы с карточкой. Взят
+      технический приём канона (--hatch/--hl-bg: полупрозрачный ink поверх
+      чего угодно), но громче — там текстура и подсветка (.02–.06), тут
+      читаемое поле (.05–.16).
    =========================================================================== */
 
-/* ---------- токены: светлая тема ---------------------------------------
-   Нейтральная база с лёгким холодком, единственный акцент — системный
-   синий. Сигнальные цвета взяты в пастельной заливке и тёмной обводке
-   текста: заливка видна издали, текст читается вблизи.
+/* tokens */
+/* ---------- токены: тёмная тема, дефолт ---------------------------------
+   Лестница поверхностей Linear-школы: canvas темнее панелей, панели
+   темнее вложенных полей, иерархия — светимостью и линией, не тенью.
+   Единственный акцент — янтарный сигнал вычисления, а не системный синий.
    ----------------------------------------------------------------------- */
 :root {
-  --bg:            #f1f2f5;   /* подложка страницы, чуть темнее карточек */
+  --bg:            #08090a;   /* canvas */
+  --card:          #0f1011;   /* s1 */
+  --card-2:        #141516;   /* s2 — вложенная плоскость внутри карточки */
+
+  --fill:          rgba(255,255,255,.06);   /* заливка полей и кнопок, см. правило 6 выше */
+  --fill-2:        rgba(255,255,255,.10);
+  --fill-3:        rgba(255,255,255,.16);
+  --hairline:      #23252a;   /* line */
+  --hairline-2:    #34343a;   /* line-2 */
+
+  --ink:           #f7f8f8;
+  --ink-2:         #d0d6e0;
+  --ink-3:         #8a8f98;
+
+  --accent:        #e0a33e;                 /* signal — «GPU считает», см. канон */
+  --accent-ink:    #e0a33e;                 /* тот же тон уже достаточно контрастен как текст */
+  --accent-soft:   rgba(224,163,62,.14);    /* signal-weak */
+  --accent-ring:   rgba(224,163,62,.35);    /* focus-ring */
+
+  --wait:          #62666d;                 /* ink-4 канона — та же роль, что у .dot.idle */
+  --done:          #4f9b6a;                 /* ok */
+  --done-ink:      var(--done);
+  --done-soft:     rgba(79,155,106,.14);    /* канон не даёт soft-варианта --ok; по правилу --warn-weak */
+  --fail:          #d9635a;                 /* у канона нет состояния «отказ» вовсе (см. правило 6);
+                                                тон подобран в той же приглушённой семье, что --warn/--ok */
+  --fail-ink:      var(--fail);
+  --fail-soft:     rgba(217,99,90,.12);
+  --warn:          #c9784a;
+  --warn-ink:      var(--warn);
+  --warn-soft:     rgba(201,120,74,.10);    /* warn-weak */
+
+  --sel:           rgba(224,163,62,.24);    /* sel-bg */
+
+  /* Канон не рисует размытую тень вовсе — глубина только линией и светимостью
+     (см. заголовок variant-reference.html). Волосяная обводка — тот же
+     приём, что у канона `.panel{border:1px solid var(--line)}`. */
+  --shadow:        0 0 0 1px var(--hairline);
+  --shadow-pop:    0 32px 72px -20px rgba(0,0,0,.85), 0 0 0 1px rgba(0,0,0,.4);   /* modal-shadow */
+
+  /* Кадр превью — медиа-окно, а не поверхность интерфейса: не участвует в
+     инверсии темы (variant-reference-light.html, комментарий у --frame-*). */
+  --frame-1:         #1c1d20;
+  --frame-2:         #141517;
+  --frame-3:         #0b0c0d;
+  --frame-warm:      rgba(224,163,62,.085);
+  --frame-cool:      rgba(127,168,189,.06);
+  --frame-ink:       #8a8f98;
+  --frame-chip-bg:   rgba(8,9,10,.62);
+  --frame-chip-line: rgba(255,255,255,.07);
+  --frame-edge:      transparent;
+
+  --stage-1:       rgba(0,0,0,.55);         /* вуаль под модалкой */
+
+  --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1.5L5 5.5L9 1.5' stroke='%23d0d6e0' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E");
+
+  color-scheme: dark;
+}
+
+/* ---------- токены: светлая тема ----------------------------------------
+   По системному предпочтению, если человек не выбрал тёмную явно — guard
+   `:not([data-theme="dark"])` не даёт смене системной темы перекрасить
+   страницу поверх ручного выбора. Не инверсия тёмной: тёплая бумажная
+   лестница, а не чёрно-белый негатив — та же логика, что у
+   variant-reference-light.html. --frame-* здесь НЕ светлеют до бумаги —
+   у медиа-окна собственная, более тёмная графитовая пара значений.
+   ----------------------------------------------------------------------- */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg:            #f1efec;
+    --card:          #ffffff;
+    --card-2:        #f7f5f2;
+
+    --fill:          rgba(20,22,26,.05);
+    --fill-2:        rgba(20,22,26,.08);
+    --fill-3:        rgba(20,22,26,.13);
+    --hairline:      #e6e3de;
+    --hairline-2:    #d6d2cc;
+
+    --ink:           #14161a;
+    --ink-2:         #33383f;
+    --ink-3:         #4e545e;
+
+    --accent:        #d18a12;
+    --accent-ink:    #8a5a07;
+    --accent-soft:   rgba(209,138,18,.13);
+    --accent-ring:   rgba(209,138,18,.45);
+
+    --wait:          #676c75;
+    --done:          #2f7d4f;
+    --done-ink:      var(--done);
+    --done-soft:     rgba(47,125,79,.10);
+    --fail:          #a82d21;
+    --fail-ink:      var(--fail);
+    --fail-soft:     rgba(168,45,33,.09);
+    --warn:          #a24a1c;
+    --warn-ink:      var(--warn);
+    --warn-soft:     rgba(162,74,28,.08);
+
+    --sel:           rgba(209,138,18,.22);
+
+    --shadow:        0 0 0 1px var(--hairline);
+    --shadow-pop:    0 28px 64px -20px rgba(20,22,26,.20), 0 2px 8px rgba(20,22,26,.06);
+
+    --frame-1:         #3c3f45;
+    --frame-2:         #2d3036;
+    --frame-3:         #212328;
+    --frame-warm:      rgba(224,163,62,.10);
+    --frame-cool:      rgba(127,168,189,.07);
+    --frame-ink:       #b9bcc2;
+    --frame-chip-bg:   rgba(10,11,12,.55);
+    --frame-chip-line: rgba(255,255,255,.13);
+    --frame-edge:      rgba(20,22,26,.10);
+
+    --stage-1:       rgba(20,22,26,.10);
+
+    --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1.5L5 5.5L9 1.5' stroke='%2333383f' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E");
+
+    color-scheme: light;
+  }
+}
+
+/* ---------- ручной выбор побеждает системный, в обе стороны ------------- */
+:root[data-theme="light"] {
+  --bg:            #f1efec;
   --card:          #ffffff;
-  --card-2:        #f7f8fa;   /* вложенная плоскость внутри карточки      */
-
-  --fill:          rgba(118,122,133,.08);   /* заливка полей и кнопок     */
-  --fill-2:        rgba(118,122,133,.14);
-  --fill-3:        rgba(118,122,133,.20);
-  --hairline:      rgba(60,60,67,.10);
-  --hairline-2:    rgba(60,60,67,.16);
-
-  --ink:           #15171c;
-  --ink-2:         #5b606c;
-  --ink-3:         #8b909c;
-
-  --accent:        #007aff;                 /* системный синий            */
-  --accent-ink:    #0062d6;                 /* он же, но пригодный в текст */
-  --accent-soft:   #e8f1ff;
-  --accent-ring:   rgba(0,122,255,.28);
-
-  --run:           var(--accent);
-  --run-soft:      var(--accent-soft);
-  --wait:          #a2a7b2;
-  --done:          #2fa84f;
-  --done-ink:      #1e7f3b;
-  --done-soft:     #e7f6ec;
-  --fail:          #ff3b30;
-  --fail-ink:      #c62a20;
-  --fail-soft:     #ffedec;
-  --warn:          #ff9f0a;
-  --warn-ink:      #9a5b00;
-  --warn-soft:     #fff4e2;
-
-  --sel:           rgba(0,122,255,.20);
-
-  /* Тень едва заметна: карточка должна отделяться от подложки, а не
-     висеть над ней. Полупиксельная обводка держит край на ретине. */
-  --shadow: 0 0 0 .5px rgba(16,20,32,.05), 0 1px 2px rgba(16,20,32,.05),
-            0 10px 24px -18px rgba(16,20,32,.22);
-  --shadow-pop: 0 1px 2px rgba(16,20,32,.16), 0 0 0 .5px rgba(16,20,32,.06);
-
-  --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1.5L5 5.5L9 1.5' stroke='%235b606c' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E");
-
+  --card-2:        #f7f5f2;
+  --fill:          rgba(20,22,26,.05);
+  --fill-2:        rgba(20,22,26,.08);
+  --fill-3:        rgba(20,22,26,.13);
+  --hairline:      #e6e3de;
+  --hairline-2:    #d6d2cc;
+  --ink:           #14161a;
+  --ink-2:         #33383f;
+  --ink-3:         #4e545e;
+  --accent:        #d18a12;
+  --accent-ink:    #8a5a07;
+  --accent-soft:   rgba(209,138,18,.13);
+  --accent-ring:   rgba(209,138,18,.45);
+  --wait:          #676c75;
+  --done:          #2f7d4f;
+  --done-ink:      var(--done);
+  --done-soft:     rgba(47,125,79,.10);
+  --fail:          #a82d21;
+  --fail-ink:      var(--fail);
+  --fail-soft:     rgba(168,45,33,.09);
+  --warn:          #a24a1c;
+  --warn-ink:      var(--warn);
+  --warn-soft:     rgba(162,74,28,.08);
+  --sel:           rgba(209,138,18,.22);
+  --shadow:        0 0 0 1px var(--hairline);
+  --shadow-pop:    0 28px 64px -20px rgba(20,22,26,.20), 0 2px 8px rgba(20,22,26,.06);
+  --frame-1:         #3c3f45;
+  --frame-2:         #2d3036;
+  --frame-3:         #212328;
+  --frame-warm:      rgba(224,163,62,.10);
+  --frame-cool:      rgba(127,168,189,.07);
+  --frame-ink:       #b9bcc2;
+  --frame-chip-bg:   rgba(10,11,12,.55);
+  --frame-chip-line: rgba(255,255,255,.13);
+  --frame-edge:      rgba(20,22,26,.10);
+  --stage-1:       rgba(20,22,26,.10);
+  --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1.5L5 5.5L9 1.5' stroke='%2333383f' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E");
   color-scheme: light;
 }
 
-/* ---------- токены: тёмная тема ----------------------------------------
-   Не инверсия светлой: подложка темнее карточек так же, как в светлой,
-   но контраст мягче, тени заменены обводкой, а сигнальные цвета взяты
-   светлее и приглушённее — на тёмном они иначе жгут глаз.
-   ----------------------------------------------------------------------- */
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg:          #101114;
-    --card:        #1c1e22;
-    --card-2:      #24262b;
-
-    --fill:        rgba(142,148,163,.14);
-    --fill-2:      rgba(142,148,163,.22);
-    --fill-3:      rgba(142,148,163,.30);
-    --hairline:    rgba(255,255,255,.09);
-    --hairline-2:  rgba(255,255,255,.15);
-
-    --ink:         #f0f1f4;
-    --ink-2:       #a3a8b4;
-    --ink-3:       #7b8090;
-
-    --accent:      #0a84ff;
-    --accent-ink:  #6cb4ff;
-    --accent-soft: rgba(10,132,255,.18);
-    --accent-ring: rgba(10,132,255,.40);
-
-    --wait:        #767c8a;
-    --done:        #30d158;
-    --done-ink:    #6ede8c;
-    --done-soft:   rgba(48,209,88,.15);
-    --fail:        #ff453a;
-    --fail-ink:    #ff8f85;
-    --fail-soft:   rgba(255,69,58,.16);
-    --warn:        #ff9f0a;
-    --warn-ink:    #f2b662;
-    --warn-soft:   rgba(255,159,10,.15);
-
-    --sel:         rgba(10,132,255,.35);
-
-    --shadow: 0 0 0 .5px rgba(255,255,255,.07), 0 1px 2px rgba(0,0,0,.35);
-    --shadow-pop: 0 1px 2px rgba(0,0,0,.5), 0 0 0 .5px rgba(255,255,255,.10);
-
-    --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1.5L5 5.5L9 1.5' stroke='%23a3a8b4' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E");
-
-    color-scheme: dark;
-  }
+:root[data-theme="dark"] {
+  --bg:            #08090a;
+  --card:          #0f1011;
+  --card-2:        #141516;
+  --fill:          rgba(255,255,255,.06);
+  --fill-2:        rgba(255,255,255,.10);
+  --fill-3:        rgba(255,255,255,.16);
+  --hairline:      #23252a;
+  --hairline-2:    #34343a;
+  --ink:           #f7f8f8;
+  --ink-2:         #d0d6e0;
+  --ink-3:         #8a8f98;
+  --accent:        #e0a33e;
+  --accent-ink:    #e0a33e;
+  --accent-soft:   rgba(224,163,62,.14);
+  --accent-ring:   rgba(224,163,62,.35);
+  --wait:          #62666d;
+  --done:          #4f9b6a;
+  --done-ink:      var(--done);
+  --done-soft:     rgba(79,155,106,.14);
+  --fail:          #d9635a;
+  --fail-ink:      var(--fail);
+  --fail-soft:     rgba(217,99,90,.12);
+  --warn:          #c9784a;
+  --warn-ink:      var(--warn);
+  --warn-soft:     rgba(201,120,74,.10);
+  --sel:           rgba(224,163,62,.24);
+  --shadow:        0 0 0 1px var(--hairline);
+  --shadow-pop:    0 32px 72px -20px rgba(0,0,0,.85), 0 0 0 1px rgba(0,0,0,.4);
+  --frame-1:         #1c1d20;
+  --frame-2:         #141517;
+  --frame-3:         #0b0c0d;
+  --frame-warm:      rgba(224,163,62,.085);
+  --frame-cool:      rgba(127,168,189,.06);
+  --frame-ink:       #8a8f98;
+  --frame-chip-bg:   rgba(8,9,10,.62);
+  --frame-chip-line: rgba(255,255,255,.07);
+  --frame-edge:      transparent;
+  --stage-1:       rgba(0,0,0,.55);
+  --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1.5L5 5.5L9 1.5' stroke='%23d0d6e0' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E");
+  color-scheme: dark;
 }
+
 /* ---------- основа ---------- */
 :root {
   --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
@@ -137,7 +272,16 @@
      Последняя колонка шире содержимого трёх кнопок: у грид-элемента
      min-width auto, и узкая дорожка заставила бы кнопки залезть на память. */
   --cols: 16px minmax(180px, 1fr) 52px 92px 50px 34px 92px 100px 208px;
+
+  /* Текст на заливке акцента (кнопка `.primary`): --accent — светлый янтарь
+     в обеих темах, тёмный текст читается на нём лучше белого. Тот же
+     near-black, что использует канон для текста на своей светлой инверс-
+     кнопке (`.btn.inverse{color:#0a0b0c}`) — не зависит от темы намеренно,
+     потому что сам --accent не темнеет в тёмной теме настолько, чтобы это
+     потребовалось. */
+  --accent-fg: #0a0b0c;
 }
+/* /tokens */
 
 * { box-sizing: border-box; }
 /* [hidden] обязан побеждать любой display ниже по файлу: иначе галочка
@@ -203,6 +347,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 24px var(--pad) 0; }
 .rail[data-worker="stopped"] .lamp { background: var(--fail); box-shadow: 0 0 0 3.5px var(--fail-soft); }
 .rail[data-worker="stopped"] .lamp::before {
   content: ""; position: absolute; left: 1.5px; right: 1.5px; top: 4.2px;
+  /* theme-invariant: bar drawn on top of the --fail dot itself, not on page ink/bg */
   height: 1.6px; background: #fff; border-radius: 1px;
 }
 .rail[data-worker="stopped"] .worker-state { color: var(--fail-ink); }
@@ -419,6 +564,7 @@ select {
 .parse li.bad::before { background: var(--fail); }
 .parse li.bad::after {
   left: 3.5px; top: 12.5px; width: 6px; height: 6px;
+  /* theme-invariant: cross drawn on top of the --fail dot itself, not on page ink/bg */
   background:
     linear-gradient(45deg, transparent 42%, #fff 42% 58%, transparent 58%),
     linear-gradient(-45deg, transparent 42%, #fff 42% 58%, transparent 58%);
@@ -577,6 +723,7 @@ select {
 .force input[type=checkbox]::after {
   content: ""; position: absolute; top: 2px; left: 2px;
   width: 18px; height: 18px; border-radius: 50%;
+  /* theme-invariant: physical toggle-knob face and its own cast shadow, same in any theme */
   background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3);
   transition: transform .16s ease;
 }
@@ -598,9 +745,11 @@ button {
 button:hover { background: var(--fill-3); }
 button:focus-visible { outline: none; box-shadow: 0 0 0 3.5px var(--accent-ring); }
 button.primary {
-  background: var(--accent); color: #fff;
+  background: var(--accent); color: var(--accent-fg);
   font-weight: 600; padding: 8px 18px; border-radius: 8px;
 }
+/* theme-invariant: color-mix's #000 is a neutral darken operator, not a painted color -- it
+   darkens whatever --accent already resolved to for the active theme */
 button.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000); }
 button.primary:disabled {
   background: var(--fill-2); color: var(--ink-3); cursor: not-allowed;
@@ -656,7 +805,11 @@ button.ghost:hover { background: var(--fill-2); color: var(--ink); }
 .running.stale .mono { color: inherit; }
 .running img {
   width: 200px; display: block; border-radius: 8px;
-  box-shadow: 0 0 0 1px var(--hairline), 0 1px 3px rgba(16,20,32,.12);
+  background: var(--frame-3);
+  /* Requirement 3: the preview frame is a media window, not a page surface -- its edge uses
+     --frame-edge (own dark-only pair), and the drop shadow below it is theme-invariant: a
+     photograph casts the same shadow regardless of what theme is reading the page around it. */
+  box-shadow: 0 0 0 1px var(--frame-edge), 0 1px 3px rgba(0,0,0,.35);
 }
 .run-cap { font-size: 11.5px; color: var(--ink-2); margin-top: 7px; }
 .run-body { min-width: 0; }
@@ -753,11 +906,13 @@ button.ghost:hover { background: var(--fill-2); color: var(--ink); }
 .m.done { background: var(--done); }
 .m.done::before {
   content: ""; position: absolute; left: 4.6px; top: 3px;
+  /* theme-invariant: checkmark drawn on top of the --done dot itself, not on page ink/bg */
   width: 4px; height: 7.5px; border: solid #fff; border-width: 0 1.7px 1.7px 0;
   transform: rotate(45deg); border-radius: 1px;
 }
 /* упало — крестик */
 .m.fail { background: var(--fail); }
+/* theme-invariant: cross drawn on top of the --fail dot itself, not on page ink/bg */
 .m.fail::before, .m.fail::after {
   content: ""; position: absolute; left: 3px; top: 6.2px;
   width: 8px; height: 1.7px; background: #fff; border-radius: 1px;
@@ -834,11 +989,18 @@ body[data-stale] main { opacity: .55; }
 .r .clip:hover { text-decoration: underline; }
 
 /* Превью может не существовать: кадр пишется раз в несколько проходов, а
-   первый появляется не сразу. Пустая рамка вместо картинки честнее битой. */
+   первый появляется не сразу. Пустая рамка вместо картинки честнее битой.
+   Requirement 3: it is the same media window as `.running img` once a frame lands, so it wears
+   the same never-inverting --frame-* gradient, not the page's own --fill. */
 .running .noshot {
   display: grid; place-items: center; width: 200px; height: 116px;
-  background: var(--fill-2); border-radius: 8px;
-  font-size: 11.5px; color: var(--ink-3); text-align: center; padding: 8px;
+  background:
+    radial-gradient(120% 120% at 22% 8%, var(--frame-warm), transparent 58%),
+    radial-gradient(90% 90% at 85% 100%, var(--frame-cool), transparent 60%),
+    linear-gradient(162deg, var(--frame-1) 0%, var(--frame-2) 46%, var(--frame-3) 100%);
+  box-shadow: inset 0 0 0 1px var(--frame-edge);
+  border-radius: 8px;
+  font-size: 11.5px; color: var(--frame-ink); text-align: center; padding: 8px;
 }
 
 /* ===========================================================================
@@ -855,7 +1017,7 @@ body[data-stale] main { opacity: .55; }
    =========================================================================== */
 .modal-back {
   position: fixed; inset: 0; z-index: 50;
-  background: rgba(0, 0, 0, .55);
+  background: var(--stage-1);
   overflow: auto;
   display: flex; padding: var(--pad);
 }

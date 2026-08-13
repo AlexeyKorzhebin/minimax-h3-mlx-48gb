@@ -1503,6 +1503,51 @@ export function argsWithPrompt(args, text) {
 }
 
 /* ===========================================================================
+   ТЕМА (task C1)
+   Три состояния, в этом порядке по кругу: системная (нет атрибута — решает
+   браузер через `prefers-color-scheme`), тёмная, светлая. "system" хранится
+   как отсутствие `data-theme`, а не как строка "system" на `<html>` -- это
+   то же самое состояние, в котором страница жила до появления переключателя,
+   так что уже сохранённый (или вовсе отсутствующий) выбор не ломается.
+   =========================================================================== */
+const THEME_ORDER = ["system", "dark", "light"];
+export const THEME_STORAGE_KEY = "h3-theme";
+
+/** Следующее состояние по кругу. Значение, которого нет в списке (будущая
+ *  версия переключателя, или подправленный вручную localStorage), не
+ *  заклинивает цикл -- оно просто считается началом цикла, "system". */
+export function nextTheme(current) {
+  const i = THEME_ORDER.indexOf(current);
+  return THEME_ORDER[(i + 1) % THEME_ORDER.length];
+}
+
+/** Русская подпись состояния для кнопки в шапке. Тот же откат к "системная",
+ *  что и в `nextTheme` -- незнакомое значение не должно молчать пустой строкой. */
+export function themeLabel(value) {
+  if (value === "dark") return "Тёмная";
+  if (value === "light") return "Светлая";
+  return "Системная";
+}
+
+/** Ставит `data-theme` на `<html>` и запоминает выбор. DOM-эффект, поэтому не
+ *  чистая функция -- но, как и остальная страница ниже, безопасна для импорта
+ *  вне браузера: она не вызывается сама по себе, только по клику или на
+ *  старте `startPage()`. */
+export function applyTheme(value) {
+  const html = document.documentElement;
+  if (value === "dark" || value === "light") {
+    html.setAttribute("data-theme", value);
+  } else {
+    html.removeAttribute("data-theme");
+  }
+  try {
+    localStorage.setItem(THEME_STORAGE_KEY, value);
+  } catch {
+    /* приватный режим или заполненная квота -- тема всё равно применилась к этому показу */
+  }
+}
+
+/* ===========================================================================
    СТРАНИЦА
    Ниже — единственная половина файла, которая знает про DOM и про сеть.
    Вне браузера модуль импортируется ради функций выше и не делает ничего.
@@ -1514,6 +1559,28 @@ if (typeof document !== "undefined") {
 
 function startPage() {
   const $ = (id) => document.getElementById(id);
+
+  // -- тема -----------------------------------------------------------------------------
+  // Значение уже применено синхронно инлайновым скриптом в <head> (до отрисовки CSS, чтобы
+  // не мигнуть системной темой при сохранённом ручном выборе) -- здесь только подпись кнопки
+  // и подписка на клик. `applyTheme` безопасно вызвать второй раз: он идемпотентен.
+  (function initTheme() {
+    let saved = "system";
+    try { saved = localStorage.getItem(THEME_STORAGE_KEY) || "system"; } catch { /* см. applyTheme */ }
+    applyTheme(saved);
+    const button = $("theme-toggle");
+    const label = $("theme-toggle-label");
+    // "system" на <html> нет атрибутом (см. applyTheme) -- getAttribute тогда вернёт null,
+    // а nextTheme(null) не найдёт его в THEME_ORDER и не сдвинется с места.
+    const current = () => document.documentElement.getAttribute("data-theme") || "system";
+    const render = () => { label.textContent = themeLabel(current()); };
+    render();
+    button.addEventListener("click", () => {
+      applyTheme(nextTheme(current()));
+      render();
+    });
+  })();
+
   // `mode` подписан отдельно: у него сверх пересчёта есть своя работа — показать
   // или спрятать поля кадров.
   const FIELDS = ["width", "height", "duration", "steps", "seed", "tag",

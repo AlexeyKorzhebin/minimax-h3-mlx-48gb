@@ -7,6 +7,19 @@
 <!-- Two local files and nothing else. No font, no library, no image from the network: this page
      has to open in five years on a machine with no toolchain and no route to the internet. -->
 <link rel="stylesheet" href="/static/style.css">
+<script>
+  /* Тема ставится синхронно, до отрисовки CSS -- иначе страница на долю секунды мигает
+     системной палитрой, даже если человек раньше выбрал другую. Не импорт app.js: <head>
+     обязан остаться синхронным блокирующим скриптом, а модуль в нём асинхронен по умолчанию.
+     Дублирует только чтение ключа -- полная логика (nextTheme, applyTheme) остаётся в app.js,
+     единственном месте, которое её экспортирует и которое тестирует tests/test_web.py. */
+  (function () {
+    try {
+      var v = localStorage.getItem("h3-theme");
+      if (v === "dark" || v === "light") document.documentElement.setAttribute("data-theme", v);
+    } catch (e) { /* приватный режим -- страница остаётся на системной теме */ }
+  })();
+</script>
 </head>
 <body>
 
@@ -33,6 +46,9 @@
     <div class="rail-run idle" id="rail-run">Ничего не считается</div>
 
     <div class="rail-clock">
+      <!-- Три состояния по кругу (system -> dark -> light -> ...), см. nextTheme в app.js. -->
+      <button class="ghost theme-toggle" id="theme-toggle" type="button"
+              title="Переключить тему">Тема: <span id="theme-toggle-label">Системная</span></button>
       <span class="clock" id="clock">--:--</span>
       <span class="poll" id="poll">опрос не проходил</span>
     </div>
