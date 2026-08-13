@@ -27,6 +27,12 @@ h3 = "h3_48gb.cli:main"
 [tool.setuptools]
 packages = ["h3_48gb"]
 
+# The page is served off disk from inside the package (`h3_48gb/webui/`), so an installed wheel
+# needs the files, not just the modules. There is no build step on purpose: a localhost tool must
+# still start in six months, and what rots is the toolchain, not the HTML.
+[tool.setuptools.package-data]
+h3_48gb = ["webui/*.html", "webui/*.css", "webui/*.js"]
+
 [tool.pytest.ini_options]
 # `upstream/` is a vendored clone whose own tests import torch, which this fork does not install —
 # a bare `pytest` collected them and died with 5 collection errors before running a single test of

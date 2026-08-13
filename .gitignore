@@ -24,3 +24,4 @@ upstream/
 # files, and not meant for a public clone.
 .superpowers/
 docs/superpowers/
+.gstack/

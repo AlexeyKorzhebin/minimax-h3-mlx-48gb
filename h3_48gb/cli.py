@@ -107,6 +107,7 @@ ERROR_CODES = {
     "lora_not_found": "--turbo-lora points at a file that does not exist",
     "turbo_strength_invalid": "--turbo-strength is not a finite number",
     "adaln_cache_unreadable": "--adaln-cache exists but is not a readable AdaLN table",
+    "checkpoint_without_adaln": "the checkpoint has no readable transformer/adaln_cache.safetensors and no --adaln-cache was given; this build cannot build the table itself",
     "upstream_patch_missing": "a keyframe was given but the vendored upstream/ checkout is unpatched",
     "outdir_not_found": "--outdir does not exist or cannot be read",
     "prompt_file_not_found": "--prompt-file points at a file that does not exist",
@@ -115,6 +116,42 @@ ERROR_CODES = {
     "prompt_both_given": "both a positional prompt and --prompt-file were given; pass exactly one",
     "prompt_missing": "no prompt: pass one positionally or with --prompt-file",
     "mode_mismatch": "--mode contradicts the --image/--end-image flags given",
+    "worker_already_running": "another worker already holds queue/worker.lock on this machine",
+    # Raised by `h3_48gb.web`, listed here because the contract is one contract: the CLI, the
+    # worker and the server all answer with the same `{"ok": false, "error": {"code", ...}}`
+    # envelope, and a caller matching on `error.code` should not have to know which process
+    # produced it. See `test_error_codes_are_documented_in_one_place`, which scans both modules.
+    "args_invalid": "`h3 generate` will not accept this argument list; `detail.stderr` carries argparse's own sentence",
+    "command_not_allowed": "only `h3 generate` may be queued, and never with --no-checkpoint",
+    "output_stem_conflict": "another pending or running job, or a file already on disk, claims that output name",
+    "job_not_pending": "the job is no longer in pending/: the worker claimed it, or it was already removed",
+    "path_outside_root": "a path names something outside every root the server may touch, or writes into the read-only models root",
+    "prompt_name_invalid": "a prompt name is not a bare `[A-Za-z0-9_-]+.txt` -- it names a directory or another suffix",
+    "queue_unwritable": "the queue directory could not be read or written; see `detail.path`",
+    "media_type_not_allowed": "/media serves only finished clips and preview frames, and that is not one",
+    # The chat prompt editor. The first three are the server's own refusals; the last three are
+    # raised inside `h3_48gb.provider` and reach the wire unchanged, because a failure of the model
+    # is not a failure of this server and a page that has to tell them apart matches on the code.
+    "chat_not_found": "there is no chat session with that id under `<outdir>/chat/`",
+    "chat_busy": "a turn of this session is already in flight; one at a time, so neither erases the other",
+    "chat_corrupt": "the session file under `<outdir>/chat/` is not a session -- hand-edited, or truncated; `detail.path` names it",
+    "bad_image": "the keyframe is not one of the image types a chat turn may attach, or is over the size limit",
+    "provider_unavailable": "the chat provider is missing or unusable; `detail.provider` names it and the message says why",
+    "gpu_busy": "a generation is running, so the local chat model is not raised: it would want the same 31 GB",
+    "llama_did_not_start": "llama-server was spawned but never answered /health; the log tail is in the message",
+    "chat_unreachable": "the chat provider did not answer at all -- not started, crashed, or the wrong address",
+    "bad_model_json": "the chat model would not hold the answer schema, twice in a row",
+    "bad_provider_reply": "the chat provider answered 200 with something that is not a completion -- OpenRouter's own `{\"error\": ...}` body, or a proxy's page; the body's first 400 characters are in the message",
+    # Router-level refusals: produced by `web._router_code` (and by the standard library's own
+    # error path behind it) rather than by a `raise CliError(...)`, which is why the contract test
+    # reads `web.ROUTER_CODES` instead of only scanning source for raise sites. They belong in this
+    # dict all the same: the contract the design spec fixes is the one on the wire, and a page
+    # turning a `code` into a Russian sentence meets these two more often than any other.
+    "host_not_allowed": "the request's Host header is not this server's own address (DNS rebinding)",
+    "origin_not_allowed": "a write did not come from this server's own page: its Origin or Sec-Fetch-Site names another site (cross-site request forgery)",
+    "not_found": "no route, or no file, at that URL",
+    "method_not_implemented": "this server has no handler for that HTTP method",
+    "bad_request": "the request itself could not be served -- malformed, or too large to accept",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 
@@ -216,10 +253,34 @@ class RunSpec:
                     f"--{name} must be a multiple of 32, got {value}",
                     {name: value},
                 )
-        # A checkpoint whose cache cannot be read falls back to the shipped grid, so a missing or
-        # corrupt cache still refuses early rather than 28 GB into a run.
-        required = (_grid_points_of(self.adaln_cache) if self.adaln_cache
-                    else baked_grid_points(self.checkpoint)) or BAKED_GRID_POINTS
+        # Which grid this run is allowed to ask for. `--adaln-cache` wins when it is given (its own
+        # readability is checked below, with a refusal that names the flag); otherwise the
+        # checkpoint's own baked table answers.
+        #
+        # **A checkpoint with no readable table is a refusal, not a fallback to 31.** That fallback
+        # cost a run: a broken symlink at `transformer/adaln_cache.safetensors` pointed at a file
+        # that was never baked, `baked_grid_points` returned `None` exactly as it does for "no cache
+        # here", `BAKED_GRID_POINTS` accepted the default `--steps 31`, and the failure arrived
+        # after 21 GB of weights had been loaded -- `ModulationCache.build` reads `time_embedder`
+        # and every block's `adaln_proj`, and this build ships neither, so there is no path where
+        # such a run can finish. The number 31 is only ever *right* for a checkpoint that has the
+        # table; when there is none, quoting it invents a grid nobody baked and turns a five-second
+        # refusal into a five-minute one.
+        #
+        # `--adaln-cache` is the way out, and the message says so: a table baked for another grid
+        # (`scripts/bake_adaln.py`) makes the checkpoint's own missing one irrelevant.
+        if self.adaln_cache:
+            required = _grid_points_of(self.adaln_cache) or BAKED_GRID_POINTS
+        else:
+            required = baked_grid_points(self.checkpoint)
+            if required is None:
+                raise CliError(
+                    "checkpoint_without_adaln",
+                    f"у чекпойнта нет читаемой таблицы AdaLN — передай --adaln-cache или почини "
+                    f"{Path(self.checkpoint) / 'transformer/adaln_cache.safetensors'}",
+                    {"checkpoint": str(self.checkpoint),
+                     "cache": str(Path(self.checkpoint) / "transformer/adaln_cache.safetensors")},
+                )
         if self.steps != required:
             raise CliError(
                 "schedule_not_baked",
@@ -355,6 +416,14 @@ def build_parser() -> argparse.ArgumentParser:
                           "(the way out of a checkpoint_mismatch refusal)")
     gen.add_argument("--no-checkpoint", action="store_true",
                      help="do not write a resume checkpoint at all; a crash then costs the whole run")
+    # Runs `spec_from_args` -- so every refusal a real run would raise (bad geometry, an
+    # unbaked schedule, a missing keyframe, ...) still fires here, with the same code -- but
+    # returns before `run_generate` touches a checkpoint or loads any weights. This is what lets
+    # a caller validate a request through `RunSpec.__post_init__`'s one set of rules without
+    # importing MLX itself: only `generate` (not `resume`) needs it, since a caller validating a
+    # request before it exists has no resume target to speak of.
+    gen.add_argument("--dry-run", action="store_true",
+                     help="report what would run, without loading weights or writing anything")
 
     res = _subcommand(sub, "resume", help="continue an interrupted run")
     # No `--restart` / `--no-checkpoint` here on purpose: `resume` exists precisely to *assert*
@@ -373,6 +442,20 @@ def build_parser() -> argparse.ArgumentParser:
     wt.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     wt.add_argument("--interval", type=float, default=20.0,
                     help="seconds between redraws (default 20); 0 renders once and exits")
+
+    wk = _subcommand(sub, "worker", help="run queued jobs, one at a time, until stopped")
+    wk.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
+    wk.add_argument("--poll", type=float, default=5.0,
+                    help="seconds between checks of an empty queue (default 5)")
+    wk.add_argument("--json", action="store_true", help="emit a machine-readable report")
+
+    # No `--host`: the server binds the loopback and only the loopback (`web.LOOPBACK`), and a flag
+    # that could hold `0.0.0.0` is a flag someone eventually sets on a machine with no auth in
+    # front of it.
+    wb = _subcommand(sub, "web", help="serve the queue page on 127.0.0.1 until stopped")
+    wb.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
+    wb.add_argument("--port", type=int, default=8765,
+                    help="port on 127.0.0.1 (default 8765); 0 asks the kernel for a free one")
 
     doc = _subcommand(sub, "doctor", help="verify a converted checkpoint")
     doc.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
@@ -590,6 +673,35 @@ def load_keyframes(spec: RunSpec) -> tuple[list, tuple[str, ...]]:
                 {"patch": "patches/0001-keyframe-masked-scatter.patch"},
             )
     return images, tuple(anchors)
+
+
+def run_dry(spec: RunSpec) -> dict:
+    """Report what `run_generate(spec)` would do, without loading weights or writing anything.
+
+    `spec` has already been through `RunSpec.__post_init__` by the time it reaches here (built by
+    `spec_from_args`, same as a real run), so every refusal a real run would raise has already had
+    its chance to fire with the same code -- a dry run is not a separate, laxer set of rules.
+
+    The report is a subset of `run_generate`'s: `video`, `audio`, and `generate_seconds` are
+    absent rather than empty, because nothing has run yet to fill them in, and a placeholder value
+    would be indistinguishable from a real one to a caller that only checks the key exists.
+    """
+    return {
+        "tag": spec.tag,
+        "canvas": f"{spec.width}x{spec.height}",
+        "duration_seconds": spec.duration,
+        "grid_points": spec.steps,
+        "forwards": spec.steps - 1,
+        "seed": spec.seed,
+        "prompt_file": spec.prompt_file,
+        "checkpoint": str(spec.checkpoint),
+        "adaln_cache": str(spec.adaln_cache) if spec.adaln_cache else None,
+        "turbo_lora": str(spec.turbo_lora) if spec.turbo_lora else None,
+        "turbo_strength": spec.turbo_strength if spec.turbo_lora else None,
+        "mode": actual_mode(spec.image, spec.end_image),
+        "dry_run": True,
+        "output_stem": str(spec.output_stem()),
+    }
 
 
 def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wav_fn=None,
@@ -974,6 +1086,90 @@ def run_watch(outdir: Path, interval: float) -> dict:
         print(f"\033[{text.count(chr(10)) + 1}A\033[J", end="")
 
 
+def queue_root(outdir) -> Path:
+    """Where the queue lives for a given output directory: `<outdir>/queue`.
+
+    One function rather than a `/ "queue"` at each call site, because the worker, the web server
+    and every test have to agree on it exactly -- a second spelling would be a second, silently
+    empty queue rather than an error.
+    """
+    return Path(outdir) / "queue"
+
+
+def run_worker(outdir: Path, poll: float = 5.0) -> dict:
+    """Run the queue worker until it is asked to stop, and report how many jobs it got through.
+
+    Imported lazily, like every other heavy dependency here, though for the opposite reason: the
+    worker is deliberately cheap (it never imports MLX), but `h3 --help` still has no business
+    loading a module it will not use.
+
+    `--outdir` is validated before the queue directory is touched. `main_loop` creates the queue
+    layout under it, so an outdir that does not exist would otherwise be silently built out of a
+    typo, and the worker would then sit for ever on an empty queue while jobs pile up in the real
+    one.
+
+    `outdir=outdir` is passed explicitly rather than left to `main_loop`'s default: it is what
+    `provider.load_providers` reads `providers.json` from (the same directory `h3 web` treats as
+    its own `--outdir`), and `main_loop`'s `root` here is `queue_root(outdir)`, one level below
+    that. Relying on the default (`Path(root).parent`) would happen to work today only because the
+    two calls agree by construction -- passing it here says so instead of leaving it implicit.
+    """
+    from h3_48gb.worker import WorkerAlreadyRunning, main_loop
+
+    outdir = Path(outdir)
+    if not outdir.is_dir():
+        raise CliError("outdir_not_found", f"--outdir does not exist: {outdir}",
+                       {"outdir": str(outdir)})
+    root = queue_root(outdir)
+    try:
+        ran = main_loop(root, poll=poll, outdir=outdir)
+    except WorkerAlreadyRunning as exc:
+        raise CliError(
+            "worker_already_running",
+            f"another worker already holds {root / 'worker.lock'}; two workers on this machine "
+            "means two 36 GB processes and swap",
+            {"queue": str(root)},
+        ) from exc
+    return {"ok": True, "queue": str(root), "jobs_run": ran}
+
+
+def run_web(outdir: Path, port: int = 8765) -> dict:
+    """Serve the queue page on `127.0.0.1:<port>` until the process is stopped.
+
+    Imported lazily for the same reason `run_worker` imports its module lazily: `h3 --help` has no
+    business loading `http.server`. `h3_48gb.web` never imports MLX, so this stays a cheap process
+    even though it sits resident all day next to a generation that is not.
+
+    `--outdir` is validated before anything is bound, exactly as `run_worker` validates it and for
+    the same reason: `queue.scan` deliberately does not create the directory it reads, so a typo'd
+    outdir would otherwise produce a page that serves an empty queue for ever while the real one
+    fills up somewhere else. Nothing here creates the queue layout either -- the worker owns that.
+
+    `Ctrl-C` is the documented way to stop it, so `KeyboardInterrupt` is a normal exit rather than
+    a traceback: the socket is closed and the report is returned.
+    """
+    from h3_48gb.web import LOOPBACK, make_server
+
+    outdir = Path(outdir)
+    if not outdir.is_dir():
+        raise CliError("outdir_not_found", f"--outdir does not exist: {outdir}",
+                       {"outdir": str(outdir)})
+    root = queue_root(outdir)
+    httpd = make_server(root, outdir, port=port, verbose=True)
+    # Not `port`: with `--port 0` the kernel picks, and the number a human has to type is the one
+    # the socket actually got.
+    bound = httpd.server_address[1]
+    url = f"http://{LOOPBACK}:{bound}/"
+    print(f"страница на {url} — очередь в {root}; остановить: Ctrl-C", flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return {"ok": True, "url": url, "queue": str(root)}
+
+
 def run_doctor(checkpoint: Path) -> dict:
     """Check a converted checkpoint before a multi-hour run rather than during it."""
     checkpoint = Path(checkpoint)
@@ -1000,12 +1196,19 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "generate":
-            # Under --json, stdout has exactly one contract: one JSON document. verbose=False
-            # keeps the pipeline and the checkpoint writer from printing progress onto it.
-            report = run_generate(spec_from_args(args), resume=not args.restart,
-                                  verbose=not as_json)
-            ok = True
-            human = f"done in {report['generate_seconds'] / 60:.1f} min -> {report['video']}"
+            spec = spec_from_args(args)
+            if getattr(args, "dry_run", False):
+                # No weights loaded, nothing written: `spec_from_args` above already ran every
+                # refusal a real run would, so reaching here means this request would proceed.
+                report = run_dry(spec)
+                ok = True
+                human = f"would generate -> {report['output_stem']}"
+            else:
+                # Under --json, stdout has exactly one contract: one JSON document. verbose=False
+                # keeps the pipeline and the checkpoint writer from printing progress onto it.
+                report = run_generate(spec, resume=not args.restart, verbose=not as_json)
+                ok = True
+                human = f"done in {report['generate_seconds'] / 60:.1f} min -> {report['video']}"
         elif args.command == "resume":
             report = run_resume(spec_from_args(args), verbose=not as_json)
             ok = True
@@ -1024,6 +1227,14 @@ def main(argv: list[str] | None = None) -> int:
             report = run_watch(args.outdir, args.interval)
             ok = True
             human = ""
+        elif args.command == "worker":
+            report = run_worker(args.outdir, args.poll)
+            ok = True
+            human = f"работник остановлен, задач выполнено: {report['jobs_run']}"
+        elif args.command == "web":
+            report = run_web(args.outdir, args.port)
+            ok = True
+            human = "сервер остановлен"
         elif args.command == "doctor":
             report = run_doctor(args.checkpoint)
             ok = report["ok"]

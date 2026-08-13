@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>h3 — панель прогонов</title>
+<!-- Two local files and nothing else. No font, no library, no image from the network: this page
+     has to open in five years on a machine with no toolchain and no route to the internet. -->
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- ===================================================================
+     ПРИБОРНАЯ СТРОКА. Липнет к верху: пока человек возится с формой,
+     состояние работника и текущий прогресс всё равно перед глазами.
+     Это единственное место на странице, рассчитанное на чтение с метра.
+     =================================================================== -->
+<header class="rail" id="rail" data-worker="unknown">
+  <div class="rail-main">
+    <div class="rail-id">
+      <span class="mark">h3</span>
+      <span class="mark-sub">Панель прогонов</span>
+    </div>
+
+    <div class="worker" id="worker">
+      <span class="lamp" aria-hidden="true"></span>
+      <span class="worker-txt">
+        <span class="worker-state" id="worker-state">Состояние работника неизвестно</span>
+        <span class="worker-pid" id="worker-pid">страница ещё не опросила сервер</span>
+      </span>
+    </div>
+
+    <div class="rail-run idle" id="rail-run">Ничего не считается</div>
+
+    <div class="rail-clock">
+      <span class="clock" id="clock">--:--</span>
+      <span class="poll" id="poll">опрос не проходил</span>
+    </div>
+  </div>
+
+  <!-- Шаги как отдельные деления: доля читается счётом, а не чтением процентов -->
+  <div class="steps" id="rail-steps" aria-label="прогресс по шагам"></div>
+
+  <!-- Сервер не отвечает. Строка, а не молчание: замершие цифры выглядят
+       точно так же, как живые, и это худшее, что страница может сделать. -->
+  <p class="conn" id="conn" role="status" hidden></p>
+</header>
+
+<main>
+
+<!-- ===================================================================
+     1. ФОРМА ПОСТАНОВКИ. Слева промпт с разбором, справа параметры.
+     Форма не очищается после постановки — сценарий «пять задач на ночь».
+     =================================================================== -->
+<section class="card" id="form">
+  <div class="card-h">
+    <h2>Постановка прогона</h2>
+    <span class="block-note" id="form-mode-note">Новая задача</span>
+  </div>
+
+  <div class="form-grid">
+
+    <!-- ---- промпт ---- -->
+    <div class="col-prompt">
+      <div class="field-head">
+        <label for="prompt">Промпт</label>
+        <span class="field-side">
+          <select id="prompt-file" class="pick" aria-label="файл промпта"></select>
+          <!-- «Обсудить» относится к выбранному в списке файлу, поэтому стоит вплотную
+               к нему; «Новый через диалог» начинает разговор с того, что сейчас в поле. -->
+          <button class="ghost" id="chat-prompt-open" type="button">Обсудить</button>
+          <button class="ghost" id="save-prompt" type="button">Сохранить в файл</button>
+          <button class="ghost" id="chat-new" type="button">Новый через диалог</button>
+        </span>
+      </div>
+
+      <!-- Слой подсветки лежит ровно под прозрачным полем: типографика и
+           отступы совпадают побайтово, прокрутка синхронизируется. -->
+      <div class="editor" id="editor">
+        <pre class="hl" id="hl" aria-hidden="true"></pre>
+        <textarea id="prompt" spellcheck="false" wrap="soft"></textarea>
+      </div>
+
+      <div class="scale" id="scale" aria-label="планы и склейки"></div>
+
+      <ul class="parse" id="parse"></ul>
+
+      <p class="src" id="prompt-src"></p>
+    </div>
+
+    <!-- ---- параметры ---- -->
+    <div class="col-params">
+      <div class="params">
+
+        <!-- Группа 1: что именно считаем -->
+        <div class="pgroup">
+          <div class="row"><label for="width">Канвас</label>
+            <div class="ctl canvas">
+              <input class="num" id="width" type="number" step="32" value="896">
+              <span class="x">×</span>
+              <input class="num" id="height" type="number" step="32" value="576">
+              <span class="hint" id="canvas-hint">Кратно 32</span>
+              <button class="ghost preset" type="button" data-preset="draft">черновик 448×288</button>
+              <button class="ghost preset" type="button" data-preset="small">малое 896×576</button>
+              <button class="ghost preset" type="button" data-preset="large">большое 1344×768</button>
+            </div>
+          </div>
+          <div class="row"><label for="duration">Длительность</label>
+            <div class="ctl"><input class="num" id="duration" type="number" step="0.5" value="10"><span class="unit">с</span></div>
+          </div>
+          <div class="row"><label for="steps">Шаги</label>
+            <div class="ctl"><input class="num" id="steps" type="number" value="8"><span class="hint">8 — таблица AdaLN подставлена по умолчанию, иначе 31</span></div>
+          </div>
+          <div class="row"><label for="seed">Сид</label>
+            <div class="ctl"><input class="num" id="seed" type="text" value="0"><span class="hint">После постановки сдвигается на следующий</span></div>
+          </div>
+          <div class="row"><label for="mode">Режим</label>
+            <div class="ctl"><select id="mode">
+              <option value="t2v">t2v — текст → видео</option>
+              <option value="t2va" selected>t2va — текст → видео со звуком</option>
+              <option value="i2v">i2v — кадр → видео</option>
+              <option value="flf">flf — первый и последний кадр</option>
+            </select></div>
+          </div>
+          <!-- Кадры нужны только двум режимам и только тогда и показываются:
+               --mode i2v без --image — это отказ mode_mismatch, а не задача. -->
+          <div class="row" id="row-image" hidden><label for="image">Первый кадр</label>
+            <div class="ctl"><input class="mono path" id="image" type="text" placeholder="~/video-out/кадры/start.png"></div>
+          </div>
+          <div class="row" id="row-end-image" hidden><label for="end-image">Последний кадр</label>
+            <div class="ctl"><input class="mono path" id="end-image" type="text" placeholder="~/video-out/кадры/end.png"></div>
+          </div>
+          <div class="row"><label for="tag">Тег</label>
+            <div class="ctl"><input class="mono" id="tag" type="text" value="run"><span class="hint">Имя вывода строится из него; повтор — отказ</span></div>
+          </div>
+        </div>
+
+        <!-- Группа 2: чем считаем. Отделена воздухом, а не линией -->
+        <div class="pgroup">
+          <div class="row"><label for="ckpt">Чекпойнт</label>
+            <div class="ctl"><input class="mono path" id="ckpt" type="text" value="~/models/h3-8bit-full"></div>
+          </div>
+          <div class="row"><label for="lora">LoRA</label>
+            <div class="ctl"><input class="mono path" id="lora" type="text" value="~/models/turbo/minimax_h3_turbo_v4_step600_ema.safetensors" placeholder="пусто — без LoRA"></div>
+          </div>
+          <div class="row"><label for="lora-str">Сила LoRA</label>
+            <div class="ctl"><input class="num narrow" id="lora-str" type="number" step="0.05" value="1.00"><span class="hint">1.00 — измеренный оптимум на этом канвасе</span></div>
+          </div>
+          <div class="row"><label for="adaln">Таблица AdaLN</label>
+            <div class="ctl"><input class="mono path" id="adaln" type="text" value="~/models/turbo/adaln_8_l100.safetensors" placeholder="~/models/turbo/adaln_8_l100.safetensors"><span class="hint">пусто — сетку задаёт таблица самого чекпойнта, а у чекпойнта без неё dry-run откажет (раньше молча брал 31 и падал после загрузки весов)</span></div>
+          </div>
+          <div class="row"><label for="outdir">Каталог</label>
+            <div class="ctl"><input class="mono path" id="outdir" type="text"></div>
+          </div>
+        </div>
+
+        <!-- Группа 3: для человека -->
+        <div class="pgroup">
+          <div class="row top"><label for="note">Заметка</label>
+            <div class="ctl"><textarea id="note" rows="2"></textarea></div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- ---- оценка: главный ответ формы ---- -->
+      <div class="estimate" id="estimate">
+        <div class="est-head">
+          <span class="est-time" id="est-time">≈—</span>
+          <span class="est-sub" id="est-sub"></span>
+        </div>
+
+        <div class="mem">
+          <div class="mem-top">
+            <span>Пик памяти</span>
+            <span class="num" id="mem-num">—</span>
+            <span class="dim">из 48</span>
+          </div>
+          <div class="gauge" id="gauge">
+            <div class="fill" id="mem-fill"></div>
+            <div class="tick t40"><span>40</span></div>
+            <div class="tick t46"><span>46</span></div>
+          </div>
+          <p class="mem-warn" id="mem-warn" hidden></p>
+          <label class="force" id="force-wrap" hidden>
+            <input type="checkbox" id="force"> Всё равно поставить
+          </label>
+        </div>
+
+        <div class="est-actions">
+          <button class="primary" id="submit" type="button">Поставить в очередь</button>
+          <button class="ghost" id="cancel-edit" type="button" hidden>Отменить правку</button>
+          <span class="est-said" id="est-said"></span>
+        </div>
+        <p class="err" id="err" hidden></p>
+        <p class="est-foot" id="est-foot">Оценка по подогнанной модели из <span class="mono">docs/RESULTS.md</span>; точность около десяти процентов</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================================================================
+     2. ОЧЕРЕДЬ И ПРОГОНЫ. Три списка одной колоночной сеткой, чтобы
+     числа сравнивались глазами по вертикали между списками.
+     =================================================================== -->
+<h2 class="section-h">Очередь и прогоны</h2>
+
+<section class="queue" id="queue">
+
+  <!-- идёт -->
+  <div class="card sub">
+    <div class="card-h"><h3>Идёт сейчас</h3></div>
+    <div class="running" id="running"></div>
+  </div>
+
+  <!-- ждёт -->
+  <div class="card sub">
+    <div class="card-h">
+      <h3>Ждут</h3>
+      <span class="sum" id="pending-sum"></span>
+    </div>
+    <!-- Работник не берёт задачу, пока жив порт llama (см. app.js, unloadBanner):
+         непустая очередь при поднятой модели реально стоит, и это второй, помимо
+         модалки чата, способ снять модель с GPU и дать очереди пойти. -->
+    <div class="mem-warn unload-banner" id="unload-banner" hidden>
+      <span id="unload-banner-text"></span>
+      <span class="unload-banner-acts">
+        <button class="primary" type="button" id="unload-banner-go">выгрузить и начать</button>
+        <button class="ghost" type="button" id="unload-banner-wait">пусть ждёт</button>
+      </span>
+    </div>
+    <div class="table" id="pending"></div>
+    <p class="empty" id="pending-empty" hidden>Очередь пуста</p>
+    <!-- Файлы, которые лежат в queue/, но не разобрались: их нет в списке
+         выше, и молчать о них нельзя — человек считает задачи по списку. -->
+    <p class="badfiles" id="pending-bad" hidden></p>
+  </div>
+
+  <!-- закончилось -->
+  <div class="card sub">
+    <div class="card-h">
+      <h3>Закончилось за сутки</h3>
+      <span class="sum" id="done-sum"></span>
+    </div>
+    <div class="table" id="finished"></div>
+    <p class="empty" id="finished-empty" hidden>За сутки ничего не закончилось</p>
+  </div>
+
+</section>
+
+</main>
+
+<!-- ===================================================================
+     3. ДИАЛОГОВЫЙ РЕДАКТОР ПРОМПТА. Модалка, а не отдельная страница:
+     разговор с моделью — продолжение работы над той же задачей, и
+     возвращаться из него некуда.
+
+     Внутри две половины. Слева окно промпта — редактируемое руками, с тем
+     же живым разбором, подсветкой и полоской планов, что и в форме (те же
+     функции рисуют в элементы chat-*). Справа лента диалога с полем ввода.
+     Раскладка адаптивная: от 1100 px обе половины видны разом, ниже —
+     колонкой, промпт сверху.
+     =================================================================== -->
+<div class="modal-back" id="chat-modal" hidden>
+  <div class="modal chat" role="dialog" aria-modal="true"
+       aria-label="Диалоговый редактор промпта">
+
+    <div class="chat-prompt">
+      <div class="field-head">
+        <label for="chat-prompt-text">Промпт</label>
+        <span class="hint" id="chat-source">новый промпт</span>
+      </div>
+      <div class="editor"><pre class="hl" id="chat-hl" aria-hidden="true"></pre>
+        <textarea id="chat-prompt-text" spellcheck="false" wrap="soft"></textarea></div>
+      <div class="scale" id="chat-scale" aria-label="планы и склейки"></div>
+      <ul class="parse" id="chat-parse"></ul>
+    </div>
+
+    <div class="chat-talk">
+      <div class="chat-head">
+        <select id="chat-provider" class="pick" aria-label="провайдер модели"></select>
+        <span id="chat-llm" class="hint">модель не поднята</span>
+        <!-- Надпись зависит от источника: «в Редактор», «сохранить промпт»
+             или «обновить задачу» — её ставит app.js при открытии. -->
+        <button class="ghost" id="chat-finish" type="button">в Редактор</button>
+        <button class="ghost" id="chat-close" type="button">закрыть</button>
+      </div>
+      <ol class="chat-log" id="chat-log"></ol>
+      <form id="chat-form"><textarea id="chat-input" rows="2"
+        placeholder="Опиши идею или попроси переделать…"></textarea>
+        <button class="primary" id="chat-send" type="submit">отправить</button></form>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
