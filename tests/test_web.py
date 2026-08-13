@@ -3887,14 +3887,73 @@ def test_tag_from_session_slug_overwrites_its_own_earlier_auto_slug_when_a_newer
     assert got == "dog-parisian-dusk", got
 
 
+
+# -- A4, fix round 2: та же память переживает переоткрытие сессии, не только один ход -----------
+
+
+@_needs_node
+def test_remember_and_recall_auto_tag_round_trip_through_a_plain_map():
+    """The two halves of `autoTagBySession`'s own contract, pinned as pure functions on a map the
+    test owns -- no module-level state, no DOM. A session that was never remembered recalls `""`,
+    the same "nothing yet" `tagFromSessionSlug` already treats as no last auto-tag at all.
+    """
+    out = _node_eval("""
+      const map = {};
+      app.rememberAutoTag(map, "s1", "cat-italian-noon");
+      console.log(JSON.stringify([
+        app.recallAutoTag(map, "s1"),
+        app.recallAutoTag(map, "never-remembered"),
+      ]));
+    """)
+    assert out == ["cat-italian-noon", ""], out
+
+
+@_needs_node
+def test_a_reopened_sessions_auto_tag_survives_where_the_chat_object_itself_does_not():
+    """Review round 2's finding: `finishChat` closes the modal unconditionally on every path
+    (`closeChat()` nulls `chat`), so `chat.lastAutoTag` (fix round 1) cannot outlive that close --
+    the next `enterChat` for the *same* session id builds a brand-new `chat` with no memory of its
+    own. Without something outside `chat`, a second «в Редактор» on the same session, after the
+    scene got renamed by a later turn, could never tell "the tag still says my own first answer"
+    from "a person retyped exactly that by hand" -- and would leave the tag stuck on the first
+    name forever.
+
+    Simulated end to end through the pure functions, standing in for two separate
+    `enterChat`/`finishChat` round trips of the same session id ("s1") sharing one `map` the way
+    `autoTagBySession` shares state across them on the real page.
+    """
+    out = _node_eval("""
+      const map = {};
+
+      // Round 1: сессия "s1" называет сцену впервые, «в Редактор» подставляет её в #tag.
+      let tag = "run";
+      const restoredBeforeFirst = app.recallAutoTag(map, "s1");   // ещё нечего вспоминать
+      const applied1 = app.tagFromSessionSlug(tag, "cat-italian-noon", restoredBeforeFirst);
+      if (applied1 !== tag) app.rememberAutoTag(map, "s1", applied1);
+      tag = applied1;
+
+      // Модалка закрылась -- `chat` того раунда мёртв. Сессию открыли заново: `lastAutoTag`
+      // восстанавливается из `map`, а не с пустой строки, как строил бы новый `chat` без неё.
+      const restoredOnReopen = app.recallAutoTag(map, "s1");
+
+      // Новый ход той же переоткрытой сессии переименовал сцену; поле #tag в DOM всё ещё то же,
+      // что раунд 1 туда положил -- человек его не трогал.
+      const applied2 = app.tagFromSessionSlug(tag, "dog-parisian-dusk", restoredOnReopen);
+
+      console.log(JSON.stringify([applied1, restoredOnReopen, applied2]));
+    """)
+    assert out == ["cat-italian-noon", "cat-italian-noon", "dog-parisian-dusk"], out
+
+
 def test_finishing_a_chat_to_the_editor_writes_the_sessions_slug_into_the_tag_field():
     """The DOM half cannot run under `node` (see `_node_eval`'s own docstring and the identical
     reasoning in `test_the_library_prompt_dialog_button_hands_the_forms_duration_to_the_new_session`
     just above it in this file) -- this pins the handler's own source instead: the «в Редактор»
     branch of `finishChat` has to route `chat.slug` through `tagFromSessionSlug` into `#tag`, and
-    has to keep `chat.lastAutoTag` in step with whatever it just wrote -- the "state" fix round 1
-    added so a later turn's newer slug can still move a still-untouched auto-tag forward (see
-    `test_tag_from_session_slug_overwrites_its_own_earlier_auto_slug_when_a_newer_one_arrives`).
+    `enterChat`/`finishChat` both have to go through the module-level `autoTagBySession` map (fix
+    round 2) -- `chat.lastAutoTag` alone (fix round 1) does not survive `closeChat()`, so a session
+    reopened later would forget its own earlier auto-tag and never be able to move it forward (see
+    `test_a_reopened_sessions_auto_tag_survives_where_the_chat_object_itself_does_not`).
     """
     app_js = (WEBUI / "app.js").read_text(encoding="utf-8")
     start = app_js.index("async function finishChat()")
@@ -3904,12 +3963,19 @@ def test_finishing_a_chat_to_the_editor_writes_the_sessions_slug_into_the_tag_fi
     assert "tagFromSessionSlug(" in body and '$("tag").value' in body, body
     assert "lastAutoTag" in body, (
         "the last auto-substituted tag must be tracked in state, not just written once:\n" + body)
+    assert "rememberAutoTag(autoTagBySession" in body, (
+        "finishChat must persist an actual substitution into the module-level map, not only "
+        "onto the doomed `chat` object:\n" + body)
 
     enter_start = app_js.index("async function enterChat(id)")
     enter_end = app_js.index("function closeChat()", enter_start)
     enter_body = app_js[enter_start:enter_end]
     assert "lastAutoTag" in enter_body, (
         "a freshly opened session must start with no auto-tag memory of its own:\n" + enter_body)
+    assert "recallAutoTag(autoTagBySession" in enter_body, (
+        "enterChat must recover lastAutoTag from the module-level map -- reading only `session` "
+        "(which never carried this field) or defaulting to \"\" is exactly the bug fix round 2 "
+        "closes:\n" + enter_body)
 
 
 def test_submit_falls_back_to_the_heuristic_slug_when_the_tag_is_still_the_default():
