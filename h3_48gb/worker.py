@@ -304,6 +304,16 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir
     `reconcile` and before `claim`, purely observing the port until the human's confirmation makes
     it go quiet.
 
+    A third gate of the same shape sits right next to the LLM one, after it and still before
+    `claim`: `q.is_paused(root)`. A human pauses the queue from the page (`POST /api/queue/pause`)
+    for reasons this loop cannot see -- about to close the laptop, wants the machine quiet for
+    something else -- and the answer is the same "take nothing new, sleep, look again" as the other
+    two gates, for the same reason: the job already in `running/` (there can be at most one, this
+    worker's own) is never interrupted by a pause, exactly as it is never interrupted by `stop`.
+    Ordered after `reconcile` and the LLM check, not before them, so a paused queue still recovers
+    wreckage from a killed worker and still respects a live lease or a resident model -- pausing
+    the *selection* of new work must not also pause the bookkeeping that keeps `running/` honest.
+
     `stop` is anything with `is_set()`/`wait()`; `_stop_signals` sets the one created here when the
     first `SIGTERM`/`SIGINT` arrives. It stops the *selection* of new jobs only -- a job already
     running is never interrupted by it, which is why the check sits at the top of the loop and
@@ -341,6 +351,10 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir
                     break
                 continue
             if _llm_holds_gpu(outdir):
+                if stop.wait(poll):
+                    break
+                continue
+            if q.is_paused(root):
                 if stop.wait(poll):
                     break
                 continue

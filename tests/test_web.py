@@ -488,6 +488,39 @@ def test_an_unexpected_exception_becomes_json_with_its_type(server, monkeypatch)
     assert "boom" not in json.dumps(body), "the message can carry a prompt or a path; only the type"
 
 
+# -- Task A5: pause/start the queue ---------------------------------------------------------------
+
+
+def test_api_state_reports_paused_true_for_a_freshly_created_queue(server):
+    """The `server` fixture's queue is created by `q.layout` and never touched afterward -- see
+    `queue.layout`'s docstring for why that must leave a brand-new queue paused.
+    """
+    _, body = _json(server, "/api/state")
+    assert body["paused"] is True
+
+
+def test_post_queue_pause_and_start_toggle_the_marker_and_report_it(server):
+    status, body = _json(server, "/api/queue/pause", method="POST")
+    assert status == 200 and body == {"ok": True, "paused": True}, body
+    assert q.is_paused(server.queue_root) is True, "the route must actually touch the marker file"
+
+    status, body = _json(server, "/api/queue/start", method="POST")
+    assert status == 200 and body == {"ok": True, "paused": False}, body
+    assert q.is_paused(server.queue_root) is False
+
+    _, state = _json(server, "/api/state")
+    assert state["paused"] is False, "/api/state must see the same marker the routes just cleared"
+
+
+def test_post_queue_pause_is_idempotent(server):
+    """A slow response and an impatient click can send the request twice; the second call must not
+    raise, and both must agree on the answer.
+    """
+    first = _json(server, "/api/queue/pause", method="POST")
+    second = _json(server, "/api/queue/pause", method="POST")
+    assert first == second == (200, {"ok": True, "paused": True})
+
+
 # -- Step 5/6: static, media, and traversal ------------------------------------------------------
 
 
@@ -4122,6 +4155,23 @@ def test_the_unload_banner_shows_only_when_jobs_wait_on_a_loaded_model():
     assert waiting_and_up["text"] == "Модель в памяти держит GPU — выгрузить и начать генерацию?"
     assert empty_and_up["show"] is False
     assert waiting_and_down["show"] is False
+
+
+@_needs_node
+def test_the_unload_banner_stays_hidden_while_the_queue_is_paused():
+    """Task A5. The worker will not take *any* job while `paused`, same as while llama's port is
+    alive -- "выгрузить и начать генерацию" on a paused queue is advice with nothing for it to
+    start, and it would tell a human their own pause decision is a stuck GPU.
+    """
+    paused_and_up, unpaused_and_up = _node_eval("""
+      console.log(JSON.stringify([
+        app.unloadBanner({pending: 2, llm: "up", paused: true}),
+        app.unloadBanner({pending: 2, llm: "up", paused: false}),
+      ]));
+    """)
+    assert paused_and_up["show"] is False, "the banner must not show while the queue is paused"
+    assert unpaused_and_up["show"] is True, (
+        "the same otherwise-triggering state must still show once unpaused")
 
 
 @_needs_node

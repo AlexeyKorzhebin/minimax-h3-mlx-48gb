@@ -900,16 +900,24 @@ export function errorText(payload) {
    =========================================================================== */
 
 /**
- * Чистая функция: `{pending, llm}` — сколько задач ждёт и в каком состоянии
- * локальная модель (`/api/llm`'s `status`) — в решение, показывать ли плашку.
+ * Чистая функция: `{pending, llm, paused}` — сколько задач ждёт, в каком состоянии локальная
+ * модель (`/api/llm`'s `status`) и стоит ли сама очередь (`/api/state`'s `paused`) — в решение,
+ * показывать ли плашку.
  *
  * `llm !== "up"` включает и `"down"`, и `"busy"`, и внешнего провайдера, у
  * которого `/api/llm` тоже отвечает `down` (см. `_llm_state` в `web.py`):
  * ни то ни другое не держит память этой машины, снимать нечего.
+ *
+ * `paused` гасит плашку раньше, чем до неё доходит очередь: A5 (пауза/старт очереди) — работник
+ * не берёт задачи, пока `is_paused`, так что «выгрузить и начать генерацию» на паузе — совет,
+ * которому нечего начинать, и он лишь путает человека, у которого очередь стоит по его же
+ * собственному решению, не по занятому GPU.
  */
 export function unloadBanner(state) {
   const pending = Number(state && state.pending) || 0;
   const llm = state && state.llm;
+  const paused = Boolean(state && state.paused);
+  if (paused) return { show: false };
   if (pending > 0 && llm === "up") {
     return { show: true,
              text: "Модель в памяти держит GPU — выгрузить и начать генерацию?" };
@@ -940,13 +948,16 @@ export function unloadBannerVisible(state, dismissedKey) {
  * Переход дисмисс-состояния плашки на один опрос — то, чем страница пользуется на самом деле.
  *
  * `prev` — `{dismissedKey}`, посчитанный на предыдущем опросе (или `{dismissedKey: null}` до
- * первого клика «пусть ждёт»); `state` — свежий `{pending, llm}`. Отличие от `unloadBannerVisible`
- * ровно в том, что тут нашло ревью первого раунда: `dismissedKey` не переживает уход состояния от
- * себя. Без сгорания цикл «2 задачи, up → пусть ждёт → 3 задачи (плашка снова видна, задачу
- * добавили) → одну из трёх удалили, снова 2 задачи, up» молча гасил предупреждение во второй раз —
- * ключ `"2:up"` совпадал с тем, что отклонили в первый раз, хотя именно это повторное появление
- * никто не отклонял. Сгорание чинит это: как только ключ хоть раз разошёлся с `dismissedKey`,
- * старый дисмисс забывается, и попадание обратно в то же `{pending, llm}` снова спрашивает.
+ * первого клика «пусть ждёт»); `state` — свежий `{pending, llm, paused}`. Отличие от
+ * `unloadBannerVisible` ровно в том, что тут нашло ревью первого раунда: `dismissedKey` не
+ * переживает уход состояния от себя. Без сгорания цикл «2 задачи, up → пусть ждёт → 3 задачи
+ * (плашка снова видна, задачу добавили) → одну из трёх удалили, снова 2 задачи, up» молча гасил
+ * предупреждение во второй раз — ключ `"2:up"` совпадал с тем, что отклонили в первый раз, хотя
+ * именно это повторное появление никто не отклонял. Сгорание чинит это: как только ключ хоть раз
+ * разошёлся с `dismissedKey`, старый дисмисс забывается, и попадание обратно в то же
+ * `{pending, llm}` снова спрашивает. `paused` не входит в `bannerKey` — она гасит `show` через
+ * `unloadBanner` напрямую (см. его докстринг), а ключ дисмисса остаётся про то же `{pending, llm}`
+ * и после того, как пауза снята, помнит именно то, что было отклонено при её снятии.
  */
 export function nextBannerState(prev, state) {
   const key = bannerKey(state);
@@ -1575,6 +1586,11 @@ function startPage() {
       unknown: "замок не удалось проверить",
     }[workerState] || "";
 
+    // -- пауза/старт очереди (A5): место рядом с заголовком секции — перевёрстка в C2,
+    // сейчас только функция. `state.paused` решает и подпись, и то, какой маршрут нажатие бьёт
+    // (см. `toggleQueuePause`).
+    $("queue-pause-toggle").textContent = state.paused ? "▶ Начать расчёт" : "⏸ Приостановить";
+
     // -- идёт сейчас
     const running = (queue.running || [])[0] || null;
     const progress = renderRunning(running, workerState, now);
@@ -1608,9 +1624,10 @@ function startPage() {
   }
 
   /** Плашка выгрузки над списком ждущих: см. `nextBannerState`. `pendingCount` приходит от
-   *  вызывающего — он уже разобрал `queue.pending`, второй раз разбирать незачем. */
+   *  вызывающего — он уже разобрал `queue.pending`, второй раз разбирать незачем. `paused`
+   *  берётся из последнего `/api/state` (A5): на паузе плашка не показывается — см. `unloadBanner`. */
   function renderUnloadBanner(pendingCount) {
-    unloadBannerInput = { pending: pendingCount, llm: llmStatus };
+    unloadBannerInput = { pending: pendingCount, llm: llmStatus, paused: Boolean(state && state.paused) };
     bannerState = nextBannerState(bannerState, unloadBannerInput);
     $("unload-banner").hidden = !bannerState.show;
     $("unload-banner-text").textContent = bannerState.show
@@ -2435,6 +2452,27 @@ function startPage() {
     renderQueue();
   }
 
+  /** Пауза/старт очереди (A5): маршрут выбирается по последнему известному `state.paused`, тем же
+   *  способом, что и подпись кнопки в `renderQueue`. Оба маршрута литеральные (не собранные из
+   *  переменной) — `test_the_page_asks_for_its_own_routes_in_a_way_the_provenance_check_accepts`
+   *  ищет URL прямо в тексте `api(...)`, и подставленная строка исчезла бы из этого списка так же,
+   *  как настоящий побег на чужой хост. Кнопка глохнет на время запроса — то же правило, что у
+   *  «выгрузить и начать» (`unloadAndStart`): без него двойной клик на паузе с медленным диском
+   *  послал бы два `POST /api/queue/pause` подряд, и это не опасно (сам маркер идемпотентен), но
+   *  кнопка, кликабельная на вид во время своего же запроса, всё равно врёт. */
+  async function toggleQueuePause() {
+    const button = $("queue-pause-toggle");
+    const paused = Boolean(state && state.paused);
+    button.disabled = true;
+    try {
+      await withQueue(() => (paused
+        ? api("POST", "/api/queue/start", {})
+        : api("POST", "/api/queue/pause", {})));
+    } finally {
+      button.disabled = false;
+    }
+  }
+
   // -- подписки ---------------------------------------------------------------------------
 
   document.addEventListener("click", (event) => {
@@ -2475,6 +2513,7 @@ function startPage() {
   $("submit").addEventListener("click", submit);
   $("unload-banner-go").addEventListener("click", unloadAndStart);
   $("unload-banner-wait").addEventListener("click", dismissUnloadBanner);
+  $("queue-pause-toggle").addEventListener("click", toggleQueuePause);
   $("cancel-edit").addEventListener("click", () => setEditing(null));
   $("force").addEventListener("change", refreshSubmitState);
   $("save-prompt").addEventListener("click", savePrompt);

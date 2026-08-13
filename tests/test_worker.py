@@ -307,6 +307,7 @@ def test_main_loop_runs_the_queue_in_order_and_counts_what_it_ran(tmp_path):
     root = tmp_path / "queue"
     first = _queued(root, tmp_path, tag="a")
     second = _queued(root, tmp_path, tag="b")
+    q.set_paused(root, False)  # A5: a freshly created queue starts paused; not what this test is about
     spawned: list[list[str]] = []
 
     ran = _answer_within(10, lambda: worker.main_loop(
@@ -330,6 +331,7 @@ def test_the_worker_waits_for_a_live_job_then_picks_the_queue_back_up(tmp_path):
     q.submit(root, ["generate", "--tag", "a"], "", _stem(_DRY, str(tmp_path / "h3-a-1x1")), {})
     alive = q.claim(root)
     q.submit(root, ["generate", "--tag", "b"], "", _stem(_DRY, str(tmp_path / "h3-b-1x1")), {})
+    q.set_paused(root, False)  # A5: a freshly created queue starts paused; not what this test is about
     spawned: list[list[str]] = []
     holder = _external_lock(root, "LOCK_EX", name=f"leases/{alive.id}.lock")
     holder.__enter__()
@@ -358,6 +360,7 @@ def test_worker_leaves_the_queue_alone_while_the_llm_holds_the_gpu(tmp_path, mon
     """
     root = tmp_path / "queue"
     _queued(root, tmp_path, tag="a")
+    q.set_paused(root, False)  # A5: a freshly created queue starts paused; not what this test is about
     holds = {"value": True}
     monkeypatch.setattr(worker, "_llm_holds_gpu", lambda r: holds["value"])
     spawned: list[list[str]] = []
@@ -394,6 +397,7 @@ def test_worker_reads_providers_json_from_outdir_not_the_queue_root(tmp_path, pa
     outdir = tmp_path
     root = outdir / "queue"
     q.submit(root, ["generate", "--tag", "a"], "", _stem(_DRY, str(tmp_path / "h3-a-1x1")), {})
+    q.set_paused(root, False)  # A5: a freshly created queue starts paused; not what this test is about
     llama = _FakeLlama()
     (outdir / "providers.json").write_text(json.dumps({
         "active": "qwen-local",
@@ -447,6 +451,38 @@ def test_llm_holds_gpu_sees_a_resident_local_provider_that_is_not_the_active_one
         assert worker._llm_holds_gpu(outdir) is True
     finally:
         llama.close()
+
+
+# -- Task A5: pause/start the queue ---------------------------------------------------------------
+
+
+def test_worker_leaves_a_pending_job_alone_while_the_queue_is_paused(tmp_path):
+    """No monkeypatch, unlike the LLM-gate test above: `q.is_paused`/`q.set_paused` are real files
+    on real disk, driven exactly the way `POST /api/queue/pause`/`/start` will drive them (task
+    A5's web routes), so this test exercises `main_loop`'s own gate rather than a stand-in for it --
+    a stub of the gate itself cannot catch a mutation that comments the gate out of `main_loop`.
+
+    A freshly created queue starts paused (`queue.layout`'s own contract), so the marker does not
+    even need to be planted by hand: `_queued` -> `q.submit` -> `q.layout` already leaves one.
+    """
+    root = tmp_path / "queue"
+    _queued(root, tmp_path, tag="a")
+    assert q.is_paused(root) is True, "a freshly created queue must start paused"
+    spawned: list[list[str]] = []
+    stop = threading.Event()
+
+    thread = threading.Thread(target=lambda: worker.main_loop(
+        root, poll=0.05, stop=stop, spawn=_recording(spawned)), daemon=True)
+    thread.start()
+    time.sleep(0.3)
+    assert spawned == [], "the worker took a pending job while the queue was paused"
+    q.set_paused(root, False)  # the page's «начать расчёт» button, or a human by hand
+    deadline = time.time() + 5
+    while not spawned and time.time() < deadline:
+        time.sleep(0.05)
+    stop.set()
+    thread.join(timeout=5)
+    assert spawned, "the worker never resumed once the queue was unpaused"
 
 
 # -- Step 9: stopping ----------------------------------------------------------------------------
@@ -523,6 +559,7 @@ def test_the_first_stop_signal_lets_the_running_job_finish_and_takes_no_new_one(
     root = tmp_path / "queue"
     first = _queued(root, tmp_path, tag="a")
     second = _queued(root, tmp_path, tag="b")
+    q.set_paused(root, False)  # A5: a freshly created queue starts paused; not what this test is about
 
     with _signal_worker(root, "sleeper", 1.5) as proc:
         started = time.time()
@@ -547,6 +584,7 @@ def test_the_second_stop_signal_kills_the_grandchild_not_just_the_direct_child(t
     """
     root = tmp_path / "queue"
     job = _queued(root, tmp_path, tag="a")
+    q.set_paused(root, False)  # A5: a freshly created queue starts paused; not what this test is about
     pidfile = tmp_path / "grandchild.pid"
 
     with _signal_worker(root, "grandchild", pidfile) as proc:

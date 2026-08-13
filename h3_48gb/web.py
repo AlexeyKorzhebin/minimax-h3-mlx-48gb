@@ -461,10 +461,16 @@ def build_state(queue_root, outdir) -> dict:
 
     Unparseable job files come back in `queue.broken` rather than being dropped -- a queue that is
     quietly one job short is the failure `scan` was written to prevent.
+
+    `paused` is `queue.is_paused(queue_root)` read fresh on every call, same as `worker`'s `state`:
+    the page's pause/resume button (`POST /api/queue/pause`/`/start`) and `main_loop`'s own gate
+    both act on the same marker file, and this is the one place a human sees whether either of them
+    has.
     """
     with queue_errors(queue_root):
         jobs, broken = q.scan(queue_root)
         state = worker_state(queue_root)
+        paused = q.is_paused(queue_root)
 
     grouped: dict[str, list[dict]] = {name: [] for name in q.QUEUE_STATES}
     for job in jobs:
@@ -474,6 +480,7 @@ def build_state(queue_root, outdir) -> dict:
     return {
         "ok": True,
         "worker": {"state": state},
+        "paused": paused,
         "queue": {**grouped,
                   "broken": [{"path": item.path, "error": item.error} for item in broken]},
         "runs": [run.as_dict() for run in runs_module.scan(Path(outdir))],
@@ -1361,6 +1368,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._create_chat()
         if path == "/api/llm/unload":
             return self._llm_unload()
+        if path == "/api/queue/pause":
+            return self._queue_pause()
+        if path == "/api/queue/start":
+            return self._queue_start()
         if path.startswith("/api/chat/") and path.endswith("/message"):
             return self._chat_message(path[len("/api/chat/"):-len("/message")])
         return 404, "application/json", _error_bytes(
@@ -1817,6 +1828,27 @@ class _Handler(BaseHTTPRequestHandler):
             pname, pcfg = by_port[port]
             provider.LlamaLocal(pname, pcfg, self.server.outdir).shutdown()
         return 200, "application/json", _json_bytes({"ok": True, "status": "down"})
+
+    def _queue_pause(self) -> tuple[int, str, bytes]:
+        """`POST /api/queue/pause`: mark the queue paused, so `main_loop`'s gate stops claiming.
+
+        Never touches the job already in `running/` -- that gate sits *before* `claim`, never
+        inside `run_job` (see `main_loop`'s docstring) -- so a pause requested mid-generation takes
+        effect only for whatever the worker would have claimed next.
+        """
+        self._json_request(allowed=())
+        with queue_errors(self.server.queue_root):
+            q.set_paused(self.server.queue_root, True)
+        return 200, "application/json", _json_bytes({"ok": True, "paused": True})
+
+    def _queue_start(self) -> tuple[int, str, bytes]:
+        """`POST /api/queue/start`: clear the pause marker, so `main_loop`'s gate lets `claim`
+        through again on its next poll.
+        """
+        self._json_request(allowed=())
+        with queue_errors(self.server.queue_root):
+            q.set_paused(self.server.queue_root, False)
+        return 200, "application/json", _json_bytes({"ok": True, "paused": False})
 
     def _chat_dir(self, create: bool = False) -> Path:
         """`<outdir>/chat/`, made only when something is about to be written into it.

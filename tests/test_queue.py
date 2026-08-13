@@ -1430,6 +1430,73 @@ def test_reconcile_takes_the_queue_lock_exactly_once_for_the_whole_table(tmp_pat
         f"reconcile must take the queue lock exactly once, exclusively; took {acquisitions}")
 
 
+# -- Task A5: pause/start the queue ---------------------------------------------------------------
+
+
+def test_a_missing_paused_marker_reads_as_not_paused(tmp_path):
+    """The safe direction, per `is_paused`'s docstring: losing the marker resumes the queue rather
+    than freezing it silently. Checked against a `root` that does not even exist yet, the strongest
+    version of "missing" -- `is_paused` must not need `layout` to have run first.
+    """
+    root = tmp_path / "queue"
+    assert q.is_paused(root) is False
+
+
+def test_set_paused_and_is_paused_round_trip(tmp_path):
+    """The pair on a queue that already exists, independent of whatever `layout` set the marker to
+    when it created the directory (see the next two tests for that half).
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+
+    q.set_paused(root, True)
+    assert q.is_paused(root) is True
+    assert (root / q.PAUSED_MARKER_NAME).exists()
+
+    q.set_paused(root, False)
+    assert q.is_paused(root) is False
+    assert not (root / q.PAUSED_MARKER_NAME).exists()
+
+    # Idempotent in both directions -- the web routes call this on every click, and a double click
+    # (a slow response, an impatient human) must not raise.
+    q.set_paused(root, False)
+    assert q.is_paused(root) is False
+    q.set_paused(root, True)
+    q.set_paused(root, True)
+    assert q.is_paused(root) is True
+
+
+def test_layout_pauses_a_freshly_created_queue(tmp_path):
+    """A queue nobody has looked at yet must not start running jobs unattended -- see `layout`'s
+    docstring for why the marker is created there rather than left for the worker or the page to
+    add on their own first touch.
+    """
+    root = tmp_path / "queue"
+    assert not root.exists()
+
+    q.layout(root)
+
+    assert q.is_paused(root) is True
+
+
+def test_layout_does_not_repause_an_existing_queue(tmp_path):
+    """The other half, and the one a one-line mutation (always touching the marker in `layout`,
+    not only on first creation) breaks: `main_loop` calls `layout(root)` on every worker startup
+    (see its own docstring), and a worker restarted after a human resumed the queue must not
+    silently pause it again out from under them.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    assert q.is_paused(root) is True, "sanity: the first layout call must have paused it"
+    q.set_paused(root, False)  # a human, or the page's «начать расчёт» button, resumes it
+
+    q.layout(root)  # e.g. `main_loop`'s own unconditional call on every startup
+
+    assert q.is_paused(root) is False, (
+        "layout on an already-existing queue root must leave the pause marker exactly as it found "
+        "it -- recreating it would pause the queue on every worker restart")
+
+
 # -- Global constraint: queue.py must stay importable without MLX -------------------------------
 
 

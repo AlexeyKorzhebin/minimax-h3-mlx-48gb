@@ -66,6 +66,12 @@ LOG_TAIL_LINES = 40
 #: queue page, unlike this module's exception messages (see the module docstring).
 RESULT_RECOVERED_NOTE = "результат найден на диске, отметка потеряна"
 
+#: Name of the marker file directly under the queue root whose mere *existence* means "paused" --
+#: see `is_paused`. A bare name, not a path: every caller reaches it through `is_paused`/
+#: `set_paused`, so nothing outside this module needs to know it lives at the root rather than,
+#: say, under `leases/`.
+PAUSED_MARKER_NAME = "paused"
+
 
 class QueueError(Exception):
     """Base class for every refusal this module raises."""
@@ -191,15 +197,61 @@ def layout(root) -> dict[str, Path]:
     Idempotent: called by `submit` and `scan` on every invocation (`root` may not exist yet the
     first time either runs), and safe to call again by hand, e.g. from a test that wants a queue
     on disk before writing a job file into it directly.
+
+    **A queue root that did not exist yet is created paused** (`set_paused(root, True)`, once,
+    only on this first call): a brand-new queue is one nobody has looked at, and a job submitted
+    to it before a human has seen the page should not start a multi-hour run unattended. The check
+    is "did `root` itself exist before this call", not "is the marker missing" -- `main_loop` calls
+    `layout` on every worker startup (see its docstring), and a marker a human explicitly removed
+    to resume the queue must not be resurrected by the next restart. An *existing* root is left
+    exactly as paused or unpaused as it already was, however incomplete its subdirectories are --
+    `root` existing at all is proof `layout` (or `submit`) ran here before, so there is nothing
+    "fresh" left to default.
     """
     root = Path(root)
+    freshly_created = not root.is_dir()
     root.mkdir(parents=True, exist_ok=True)
     paths = {"root": root}
     for name in ("pending", "running", "done", "failed", "leases", "results", "prompts", "logs"):
         path = root / name
         path.mkdir(parents=True, exist_ok=True)
         paths[name] = path
+    if freshly_created:
+        set_paused(root, True)
     return paths
+
+
+def is_paused(root) -> bool:
+    """Whether the queue at `root` is paused: does `<root>/paused` exist.
+
+    A missing marker means "not paused" -- **deliberately the safe direction**. The marker carries
+    no content and nothing durable-writes it (see `set_paused`), so a plain crash cannot corrupt it
+    the way a job file can; what can make it disappear is a human clearing the queue directory by
+    hand, a backup that drops zero-length files, or any other loss nobody asked for. Losing "paused"
+    resumes the queue, which a human watching the page notices within one `poll` interval and can
+    re-pause; losing "running" would leave the queue silently idle with a free GPU and no worker
+    ever explaining why nothing moves -- there is no poll interval that surfaces an *absence* of
+    activity as loudly as `unloadBanner`'s plate flags a *presence* of one. `main_loop` calls this,
+    not the reverse, at the top of every iteration -- see its docstring for exactly where.
+    """
+    return (Path(root) / PAUSED_MARKER_NAME).exists()
+
+
+def set_paused(root, value: bool) -> None:
+    """Create (`value=True`) or remove (`value=False`) `<root>/paused`.
+
+    Not routed through `write_text_durably`: the marker's only fact is whether the file exists, and
+    an interrupted `touch`/`unlink` leaves it either fully present or fully absent, never a
+    half-written mixture the way a truncated job file can be -- there is no partial state for a
+    crash to land in. `main_loop` polls `is_paused` again every `poll` seconds regardless, so even
+    the "wrong" outcome of an interrupted call self-heals on the next iteration rather than sticking.
+    """
+    path = Path(root) / PAUSED_MARKER_NAME
+    if value:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def write_text_durably(path, text: str) -> None:
