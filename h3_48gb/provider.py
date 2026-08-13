@@ -94,6 +94,35 @@ def load_providers(root) -> dict:
     return {"active": data.get("active"), "providers": providers}
 
 
+def local_ports(roster: dict) -> list[int]:
+    """Every distinct port a `llama-local` provider in `roster` claims, in roster order.
+
+    `roster` is the shape `load_providers` returns (`{"active", "providers"}`) -- callers pass
+    the whole thing, not just `roster["providers"]`, so this reads the same value they already
+    loaded rather than asking them to unwrap it.
+
+    Every "queue outranks a resident LLM" check in this codebase used to look at `active` alone
+    (`worker._llm_holds_gpu`, `web._llm_state`, `web._llm_unload`). A human can raise a
+    `llama-local` provider that is **not** `active` -- the chat page's per-turn provider dropdown
+    picks one directly, without ever touching `providers.json`'s `active` field -- so a roster
+    with an active external provider and a resident local one on another (or, on the real deployed
+    config, the *same*) port was invisible to all three checks. This is the single place that
+    answers "which ports could possibly hold GPU memory right now", so the three checks agree by
+    construction instead of by three separate people remembering the same rule.
+
+    Ports repeat when two provider entries share one (the real roster does, both on 8080) --
+    de-duplicated here so callers checking `port_alive` once per port don't pay for it twice.
+    """
+    ports: list[int] = []
+    for cfg in roster.get("providers", {}).values():
+        if cfg.get("type") != "llama-local":
+            continue
+        port = cfg.get("port", 0)
+        if port and port not in ports:
+            ports.append(port)
+    return ports
+
+
 def port_alive(port: int) -> bool:
     if not port:
         return False

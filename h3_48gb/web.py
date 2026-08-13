@@ -1646,11 +1646,28 @@ class _Handler(BaseHTTPRequestHandler):
 
         `down` for an external provider is not a lie by omission: the plate answers "are 31 GB of
         this machine's memory currently held by a chat model", and for openrouter the answer is no.
+
+        Checks **every** `llama-local` provider in the roster (`provider.local_ports`), not only
+        `name`/`cfg` (finding I1). The chat page's per-turn provider dropdown can raise a
+        `llama-local` provider that is not `providers.json`'s `active` entry -- and `_locked_turn`
+        passes exactly that provider's `name`/`cfg` here after a turn -- so a resident model
+        elsewhere in the roster used to read as `down` whenever it was not the one this call
+        happened to be about. `provider` in the answer names whichever entry is actually up,
+        preferring `name` itself when it is the live one, so the common case (the provider this
+        call is about *is* the resident model) still reads exactly as before the fix.
         """
         if cfg is None:
             name, cfg = self._active_provider()
-        lam = self._llama_for(name, cfg)
-        return {"status": lam.status() if lam else "down", "provider": name}
+        roster = provider.load_providers(self.server.outdir)
+        alive_ports = {port for port in provider.local_ports(roster) if provider.port_alive(port)}
+        if not alive_ports:
+            return {"status": "down", "provider": name}
+        if cfg.get("port") in alive_ports:
+            return {"status": "up", "provider": name}
+        for other_name, other_cfg in roster["providers"].items():
+            if other_cfg.get("type") == "llama-local" and other_cfg.get("port") in alive_ports:
+                return {"status": "up", "provider": other_name}
+        return {"status": "up", "provider": name}  # unreachable: alive_ports came from this roster
 
     def _llm_status(self) -> tuple[int, str, bytes]:
         return 200, "application/json", _json_bytes({"ok": True, **self._llm_state()})
@@ -1660,11 +1677,24 @@ class _Handler(BaseHTTPRequestHandler):
 
         Answers `down` even when there was nothing to stop -- the caller asked for a state, not for
         an action, and "there was no local provider" is not a failure to report.
+
+        Shuts down **every** `llama-local` provider in the roster, not only the active one (finding
+        I1): looking up `_active_provider()` alone missed a resident `gemma-local` whenever the
+        active entry was external, and the human clicking "free the GPU" got nothing freed. One
+        `LlamaLocal.shutdown()` call per distinct port (`provider.local_ports`) is enough -- its
+        `pkill -f llama-server` already kills every local llama-server process on the machine
+        regardless of which provider config it belongs to, and de-duplicating by port avoids
+        calling it twice when two provider entries share one, as the real roster's do.
         """
         self._json_request(allowed=())
-        lam = self._llama_for(*self._active_provider())
-        if lam is not None:
-            lam.shutdown()
+        roster = provider.load_providers(self.server.outdir)
+        by_port: dict[int, tuple[str, dict]] = {}
+        for pname, pcfg in roster["providers"].items():
+            if pcfg.get("type") == "llama-local":
+                by_port.setdefault(pcfg.get("port", 0), (pname, pcfg))
+        for port in provider.local_ports(roster):
+            pname, pcfg = by_port[port]
+            provider.LlamaLocal(pname, pcfg, self.server.outdir).shutdown()
         return 200, "application/json", _json_bytes({"ok": True, "status": "down"})
 
     def _chat_dir(self) -> Path:
@@ -1726,7 +1756,7 @@ class _Handler(BaseHTTPRequestHandler):
         this server confirms is: the page navigates to `/#chat/<id>` the moment it gets the id, and
         a session that is not on disk by then is a page that opens on a 404.
         """
-        payload = self._json_request(allowed=("source", "prompt", "mode", "image"))
+        payload = self._json_request(allowed=("source", "prompt", "mode", "image", "end_image"))
         source = payload.get("source") or {"kind": "new"}
         if not isinstance(source, dict) or source.get("kind") not in CHAT_SOURCE_KINDS \
                 or not set(source) <= CHAT_SOURCE_KEYS:
@@ -1738,10 +1768,17 @@ class _Handler(BaseHTTPRequestHandler):
                  "kinds": sorted(CHAT_SOURCE_KINDS), "keys": sorted(CHAT_SOURCE_KEYS)},
             )
         image = self._string_of(payload, "image")
+        # `end_image` (T4): the last-frame keyframe of a `flf` job. Checked with the same rule as
+        # `image` -- inside a root, and an image suffix -- because it names a file on disk exactly
+        # the same way. Unlike `image`, its bytes are never attached to a turn (`_locked_turn` only
+        # mentions the path in the system context): the model does not need to *see* the last
+        # frame to reason about it, and sending it would double the per-turn upload for no benefit.
+        end_image = self._string_of(payload, "end_image")
         session = {"id": secrets.token_hex(4),
                    "source": source,
                    "mode": self._string_of(payload, "mode"),
                    "image": str(self._chat_image_path(image)) if image else "",
+                   "end_image": str(self._chat_image_path(end_image)) if end_image else "",
                    "messages": [],
                    "prompt": self._string_of(payload, "prompt")}
         self._write_session(self._chat_path(session["id"]), session)
@@ -1890,8 +1927,15 @@ class _Handler(BaseHTTPRequestHandler):
                 return 409, "application/json", _error_bytes(
                     "gpu_busy", "идёт прогон — модель поднимется после него",
                     {"running": _running_ids(running)})
+        # `end_image` (T4): mentioned by path only, never attached as a picture -- the model needs
+        # to know a last frame exists (so it writes the `mode: flf` instruction line and describes
+        # a path toward it, per docs/h3-prompt-system.md) without paying for a second image upload
+        # every turn the way `_turn_content` pays for the first frame.
+        end_image_line = (f"\nend_image: {session['end_image']}" if session.get("end_image")
+                          else "")
         system = (provider.system_prompt()
                   + "\n\n## Context\nmode: " + (session.get("mode") or DEFAULT_CHAT_MODE)
+                  + end_image_line
                   + "\n\n## Current prompt\n" + self._string_of(payload, "prompt"))
         content, warning = self._turn_content(text, session.get("image") or "")
         messages = ([{"role": "system", "content": system}]

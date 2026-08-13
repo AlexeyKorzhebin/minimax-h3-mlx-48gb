@@ -276,10 +276,15 @@ def _llm_holds_gpu(outdir) -> bool:
     outdir / "queue"`). `main_loop` is the only caller and resolves that distinction once; a
     second caller passing the queue root here would find no roster and this check would silently
     never fire, exactly the bug fixed in this round.
+
+    Checks **every** `llama-local` provider in the roster (`provider.local_ports`), not only the
+    one `providers.json` names `active` (finding I1). The chat page's per-turn provider dropdown
+    can raise a `llama-local` provider that is not `active` without ever touching that field, so
+    "active provider is external, some other local one is resident" used to be invisible here --
+    the worker would claim a 27 GB job right next to a 30 GB resident model it never looked at.
     """
     roster = provider.load_providers(outdir)
-    cfg = roster["providers"].get(roster["active"] or "", {})
-    return cfg.get("type") == "llama-local" and provider.port_alive(cfg.get("port", 0))
+    return any(provider.port_alive(port) for port in provider.local_ports(roster))
 
 
 def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir=None) -> int:

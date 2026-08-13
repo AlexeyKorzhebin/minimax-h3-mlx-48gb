@@ -483,6 +483,33 @@ def test_the_llm_plate_follows_the_health_endpoint_and_unload_asks_for_a_shutdow
     assert killed == ["qwen-local"]
 
 
+def test_the_llm_plate_is_up_when_a_non_active_local_provider_is_resident(_serve, fake_llama):
+    """Finding I1: `providers.json` can list more than one `llama-local` provider (the real
+    roster does -- `qwen-local` and `gemma-local`, both under one `active` field), and the chat
+    page's per-turn provider dropdown can raise one that is not `active` without ever touching that
+    field. The plate used to ask only the active provider's port, so "active external,
+    `gemma-local` resident elsewhere" read as `down` -- exactly the state that let the worker start
+    a generation next to a resident 30 GB model.
+    """
+    srv = _serve(providers={**_external(1), "gemma-local": {**_LLAMA, "port": fake_llama.port}},
+                 active="openrouter")
+    assert srv.get_json("/api/llm") == {"ok": True, "status": "up", "provider": "gemma-local"}
+
+
+def test_llm_unload_kills_a_resident_local_provider_even_when_it_is_not_active(_serve, fake_llama,
+                                                                                monkeypatch):
+    """Same gap as above, the unload side: `POST /api/llm/unload` used to look up only the active
+    provider (`_active_provider`), so with `openrouter` active it found no `LlamaLocal` at all and
+    never touched the resident `gemma-local` -- the human clicks "free the GPU" and nothing frees.
+    """
+    srv = _serve(providers={**_external(1), "gemma-local": {**_LLAMA, "port": fake_llama.port}},
+                 active="openrouter")
+    killed: list[str] = []
+    monkeypatch.setattr(provider.LlamaLocal, "shutdown", lambda self: killed.append(self.name))
+    assert srv.post_json("/api/llm/unload", {})["status"] == "down"
+    assert killed == ["gemma-local"]
+
+
 def test_without_a_roster_the_plate_is_down_and_a_turn_says_which_provider_is_missing(_serve):
     """Ни providers.json, ни активного провайдера: сервер обязан отвечать, а не падать."""
     srv = _serve(roster=False)

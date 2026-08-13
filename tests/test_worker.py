@@ -424,6 +424,31 @@ def test_worker_reads_providers_json_from_outdir_not_the_queue_root(tmp_path, pa
             llama.close()
 
 
+def test_llm_holds_gpu_sees_a_resident_local_provider_that_is_not_the_active_one(tmp_path):
+    """Finding I1: the chat page's per-turn `provider` field can raise ANY `llama-local` entry in
+    the roster, not only `providers.json`'s `active` one -- a human picks it from a dropdown, the
+    active field never moves. `_llm_holds_gpu` used to read only the active provider's port, so
+    "active external, `gemma-local` resident on its own port" was invisible to this gate: the
+    worker would claim a 27 GB job right next to a 30 GB resident model. Today this is additionally
+    masked because the real roster's two local providers share one port (8080), which is exactly
+    why the roster below uses two distinct providers rather than relying on that coincidence.
+    """
+    outdir = tmp_path
+    llama = _FakeLlama()
+    try:
+        (outdir / "providers.json").write_text(json.dumps({
+            "active": "openrouter",
+            "providers": {
+                "openrouter": {"type": "openai", "base_url": "https://example.invalid/v1",
+                               "model": "m"},
+                "gemma-local": {"type": "llama-local", "port": llama.port},
+            },
+        }), encoding="utf-8")
+        assert worker._llm_holds_gpu(outdir) is True
+    finally:
+        llama.close()
+
+
 # -- Step 9: stopping ----------------------------------------------------------------------------
 
 
