@@ -2711,11 +2711,29 @@ def test_the_finished_rows_copy_button_has_an_explicit_place_in_the_row_grid():
 
     # The structural overflow above is real and expected (that many children never fit one row);
     # what must not be true is that the browser is left to place the overflow on its own.
-    assert re.search(r"\.r\.done\s+\.acts\s*\{[^}]*grid-column", css), (
-        "the succeeded row's .acts needs an explicit grid-column in style.css, or it wraps into "
-        "the next implicit row's 16px marker column and gets clipped")
-    assert re.search(r"\.r\.fail\s+\.acts\s*\{[^}]*grid-column", css), (
-        "same for the failed row's .acts")
+    #
+    # The *presence* of a `grid-column` is not the property this test is about, and asserting only
+    # that let the bug back in: `grid-column: 1 / -1` is present, declared, explicit -- and puts
+    # the button back in the 16px marker column, which is exactly the clipping («опия») the rule
+    # exists to prevent. The value has to be checked, and the value it has to be is derived the
+    # same way the column count above is, from `--cols` itself.
+    tracks = re.findall(r"minmax\([^)]*\)|\S+", cols_match.group(1))
+    assert re.fullmatch(r"\d+px", tracks[0]), (
+        f"the grid's first track is the status marker's; it is {tracks[0]!r}, so the "
+        "«one column past the marker» this test computes below no longer means that")
+    marker_tracks = 1
+    first_content_column = str(marker_tracks + 1)
+    for state, what in (("done", "the succeeded row"), ("fail", "the failed row")):
+        rule = re.search(r"\.r\.%s\s+\.acts\s*\{([^}]*)\}" % state, css)
+        assert rule, (f"{what}'s .acts needs an explicit place in style.css, or it wraps into the "
+                      "next implicit row's marker column and gets clipped")
+        declared = re.search(r"grid-column:\s*([^;}]+)", rule.group(1))
+        assert declared, f"{what}'s .acts rule has no grid-column: {rule.group(1)!r}"
+        start = declared.group(1).split("/")[0].strip()
+        assert start == first_content_column, (
+            f"{what}'s .acts starts at column {start}, and the first column past the marker is "
+            f"{first_content_column}: a button placed on the marker's own track is the clipping "
+            "this rule exists to prevent, whether or not a grid-column was written down")
 
 
 @_needs_node
@@ -3293,8 +3311,10 @@ def test_the_new_file_entry_carries_a_sentinel_that_survives_the_html_parser():
         f"{sentinel!r} would collide with a real prompt file name")
     assert '<option value="${NEW_PROMPT}">' in script
     assert script.count("NEW_PROMPT") == 5, (
-        "the constant, the option, and the three comparisons (the two in the select's own handler "
-        "and the one that refuses to open a chat about «— новый файл… —») -- no other spelling")
+        "the constant, the option, and the three comparisons -- one in `savePrompt` (which asks "
+        "for a name instead of saving over the placeholder), one in the select's own `change` "
+        "handler, and one that refuses to open a chat about «— новый файл… —» -- three separate "
+        "places, no other spelling")
 
 
 def test_a_posted_job_leaves_every_field_but_the_seed_and_the_tag_alone():

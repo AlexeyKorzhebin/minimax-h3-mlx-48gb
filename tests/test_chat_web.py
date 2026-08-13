@@ -758,6 +758,38 @@ def test_duplicating_a_finished_job_lands_a_new_pending_job(_serve):
     assert by_id[new_id].output_stem != job.output_stem
 
 
+def test_duplicating_a_failed_job_lands_a_new_pending_job(_serve):
+    """Копия провалившейся — главный сценарий кнопки «Копия», и он был непроверен.
+
+    Задача падает по причине, которая к самой задаче отношения не имеет (кончилось место, Мак
+    заснул, работника убили), и повторить её — первое, что делает человек утром; на строке
+    `fail` кнопка «Копия» единственная, что там вообще есть (`finishedRowHtml`). Тест дубликата
+    `done` этого не покрывает: `done` и `failed` — разные каталоги очереди, и маршрут ищет
+    исходную задачу перебором состояний.
+
+    Имя вывода у копии всё равно новое, хотя исходное свободно (файла нет — прогон не дошёл до
+    записи): `_duplicate_tag_candidates` переписывает тег, не спрашивая, чем кончился источник, и
+    это правильно — иначе повтор затирал бы логи и превью того прогона, который и разбирают.
+    """
+    srv = _serve()
+    job = _submit_job(srv.queue_root, srv.root, "упало", note="из упавшей")
+    running = q.claim(srv.queue_root)
+    q.finish(srv.queue_root, running.id, 1, "MemoryError: metal")
+
+    status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/duplicate", None)
+    assert status == 200, answer
+    new_id = answer["id"]
+
+    jobs, broken = q.scan(srv.queue_root)
+    assert broken == []
+    by_id = {row.id: row for row in jobs}
+    assert by_id[job.id].state == "failed", "копия не трогает упавшую задачу"
+    assert by_id[job.id].exit_code == 1
+    assert by_id[new_id].state == "pending"
+    assert by_id[new_id].note == "из упавшей"
+    assert by_id[new_id].output_stem != job.output_stem
+
+
 def test_duplicating_an_unknown_job_is_a_named_404(_serve):
     srv = _serve()
     status, answer = srv.post_json_raw("/api/jobs/does-not-exist/duplicate", None)
