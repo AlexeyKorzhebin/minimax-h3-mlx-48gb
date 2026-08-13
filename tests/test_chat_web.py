@@ -132,7 +132,7 @@ def _serve(tmp_path):
     started: list[_Live] = []
 
     def start(providers_port=None, providers=None, active=None, env=None,
-              roster=True) -> _Live:
+              roster=True, reveal=None) -> _Live:
         root = tmp_path / "outdir"
         root.mkdir(exist_ok=True)
         queue_root = q.layout(root / "queue")["root"]
@@ -144,7 +144,12 @@ def _serve(tmp_path):
                 json.dumps({"active": active, "providers": providers}), encoding="utf-8")
         if env is not None:
             (root / ".env").write_text(env, encoding="utf-8")
-        httpd = web.make_server(queue_root, root, port=0)
+        # `reveal` is the seam `/api/jobs/<id>/reveal` (`_reveal_job` in `web.py`) calls through
+        # instead of shelling out to `open -R` for real -- a test that wants the real subprocess
+        # is exercising macOS Finder, not this route, and `test_reveal_in_finder_calls_open_dash_r`
+        # (`test_web.py`) already covers the default wired up here.
+        httpd = web.make_server(queue_root, root, port=0,
+                                **({"reveal": reveal} if reveal is not None else {}))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         live = _Live(httpd=httpd, port=httpd.server_address[1], root=root, queue_root=queue_root)
         started.append(live)
@@ -1289,3 +1294,87 @@ def test_duplicating_a_job_with_a_prompt_file_gets_its_own_snapshot_not_the_sour
     assert new_snapshot == srv.queue_root / "prompts" / f"{new_id}.txt"
     assert new_snapshot.exists(), "cancelling the source must not break the duplicate"
     assert new_snapshot.read_text(encoding="utf-8") == "Кот на подоконнике."
+
+
+# -- показать в Finder ---------------------------------------------------------------------------
+
+
+def test_revealing_a_finished_job_opens_finder_at_its_clip(_serve):
+    """`POST /api/jobs/<id>/reveal`, happy path: a `done` job with its `.mp4` still on disk hands
+    that exact file to `open -R` -- the one thing a person clicking "Показать в Finder" on a
+    finished card actually wants to see selected, not the run's directory around it.
+
+    `reveal` is the seam (`make_server(..., reveal=...)`, see `_serve` above): the route never
+    shells out for real in this suite.
+    """
+    calls = []
+    srv = _serve(reveal=lambda path: calls.append(path))
+    job = _submit_job(srv.queue_root, srv.root, "готово")
+    running = q.claim(srv.queue_root)
+    q.finish(srv.queue_root, running.id, 0, "ok")
+    Path(job.output_stem).parent.mkdir(parents=True, exist_ok=True)
+    clip = Path(f"{job.output_stem}.mp4")
+    clip.write_bytes(b"video")
+
+    status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/reveal", None)
+    assert status == 200, answer
+    assert Path(answer["path"]) == clip.resolve()
+    assert calls == [clip.resolve()], "the route must call through the reveal seam exactly once"
+    assert clip.resolve().is_relative_to(srv.root.resolve()), (
+        "the path handed to Finder must stay inside the outdir")
+
+
+def test_revealing_a_failed_job_without_a_clip_falls_back_to_its_run_directory(_serve):
+    """A `failed` job never got as far as writing an `.mp4` -- the route's second candidate is the
+    job's own subdirectory (task A6), the only thing on disk left to look at: the partial
+    checkpoints and whatever log the worker left behind.
+    """
+    calls = []
+    srv = _serve(reveal=lambda path: calls.append(path))
+    job = _submit_job(srv.queue_root, srv.root, "упало")
+    running = q.claim(srv.queue_root)
+    q.finish(srv.queue_root, running.id, 1, "MemoryError: metal")
+    run_dir = Path(job.output_stem).parent
+    run_dir.mkdir(parents=True, exist_ok=True)  # the worker's own subdirectory; no clip was ever written
+
+    status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/reveal", None)
+    assert status == 200, answer
+    assert Path(answer["path"]) == run_dir.resolve()
+    assert calls == [run_dir.resolve()]
+
+
+def test_revealing_a_job_with_nothing_left_on_disk_is_a_named_404(_serve):
+    """Neither the clip nor the run's own directory ever made it to disk (the worker died before
+    `RunSpec.outdir.mkdir` -- see `test_cli.py`) -- there is nothing to select in Finder, and the
+    route says so by code rather than opening the outdir root as a consolation prize.
+    """
+    calls = []
+    srv = _serve(reveal=lambda path: calls.append(path))
+    job = _submit_job(srv.queue_root, srv.root, "стёрто")
+    running = q.claim(srv.queue_root)
+    q.finish(srv.queue_root, running.id, 0, "ok")
+
+    status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/reveal", None)
+    assert status == 404, answer
+    assert answer["error"]["code"] == "not_found", answer
+    assert calls == [], "nothing on disk means the seam must never be called"
+
+
+def test_revealing_a_pending_job_is_refused(_serve):
+    """A `pending` job has not run yet -- there is no output directory, own subdirectory or not,
+    and revealing it would either open nothing or (worse) open whatever `output_stem`'s parent
+    happens to resolve to before the job ever claims its own subdirectory.
+    """
+    srv = _serve()
+    job = _submit_job(srv.queue_root, srv.root, "ждёт")
+
+    status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/reveal", None)
+    assert status == 404, answer
+    assert answer["error"]["code"] == "not_found", answer
+
+
+def test_revealing_an_unknown_job_is_a_named_404(_serve):
+    srv = _serve()
+    status, answer = srv.post_json_raw("/api/jobs/does-not-exist/reveal", None)
+    assert status == 404, answer
+    assert answer["error"]["code"] == "not_found", answer

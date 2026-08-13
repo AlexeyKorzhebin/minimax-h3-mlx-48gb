@@ -831,8 +831,15 @@ export function pendingRowHtml(job, { editingId = null, index = null } = {}) {
 
 /**
  * Завершённая задача: код возврата виден всегда, причина — у упавших.
- * Единственное действие — копия (см. `pendingRowHtml`): прогон уже случился,
- * отменять и поднимать нечего, а вот повторить теми же параметрами — обычное дело.
+ *
+ * Три действия, не пять и не одно: «Обсудить», «Показать в Finder» и «Копия» — все три только
+ * читают задачу, ничего в ней не меняя (у «Обсудить» есть и пишущий финал — «обновить задачу»,
+ * `PUT /api/jobs/<id>` из модалки, — но он существует только для ждущей, и сервер сам откажет
+ * `job_not_pending`, попроси его завершённая; это осмысленный отказ, а не дыра, так что кнопка
+ * открытия разговора здесь всё равно уместна: посмотреть и обсудить прошлый прогон стоит и без
+ * намерения его переписывать). Едит/наверх/удалить нет вовсе — прогон уже случился, у готовой
+ * карточки нет ни своей строки в форме, чтобы её править, ни места в очереди, откуда её поднимать
+ * или снимать.
  *
  * `outdir` — необязательный (fix round 1, A6): без него `clipUrl` просто не
  * построит ссылку (см. `mediaParts`), а не упадёт — карточка ещё покажет имя
@@ -840,16 +847,23 @@ export function pendingRowHtml(job, { editingId = null, index = null } = {}) {
  *
  * C2: строка стала карточкой `.rcard` из макета, и главное в ней — кадр.
  *
- * Откуда берётся число проходов для `previewUrl` — зависит от исхода, и это не мелочь (ревью C2,
- * опасение 1). У успешной задачи это её собственная оценка (`estimate.forwards`): прогон дошёл до
- * конца, значит прошёл их все, и оценка тут — факт, переживающий исчезновение прогона из `runs`
- * сутки спустя. У упавшей `estimate.forwards` — обещание, а не факт: до последнего прохода она не
- * дожила, и адрес кадра, построенный по нему, отвечал 404 на каждый опрос, раз в двадцать секунд,
- * на каждую упавшую карточку. Сколько проходов было на самом деле, знает `runs.scan`
- * (`run.completed`, посчитанный по чекпойнтам на диске) — отсюда третий аргумент.
+ * Round 2 (карточки готового): кадр решает исход, и это не мелочь. У успешной задачи — её
+ * собственный ролик (`<video>`, первый кадр браузер вытянет сам; клик по нему — пуск/пауза
+ * инлайн, без открытия вкладки): TAE-снимок полусырого латента с середины диффузии для готовой
+ * задачи ничего не говорит — есть mp4, и он один даёт честный кадр. У упавшей ролика нет никогда
+ * (прогон не дошёл до записи), и там кадр остаётся тем же снимком TAE, что и раньше — единственное,
+ * что от прогона осталось посмотреть, поэтому `<img>` с явной подписью, что это снимок с середины
+ * оборвавшегося счёта, а не результат.
  *
- * Кадра может не быть вовсе (прогон короче одного интервала записи, упал раньше первого, или его
- * каталога уже нет в `runs`) — тогда рамка пустая: битая картинка хуже пустой.
+ * Число проходов для этой подписи и для адреса кадра упавшей — `runs.scan`
+ * (`run.completed`, посчитанный по чекпойнтам на диске), не `estimate.forwards`: до последнего
+ * прохода упавшая не дожила, и адрес, построенный по обещанному числу, отвечал 404 на каждый
+ * опрос, раз в двадцать секунд, на каждую упавшую карточку (ревью C2, опасение 1). У успешной
+ * этот вопрос больше не встаёт вовсе — кадр её ролика не зависит от числа проходов.
+ *
+ * Кадра у упавшей может не быть вовсе (прогон короче одного интервала записи, упал раньше
+ * первого, или его каталога уже нет в `runs`), а у успешной — без `outdir` (`clipUrl` тогда
+ * возвращает `null`) — в обоих случаях рамка пустая: битая картинка хуже пустой.
  */
 export function finishedRowHtml(job, outdir, runs) {
   const code = job.exit_code;
@@ -860,8 +874,9 @@ export function finishedRowHtml(job, outdir, runs) {
   const id = escapeHtml(job.id);
   const e = job.estimate || {};
   const run = ok ? null : runForJob(job, runs);
-  const completed = ok ? Number(e.forwards) || 0 : Number((run && run.completed) || 0);
-  const shot = previewUrl(job, completed, outdir);
+  const completed = ok ? 0 : Number((run && run.completed) || 0);
+  const step = ok ? 0 : previewStep(job, completed);
+  const shot = ok ? null : previewUrl(job, completed, outdir);
   // Код возврата стоит в `.meta` и только там: до этой правки упавшая карточка называла его
   // дважды подряд — «код 1» строкой выше и «код возврата 1» строкой ниже.
   const link = ok && clip
@@ -870,10 +885,18 @@ export function finishedRowHtml(job, outdir, runs) {
   const took = job.started_at && job.finished_at
     ? (Date.parse(job.finished_at) - Date.parse(job.started_at)) / 1000
     : NaN;
+  const frame = ok
+    ? (clip
+        ? `<video class="frame-video" preload="metadata" muted playsinline src="${clip}" `
+          + `title="Кадр ролика — щёлкните для показа/паузы"></video>`
+        : "")
+    : (shot
+        ? `<img src="${shot}" alt="снимок с середины диффузии" `
+          + `title="снимок с шага ${step} — прогон упал" onerror="this.hidden = true">`
+        : "");
   return `<article class="rcard ${ok ? "done" : "fail"}">`
     + `<div class="frame">`
-    // Кадр мог не долететь на диск или быть стёрт вместе с прогоном: пустая рамка честнее битой.
-    + (shot ? `<img src="${shot}" alt="превью-кадр" onerror="this.hidden = true">` : "")
+    + frame
     + `<span class="tc">${escapeHtml(e.width ?? "?")}×${escapeHtml(e.height ?? "?")}</span>`
     + `<span class="dur">${escapeHtml(e.duration_seconds ?? "?")} с</span>`
     + `</div>`
@@ -886,6 +909,8 @@ export function finishedRowHtml(job, outdir, runs) {
     + `<div class="link">${link}</div>`
     + (ok ? "" : `<div class="why">${escapeHtml(job.log_tail || "причина не записана")}</div>`)
     + `<div class="acts">`
+    + `<button data-act="chat" data-id="${id}">Обсудить</button>`
+    + `<button data-act="reveal" data-id="${id}">Показать в Finder</button>`
     + `<button data-act="dup" data-id="${id}">Копия</button>`
     + `</div>`
     + `</div>`
@@ -2571,9 +2596,22 @@ function startPage() {
     }
   }
 
+  /** Задача по `id`, в каком бы из четырёх списков `/api/state` она ни сидела.
+   *
+   *  `openChatFromJob` зовёт её для любой карточки с кнопкой «Обсудить» — а с C2 такая
+   *  кнопка есть и у готовой (`finishedRowHtml`), не только у ждущей. Искать по одному
+   *  `queue.pending`, как раньше, значит открывать разговор для ждущей и молча ничего не
+   *  делать по клику для готовой — не отказ, а тишина, которую легко принять за то, что
+   *  кнопка ничего и не делала. */
+  function jobById(id) {
+    const queue = (state && state.queue) || {};
+    return [...(queue.pending || []), ...(queue.running || []),
+            ...(queue.done || []), ...(queue.failed || [])]
+      .find((row) => row.id === id) || null;
+  }
+
   async function openChatFromJob(id) {
-    const job = ((state && state.queue && state.queue.pending) || [])
-      .find((row) => row.id === id);
+    const job = jobById(id);
     if (!job) return;
     const prompt = await jobPromptText(job);
     await openChatModal({ kind: "job", id }, {
@@ -3076,9 +3114,30 @@ function startPage() {
     }
   }
 
+  /** «Показать в Finder» для готовой карточки: сервер сам решает, что показать (ролик или
+   *  каталог прогона, см. `_reveal_job` в `web.py`), эта кнопка только просит его об этом.
+   *  Не через `withQueue` — ничего в очереди не меняется, и перечитывать `/api/state` ради
+   *  локального открытия окна Finder незачем. */
+  async function revealInFinder(id) {
+    try {
+      await api("POST", `/api/jobs/${encodeURIComponent(id)}/reveal`, {});
+      clearError();
+    } catch (error) {
+      if (error.payload) showError(error.payload);
+    }
+  }
+
   // -- подписки ---------------------------------------------------------------------------
 
   document.addEventListener("click", (event) => {
+    // Кадр готовой задачи — не кнопка, а `<video>` (см. `finishedRowHtml`): щёлкнули —
+    // пуск/пауза на месте, без своих элементов управления и без открытия вкладки, повторный
+    // щелчок — снова пауза.
+    const video = event.target.closest("video.frame-video");
+    if (video) {
+      if (video.paused) video.play(); else video.pause();
+      return;
+    }
     const button = event.target.closest("button[data-act]");
     if (!button) return;
     const id = button.dataset.id;
@@ -3092,6 +3151,7 @@ function startPage() {
       withQueue(() => api("POST", `/api/jobs/${encodeURIComponent(id)}/duplicate`, {}));
       return;
     }
+    if (button.dataset.act === "reveal") { revealInFinder(id); return; }
     if (button.dataset.act === "del") {
       withQueue(async () => {
         await api("DELETE", "/api/jobs/" + encodeURIComponent(id));
