@@ -120,18 +120,30 @@ export function jobTag(job) {
   return stem.slice(stem.lastIndexOf("/") + 1) || job.id;
 }
 
-/** `/media/<прогон>/<файл>` строится из `output_stem`, который сервер хранит
- *  абсолютным: предпоследний сегмент — каталог прогона, последний — основа
- *  имени. Если задача пишет прямо в корень выхода, каталога прогона нет и
- *  ссылка не строится: `/media` требует ровно `<прогон>/<файл>`. */
-export function mediaParts(outputStem) {
-  const parts = String(outputStem || "").split("/").filter((x) => x !== "");
-  if (parts.length < 2) return null;
-  return { run: parts[parts.length - 2], stem: parts[parts.length - 1] };
+/** `/media/<прогон>/<файл>` строится из `output_stem` (абсолютный) и `outdir` —
+ *  тот самый `--outdir`, с которым запущен `h3 web`, из `/api/state` (`build_state`
+ *  в `web.py`). Fix round 1 (ревью A6, C1): раньше «прогон» брался по числу
+ *  сегментов (предпоследний), что верно ровно на глубине 1 — а своя папка
+ *  задачи (A6) плюс папка-дата, которую сама форма подставляет по умолчанию
+ *  (`defaultOutdir()`), вместе дают глубину 2 и больше. Без `outdir` сервера
+ *  границу между «корнем сервера» и «путём задачи» разобрать нечем — вся
+ *  строка `output_stem` абсолютна и ничем не выдаёт, где она начинается, — и
+ *  без него ссылка не строится. Остаток после `outdir/` целиком, до
+ *  последнего `/`, идёт в `run` одним куском (сервер, `_media`, сам разбирает
+ *  его до последнего `/`, а не по сегментам) — это и даёт произвольную
+ *  глубину: `2026-08-12/20260813-1435-kot-italy` не хуже, чем `2026-08-12`. */
+export function mediaParts(outputStem, outdir) {
+  const stem = String(outputStem || "");
+  const base = String(outdir || "");
+  if (!base || !stem.startsWith(`${base}/`)) return null;
+  const relative = stem.slice(base.length + 1);
+  const lastSlash = relative.lastIndexOf("/");
+  if (lastSlash <= 0) return null;
+  return { run: relative.slice(0, lastSlash), stem: relative.slice(lastSlash + 1) };
 }
 
-export function clipUrl(job) {
-  const parts = mediaParts(job.output_stem);
+export function clipUrl(job, outdir) {
+  const parts = mediaParts(job.output_stem, outdir);
   if (!parts) return null;
   return `/media/${encodeURIComponent(parts.run)}/${encodeURIComponent(parts.stem + ".mp4")}`;
 }
@@ -146,11 +158,11 @@ export function previewStep(job, completedForwards) {
   return Math.floor(done / every) * every;
 }
 
-export function previewUrl(job, completedForwards) {
+export function previewUrl(job, completedForwards, outdir) {
   const step = previewStep(job, completedForwards);
   if (step <= 0) return null;
   const explicit = argValue(job.args, "--preview-stem");
-  const parts = mediaParts(explicit || job.output_stem);
+  const parts = mediaParts(explicit || job.output_stem, outdir);
   if (!parts) return null;
   const name = `${parts.stem}-preview-step${String(step).padStart(2, "0")}.jpg`;
   return `/media/${encodeURIComponent(parts.run)}/${encodeURIComponent(name)}`;
@@ -733,11 +745,15 @@ export function pendingRowHtml(job, { editingId = null } = {}) {
  * Завершённая задача: код возврата виден всегда, причина — у упавших.
  * Единственное действие — копия (см. `pendingRowHtml`): прогон уже случился,
  * отменять и поднимать нечего, а вот повторить теми же параметрами — обычное дело.
+ *
+ * `outdir` — необязательный (fix round 1, A6): без него `clipUrl` просто не
+ * построит ссылку (см. `mediaParts`), а не упадёт — строка ещё покажет имя
+ * файла текстом, как до этой задачи, если `outdir` почему-то не пришёл.
  */
-export function finishedRowHtml(job) {
+export function finishedRowHtml(job, outdir) {
   const code = job.exit_code;
   const ok = code === 0;
-  const clip = ok ? clipUrl(job) : null;
+  const clip = ok ? clipUrl(job, outdir) : null;
   const stem = String(job.output_stem || "");
   const name = stem.slice(stem.lastIndexOf("/") + 1);
   const id = escapeHtml(job.id);
@@ -1615,7 +1631,7 @@ function startPage() {
 
     // -- закончилось за сутки
     const finished = finishedWithin([...(queue.done || []), ...(queue.failed || [])], now);
-    $("finished").innerHTML = finished.map(finishedRowHtml).join("");
+    $("finished").innerHTML = finished.map((job) => finishedRowHtml(job, state.outdir)).join("");
     $("finished-empty").hidden = finished.length > 0;
     const failed = finished.filter((job) => job.exit_code !== 0).length;
     $("done-sum").textContent = finished.length
@@ -1673,7 +1689,7 @@ function startPage() {
     const till = new Date(now.getTime() + remaining * 1000);
     const share = forwards ? Math.min(1, completed / forwards) : 0;
     const peak = jobPeak(job);
-    const shot = previewUrl(job, completed);
+    const shot = previewUrl(job, completed, state.outdir);
 
     const e = job.estimate || {};
     const cell = (k, v, cls = "") =>

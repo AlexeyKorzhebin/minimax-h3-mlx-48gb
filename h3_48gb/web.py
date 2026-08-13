@@ -476,6 +476,17 @@ def build_state(queue_root, outdir) -> dict:
     answer through here would tell a human's very first page load "the queue is running" about a
     queue that is guaranteed to start paused the instant it exists -- review round 1 caught exactly
     this: the button would offer «⏸ Приостановить» before a single job could ever have run.
+
+    **`outdir` is the server's own, resolved the same way `_media` resolves it.** Fix round 1
+    (task A6 review): the page cannot build a `/media/<run>/<file>` link from `output_stem` alone
+    once a job's own subdirectory can sit at any depth inside `--outdir` -- the C1 finding was
+    exactly that `mediaParts` guessed the depth was always 1, which a job whose form-level
+    `--outdir` already named a subdirectory of its own (the page's own `defaultOutdir()` default,
+    `~/video-out/<date>`) breaks. The client has no other way to know where the server's own root
+    ends and a job's own path begins, so it is handed over here, once, as a plain string --
+    `str(Path(outdir).resolve())`, matching `_media`'s own `outdir = Path(self.server.outdir).
+    resolve()` exactly, so a prefix comparison on the client is comparing the same two strings
+    `_media` itself would produce.
     """
     with queue_errors(queue_root):
         jobs, broken = q.scan(queue_root)
@@ -491,6 +502,7 @@ def build_state(queue_root, outdir) -> dict:
         "ok": True,
         "worker": {"state": state},
         "paused": paused,
+        "outdir": str(Path(outdir).resolve()),
         "queue": {**grouped,
                   "broken": [{"path": item.path, "error": item.error} for item in broken]},
         "runs": [run.as_dict() for run in runs_module.scan(Path(outdir))],
@@ -906,6 +918,36 @@ def queue_write_errors(queue_root, *, what="the request"):
         ) from exc
 
 
+def _refuse_if_relocation_escapes_the_roots(args: list[str], output_stem: str,
+                                            roots: dict[str, Path]) -> None:
+    """`resolve_within` the output_stem `submit` will actually relocate to -- not the flat one
+    `prepare_submission`'s dry run reported -- or raise `path_outside_root`.
+
+    Fix round 1 (I2, review round 1, Important). `queue._base_outdir` strips a directory that
+    matches `queue._JOB_SUBDIR_RE` (`YYYYMMDD-HHMM-<slug>`) before nesting a fresh one under it --
+    right when that directory really is a job's own subdirectory from an earlier submission, wrong
+    when it is the server's *own* `--outdir`, spelled the same way by coincidence (or by a human
+    promoting an old job's own subdirectory to `--outdir` by hand). Left unchecked, every job
+    submitted to such a server lands one level *above* the server's own root, outside every root
+    this server may write to -- `prepare_submission`'s own `resolve_within` on `output_stem` cannot
+    catch this, because it runs *before* `submit` relocates anything.
+
+    Called **before** `submit` ever writes the job to `pending/`, not after: a check that ran after
+    would also have to cancel the job it had just created, and the worker could claim it in the
+    window between the two -- a real race that would leave a job in `running/` about to spawn `h3
+    generate` with an `--outdir` outside every root, unstoppable by the time this noticed. Checking
+    first means the job never exists at all if the relocation would have escaped.
+
+    The exact subdirectory this previews is not necessarily the one the real `submit` call moments
+    later will use -- its own clock reads a few instructions later, and could cross the minute
+    boundary `queue._dir_stamp` rounds to. Harmless here: whether a path escapes every root depends
+    only on the *base* directory `queue._base_outdir` decides on, which this computes identically,
+    never on the minute stamp appended after it.
+    """
+    preview_stem = q._relocate_to_job_subdir(list(args), str(output_stem), q._now())[1]
+    resolve_within(preview_stem, roots, write=True)
+
+
 def _duplicate_tag_candidates(args: list[str], output_stem: str):
     """`(args, output_stem)` pairs for `_duplicate_job` to try, in order, forever.
 
@@ -1030,6 +1072,36 @@ def _is_same_file(left, right) -> bool:
         return os.path.samefile(left, right)
     except OSError:
         return False
+
+
+def _is_within(path, other) -> bool:
+    """Whether `path` *is* `other`, or sits anywhere inside it -- checked level by level with
+    `_is_same_file`, never by comparing resolved path text.
+
+    Fix round 1 (task A6 review, C1): `/media` used to bound "the queue" by comparing `path`
+    against `other` directly, which was enough when a served directory was always exactly one
+    level under the outdir (`path` could only ever *be* the queue root, never something inside
+    it). Now that a served directory can sit at any depth (a job's own subdirectory nested inside
+    whatever `--outdir` the form already named), `queue/logs/x.jpg` has to be refused exactly as
+    `queue` itself already was -- so every ancestor of `path`, not just `path` itself, is checked.
+
+    Text comparison (`is_relative_to` on two resolved paths) would be wrong for the same reason
+    `_is_same_file` exists at all: `Path.resolve()` does not canonicalise case, so `<outdir>/QUEUE`
+    and `<outdir>/queue` are different *strings* on a case-insensitive volume even though the
+    filesystem calls them the same directory. `_is_same_file` at every level is what actually
+    answers "is this the queue's own file", the way the filesystem itself would.
+
+    Bounded by path depth: `.parent` strictly shortens `path` until it reaches the filesystem
+    root, where `.parent` returns itself -- the loop's own termination condition.
+    """
+    current = Path(path)
+    while True:
+        if _is_same_file(current, other):
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
 
 
 def _content_type(path: Path) -> str:
@@ -1512,6 +1584,8 @@ class _Handler(BaseHTTPRequestHandler):
         # a number is the caller's mistake and should not cost a fork to discover.
         args, note = self._args_of(payload), self._note_of(payload)
         prepared = prepare_submission(args, self.server.roots)
+        _refuse_if_relocation_escapes_the_roots(
+            prepared["args"], prepared["report"]["output_stem"], self.server.roots)
         with queue_write_errors(self.server.queue_root, what="--tag"):
             job = q.submit(self.server.queue_root, prepared["args"], note,
                            prepared["report"], prepared["estimate"],
@@ -1597,6 +1671,7 @@ class _Handler(BaseHTTPRequestHandler):
         candidates = _duplicate_tag_candidates(job.args, job.output_stem)
         for _ in range(DUPLICATE_ATTEMPTS):
             args, output_stem = next(candidates)
+            _refuse_if_relocation_escapes_the_roots(args, output_stem, self.server.roots)
             try:
                 with queue_write_errors(self.server.queue_root, what="the job id"):
                     new_job = q.submit(self.server.queue_root, args, job.note,
@@ -2267,27 +2342,38 @@ class _Handler(BaseHTTPRequestHandler):
              "warning": warning, "llm": self._llm_state(name, cfg)})
 
     def _media(self, relative: str) -> tuple[int, str, bytes]:
-        """A preview frame or a finished clip from **one** run's directory under the outdir.
+        """A preview frame or a finished clip from **one** run's directory somewhere inside the
+        outdir -- at any depth, not just a direct child.
 
-        Four checks, and review circle 1 found the route shipping with only two of them. "Inside
-        the outdir" plus "inside the run directory" reads complete and is not: the *first segment*
-        of the URL decides what "the run directory" means, and three spellings make it collapse
-        back onto the outdir itself, at which point the second check compares the outdir with the
-        outdir and passes everything under it.
+        Fix round 1 (task A6 review, C1): a job's own `--outdir` can already sit more than one
+        level inside the server's own outdir (`defaultOutdir()` in `app.js` defaults the form to
+        `~/video-out/<date>`, one level down on its own; task A6's own per-job subdirectory adds a
+        second), so "the run directory" can no longer mean "the first URL segment, a direct child
+        of the outdir" -- the page cannot even name that one segment without knowing where the
+        server's own root ends, which is why `/api/state` now carries `outdir` (`build_state`).
+        This route follows: "the run directory" is now *everything before the last `/`*, and the
+        file is everything after it.
 
-        1. there must be a run segment and a file after it;
-        2. `<outdir>/<run>` must resolve inside the outdir -- this is what stops `..`;
-        3. it must be a **direct child** of the outdir. `/media//x`, `/media/./x` and
-           `/media/%2e/x` all resolve `<outdir>/<run>` to the outdir itself, and without this line
-           they served the whole output tree, `queue/logs/*.log` and `queue/pending/*.json`
-           included. Verified live before the fix, on all three spellings;
-        4. it must not be the queue, compared **by inode** (`os.path.samefile`) rather than by
-           path. `queue/` *is* a direct child of the outdir, so check 3 lets
-           `/media/queue/pending/<id>.json` through on its own -- and comparing the resolved paths
-           as text let `/media/QUEUE/...` through as well, because `Path.resolve()` does not
-           canonicalise case and this machine's volume is case-insensitive. `samefile` answers the
-           question the filesystem actually decides: on that same pair, path equality is `False`
-           and `samefile` is `True`;
+        Five checks, run in this order:
+
+        1. there must be a run segment and a file after it (`rpartition`'s own `not separator`);
+        2. no component of the **literal, unresolved** run path may be `.`, `..` or empty. This is
+           new here and it is not optional now that the run path can be more than one segment:
+           `resolve_within` alone answers "does this resolve inside the outdir", and
+           `run-a/../run-b` resolves to a path that is perfectly, legitimately inside the outdir --
+           `run-b`'s own directory -- while still being exactly the escape-from-one-run-into-
+           another review circle 1 first found (`test_media_cannot_step_out_of_one_run_into_
+           another`). The three collapsing spellings that check found (`//x`, `/./x`, `/%2e/x`)
+           are refused by the same rule: each puts an empty or `.` component in the run path;
+        3. `<outdir>/<run>` must resolve inside the outdir -- this is what stops a run path that
+           starts with enough literal `..` components to leave it entirely (`../../etc/passwd`);
+        4. it must not *be* the outdir itself, and it must not be the queue or anything inside the
+           queue, decided by inode identity (`_is_within`) at every level from the run directory up
+           to the outdir -- not by comparing resolved path text, which is wrong on a case-
+           insensitive volume (`_is_same_file`'s own docstring) and was already wrong before this
+           fix for the exact-match case; walking every ancestor is what makes `queue/logs/x.jpg`
+           refused exactly as `queue` itself already was, now that "inside the queue" is not
+           bounded to one level either;
         5. and the file itself must be one of `MEDIA_SUFFIXES` (in `_serve_file`), which is what
            makes the whole set survive a directory nobody thought of -- check 4 is a denylist by
            identity, and a denylist only ever covers the names someone listed.
@@ -2302,9 +2388,10 @@ class _Handler(BaseHTTPRequestHandler):
         the resolution is what held. `test_the_suffix_and_the_bytes_come_from_the_same_path` pins
         the property the five checks rest on.
 
-        The tail after the run segment is deliberately *not* flattened: a run directory has
+        The tail after the run path is deliberately *not* flattened further: a run directory has
         subdirectories of its own (`checkpoints/`), and everything below it is still inside it --
-        `19-real-run/checkpoints/step05.jpg` is a legitimate preview frame.
+        `19-real-run/checkpoints/step05.jpg` is a legitimate preview frame, and so, now, is
+        `2026-08-12/20260813-1435-kot-italy/h3-kot-italy-896x576.mp4`.
 
         **Threat model: the run directory is trusted.** A *hard* link named `clip.mp4` inside it,
         pointing at `queue/pending/<id>.json` or anywhere else on the volume, is served, and
@@ -2316,20 +2403,29 @@ class _Handler(BaseHTTPRequestHandler):
         the perimeter. What this route defends is the *remote* caller: a browser on someone else's
         page, which can send URLs and nothing else.
         """
-        run, separator, rest = relative.partition("/")
-        if not separator or not rest:
+        directory, separator, filename = relative.rpartition("/")
+        if not separator or not filename:
             return 404, "application/json", _error_bytes(
                 "not_found", "a media URL is /media/<run>/<file>", {"path": relative})
-        outdir = Path(self.server.outdir).resolve()
-        run_dir = resolve_within(Path(self.server.outdir) / run, {"outdir": outdir}, write=False)
-        if run_dir.parent != outdir or _is_same_file(run_dir, self.server.queue_root):
+        if any(part in ("", ".", "..") for part in directory.split("/")):
             raise CliError(
                 "path_outside_root",
-                f"/media serves one run's directory directly under the output directory, and "
-                f"{run!r} is not one",
-                {"path": relative, "run": run, "resolved": str(run_dir), "outdir": str(outdir)},
+                f"/media does not accept an empty, . or .. segment in a run's own path: "
+                f"{relative!r}",
+                {"path": relative, "run": directory},
             )
-        return _serve_file(run_dir, rest, suffixes=MEDIA_SUFFIXES)
+        outdir = Path(self.server.outdir).resolve()
+        run_dir = resolve_within(Path(self.server.outdir) / directory, {"outdir": outdir},
+                                 write=False)
+        if run_dir == outdir or _is_within(run_dir, self.server.queue_root):
+            raise CliError(
+                "path_outside_root",
+                f"/media serves one run's directory inside the output directory, and {directory!r} "
+                f"is not one",
+                {"path": relative, "run": directory, "resolved": str(run_dir),
+                 "outdir": str(outdir)},
+            )
+        return _serve_file(run_dir, filename, suffixes=MEDIA_SUFFIXES)
 
     def send_error(self, code, message=None, explain=None) -> None:
         """JSON, never the HTML page `BaseHTTPRequestHandler` would otherwise produce.

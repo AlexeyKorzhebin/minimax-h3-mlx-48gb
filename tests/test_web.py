@@ -467,6 +467,16 @@ def test_api_state_reports_a_run_in_flight(server, monkeypatch):
         [("in_flight", 3, 7)]
 
 
+def test_api_state_reports_the_servers_own_outdir(server):
+    """Task A6, fix round 1 (C1). The page cannot build a `/media` link for a job whose own
+    subdirectory sits more than one level inside `--outdir` without knowing where the server's
+    own root ends -- `output_stem` alone, an absolute path, gives no such boundary. `build_state`'s
+    own docstring explains why this has to be resolved exactly the way `_media` resolves it.
+    """
+    _, body = _json(server, "/api/state")
+    assert body["outdir"] == str(server.outdir.resolve())
+
+
 def test_a_queue_that_cannot_be_read_is_a_500_naming_the_directory(server, monkeypatch):
     def unreadable(root):
         raise PermissionError(13, "Permission denied")
@@ -2178,6 +2188,44 @@ def test_a_job_that_does_not_name_an_outdir_at_all_is_refused(queue_server):
     assert _pending(queue_server) == []
 
 
+def test_submitting_when_the_servers_own_outdir_looks_like_a_job_subdirectory_is_refused(tmp_path):
+    """Fix round 1 (I2, review round 1, Important). `queue._base_outdir` strips a trailing
+    directory that matches `queue._JOB_SUBDIR_RE` before nesting a fresh one under it -- exactly
+    right when that directory is a job's own subdirectory from an earlier submission, and exactly
+    wrong when it is the server's *own* `--outdir`, which just happens to be spelled the same way
+    (a leftover job subdirectory promoted to `--outdir` by hand, say). Left unchecked, every job
+    submitted to a server started that way lands one level *above* the server's own root -- outside
+    every root this server may write to, and nothing here would ever notice.
+
+    The probe: a server whose `--outdir` is itself named like a job subdirectory
+    (`20260813-1200-run`), and an ordinary submission naming that same directory as `--outdir` (the
+    form's own default, `_job_args`'s convention throughout this suite). `queue.submit` would
+    relocate straight past the server's root; this must be refused before the job ever reaches
+    `pending/`.
+    """
+    outdir = tmp_path / "base" / "20260813-1200-run"
+    outdir.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    (repo / "prompts").mkdir(parents=True)
+    models = tmp_path / "models"
+    bake_adaln_table(models / "ckpt")
+    webui = tmp_path / "webui"
+    webui.mkdir()
+    root = q.layout(outdir / "queue")["root"]
+    live = _serve(root, outdir, repo=repo, models=models, webui=webui)
+    try:
+        status, answer = _call(live, "POST", "/api/jobs",
+                               {"args": _job_args(live, tag="кот"), "note": ""})
+        assert status == 400, answer
+        assert answer["error"]["code"] == "path_outside_root", answer
+        assert _pending(live) == [], "nothing must be queued when the relocation escapes the root"
+        assert list((tmp_path / "base").iterdir()) == [outdir], (
+            "no stray directory may appear beside the server's own outdir")
+    finally:
+        live.httpd.shutdown()
+        live.httpd.server_close()
+
+
 def test_the_estimate_route_reads_the_bit_width_through_the_resolved_checkpoint(queue_server,
                                                                                 monkeypatch):
     """One request must not be quoted at 4 bits here and 8 bits on submission. `--checkpoint
@@ -2355,10 +2403,9 @@ def test_media_serves_the_clip_from_a_jobs_own_subdirectory(server):
 
     `--outdir` here is the server's own outdir directly, exactly as every other submission fixture
     in this suite builds it (`_job_args`, `_submit_job` in `test_chat_web.py`): task A6 nests the
-    job's own subdirectory one level under that, which is the one level `/media` itself supports
-    (`_media`'s own docstring: the *first* URL segment is the run directory, a direct child of the
-    outdir). A job whose `--outdir` already names a deeper directory of the caller's own choosing
-    -- unrelated to this task -- is not covered here.
+    job's own subdirectory one level under that. `outdir` for `clipUrl` comes from `/api/state`
+    (`build_state`'s own field, fix round 1), exactly as the real page reads it -- not a value this
+    test already knows independently, which would prove nothing about the wire-up.
     """
     job = q.submit(server.queue_root, ["generate", "--tag", "kot-italy"], "",
                    {"output_stem": str(server.outdir / "h3-kot-italy-896x576")}, {})
@@ -2368,8 +2415,41 @@ def test_media_serves_the_clip_from_a_jobs_own_subdirectory(server):
     result_dir.mkdir(parents=True, exist_ok=True)
     Path(f"{job.output_stem}.mp4").write_bytes(b"\x00mp4")
 
-    url = _node_eval(f"console.log(JSON.stringify(app.clipUrl({json.dumps(job.as_dict())})));")
+    _, state = _json(server, "/api/state")
+    url = _node_eval(
+        f"console.log(JSON.stringify(app.clipUrl({json.dumps(job.as_dict())}, "
+        f"{json.dumps(state['outdir'])})));")
     assert url is not None, "clipUrl must still build a link for a relocated job"
+
+    status, headers, body = _request(server, url)
+    assert status == 200 and body == b"\x00mp4", (status, url, body[:40])
+
+
+@_needs_node
+def test_media_serves_the_clip_when_the_forms_own_outdir_already_nests_a_folder(server):
+    """Fix round 1 (C1), the review's own live probe. `defaultOutdir()` (app.js) suggests
+    `~/video-out/<date>` for the form's `--outdir` -- one level below the server's own root on its
+    own -- and task A6 nests the job's own subdirectory *inside that*, a second level. `clipUrl`
+    used to guess "run" by counting segments from the end of `output_stem` and got this case wrong
+    (it named the date folder as "run" and dropped the job's own subdirectory entirely); this pins
+    the fix with a real `/media` request against a real file, not by inspecting the URL string.
+    """
+    form_outdir = server.outdir / "2026-08-13"
+    job = q.submit(server.queue_root,
+                   ["generate", "--tag", "kot-italy", "--outdir", str(form_outdir)], "",
+                   {"output_stem": str(form_outdir / "h3-kot-italy-896x576")}, {})
+    result_dir = Path(job.output_stem).parent
+    assert result_dir.parent == form_outdir and result_dir.parent.parent == server.outdir, (
+        "the fixture must actually exercise two levels of nesting below the server's own outdir, "
+        "or this test cannot tell depth 1 from depth 2 apart")
+    result_dir.mkdir(parents=True, exist_ok=True)
+    Path(f"{job.output_stem}.mp4").write_bytes(b"\x00mp4")
+
+    _, state = _json(server, "/api/state")
+    url = _node_eval(
+        f"console.log(JSON.stringify(app.clipUrl({json.dumps(job.as_dict())}, "
+        f"{json.dumps(state['outdir'])})));")
+    assert url is not None, "clipUrl must build a link two levels deep"
 
     status, headers, body = _request(server, url)
     assert status == 200 and body == b"\x00mp4", (status, url, body[:40])
@@ -2946,16 +3026,47 @@ def test_progress_is_drawn_as_one_division_per_forward():
 
 
 @_needs_node
+def test_media_parts_builds_a_relative_path_of_any_depth_inside_outdir():
+    """Task A6, fix round 1 (C1). `mediaParts` used to guess "run" from the last two segments of
+    `output_stem`, which is only ever right when a job's own directory sits exactly one level
+    inside the outdir -- the review's own probe: `defaultOutdir()`'s date folder plus task A6's own
+    per-job subdirectory is *two* levels, and the old guess named the date folder, not the job's
+    own subdirectory.
+
+    Depth 1 and a flat stem (a job that writes straight into the outdir, no subdirectory at all --
+    something `/media` itself has never been able to serve, single level or not) are pinned
+    alongside depth 2 so a fix that only handles the deep case cannot pass by accident.
+    """
+    depth_two, depth_one, flat, no_outdir, outside_outdir = _node_eval("""
+      console.log(JSON.stringify([
+        app.mediaParts("/o/2026-08-13/20260813-1435-kot-italy/h3-kot-italy-896x576", "/o"),
+        app.mediaParts("/o/20260813-1435-kot-italy/h3-kot-italy-896x576", "/o"),
+        app.mediaParts("/o/h3-kot-italy-896x576", "/o"),
+        app.mediaParts("/o/2026-08-13/20260813-1435-kot-italy/h3-kot-italy-896x576", null),
+        app.mediaParts("/elsewhere/h3-kot-italy-896x576", "/o"),
+      ]));
+    """)
+    assert depth_two == {"run": "2026-08-13/20260813-1435-kot-italy", "stem": "h3-kot-italy-896x576"}
+    assert depth_one == {"run": "20260813-1435-kot-italy", "stem": "h3-kot-italy-896x576"}
+    assert flat is None, "a job with no subdirectory at all has no run segment for /media"
+    assert no_outdir is None, "without outdir there is no boundary to cut output_stem at"
+    assert outside_outdir is None, "a stem outside outdir names no run under it at all"
+
+
+@_needs_node
 def test_the_preview_frame_is_the_last_one_the_run_actually_wrote():
     """Requirement 8's thumbnail. The name is derived from the cadence and the count of finished
     forwards, so the page asks for a frame that exists instead of one it hopes for.
+
+    `outdir` (`/o`) is now required to build any link at all (task A6, fix round 1) -- `output_stem`
+    alone no longer says where the server's own root ends.
     """
     at_seven, at_two, from_stem = _node_eval("""
       const job = {args: ["generate", "--preview-every", "5"],
                    output_stem: "/o/ночь/h3-кот-896x576"};
-      console.log(JSON.stringify([app.previewUrl(job, 7), app.previewUrl(job, 2),
+      console.log(JSON.stringify([app.previewUrl(job, 7, "/o"), app.previewUrl(job, 2, "/o"),
                                   app.previewUrl({args: ["generate"],
-                                                  output_stem: "h3-кот"}, 9)]));
+                                                  output_stem: "h3-кот"}, 9, "/o")]));
     """)
     assert at_seven.endswith("-preview-step05.jpg"), at_seven
     assert at_seven.startswith("/media/%D0%BD%D0%BE%D1%87%D1%8C/"), at_seven
@@ -3001,6 +3112,9 @@ def test_the_output_directory_defaults_to_the_one_the_last_jobs_used():
 def test_finished_shows_the_exit_code_and_a_failure_shows_why():
     """Requirement 9. The reason is the worker's own `log_tail`; inventing a friendlier one would
     hide the only line that says what happened.
+
+    `outdir` (`/o`) is `finishedRowHtml`'s second argument now (task A6, fix round 1) -- without
+    it `clipUrl` cannot build a link at all and the row would fall back to plain text.
     """
     ok, failed = _node_eval("""
       const base = {id: "j", note: "", args: ["generate", "--tag", "кот"],
@@ -3008,9 +3122,9 @@ def test_finished_shows_the_exit_code_and_a_failure_shows_why():
                     output_stem: "/o/ночь/h3-кот-896x576",
                     started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
       console.log(JSON.stringify([
-        app.finishedRowHtml({...base, exit_code: 0}),
+        app.finishedRowHtml({...base, exit_code: 0}, "/o"),
         app.finishedRowHtml({...base, exit_code: 1,
-                             log_tail: "RuntimeError: [metal::malloc] 51.4 GB > 48.0 GB"}),
+                             log_tail: "RuntimeError: [metal::malloc] 51.4 GB > 48.0 GB"}, "/o"),
       ]));
     """)
     assert "код 0" in ok
