@@ -35,6 +35,7 @@ from h3_48gb import queue as q
 from h3_48gb import web
 from h3_48gb.cli import DEFAULT_CHECKPOINT, ERROR_CODES, CliError, build_parser
 # `flock` is only honest when the holder is a separate process -- see the module docstring.
+from test_cli import bake_adaln_table
 from test_queue import _DRY, _external_lock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -1295,7 +1296,10 @@ def queue_server(tmp_path):
     repo = tmp_path / "repo"
     (repo / "prompts").mkdir(parents=True)
     models = tmp_path / "models"
-    (models / "ckpt").mkdir(parents=True)
+    # A checkpoint, not just a directory named like one: a fake checkpoint with no readable
+    # `transformer/adaln_cache.safetensors` is now refused (`checkpoint_without_adaln`) before
+    # anything else about the job is judged, and these tests are about the other refusals.
+    bake_adaln_table(models / "ckpt")
     webui = tmp_path / "webui"
     webui.mkdir()
     root = q.layout(outdir / "queue")["root"]
@@ -1612,8 +1616,7 @@ def test_posting_a_job_with_an_image_never_pulls_mlx_into_the_server(tmp_path):
     (outdir / "run").mkdir(parents=True)
     repo = tmp_path / "repo"
     (repo / "prompts").mkdir(parents=True)
-    models = tmp_path / "models" / "ckpt"
-    models.mkdir(parents=True)
+    models = bake_adaln_table(tmp_path / "models" / "ckpt")
     image = outdir / "frame.png"
     _write_png(image)
 

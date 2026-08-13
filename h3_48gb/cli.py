@@ -107,6 +107,7 @@ ERROR_CODES = {
     "lora_not_found": "--turbo-lora points at a file that does not exist",
     "turbo_strength_invalid": "--turbo-strength is not a finite number",
     "adaln_cache_unreadable": "--adaln-cache exists but is not a readable AdaLN table",
+    "checkpoint_without_adaln": "the checkpoint has no readable transformer/adaln_cache.safetensors and no --adaln-cache was given; this build cannot build the table itself",
     "upstream_patch_missing": "a keyframe was given but the vendored upstream/ checkout is unpatched",
     "outdir_not_found": "--outdir does not exist or cannot be read",
     "prompt_file_not_found": "--prompt-file points at a file that does not exist",
@@ -252,10 +253,34 @@ class RunSpec:
                     f"--{name} must be a multiple of 32, got {value}",
                     {name: value},
                 )
-        # A checkpoint whose cache cannot be read falls back to the shipped grid, so a missing or
-        # corrupt cache still refuses early rather than 28 GB into a run.
-        required = (_grid_points_of(self.adaln_cache) if self.adaln_cache
-                    else baked_grid_points(self.checkpoint)) or BAKED_GRID_POINTS
+        # Which grid this run is allowed to ask for. `--adaln-cache` wins when it is given (its own
+        # readability is checked below, with a refusal that names the flag); otherwise the
+        # checkpoint's own baked table answers.
+        #
+        # **A checkpoint with no readable table is a refusal, not a fallback to 31.** That fallback
+        # cost a run: a broken symlink at `transformer/adaln_cache.safetensors` pointed at a file
+        # that was never baked, `baked_grid_points` returned `None` exactly as it does for "no cache
+        # here", `BAKED_GRID_POINTS` accepted the default `--steps 31`, and the failure arrived
+        # after 21 GB of weights had been loaded -- `ModulationCache.build` reads `time_embedder`
+        # and every block's `adaln_proj`, and this build ships neither, so there is no path where
+        # such a run can finish. The number 31 is only ever *right* for a checkpoint that has the
+        # table; when there is none, quoting it invents a grid nobody baked and turns a five-second
+        # refusal into a five-minute one.
+        #
+        # `--adaln-cache` is the way out, and the message says so: a table baked for another grid
+        # (`scripts/bake_adaln.py`) makes the checkpoint's own missing one irrelevant.
+        if self.adaln_cache:
+            required = _grid_points_of(self.adaln_cache) or BAKED_GRID_POINTS
+        else:
+            required = baked_grid_points(self.checkpoint)
+            if required is None:
+                raise CliError(
+                    "checkpoint_without_adaln",
+                    f"у чекпойнта нет читаемой таблицы AdaLN — передай --adaln-cache или почини "
+                    f"{Path(self.checkpoint) / 'transformer/adaln_cache.safetensors'}",
+                    {"checkpoint": str(self.checkpoint),
+                     "cache": str(Path(self.checkpoint) / "transformer/adaln_cache.safetensors")},
+                )
         if self.steps != required:
             raise CliError(
                 "schedule_not_baked",

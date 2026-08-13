@@ -20,7 +20,36 @@ from h3_48gb.cli import (
     run_status,
     spec_from_args,
 )
-from h3_48gb.cli import _checkpoint_path_for, DEFAULT_OUTDIR
+from h3_48gb.cli import _checkpoint_path_for, BAKED_GRID_POINTS, DEFAULT_OUTDIR
+
+
+def bake_adaln_table(checkpoint: Path, points: int = BAKED_GRID_POINTS) -> Path:
+    """`<checkpoint>/transformer/adaln_cache.safetensors` covering `points` grid points.
+
+    Header only, in the sense that matters: `RunSpec` reads `video_sigmas`'s shape out of the
+    safetensors header and never touches the tensor bytes, so a real table (873 MB on this
+    machine) and this one are the same file to everything under test. The bytes *are* written,
+    though -- the header declares their offsets, and a file whose declared length is not there is
+    a different fixture than the one this pretends to be.
+
+    A fake checkpoint needs it because a checkpoint with no readable table is now a refusal
+    (`checkpoint_without_adaln`) rather than a silent fallback to 31: the fixtures say "a
+    checkpoint" and a directory with nothing in it stopped being one. Deliberately not an autouse
+    fixture -- a refusal that every test disarms by existing is not a refusal, and the tests that
+    check it need the *absence* to survive.
+    """
+    import struct
+
+    root = Path(checkpoint) / "transformer"
+    root.mkdir(parents=True, exist_ok=True)
+    header = json.dumps({
+        "video_sigmas": {"dtype": "F32", "shape": [points], "data_offsets": [0, 4 * points]},
+    }).encode()
+    with open(root / "adaln_cache.safetensors", "wb") as fh:
+        fh.write(struct.pack("<Q", len(header)))
+        fh.write(header)
+        fh.write(b"\x00" * 4 * points)
+    return Path(checkpoint)
 
 
 def test_parser_defaults_to_the_baked_schedule():
@@ -156,7 +185,7 @@ def test_raw_arrays_are_written_before_encoding(tmp_path):
         raise RuntimeError("ffmpeg unavailable")
 
     spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
-                   checkpoint=tmp_path, outdir=tmp_path, tag="t")
+                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
     try:
         run_generate(spec, pipeline_factory=lambda _: (lambda **kw: _StubResult()),
                      save_mp4_fn=exploding_save_mp4)
@@ -176,7 +205,7 @@ def test_truncated_raw_file_is_not_left_at_destination(tmp_path):
     import glob
 
     spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
-                   checkpoint=tmp_path, outdir=tmp_path, tag="t")
+                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
 
     # Patch os.replace to fail *after* the real savez_compressed has written the temp file.
     # This exercises the window between "write temp" and "atomic rename".
@@ -210,7 +239,7 @@ def test_rejects_mismatched_schedule(tmp_path):
     """
     try:
         RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=30, seed=0,
-                checkpoint=tmp_path, outdir=tmp_path, tag="t")
+                checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
     except CliError as exc:
         assert "31" in str(exc), "error message must name the baked value"
         assert "AdaLN" in str(exc), "error message must explain why"
@@ -741,7 +770,7 @@ class _StubPipe:
 
 def test_resume_fails_loudly_when_there_is_nothing_to_resume(tmp_path):
     spec = RunSpec(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
-                   checkpoint=tmp_path, outdir=tmp_path, tag="t")
+                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
     try:
         run_resume(spec, pipeline_factory=lambda _: _StubPipe())
     except CliError as exc:
@@ -752,7 +781,7 @@ def test_resume_fails_loudly_when_there_is_nothing_to_resume(tmp_path):
 
 def test_resume_continues_when_a_matching_checkpoint_exists(tmp_path):
     spec = RunSpec(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
-                   checkpoint=tmp_path, outdir=tmp_path, tag="t")
+                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
     pipe = _StubPipe()
     path = _checkpoint_path_for(spec, pipe, tmp_path / "checkpoints")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -762,18 +791,18 @@ def test_resume_continues_when_a_matching_checkpoint_exists(tmp_path):
     assert report["tag"] == "t"
 
 
-def test_resume_checkpoint_path_changes_with_the_request():
+def test_resume_checkpoint_path_changes_with_the_request(tmp_path):
     """Two different requests must never resolve to the same checkpoint file."""
     spec_a = RunSpec(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
-                     checkpoint=Path("/x"), outdir=Path("/x"), tag="t")
+                     checkpoint=bake_adaln_table(tmp_path), outdir=Path("/x"), tag="t")
     spec_b = RunSpec(prompt="a dog", width=64, height=64, duration=1.0, steps=31, seed=0,
-                     checkpoint=Path("/x"), outdir=Path("/x"), tag="t")
+                     checkpoint=bake_adaln_table(tmp_path), outdir=Path("/x"), tag="t")
     pipe = _StubPipe()
     assert (_checkpoint_path_for(spec_a, pipe, Path("/ckpt"))
             != _checkpoint_path_for(spec_b, pipe, Path("/ckpt")))
 
 
-def test_resume_checkpoint_path_changes_with_the_tag_alone():
+def test_resume_checkpoint_path_changes_with_the_tag_alone(tmp_path):
     """Pins the fix: `tag` used to be invisible to `request_identity` (upstream's `__call__` has no
     such parameter, so it never reached `bound.arguments`), so two otherwise-identical specs
     differing only by `--tag` silently resolved to the *same* checkpoint file — a `--tag` that
@@ -781,15 +810,15 @@ def test_resume_checkpoint_path_changes_with_the_tag_alone():
     only the tag differs, so this must resolve to two different files, asserted directly.
     """
     spec_a = RunSpec(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
-                     checkpoint=Path("/x"), outdir=Path("/x"), tag="a")
+                     checkpoint=bake_adaln_table(tmp_path), outdir=Path("/x"), tag="a")
     spec_b = RunSpec(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
-                     checkpoint=Path("/x"), outdir=Path("/x"), tag="b")
+                     checkpoint=bake_adaln_table(tmp_path), outdir=Path("/x"), tag="b")
     pipe = _StubPipe()
     assert (_checkpoint_path_for(spec_a, pipe, Path("/ckpt"))
             != _checkpoint_path_for(spec_b, pipe, Path("/ckpt")))
 
 
-def test_cli_and_checkpoint_module_agree_on_the_file_name():
+def test_cli_and_checkpoint_module_agree_on_the_file_name(tmp_path):
     """`_checkpoint_path_for` (cli.py) must resolve to exactly what `_resolve_store`
     (checkpoint.py) resolves to for the same run.
 
@@ -806,7 +835,7 @@ def test_cli_and_checkpoint_module_agree_on_the_file_name():
     from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
 
     spec = RunSpec(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=3,
-                   checkpoint=Path("/x"), outdir=Path("/x"), tag="t")
+                   checkpoint=bake_adaln_table(tmp_path), outdir=Path("/x"), tag="t")
     pipe = _StubPipe()
     ckpt_dir = Path("/ckpt")
 
@@ -990,7 +1019,7 @@ def test_the_preview_decoder_reaches_the_pipeline(tmp_path):
 
 def _spec(tmp_path, **overrides):
     base = dict(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
-                checkpoint=tmp_path, outdir=tmp_path, tag="t")
+                checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
     base.update(overrides)
     return RunSpec(**base)
 
@@ -1327,7 +1356,7 @@ def test_restart_is_named_in_the_mismatch_refusal(tmp_path):
         raise CheckpointMismatch("belongs to a different run")
 
     spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
-                   checkpoint=tmp_path, outdir=tmp_path, tag="t")
+                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
     try:
         run_generate(spec, pipeline_factory=lambda _: exploding_pipe)
     except CliError as exc:
@@ -1345,7 +1374,7 @@ def test_checkpoint_mismatch_surfaces_as_a_cli_error_not_a_raw_exception(tmp_pat
         raise CheckpointMismatch("this checkpoint belongs to a different run")
 
     spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
-                   checkpoint=tmp_path, outdir=tmp_path, tag="t")
+                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
     try:
         run_generate(spec, pipeline_factory=lambda _: exploding_pipe)
     except CliError as exc:
@@ -1361,7 +1390,7 @@ def test_checkpoint_corrupt_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path
         raise CheckpointCorrupt("could not be read")
 
     spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
-                   checkpoint=tmp_path, outdir=tmp_path, tag="t")
+                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
     try:
         run_generate(spec, pipeline_factory=lambda _: exploding_pipe)
     except CliError as exc:
@@ -1380,7 +1409,7 @@ def test_checkpoint_locked_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path)
         raise CheckpointLocked("another process already holds the lock for this checkpoint")
 
     spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
-                   checkpoint=tmp_path, outdir=tmp_path, tag="t")
+                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
     try:
         run_generate(spec, pipeline_factory=lambda _: exploding_pipe)
     except CliError as exc:
@@ -1723,7 +1752,8 @@ def test_a_keyframe_on_an_unpatched_checkout_is_refused_before_any_weight_loads(
 def _canvas(tmp_path, argv):
     from h3_48gb.cli import spec_from_args
     spec = spec_from_args(build_parser().parse_args(
-        argv + ["--outdir", str(tmp_path), "--checkpoint", str(tmp_path)]))
+        argv + ["--outdir", str(tmp_path),
+                "--checkpoint", str(bake_adaln_table(tmp_path))]))
     return spec.width, spec.height
 
 
@@ -1960,6 +1990,75 @@ def test_the_step_count_is_read_from_the_checkpoint_not_hardcoded(tmp_path):
     assert excinfo.value.detail["required"] == 8, "the refusal must quote this checkpoint's grid"
 
 
+@pytest.mark.parametrize("break_it", ["absent", "broken_symlink", "junk", "directory"])
+def test_a_checkpoint_with_no_readable_adaln_table_is_refused_before_the_weights_load(
+        tmp_path, break_it):
+    """Это стоило прогона: битый симлинк на неиспечённый файл — и отказ пришёл после 21 ГБ.
+
+    `baked_grid_points` возвращает `None` одинаково на «таблицы нет» и «таблица не читается», а
+    `or BAKED_GRID_POINTS` подставлял 31 — и `--steps 31` (значение по умолчанию!) проходил
+    проверку. Дальше прогон гарантированно умирал: `ModulationCache.build` читает
+    `dit.time_embedder` и `adaln_proj` каждого блока, а эта сборка не везёт ни того ни другого,
+    так что пути, на котором такой прогон доходит до конца, не существует вовсе. Тридцать одна
+    точка — правда про чекпойнт, у которого таблица есть; там, где её нет, это выдуманная сетка,
+    и цена выдумки — пять минут загрузки весов вместо пяти секунд отказа.
+
+    Четыре способа «нет читаемой таблицы» проверяются вместе, потому что они и в коде одно: тот
+    самый битый симлинк, отсутствие файла, мусор вместо safetensors и каталог с нужным именем.
+    """
+    checkpoint = tmp_path / "ckpt"
+    (checkpoint / "transformer").mkdir(parents=True)
+    table = checkpoint / "transformer" / "adaln_cache.safetensors"
+    if break_it == "broken_symlink":
+        table.symlink_to(tmp_path / "never-baked.safetensors")
+    elif break_it == "junk":
+        table.write_bytes(b"not a safetensors file at all")
+    elif break_it == "directory":
+        table.mkdir()
+
+    with pytest.raises(CliError) as excinfo:
+        RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
+                checkpoint=checkpoint, outdir=tmp_path, tag="t")
+    assert excinfo.value.code == "checkpoint_without_adaln", excinfo.value.code
+    assert "--adaln-cache" in excinfo.value.message, excinfo.value.message
+    assert "adaln_cache.safetensors" in excinfo.value.message, excinfo.value.message
+    assert excinfo.value.detail["checkpoint"] == str(checkpoint)
+
+    # Через настоящий путь валидации, а не только через конструктор: `--dry-run` для того и
+    # существует, чтобы отказ пришёл раньше весов, и именно он ведёт себя как прогон.
+    code = main(["generate", "кот", "--json", "--dry-run", "--outdir", str(tmp_path),
+                 "--checkpoint", str(checkpoint)])
+    assert code == 1
+
+    # Обе законные развязки остаются законными: своя читаемая таблица… (в соседнем каталоге —
+    # вариант `directory` занял имя файла каталогом, и печь поверх него нечего)
+    spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
+                   checkpoint=bake_adaln_table(tmp_path / "healthy"), outdir=tmp_path, tag="t")
+    assert spec.steps == 31
+
+
+def test_an_alternate_table_answers_for_a_checkpoint_that_has_none(tmp_path):
+    """…и `--adaln-cache`, ради которого отказ и называет флаг.
+
+    Отдельным тестом, а не хвостом предыдущего: это единственный способ запустить чекпойнт без
+    родной таблицы, и он обязан работать, даже когда рядом нет ни `transformer/`, ни самого
+    чекпойнта. Сетку при этом задаёт переданная таблица — 8 шагов, а не 31.
+    """
+    naked = tmp_path / "no-such-checkpoint"
+    table = bake_adaln_table(tmp_path / "alt", points=8) / "transformer" / "adaln_cache.safetensors"
+
+    spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=8, seed=0,
+                   checkpoint=naked, outdir=tmp_path, tag="t", adaln_cache=table)
+    assert spec.steps == 8
+
+    with pytest.raises(CliError) as excinfo:
+        RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
+                checkpoint=naked, outdir=tmp_path, tag="t", adaln_cache=table)
+    assert excinfo.value.code == "schedule_not_baked", (
+        "с переданной таблицей отказ должен быть про сетку, а не про отсутствие родной")
+    assert excinfo.value.detail["required"] == 8
+
+
 def test_output_does_not_default_into_the_weights_directory():
     """Clips are disposable; the 46 GB of weights beside them are not.
 
@@ -2029,7 +2128,7 @@ def _turbo_spec(tmp_path, **overrides):
     lora = tmp_path / "lora.safetensors"
     lora.write_bytes(b"x" * 128)
     base = dict(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
-                checkpoint=tmp_path, outdir=tmp_path, tag="t", turbo_lora=lora)
+                checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t", turbo_lora=lora)
     base.update(overrides)
     return RunSpec(**base)
 

@@ -147,7 +147,7 @@
             <div class="ctl"><input class="num narrow" id="lora-str" type="number" step="0.05" value="1.00"><span class="hint">1.00 — измеренный оптимум на этом канвасе</span></div>
           </div>
           <div class="row"><label for="adaln">Таблица AdaLN</label>
-            <div class="ctl"><input class="mono path" id="adaln" type="text" value="~/models/turbo/adaln_8_l100.safetensors" placeholder="~/models/turbo/adaln_8_l100.safetensors"><span class="hint">пусто — 8 шагов отклонит dry-run (schedule_not_baked), останутся 31</span></div>
+            <div class="ctl"><input class="mono path" id="adaln" type="text" value="~/models/turbo/adaln_8_l100.safetensors" placeholder="~/models/turbo/adaln_8_l100.safetensors"><span class="hint">пусто — сетку задаёт таблица самого чекпойнта, а у чекпойнта без неё dry-run откажет (раньше молча брал 31 и падал после загрузки весов)</span></div>
           </div>
           <div class="row"><label for="outdir">Каталог</label>
             <div class="ctl"><input class="mono path" id="outdir" type="text"></div>
