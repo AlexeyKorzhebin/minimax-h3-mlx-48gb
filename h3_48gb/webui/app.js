@@ -211,13 +211,24 @@ export function canvasIsPacked(width, height) {
       && width > 0 && height > 0 && width % 32 === 0 && height % 32 === 0;
 }
 
-/** Три готовых канваса, за черновик/предпросмотр/финал. Ровно эти три —
- *  форма не растёт списком пресетов, у неё есть ручной ввод для всего
- *  остального. */
+/** Три готовых канваса — черновик/предпросмотр/финал — и каждый в двух ориентациях (C2).
+ *
+ *  Вертикальные добавлены не ради полноты списка: вертикальный ролик снимается тем же
+ *  черновиком, что и горизонтальный, а до этой задачи его размеры набирались руками в оба поля
+ *  и набирались неправильно. Ровно шесть — форма не растёт списком пресетов дальше, у неё есть
+ *  «своё…» с ручным вводом для всего остального.
+ *
+ *  Порядок — парами (гориз., верт.): выпадашка читается сверху вниз, и размер обязан стоять
+ *  рядом со своим поворотом, а не в отдельном хвосте списка. `label` — подпись пункта без
+ *  чисел; числа в подписи пишет разметка, и `test_every_canvas_preset_has_its_own_option_...`
+ *  сверяет, что она пишет именно эти. */
 export const CANVAS_PRESETS = [
   { key: "draft", label: "черновик", w: 448, h: 288 },
+  { key: "draft-v", label: "черновик верт.", w: 288, h: 448 },
   { key: "small", label: "малое", w: 896, h: 576 },
+  { key: "small-v", label: "малое верт.", w: 576, h: 896 },
   { key: "large", label: "большое", w: 1344, h: 768 },
+  { key: "large-v", label: "большое верт.", w: 768, h: 1344 },
 ];
 
 /**
@@ -225,12 +236,68 @@ export const CANVAS_PRESETS = [
  *
  * Чистая функция — ни одного обращения к DOM, поэтому её проверяет узел без браузера, как и
  * весь остальной пул чистых функций этого модуля. Заполнение `#width`/`#height` и пересчёт
- * оценки после клика делает обработчик в `startPage()`, тем же путём, что и ручной ввод (см.
+ * оценки после выбора делает обработчик в `startPage()`, тем же путём, что и ручной ввод (см.
  * подписку `FIELDS` на `input`).
  */
 export function applyCanvasPreset(key) {
   const preset = CANVAS_PRESETS.find((p) => p.key === key);
   return preset ? { width: preset.w, height: preset.h } : null;
+}
+
+/**
+ * Пункт выпадашки, которому отвечает канвас `width`×`height`, или `"custom"`, если ни один.
+ *
+ * Обратная сторона `applyCanvasPreset`: выпадашка обязана показывать то, что в полях, а не то,
+ * что в ней последний раз выбрали руками. С этой стороны приходят правка задачи
+ * (`fillFormFrom` — у задачи свои числа, и они могут не совпасть ни с одним пресетом) и ручной
+ * ввод в «своё…».
+ */
+export function canvasPresetKey(width, height) {
+  const preset = CANVAS_PRESETS.find((p) => p.w === Number(width) && p.h === Number(height));
+  return preset ? preset.key : "custom";
+}
+
+/** Имя файла без каталога и без расширения — тем же правилом, что и `pathBasename` в DOM-половине:
+ *  путь мог прийти с сервера (всегда `/`) или быть вписан руками на другой ОС. */
+function stemOfPath(value) {
+  const trimmed = String(value == null ? "" : value).trim();
+  if (!trimmed) return "";
+  const parts = trimmed.split(/[\\/]/);
+  const name = parts[parts.length - 1];
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(0, dot) : name;
+}
+
+/**
+ * Одна строка вместо четырёх свёрнутых полей: «h3-8bit-full · 8 шагов · LoRA 1.00 · таблица l100».
+ *
+ * `<details>` с настройками модели закрыт по умолчанию (C2, требование 3) — и это правильно
+ * ровно до тех пор, пока свёрнутый вид говорит, что под ним лежит. Прогон по чужому чекпойнту
+ * или без LoRA стоит лишнего часа, а выглядит как обычный, и единственное, что стоит между
+ * человеком и этим часом, — вот эта строка.
+ *
+ * Отсутствующее не молчит, а называется: пустая LoRA — «LoRA нет» (без неё прогон идёт вчетверо
+ * дольше), пустая таблица AdaLN — «таблица чекпойнта» (сетку тогда задаёт сам чекпойнт, см.
+ * подпись поля). Молчание об этом читалось бы как «на месте».
+ *
+ * Чистая функция от объекта того же вида, что отдаёт `readForm()`: `{checkpoint, steps, lora,
+ * loraStrength, adaln}`. Ни одного обращения к DOM — её зовёт `refreshSubmitState`, а проверяет
+ * узел без браузера.
+ */
+export function modelSummary(form) {
+  const it = form || {};
+  const checkpoint = stemOfPath(it.checkpoint) || "чекпойнт не указан";
+  const steps = Math.max(0, Math.round(Number(it.steps) || 0));
+  const lora = String(it.lora || "").trim()
+    ? `LoRA ${(Number(it.loraStrength) || 0).toFixed(2)}`
+    : "LoRA нет";
+  const adaln = stemOfPath(it.adaln);
+  // `adaln_8_l100.safetensors` -> `l100`: имена таблиц строятся из числа шагов и длины сетки,
+  // и в свёрнутой строке человеку нужен именно хвост, а не общий для всех префикс.
+  const table = adaln ? `таблица ${adaln.split("_").pop() || adaln}` : "таблица чекпойнта";
+  return [checkpoint,
+          `${steps} ${plural(steps, "шаг", "шага", "шагов")}`,
+          lora, table].join(" · ");
 }
 
 /* ===========================================================================
@@ -694,17 +761,20 @@ export function stepsHtml(completed, total) {
   return html;
 }
 
-const SPEC_CELLS = (job) => {
+/** Технические параметры задачи одной строкой: режим, канвас, длительность, шаги.
+ *
+ *  До C2 это были четыре ячейки общей девятиколоночной сетки `--cols`, одной на все три списка.
+ *  Списков теперь два и оба карточные (макет: `.qitem` в очереди, `.rcard` в готовом), сравнивать
+ *  числа по вертикали между ними больше нечем и незачем — параметры стали подписью под именем. */
+const specText = (job) => {
   const e = job.estimate || {};
   const mode = argValue(job.args, "--mode") || "auto";
   const w = e.width ?? "?";
   const h = e.height ?? "?";
   const sec = e.duration_seconds ?? "?";
   const steps = e.steps ?? "?";
-  return `<span class="c l">${escapeHtml(mode)}</span>`
-       + `<span class="c">${escapeHtml(w)}×${escapeHtml(h)}</span>`
-       + `<span class="c">${escapeHtml(sec)} с</span>`
-       + `<span class="c">${escapeHtml(steps)}</span>`;
+  return `${escapeHtml(mode)} · ${escapeHtml(w)}×${escapeHtml(h)}`
+       + ` · ${escapeHtml(sec)} с · ${escapeHtml(steps)} шаг.`;
 };
 
 /**
@@ -715,22 +785,31 @@ const SPEC_CELLS = (job) => {
  * же породы: разговор кончается `PUT /api/jobs/<id>`, а он бывает только у ждущей. Копия —
  * исключение: она ничего не меняет в этой задаче, только читает её `args`/`note`, поэтому
  * уместна и у завершённой тоже (см. `finishedRowHtml`).
+ *
+ * C2: строка общей сетки стала карточкой `.qitem` из макета — номер в очереди слева, имя и
+ * параметры столбиком, действия справа. Заметка (`job.note`) остаётся: поле ввода из формы ушло
+ * (требование 4), но сама заметка приезжает с сервера у копий и у задач, поставленных не с этой
+ * страницы, и прятать её было бы прятанием чужих данных.
  */
-export function pendingRowHtml(job, { editingId = null } = {}) {
+export function pendingRowHtml(job, { editingId = null, index = null } = {}) {
   const peak = jobPeak(job);
   const over = peak > WARN_GB;
   const priority = Number(job.priority) || 0;
   const id = escapeHtml(job.id);
-  return `<div class="r wait${editingId === job.id ? " editing" : ""}">`
-    + `<span class="m wait"></span>`
-    + `<span class="name">${escapeHtml(jobTag(job))}`
+  const note = String(job.note || "");
+  return `<div class="qitem${editingId === job.id ? " editing" : ""}">`
+    + `<span class="idx">${index === null ? "" : escapeHtml(index)}</span>`
+    + `<span class="m wait" aria-hidden="true"></span>`
+    + `<span class="body">`
+    + `<span class="n">${escapeHtml(jobTag(job))}`
     + (priority > 0 ? ` <span class="prio">↑${priority}</span>` : "")
-    + `<span class="note">${escapeHtml(job.note)}</span></span>`
-    + SPEC_CELLS(job)
-    + `<span class="c">${formatDuration(jobSeconds(job))}</span>`
-    + `<span class="c mem${over ? " over" : ""}">${formatGb(peak)}`
+    + `</span>`
+    + `<span class="meta">${specText(job)} · ≈${formatDuration(jobSeconds(job))}`
+    + `<span class="mem${over ? " over" : ""}">${formatGb(peak)}`
     + `<i class="mg" title="из ${PHYSICAL_GB} ГБ, риска на ${WARN_GB}">`
-    + `<b style="width:${Math.min(100, peak / PHYSICAL_GB * 100)}%"></b></i></span>`
+    + `<b style="width:${Math.min(100, peak / PHYSICAL_GB * 100)}%"></b></i></span></span>`
+    + (note ? `<span class="note">${escapeHtml(note)}</span>` : "")
+    + `</span>`
     + `<span class="acts">`
     + `<button data-act="chat" data-id="${id}">Обсудить</button>`
     + `<button data-act="edit" data-id="${id}">Править</button>`
@@ -747,8 +826,14 @@ export function pendingRowHtml(job, { editingId = null } = {}) {
  * отменять и поднимать нечего, а вот повторить теми же параметрами — обычное дело.
  *
  * `outdir` — необязательный (fix round 1, A6): без него `clipUrl` просто не
- * построит ссылку (см. `mediaParts`), а не упадёт — строка ещё покажет имя
+ * построит ссылку (см. `mediaParts`), а не упадёт — карточка ещё покажет имя
  * файла текстом, как до этой задачи, если `outdir` почему-то не пришёл.
+ *
+ * C2: строка стала карточкой `.rcard` из макета, и главное в ней — кадр. Число проходов для
+ * `previewUrl` берётся из оценки самой задачи (`estimate.forwards`): прогон закончился, значит
+ * прошёл их все, и последний записанный кадр выводится по тому же правилу `--preview-every`,
+ * что и у идущей задачи, а не угадывается. Кадра может не быть вовсе (прогон короче одного
+ * интервала записи, или упал раньше первого) — тогда рамка пустая: битая картинка хуже пустой.
  */
 export function finishedRowHtml(job, outdir) {
   const code = job.exit_code;
@@ -757,25 +842,35 @@ export function finishedRowHtml(job, outdir) {
   const stem = String(job.output_stem || "");
   const name = stem.slice(stem.lastIndexOf("/") + 1);
   const id = escapeHtml(job.id);
-  const note = ok
+  const e = job.estimate || {};
+  const shot = previewUrl(job, Number(e.forwards) || 0, outdir);
+  const link = ok
     ? (clip ? `<a class="clip" href="${clip}">${escapeHtml(name)}.mp4</a>`
             : escapeHtml(name))
     : `код возврата ${escapeHtml(code == null ? "неизвестен" : code)}`;
   const took = job.started_at && job.finished_at
     ? (Date.parse(job.finished_at) - Date.parse(job.started_at)) / 1000
     : NaN;
-  return `<div class="r ${ok ? "done" : "fail"}">`
-    + `<span class="m ${ok ? "done" : "fail"}"></span>`
-    + `<span class="name">${escapeHtml(jobTag(job))}<span class="note">${note}</span></span>`
-    + SPEC_CELLS(job)
-    + `<span class="c">${Number.isFinite(took) ? formatDuration(took) : "—"}</span>`
-    + `<span class="c">${job.finished_at ? formatClock(new Date(job.finished_at)) : "—"}</span>`
-    + `<span class="c l">код ${escapeHtml(code == null ? "?" : code)}</span>`
-    + (ok ? "" : `<span class="why">${escapeHtml(job.log_tail || "причина не записана")}</span>`)
-    + `<span class="acts">`
+  return `<article class="rcard ${ok ? "done" : "fail"}">`
+    + `<div class="frame">`
+    // Кадр мог не долететь на диск или быть стёрт вместе с прогоном: пустая рамка честнее битой.
+    + (shot ? `<img src="${shot}" alt="превью-кадр" onerror="this.hidden = true">` : "")
+    + `<span class="tc">${escapeHtml(e.width ?? "?")}×${escapeHtml(e.height ?? "?")}</span>`
+    + `<span class="dur">${escapeHtml(e.duration_seconds ?? "?")} с</span>`
+    + `</div>`
+    + `<div class="info">`
+    + `<div class="n"><span class="m ${ok ? "done" : "fail"}" aria-hidden="true"></span>`
+    + `${escapeHtml(jobTag(job))}</div>`
+    + `<div class="meta">${Number.isFinite(took) ? formatDuration(took) : "—"}`
+    + ` · ${job.finished_at ? formatClock(new Date(job.finished_at)) : "—"}`
+    + ` · код ${escapeHtml(code == null ? "?" : code)}</div>`
+    + `<div class="link">${link}</div>`
+    + (ok ? "" : `<div class="why">${escapeHtml(job.log_tail || "причина не записана")}</div>`)
+    + `<div class="acts">`
     + `<button data-act="dup" data-id="${id}">Копия</button>`
-    + `</span>`
-    + `</div>`;
+    + `</div>`
+    + `</div>`
+    + `</article>`;
 }
 
 /** Нечитаемые файлы очереди. Их нет ни в одном списке, а человек считает
@@ -1603,6 +1698,13 @@ function startPage() {
   // изменения молча гасил бы предупреждение, которое в этот раз никто не отклонял.
   let bannerState = { dismissedKey: null };
   let unloadBannerInput = { pending: 0, llm: "" };  // вход последней отрисовки — им отвечает клик
+  /* Заметка правящейся задачи (C2, требование 4). Поля ввода у неё больше нет: за всё время
+     существования формы её никто не заполнял, а место она занимала в самом видном углу. Сама
+     заметка при этом жива — сервер её хранит, копия наследует, и `pendingRowHtml` её рисует, —
+     поэтому правка задачи обязана вернуть на `PUT /api/jobs/<id>` ту же строку, с которой
+     пришла, а не пустую: иначе «Править» тихо стирала бы чужой текст. Новая задача уходит с
+     пустой заметкой, как и раньше уходила с пустым полем. */
+  let formNote = "";
 
   const readForm = () => ({
     width: Math.round(Number($("width").value) || 0),
@@ -1617,7 +1719,7 @@ function startPage() {
     loraStrength: Number(String($("lora-str").value).replace(",", ".")) || 1,
     adaln: $("adaln").value.trim(),
     outdir: $("outdir").value.trim(),
-    note: $("note").value.trim(),
+    note: formNote,
     prompt: $("prompt").value,
     image: $("image").value.trim(),
     endImage: $("end-image").value.trim(),
@@ -1700,23 +1802,27 @@ function startPage() {
     const queue = state.queue || {};
     const workerState = (state.worker || {}).state || "unknown";
 
-    // -- приборная строка
+    // -- чрома: три показания рядом, каждое в два слова (макет: `.readout`)
+    const paused = Boolean(state.paused);
     $("rail").dataset.worker = workerState;
     $("worker-state").textContent = {
-      alive: "Работник запущен",
-      stopped: "Работник не запущен",
-      unknown: "Состояние работника неизвестно",
-    }[workerState] || "Состояние работника неизвестно";
+      alive: "запущен", stopped: "не запущен", unknown: "неизвестно",
+    }[workerState] || "неизвестно";
     $("worker-pid").textContent = {
       alive: "задачи берутся из очереди",
       stopped: "очередь стоит, задачи не берутся",
       unknown: "замок не удалось проверить",
     }[workerState] || "";
-
-    // -- пауза/старт очереди (A5): место рядом с заголовком секции — перевёрстка в C2,
-    // сейчас только функция. `state.paused` решает и подпись, и то, какой маршрут нажатие бьёт
-    // (см. `toggleQueuePause`).
-    $("queue-pause-toggle").textContent = state.paused ? "▶ Начать расчёт" : "⏸ Приостановить";
+    // «идёт» только когда очередь действительно может пойти: снятая пауза при незапущенном
+    // работнике — это стоящая очередь, и говорить о ней «идёт» рядом с «работник не запущен»
+    // значит спорить с самим собой в одной строке.
+    $("queue-state").textContent = paused ? "на паузе"
+      : workerState === "alive" ? "идёт" : "стоит";
+    $("queue-state").className = "v" + (paused || workerState !== "alive" ? " warn" : "");
+    $("llm-state").textContent = {
+      up: "поднята", busy: "занята прогоном", down: "выгружена",
+    }[llmStatus] || "неизвестно";
+    $("llm-state").className = "v" + (llmStatus === "up" ? " hot" : "");
 
     // -- идёт сейчас
     const running = (queue.running || [])[0] || null;
@@ -1729,12 +1835,29 @@ function startPage() {
     const pending = queue.pending || [];
     renderUnloadBanner(pending.length);
     $("pending").innerHTML = pending
-      .map((job) => pendingRowHtml(job, { editingId: editing })).join("");
+      .map((job, i) => pendingRowHtml(job, { editingId: editing, index: i + 1 })).join("");
     $("pending-empty").hidden = pending.length > 0;
+    $("pending-count").textContent = pending.length || "";
     const summary = pendingSummary(pending, {
       now, runningSeconds: progress.left, workerState,
     });
     $("pending-sum").textContent = summary.text;
+
+    /* -- пауза/старт очереди (A5, место из C2): кнопка вынесена из `<h2>` в собственную полосу
+       состояния над списком. `state.paused` решает подпись, `aria-pressed` и то, какой маршрут
+       бьёт нажатие (см. `toggleQueuePause`) — все три из одного значения, чтобы кнопка не
+       могла выглядеть нажатой и звучать отжатой. Крупная строка рядом отвечает на единственный
+       вопрос, ради которого на эту зону смотрят издалека: считается сейчас или нет. */
+    $("queue-pause-toggle").textContent = paused ? "▶ Начать расчёт" : "⏸ Приостановить";
+    $("queue-pause-toggle").setAttribute("aria-pressed", paused ? "true" : "false");
+    $("queue-title").textContent = paused ? "Очередь приостановлена"
+      : workerState !== "alive" ? "Работник не запущен"
+      : running ? "Идёт расчёт"
+      : pending.length ? "Очередь ждёт своей минуты" : "Очередь пуста";
+    $("queue-sub").textContent = paused
+      ? "работник не берёт задачи, пока не нажать «Начать расчёт»"
+      : workerState !== "alive" ? "запустите h3 worker — без него очередь стоит"
+      : summary.text || (running ? "в очереди больше ничего не ждёт" : "ставить нечего");
 
     const broken = brokenHtml(queue.broken);
     $("pending-bad").hidden = broken === "";
@@ -1835,7 +1958,15 @@ function startPage() {
       cell("Кончится", formatClock(till)),
       cell("Пик памяти", formatGb(peak), peak > WARN_GB ? " over" : ""),
       `</div>`,
-      `<div class="bar"><i style="width:${share * 100}%"></i></div>`,
+      /* Сегменты проходов прямо в карточке задачи (C2, макет: `.now .steps`): в приборной
+         строке те же деления стоят на всю ширину экрана и отвечают «сколько осталось вообще»,
+         а здесь — «сколько осталось вот этой задаче», и смотрят на них с разного расстояния.
+         Та же `stepsHtml`, что и наверху: одно правило рисования, два места показа. */
+      `<div class="steps run-steps">${stepsHtml(completed, forwards)}</div>`,
+      `<div class="steps-legend">`,
+      `<span>проход ${completed} / ${forwards}</span>`,
+      `<span>${Math.round(share * 100)} %</span>`,
+      `</div>`,
       `<div class="run-foot">`,
       `старт <span class="num">`
         + `${job.started_at ? formatClock(new Date(job.started_at)) : "—"}</span> · `,
@@ -1938,6 +2069,8 @@ function startPage() {
     const packed = canvasIsPacked(form.width, form.height);
     $("canvas-hint").textContent = packed ? "Кратно 32" : "Должно быть кратно 32";
     $("canvas-hint").className = "hint" + (packed ? "" : " bad");
+    // Свёрнутые «Настройки модели» обязаны сказать, что под ними лежит (C2, требование 3).
+    $("model-summary").textContent = modelSummary(form);
     const verdict = lastEstimate ? memoryVerdict(lastEstimate.peak_gb)
                                  : { needsConfirm: false };
     $("submit").disabled = !submitAllowed({
@@ -2521,8 +2654,11 @@ function startPage() {
     $("outdir").value = argValue(job.args, "--outdir") || "";
     $("image").value = argValue(job.args, "--image") || "";
     $("end-image").value = argValue(job.args, "--end-image") || "";
-    $("note").value = job.note || "";
+    // C2, требование 4: поля ввода у заметки больше нет, но правка обязана вернуть на сервер ту
+    // же строку, с которой пришла (см. `formNote`) — иначе «Править» тихо стирала бы чужой текст.
+    formNote = job.note || "";
     syncModeRows();
+    syncCanvasPreset();
     updateUploadZone("image");
     updateUploadZone("end-image");
   }
@@ -2532,6 +2668,8 @@ function startPage() {
     $("form-mode-note").textContent = id ? `Правка ждущей задачи ${id}` : "Новая задача";
     $("submit").textContent = id ? "Сохранить правку" : "Поставить в очередь";
     $("cancel-edit").hidden = !id;
+    // Выход из правки — конец чужой заметки: следующая постановка своей не имеет (см. `formNote`).
+    if (!id) formNote = "";
     if (id && state) {
       const job = (state.queue.pending || []).find((x) => x.id === id);
       if (job) {
@@ -2600,6 +2738,35 @@ function startPage() {
     const mode = $("mode").value;
     $("row-image").hidden = !(mode === "i2v" || mode === "flf");
     $("row-end-image").hidden = mode !== "flf";
+  }
+
+  /* -- разрешение выпадашкой (C2) ------------------------------------------------------------
+     Источник правды остался прежним: `#width`/`#height`, из которых читает `readForm` и которые
+     видит `buildArgs`. Выпадашка над ними — только способ их заполнить, а «своё…» открывает их
+     ручному вводу. Из этого следуют обе стороны синхронизации ниже: выбор пункта пишет числа,
+     а числа (правка задачи, ручной ввод) выбирают пункт — иначе список показывал бы «малое» на
+     канвасе 1024×576. */
+
+  /** Пункт списка — по тому, что сейчас в полях; поля ручного ввода видны только под «своё…». */
+  function syncCanvasPreset() {
+    const key = canvasPresetKey($("width").value, $("height").value);
+    $("canvas-preset").value = key;
+    $("row-canvas").hidden = key !== "custom";
+  }
+
+  /** Выбор пункта — в поля. «своё…» ничего не пишет: оно открывает то, что уже стоит, и человек
+   *  правит от него, а не от обнулённого канваса. */
+  function applyCanvasChoice() {
+    const key = $("canvas-preset").value;
+    const preset = applyCanvasPreset(key);
+    if (preset) {
+      $("width").value = preset.width;
+      $("height").value = preset.height;
+    }
+    $("row-canvas").hidden = key !== "custom";
+    // Тот же путь, что и ручной ввод в поля из FIELDS — см. подписку ниже.
+    scheduleEstimate();
+    renderPrompt();
   }
 
   /* -- зона загрузки кадра (A7) --------------------------------------------------------------
@@ -2854,19 +3021,6 @@ function startPage() {
   // -- подписки ---------------------------------------------------------------------------
 
   document.addEventListener("click", (event) => {
-    const presetButton = event.target.closest("button[data-preset]");
-    if (presetButton) {
-      const preset = applyCanvasPreset(presetButton.dataset.preset);
-      if (preset) {
-        $("width").value = preset.width;
-        $("height").value = preset.height;
-        // Тот же путь, что и ручной ввод в поля из FIELDS — см. подписку ниже.
-        scheduleEstimate();
-        renderPrompt();
-      }
-      return;
-    }
-
     const button = event.target.closest("button[data-act]");
     if (!button) return;
     const id = button.dataset.id;
@@ -2905,11 +3059,15 @@ function startPage() {
     $("hl").scrollTop = $("prompt").scrollTop;
     $("hl").scrollLeft = $("prompt").scrollLeft;
   });
+  $("canvas-preset").addEventListener("change", applyCanvasChoice);
   for (const id of FIELDS) {
     $(id).addEventListener("input", () => {
       scheduleEstimate();
       renderPrompt();
       if (id === "image" || id === "end-image") updateUploadZone(id);
+      // Числа в полях решают, какой пункт горит в списке, а не наоборот (см. `syncCanvasPreset`).
+      if (id === "width" || id === "height") $("canvas-preset").value =
+        canvasPresetKey($("width").value, $("height").value);
     });
   }
   wireUploadZone("image");
@@ -3011,6 +3169,12 @@ function startPage() {
   // -- запуск -----------------------------------------------------------------------------
 
   syncModeRows();
+  syncCanvasPreset();
+  refreshSubmitState();   // сводка «Настроек модели» видна до первой оценки, а не после неё
+  // Адрес в чроме: у этой страницы бывает вторая копия себя на другом порту (свой сервер для
+  // проверок), и перепутать их — потерять вечер. Читается из адресной строки, а не из ответа
+  // сервера: сервер знает, на чём он слушает, а не то, как до него дошли.
+  $("host").textContent = window.location.host;
   renderPrompt();
   renderConnection();
   poll().then(() => { requestEstimate(); syncChatFromHash(); });

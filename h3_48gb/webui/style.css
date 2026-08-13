@@ -262,16 +262,14 @@
   --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, "DejaVu Sans Mono", monospace;
 
-  --pad: 28px;          /* поле страницы            */
-  --cardpad: 22px;      /* поле карточки            */
-  --r-card: 14px;       /* скругление карточки      */
+  /* Полоса макета и его 4px-сетка: одна ширина у чромы, зон и модалки,
+     радиусы 4/8/10/12 (канон: --r-xs/--r-sm/--r-lg/--r-xl). */
+  --shell: 1380px;      /* полоса макета            */
+  --pad: 24px;          /* поле страницы            */
+  --r-card: 12px;       /* скругление панели        */
   --r-inner: 10px;      /* скругление вложенного    */
-  --r-ctl: 7px;         /* скругление элемента ввода */
-
-  /* Одна колоночная сетка на все списки — иначе числа не сравнить взглядом.
-     Последняя колонка шире содержимого трёх кнопок: у грид-элемента
-     min-width auto, и узкая дорожка заставила бы кнопки залезть на память. */
-  --cols: 16px minmax(180px, 1fr) 52px 92px 50px 34px 92px 100px 208px;
+  --r-ctl: 8px;         /* скругление элемента ввода */
+  --r-xs: 4px;          /* скругление мелкого       */
 
   /* Текст на заливке акцента (кнопка `.primary`): --accent — светлый янтарь
      в обеих темах, тёмный текст читается на нём лучше белого. Тот же
@@ -282,7 +280,6 @@
   --accent-fg: #0a0b0c;
 }
 /* /tokens */
-
 * { box-sizing: border-box; }
 /* [hidden] обязан побеждать любой display ниже по файлу: иначе галочка
    «всё равно поставить» вылезает при пике, который её не требует. */
@@ -291,169 +288,245 @@ html, body { margin: 0; }
 body {
   background: var(--bg);
   color: var(--ink);
-  font: 13px/1.5 var(--ui);
+  font: 14px/1.5 var(--ui);
+  letter-spacing: -.011em;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-  padding-bottom: 64px;
+  padding-bottom: 96px;
 }
 ::selection { background: var(--sel); }
 
-.mono { font-family: var(--mono); font-size: .93em; font-variant-numeric: tabular-nums; }
+.mono { font-family: var(--mono); font-size: .93em; font-variant-numeric: tabular-nums;
+        letter-spacing: 0; }
 .num  { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
 .dim  { color: var(--ink-3); }
 b { font-weight: 600; }
+.spacer { flex: 1; }
 
-main { max-width: 1440px; margin: 0 auto; padding: 24px var(--pad) 0; }
+/* Полоса макета: одна ширина у чромы, зон и разделителей. */
+.shell { max-width: var(--shell); margin: 0 auto; padding: var(--pad); }
+.section-gap { margin-top: 20px; }
 
 /* ===========================================================================
-   ПРИБОРНАЯ СТРОКА
+   ЧРОМА
    Полупрозрачная панель с размытием: под ней проезжает содержимое, и это
-   единственное место, где полупрозрачность что-то сообщает.
+   единственное место, где полупрозрачность что-то сообщает. Слева — кто мы и
+   на каком адресе, справа — три показания и часы; читается с метра.
    =========================================================================== */
-.rail {
+.chrome {
   position: sticky; top: 0; z-index: 20;
-  background: color-mix(in srgb, var(--bg) 78%, transparent);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
-  backdrop-filter: saturate(180%) blur(20px);
-  box-shadow: 0 .5px 0 var(--hairline-2);
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
+  backdrop-filter: saturate(180%) blur(12px);
+  border-bottom: 1px solid var(--hairline);
   transition: background .2s ease;
 }
-.rail-main {
-  max-width: 1440px; margin: 0 auto;
-  padding: 11px var(--pad) 10px;
-  display: flex; align-items: center; gap: 28px;
+.chrome-in {
+  max-width: var(--shell); margin: 0 auto;
+  padding: 9px var(--pad);
+  display: flex; align-items: center; gap: 16px;
 }
-.rail-id { display: flex; align-items: baseline; gap: 8px; flex: none; }
 .mark {
-  font: 600 15px/1 var(--ui); letter-spacing: -.01em;
-  padding: 3px 8px; border-radius: 7px;
-  background: var(--fill-2); color: var(--ink);
+  display: flex; align-items: center; gap: 10px; flex: none;
+  padding-right: 16px; border-right: 1px solid var(--hairline);
 }
-.mark-sub { font-size: 13px; color: var(--ink-3); }
+.glyph {
+  width: 24px; height: 24px; border-radius: var(--r-ctl);
+  border: 1px solid var(--hairline-2); background: var(--fill);
+  display: grid; place-items: center;
+  font: 500 11px/1 var(--mono); color: var(--ink-2); letter-spacing: 0;
+}
+.mark-name { font: 510 13px/1 var(--ui); letter-spacing: -.01em; white-space: nowrap; }
+.host { font-size: 12px; color: var(--ink-3); flex: none; }
 
-/* состояние работника: лампа + слово, читается с метра */
-.worker { display: flex; align-items: center; gap: 9px; flex: none; }
-.worker-txt { display: flex; flex-direction: column; line-height: 1.25; }
+.readout { display: flex; align-items: center; gap: 4px; flex: none; }
+.stat {
+  display: flex; align-items: baseline; gap: 7px;
+  padding: 4px 10px; border-radius: var(--r-ctl);
+}
+.stat .k {
+  font-size: 11px; color: var(--ink-3); letter-spacing: .4px; text-transform: uppercase;
+}
+.stat .v {
+  font-family: var(--mono); font-size: 12px; letter-spacing: 0;
+  color: var(--ink-2); font-variant-numeric: tabular-nums;
+}
+.stat .v.hot { color: var(--accent-ink); }
+.stat .v.warn { color: var(--warn-ink); }
+.stat .v.sub { display: none; }          /* объяснение состояния — в подсказке, не в строке */
+.stat.worker { gap: 8px; }
+
+/* состояние работника: лампа как форма, цвет — только подтверждение */
 .lamp {
-  position: relative; width: 10px; height: 10px; border-radius: 50%;
+  position: relative; width: 8px; height: 8px; border-radius: 50%;
   background: var(--done); flex: none;
-  box-shadow: 0 0 0 3.5px var(--done-soft);
+  box-shadow: 0 0 0 3px var(--done-soft);
 }
-.worker-state { font-weight: 600; font-size: 13px; }
-.worker-pid { color: var(--ink-3); font-size: 11.5px; font-variant-numeric: tabular-nums; }
-
-/* Не запущен: лампа перечёркнута — состояние видно и без цвета */
-.rail[data-worker="stopped"] { background: color-mix(in srgb, var(--fail-soft) 82%, transparent); }
-.rail[data-worker="stopped"] .lamp { background: var(--fail); box-shadow: 0 0 0 3.5px var(--fail-soft); }
-.rail[data-worker="stopped"] .lamp::before {
-  content: ""; position: absolute; left: 1.5px; right: 1.5px; top: 4.2px;
+.chrome[data-worker="stopped"] .lamp { background: var(--fail); box-shadow: 0 0 0 3px var(--fail-soft); }
+.chrome[data-worker="stopped"] .lamp::before {
+  content: ""; position: absolute; left: 1px; right: 1px; top: 3.2px;
   /* theme-invariant: bar drawn on top of the --fail dot itself, not on page ink/bg */
   height: 1.6px; background: #fff; border-radius: 1px;
 }
-.rail[data-worker="stopped"] .worker-state { color: var(--fail-ink); }
-/* Неизвестно: полое кольцо */
-.rail[data-worker="unknown"] { background: color-mix(in srgb, var(--warn-soft) 82%, transparent); }
-.rail[data-worker="unknown"] .lamp {
-  background: transparent; box-shadow: inset 0 0 0 2px var(--warn);
-}
-.rail[data-worker="unknown"] .worker-state { color: var(--warn-ink); }
+.chrome[data-worker="stopped"] .stat.worker .v { color: var(--fail-ink); }
+.chrome[data-worker="unknown"] .lamp { background: transparent; box-shadow: inset 0 0 0 2px var(--warn); }
+.chrome[data-worker="unknown"] .stat.worker .v { color: var(--warn-ink); }
+.chrome[data-worker="stopped"] { background: color-mix(in srgb, var(--fail-soft) 86%, transparent); }
+.chrome[data-worker="unknown"] { background: color-mix(in srgb, var(--warn-soft) 86%, transparent); }
 
 .rail-run {
-  display: flex; align-items: baseline; gap: 16px; min-width: 0;
-  font-variant-numeric: tabular-nums;
+  display: flex; align-items: baseline; gap: 14px; min-width: 0; flex: none;
+  font-variant-numeric: tabular-nums; font-size: 12.5px;
 }
-.run-tag { font-weight: 600; font-family: var(--mono); font-size: 12.5px; }
-.run-step, .run-share { color: var(--ink-2); }
-.run-left { color: var(--ink-2); }
-.run-left b { font-size: 15px; color: var(--ink); }
+.run-tag { font-weight: 600; font-family: var(--mono); font-size: 12.5px; letter-spacing: 0; }
+.run-step, .run-share, .run-left { color: var(--ink-2); }
+.run-left b { font-size: 14px; color: var(--ink); }
 .rail-run.idle { color: var(--ink-3); }
 
-.rail-clock { margin-left: auto; display: flex; align-items: baseline; gap: 14px; flex: none; }
-.clock { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
-.poll { font-size: 11.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.rail-clock { margin-left: auto; display: flex; align-items: baseline; gap: 12px; flex: none; }
+.clock { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.poll { font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.theme-toggle { white-space: nowrap; }
 
 /* шаги как деления шкалы: доля считается, а не читается */
-.steps {
-  display: flex; gap: 3px; max-width: 1440px;
-  margin: 0 auto; padding: 0 var(--pad) 8px;
+.steps { display: flex; gap: 3px; }
+.steps i {
+  display: block; height: 4px; flex: 1; border-radius: 2px;
+  background: var(--fill-2); box-shadow: inset 0 0 0 1px var(--hairline);
 }
-.steps i { display: block; height: 4px; flex: 1; border-radius: 2px; background: var(--fill-2); }
-.steps i.done { background: var(--accent); }
-.steps i.now  { background: var(--accent); animation: breathe 2.4s ease-in-out infinite; }
-@keyframes breathe { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
-.rail[data-worker="stopped"] .steps i.done,
-.rail[data-worker="stopped"] .steps i.now { background: var(--wait); animation: none; }
+.steps i.done { background: var(--accent); box-shadow: none; }
+.steps i.now  {
+  background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent);
+  animation: breathe 2.4s ease-in-out infinite;
+}
+@keyframes breathe { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+.rail-steps { max-width: var(--shell); margin: 0 auto; padding: 0 var(--pad) 8px; }
+.chrome[data-worker="stopped"] .rail-steps i.done,
+.chrome[data-worker="stopped"] .rail-steps i.now { background: var(--wait); animation: none; }
+
+/* Сервер не отвечает. Полоса во всю чрому — её нельзя не заметить, а цифры
+   выше неё в этот момент устарели и об этом сказано словами. */
+.conn {
+  max-width: var(--shell); margin: 0 auto; padding: 0 var(--pad) 9px;
+  display: flex; gap: 9px; align-items: baseline;
+  font-size: 12.5px; color: var(--fail-ink); font-weight: 500; line-height: 1.45;
+}
+.chrome:has(.conn:not([hidden])) { background: color-mix(in srgb, var(--fail-soft) 86%, transparent); }
+.conn::before {
+  content: ""; width: 13px; height: 13px; flex: none; align-self: flex-start; margin-top: 3px;
+  background: var(--fail); clip-path: polygon(50% 4%, 100% 96%, 0 96%);
+}
+/* Пока сервер молчит, цифры очереди — прошлогодний снег. Чрома остаётся
+   яркой: там висит объяснение, почему всё остальное поблёкло. */
+body[data-stale] main { opacity: .55; }
 
 /* ===========================================================================
-   КАРТОЧКИ
+   ЗОНЫ. Панель с шапкой-номером — единица раскладки макета: номер, название,
+   и справа одна строка eyebrow с ответом на «сколько».
    =========================================================================== */
-.card {
+.panel {
   background: var(--card);
+  border: 1px solid var(--hairline);
   border-radius: var(--r-card);
-  box-shadow: var(--shadow);
-  padding: var(--cardpad);
-  margin-bottom: 24px;
+  overflow: hidden;
 }
-.card-h {
-  display: flex; align-items: baseline; gap: 12px;
-  margin: 0 0 18px;
+.panel-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--card-2);
 }
-.card-h h2, .card-h h3 {
-  margin: 0; font-weight: 600; letter-spacing: -.01em; color: var(--ink);
+.panel-head h2 {
+  margin: 0; font: 510 13px/1.3 var(--ui); letter-spacing: -.01em; color: var(--ink);
 }
-.card-h h2 { font-size: 16px; }
-.card-h h3 { font-size: 15px; }
-.block-note { font-size: 12.5px; color: var(--accent-ink); }
-.sum { font-size: 12.5px; color: var(--ink-2); margin-left: auto; font-variant-numeric: tabular-nums; }
+.panel-head .num {
+  font: 500 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0;
+  width: 18px; height: 18px; border: 1px solid var(--hairline-2); border-radius: var(--r-xs);
+  display: grid; place-items: center; flex: none;
+}
+.panel-body { padding: 16px; }
+.eyebrow {
+  font-size: 11px; font-weight: 500; letter-spacing: .4px; text-transform: uppercase;
+  color: var(--ink-3); font-variant-numeric: tabular-nums;
+}
 
-.section-h {
-  font: 600 17px/1.3 var(--ui); letter-spacing: -.015em;
-  margin: 34px 0 14px; color: var(--ink);
+/* ===========================================================================
+   КНОПКИ
+   Три веса: главная (заливка акцентом), обычная, призрачная.
+   =========================================================================== */
+button {
+  font: 510 13px/1.2 var(--ui); letter-spacing: -.005em;
+  border-radius: var(--r-ctl); cursor: pointer; white-space: nowrap;
+  border: 1px solid var(--hairline-2); background: var(--fill); color: var(--ink-2);
+  padding: 7px 12px;
+  display: inline-flex; align-items: center; gap: 7px;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
 }
+button:hover { background: var(--fill-2); color: var(--ink); }
+button:focus-visible { outline: none; box-shadow: 0 0 0 3.5px var(--accent-ring); }
+button.primary {
+  background: var(--accent); color: var(--accent-fg); border-color: var(--accent);
+  font-weight: 600;
+}
+/* theme-invariant: color-mix's #000 is a neutral darken operator, not a painted color -- it
+   darkens whatever --accent already resolved to for the active theme */
+button.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000);
+                       border-color: color-mix(in srgb, var(--accent) 88%, #000); }
+button.primary:disabled {
+  background: var(--fill-2); color: var(--ink-3); border-color: transparent; cursor: not-allowed;
+}
+button.ghost { background: transparent; border-color: transparent; color: var(--ink-3); }
+button.ghost:hover { background: var(--fill); color: var(--ink-2); }
+button.lg { padding: 10px 16px; font-size: 14px; border-radius: var(--r-inner); }
 
+/* ===========================================================================
+   ЗОНА 1: СОЧИНЕНИЕ
+   Слева промпт с разбором, справа параметры. Пропорция колонок — из макета.
+   =========================================================================== */
 .form-grid {
   display: grid;
-  grid-template-columns: minmax(460px, 1.2fr) minmax(392px, 1fr);
-  gap: 32px;
+  grid-template-columns: minmax(0, 1.32fr) minmax(0, 1fr);
+  gap: 20px;
   align-items: start;
 }
-@media (max-width: 1040px) { .form-grid { grid-template-columns: 1fr; } }
+.col-prompt, .col-params { min-width: 0; }
 
-/* ===========================================================================
-   ЭЛЕМЕНТЫ ВВОДА
-   Мягкая заливка вместо рамки; рамка появляется только у фокуса, и вместе
-   с ней — кольцо, как в системных приложениях.
-   =========================================================================== */
-label { color: var(--ink-2); }
-input, textarea, select, button { font-family: var(--ui); font-size: 13px; color: var(--ink); }
-input, textarea, select {
-  background: var(--fill);
-  border: 1px solid transparent;
-  border-radius: var(--r-ctl);
-  padding: 5px 9px;
+.editor-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+.editor-bar .sel { flex: 0 1 260px; }
+
+/* ---------- элементы ввода ---------- */
+label { color: var(--ink-3); }
+input, textarea, select, button { font-family: var(--ui); }
+.inp, input, textarea {
+  font-family: var(--mono); font-size: 13px; letter-spacing: 0;
+  color: var(--ink); background: var(--card-2);
+  border: 1px solid var(--hairline); border-radius: var(--r-ctl);
+  padding: 7px 10px; width: 100%;
+  font-variant-numeric: tabular-nums;
   transition: background .12s ease, box-shadow .12s ease, border-color .12s ease;
 }
-input:hover, textarea:hover, select:hover { background: var(--fill-2); }
+input:hover, textarea:hover { border-color: var(--hairline-2); }
 input:focus, textarea:focus, select:focus {
-  outline: none;
-  background: var(--card);
-  border-color: var(--accent);
+  outline: none; border-color: var(--accent);
   box-shadow: 0 0 0 3.5px var(--accent-ring);
 }
 input::placeholder, textarea::placeholder { color: var(--ink-3); }
-input.num, input[type=number], textarea.num {
-  font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1;
-}
-input.mono, textarea.mono { font-family: var(--mono); font-size: 12px; }
 
-select {
+/* Выпадашка — своя стрелка (data-URI в токенах), потому что системная не
+   красится и в тёмной теме остаётся чёрной на чёрном. */
+.sel { position: relative; display: inline-flex; min-width: 0; }
+.sel select, select {
   appearance: none; -webkit-appearance: none;
-  padding-right: 26px;
+  font: 400 13px/1.4 var(--ui); letter-spacing: -.005em;
+  color: var(--ink-2); background: var(--card-2);
+  border: 1px solid var(--hairline); border-radius: var(--r-ctl);
+  padding: 7px 28px 7px 10px; width: 100%; cursor: pointer;
   background-image: var(--chev);
   background-repeat: no-repeat;
-  background-position: right 9px center;
-  cursor: pointer;
+  background-position: right 10px center;
 }
+select:hover { border-color: var(--hairline-2); color: var(--ink); }
+.pick { font-family: var(--mono); font-size: 12px; max-width: 260px; }
 
 .field-head {
   display: flex; align-items: center; justify-content: space-between;
@@ -461,44 +534,40 @@ select {
 }
 .field-head label { font-weight: 600; color: var(--ink); font-size: 14px; }
 .field-side { display: flex; gap: 8px; align-items: center; }
-.pick { font-family: var(--mono); font-size: 11.5px; padding: 4px 24px 4px 8px; max-width: 230px; }
-#chat-duration { width: 56px; text-align: right; }
+#chat-duration { width: 62px; text-align: right; }
 
 /* ---------- редактор промпта: слой подсветки под прозрачным полем ------- */
 .editor {
   position: relative;
   height: 336px;
-  border: 1px solid transparent;
+  border: 1px solid var(--hairline-2);
   border-radius: var(--r-inner);
-  background: var(--fill);
+  background: var(--bg);
   overflow: hidden;
-  transition: background .12s ease, box-shadow .12s ease, border-color .12s ease;
+  transition: box-shadow .12s ease, border-color .12s ease;
 }
 .hl, .editor textarea {
   /* Всё, что влияет на раскладку строк, обязано совпадать в обоих слоях */
   position: absolute; inset: 0;
-  margin: 0; border: 0; padding: 13px 15px;
-  font: 12.5px/1.62 var(--mono);
+  margin: 0; border: 0; padding: 14px 16px;
+  font: 12.5px/1.72 var(--mono);
   letter-spacing: 0;
   white-space: pre-wrap;
   overflow-wrap: break-word;
   word-break: normal;
   tab-size: 4;
   overflow: auto;
+  width: auto;
 }
 /* Слой подсветки не прокручивается пользователем и не показывает полосу
    прокрутки: иначе ширина строки в нём и в поле разошлась бы на её толщину. */
-.hl { color: var(--ink); pointer-events: none; overflow: hidden; }
+.hl { color: var(--ink-2); pointer-events: none; overflow: hidden; }
 .editor textarea {
   background: transparent; color: transparent; caret-color: var(--accent);
   resize: none; outline: none; border-radius: 0;
 }
 .editor textarea:hover, .editor textarea:focus { background: transparent; box-shadow: none; border: 0; }
-.editor:focus-within {
-  background: var(--card);
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3.5px var(--accent-ring);
-}
+.editor:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3.5px var(--accent-ring); }
 
 .hl mark { background: none; color: inherit; }
 /* Пять видов разметки документированного формата: планы, три поля, теги
@@ -514,8 +583,9 @@ select {
 
 /* ---------- полоска планов ---------- */
 .scale {
-  position: relative; height: 30px; margin: 12px 0 4px;
-  border-radius: var(--r-ctl); background: var(--fill);
+  position: relative; height: 28px; margin: 10px 0 4px;
+  border-radius: var(--r-ctl); background: var(--card-2);
+  border: 1px solid var(--hairline);
   overflow: hidden;
 }
 .scale .seg {
@@ -524,7 +594,7 @@ select {
   border-radius: 5px;
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
   color: var(--accent-ink);
-  font: 500 10.5px/24px var(--ui); font-variant-numeric: tabular-nums;
+  font: 500 10.5px/20px var(--ui); font-variant-numeric: tabular-nums;
   text-align: center; overflow: hidden;
 }
 
@@ -574,59 +644,53 @@ select {
 .parse li.warn .num { color: var(--warn-ink); }
 .parse li.bad  .num { color: var(--fail-ink); }
 
+/* Откуда уйдёт промпт: из файла (тогда очередь снимет с него копию) или
+   текстом в командной строке (тогда снимка не будет). */
+.src { margin: 8px 0 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.45; }
+.src.dirty { color: var(--warn-ink); }
+
 /* ===========================================================================
    ПАРАМЕТРЫ
-   Три группы, разделённые воздухом. Внутри группы строки разделены
-   волосяной линией, вдвинутой под колонку значений.
+   Две колонки по 4px-сетке макета; поля, которым нужна вся ширина, берут её
+   классом .full. Ни одной разделительной линии: группы разделяет воздух.
    =========================================================================== */
-.params { display: flex; flex-direction: column; gap: 22px; }
-.pgroup { display: flex; flex-direction: column; }
-.params .row {
-  display: grid; grid-template-columns: 118px 1fr; gap: 14px;
-  align-items: center;
-  padding: 7px 0;
-  position: relative;
+.params {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
 }
-.params .row + .row::before {
-  content: ""; position: absolute; left: 132px; right: 0; top: 0;
-  height: 1px; background: var(--hairline);
-}
-.params .row.top { align-items: start; }
-.params .row.top > label { padding-top: 6px; }
-.params .row > label { font-size: 13px; text-align: right; }
+.field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.field.full { grid-column: 1 / -1; }
+.field > label { font-size: 11.5px; color: var(--ink-3); letter-spacing: -.005em; }
+.field .sel { width: 100%; }
 
-.ctl { display: flex; align-items: center; gap: 9px; min-width: 0; }
-.ctl input[type=number] { width: 84px; text-align: right; }
-.ctl input.narrow { width: 70px; text-align: right; }
-.ctl input.path { flex: 1; min-width: 0; }
-.ctl input#seed { width: 168px; }
-.ctl input#tag { width: 168px; }
-.ctl textarea { flex: 1; resize: vertical; font-size: 12.5px; line-height: 1.45; }
-.ctl select { flex: 0 1 auto; min-width: 0; }
-.canvas input { width: 84px; text-align: right; }
+.inp-unit { position: relative; display: flex; }
+.inp-unit .u {
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  font: 11px/1 var(--mono); color: var(--ink-3); pointer-events: none; letter-spacing: 0;
+}
+.canvas { display: flex; align-items: center; gap: 9px; min-width: 0; flex-wrap: wrap; }
+.canvas input { width: 96px; text-align: right; }
 .x { color: var(--ink-3); }
-.unit { color: var(--ink-2); }
-.hint { font-size: 11.5px; color: var(--ink-3); min-width: 0; }
+.hint { font-size: 11.5px; color: var(--ink-3); min-width: 0; line-height: 1.4; }
 .hint.bad { color: var(--fail-ink); font-weight: 500; }
 
 /* ---------- зона загрузки кадра (A7) -------------------------------------
    Пунктир — тот же язык, что у любого «сюда» в системных приложениях: клик
    и перетаскивание запускают одно и то же действие, поэтому это одна зона,
-   а не поле плюс кнопка рядом. Заполненная зона переходит на сплошную
-   обводку и моноширинный шрифт имени — та же смена, что различает пустой
-   и заполненный `.mono.path` в остальной форме. ----------------------------- */
+   а не поле плюс кнопка рядом. ----------------------------------------------- */
+.drop-row { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
 .dropzone {
   flex: 1; min-width: 0; display: flex; align-items: center;
-  padding: 6px 11px;
+  padding: 10px 12px;
   border: 1px dashed var(--hairline-2);
-  border-radius: var(--r-ctl);
-  background: var(--fill);
+  border-radius: var(--r-inner);
+  background: var(--card-2);
   color: var(--ink-3);
   font-size: 12.5px;
   cursor: pointer;
   transition: background .12s ease, border-color .12s ease, color .12s ease;
 }
-.dropzone:hover { background: var(--fill-2); }
+.dropzone:hover { background: var(--fill); }
 .dropzone:focus-visible {
   outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px var(--accent-ring);
 }
@@ -645,68 +709,97 @@ select {
 .upload-link:hover { text-decoration: underline; }
 .upload-link:focus-visible { outline: none; box-shadow: 0 0 0 3.5px var(--accent-ring); }
 
+/* ---------- настройки модели: свёрнуто, со сводкой в самом summary ---------- */
+details.adv {
+  grid-column: 1 / -1;
+  border: 1px solid var(--hairline); border-radius: var(--r-inner);
+  background: var(--card-2);
+}
+details.adv > summary {
+  list-style: none; cursor: pointer;
+  padding: 10px 14px;
+  display: flex; align-items: center; gap: 9px;
+  font: 500 13px/1.4 var(--ui); color: var(--ink-2); letter-spacing: -.008em;
+}
+details.adv > summary::-webkit-details-marker { display: none; }
+details.adv > summary::before {
+  content: ""; width: 5px; height: 5px; flex: none;
+  border-right: 1.3px solid var(--ink-3); border-bottom: 1.3px solid var(--ink-3);
+  transform: rotate(-45deg); transition: transform .15s ease;
+}
+details.adv[open] > summary::before { transform: rotate(45deg); }
+details.adv > summary:hover { color: var(--ink); }
+details.adv > summary .hint {
+  margin-left: auto; font-family: var(--mono); font-size: 11px; letter-spacing: 0;
+  font-variant-numeric: tabular-nums; text-align: right;
+}
+.adv-body {
+  border-top: 1px solid var(--hairline); padding: 14px;
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px;
+}
+
 /* ===========================================================================
    ОЦЕНКА — главный ответ формы
    =========================================================================== */
 .estimate {
-  margin-top: 24px; padding: 18px;
+  margin-top: 16px; padding: 14px;
   background: var(--card-2);
+  border: 1px solid var(--hairline);
   border-radius: var(--r-inner);
-  box-shadow: inset 0 0 0 1px var(--hairline);
 }
 .est-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 .est-time {
-  font-size: 30px; font-weight: 600; letter-spacing: -.025em;
+  font-size: 26px; font-weight: 500; letter-spacing: -.4px;
   font-variant-numeric: tabular-nums;
 }
-.est-sub { font-size: 12.5px; color: var(--ink-2); }
+.est-sub { font-size: 12.5px; color: var(--ink-3); }
 
-.mem { margin-top: 18px; }
-.mem-top { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; color: var(--ink-2); }
-.mem-top .num { font-size: 15px; font-weight: 600; color: var(--ink); }
+.mem { margin-top: 16px; }
+.mem-top { display: flex; align-items: baseline; gap: 8px; font-size: 12px; color: var(--ink-3); }
+.mem-top .num { font-size: 14px; font-weight: 600; color: var(--ink); font-family: var(--mono); }
 /* Шкала не обрезает содержимое: подписи рисок 40 и 46 стоят под ней,
    а сама заливка скруглена по своему правому краю. */
 .gauge {
-  position: relative; height: 10px; margin: 8px 0 26px;
-  background: var(--fill-2); border-radius: 5px;
+  position: relative; height: 8px; margin: 8px 0 24px;
+  background: var(--fill-2); border-radius: 4px;
   overflow: visible;
 }
 .gauge .fill {
-  position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px;
+  position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px;
   background: var(--accent); transition: width .18s ease, background-color .18s ease;
 }
 .gauge .fill.warn { background: var(--warn); }
 .gauge .fill.bad  { background: var(--fail); }
 /* Риски 40 и 46 из 48 — те же места, что и на микрошкале в строках очереди */
-.gauge .tick { position: absolute; top: 0; bottom: 0; width: 1.5px; background: var(--card); opacity: .9; }
+.gauge .tick { position: absolute; top: 0; bottom: 0; width: 1.5px; background: var(--card-2); opacity: .9; }
 .gauge .tick span {
-  position: absolute; top: 13px; left: -6px;
-  font: 10.5px/1 var(--ui); color: var(--ink-3); font-variant-numeric: tabular-nums;
+  position: absolute; top: 11px; left: -6px;
+  font: 10.5px/1 var(--mono); color: var(--ink-3); font-variant-numeric: tabular-nums;
 }
 .gauge .t40 { left: 83.33%; }
 .gauge .t46 { left: 95.83%; }
 .mem-warn {
   margin: 4px 0 0; font-size: 12.5px; line-height: 1.45;
   color: var(--warn-ink); font-weight: 500;
-  background: var(--warn-soft); padding: 9px 12px; border-radius: 8px;
+  background: var(--warn-soft); padding: 10px 12px; border-radius: var(--r-inner);
+  border: 1px solid color-mix(in srgb, var(--warn) 26%, transparent);
 }
-.mem-warn.bad { color: var(--fail-ink); background: var(--fail-soft); }
+.mem-warn.bad { color: var(--fail-ink); background: var(--fail-soft);
+                border-color: color-mix(in srgb, var(--fail) 26%, transparent); }
 
 /* Плашка выгрузки — единственный `.mem-warn` с кнопками внутри, и до этого правила у неё не
    было своих вовсе: два `<span>` вставали в строку по-инлайновому, кнопки прилипали к тексту
    без просвета, а на узком окне переносились по одной. Тон тот же предупреждающий, что у
-   `.mem-warn` (плашка говорит «очередь стоит»), плюс рамка — она просит нажать, а не читается,
-   как остальные предупреждения. */
+   `.mem-warn` (плашка говорит «очередь стоит»), плюс рамка — она просит нажать. */
 .unload-banner {
   display: flex; align-items: center; justify-content: space-between;
   gap: 10px 14px; flex-wrap: wrap;
-  margin: 8px 0 10px;
-  border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+  margin: 16px;
 }
 /* `flex: none` — кнопки не сжимаются: первым переносится текст, у него для этого есть слова. */
 .unload-banner-acts { display: flex; align-items: center; gap: 8px; flex: none; }
 /* На кегль плашки: кнопка карточки рядом с 12.5px текстом выглядит вдвое громче, чем стоит. */
-.unload-banner button.primary { font-size: 12.5px; padding: 6px 14px; }
+.unload-banner button { font-size: 12.5px; padding: 6px 12px; }
 .force {
   display: inline-flex; align-items: center; gap: 9px;
   margin-top: 10px; font-size: 12.5px; color: var(--fail-ink); font-weight: 500;
@@ -731,66 +824,53 @@ select {
 .force input[type=checkbox]:checked::after { transform: translateX(14px); }
 .force input[type=checkbox]:focus-visible { box-shadow: 0 0 0 3.5px var(--accent-ring); outline: none; }
 
-.est-actions { display: flex; align-items: center; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
-.est-foot { margin: 12px 0 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.45; }
+.est-actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+.est-actions .primary { flex: 1; justify-content: center; }
+.est-foot { margin: 12px 0 0; font-size: 11px; color: var(--ink-3); line-height: 1.45; }
 .est-said { font-size: 12.5px; color: var(--done-ink); font-weight: 500; }
 
-/* ---------- кнопки ---------- */
-button {
-  border-radius: var(--r-ctl); cursor: pointer;
-  border: 0; background: var(--fill-2); color: var(--ink);
-  padding: 6px 12px; font-size: 13px;
-  transition: background .12s ease, opacity .12s ease;
+/* Отказ на запрос. Текст stderr от argparse показывается как есть,
+   моноширинным: «unrecognized arguments: --widht 896» точнее пересказа. */
+.err {
+  margin: 12px 0 0; padding: 10px 12px;
+  background: var(--fail-soft); border-radius: var(--r-inner);
+  font-size: 12.5px; color: var(--fail-ink); line-height: 1.5; overflow-wrap: anywhere;
 }
-button:hover { background: var(--fill-3); }
-button:focus-visible { outline: none; box-shadow: 0 0 0 3.5px var(--accent-ring); }
-button.primary {
-  background: var(--accent); color: var(--accent-fg);
-  font-weight: 600; padding: 8px 18px; border-radius: 8px;
+.err b { display: block; margin-bottom: 3px; }
+.err pre {
+  margin: 6px 0 0; font-family: var(--mono); font-size: 11.5px;
+  white-space: pre-wrap; color: var(--fail-ink); opacity: .9;
 }
-/* theme-invariant: color-mix's #000 is a neutral darken operator, not a painted color -- it
-   darkens whatever --accent already resolved to for the active theme */
-button.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000); }
-button.primary:disabled {
-  background: var(--fill-2); color: var(--ink-3); cursor: not-allowed;
-}
-button.ghost { background: var(--fill); font-size: 12.5px; padding: 5px 11px; color: var(--ink-2); }
-button.ghost:hover { background: var(--fill-2); color: var(--ink); }
 
 /* ===========================================================================
-   ОЧЕРЕДЬ
-   Три карточки с одинаковыми внутренними полями — колонки в них стоят
-   на одной вертикали, и числа сравниваются между списками.
+   ЗОНА 2: ОЧЕРЕДЬ
+   Крупное состояние и кнопка старта сверху — их видно с метра и они одни на
+   всю очередь; ниже идущая задача, плашка выгрузки и список ждущих.
    =========================================================================== */
-.queue .sub:last-child { margin-bottom: 0; }
-.empty { font-size: 12.5px; color: var(--ink-3); margin: 6px 0; }
-.badfiles {
-  display: flex; gap: 9px; align-items: baseline;
-  margin: 14px 0 0; padding: 10px 12px;
-  background: var(--warn-soft); border-radius: 8px;
-  font-size: 12.5px; color: var(--warn-ink); line-height: 1.45;
+.qstate {
+  padding: 16px;
+  border-bottom: 1px solid var(--hairline);
 }
-.badfiles::before {
-  content: ""; width: 13px; height: 13px; flex: none;
-  background: var(--warn); clip-path: polygon(50% 4%, 100% 96%, 0 96%);
-  align-self: flex-start; margin-top: 3px;
+.qstate-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.qstate-txt { min-width: 0; }
+.qstate .title { font: 500 20px/1.2 var(--ui); letter-spacing: -.4px; color: var(--ink); }
+.qstate .sub {
+  margin-top: 4px; font: 12px/1.45 var(--mono); letter-spacing: 0;
+  color: var(--ink-3); font-variant-numeric: tabular-nums;
 }
-.badfiles .mono { color: var(--warn-ink); opacity: .85; }
 
 /* ---- идущая задача ---- */
 .running {
   display: grid; grid-template-columns: 200px 1fr; gap: 20px;
   padding: 16px;
-  background: var(--accent-soft);
-  border-radius: var(--r-inner);
+  background: var(--card-2);
+  border-bottom: 1px solid var(--hairline);
 }
 .running.none, .running.stale {
-  display: block; position: relative; padding: 16px 18px;
+  display: block; position: relative; padding: 16px;
   font-size: 12.5px; line-height: 1.5;
 }
-.running.none {
-  background: var(--fill); color: var(--ink-3);
-}
+.running.none { background: var(--card); color: var(--ink-3); }
 /* Задача в running/ без работника — не «идёт», а «неизвестно»: знак тот же
    треугольник, что у нечитаемых файлов очереди, и заливка та же. */
 .running.stale {
@@ -804,89 +884,114 @@ button.ghost:hover { background: var(--fill-2); color: var(--ink); }
 }
 .running.stale .mono { color: inherit; }
 .running img {
-  width: 200px; display: block; border-radius: 8px;
+  width: 200px; display: block; border-radius: var(--r-ctl);
   background: var(--frame-3);
   /* Requirement 3: the preview frame is a media window, not a page surface -- its edge uses
      --frame-edge (own dark-only pair), and the drop shadow below it is theme-invariant: a
      photograph casts the same shadow regardless of what theme is reading the page around it. */
   box-shadow: 0 0 0 1px var(--frame-edge), 0 1px 3px rgba(0,0,0,.35);
 }
-.run-cap { font-size: 11.5px; color: var(--ink-2); margin-top: 7px; }
+.run-cap { font-size: 11px; color: var(--ink-3); margin-top: 7px; }
 .run-body { min-width: 0; }
-.run-line1 { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.run-name { font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
-.run-spec { font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
-.run-num { display: flex; gap: 28px; margin: 16px 0 12px; flex-wrap: wrap; }
+.run-line1 { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.run-name { font: 500 13px/1.3 var(--mono); letter-spacing: 0; color: var(--ink); }
+.run-spec { font: 12px/1.3 var(--mono); color: var(--ink-3); letter-spacing: 0;
+            font-variant-numeric: tabular-nums; }
+.run-num { display: flex; gap: 24px; margin: 14px 0 12px; flex-wrap: wrap; }
 .run-num div { display: flex; flex-direction: column; gap: 2px; }
-.run-num .k { font-size: 11.5px; color: var(--ink-2); }
+.run-num .k { font-size: 11px; color: var(--ink-3); }
 .run-num .v {
-  font: 600 19px/1.15 var(--ui); letter-spacing: -.02em;
+  font: 500 18px/1.15 var(--mono); letter-spacing: -.02em;
   font-variant-numeric: tabular-nums;
 }
 .run-num .v.over { color: var(--warn-ink); }
-.bar {
-  height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--accent) 18%, transparent);
-  position: relative; overflow: hidden;
+/* Сегменты проходов внутри карточки задачи (макет: `.now .steps`). */
+.run-steps { margin: 12px 0 8px; }
+.steps-legend { display: flex; justify-content: space-between; }
+.steps-legend span {
+  font: 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
 }
-.bar i {
-  position: absolute; left: 0; top: 0; bottom: 0;
-  background: var(--accent); border-radius: 3px;
-}
-.run-foot { margin-top: 12px; font-size: 12px; color: var(--ink-2); line-height: 1.5; }
+.run-foot { margin-top: 12px; font-size: 11.5px; color: var(--ink-3); line-height: 1.5; }
 .run-note { color: var(--ink-2); }
 
-/* ---- таблицы ---- */
-.table { overflow-x: auto; margin: 0 calc(var(--cardpad) * -1); padding: 0 var(--cardpad); }
-.r {
-  min-width: 800px;
-  display: grid; grid-template-columns: var(--cols);
-  gap: 12px; align-items: center;
-  padding: 9px 8px 9px 8px; margin: 0 -8px;
-  border-radius: 8px;
-  position: relative;
-  transition: background-color .12s ease;
+/* ---- ждущие ---- */
+.waiting { padding: 16px; }
+.waiting-head { display: flex; justify-content: space-between; margin-bottom: 10px; }
+.qlist { display: flex; flex-direction: column; gap: 8px; }
+.qitem {
+  border: 1px solid var(--hairline); border-radius: var(--r-inner);
+  background: var(--card-2);
+  padding: 11px 12px;
+  display: flex; align-items: center; gap: 12px;
+  transition: border-color .12s ease, background-color .12s ease;
 }
-/* Разделитель вдвинут: он начинается там, где начинается имя, и не
-   разрезает колонку знака состояния. */
-.r + .r:not(.fail)::before {
-  content: ""; position: absolute; left: 34px; right: 8px; top: 0;
-  height: 1px; background: var(--hairline);
+.qitem:hover { border-color: var(--hairline-2); }
+.qitem .idx {
+  font: 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0;
+  width: 14px; flex: none; text-align: right;
+  font-variant-numeric: tabular-nums;
 }
-.r:hover { background: var(--fill); }
-.r:hover::before, .r:hover + .r::before { background: transparent; }
-.r .name { font-weight: 600; min-width: 0; letter-spacing: -.005em; }
-.r .name .note {
-  display: block; font-weight: 400; font-size: 11.5px; color: var(--ink-3);
-  margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+.qitem .body { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.qitem .n {
+  font: 500 12.5px/1.3 var(--mono); color: var(--ink); letter-spacing: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.r .c {
-  font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1;
-  font-size: 12.5px; text-align: right; color: var(--ink-2);
+.qitem .meta {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font: 11px/1.3 var(--mono); color: var(--ink-3); letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
 }
-.r .c.l { text-align: left; font-family: var(--mono); font-size: 11.5px; }
-.r .acts { display: flex; gap: 6px; justify-content: flex-end; }
-.r .acts button { font-size: 12px; padding: 4px 10px; background: var(--fill); color: var(--ink-2); }
-.r .acts button:hover { background: var(--fill-2); color: var(--ink); }
-.r .acts button[data-act="del"]:hover { background: var(--fail-soft); color: var(--fail-ink); }
-.r .why {
-  grid-column: 2 / -1; font-family: var(--mono); font-size: 11.5px;
-  color: var(--fail-ink); padding-top: 4px; overflow-wrap: anywhere; line-height: 1.5;
+.qitem .note {
+  font-size: 11.5px; color: var(--ink-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* `finishedRowHtml`'s `.acts` (the "Копия" button) is always one child past `--cols`'s nine
-   tracks -- ten on a succeeded row, eleven on a failed one, next to `.why` -- so left to the
-   grid's own auto-flow it wraps into the next implicit row's *first* column: 16px, sized for the
-   status dot, and its text gets clipped. An explicit place fixes that without touching
-   `pendingRowHtml`'s row, which still fits `--cols` exactly and keeps using auto-flow.
-   Succeeded and failed get different rows because `.why` already claims row 2 (`grid-column: 2 /
-   -1` above, same as here) on a failed row -- if `.acts` also landed on row 2 there, the button
-   would sit on top of the failure text instead of below it. */
-.r.done .acts { grid-column: 2 / -1; grid-row: 2; padding-top: 4px; }
-.r.fail .acts { grid-column: 2 / -1; grid-row: 3; padding-top: 4px; }
+.qitem .mem { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
+.qitem .mem.over { color: var(--warn-ink); font-weight: 500; }
+.qitem .prio { font-size: 11px; color: var(--accent-ink); font-weight: 600; }
+.qitem.editing { border-color: var(--accent); background: var(--accent-soft); }
+
+/* Микрошкала памяти: число сравнивается точно, полоска — мгновенно.
+   Риска на 40 из 48 стоит на том же месте, что и на большой шкале формы. */
+.mg {
+  display: inline-block; width: 44px; height: 3px; position: relative;
+  background: var(--fill-2); border-radius: 2px; overflow: hidden; vertical-align: middle;
+}
+.mg::after {
+  content: ""; position: absolute; left: 83.33%; top: 0; bottom: 0;
+  width: 1px; background: var(--card-2);
+}
+.mg b { position: absolute; left: 0; top: 0; bottom: 0; background: var(--wait); border-radius: 2px; }
+.qitem .mem.over .mg b { background: var(--warn); }
+
+/* ---- действия строки/карточки: текстовые, плотно ---- */
+.acts { display: flex; align-items: center; gap: 2px; flex: none; flex-wrap: wrap; }
+.acts button {
+  font-size: 11.5px; padding: 4px 7px; border-color: transparent;
+  background: transparent; color: var(--ink-3); border-radius: var(--r-xs);
+}
+.acts button:hover { color: var(--ink); background: var(--fill); }
+.acts button[data-act="del"]:hover { background: var(--fail-soft); color: var(--fail-ink); }
+
+.empty { font-size: 12.5px; color: var(--ink-3); margin: 6px 0; }
+.empty.pad { margin: 0; padding: 16px; }
+.badfiles {
+  display: flex; gap: 9px; align-items: baseline;
+  margin: 12px 0 0; padding: 10px 12px;
+  background: var(--warn-soft); border-radius: var(--r-inner);
+  font-size: 12.5px; color: var(--warn-ink); line-height: 1.45;
+}
+.badfiles::before {
+  content: ""; width: 13px; height: 13px; flex: none;
+  background: var(--warn); clip-path: polygon(50% 4%, 100% 96%, 0 96%);
+  align-self: flex-start; margin-top: 3px;
+}
+.badfiles .mono { color: var(--warn-ink); opacity: .85; }
 
 /* ---- знаки четырёх состояний: форма важнее цвета ---- */
 .m {
-  position: relative; display: block; width: 14px; height: 14px;
-  border-radius: 50%; flex: none;
+  position: relative; display: inline-block; width: 12px; height: 12px;
+  border-radius: 50%; flex: none; vertical-align: -1px;
 }
 /* ждёт — полое кольцо */
 .m.wait { box-shadow: inset 0 0 0 1.7px var(--wait); }
@@ -905,93 +1010,92 @@ button.ghost:hover { background: var(--fill-2); color: var(--ink); }
 /* сделано — галочка */
 .m.done { background: var(--done); }
 .m.done::before {
-  content: ""; position: absolute; left: 4.6px; top: 3px;
+  content: ""; position: absolute; left: 3.9px; top: 2.4px;
   /* theme-invariant: checkmark drawn on top of the --done dot itself, not on page ink/bg */
-  width: 4px; height: 7.5px; border: solid #fff; border-width: 0 1.7px 1.7px 0;
+  width: 3.4px; height: 6.4px; border: solid #fff; border-width: 0 1.6px 1.6px 0;
   transform: rotate(45deg); border-radius: 1px;
 }
 /* упало — крестик */
 .m.fail { background: var(--fail); }
 /* theme-invariant: cross drawn on top of the --fail dot itself, not on page ink/bg */
 .m.fail::before, .m.fail::after {
-  content: ""; position: absolute; left: 3px; top: 6.2px;
-  width: 8px; height: 1.7px; background: #fff; border-radius: 1px;
+  content: ""; position: absolute; left: 2.5px; top: 5.2px;
+  width: 7px; height: 1.6px; background: #fff; border-radius: 1px;
 }
 .m.fail::before { transform: rotate(45deg); }
 .m.fail::after  { transform: rotate(-45deg); }
 
-.r.done { color: var(--ink-3); }
-.r.done .name { font-weight: 500; color: var(--ink-2); }
-.r.fail { background: var(--fail-soft); }
-.r.fail .name { color: var(--fail-ink); }
-.r.fail + .r::before, .r.fail::before { background: transparent; }
-.r.wait .c.mem.over { color: var(--warn-ink); font-weight: 600; }
-
-/* Микрошкала памяти: число сравнивается точно, полоска — мгновенно.
-   Риска на 40 из 48 стоит на том же месте, что и на большой шкале формы. */
-.mg {
-  display: block; height: 3px; margin-top: 4px; position: relative;
-  background: var(--fill-2); border-radius: 2px; overflow: hidden;
-}
-.mg::after {
-  content: ""; position: absolute; left: 83.33%; top: 0; bottom: 0;
-  width: 1px; background: var(--card);
-}
-.mg b { position: absolute; left: 0; top: 0; bottom: 0; background: var(--wait); border-radius: 2px; }
-.r.wait .c.mem.over .mg b { background: var(--warn); }
-.r.editing { background: var(--accent-soft); box-shadow: inset 0 0 0 1.5px var(--accent); }
-.r .prio { font-size: 11px; color: var(--accent-ink); font-weight: 600; }
-
 /* ===========================================================================
-   ЧЕГО В МАКЕТЕ НЕ БЫЛО
-   Макет знал ответ сервера заранее. У живой страницы есть ещё три состояния:
-   сервер не отвечает, запрос отказал, промпт разошёлся с файлом.
+   ЗОНА 3: ГОТОВО
+   Карточками, а не строками: у законченного прогона главное — кадр.
    =========================================================================== */
+.results {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px; padding: 16px;
+}
+.results:empty { display: none; }
+.rcard {
+  border: 1px solid var(--hairline); border-radius: var(--r-inner);
+  background: var(--card-2); overflow: hidden;
+  transition: border-color .12s ease;
+}
+.rcard:hover { border-color: var(--hairline-2); }
+/* Кадр — медиа-окно, а не поверхность интерфейса: не участвует в инверсии темы
+   (variant-reference-light.html, комментарий у --frame-*). Пустая рамка — тот же
+   градиент: битая картинка хуже пустой. */
+.frame {
+  position: relative;
+  aspect-ratio: 14 / 9;
+  background:
+    radial-gradient(120% 120% at 22% 8%, var(--frame-warm), transparent 58%),
+    radial-gradient(90% 90% at 85% 100%, var(--frame-cool), transparent 60%),
+    linear-gradient(162deg, var(--frame-1) 0%, var(--frame-2) 46%, var(--frame-3) 100%);
+  border-bottom: 1px solid var(--hairline);
+  overflow: hidden;
+}
+.frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.frame .tc, .frame .dur {
+  position: absolute; bottom: 9px; z-index: 1;
+  font: 10.5px/1 var(--mono); letter-spacing: 0; color: var(--frame-ink);
+  font-variant-numeric: tabular-nums;
+  background: var(--frame-chip-bg);
+  border: 1px solid var(--frame-chip-line);
+  border-radius: var(--r-xs); padding: 3px 6px;
+}
+.frame .tc { left: 9px; }
+.frame .dur { right: 9px; }
 
-/* Сервер не отвечает. Полоса во всю приборную строку — её нельзя не заметить,
-   а цифры выше неё в этот момент устарели и об этом сказано словами. */
-.conn {
-  max-width: 1440px; margin: 0 auto; padding: 0 var(--pad) 9px;
-  display: flex; gap: 9px; align-items: baseline;
-  font-size: 12.5px; color: var(--fail-ink); font-weight: 500; line-height: 1.45;
+.rcard .info { padding: 11px 12px; }
+.rcard .info .n {
+  display: flex; align-items: center; gap: 8px;
+  font: 500 13px/1.3 var(--ui); color: var(--ink); letter-spacing: -.01em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.rail:has(.conn:not([hidden])) { background: color-mix(in srgb, var(--fail-soft) 82%, transparent); }
-.conn::before {
-  content: ""; width: 13px; height: 13px; flex: none; align-self: flex-start; margin-top: 3px;
-  background: var(--fail); clip-path: polygon(50% 4%, 100% 96%, 0 96%);
+.rcard .info .meta {
+  font: 11px/1.4 var(--mono); color: var(--ink-3); letter-spacing: 0; margin-top: 4px;
+  font-variant-numeric: tabular-nums;
 }
-/* Пока сервер молчит, цифры очереди — прошлогодний снег. Приборная строка
-   остаётся яркой: там висит объяснение, почему всё остальное поблёкло. */
-body[data-stale] main { opacity: .55; }
-
-/* Отказ на запрос. Текст stderr от argparse показывается как есть,
-   моноширинным: «unrecognized arguments: --widht 896» точнее пересказа. */
-.err {
-  margin: 12px 0 0; padding: 10px 12px;
-  background: var(--fail-soft); border-radius: 8px;
-  font-size: 12.5px; color: var(--fail-ink); line-height: 1.5; overflow-wrap: anywhere;
+.rcard .info .link {
+  margin-top: 4px; font: 11px/1.4 var(--mono); letter-spacing: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.err b { display: block; margin-bottom: 3px; }
-.err pre {
-  margin: 6px 0 0; font-family: var(--mono); font-size: 11.5px;
-  white-space: pre-wrap; color: var(--fail-ink); opacity: .9;
+.rcard .info .acts { margin: 8px -7px -4px; }
+.rcard.fail { border-color: color-mix(in srgb, var(--fail) 34%, transparent); }
+.rcard.fail .info .link { color: var(--fail-ink); }
+.rcard .why {
+  margin-top: 6px; font: 11px/1.5 var(--mono); letter-spacing: 0;
+  color: var(--fail-ink); overflow-wrap: anywhere;
+  max-height: 4.5em; overflow: hidden;
 }
-
-/* Откуда уйдёт промпт: из файла (тогда очередь снимет с него копию) или
-   текстом в командной строке (тогда снимка не будет). */
-.src { margin: 8px 0 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.45; }
-.src.dirty { color: var(--warn-ink); }
 
 /* Ссылка на готовый ролик. Именно ссылка, а не <video>: сервер читает файл
    в память целиком и перемотки не поддерживает, так что сорок мегабайт
    грузятся только тогда, когда человек этого действительно захотел. */
-.r .clip { color: var(--accent-ink); text-decoration: none; }
-.r .clip:hover { text-decoration: underline; }
+.clip { color: var(--accent-ink); text-decoration: none; }
+.clip:hover { text-decoration: underline; }
 
 /* Превью может не существовать: кадр пишется раз в несколько проходов, а
-   первый появляется не сразу. Пустая рамка вместо картинки честнее битой.
-   Requirement 3: it is the same media window as `.running img` once a frame lands, so it wears
-   the same never-inverting --frame-* gradient, not the page's own --fill. */
+   первый появляется не сразу. Пустая рамка вместо картинки честнее битой. */
 .running .noshot {
   display: grid; place-items: center; width: 200px; height: 116px;
   background:
@@ -999,8 +1103,8 @@ body[data-stale] main { opacity: .55; }
     radial-gradient(90% 90% at 85% 100%, var(--frame-cool), transparent 60%),
     linear-gradient(162deg, var(--frame-1) 0%, var(--frame-2) 46%, var(--frame-3) 100%);
   box-shadow: inset 0 0 0 1px var(--frame-edge);
-  border-radius: 8px;
-  font-size: 11.5px; color: var(--frame-ink); text-align: center; padding: 8px;
+  border-radius: var(--r-ctl);
+  font-size: 11px; color: var(--frame-ink); text-align: center; padding: 8px;
 }
 
 /* ===========================================================================
@@ -1022,13 +1126,13 @@ body[data-stale] main { opacity: .55; }
   display: flex; padding: var(--pad);
 }
 .modal {
-  margin: auto; width: min(1440px, 100%);
-  background: var(--card); border-radius: var(--r-card);
-  box-shadow: var(--shadow-pop); padding: var(--cardpad);
+  margin: auto; width: min(1080px, 100%);
+  background: var(--card); border: 1px solid var(--hairline-2); border-radius: var(--r-card);
+  box-shadow: var(--shadow-pop); padding: 20px;
 }
-.modal.chat { display: grid; grid-template-columns: 1fr; gap: 26px; }
+.modal.chat { display: grid; grid-template-columns: 1fr; gap: 24px; }
 @media (min-width: 1100px) {
-  .modal.chat { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .modal.chat { grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); }
 }
 
 .chat-prompt, .chat-talk { min-width: 0; display: flex; flex-direction: column; }
@@ -1046,18 +1150,20 @@ body[data-stale] main { opacity: .55; }
 .chat-log {
   list-style: none; margin: 0; padding: 2px 0;
   flex: 1; min-height: 180px; max-height: 60vh; overflow-y: auto;
-  display: flex; flex-direction: column; gap: 8px;
+  display: flex; flex-direction: column; gap: 10px;
 }
 /* Реплика — абзац, а не строка таблицы: переносы модели значимы (она пишет
    промпт блоками), поэтому pre-wrap, а длинное имя файла в предупреждении
    рвётся где придётся, лишь бы не растягивало колонку. */
 .chat-log .turn {
-  max-width: 92%; padding: 9px 12px; border-radius: var(--r-inner);
-  line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere;
+  max-width: 90%; padding: 10px 12px; border-radius: var(--r-inner);
+  border: 1px solid var(--hairline);
+  line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere;
+  color: var(--ink-2); font-size: 13px;
 }
-.chat-log .user { align-self: flex-end; background: var(--accent-soft); color: var(--accent-ink); }
-.chat-log .assistant { background: var(--fill); }
-.chat-log .note { max-width: 100%; font-size: 12.5px; background: var(--fill); color: var(--ink-3); }
+.chat-log .user { align-self: flex-end; background: var(--fill); border-color: var(--hairline-2); color: var(--ink); }
+.chat-log .assistant { background: var(--card-2); }
+.chat-log .note { max-width: 100%; font-size: 12.5px; background: var(--card-2); color: var(--ink-3); }
 .chat-log .note.warn { background: var(--warn-soft); color: var(--warn-ink); }
 .chat-log .note.bad { background: var(--fail-soft); color: var(--fail-ink); }
 /* Плейсхолдер хода (`pendingEntry`): три точки, бегущие волной, пока ответа ещё нет. Гасится
@@ -1065,7 +1171,7 @@ body[data-stale] main { opacity: .55; }
 .chat-log .note.pending { display: flex; align-items: center; gap: 2px; }
 .chat-log .pending .dots { display: inline-flex; gap: 3px; margin-left: 2px; }
 .chat-log .pending .dots i {
-  display: inline-block; width: 5px; height: 5px; border-radius: 50%;
+  display: inline-block; width: 4px; height: 4px; border-radius: 50%;
   background: currentColor; opacity: .25;
   animation: pending-dot 1.1s infinite ease-in-out;
 }
@@ -1077,12 +1183,13 @@ body[data-stale] main { opacity: .55; }
 }
 
 #chat-form { display: flex; gap: 9px; align-items: flex-end; margin-top: 12px; }
-#chat-input { flex: 1; resize: vertical; line-height: 1.45; }
-#chat-send:disabled { background: var(--fill-2); color: var(--ink-3); cursor: not-allowed; }
+#chat-input { flex: 1; resize: vertical; line-height: 1.45; font-family: var(--ui); }
+#chat-send:disabled { background: var(--fill-2); color: var(--ink-3); border-color: transparent;
+                      cursor: not-allowed; }
 
 /* A8: скрепка — квадратная, той же высоты, что и первая строка поля ввода, не растягивается
    вместе с ним при resize (в отличие от #chat-input, у которого flex:1). */
-.chat-attach { flex: 0 0 auto; padding: 5px 10px; font-size: 15px; line-height: 1.45; }
+.chat-attach { flex: 0 0 auto; padding: 6px 10px; font-size: 15px; line-height: 1.4; }
 /* Перетаскивание кадра прямо на поле ввода (A8, требование 1) — та же подсветка рамкой, что и
    у `.dropzone.dragover` в форме постановки, чтобы приём файла читался одинаково в обоих
    местах страницы. */
@@ -1095,7 +1202,7 @@ body[data-stale] main { opacity: .55; }
 .chat-attachment {
   display: flex; align-items: center; gap: 8px; margin: 8px 0 0;
   padding: 6px 10px; border-radius: var(--r-inner);
-  background: var(--fill); color: var(--ink-2); font-size: 12.5px;
+  background: var(--card-2); color: var(--ink-2); font-size: 12.5px;
 }
 .chat-attachment.busy { opacity: .7; }
 .chat-attachment.error { background: var(--fail-soft); color: var(--fail-ink); }
@@ -1113,13 +1220,23 @@ body[data-stale] main { opacity: .55; }
 
 /* ---------- узкие окна ---------- */
 @media (max-width: 1180px) {
-  :root { --pad: 20px; --cardpad: 18px; }
-  .rail-main { gap: 20px; }
-  .rail-run { gap: 12px; }
+  .form-grid { grid-template-columns: minmax(0, 1fr); }
+  .results { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .chrome-in { gap: 12px; }
+  .stat.worker .k, .host { display: none; }
 }
 @media (max-width: 1040px) {
   .running { grid-template-columns: 1fr; }
-  .running img { width: 100%; max-width: 320px; }
+  .running img, .running .noshot { width: 100%; max-width: 320px; }
+}
+@media (max-width: 860px) {
+  :root { --pad: 16px; }
+  .params, .adv-body { grid-template-columns: minmax(0, 1fr); }
+  .results { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 12px; }
+  .readout .stat:nth-child(n+2) { display: none; }
+  .rail-run { display: none; }
+  .qitem { flex-wrap: wrap; }
+  .qitem .acts { width: 100%; justify-content: flex-start; margin-left: 26px; }
 }
 
 /* ---------- уважение к системной настройке движения ---------- */

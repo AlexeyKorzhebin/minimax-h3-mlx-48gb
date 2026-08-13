@@ -2600,11 +2600,24 @@ def test_the_form_keeps_its_values_and_moves_on_to_the_next_seed_and_tag():
 
 
 @_needs_node
-def test_there_are_exactly_three_canvas_presets_draft_small_large():
+def test_there_are_six_canvas_presets_three_sizes_in_both_orientations():
+    """C2: три кнопки-пресета уступили место выпадашке, и в ней каждый из трёх размеров стоит
+    в обеих ориентациях.
+
+    До этой задачи вертикальный ролик приходилось набирать руками в оба поля, и набирался он
+    неправильно: 288×448 — это не «448×288 наоборот» для человека, который только что выбрал
+    черновик и хочет тот же черновик стоймя. Порядок пар (гориз., верт.) закреплён здесь же:
+    выпадашка читается сверху вниз, и размер обязан идти рядом со своим поворотом.
+    """
     presets = _node_eval("console.log(JSON.stringify(app.CANVAS_PRESETS));")
     assert [(p["key"], p["w"], p["h"]) for p in presets] == [
-        ("draft", 448, 288), ("small", 896, 576), ("large", 1344, 768),
+        ("draft", 448, 288), ("draft-v", 288, 448),
+        ("small", 896, 576), ("small-v", 576, 896),
+        ("large", 1344, 768), ("large-v", 768, 1344),
     ]
+    for preset in presets:
+        assert (preset["w"] > preset["h"]) is not preset["key"].endswith("-v"), (
+            f"{preset['key']} назван поворотом, которого у него нет: {preset}")
 
 
 @_needs_node
@@ -2614,9 +2627,155 @@ def test_applying_the_draft_preset_sets_448_by_288():
 
 
 @_needs_node
+def test_applying_a_vertical_preset_stands_the_canvas_on_its_short_side():
+    """Мутационная пара к тесту выше: пресет с ключом `-v` обязан отдать ту же пару чисел
+    перевёрнутой, а не ту же самую (или почти ту же — 288×449 не кратно 32 и до генератора
+    не доедет вовсе).
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify(["draft-v", "small-v", "large-v"]
+        .map((key) => app.applyCanvasPreset(key))));
+    """)
+    assert got == [{"width": 288, "height": 448}, {"width": 576, "height": 896},
+                   {"width": 768, "height": 1344}], got
+    for size in got:
+        assert size["width"] % 32 == 0 and size["height"] % 32 == 0, size
+
+
+@_needs_node
 def test_an_unknown_preset_key_is_not_silently_accepted():
     got = _node_eval('console.log(JSON.stringify(app.applyCanvasPreset("huge")));')
     assert got is None
+
+
+@_needs_node
+def test_every_canvas_preset_has_its_own_option_in_the_resolution_dropdown():
+    """Список в разметке и список в скрипте — один список.
+
+    Значения (`w`/`h`) живут в `CANVAS_PRESETS` и только там; подпись пункта пишет их для
+    человека, и разъехаться эти два списка не имеют права — выпадашка, обещающая «малое
+    896×576» и ставящая 1344×768, хуже отсутствующей.
+    """
+    page = _page_text("index.html")
+    select = re.search(r'<select[^>]*id="canvas-preset".*?</select>', page, re.S)
+    assert select, "разрешение выбирается выпадашкой #canvas-preset, а не кнопками-пресетами"
+    options = re.findall(r'<option value="([^"]+)"[^>]*>([^<]*)</option>', select.group(0))
+    keys = [value for value, _ in options]
+    assert keys[-1] == "custom", f"«своё…» — последний пункт списка, а список {keys}"
+
+    presets = _node_eval("console.log(JSON.stringify(app.CANVAS_PRESETS));")
+    assert keys[:-1] == [p["key"] for p in presets], (keys, [p["key"] for p in presets])
+    for (value, label), preset in zip(options, presets):
+        assert f'{preset["w"]}×{preset["h"]}' in label, (
+            f"пункт {value!r} подписан {label!r}, а пресет — {preset['w']}×{preset['h']}")
+    assert "data-preset=" not in page, "кнопки-пресеты заменены выпадашкой, а не дополнены ею"
+
+
+@_needs_node
+def test_the_model_summary_folds_the_model_settings_into_one_line():
+    """C2, требование 3: свёрнутые «Настройки модели» обязаны сказать, что в них лежит.
+
+    Чистая функция, а не чтение DOM внутри рендера: строка, которую человек читает вместо
+    четырёх полей, — единственное, что стоит между ним и прогоном по чужому чекпойнту.
+    """
+    line = _node_eval("""
+      console.log(JSON.stringify(app.modelSummary({
+        checkpoint: "~/models/h3-8bit-full", steps: 8,
+        lora: "~/models/turbo/minimax_h3_turbo_v4_step600_ema.safetensors", loraStrength: 1,
+        adaln: "~/models/turbo/adaln_8_l100.safetensors"})));
+    """)
+    assert line == "h3-8bit-full · 8 шагов · LoRA 1.00 · таблица l100", line
+
+
+@_needs_node
+def test_the_model_summary_says_out_loud_that_there_is_no_lora():
+    """Мутационная пара к тесту выше. Пустая LoRA — не «поле, о котором нечего сказать»:
+    прогон без неё идёт вчетверо дольше и выглядит иначе, и молчание сводки об этом читается
+    как «LoRA на месте». Так же и с таблицей AdaLN: пустая — это «сетку берём из чекпойнта».
+    """
+    line, one_step = _node_eval("""
+      console.log(JSON.stringify([
+        app.modelSummary({checkpoint: "/m/h3-fp16", steps: 31, lora: "", loraStrength: 1,
+                          adaln: ""}),
+        app.modelSummary({checkpoint: "/m/h3-fp16", steps: 1, lora: "", loraStrength: 1,
+                          adaln: ""}),
+      ]));
+    """)
+    assert line == "h3-fp16 · 31 шаг · LoRA нет · таблица чекпойнта", line
+    assert one_step.startswith("h3-fp16 · 1 шаг · "), one_step
+
+
+@_needs_node
+def test_the_model_settings_are_collapsed_behind_a_summary_that_shows_their_values():
+    """Разметка половины требования 3: `<details>` свёрнут по умолчанию, сводка стоит прямо
+    в `<summary>`, и пересчитывает её скрипт, а не разметка.
+    """
+    page = _page_text("index.html")
+    details = re.search(r"<details[^>]*>.*?</details>", page, re.S)
+    assert details, "«Настройки модели» должны жить в <details>"
+    block = details.group(0)
+    opening = block[:block.index(">") + 1]
+    assert " open" not in opening, f"свёрнуто по умолчанию, а тег {opening!r}"
+    summary = re.search(r"<summary[^>]*>(.*?)</summary>", block, re.S)
+    assert summary and "Настройки модели" in summary.group(1), block[:400]
+    assert 'id="model-summary"' in summary.group(1), (
+        "сводка значений обязана стоять в самом <summary> — иначе в свёрнутом виде её не видно")
+    for field in ("ckpt", "lora", "lora-str", "adaln", "steps"):
+        assert f'id="{field}"' in block, f"поле {field} должно уехать под <details> вместе с ними"
+
+    script = _page_text("app.js")
+    assert "modelSummary(" in script and '$("model-summary")' in script, (
+        "сводка считается из формы на каждое изменение, а не написана в разметке руками")
+
+
+def test_the_queue_pause_button_stands_outside_the_heading_with_its_state_in_aria():
+    """C2, требование 1 (леджер: aria). Кнопка стояла внутри `<h2>` — временное место из A5.
+
+    Заголовок с кнопкой внутри перестаёт быть заголовком: скринридер читает подпись кнопки как
+    часть названия раздела, а сама кнопка теряет единственное, что о её состоянии говорит —
+    `aria-pressed`. Подпись («▶ Начать расчёт» / «⏸ Приостановить») видна только глазами.
+    """
+    page = _page_text("index.html")
+    button = re.search(r'<button[^>]*id="queue-pause-toggle"[^>]*>', page)
+    assert button, "кнопки паузы очереди нет на странице"
+    assert "aria-pressed=" in button.group(0), (
+        "состояние очереди должно читаться и без картинки треугольника:\n" + button.group(0))
+    # Комментарии выкидываются до разбора: в них написано, почему кнопка отсюда уехала, и
+    # `<h2>` внутри такого объяснения — не заголовок, а слово.
+    markup = re.sub(r"<!--.*?-->", "", page, flags=re.S)
+    for heading in re.findall(r"<h[1-6][^>]*>.*?</h[1-6]>", markup, re.S):
+        assert "queue-pause-toggle" not in heading, (
+            "кнопка внутри заголовка — заголовок перестаёт быть заголовком:\n" + heading)
+
+    body = _js_function(_page_text("app.js"), "function renderQueue()")
+    assert "aria-pressed" in body, (
+        "aria-pressed обязан двигаться вместе с подписью кнопки, иначе он врёт с первого "
+        "нажатия:\n" + body)
+
+
+@_needs_node
+def test_the_note_column_outlives_the_form_field_that_used_to_feed_it():
+    """C2, требование 4. Поле ввода «Заметка» убрано из формы, показ заметки — остаётся.
+
+    Проверено перед удалением (отчёт задачи): `job.note` доезжает до страницы в `/api/state`
+    для всех состояний и рисуется в двух местах — строкой ждущей задачи (`pendingRowHtml`) и
+    подвалом карточки идущего прогона. Заметка приходит и у задач, поставленных не этой
+    страницей, и у копий (`POST /api/jobs/<id>/duplicate` наследует её на сервере), так что
+    убрать показ значило бы прятать чужие данные. Убрано ровно поле ввода.
+    """
+    page = _page_text("index.html")
+    assert 'id="note"' not in page, "поле ввода «Заметка» убрано из формы"
+    row = _node_eval("""
+      console.log(JSON.stringify(app.pendingRowHtml({
+        id: "j", priority: 0, note: "первая ночная",
+        args: ["generate", "--tag", "кот"], estimate: {seconds: 1, peak_gb: 1},
+        output_stem: "/o/n/h3-кот"})));
+    """)
+    assert "первая ночная" in row, (
+        "заметка приходит с сервера и обязана быть видна — ушло поле ввода, не колонка")
+    script = _page_text("app.js")
+    assert '$("note")' not in script, "в разметке этого поля больше нет — читать нечего"
+    assert "job.note" in script, "показ заметки остаётся"
 
 
 @_needs_node
@@ -3021,81 +3180,45 @@ def test_only_a_waiting_job_carries_edit_top_and_delete():
 
 
 @_needs_node
-def test_the_finished_rows_copy_button_has_an_explicit_place_in_the_row_grid():
-    """Task 7 fix round 1. `.r` is one CSS grid (`--cols` in `style.css`) sized for exactly as
-    many columns as `pendingRowHtml` has direct children -- that is the whole point of one shared
-    grid across three different row shapes (see `--cols`'s own comment). `finishedRowHtml`'s
-    `<span class="acts">` is always one child *past* that count (two, on a failed row, next to
-    `.why`), so without an explicit `grid-column`/`grid-row` in the stylesheet it silently falls
-    into the next implicit row's first (16px, meant for the status dot) column and its text gets
-    clipped -- exactly the "опия" bug a browser render caught.
+def test_a_finished_run_is_a_card_with_its_own_preview_frame():
+    """Заменяет `test_the_finished_rows_copy_button_has_an_explicit_place_in_the_row_grid`.
 
-    This is checked from both ends, neither of them the literal number 10: the column count comes
-    from parsing `--cols` itself, and the child count is measured on the actual HTML the row
-    functions produce, not asserted as a constant.
+    Тот тест сторожил один конкретный способ сломать список готовых: `.r` — одна CSS-сетка с
+    девятью фиксированными дорожками (`--cols`), а `finishedRowHtml` рисовала на один
+    прямой потомок больше, чем дорожек, и лишний уезжал в первую колонку следующего
+    неявного ряда — 16 px под знак состояния, где текст кнопки обрезался в «опия».
+
+    В C2 зона «Готово» — карточки (`.results`, сетка по содержимому), а не общая с очередью
+    строчная сетка: у карточки нет фиксированных дорожек, в которые можно не влезть, и того
+    режима отказа больше не существует. Ослаблением это не будет только при одном условии —
+    если вместо снятой проверки встанет проверка того, ради чего карточки и вводились:
+    превью-кадр задачи виден картинкой, а не именем файла. Она ниже.
+
+    `previewUrl` — та же функция, что рисует кадр идущего прогона; для законченной задачи
+    число проходов берётся из её собственной оценки, так что имя кадра выводится, а не
+    угадывается, и кадра может не быть вовсе (прогон короче `--preview-every`).
     """
-    css = _page_text("style.css")
-    cols_match = re.search(r"--cols:\s*([^;]+);", css)
-    assert cols_match, "style.css must still define --cols for the row grid"
-    # A plain `.split()` would cut `minmax(180px, 1fr)` in two at its internal comma-space --
-    # `minmax(...)` is kept as one token the same way a naive split would wrongly break it apart.
-    column_count = len(re.findall(r"minmax\([^)]*\)|\S+", cols_match.group(1)))
-
-    ok_children, failed_children = _node_eval("""
-      // Counts *direct* children of the single outer <div>: a depth-aware tag scan, because the
-      // row's own children (.name, the memory gauge, ...) nest further tags inside themselves.
-      function directChildCount(rowHtml) {
-        const inner = rowHtml.replace(/^<div[^>]*>/, "").replace(/<\\/div>$/, "");
-        const tagRe = /<(\\/?)([a-zA-Z][a-zA-Z0-9]*)\\b[^>]*?(\\/)?>/g;
-        let depth = 0, count = 0, m;
-        while ((m = tagRe.exec(inner))) {
-          const closing = m[1], selfClosing = m[3];
-          if (selfClosing) continue;
-          if (closing) { depth -= 1; }
-          else { if (depth === 0) count += 1; depth += 1; }
-        }
-        return count;
-      }
-      const base = {id: "j", note: "", args: ["generate", "--tag", "кот"],
-                    estimate: {width: 896, height: 576, duration_seconds: 10, steps: 8},
-                    output_stem: "/o/n/h3-кот-896x576",
+    ok, no_preview = _node_eval("""
+      const base = {id: "j", note: "", args: ["generate", "--tag", "кот", "--preview-every", "5"],
+                    estimate: {width: 896, height: 576, duration_seconds: 10, steps: 8,
+                               forwards: 7, seconds: 3600, peak_gb: 35},
+                    output_stem: "/o/ночь/h3-кот-896x576", exit_code: 0,
                     started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
-      const ok = app.finishedRowHtml({...base, exit_code: 0});
-      const failed = app.finishedRowHtml({...base, exit_code: 1, log_tail: "boom"});
-      console.log(JSON.stringify([directChildCount(ok), directChildCount(failed)]));
+      console.log(JSON.stringify([
+        app.finishedRowHtml(base, "/o"),
+        app.finishedRowHtml({...base, estimate: {...base.estimate, forwards: 0}}, "/o"),
+      ]));
     """)
-    assert ok_children == column_count + 1, (
-        f"a finished/succeeded row must have exactly one child ({{.acts}}) past the grid's own "
-        f"{column_count} columns -- got {ok_children}; the count this test derives its "
-        f"expectation from, and the row's own shape, must have drifted apart")
-    assert failed_children == column_count + 2, (
-        f"a failed row adds .why on top of that -- got {failed_children}")
+    assert "<img" in ok and "-preview-step05.jpg" in ok, ok
+    assert "/media/%D0%BD%D0%BE%D1%87%D1%8C/" in ok, "кадр берётся из каталога прогона"
+    assert "кот" in ok, "слаг задачи — заголовок карточки"
+    assert "1 ч" in ok, "время счёта — то, ради чего в этот список вообще смотрят"
+    assert "<img" not in no_preview, (
+        "кадра ещё не записано — пустая рамка честнее битой картинки")
 
-    # The structural overflow above is real and expected (that many children never fit one row);
-    # what must not be true is that the browser is left to place the overflow on its own.
-    #
-    # The *presence* of a `grid-column` is not the property this test is about, and asserting only
-    # that let the bug back in: `grid-column: 1 / -1` is present, declared, explicit -- and puts
-    # the button back in the 16px marker column, which is exactly the clipping («опия») the rule
-    # exists to prevent. The value has to be checked, and the value it has to be is derived the
-    # same way the column count above is, from `--cols` itself.
-    tracks = re.findall(r"minmax\([^)]*\)|\S+", cols_match.group(1))
-    assert re.fullmatch(r"\d+px", tracks[0]), (
-        f"the grid's first track is the status marker's; it is {tracks[0]!r}, so the "
-        "«one column past the marker» this test computes below no longer means that")
-    marker_tracks = 1
-    first_content_column = str(marker_tracks + 1)
-    for state, what in (("done", "the succeeded row"), ("fail", "the failed row")):
-        rule = re.search(r"\.r\.%s\s+\.acts\s*\{([^}]*)\}" % state, css)
-        assert rule, (f"{what}'s .acts needs an explicit place in style.css, or it wraps into the "
-                      "next implicit row's marker column and gets clipped")
-        declared = re.search(r"grid-column:\s*([^;}]+)", rule.group(1))
-        assert declared, f"{what}'s .acts rule has no grid-column: {rule.group(1)!r}"
-        start = declared.group(1).split("/")[0].strip()
-        assert start == first_content_column, (
-            f"{what}'s .acts starts at column {start}, and the first column past the marker is "
-            f"{first_content_column}: a button placed on the marker's own track is the clipping "
-            "this rule exists to prevent, whether or not a grid-column was written down")
+    css = _page_text("style.css")
+    assert re.search(r"\.results\s*\{[^}]*grid-template-columns", css), (
+        "карточки готового стоят сеткой из макета, а не в поток")
 
 
 @_needs_node
