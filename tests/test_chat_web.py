@@ -199,6 +199,43 @@ def test_a_source_the_server_does_not_know_is_refused_rather_than_stored(_serve)
     assert (status, payload["error"]["code"]) == (400, "args_invalid")
 
 
+def test_a_mode_the_generator_does_not_know_is_refused_the_way_a_bad_source_is(_serve):
+    """`mode` шёл в сессию не глядя, хотя список закрыт ровно так же, как у `source.kind`.
+
+    Цена молчания разная у двух читателей. Модель получает `## Context\\nmode: <что угодно>` и
+    честно пишет промпт под выдуманный режим — вернуть его в очередь нельзя, `--mode` такого не
+    примет (`choices` в `cli._add_run_flags`). Страница по `chat.mode` решает, показывать ли
+    звуковые секции (`renderChatPrompt`), и на незнакомом режиме тихо считает, что звука нет.
+    Оба узнают об ошибке через ход к модели; отказ на создании — единственный момент, когда это
+    ещё дёшево.
+
+    Пустой и отсутствующий `mode` остаются валидными: сессию открывают и без режима, а `t2va`
+    подставляется на ходу (`DEFAULT_CHAT_MODE`).
+    """
+    srv = _serve()
+    for mode in ("t2vа", "T2VA", "видео", "t2v "):   # первый — с кириллической «а»
+        status, payload = srv.post_json_raw("/api/chat", {"source": {"kind": "new"},
+                                                          "prompt": "", "mode": mode})
+        assert status == 400, (mode, payload)
+        assert payload["error"]["code"] == "args_invalid", (mode, payload)
+        assert sorted(payload["error"]["detail"]["modes"]) == sorted(web.CHAT_MODES), payload
+    for mode in sorted(web.CHAT_MODES) + ["", None]:
+        answer = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": "",
+                                             "mode": mode})
+        assert srv.get_json(f"/api/chat/{answer['id']}")["mode"] == (mode or "")
+
+
+def test_the_modes_a_session_may_carry_are_the_modes_the_generator_accepts():
+    """Два списка, один смысл: разойдясь, они дают либо сессию, которую нельзя поставить в
+    очередь, либо отказ странице на режиме, который генератор давно умеет. Список у argparse
+    первичен -- он и есть контракт `h3 generate`.
+    """
+    from h3_48gb import cli
+    generate = cli.build_parser()._subparsers._group_actions[0].choices["generate"]
+    (mode_flag,) = [a for a in generate._actions if a.dest == "mode"]
+    assert set(mode_flag.choices) == set(web.CHAT_MODES), (mode_flag.choices, web.CHAT_MODES)
+
+
 @pytest.mark.parametrize("sid", ["../../etc/passwd", "..%2f..%2fetc%2fpasswd", "sub/dir"])
 def test_a_session_id_cannot_climb_out_of_the_chat_directory(_serve, sid):
     """Id сессии — это имя файла: `../../` в нём обязан быть отказом с кодом, а не 404, который
@@ -591,6 +628,77 @@ def test_a_chat_opened_from_a_library_prompt_survives_a_turn_end_to_end(_serve, 
         ("user", "сделай мрачнее"), ("assistant", "Сделал мрачнее.")]
     assert saved["prompt_struct"] == answer["prompt"]
     assert saved["prompt"] == "старый текст"
+
+
+def test_reading_a_session_that_is_not_there_does_not_create_the_chat_directory(_serve):
+    """`_chat_dir` вызывался с `mkdir` из обоих путей, включая чтение.
+
+    GET по несуществующей сессии — это то, что делает страница, открытая по старой ссылке
+    `/#chat/<id>` после того, как сессию удалили: чтение оставляло за собой пустой `chat/` в
+    выводном каталоге. Каталог, который создаёт чтение, — маленькая ложь о состоянии («чат тут
+    был») и, для outdir на внешнем диске, запись туда, где её никто не просил.
+    """
+    srv = _serve()
+    chat_dir = Path(srv.root) / "chat"
+    assert not chat_dir.exists(), "фикстура обязана начинать с чистого outdir"
+
+    status, payload = srv.get_json_raw("/api/chat/deadbeef")
+    assert (status, payload["error"]["code"]) == (404, "chat_not_found"), payload
+    assert not chat_dir.exists(), "чтение не создаёт каталог"
+
+    # …а создание — создаёт: тот же каталог, тот же вызов, разница только в намерении.
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    assert (chat_dir / f"{sid}.json").is_file()
+
+
+def _corrupt_session(root: Path, sid: str, body) -> None:
+    """Сессия, записанная мимо сервера — ровно то, что делает рука в редакторе."""
+    directory = Path(root) / "chat"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{sid}.json").write_text(json.dumps(body), encoding="utf-8")
+
+
+@pytest.mark.parametrize("body", [
+    {"id": "hand", "prompt": "текст"},                        # `messages` не написали вовсе
+    {"id": "hand", "messages": "две реплики"},                # строка вместо списка
+    {"id": "hand", "messages": [{"role": "user"}]},           # реплика без content
+    {"id": "hand", "messages": ["сделай мрачнее"]},           # реплика не объект
+    ["сессия", "списком"],                                    # корень вообще не объект
+])
+def test_a_hand_edited_session_is_a_named_refusal_and_not_a_five_hundred(_serve, fake_llama, body):
+    """Файл сессии правят руками — это JSON в каталоге, который человек видит.
+
+    `session["messages"]` на файле без этого ключа кидал KeyError, и он же долетал до сети как
+    `internal_error` 500: страница говорила «сервер споткнулся» про файл, который сама же и не
+    писала, а в терминале оставался трейсбек, выглядящий как баг сервера. Отказ по коду —
+    единственное, из чего понятно, что чинить надо файл.
+
+    Проверяется и ход, и чтение: страница открывает сессию раньше, чем делает в ней ход, и
+    отдать ей битый файл как исправный — значит перенести тот же KeyError в браузер.
+    """
+    srv = _serve(providers_port=fake_llama.port)
+    _corrupt_session(srv.root, "hand", body)
+
+    status, payload = srv.post_json_raw("/api/chat/hand/message", {"text": "x", "prompt": ""})
+    assert status != 500, payload
+    assert payload["error"]["code"] == "chat_corrupt", payload
+    assert status == web.ERROR_STATUS["chat_corrupt"], payload
+
+    status, payload = srv.get_json_raw("/api/chat/hand")
+    assert status != 500, payload
+    assert payload["error"]["code"] == "chat_corrupt", payload
+
+    assert fake_llama.requests == [], "битый файл — не повод платить за ход"
+
+
+def test_a_session_the_server_itself_wrote_is_never_called_corrupt(_serve, fake_llama):
+    """Обратная сторона: проверка формы обязана пропускать всё, что пишет сам сервер — и пустую
+    сессию сразу после создания, и её же после хода."""
+    srv = _serve(providers_port=fake_llama.port)
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    assert srv.get_json(f"/api/chat/{sid}")["messages"] == []
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "мрачнее", "prompt": ""})
+    assert len(srv.get_json(f"/api/chat/{sid}")["messages"]) == 2
 
 
 # -- дублирование задачи -------------------------------------------------------------------------

@@ -143,6 +143,24 @@ CHAT_SOURCE_KINDS = frozenset({"new", "prompt", "job", "clip"})
 #: The keys a `source` may carry beside `kind`: which prompt file, or which job/clip id.
 CHAT_SOURCE_KEYS = frozenset({"kind", "name", "id"})
 
+#: The longest a single filename may be, in bytes. 255 on APFS, on HFS+ and on every filesystem
+#: this server is plausibly run against; it is a bound on what to *refuse early*, not a portability
+#: claim, and the kernel's own `ENAMETOOLONG` (`name_too_long_is_a_refusal`) still answers for
+#: anything stricter. See `_chat_path` for why the check cannot be left to the kernel alone.
+NAME_MAX_BYTES = 255
+
+#: What a chat session may say its mode is -- the same closed list `h3 generate --mode` accepts,
+#: and checked on creation for the same reason `CHAT_SOURCE_KINDS` is. Two readers act on this
+#: string and neither can question it: the model is handed `## Context\nmode: <value>` and writes
+#: a prompt for whatever it is told, and the page decides from it whether the prompt needs sound
+#: sections at all. A mode nobody knows produces a plausible-looking session whose prompt cannot
+#: be queued (`--mode` refuses it) and whose highlighting is wrong -- both discovered a turn later,
+#: after the model has been paid for.
+#:
+#: `test_the_modes_a_session_may_carry_are_the_modes_the_generator_accepts` pins this to argparse's
+#: own `choices`, which is the contract; this is a copy of it and copies drift.
+CHAT_MODES = frozenset({"t2v", "t2va", "i2v", "flf"})
+
 #: The mode a session is assumed to be about when it does not say. `t2va` is what `h3 generate`
 #: itself defaults to, and the difference matters to the model: an `i2v` prompt opens with a
 #: sentence about the given first frame, a `t2va` one must not.
@@ -186,6 +204,10 @@ ERROR_STATUS = {
     # 409 for the same reason `job_not_pending` is: the request was valid and lost a race -- with
     # another turn of the same session, which is holding its lock and talking to the model.
     "chat_busy": 409,
+    # 409 for the third time on this route, and the same reason both earlier ones give: the
+    # request is not wrong (400 would blame the caller) and this server is not broken (500 would
+    # blame itself) -- the session file on disk is, and only a person with an editor can fix it.
+    "chat_corrupt": 409,
     "queue_unwritable": 500,
     "internal_error": 500,
 }
@@ -1031,6 +1053,40 @@ def _serve_file(root, relative: str, *, suffixes) -> tuple[int, str, bytes]:
             {"path": relative, "error": f"{type(exc).__name__}: {exc}"})
 
 
+def _check_session_shape(sid: str, path, session) -> None:
+    """Refuse a session file this server did not write, by code, before anything indexes it.
+
+    A session is JSON in a directory a person can see (`<outdir>/chat/`), next to `llama.log`, and
+    people edit what they can see -- trimming a transcript by hand is the obvious way to shorten a
+    context that has grown too long. Every field but `messages` is already read through `.get`
+    with a default; `messages` was indexed directly, so a file missing the key raised `KeyError`
+    inside the route, reached the last-resort net at the HTTP boundary and left the page with
+    `internal_error` 500 «сервер споткнулся» -- a sentence that blames this server for a file it
+    did not write, and hides the one instruction that fixes it.
+
+    The whole shape is checked, not only the missing key: a `messages` that is a string indexes
+    into characters (`TypeError`), a root that is a list has no `.get` (`AttributeError`), and an
+    entry without `content` is a `KeyError` one line later. All four are the same event -- the file
+    is not a session -- and reporting them as one code is what lets the page say so.
+
+    **409, not 400 and not 500.** The request was valid and this server is not broken; the
+    resource on disk is, which is exactly what `chat_busy` already means by 409 on this route.
+    """
+    if not isinstance(session, dict):
+        raise CliError("chat_corrupt",
+                       f"файл сессии повреждён: {path} — в корне {type(session).__name__}, "
+                       f"а должен быть объект",
+                       {"id": sid, "path": str(path), "found": type(session).__name__})
+    messages = session.get("messages")
+    if not isinstance(messages, list) or not all(
+            isinstance(m, dict) and isinstance(m.get("role"), str)
+            and isinstance(m.get("content"), str) for m in messages):
+        raise CliError("chat_corrupt",
+                       f"файл сессии повреждён: {path} — `messages` должен быть списком реплик "
+                       f"{{role, content}}",
+                       {"id": sid, "path": str(path)})
+
+
 @contextlib.contextmanager
 def chat_session_lock(path):
     """Hold `<sid>.lock` for one turn, or refuse with `chat_busy`.
@@ -1697,12 +1753,22 @@ class _Handler(BaseHTTPRequestHandler):
             provider.LlamaLocal(pname, pcfg, self.server.outdir).shutdown()
         return 200, "application/json", _json_bytes({"ok": True, "status": "down"})
 
-    def _chat_dir(self) -> Path:
+    def _chat_dir(self, create: bool = False) -> Path:
+        """`<outdir>/chat/`, made only when something is about to be written into it.
+
+        `create` is not a convenience flag, it is the whole point: this used to `mkdir` on every
+        call, and `_chat_path` is on the *read* path too. A `GET /api/chat/<id>` for a session that
+        does not exist -- what a page opened on a stale `/#chat/<id>` link does on its first
+        request -- therefore left an empty `chat/` behind in the output directory. A read that
+        writes is a small lie about state ("a chat lived here") and, on an outdir that is a mounted
+        disk, a write nobody asked for.
+        """
         directory = Path(self.server.outdir) / CHAT_DIR
-        directory.mkdir(parents=True, exist_ok=True)
+        if create:
+            directory.mkdir(parents=True, exist_ok=True)
         return directory
 
-    def _chat_path(self, sid: str) -> Path:
+    def _chat_path(self, sid: str, create: bool = False) -> Path:
         """`<outdir>/chat/<sid>.json`, or `path_outside_root`.
 
         The id arrives in a URL and becomes a filename, so it is a path component in everything but
@@ -1710,8 +1776,24 @@ class _Handler(BaseHTTPRequestHandler):
         result to be one file directly inside the chat directory. `../../etc/passwd` and `sub/dir`
         are both refused before anything opens a file, and the refusal carries a code rather than
         being a 404 indistinguishable from an unrecognised URL.
+
+        **Too long to be a filename is decided here, not by the kernel.** It used to fall out of
+        the `ENAMETOOLONG` the first `open` raised (`name_too_long_is_a_refusal`), which made the
+        answer depend on something that has nothing to do with the id: once `chat/` stopped being
+        `mkdir`-ed on the read path, lookup failed at the *missing directory* with `ENOENT` first
+        and a 400-character id came back as an ordinary «нет сессии» 404. The id's own shape is
+        knowable without touching the filesystem, so it is judged without touching it, and the
+        kernel's own refusal stays as the backstop for the limits this does not know.
         """
-        directory = self._chat_dir()
+        name = f"{sid}.json"
+        if len(name.encode("utf-8", "surrogatepass")) > NAME_MAX_BYTES:
+            raise CliError(
+                "path_outside_root",
+                f"a chat id has to fit in a filename ({NAME_MAX_BYTES} bytes), and this one is "
+                f"{len(sid)} characters long",
+                {"id": sid[:80], "chars": len(sid), "limit": NAME_MAX_BYTES},
+            )
+        directory = self._chat_dir(create=create)
         target = resolve_within(directory / f"{sid}.json", {"chat": directory}, write=True)
         if target.parent != directory.expanduser().resolve() or target.suffix != ".json":
             raise CliError(
@@ -1767,6 +1849,17 @@ class _Handler(BaseHTTPRequestHandler):
                 {"source": source if isinstance(source, (dict, str)) else None,
                  "kinds": sorted(CHAT_SOURCE_KINDS), "keys": sorted(CHAT_SOURCE_KEYS)},
             )
+        # The same closed-list check as `source.kind` above, and refused with the same code: a
+        # session's `mode` is read by the model and by the page, and neither can tell a typo from
+        # a mode it has not learned yet. Empty (and absent) stays valid -- `DEFAULT_CHAT_MODE`
+        # answers for it at turn time.
+        mode = self._string_of(payload, "mode")
+        if mode and mode not in CHAT_MODES:
+            raise CliError(
+                "args_invalid",
+                f"`mode` is one of {sorted(CHAT_MODES)} or empty, and {mode!r} is not",
+                {"mode": mode, "modes": sorted(CHAT_MODES)},
+            )
         image = self._string_of(payload, "image")
         # `end_image` (T4): the last-frame keyframe of a `flf` job. Checked with the same rule as
         # `image` -- inside a root, and an image suffix -- because it names a file on disk exactly
@@ -1776,12 +1869,12 @@ class _Handler(BaseHTTPRequestHandler):
         end_image = self._string_of(payload, "end_image")
         session = {"id": secrets.token_hex(4),
                    "source": source,
-                   "mode": self._string_of(payload, "mode"),
+                   "mode": mode,
                    "image": str(self._chat_image_path(image)) if image else "",
                    "end_image": str(self._chat_image_path(end_image)) if end_image else "",
                    "messages": [],
                    "prompt": self._string_of(payload, "prompt")}
-        self._write_session(self._chat_path(session["id"]), session)
+        self._write_session(self._chat_path(session["id"], create=True), session)
         return 200, "application/json", _json_bytes({"ok": True, "id": session["id"]})
 
     @staticmethod
@@ -1805,12 +1898,14 @@ class _Handler(BaseHTTPRequestHandler):
         path = self._chat_path(sid)
         try:
             with name_too_long_is_a_refusal("a chat id"):
-                return path, json.loads(path.read_text(encoding="utf-8"))
+                session = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return path, None
         except (OSError, ValueError, UnicodeDecodeError) as exc:
             raise CliError("queue_unwritable", f"сессия не читается: {path} ({exc})",
                            {"id": sid, "path": str(path)}) from exc
+        _check_session_shape(sid, path, session)
+        return path, session
 
     def _read_chat(self, sid: str) -> tuple[int, str, bytes]:
         path, session = self._read_session(sid)

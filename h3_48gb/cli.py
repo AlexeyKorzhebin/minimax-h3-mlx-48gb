@@ -133,6 +133,7 @@ ERROR_CODES = {
     # is not a failure of this server and a page that has to tell them apart matches on the code.
     "chat_not_found": "there is no chat session with that id under `<outdir>/chat/`",
     "chat_busy": "a turn of this session is already in flight; one at a time, so neither erases the other",
+    "chat_corrupt": "the session file under `<outdir>/chat/` is not a session -- hand-edited, or truncated; `detail.path` names it",
     "bad_image": "the keyframe is not one of the image types a chat turn may attach, or is over the size limit",
     "provider_unavailable": "the chat provider is missing or unusable; `detail.provider` names it and the message says why",
     "gpu_busy": "a generation is running, so the local chat model is not raised: it would want the same 31 GB",
