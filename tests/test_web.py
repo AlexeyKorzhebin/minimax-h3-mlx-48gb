@@ -1835,6 +1835,26 @@ def test_a_refusal_naming_an_undocumented_code_becomes_args_invalid(tmp_path):
     assert excinfo.value.code == "args_invalid"
 
 
+def test_reveal_in_finder_calls_open_dash_r(monkeypatch, tmp_path):
+    """`_reveal_in_finder` -- the default `self.server.reveal` wired up by `make_server` -- is the
+    one place this server shells out to `open -R`. Nothing above it (the route, the tests that
+    exercise it through `/api/jobs/<id>/reveal`) should ever need a real Finder or a real
+    subprocess; this pins the one function that does, by mocking `subprocess.run` itself rather
+    than the seam a test with a fake job queue would otherwise use (`tests/test_chat_web.py`'s
+    `reveal=` parameter to `_serve`).
+
+    `check=False`: Finder's own reaction to a path that no longer exists by the time it gets there
+    is not this process's problem to raise on -- a `CalledProcessError` here would turn a cosmetic
+    miss into a 500 for a request that otherwise found a real file.
+    """
+    calls = []
+    monkeypatch.setattr(web.subprocess, "run",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    target = tmp_path / "h3-кот-896x576.mp4"
+    web._reveal_in_finder(target)
+    assert calls == [((["open", "-R", str(target)],), {"check": False})]
+
+
 def test_exit_two_is_args_invalid_with_argparses_own_stderr(tmp_path):
     fake = _fake_python(tmp_path, 'print("unrecognized arguments: --widht", file=sys.stderr)\n'
                                   'sys.exit(2)')
@@ -3360,26 +3380,33 @@ def test_the_prompt_parse_rewrites_nothing():
 
 @_needs_node
 def test_only_a_waiting_job_carries_edit_top_and_delete():
-    """Requirement 6, refined by task 7's duplicate button and task 8's chat: not grey buttons --
-    no buttons, a grey button promises it will work one day. That still holds for
-    edit/top/delete/chat, which only ever make sense for a job still waiting to run (the chat ends
-    in a `PUT /api/jobs/<id>`, and that route refuses a job the worker has already claimed) -- but
-    duplicate reads a job without changing it, so it is offered on the finished row too (see
-    `finishedRowHtml`'s own docstring).
+    """Requirement 6, refined by task 7's duplicate button, task 8's chat, and the reveal-in-Finder
+    button: not grey buttons -- no buttons, a grey button promises it will work one day. Edit/top/
+    delete only ever make sense for a job still waiting to run, and stay pending-only. Chat,
+    duplicate and reveal all only *read* a job (chat's own finishing PUT is refused by the server
+    for anything but a pending job -- `job_not_pending` -- which is a sensible answer, not a hole),
+    so all three are offered on the finished row too, for both outcomes (see `finishedRowHtml`'s
+    own docstring).
     """
-    waiting, finished = _node_eval("""
+    waiting, done, failed = _node_eval("""
       const job = {id: "j1", note: "ночная", priority: 0,
                    args: ["generate", "--tag", "кот", "--mode", "t2va"],
                    estimate: {seconds: 3600, peak_gb: 35, width: 896, height: 576,
                               duration_seconds: 10, steps: 8},
-                   output_stem: "/o/night/h3-кот-896x576", exit_code: 0,
+                   output_stem: "/o/night/h3-кот-896x576",
                    started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
-      console.log(JSON.stringify([app.pendingRowHtml(job), app.finishedRowHtml(job)]));
+      console.log(JSON.stringify([
+        app.pendingRowHtml(job),
+        app.finishedRowHtml({...job, exit_code: 0}, "/o"),
+        app.finishedRowHtml({...job, exit_code: 1}, "/o"),
+      ]));
     """)
     assert sorted(re.findall(r'data-act="([a-z]+)"', waiting)) == [
         "chat", "del", "dup", "edit", "top"]
-    assert re.findall(r'data-act="([a-z]+)"', finished) == ["dup"], (
-        "a finished run offers nothing but a copy of itself")
+    for finished in (done, failed):
+        assert sorted(re.findall(r'data-act="([a-z]+)"', finished)) == ["chat", "dup", "reveal"], (
+            "a finished run offers discuss, reveal-in-Finder and copy -- never edit/top/delete:\n"
+            + finished)
 
 
 @_needs_node
@@ -3395,13 +3422,14 @@ def test_a_finished_run_is_a_card_with_its_own_preview_frame():
     строчная сетка: у карточки нет фиксированных дорожек, в которые можно не влезть, и того
     режима отказа больше не существует. Ослаблением это не будет только при одном условии —
     если вместо снятой проверки встанет проверка того, ради чего карточки и вводились:
-    превью-кадр задачи виден картинкой, а не именем файла. Она ниже.
+    кадр задачи виден, а не именем файла. Она ниже.
 
-    `previewUrl` — та же функция, что рисует кадр идущего прогона; для законченной задачи
-    число проходов берётся из её собственной оценки, так что имя кадра выводится, а не
-    угадывается, и кадра может не быть вовсе (прогон короче `--preview-every`).
+    Round 2 (карточки готового): у успешной задачи кадр больше не TAE-снимок полусырого
+    латента с середины диффузии (`<img>` на `-preview-stepNN.jpg`, цветная каша) — это
+    честный `<video>` на её собственный ролик, браузер сам вытянет из него первый кадр.
+    `<img>` остаётся только у упавшей (см. следующий тест) — там ролика никогда не было.
     """
-    ok, no_preview = _node_eval("""
+    ok, no_clip = _node_eval("""
       const base = {id: "j", note: "", args: ["generate", "--tag", "кот", "--preview-every", "5"],
                     estimate: {width: 896, height: 576, duration_seconds: 10, steps: 8,
                                forwards: 7, seconds: 3600, peak_gb: 35},
@@ -3409,15 +3437,19 @@ def test_a_finished_run_is_a_card_with_its_own_preview_frame():
                     started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
       console.log(JSON.stringify([
         app.finishedRowHtml(base, "/o"),
-        app.finishedRowHtml({...base, estimate: {...base.estimate, forwards: 0}}, "/o"),
+        app.finishedRowHtml(base, null),
       ]));
     """)
-    assert "<img" in ok and "-preview-step05.jpg" in ok, ok
-    assert "/media/%D0%BD%D0%BE%D1%87%D1%8C/" in ok, "кадр берётся из каталога прогона"
+    assert "<img" not in ok, ("успешная задача больше не показывает кадр TAE — у неё есть "
+                              "готовый ролик:\n" + ok)
+    assert "<video" in ok and 'class="frame-video"' in ok, ok
+    assert "/media/%D0%BD%D0%BE%D1%87%D1%8C/h3-%D0%BA%D0%BE%D1%82-896x576.mp4" in ok, (
+        "кадр — собственный ролик прогона, из его каталога:\n" + ok)
+    assert 'preload="metadata"' in ok and "muted" in ok and "playsinline" in ok, ok
     assert "кот" in ok, "слаг задачи — заголовок карточки"
     assert "1 ч" in ok, "время счёта — то, ради чего в этот список вообще смотрят"
-    assert "<img" not in no_preview, (
-        "кадра ещё не записано — пустая рамка честнее битой картинки")
+    assert "<video" not in no_clip and "<img" not in no_clip, (
+        "без outdir clipUrl не строит ссылку на ролик — пустая рамка честнее битой:\n" + no_clip)
 
     css = _page_text("style.css")
     assert re.search(r"\.results\s*\{[^}]*grid-template-columns", css), (
@@ -3436,8 +3468,13 @@ def test_a_failed_run_takes_its_frame_from_the_passes_it_actually_reached():
     прохода, а не до первого, и кадр с него — единственное, что от неё осталось посмотреть.
     Поэтому не «прятать картинку у упавших», а брать у них правильную.
 
-    У успешной ничего не меняется: она прошла всё, что обещала, и `estimate.forwards` для неё
-    факт (и переживает исчезновение прогона из `runs`, которое сутки спустя обычное дело).
+    Round 2: успешная больше не показывает TAE-кадр вовсе (у неё готовый ролик, см.
+    `test_a_finished_run_is_a_card_with_its_own_preview_frame`) — `estimate.forwards`
+    здесь участвует только в кадре упавшей, и этот тест теперь целиком про неё.
+
+    Кадр упавшей — снимок полусырого латента с середины диффузии, а не готовый результат, и
+    `title` обязан сказать это прямо: подпись называет номер шага и то, что прогон упал, а не
+    молчит, как молчала бы подпись готового кадра.
     """
     failed, orphan, ok = _node_eval("""
       const base = {id: "j", note: "",
@@ -3459,10 +3496,13 @@ def test_a_failed_run_takes_its_frame_from_the_passes_it_actually_reached():
         + failed)
     assert "-preview-step40.jpg" not in failed, (
         "сорок проходов упавшая не прошла, и кадра с сорокового на диске нет:\n" + failed)
+    assert "снимок с шага 10" in failed and "прогон упал" in failed, (
+        "подпись кадра упавшей обязана называть шаг и то, что прогон не завершился:\n" + failed)
     assert "<img" not in orphan, (
         "прогона нет в runs — сколько проходов было, неизвестно, и пустая рамка честнее 404")
-    assert "-preview-step40.jpg" in ok, (
-        "успешный прогон прошёл всё, что обещала оценка — у него кадр по-прежнему её:\n" + ok)
+    assert "<img" not in ok and "-preview-step40.jpg" not in ok, (
+        "успешный прогон больше не берёт кадр из TAE-превью — у него есть готовый ролик:\n" + ok)
+    assert "<video" in ok and "h3-%D0%BA%D0%BE%D1%82-896x576.mp4" in ok, ok
 
 
 @_needs_node
@@ -3606,6 +3646,8 @@ def test_finished_shows_the_exit_code_and_a_failure_shows_why():
     assert "код 1" in failed
     assert "metal::malloc" in failed, "a failed run with no visible reason is a mystery, not a row"
     assert 'href="/media/%D0%BD%D0%BE%D1%87%D1%8C/h3-%D0%BA%D0%BE%D1%82-896x576.mp4"' in ok, ok
+    assert "<video" in ok and "<img" not in ok, "done shows its own clip, not a mid-diffusion mess"
+    assert "<video" not in failed, "a failed run never has a clip to show"
     # Правка по ревью C2: карточка упавшей задачи называла код возврата дважды подряд --
     # «код 1» в строке чисел и «код возврата 1» строкой ниже, где у успешной стоит ссылка на
     # ролик. Одно число -- одно место; строка ссылки у упавшей называет имя вывода.

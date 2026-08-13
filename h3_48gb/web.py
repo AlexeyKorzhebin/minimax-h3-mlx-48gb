@@ -1219,6 +1219,20 @@ def _is_within(path, other) -> bool:
         current = parent
 
 
+def _reveal_in_finder(path: Path) -> None:
+    """Select `path` in Finder -- the default `self.server.reveal` (`_reveal_job`'s own seam,
+    `make_server(..., reveal=...)`). macOS-only, and only ever called with a path already checked
+    to sit inside the outdir.
+
+    `check=False`: by the time this runs, Finder is the only thing left that can react to `path`
+    no longer being there (removed between the check in `_reveal_job` and this call, or `open`
+    itself missing on a non-macOS box this server should not otherwise be running on) -- and
+    that reaction is not a `CalledProcessError` this process should raise on. The request already
+    found a real file; a `open -R` that then fails is a cosmetic miss, not a 500.
+    """
+    subprocess.run(["open", "-R", str(path)], check=False)
+
+
 def _content_type(path: Path) -> str:
     guess = _CONTENT_TYPES.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0]
     guess = guess or "application/octet-stream"
@@ -1568,6 +1582,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._promote_job(path[len("/api/jobs/"):-len("/top")])
         if path.startswith("/api/jobs/") and path.endswith("/duplicate"):
             return self._duplicate_job(path[len("/api/jobs/"):-len("/duplicate")])
+        if path.startswith("/api/jobs/") and path.endswith("/reveal"):
+            return self._reveal_job(path[len("/api/jobs/"):-len("/reveal")])
         if path == "/api/chat":
             return self._create_chat()
         if path == "/api/llm/unload":
@@ -1903,6 +1919,48 @@ class _Handler(BaseHTTPRequestHandler):
                 continue
             return 200, "application/json", _json_bytes({"id": new_job.id})
         raise last_error
+
+    def _reveal_job(self, raw_id: str) -> tuple[int, str, bytes]:
+        """`POST /api/jobs/<id>/reveal`: open Finder at a `done` or `failed` job's own output.
+
+        `pending`/`running` are refused with `not_found`, the same as an unknown id: a `pending`
+        job has no output yet worth revealing, and one still in `running/` could point Finder at a
+        file the worker is writing to this very second (`_promote_job`, `_cancel_job` and this
+        route are the only three that ever look a job up by bare id across every state the way
+        `_duplicate_job` does, and this one narrows the set on purpose).
+
+        The target is the job's own clip if it made it to disk, its own run directory otherwise
+        (task A6 gives every job its own subdirectory) -- the clip is the one file a person came
+        here to look at, the directory is what is left once a failed run never produced one.
+        Neither existing is the same as "nothing worth showing", not "show the outdir instead":
+        the button promises *this job's* output, and a consolation prize one level up would be a
+        different, unrelated job's neighbour.
+
+        `resolve_within` bounds the target to the outdir the same way `/media` bounds its own
+        reads: `output_stem` is job data read back off disk here, not re-validated against the
+        roots the way a fresh submission is (`_refuse_if_relocation_escapes_the_roots`), so a job
+        written before some future change to that policy is exactly the case this still guards.
+
+        `self.server.reveal` is the seam a test replaces (`make_server(..., reveal=...)`); in
+        production it is `_reveal_in_finder`, which shells out to `open -R`.
+        """
+        jobs, _broken = q.scan(self.server.queue_root)
+        job = next((candidate for candidate in jobs if candidate.id == raw_id
+                   and candidate.state in ("done", "failed")), None)
+        if job is None:
+            return 404, "application/json", _error_bytes(
+                "not_found", f"нет такой законченной задачи: {raw_id}", {"id": raw_id})
+
+        stem = Path(job.output_stem)
+        candidates = (stem.with_name(stem.name + ".mp4"), stem.parent)
+        target = next((path for path in candidates if path.exists()), None)
+        if target is None:
+            return 404, "application/json", _error_bytes(
+                "not_found", f"на диске не осталось файлов задачи: {raw_id}", {"id": raw_id})
+
+        resolved = resolve_within(target, {"outdir": Path(self.server.outdir)}, write=False)
+        self.server.reveal(resolved)
+        return 200, "application/json", _json_bytes({"ok": True, "path": str(resolved)})
 
     def _cancel_job(self, raw_id: str) -> tuple[int, str, bytes]:
         job_id = self._job_id_of(raw_id)
@@ -2760,7 +2818,7 @@ class _Server(ThreadingHTTPServer):
 
 
 def make_server(queue_root, outdir, repo=None, models=None, webui=None, port=DEFAULT_PORT,
-                verbose=False) -> ThreadingHTTPServer:
+                verbose=False, reveal=None) -> ThreadingHTTPServer:
     """A server bound to the loopback, ready for `serve_forever()`.
 
     `port=0` asks the kernel for a free one; the actual number is in `server_address[1]`, which is
@@ -2769,6 +2827,11 @@ def make_server(queue_root, outdir, repo=None, models=None, webui=None, port=DEF
     `repo`, `models` and `webui` are parameters rather than module constants read at call time so a
     test can point them at a temporary tree -- but they default to the real ones, so nothing in
     production depends on a caller getting them right.
+
+    `reveal` is the same idea for `_reveal_job`'s `open -R`: a callable of one `Path`, defaulting
+    to `_reveal_in_finder`, which is the only thing in this module that ever shells out for it.
+    A test that wants to assert *what* would be revealed, without a real Finder or a real macOS
+    box, passes its own here (see `tests/test_chat_web.py`'s `_serve`).
     """
     httpd = _Server((LOOPBACK, port), _Handler)
     # Built from the port the socket actually got, not from `port`: with `port=0` the kernel picks,
@@ -2785,4 +2848,5 @@ def make_server(queue_root, outdir, repo=None, models=None, webui=None, port=DEF
                    "outdir": Path(outdir),
                    "models": Path(models) if models is not None else models_root()}
     httpd.verbose = verbose
+    httpd.reveal = reveal if reveal is not None else _reveal_in_finder
     return httpd

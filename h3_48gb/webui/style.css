@@ -1081,7 +1081,8 @@ details.adv > summary .hint {
   border-bottom: 1px solid var(--hairline);
   overflow: hidden;
 }
-.frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.frame img, .frame video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.frame video { cursor: pointer; }
 .frame .tc, .frame .dur {
   position: absolute; bottom: 9px; z-index: 1;
   font: 10.5px/1 var(--mono); letter-spacing: 0; color: var(--frame-ink);
@@ -1116,9 +1117,11 @@ details.adv > summary .hint {
   max-height: 4.5em; overflow: hidden;
 }
 
-/* Ссылка на готовый ролик. Именно ссылка, а не <video>: сервер читает файл
-   в память целиком и перемотки не поддерживает, так что сорок мегабайт
-   грузятся только тогда, когда человек этого действительно захотел. */
+/* Ссылка на готовый ролик, рядом с кадром (`.frame-video`), а не вместо него: `/media` читает
+   файл в память целиком и перемотки не поддерживает, но `preload="metadata"` на трёх-двенадцати
+   мегабайтах — не сорок мегабайт без спроса, браузер останавливает загрузку сам, как только
+   вытянул первый кадр (проверено вживую, round 2). Ссылка ниже — тот же принцип для полного
+   открытия/скачивания: явное действие, а не подгрузка при одном только рендере карточки. */
 .clip { color: var(--accent-ink); text-decoration: none; }
 .clip:hover { text-decoration: underline; }
 
