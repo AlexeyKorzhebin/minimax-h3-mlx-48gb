@@ -499,6 +499,33 @@ def test_api_state_reports_paused_true_for_a_freshly_created_queue(server):
     assert body["paused"] is True
 
 
+def test_api_state_reports_paused_true_when_the_queue_root_does_not_exist_yet(tmp_path):
+    """Review round 1, Important. The `server` fixture above runs `q.layout` before the server
+    ever answers a request, so it cannot see the real window this closes: `h3 web` started, no
+    job submitted yet, no worker started yet -- nothing has called `q.layout(queue_root)`, so the
+    directory does not exist on disk at all. `q.is_paused` alone answers `False` there (a missing
+    marker is "not paused", its own deliberately safe direction -- see its docstring), and
+    `build_state` used to pass that straight through: the very first `/api/state` a human's browser
+    ever saw would say the queue is running, and the page would offer «⏸ Приостановить» for a
+    queue that, the instant anything actually creates it, starts paused (`queue.layout`'s own
+    contract). This builds its own server, deliberately skipping `q.layout` -- `server`'s fixture
+    calling it up front is exactly what let this window go uncovered.
+    """
+    outdir = tmp_path / "outdir"
+    outdir.mkdir()
+    root = outdir / "queue"
+    assert not root.exists(), "the whole point is a queue root nothing has created yet"
+    live = _serve(root, outdir)
+    try:
+        _, body = _json(live, "/api/state")
+        assert body["paused"] is True, (
+            "a queue root that does not exist yet must still answer paused=True -- it will be "
+            "created paused the instant anything (a submit, a worker) actually creates it")
+    finally:
+        live.httpd.shutdown()
+        live.httpd.server_close()
+
+
 def test_post_queue_pause_and_start_toggle_the_marker_and_report_it(server):
     status, body = _json(server, "/api/queue/pause", method="POST")
     assert status == 200 and body == {"ok": True, "paused": True}, body
@@ -4172,6 +4199,22 @@ def test_the_unload_banner_stays_hidden_while_the_queue_is_paused():
     assert paused_and_up["show"] is False, "the banner must not show while the queue is paused"
     assert unpaused_and_up["show"] is True, (
         "the same otherwise-triggering state must still show once unpaused")
+
+
+@_needs_node
+def test_next_banner_state_stays_hidden_while_the_queue_is_paused():
+    """Review round 1 (fix, cheap add): the brief asked for `paused` coverage on *both* functions
+    the page's banner logic is built from, and only `unloadBanner` had it above.
+    `renderUnloadBanner` -- what the page actually calls every poll -- goes through
+    `nextBannerState`, never `unloadBanner` directly, so a regression that broke the `paused` gate
+    only inside `nextBannerState`'s own body (as opposed to the `unloadBanner` call it wraps) would
+    have passed the whole suite without this.
+    """
+    banner = _node_eval("""
+      console.log(JSON.stringify(
+        app.nextBannerState({dismissedKey: null}, {pending: 2, llm: "up", paused: true})));
+    """)
+    assert banner["show"] is False
 
 
 @_needs_node

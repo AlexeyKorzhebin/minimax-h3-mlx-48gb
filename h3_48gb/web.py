@@ -466,11 +466,21 @@ def build_state(queue_root, outdir) -> dict:
     the page's pause/resume button (`POST /api/queue/pause`/`/start`) and `main_loop`'s own gate
     both act on the same marker file, and this is the one place a human sees whether either of them
     has.
+
+    **Except when `queue_root` does not exist yet, when `paused` is `True` regardless of what
+    `is_paused` says.** `is_paused`'s own contract treats a missing marker as "not paused" -- its
+    deliberately safe direction, documented on that function, for a queue that *used to have* a
+    marker and lost it. A queue root that has never been created at all is a different situation:
+    nothing has called `queue.layout` yet (no job submitted, no worker started), and the moment
+    anything does, `layout` creates it paused (see its own docstring). Passing `is_paused`'s literal
+    answer through here would tell a human's very first page load "the queue is running" about a
+    queue that is guaranteed to start paused the instant it exists -- review round 1 caught exactly
+    this: the button would offer «⏸ Приостановить» before a single job could ever have run.
     """
     with queue_errors(queue_root):
         jobs, broken = q.scan(queue_root)
         state = worker_state(queue_root)
-        paused = q.is_paused(queue_root)
+        paused = True if not Path(queue_root).is_dir() else q.is_paused(queue_root)
 
     grouped: dict[str, list[dict]] = {name: [] for name in q.QUEUE_STATES}
     for job in jobs:
