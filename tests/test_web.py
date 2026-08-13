@@ -3235,6 +3235,25 @@ def test_build_args_carries_the_adaln_cache_flag_only_when_the_field_is_set():
     assert "--adaln-cache" not in without, without
 
 
+@_needs_node
+def test_the_upload_zone_shows_a_prompt_when_empty_and_the_name_once_loaded():
+    """A7: `uploadZoneLabel` is the one pure function the drop zone's text is built from --
+    `updateUploadZone` (the DOM half) just feeds it `{name}` derived from whatever is currently in
+    `#image`/`#end-image`, so this is what actually pins requirement 21's two states without a
+    browser.
+    """
+    empty, loaded, blank_name = _node_eval("""
+      console.log(JSON.stringify([
+        app.uploadZoneLabel(null),
+        app.uploadZoneLabel({name: "start.png"}),
+        app.uploadZoneLabel({name: ""}),
+      ]));
+    """)
+    assert empty == "перетащи картинку или выбери файл", empty
+    assert loaded == "start.png", loaded
+    assert blank_name == empty, "an empty name must read exactly like no state at all"
+
+
 def test_the_form_defaults_to_the_project_s_working_recipe():
     """The project's working recipe is 8 steps, this checkpoint, this turbo LoRA at full strength,
     and this baked AdaLN table -- so a fresh page has to open ready to run it, not to a checkpoint

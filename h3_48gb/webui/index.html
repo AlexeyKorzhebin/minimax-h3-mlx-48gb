@@ -124,11 +124,27 @@
           </div>
           <!-- Кадры нужны только двум режимам и только тогда и показываются:
                --mode i2v без --image — это отказ mode_mismatch, а не задача. -->
-          <div class="row" id="row-image" hidden><label for="image">Первый кадр</label>
-            <div class="ctl"><input class="mono path" id="image" type="text" placeholder="~/video-out/кадры/start.png"></div>
+          <div class="row" id="row-image" hidden><label for="image-file">Первый кадр</label>
+            <div class="ctl">
+              <div class="dropzone" id="image-zone" tabindex="0" role="button"
+                   aria-label="Первый кадр — перетащи файл или нажми, чтобы выбрать">
+                <span class="dropzone-label" id="image-zone-label"></span>
+              </div>
+              <input type="file" id="image-file" accept="image/*" hidden>
+              <button type="button" class="upload-link" id="image-manual">указать путь</button>
+              <input class="mono path" id="image" type="text" placeholder="~/video-out/кадры/start.png" hidden>
+            </div>
           </div>
-          <div class="row" id="row-end-image" hidden><label for="end-image">Последний кадр</label>
-            <div class="ctl"><input class="mono path" id="end-image" type="text" placeholder="~/video-out/кадры/end.png"></div>
+          <div class="row" id="row-end-image" hidden><label for="end-image-file">Последний кадр</label>
+            <div class="ctl">
+              <div class="dropzone" id="end-image-zone" tabindex="0" role="button"
+                   aria-label="Последний кадр — перетащи файл или нажми, чтобы выбрать">
+                <span class="dropzone-label" id="end-image-zone-label"></span>
+              </div>
+              <input type="file" id="end-image-file" accept="image/*" hidden>
+              <button type="button" class="upload-link" id="end-image-manual">указать путь</button>
+              <input class="mono path" id="end-image" type="text" placeholder="~/video-out/кадры/end.png" hidden>
+            </div>
           </div>
           <div class="row"><label for="tag">Тег</label>
             <div class="ctl"><input class="mono" id="tag" type="text" value="run"><span class="hint">Имя вывода строится из него; повтор — отказ</span></div>

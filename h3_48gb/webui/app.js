@@ -1009,6 +1009,16 @@ export function buildArgs(form, { withPrompt = true } = {}) {
   return args;
 }
 
+/** Текст зоны загрузки кадра (A7): пусто — приглашение перетащить или выбрать файл, что-то
+ *  загружено (или вписано вручную) — имя файла. Чистая функция состояния зоны, а не поля ввода
+ *  напрямую: `state` — `{name}` c возможно отсутствующим или пустым `name`, ровно то, что
+ *  `updateUploadZone` (ниже, в DOM-половине) строит из текущего пути в поле, а node-тест — из
+ *  ничего вообще. */
+export function uploadZoneLabel(state) {
+  const name = (state && state.name) || "";
+  return name || "перетащи картинку или выбери файл";
+}
+
 /** Тег с сидом в хвосте. Без него три сида одной сцены упрутся в
  *  `output_stem_conflict`: имя вывода строится из тега. */
 export function tagWithSeed(tag, seed) {
@@ -2362,6 +2372,8 @@ function startPage() {
     $("end-image").value = argValue(job.args, "--end-image") || "";
     $("note").value = job.note || "";
     syncModeRows();
+    updateUploadZone("image");
+    updateUploadZone("end-image");
   }
 
   function setEditing(id) {
@@ -2437,6 +2449,107 @@ function startPage() {
     const mode = $("mode").value;
     $("row-image").hidden = !(mode === "i2v" || mode === "flf");
     $("row-end-image").hidden = mode !== "flf";
+  }
+
+  /* -- зона загрузки кадра (A7) --------------------------------------------------------------
+     `#image`/`#end-image` are the only thing `buildArgs` ever reads: a drop zone just has to
+     put a path into one of them, the same as typing into it always did. The zone's own text is
+     always derived from that field's current value (`updateUploadZone`), never tracked as
+     separate state, so a job restored into the form (`fillFormFrom`), a path typed by hand
+     through "указать путь", and a freshly uploaded file all show up the same way. */
+
+  /** Имя файла из пути в поле `id` — с любым разделителем, потому что путь мог прийти с сервера
+   *  (всегда `/`) или быть вписан руками на другой ОС. */
+  function pathBasename(value) {
+    const trimmed = (value || "").trim();
+    if (!trimmed) return "";
+    const parts = trimmed.split(/[\\/]/);
+    return parts[parts.length - 1];
+  }
+
+  function updateUploadZone(id) {
+    const name = pathBasename($(id).value);
+    $(`${id}-zone-label`).textContent = uploadZoneLabel({ name });
+    $(`${id}-zone`).classList.toggle("loaded", Boolean(name));
+    $(`${id}-zone`).classList.remove("error");
+  }
+
+  /** Один POST, сырыми байтами: `Content-Type: application/octet-stream` и имя файла в
+   *  `X-Filename`, а не в теле — картинке незачем делать крюк через base64 и JSON, когда байты
+   *  и так уже есть в `File`. Имя закодировано `encodeURIComponent`: значение заголовка — ASCII
+   *  по спецификации и `fetch` сам бросит исключение на кириллице, если этого не сделать
+   *  (см. `_upload_frame` в `web.py`, где сервер это же значение `decodeURIComponent`ит назад). */
+  async function uploadFrame(id, file) {
+    const zone = $(`${id}-zone`);
+    zone.classList.remove("error");
+    zone.classList.add("busy");
+    try {
+      const response = await fetch("/api/uploads", {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream",
+                  "X-Filename": encodeURIComponent(file.name) },
+        body: file,
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const error = new Error("upload");
+        error.payload = payload;
+        throw error;
+      }
+      $(id).value = payload.path;
+      updateUploadZone(id);
+      scheduleEstimate();
+      renderPrompt();
+    } catch (error) {
+      zone.classList.add("error");
+      $(`${id}-zone-label`).textContent = error.payload
+        ? errorText(error.payload).title : "Файл не загрузился";
+    } finally {
+      zone.classList.remove("busy");
+    }
+  }
+
+  /** Зона `id-zone` рядом с полем `id`: клик или Enter/пробел открывают скрытый `id-file`,
+   *  перетаскивание принимает первый файл так же, а ссылка `id-manual` — запасной путь на случай,
+   *  когда файла для перетаскивания просто нет: путь уже известен (открыта правка задачи,
+   *  которую поставили не с этой страницы) и его проще вписать, чем найти на диске. */
+  function wireUploadZone(id) {
+    const zone = $(`${id}-zone`);
+    const fileInput = $(`${id}-file`);
+    const manual = $(`${id}-manual`);
+    const path = $(id);
+
+    zone.addEventListener("click", () => fileInput.click());
+    zone.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        fileInput.click();
+      }
+    });
+    zone.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      zone.classList.add("dragover");
+    });
+    zone.addEventListener("dragleave", () => zone.classList.remove("dragover"));
+    zone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      zone.classList.remove("dragover");
+      const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+      if (file) uploadFrame(id, file);
+    });
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (file) uploadFrame(id, file);
+      fileInput.value = "";     // тот же файл второй раз подряд тоже должен дать событие change
+    });
+    manual.addEventListener("click", (event) => {
+      event.preventDefault();
+      zone.hidden = true;
+      manual.hidden = true;
+      path.hidden = false;
+      path.focus();
+    });
+    updateUploadZone(id);
   }
 
   /** «Выгрузить и начать»: `POST /api/llm/unload`, затем то же перечитывание состояния, что и
@@ -2544,8 +2657,14 @@ function startPage() {
     $("hl").scrollLeft = $("prompt").scrollLeft;
   });
   for (const id of FIELDS) {
-    $(id).addEventListener("input", () => { scheduleEstimate(); renderPrompt(); });
+    $(id).addEventListener("input", () => {
+      scheduleEstimate();
+      renderPrompt();
+      if (id === "image" || id === "end-image") updateUploadZone(id);
+    });
   }
+  wireUploadZone("image");
+  wireUploadZone("end-image");
   $("mode").addEventListener("change", () => {
     syncModeRows();
     renderPrompt();     // t2va без звуковых секций — отказ, t2v без них — нет

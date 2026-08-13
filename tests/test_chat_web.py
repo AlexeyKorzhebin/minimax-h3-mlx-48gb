@@ -20,6 +20,7 @@ import http.client
 import json
 import os
 import threading
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -80,6 +81,37 @@ class _Live:
 
     def delete_json_raw(self, url: str) -> tuple[int, dict]:
         return self._request("DELETE", url)
+
+    def upload_raw(self, data: bytes, filename, *, headers=None) -> tuple[int, dict]:
+        """`POST /api/uploads` with a raw body -- the one route on this server that is not JSON,
+        so it cannot go through `_request` above (`Content-Type: application/octet-stream`, the
+        filename in a header rather than the body).
+
+        `filename` is `quote`d the way `app.js` sends it (`encodeURIComponent`): an HTTP header
+        value is plain ASCII, enforced by every browser's `fetch`, so a Cyrillic name has to be
+        percent-encoded before it can travel as `X-Filename` at all -- `web.py`'s `_upload_frame`
+        `unquote`s it back on arrival. `filename=None` omits `X-Filename` entirely, for the test
+        that checks it is required. `headers` overrides/extends the pair this sends by default,
+        so a test can still spell `X-Filename` itself if it wants a header this helper does not
+        set on its own.
+        """
+        request_headers = {"Content-Type": "application/octet-stream"}
+        if filename is not None:
+            request_headers["X-Filename"] = urllib.parse.quote(filename, safe="")
+        if headers:
+            request_headers.update(headers)
+        connection = http.client.HTTPConnection(web.LOOPBACK, self.port, timeout=30)
+        try:
+            connection.request("POST", "/api/uploads", body=data, headers=request_headers)
+            response = connection.getresponse()
+            content_type = response.getheader("Content-Type")
+            raw = response.read()
+            status = response.status
+        finally:
+            connection.close()
+        assert content_type == "application/json", (
+            f"POST /api/uploads answered {content_type!r}; the contract is JSON everywhere")
+        return status, json.loads(raw)
 
 
 @pytest.fixture
@@ -688,6 +720,74 @@ def test_a_keyframe_outside_every_root_is_refused_when_the_session_opens(_serve,
     status, payload = srv.post_json_raw("/api/chat", {"source": {"kind": "new"}, "prompt": "",
                                                       "mode": "i2v", "image": str(outside)})
     assert (status, payload["error"]["code"]) == (400, "path_outside_root")
+
+
+# -- загрузка кадра (A7) ------------------------------------------------------------------------
+
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+
+
+def test_an_uploaded_frame_lands_in_the_outdirs_uploads_directory_and_is_returned_as_a_path(
+        _serve):
+    srv = _serve()
+    status, answer = srv.upload_raw(_PNG_BYTES, "start.png")
+    assert (status, answer["ok"]) == (200, True), answer
+    saved = Path(answer["path"])
+    assert saved.is_file()
+    assert saved.read_bytes() == _PNG_BYTES
+    assert saved.parent == (Path(srv.root) / "uploads").resolve()
+    assert saved.name.endswith("-start.png")
+
+
+def test_a_non_image_upload_is_refused_as_bad_image(_serve):
+    """Суффикс — та же проверка, что и у кадра сессии (`CHAT_IMAGE_SUFFIXES`), только раньше:
+    здесь она не пускает файл на диск вовсе, а не только в разговор с моделью."""
+    srv = _serve()
+    status, answer = srv.upload_raw(b"not a picture", "notes.txt")
+    assert (status, answer["error"]["code"]) == (400, "bad_image"), answer
+    assert not (Path(srv.root) / "uploads").exists(), "отказ не должен создавать файл на диске"
+
+
+def test_an_upload_over_the_size_limit_is_refused_as_bad_image(_serve, monkeypatch):
+    monkeypatch.setattr(web, "CHAT_IMAGE_MAX_BYTES", 8)
+    srv = _serve()
+    status, answer = srv.upload_raw(_PNG_BYTES, "big.png")
+    assert (status, answer["error"]["code"]) == (400, "bad_image"), answer
+    assert not (Path(srv.root) / "uploads").exists(), "отказ не должен создавать файл на диске"
+
+
+def test_a_traversal_filename_does_not_escape_the_uploads_directory(_serve):
+    """`X-Filename: ../x.png` — тот же побег из корня, что и путь кадра сессии
+    (`test_a_keyframe_outside_every_root_is_refused_when_the_session_opens`), только тут имя
+    приходит не путём, а заголовком, который и берётся за basename в `sanitize_upload_name`."""
+    srv = _serve()
+    status, answer = srv.upload_raw(_PNG_BYTES, "../x.png")
+    assert (status, answer["ok"]) == (200, True), answer
+    saved = Path(answer["path"])
+    # Файл создан ВНУТРИ uploads/, а не поднялся на уровень выше -- побег не удался.
+    assert saved.parent == (Path(srv.root) / "uploads").resolve()
+    assert saved.is_file()
+    assert not (Path(srv.root) / "x.png").exists(), "имя не должно было сбежать из uploads/"
+    # Имя очищено: разделитель не пережил sanitize_upload_name, «..» тоже не осталось.
+    assert ".." not in saved.name
+    assert "/" not in saved.name
+
+
+def test_a_cyrillic_or_spaced_filename_becomes_a_safe_name(_serve):
+    srv = _serve()
+    status, answer = srv.upload_raw(_PNG_BYTES, "Кадр номер 1.png")
+    assert (status, answer["ok"]) == (200, True), answer
+    saved = Path(answer["path"])
+    assert saved.is_file()
+    # Только безопасный алфавит остался в имени; ни кириллицы, ни пробела.
+    assert all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in saved.name), saved.name
+    assert saved.suffix == ".png"
+
+
+def test_an_upload_without_x_filename_is_a_bad_request(_serve):
+    srv = _serve()
+    status, answer = srv.upload_raw(_PNG_BYTES, None)
+    assert (status, answer["error"]["code"]) == (400, "bad_request"), answer
 
 
 # -- провайдеры и плашка модели ------------------------------------------------------------------

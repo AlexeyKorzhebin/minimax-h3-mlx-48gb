@@ -463,6 +463,42 @@ select {
 .hint { font-size: 11.5px; color: var(--ink-3); min-width: 0; }
 .hint.bad { color: var(--fail-ink); font-weight: 500; }
 
+/* ---------- зона загрузки кадра (A7) -------------------------------------
+   Пунктир — тот же язык, что у любого «сюда» в системных приложениях: клик
+   и перетаскивание запускают одно и то же действие, поэтому это одна зона,
+   а не поле плюс кнопка рядом. Заполненная зона переходит на сплошную
+   обводку и моноширинный шрифт имени — та же смена, что различает пустой
+   и заполненный `.mono.path` в остальной форме. ----------------------------- */
+.dropzone {
+  flex: 1; min-width: 0; display: flex; align-items: center;
+  padding: 6px 11px;
+  border: 1px dashed var(--hairline-2);
+  border-radius: var(--r-ctl);
+  background: var(--fill);
+  color: var(--ink-3);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+.dropzone:hover { background: var(--fill-2); }
+.dropzone:focus-visible {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px var(--accent-ring);
+}
+.dropzone.dragover { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-ink); }
+.dropzone.loaded { border-style: solid; color: var(--ink); }
+.dropzone.loaded .dropzone-label { font-family: var(--mono); font-size: 12px; }
+.dropzone.busy { opacity: .6; cursor: progress; }
+.dropzone.error { border-color: var(--fail); background: var(--fail-soft); color: var(--fail-ink); }
+.dropzone-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.upload-link {
+  background: none; border: none; padding: 0; font-family: var(--ui);
+  font-size: 11.5px; color: var(--accent-ink); text-decoration: none;
+  white-space: nowrap; cursor: pointer;
+}
+.upload-link:hover { text-decoration: underline; }
+.upload-link:focus-visible { outline: none; box-shadow: 0 0 0 3.5px var(--accent-ring); }
+
 /* ===========================================================================
    ОЦЕНКА — главный ответ формы
    =========================================================================== */

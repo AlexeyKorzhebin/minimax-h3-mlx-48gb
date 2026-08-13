@@ -40,6 +40,7 @@ import secrets
 import subprocess
 import sys
 import urllib.parse
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -135,6 +136,14 @@ PROMPTS_DIR = "prompts"
 #: purpose. `llama.log` lands in the same directory (see `provider.LlamaLocal.ensure_up`).
 CHAT_DIR = "chat"
 
+#: Where an uploaded keyframe lands, relative to the output directory: `<outdir>/uploads/`.
+#: `POST /api/uploads` (task A7) writes here and answers with a path inside it, which the page
+#: then puts straight into `#image`/`#end-image` -- those two fields have always taken a path,
+#: never a file, so a drag-and-drop upload only needs to land somewhere `--image`/`--end-image`
+#: can already point at. Under the outdir for the same reason `CHAT_DIR` is: a dropped frame is a
+#: working file on one machine, not something that belongs in the repository.
+UPLOAD_DIR = "uploads"
+
 #: What a chat session may say it was opened from. A closed list, and checked on creation: a
 #: session whose `kind` the page does not know is one the page can never open again, and the honest
 #: moment to say so is the moment it is written. `clip` is accepted and stored but not yet acted on
@@ -200,8 +209,107 @@ CHAT_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
 #: The biggest keyframe a turn will carry. Not a security bound -- `CHAT_IMAGE_SUFFIXES` is that --
 #: but a limit on what is worth sending: base64 inflates by a third, and a 40 MB frame becomes 53 MB
 #: of context that a local model spends minutes on before answering. Bigger than `MAX_BODY_BYTES`
-#: on purpose: that one bounds what a *request* may carry, and a keyframe arrives as a path.
+#: on purpose: that one bounds what a *request* may carry, and a keyframe named by a *session*
+#: arrives as a path, already on disk.
+#:
+#: `POST /api/uploads` (task A7) is the one route where a keyframe *does* arrive as a request
+#: body -- a drag-and-drop file, not yet a path -- and `MAX_BODY_BYTES` still does not bound it:
+#: that route never calls `_json_request` (its body is raw bytes, not JSON), so the 4 MiB JSON
+#: limit is simply never in its path. What bounds the upload instead is this constant, deliberately
+#: reused rather than a second, larger number invented for the route: an upload over
+#: `CHAT_IMAGE_MAX_BYTES` would only stage a file `_turn_content` refuses to read the moment a
+#: chat turn tries to send it, so there is no size a bigger upload limit would actually let through.
 CHAT_IMAGE_MAX_BYTES = 16 * 1024 * 1024
+
+#: The longest a sanitized upload filename may be, in bytes -- matched against `X-Filename` after
+#: `sanitize_upload_name` has already stripped it to `[A-Za-z0-9._-]`. Well under `NAME_MAX_BYTES`
+#: (255, the filesystem's own bound) on purpose: `_upload_target` still prefixes the sanitized name
+#: with a timestamp-and-nonce stamp (`_upload_stamp`, ~22 bytes), and the two together have to fit
+#: inside the same 255-byte filename the kernel enforces.
+UPLOAD_NAME_MAX_BYTES = 100
+
+#: Cyrillic letters as their closest Latin spelling. A courtesy for the common case on this
+#: Russian-speaking machine, not a security boundary -- `_UPLOAD_NAME_UNSAFE` runs after this and
+#: would turn an untranslated «кадр.png» into the equally-safe but unreadable «----.png» on its
+#: own. Bare lowercase letters only; `_transliterate_cyrillic` handles case itself, the same way a
+#: human would read «Кадр» as capitalised «Kadr» rather than «KADR» or «kADR».
+_CYRILLIC_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
+    "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+    "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu",
+    "я": "ya",
+}
+
+#: What survives in a sanitized upload filename, once `_transliterate_cyrillic` has already run.
+#: A **replacement**, not a drop: `_UPLOAD_NAME_UNSAFE.sub("-", name)` turns every run of anything
+#: else -- a slash, a space, an untranslated character -- into one `-`, so two names that differ
+#: only in the replaced run do not collide into the same file, and no separator survives to be
+#: read by a filesystem as structure. The character class is `PROMPT_NAME`'s own alphabet
+#: (`[A-Za-z0-9_-]`) plus the dot a suffix needs.
+_UPLOAD_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _transliterate_cyrillic(text: str) -> str:
+    """`text` with every Cyrillic letter replaced by its closest Latin spelling.
+
+    See `_CYRILLIC_TRANSLIT`'s docstring for why this exists and what it is not.
+    """
+    pieces = []
+    for ch in text:
+        piece = _CYRILLIC_TRANSLIT.get(ch.lower())
+        if piece is None:
+            pieces.append(ch)
+        else:
+            pieces.append(piece.capitalize() if ch.isupper() and piece else piece)
+    return "".join(pieces)
+
+
+def sanitize_upload_name(raw: str) -> str:
+    """`raw` (an `X-Filename` header) reduced to a bare filename safe to place inside `uploads/`.
+
+    Three steps, in order, and each answers a different failure:
+
+    1. **basename, both slash spellings.** `X-Filename` is a header a person can set from `curl`
+       on any OS, so a POSIX-only `os.path.basename` would leave a backslash-separated
+       `..\\..\\x.png` untouched; both `/` and `\\` are normalised before anything splits on them.
+       `../x.png` and `/etc/passwd` collapse to their last segment here, before either reaches a
+       filesystem call.
+    2. **transliteration** (`_transliterate_cyrillic`) -- readability, not safety.
+    3. **the character filter** (`_UPLOAD_NAME_UNSAFE`) -- this is the step that actually makes
+       the name safe: nothing outside `[A-Za-z0-9._-]` survives, so nothing a filesystem would
+       read as a separator or a `..` segment can reach `_upload_target`. That function's own
+       `resolve_within` call is the second, independent line behind this one, exactly as
+       `resolve_prompt_name`'s docstring explains for `PROMPT_NAME` -- a whitelist here is not a
+       reason to skip the path check there, or the other way around.
+
+    Bounded at `UPLOAD_NAME_MAX_BYTES`. An empty result (a name that was nothing but separators
+    and unsafe characters) becomes `"upload"` rather than an empty string, so `_upload_target`
+    never has to reason about a sanitized name with nothing in it.
+    """
+    name = (raw or "").replace("\\", "/")
+    name = name.rsplit("/", 1)[-1].strip()
+    name = _transliterate_cyrillic(name)
+    name = _UPLOAD_NAME_UNSAFE.sub("-", name).strip("-")
+    if not name:
+        name = "upload"
+    encoded = name.encode("utf-8", "ignore")
+    if len(encoded) > UPLOAD_NAME_MAX_BYTES:
+        # `errors="ignore"` on the way back: a hard byte cut can land mid-character if a future
+        # widening of `_UPLOAD_NAME_UNSAFE` ever admits a multi-byte one, and dropping the partial
+        # tail is preferable to `UnicodeDecodeError` turning a 400 into a 500.
+        name = encoded[:UPLOAD_NAME_MAX_BYTES].decode("utf-8", "ignore").strip("-") or "upload"
+    return name
+
+
+def _upload_stamp() -> str:
+    """`YYYYmmdd-HHMMSS-<6 hex>`: readable at a glance in a directory listing (`queue.py`'s
+    `_stamp` shape), with a random tail (`queue.py`'s own `secrets`-based uniqueness) so that
+    dropping both a first and a last frame inside the same second -- an ordinary `flf` upload,
+    two POSTs a script or a fast double-drop can send within the same clock tick -- lands as two
+    files, not one silently overwriting the other.
+    """
+    return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
 
 #: HTTP status for each `CliError` code that is not a plain refusal of the request. Everything
 #: absent from here is 400: the caller asked for something this server will not do.
@@ -1463,6 +1571,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._queue_start()
         if path.startswith("/api/chat/") and path.endswith("/message"):
             return self._chat_message(path[len("/api/chat/"):-len("/message")])
+        if path == "/api/uploads":
+            return self._upload_frame()
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for POST {path}", {"path": path})
 
@@ -1570,6 +1680,108 @@ class _Handler(BaseHTTPRequestHandler):
                 {"id": raw, "resolved": str(target)},
             )
         return raw
+
+    # -- uploads ----------------------------------------------------------------------------
+
+    def _upload_dir(self) -> Path:
+        """`<outdir>/uploads/`, created on first use -- the same lazy-`mkdir` shape as
+        `_chat_dir`, and for the same reason: a `GET`-only session that never uploads a frame
+        should not leave an empty `uploads/` behind on an outdir that may be a mounted disk.
+        """
+        directory = Path(self.server.outdir) / UPLOAD_DIR
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def _upload_target(self, sanitized_name: str) -> Path:
+        """`<outdir>/uploads/<stamp>-<sanitized_name>`, or `path_outside_root`.
+
+        `resolve_within`, then a second, independent line confirming the result is one file
+        directly inside the uploads directory -- the same belt-and-braces shape `_chat_path` and
+        `_job_id_of` both use for a name that arrived from outside. `sanitized_name` has already
+        been through `sanitize_upload_name` by the time it reaches here (`_upload_frame` is the
+        only caller), but this check does not trust that: a whitelist upstream is not a reason to
+        skip the path check downstream, exactly as `resolve_prompt_name`'s docstring says of
+        `PROMPT_NAME`.
+        """
+        directory = self._upload_dir()
+        target = resolve_within(directory / f"{_upload_stamp()}-{sanitized_name}",
+                                {"uploads": directory}, write=True)
+        if target.parent != directory.expanduser().resolve():
+            raise CliError(
+                "path_outside_root",
+                f"an upload names one file in the uploads directory, and {sanitized_name!r} "
+                "does not",
+                {"name": sanitized_name, "resolved": str(target)},
+            )
+        return target
+
+    def _upload_body(self) -> bytes:
+        """The raw bytes of an upload request, bounded by `CHAT_IMAGE_MAX_BYTES` -- see that
+        constant's own docstring for why `MAX_BODY_BYTES` never enters this route at all.
+
+        Read in one call by an honest `Content-Length`, the same shape `_json_request` reads its
+        own body with and for the same reason: the alternative, reading until the connection
+        closes, would block forever on a request that promised bytes and never sent them.
+        """
+        raw_length = self.headers.get("Content-Length") if self.headers else None
+        try:
+            length = int(raw_length or 0)
+        except ValueError as exc:
+            raise CliError("bad_request", f"Content-Length is not a number: {raw_length!r}",
+                           {"content_length": raw_length}) from exc
+        if length <= 0:
+            raise CliError("bad_request", "the upload body is empty",
+                           {"content_length": length})
+        if length > CHAT_IMAGE_MAX_BYTES:
+            raise CliError(
+                "bad_image",
+                f"кадр больше {CHAT_IMAGE_MAX_BYTES} байт ({length})",
+                {"content_length": length, "limit": CHAT_IMAGE_MAX_BYTES})
+        return self.rfile.read(length)
+
+    def _upload_frame(self) -> tuple[int, str, bytes]:
+        """`POST /api/uploads`: one keyframe from disk, dropped or picked in the browser, saved
+        under `<outdir>/uploads/` and answered with the path the rest of the page already knows
+        how to use -- `#image`/`#end-image` have always taken a path, never a file, so a drop
+        zone only has to produce one and put it there (see `h3_48gb/webui/app.js`).
+
+        The body is raw bytes with `X-Filename` naming the file, not JSON -- an image does not
+        fit inside a JSON string without a base64 detour this route has no reason to make when
+        the bytes can simply be the body.
+
+        **Cheap checks before expensive ones.** `X-Filename` is read and sanitized, and the
+        suffix it produces is checked against `CHAT_IMAGE_SUFFIXES`, before a single byte of the
+        body is read: a `.txt` dropped on the zone by mistake is refused off the headers alone,
+        the same order `_serve_file` uses (`resolve` -> `suffix` -> read) and for the same reason
+        -- a refusal should not cost the I/O of the thing being refused.
+        """
+        header_name = self._sole_header("X-Filename", "bad_request")
+        if not header_name:
+            raise CliError("bad_request", "X-Filename is required and must name one file",
+                           {"header": "X-Filename"})
+        # An HTTP header value is ISO-8859-1 by the letter of the spec and, in every browser that
+        # matters here, enforced as ByteString by `fetch`/`XMLHttpRequest` itself -- a Cyrillic
+        # name would throw in the page before the request was even sent. The page therefore sends
+        # `encodeURIComponent(file.name)` (`app.js`), and this is the matching `decodeURIComponent`
+        # on the way back in; a plain ASCII name round-trips through both unchanged, since nothing
+        # in it is a percent-sign.
+        raw_name = urllib.parse.unquote(header_name)
+        sanitized = sanitize_upload_name(raw_name)
+        suffix = Path(sanitized).suffix.lower()
+        if suffix not in CHAT_IMAGE_SUFFIXES:
+            raise CliError(
+                "bad_image",
+                f"кадром может быть только {sorted(CHAT_IMAGE_SUFFIXES)}, а {sanitized!r} — нет",
+                {"name": sanitized, "suffix": suffix, "allowed": sorted(CHAT_IMAGE_SUFFIXES)},
+            )
+        data = self._upload_body()
+        target = self._upload_target(sanitized)
+        try:
+            target.write_bytes(data)
+        except OSError as exc:
+            raise CliError("queue_unwritable", f"файл не сохранился: {target} ({exc})",
+                           {"path": str(target), "error": f"{type(exc).__name__}: {exc}"}) from exc
+        return 200, "application/json", _json_bytes({"ok": True, "path": str(target)})
 
     # -- jobs -------------------------------------------------------------------------------
 
