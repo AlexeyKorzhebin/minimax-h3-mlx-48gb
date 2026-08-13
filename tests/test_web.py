@@ -5121,3 +5121,140 @@ def test_send_chat_message_wires_the_attachment_into_the_outgoing_turn():
     assert "pendingImage" in body, (
         "sendChatMessage must read the frame the attach button/dnd just uploaded "
         "(`chat.pendingImage`) to build the turn's body:\n" + body)
+
+
+# -- Task C3: the chat modal by the second screen of the mock, and 360-1920 --------------------
+
+
+def _modal_markup() -> str:
+    """The `#chat-modal` subtree of `index.html`, comments stripped.
+
+    Comments are stripped for the same reason `test_the_queue_pause_button_...` strips them: this
+    file explains its own layout in them, and an explanation that names a class is not that class.
+    """
+    page = _page_text("index.html")
+    start = page.index('<div class="modal-back" id="chat-modal"')
+    return re.sub(r"<!--.*?-->", "", page[start:], flags=re.S)
+
+
+def test_the_chat_modal_is_the_two_column_window_of_the_second_screen():
+    """C3. Модалка была формой на подложке: одна колонка полей с внутренним отступом, шапка
+    диалога — просто строка кнопок посреди неё. Макет («Экран 2») строит её как окно —
+    собственная шапка со своим фоном, линия между половинами во всю высоту, подвал ввода, — и
+    из этого следует, что поля принадлежат частям, а не окну: иначе линия не доходит до краёв.
+
+    Проверяется каркас, а не пиксели: три части макета на месте и вложены друг в друга в том
+    порядке, в каком макет их рисует. Всё остальное про эту модалку — глазами и на скриншотах.
+    """
+    modal = _modal_markup()
+    for part in ("mhead", "mgrid", "mleft", "mright", "composer"):
+        assert f'class="{part}"' in modal or f'"{part}"' in modal, (
+            f"части макета «{part}» в модалке нет")
+    assert modal.index('class="mhead"') < modal.index('class="mgrid"'), (
+        "шапка стоит над колонками, а не между ними")
+    assert modal.index('class="mleft"') < modal.index('class="mright"'), (
+        "слева промпт, справа лента — порядок макета и порядок табуляции")
+    left = modal[modal.index('class="mleft"'):modal.index('class="mright"')]
+    for ident in ("chat-prompt-text", "chat-hl", "chat-scale", "chat-parse"):
+        assert f'id="{ident}"' in left, f"{ident} принадлежит окну промпта, а не ленте"
+    right = modal[modal.index('class="mright"'):]
+    for ident in ("chat-log", "chat-input", "chat-send", "chat-attach", "chat-attachment"):
+        assert f'id="{ident}"' in right, f"{ident} принадлежит ленте, а не окну промпта"
+
+
+def test_the_modal_head_carries_everything_the_conversation_is_steered_by():
+    """C3: «шапка: источник, провайдер, длительность, статус модели, кнопки». Все пять — в одной
+    полосе и в ней одной. Разговор длинный, окно закрывается по Esc, и вопрос «а с кем я сейчас
+    говорю и что будет, когда закончу» не должен требовать прокрутки.
+    """
+    modal = _modal_markup()
+    head = modal[modal.index('class="mhead"'):modal.index('class="mgrid"')]
+    for ident in ("chat-source", "chat-provider", "chat-duration", "chat-llm",
+                  "chat-finish", "chat-delete", "chat-close"):
+        assert f'id="{ident}"' in head, f"{ident} обязан стоять в шапке модалки"
+    assert 'id="chat-llm-dot"' in head, (
+        "состояние модели названо словом и подтверждено точкой — формой макета")
+
+    script = _page_text("app.js")
+    body = _js_function(script, "function renderLlmPlate(override)")
+    assert "chat-llm-dot" in body, (
+        "точка обязана двигаться вместе со словом, иначе она врёт молча:\n" + body)
+    assert '"busy"' in body and "hot" in body, (
+        "янтарной точка становится только под `busy` — это единственное её состояние, в котором "
+        "GPU действительно занят:\n" + body)
+
+
+def test_the_empty_feed_tells_the_person_what_this_window_is_for():
+    """C3: пустое состояние с подсказкой. Разговор начинается с чистого листа каждый раз, и
+    белое пятно на пол-окна — худший ответ на вопрос «а что тут делать».
+    """
+    body = _js_function(_page_text("app.js"), "function renderChatLog()")
+    assert "feed-empty" in body, (
+        "у пустой ленты собственная разметка, а не реплика-заглушка в общем пузыре:\n" + body)
+    assert "chat.log.length" in body, "подсказка показывается ровно на пустом логе"
+    css = _page_text("style.css")
+    assert ".feed-empty" in css, "пустое состояние должно быть оформлено, а не свалено в поток"
+
+
+def test_the_modal_folds_into_one_column_before_the_window_gets_narrow():
+    """C3, адаптив. Две колонки в модалке живут до 860 px — ниже промпт и лента встают друг под
+    друга. Без этого правила окно на планшете отдавало каждой половине по 300 px, и в левой
+    промпт переносился по слову.
+
+    Линия между половинами при этом обязана переехать: `border-right` у колонки, которая больше
+    не слева, рисует вертикальную черту посреди пустого места.
+    """
+    css = _page_text("style.css")
+    narrow = re.search(r"@media \(max-width: 860px\) \{(.*?)\n\}", css, re.S)
+    assert narrow, "ступени 860 в style.css больше нет"
+    assert re.search(r"\.mgrid\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)", narrow.group(1)), (
+        "модалка обязана складываться в одну колонку:\n" + narrow.group(1))
+    assert re.search(r"\.mleft\s*\{[^}]*border-right:\s*0", narrow.group(1)), (
+        "вертикальная линия под сложенными колонками — черта посреди пустоты:\n"
+        + narrow.group(1))
+
+
+def test_every_grid_track_on_the_page_may_shrink_below_its_contents():
+    """C3, адаптив, и это единственный способ проверить «ничего не вылезает за край» без
+    браузера. Дорожка `1fr` не сжимается меньше своего `min-content`: одно длинное слово в ней
+    — путь к чекпойнту, слаг задачи, строка `metal::malloc` — раздвигает сетку шире экрана, и
+    горизонтальная прокрутка появляется у всей страницы, а не у той карточки, где живёт слово.
+    `minmax(0, …)` снимает этот минимум, и тогда переносится содержимое, а не ломается раскладка.
+
+    Проверяются все сетки страницы разом: правило, соблюдённое в пяти местах из шести, ничего
+    не гарантирует, а шестое — всегда то, которое найдут пользователи.
+    """
+    css = _page_text("style.css")
+    offenders = []
+    for match in re.finditer(r"grid-template-columns:\s*([^;}]+)", css):
+        tracks = match.group(1).strip()
+        # `repeat(N, minmax(0, …))` и `minmax(0, …)` — годные; фиксированные px тоже (они и так
+        # не растут). Плохо ровно одно: `fr` без снятого минимума.
+        rest = re.sub(r"minmax\(0,[^)]*\)", "", tracks)
+        if re.search(r"[\d.]+fr\b", rest):
+            offenders.append(tracks)
+    assert not offenders, (
+        "дорожка `1fr` без `minmax(0, …)` растягивается длинным словом шире экрана: " + str(offenders))
+
+
+def test_nothing_in_the_chrome_refuses_to_shrink_except_the_clock():
+    """C3, живая проверка на 1024 и 1440: как только прогон пошёл, часы уезжали за правый край
+    окна. Чрома — одна flex-строка, и `flex: none` на строке идущего прогона означал «этот
+    кусок никогда не сжимается»; вместе с росписью показаний и адресом он не оставлял часам
+    места, а `flex: none` часов не давал сжаться и им. Горизонтальная прокрутка появлялась у
+    всей страницы, и появлялась она ровно в том состоянии, ради которого на страницу и смотрят.
+
+    Правило: сжимается всё, что несёт текст переменной длины (адрес, показания, строка
+    прогона), и не сжимается только то, у кого содержимое фиксировано — марка слева и часы
+    справа. Сжатие без `min-width: 0` не работает вовсе: у flex-элемента минимум по умолчанию
+    равен `min-content`, и именно он держал строку шире окна.
+    """
+    css = _page_text("style.css")
+    for selector in (r"\.rail-run", r"\.readout", r"\.host"):
+        rule = re.search(selector + r"\s*\{([^}]*)\}", css)
+        assert rule, f"правила {selector} в style.css нет"
+        body = rule.group(1)
+        assert "flex: none" not in body, (
+            f"{selector} с `flex: none` выталкивает часы за край окна:\n{body}")
+        assert "min-width: 0" in body, (
+            f"{selector} без `min-width: 0` не сожмётся, что бы ни говорил flex:\n{body}")

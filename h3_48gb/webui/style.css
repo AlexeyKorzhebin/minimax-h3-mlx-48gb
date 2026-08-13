@@ -347,11 +347,16 @@ b { font-weight: 600; }
   font: 500 11px/1 var(--mono); color: var(--ink-2); letter-spacing: 0;
 }
 .mark-name { font: 510 13px/1 var(--ui); letter-spacing: -.01em; white-space: nowrap; }
-.host { font-size: 12px; color: var(--ink-3); flex: none; }
+.host { font-size: 12px; color: var(--ink-3); flex: 0 1 auto; min-width: 0;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.readout { display: flex; align-items: center; gap: 4px; flex: none; }
+/* Всё, что несёт текст переменной длины, обязано уметь сжиматься: чрома — одна flex-строка,
+   и `flex: none` на строке идущего прогона выталкивал часы за правый край окна ровно тогда,
+   когда прогон шёл (C3, живая проверка на 1024 и 1440). Не сжимаются только часы справа и
+   марка слева — им и нечем, у них фиксированное содержимое. */
+.readout { display: flex; align-items: center; gap: 4px; flex: 0 1 auto; min-width: 0; }
 .stat {
-  display: flex; align-items: baseline; gap: 7px;
+  display: flex; align-items: baseline; gap: 7px; min-width: 0;
   padding: 4px 10px; border-radius: var(--r-ctl);
 }
 .stat .k {
@@ -360,6 +365,7 @@ b { font-weight: 600; }
 .stat .v {
   font-family: var(--mono); font-size: 12px; letter-spacing: 0;
   color: var(--ink-2); font-variant-numeric: tabular-nums;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .stat .v.hot { color: var(--accent-ink); }
 .stat .v.warn { color: var(--warn-ink); }
@@ -384,15 +390,18 @@ b { font-weight: 600; }
 .chrome[data-worker="unknown"] { background: color-mix(in srgb, var(--warn-soft) 86%, transparent); }
 
 .rail-run {
-  display: flex; align-items: baseline; gap: 14px; min-width: 0; flex: none;
+  display: flex; align-items: baseline; gap: 14px; min-width: 0; flex: 0 1 auto;
+  overflow: hidden; white-space: nowrap;
   font-variant-numeric: tabular-nums; font-size: 12.5px;
 }
+.rail-run > * { overflow: hidden; text-overflow: ellipsis; }
 .run-tag { font-weight: 600; font-family: var(--mono); font-size: 12.5px; letter-spacing: 0; }
 .run-step, .run-share, .run-left { color: var(--ink-2); }
 .run-left b { font-size: 14px; color: var(--ink); }
 .rail-run.idle { color: var(--ink-3); }
 
 .rail-clock { margin-left: auto; display: flex; align-items: baseline; gap: 12px; flex: none; }
+.rail-clock .theme-toggle { flex: none; }
 .clock { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
 .poll { font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .theme-toggle { white-space: nowrap; }
@@ -545,13 +554,14 @@ input::placeholder, textarea::placeholder { color: var(--ink-3); }
 select:hover { border-color: var(--hairline-2); color: var(--ink); }
 .pick { font-family: var(--mono); font-size: 12px; max-width: 260px; }
 
-.field-head {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 9px; gap: 12px;
+/* Число с подписью в строку — макет пишет её так и в шапке модалки, и в поле ввода. */
+.dur-inline {
+  display: inline-flex; align-items: center; gap: 7px; flex: none;
+  font-size: 12px; color: var(--ink-3); letter-spacing: -.005em;
 }
-.field-head label { font-weight: 600; color: var(--ink); font-size: 14px; }
-.field-side { display: flex; gap: 8px; align-items: center; }
-#chat-duration { width: 62px; text-align: right; }
+.dur-inline label { font-size: 12px; }
+.dur-inline .u { font: 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0; }
+#chat-duration { width: 58px; text-align: right; padding: 4px 8px; font-size: 12px; }
 
 /* ---------- редактор промпта: слой подсветки под прозрачным полем ------- */
 .editor {
@@ -878,7 +888,7 @@ details.adv > summary .hint {
 
 /* ---- идущая задача ---- */
 .running {
-  display: grid; grid-template-columns: 200px 1fr; gap: 20px;
+  display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 20px;
   padding: 16px;
   background: var(--card-2);
   border-bottom: 1px solid var(--hairline);
@@ -911,7 +921,8 @@ details.adv > summary .hint {
 .run-cap { font-size: 11px; color: var(--ink-3); margin-top: 7px; }
 .run-body { min-width: 0; }
 .run-line1 { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.run-name { font: 500 13px/1.3 var(--mono); letter-spacing: 0; color: var(--ink); }
+.run-name { font: 500 13px/1.3 var(--mono); letter-spacing: 0; color: var(--ink);
+            min-width: 0; overflow-wrap: anywhere; }
 .run-spec { font: 12px/1.3 var(--mono); color: var(--ink-3); letter-spacing: 0;
             font-variant-numeric: tabular-nums; }
 .run-num { display: flex; gap: 24px; margin: 14px 0 12px; flex-wrap: wrap; }
@@ -1125,12 +1136,19 @@ details.adv > summary .hint {
 }
 
 /* ===========================================================================
-   ДИАЛОГОВЫЙ РЕДАКТОР ПРОМПТА
+   ДИАЛОГОВЫЙ РЕДАКТОР ПРОМПТА (C3; макет: «Экран 2» variant-reference)
 
-   Модалка поверх страницы: слева окно промпта, справа лента диалога. Обе
-   половины видны разом от 1100 px — правка промпта и реплика, которая её
-   объясняет, читаются вместе или не читаются вовсе. Ниже этой ширины окна
-   встают колонкой, промпт сверху: он главный, лента — способ его получить.
+   Модалка — не форма на подложке, а собственное окно: у неё своя шапка со
+   своим фоном, своя граница между половинами и свой подвал ввода. Отсюда
+   `overflow: hidden` на самом окне и ноль внутренних полей у него — поля
+   принадлежат частям, а не окну, иначе разделительная линия между колонками
+   не доходит до краёв и окно рассыпается на три карточки.
+
+   Три части сверху вниз: `.mhead` (о чём разговор, кем ведётся, чем
+   кончится), `.mgrid` (слева промпт, справа лента) и внутри правой колонки
+   `.composer` — поле ввода со своей полосой действий. Обе половины видны
+   разом от 860 px: правка промпта и реплика, которая её объясняет, читаются
+   вместе или не читаются вовсе. Ниже — колонкой, промпт сверху.
 
    Подложка прокручивается сама (`overflow: auto`), а окно центрируется
    полями `margin: auto` внутри флекса: на коротком экране модалка не
@@ -1145,68 +1163,144 @@ details.adv > summary .hint {
 .modal {
   margin: auto; width: min(1080px, 100%);
   background: var(--card); border: 1px solid var(--hairline-2); border-radius: var(--r-card);
-  box-shadow: var(--shadow-pop); padding: 20px;
-}
-.modal.chat { display: grid; grid-template-columns: 1fr; gap: 24px; }
-@media (min-width: 1100px) {
-  .modal.chat { grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); }
+  box-shadow: var(--shadow-pop);
+  overflow: hidden;
 }
 
-.chat-prompt, .chat-talk { min-width: 0; display: flex; flex-direction: column; }
+/* ---------- шапка ---------- */
+.mhead {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--card-2);
+}
+.mhead .t { font: 510 13px/1.3 var(--ui); letter-spacing: -.01em; color: var(--ink); flex: none; }
+.mhead .msrc { font-size: 11.5px; color: var(--ink-3); flex: none; }
+.mhead .prov { flex: 0 1 190px; min-width: 120px; }
+.mhead .prov select { padding-top: 4px; padding-bottom: 4px; font-size: 12px; }
+.mhead .status {
+  display: inline-flex; align-items: center; gap: 7px; min-width: 0;
+  font-size: 11.5px; color: var(--ink-3); letter-spacing: -.005em;
+}
+.mhead-acts { display: flex; align-items: center; gap: 7px; flex: none; }
+.mhead-acts button { font-size: 12.5px; padding: 6px 11px; }
+/* Точка состояния — форма макета: цвет только подтверждает слово рядом. */
+.dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--wait); }
+.dot.ok { background: var(--done); }
+.dot.hot { background: var(--accent); }
+/* Подпись клавиши внутри кнопки. На инверсной плашке — тем же чернилом, что и её текст. */
+.kbd { font: 11px/1 var(--mono); letter-spacing: 0; opacity: .6; }
+
+/* ---------- две колонки ---------- */
+.mgrid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); }
+.mleft {
+  min-width: 0; padding: 14px;
+  border-right: 1px solid var(--hairline);
+  display: flex; flex-direction: column; gap: 9px;
+}
+.mleft-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.mleft-head label { font: inherit; color: inherit; }
+.mleft-head .mono { text-transform: none; letter-spacing: 0; font-size: 10.5px; }
 /* Окно промпта ниже, чем в форме: рядом с ним лента, и обе половины должны
    уместиться в экран целиком. */
-.chat-prompt .editor { height: min(44vh, 420px); min-height: 220px; }
+.mleft .editor { height: min(44vh, 420px); min-height: 220px; }
+.mright { min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
 
-.chat-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 12px; }
-.chat-head #chat-llm { margin-right: auto; }   /* кнопки завершения — к правому краю */
-.chat-head #chat-provider { max-width: 200px; }
-
-/* Лента занимает всё, что осталось от колонки после шапки и поля ввода: `flex: 1` вместо
-   заданной высоты — иначе на широком экране под полем ввода зияет пустота, а на узком лента
-   упирается в потолок раньше, чем в край экрана. */
+/* ---------- лента ---------- */
+/* Лента занимает всё, что осталось от колонки после поля ввода: `flex: 1` вместо заданной
+   высоты — иначе на широком экране под полем ввода зияет пустота, а на узком лента упирается
+   в потолок раньше, чем в край экрана. */
 .chat-log {
-  list-style: none; margin: 0; padding: 2px 0;
-  flex: 1; min-height: 180px; max-height: 60vh; overflow-y: auto;
-  display: flex; flex-direction: column; gap: 10px;
+  list-style: none; margin: 0; padding: 14px;
+  flex: 1; min-height: 200px; max-height: 56vh; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 12px;
 }
 /* Реплика — абзац, а не строка таблицы: переносы модели значимы (она пишет
    промпт блоками), поэтому pre-wrap, а длинное имя файла в предупреждении
    рвётся где придётся, лишь бы не растягивало колонку. */
 .chat-log .turn {
-  max-width: 90%; padding: 10px 12px; border-radius: var(--r-inner);
+  max-width: 88%; padding: 10px 12px; border-radius: var(--r-inner);
   border: 1px solid var(--hairline);
   line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere;
-  color: var(--ink-2); font-size: 13px;
+  color: var(--ink-2); font-size: 13px; letter-spacing: -.008em;
+  background: var(--card-2);
 }
-.chat-log .user { align-self: flex-end; background: var(--fill); border-color: var(--hairline-2); color: var(--ink); }
-.chat-log .assistant { background: var(--card-2); }
-.chat-log .note { max-width: 100%; font-size: 12.5px; background: var(--card-2); color: var(--ink-3); }
+.chat-log .user {
+  align-self: flex-end; background: var(--fill); border-color: var(--hairline-2); color: var(--ink);
+}
+.chat-log .note { max-width: 100%; font-size: 12.5px; color: var(--ink-3); }
 .chat-log .note.warn { background: var(--warn-soft); color: var(--warn-ink); }
 .chat-log .note.bad { background: var(--fail-soft); color: var(--fail-ink); }
-/* Плейсхолдер хода (`pendingEntry`): три точки, бегущие волной, пока ответа ещё нет. Гасится
-   вместе со всей остальной анимацией страницы правилом `prefers-reduced-motion` ниже. */
-.chat-log .note.pending { display: flex; align-items: center; gap: 2px; }
-.chat-log .pending .dots { display: inline-flex; gap: 3px; margin-left: 2px; }
-.chat-log .pending .dots i {
-  display: inline-block; width: 4px; height: 4px; border-radius: 50%;
-  background: currentColor; opacity: .25;
-  animation: pending-dot 1.1s infinite ease-in-out;
+/* Стадия хода (`pendingEntry`, A2) — не реплика, а состояние: макет рисует её строкой без
+   пузыря (`.thinking`), потому что пузырь обещает содержание, а содержания ещё нет. */
+.chat-log .note.pending {
+  align-self: flex-start; max-width: 100%;
+  background: none; border: 0; padding: 2px 0;
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: var(--ink-3);
 }
-.chat-log .pending .dots i:nth-child(2) { animation-delay: .15s; }
-.chat-log .pending .dots i:nth-child(3) { animation-delay: .3s; }
+.chat-log .pending .dots { display: inline-flex; gap: 3px; }
+.chat-log .pending .dots i {
+  display: block; width: 3px; height: 3px; border-radius: 50%;
+  background: currentColor; opacity: .22;
+  animation: pending-dot 1.25s infinite ease-in-out;
+}
+.chat-log .pending .dots i:nth-child(2) { animation-delay: .16s; }
+.chat-log .pending .dots i:nth-child(3) { animation-delay: .32s; }
 @keyframes pending-dot {
-  0%, 80%, 100% { opacity: .25; transform: translateY(0); }
-  40%           { opacity: 1;   transform: translateY(-2px); }
+  0%, 60%, 100% { opacity: .22; transform: translateY(0); }
+  30%           { opacity: 1;   transform: translateY(-2px); }
+}
+/* Пометка кадра внутри реплики ленты (`entry.attachment`, задача A8, требование 2). */
+.chat-log .turn-attach {
+  display: block; font-size: 11.5px; opacity: .75; margin-bottom: 2px;
 }
 
-#chat-form { display: flex; gap: 9px; align-items: flex-end; margin-top: 12px; }
-#chat-input { flex: 1; resize: vertical; line-height: 1.45; font-family: var(--ui); }
+/* Пустая лента: не белое пятно, а короткая инструкция. Разговор начинается с чистого листа
+   каждый раз, и лист обязан сказать, чего от него ждут. */
+.feed-empty {
+  margin: auto 0; padding: 4px 2px;
+  display: flex; flex-direction: column; gap: 7px;
+  color: var(--ink-3); font-size: 12.5px; line-height: 1.5;
+}
+.feed-empty .fe-t { font: 500 14px/1.3 var(--ui); color: var(--ink-2); letter-spacing: -.01em; }
+
+/* ---------- поле ввода ---------- */
+.composer { border-top: 1px solid var(--hairline); padding: 12px 14px; background: var(--card); }
+#chat-form.box {
+  border: 1px solid var(--hairline-2); border-radius: var(--r-inner);
+  background: var(--card-2);
+  padding: 8px 10px;
+  display: flex; flex-direction: column;
+}
+#chat-input {
+  border: 0; background: none; padding: 2px 0; border-radius: 0;
+  resize: vertical; line-height: 1.45; font-family: var(--ui); font-size: 13px; min-height: 40px;
+}
+#chat-input:hover, #chat-input:focus { border: 0; box-shadow: none; background: none; }
+#chat-form.box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3.5px var(--accent-ring); }
+.composer .bottom {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--hairline);
+}
 #chat-send:disabled { background: var(--fill-2); color: var(--ink-3); border-color: transparent;
                       cursor: not-allowed; }
 
-/* A8: скрепка — квадратная, той же высоты, что и первая строка поля ввода, не растягивается
-   вместе с ним при resize (в отличие от #chat-input, у которого flex:1). */
-.chat-attach { flex: 0 0 auto; padding: 6px 10px; font-size: 15px; line-height: 1.4; }
+/* A8: скрепка — квадратная кнопка-иконка макета, не растягивается вместе с полем при resize. */
+.iconbtn {
+  width: 28px; height: 28px; padding: 0; flex: none;
+  border-radius: var(--r-xs); border: 1px solid var(--hairline);
+  background: var(--fill); color: var(--ink-3);
+  display: grid; place-items: center; font-size: 14px; line-height: 1;
+}
+.iconbtn:hover { color: var(--ink); border-color: var(--hairline-2); background: var(--fill-2); }
+/* Подсказка о перетаскивании — пунктиром, тем же языком, что и `.dropzone` в форме. */
+.dndhint {
+  flex: 0 1 auto; min-width: 0;
+  border: 1px dashed var(--hairline); border-radius: var(--r-xs);
+  padding: 4px 8px; font-size: 11px; color: var(--ink-3); line-height: 1.35;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 /* Перетаскивание кадра прямо на поле ввода (A8, требование 1) — та же подсветка рамкой, что и
    у `.dropzone.dragover` в форме постановки, чтобы приём файла читался одинаково в обоих
    местах страницы. */
@@ -1214,15 +1308,17 @@ details.adv > summary .hint {
   outline: 2px dashed var(--accent); outline-offset: -2px; background: var(--accent-soft);
 }
 
-/* Бейдж загруженного, но ещё не отправленного кадра (`chat.pendingImage`) — между лентой и
-   полем ввода, тем же тоном, что и служебные строки ленты (`.chat-log .note`). */
+/* Бейдж загруженного, но ещё не отправленного кадра (`chat.pendingImage`) — над полем ввода,
+   тем же тоном, что и служебные строки ленты. */
 .chat-attachment {
-  display: flex; align-items: center; gap: 8px; margin: 8px 0 0;
-  padding: 6px 10px; border-radius: var(--r-inner);
-  background: var(--card-2); color: var(--ink-2); font-size: 12.5px;
+  display: flex; align-items: center; gap: 8px; margin: 0 0 8px;
+  padding: 6px 10px; border-radius: var(--r-xs);
+  border: 1px solid var(--hairline);
+  background: var(--card-2); color: var(--ink-2); font-size: 12px;
 }
 .chat-attachment.busy { opacity: .7; }
-.chat-attachment.error { background: var(--fail-soft); color: var(--fail-ink); }
+.chat-attachment.error { background: var(--fail-soft); color: var(--fail-ink);
+                         border-color: color-mix(in srgb, var(--fail) 26%, transparent); }
 #chat-attachment-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-attachment-clear {
   margin-left: auto; background: none; border: none; padding: 0 2px;
@@ -1230,12 +1326,15 @@ details.adv > summary .hint {
 }
 .chat-attachment-clear:hover { color: var(--fail-ink); }
 
-/* Пометка кадра внутри реплики ленты (`entry.attachment`, задача A8, требование 2). */
-.chat-log .turn-attach {
-  display: block; font-size: 11.5px; opacity: .75; margin-bottom: 2px;
-}
-
-/* ---------- узкие окна ---------- */
+/* ---------- узкие окна -----------------------------------------------------
+   Страница держит от 360 до 1920 (C3). Сверху её ограничивает --shell: за
+   1380 px растут поля, а не строки — строка в полтора экрана не читается.
+   Снизу — четыре ступени ниже. Правило у всех одно: сначала уходит то, что
+   можно узнать иначе (адрес, подпись показания, приборная строка), потом
+   колонки складываются в одну, и только в последнюю очередь мельчает набор.
+   Ни одна из ступеней ничего не обрезает: то, что не помещается в ряд,
+   переносится (`flex-wrap`), а не уезжает за край.
+   --------------------------------------------------------------------------- */
 @media (max-width: 1180px) {
   .form-grid { grid-template-columns: minmax(0, 1fr); }
   .results { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1245,7 +1344,7 @@ details.adv > summary .hint {
   .stat.worker .k, .stat.worker .v, .host { display: none; }
 }
 @media (max-width: 1040px) {
-  .running { grid-template-columns: 1fr; }
+  .running { grid-template-columns: minmax(0, 1fr); }
   .running img, .running .noshot { width: 100%; max-width: 320px; }
 }
 @media (max-width: 860px) {
@@ -1256,6 +1355,42 @@ details.adv > summary .hint {
   .rail-run { display: none; }
   .qitem { flex-wrap: wrap; }
   .qitem .acts { width: 100%; justify-content: flex-start; margin-left: 26px; }
+  /* Колонки модалки — друг под друга, промпт сверху: он главный, лента — способ его
+     получить. Линия между ними переезжает с правого края левой колонки на её низ. */
+  .mgrid { grid-template-columns: minmax(0, 1fr); }
+  .mleft { border-right: 0; border-bottom: 1px solid var(--hairline); }
+  .mleft .editor { height: min(38vh, 300px); min-height: 180px; }
+  .chat-log { max-height: 42vh; }
+}
+@media (max-width: 620px) {
+  /* Шапка модалки перестаёт быть одной строкой: действия уходят на свою, во всю ширину.
+     Раньше их выдавливало за правый край окна — то самое замечание про кнопки. */
+  .mhead { gap: 8px 10px; }
+  .mhead .spacer { display: none; }
+  .mhead .prov { flex: 1 1 140px; }
+  .mhead-acts { width: 100%; }
+  .mhead-acts #chat-finish { flex: 1; justify-content: center; }
+  .qstate-row .spacer { display: none; }
+  .qstate-row #queue-pause-toggle { width: 100%; justify-content: center; }
+  .est-actions .inverse { flex: 1 1 100%; }
+  .editor-bar .sel { flex: 1 1 100%; }
+  .editor-bar .spacer { display: none; }
+}
+@media (max-width: 420px) {
+  /* 360 — самое узкое окно, ради которого страница вообще проверяется: телефон, с которого
+     смотрят на ночную очередь из кухни. Поля жмутся до 10 px, окно промпта опускается до
+     высоты, при которой под ним ещё видно разбор, а модалка занимает экран целиком. */
+  :root { --pad: 10px; }
+  .chrome-in { gap: 8px; }
+  .mark { padding-right: 10px; }
+  .mark-name, .poll { display: none; }
+  .editor { height: 240px; }
+  .modal-back { padding: 0; }
+  .modal { width: 100%; border-radius: 0; border-left: 0; border-right: 0; min-height: 100%; }
+  .mleft, .chat-log, .composer, .mhead { padding-left: 10px; padding-right: 10px; }
+  .dndhint { display: none; }
+  .run-num { gap: 14px; }
+  .acts button { padding: 4px 6px; }
 }
 
 /* ---------- уважение к системной настройке движения ---------- */

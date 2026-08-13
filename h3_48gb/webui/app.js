@@ -2233,13 +2233,19 @@ function startPage() {
    * собирается из выбранного провайдера и последнего известного состояния (`llmPlateText`).
    */
   function renderLlmPlate(override) {
-    if (override) { $("chat-llm").textContent = override; return; }
+    if (override) { $("chat-llm").textContent = override; $("chat-llm-dot").className = "dot"; return; }
     const row = ((chat && chat.providers) || [])
       .find((item) => item.name === $("chat-provider").value);
-    $("chat-llm").textContent = llmPlateText((chat && chat.llmStatus) || "", {
+    const status = (chat && chat.llmStatus) || "";
+    $("chat-llm").textContent = llmPlateText(status, {
       external: Boolean(row) && row.type !== "llama-local",
       runningSeconds: runningLeft,
     });
+    /* Точка рядом со словом — форма макета. Янтарь достаётся только `busy`, то есть ровно
+       тому состоянию, в котором GPU действительно занят прогоном; «поднята» — зелёная, всё
+       остальное серое. Цвет здесь подтверждает слово, а не заменяет его. */
+    $("chat-llm-dot").className = "dot"
+      + (status === "busy" ? " hot" : status === "up" ? " ok" : "");
   }
 
   function renderChatPrompt() {
@@ -2252,6 +2258,10 @@ function startPage() {
     paintPrompt({ hl: "chat-hl", scale: "chat-scale", parse: "chat-parse" }, chat.promptText,
                 { audio: (chat.mode || $("mode").value) === "t2va",
                   declared: chatDuration(chat) });
+    // Приписка у заголовка окна — место макета под «черновик · не сохранён». Здесь она отвечает
+    // на единственный вопрос, который у этого окна есть: переживёт ли набранное закрытие. Не
+    // переживёт (`hasUnsavedEdits`) — об этом сказано до Esc, а не в диалоге после него.
+    $("chat-prompt-note").textContent = hasUnsavedEdits(chat) ? "правки не сохранены" : "";
   }
 
   function renderChatLog() {
@@ -2276,8 +2286,15 @@ function startPage() {
             + `${entry.kind ? " " + escapeHtml(entry.kind) : ""}">`
             + `${attach}${escapeHtml(entry.text)}${dots}</li>`;
         }).join("")
-      : `<li class="turn note">Опишите идею словами — модель соберёт промпт по формату. `
-        + `Уже готовый текст можно вставить в окно слева и попросить привести к стандарту.</li>`;
+      /* Пустая лента — не белое пятно, а короткая инструкция (C3, макет: пустое состояние).
+         Разговор начинается с чистого листа каждый раз, и лист обязан сказать, чего от него
+         ждут: три вещи, которые здесь можно сделать, в том порядке, в каком их делают. */
+      : `<li class="feed-empty">`
+        + `<span class="fe-t">Расскажите, что снимаем</span>`
+        + `<span>Опишите идею словами — модель соберёт промпт по формату MiniMax H3.</span>`
+        + `<span>Уже готовый текст вставьте в окно промпта и попросите привести к стандарту.</span>`
+        + `<span>Картинку можно перетащить прямо в поле ввода — станет опорным кадром.</span>`
+        + `</li>`;
     box.scrollTop = box.scrollHeight;   // свежая реплика видна без прокрутки
   }
 

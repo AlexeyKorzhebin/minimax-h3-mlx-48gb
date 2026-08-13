@@ -372,60 +372,92 @@
 </main>
 
 <!-- ===================================================================
-     ДИАЛОГОВЫЙ РЕДАКТОР ПРОМПТА. Модалка, а не отдельная страница:
-     разговор с моделью — продолжение работы над той же задачей, и
-     возвращаться из него некуда.
+     ДИАЛОГОВЫЙ РЕДАКТОР ПРОМПТА (C3; макет: «Экран 2» variant-reference).
+     Модалка, а не отдельная страница: разговор с моделью — продолжение
+     работы над той же задачей, и возвращаться из него некуда.
 
-     Внутри две половины. Слева окно промпта — редактируемое руками, с тем
-     же живым разбором, подсветкой и полоской планов, что и в форме (те же
-     функции рисуют в элементы chat-*). Справа лента диалога с полем ввода.
-     Раскладка адаптивная: от 1100 px обе половины видны разом, ниже —
-     колонкой, промпт сверху.
+     Три части макета, сверху вниз. Шапка `.mhead` — единственная полоса,
+     где сказано, о чём разговор (источник), кем он ведётся (провайдер и
+     точка состояния модели), какой длины будет ролик, и чем разговор
+     кончится (три кнопки). Ниже `.mgrid` в две колонки: слева окно промпта
+     с тем же живым разбором, подсветкой и полоской планов, что и в форме
+     (те же функции рисуют в элементы chat-*), справа лента и поле ввода.
+     От 860 px и ниже колонки встают друг под друга, промпт сверху: он
+     главный, лента — способ его получить.
      =================================================================== -->
 <div class="modal-back" id="chat-modal" hidden>
   <div class="modal chat" role="dialog" aria-modal="true"
-       aria-label="Диалоговый редактор промпта">
+       aria-labelledby="chat-title">
 
-    <div class="chat-prompt">
-      <div class="field-head">
-        <label for="chat-prompt-text">Промпт</label>
-        <span class="field-side">
-          <label for="chat-duration" class="hint">Длительность, с</label>
-          <input class="inp num" id="chat-duration" type="number" step="0.5" min="0.5" value="10">
-          <span class="hint" id="chat-source">новый промпт</span>
-        </span>
-      </div>
-      <div class="editor"><pre class="hl" id="chat-hl" aria-hidden="true"></pre>
-        <textarea id="chat-prompt-text" spellcheck="false" wrap="soft"></textarea></div>
-      <div class="scale" id="chat-scale" aria-label="планы и склейки"></div>
-      <ul class="parse" id="chat-parse"></ul>
-    </div>
+    <div class="mhead">
+      <span class="t" id="chat-title">Диалог о промпте</span>
+      <span class="msrc mono" id="chat-source">новый промпт</span>
+      <div class="spacer"></div>
 
-    <div class="chat-talk">
-      <div class="chat-head">
+      <span class="dur-inline">
+        <label for="chat-duration">Длительность</label>
+        <input class="inp num" id="chat-duration" type="number" step="0.5" min="0.5" value="10">
+        <span class="u">с</span>
+      </span>
+
+      <span class="sel prov">
         <select id="chat-provider" class="pick" aria-label="провайдер модели"></select>
-        <span id="chat-llm" class="hint">модель не поднята</span>
+      </span>
+      <!-- Точка состояния модели — форма макета (`.dot`): янтарная только под `busy`,
+           то есть ровно тогда, когда GPU действительно занят прогоном. -->
+      <span class="status"><span class="dot idle" id="chat-llm-dot" aria-hidden="true"></span>
+        <span id="chat-llm">модель не поднята</span></span>
+
+      <span class="mhead-acts">
         <!-- Надпись зависит от источника: «в Редактор», «сохранить промпт»
              или «обновить задачу» — её ставит app.js при открытии. -->
-        <button class="ghost" id="chat-finish" type="button">в Редактор</button>
+        <button class="inverse" id="chat-finish" type="button">в Редактор</button>
         <button class="ghost" id="chat-delete" type="button">очистить</button>
-        <button class="ghost" id="chat-close" type="button">закрыть</button>
+        <button class="ghost" id="chat-close" type="button">закрыть
+          <span class="kbd">esc</span></button>
+      </span>
+    </div>
+
+    <div class="mgrid">
+
+      <div class="mleft">
+        <div class="eyebrow mleft-head">
+          <label for="chat-prompt-text">Промпт</label>
+          <span class="mono" id="chat-prompt-note"></span>
+        </div>
+        <div class="editor"><pre class="hl" id="chat-hl" aria-hidden="true"></pre>
+          <textarea id="chat-prompt-text" spellcheck="false" wrap="soft"></textarea></div>
+        <div class="scale" id="chat-scale" aria-label="планы и склейки"></div>
+        <ul class="parse" id="chat-parse"></ul>
       </div>
-      <ol class="chat-log" id="chat-log"></ol>
-      <!-- A8: кадр в диалог — бейдж загруженного, но ещё не отправленного кадра
-           (`chat.pendingImage`, app.js); скрыт, пока ничего не приложено. -->
-      <p class="chat-attachment" id="chat-attachment" hidden>
-        <span id="chat-attachment-label"></span>
-        <button type="button" class="chat-attachment-clear" id="chat-attachment-clear"
-                aria-label="Убрать кадр">×</button>
-      </p>
-      <form id="chat-form">
-        <button type="button" class="ghost chat-attach" id="chat-attach"
-                aria-label="Приложить кадр" title="Приложить кадр">📎</button>
-        <input type="file" id="chat-attach-file" accept="image/*" hidden>
-        <textarea id="chat-input" rows="2"
-        placeholder="Опиши идею или попроси переделать…"></textarea>
-        <button class="primary" id="chat-send" type="submit">отправить</button></form>
+
+      <div class="mright">
+        <ol class="chat-log" id="chat-log"></ol>
+
+        <div class="composer">
+          <!-- A8: кадр в диалог — бейдж загруженного, но ещё не отправленного кадра
+               (`chat.pendingImage`, app.js); скрыт, пока ничего не приложено. -->
+          <p class="chat-attachment" id="chat-attachment" hidden>
+            <span id="chat-attachment-label"></span>
+            <button type="button" class="chat-attachment-clear" id="chat-attachment-clear"
+                    aria-label="Убрать кадр">×</button>
+          </p>
+          <form id="chat-form" class="box">
+            <textarea id="chat-input" rows="2"
+            placeholder="Опиши идею или попроси переделать…"></textarea>
+            <div class="bottom">
+              <button type="button" class="iconbtn chat-attach" id="chat-attach"
+                      aria-label="Приложить кадр" title="Приложить кадр">📎</button>
+              <input type="file" id="chat-attach-file" accept="image/*" hidden>
+              <span class="dndhint">перетащи картинку сюда — станет опорным кадром для i2v</span>
+              <div class="spacer"></div>
+              <button id="chat-send" type="submit">отправить
+                <span class="kbd">↵</span></button>
+            </div>
+          </form>
+        </div>
+      </div>
+
     </div>
   </div>
 </div>
