@@ -33,7 +33,7 @@ import pytest
 
 from h3_48gb import queue as q
 from h3_48gb import web
-from h3_48gb.cli import DEFAULT_CHECKPOINT, CliError, build_parser
+from h3_48gb.cli import DEFAULT_CHECKPOINT, ERROR_CODES, CliError, build_parser
 # `flock` is only honest when the holder is a separate process -- see the module docstring.
 from test_queue import _DRY, _external_lock
 
@@ -3379,6 +3379,136 @@ def test_every_refusal_the_server_answers_with_403_has_a_russian_sentence():
     """ % json.dumps(forbidden))
     assert titles == ["Запрос пришёл не с этой страницы"] * len(forbidden), (forbidden, titles)
     assert fallback not in titles, "the sentence has to be chosen, not inherited from `default:`"
+
+
+def test_the_unload_banner_is_laid_out_by_the_stylesheet_and_locks_while_it_works():
+    """Плашка «выгрузить и начать» — единственный `.mem-warn` с кнопками внутри.
+
+    Без собственных правил её два `<span>` вставали по-инлайновому: кнопки прилипали к тексту и
+    переносились по одной. И без блокировки на время запроса она принимает второй клик — выгрузка
+    это `pkill` плюс ожидание смерти порта, до десяти секунд молчания, а в молчание человек жмёт
+    ещё раз.
+
+    Обе половины проверяются текстом файла — браузера здесь нет; отпускание кнопки требуется
+    именно в `finally`, потому что отказ сети — ровно тот случай, когда мёртвая кнопка стоит
+    перезагрузки страницы.
+    """
+    css = _page_text("style.css")
+    rule = re.search(r"\.unload-banner\s*\{([^}]*)\}", css)
+    assert rule, "у #unload-banner нет собственного правила в style.css"
+    assert "display: flex" in rule.group(1), rule.group(1)
+    assert re.search(r"\.unload-banner-acts\s*\{[^}]*display:\s*flex", css), (
+        "кнопки плашки должны стоять в ряд собственным правилом, а не по воле инлайн-потока")
+
+    script = _page_text("app.js")
+    body = _js_function(script, "async function unloadAndStart()")
+    assert re.search(r'\$\("unload-banner-go"\)', body), body
+    assert "disabled = true" in body and "finally" in body, body
+    assert body.index("disabled = true") < body.index("api(\"POST\""), (
+        "кнопка обязана глохнуть до запроса, а не после")
+
+
+@_needs_node
+def test_opening_a_chat_reads_the_session_once_even_though_the_hash_fires_late():
+    """Открытие модалки — `location.hash = "#chat/<id>"`, и браузер ставит `hashchange` в очередь,
+    а не зовёт обработчик тут же; страница поэтому синхронизируется руками сразу после
+    присваивания. Сторож при этом смотрел на `chat`, который появляется только *после* `await` за
+    сессией: в окне ожидания он пуст, `hashchange` приходит ровно в него, и та же сессия читается
+    вторым GET и рисуется второй раз.
+
+    Проверяется чистая функция-сторож на том самом порядке событий: «уже открывается» обязано
+    закрывать дверь так же, как «уже открыто».
+    """
+    got = _node_eval("""
+      const calls = [];
+      let wanted = null;                       // то, что страница хранит рядом с `chat`
+      function sync(hash) {                    // ровно тело `syncChatFromHash`
+        const action = app.chatHashAction(hash, wanted);
+        if (action.act === "close") { wanted = null; return; }
+        if (action.act === "nothing") return;
+        wanted = action.id;
+        calls.push(action.id);                 // здесь страница уходит в `await enterChat`
+      }
+      sync("#chat/ab12");                      // ручной вызов сразу после присваивания хеша
+      sync("#chat/ab12");                      // тот же адрес, но уже событием hashchange
+      const opened = calls.slice();
+      sync("#chat/ab12");                      // ещё один hashchange (F5 по тому же адресу)
+      const still = calls.slice();
+      sync("");                                // закрыли — и снова открыли ту же сессию
+      sync("#chat/ab12");
+      const reopened = calls.slice();
+      sync("#chat/cd34");                      // другой разговор всё так же открывается
+      console.log(JSON.stringify([opened, still, reopened, calls,
+                                  app.chatHashAction("#not-a-chat", null),
+                                  app.chatHashAction("#not-a-chat", "ab12"),
+                                  app.chatHashAction("#chat/ZZZZ", null)]));
+    """)
+    opened, still, reopened, all_calls, no_hash, leaving, bad_id = got
+    assert opened == ["ab12"], "программная установка хеша и его событие — одно открытие"
+    assert still == ["ab12"], "повторный hashchange на том же адресе ничего не читает"
+    assert reopened == ["ab12", "ab12"], "закрытая сессия открывается заново, а не глохнет"
+    assert all_calls == ["ab12", "ab12", "cd34"]
+    assert no_hash == {"act": "nothing"}, "без открытой сессии нечего закрывать"
+    assert leaving == {"act": "close"}
+    assert bad_id == {"act": "nothing"}, "id не из `secrets.token_hex` — не адрес сессии"
+
+
+#: Two or more Latin letters in a row -- the shape an untranslated English word has. Single
+#: letters are left alone (`t2va`, `flf`, a stray `N`), and the one place a Latin *name* belongs
+#: in a sentence (`llama-server`, the program the person has to go and look at) is stripped by the
+#: caller rather than weakened here.
+_LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
+_PROVIDER_SOURCE = (PROJECT_ROOT / "h3_48gb" / "provider.py").read_text(encoding="utf-8")
+
+#: Codes the chat modal can put in front of a person, and where each is raised. A literal list
+#: because there is no single table to read them out of -- half are `_error_bytes(...)` inside
+#: `web`'s chat routes and half are `ProviderError`s from `provider` -- but the provider half is
+#: *checked* against the source below rather than trusted, which is the half that grows.
+_CHAT_CODES = ("chat_not_found", "chat_busy", "chat_corrupt", "bad_image", "gpu_busy",
+               "provider_unavailable", "llama_did_not_start", "chat_unreachable",
+               "bad_model_json", "bad_provider_reply")
+
+
+@_needs_node
+def test_every_refusal_the_chat_can_produce_has_a_russian_sentence():
+    """The whole chat modal fell through to `default:` — «Отказ: chat_unreachable», an English
+    code on a Russian page, and the *same* sentence for «модель не подняли», «провайдер молчит»
+    and «файл сессии сломан», which are three different things to go and do.
+
+    Every code is also required to be in `ERROR_CODES`, so a sentence for a code the server
+    cannot produce (a typo, or a code that was renamed on one side only) fails here too: a
+    branch that never runs reads as coverage and is worse than the fallback it replaced.
+    """
+    for code in _CHAT_CODES:
+        assert code in ERROR_CODES, f"{code!r} is not a code this system produces"
+    titles, fallback = _node_eval("""
+      const say = (code) => app.errorText({error: {code, message: "почему"}}).title;
+      console.log(JSON.stringify([%s.map(say), say("code_nobody_wrote_a_sentence_for")]));
+    """ % json.dumps(list(_CHAT_CODES)))
+    for code, title in zip(_CHAT_CODES, titles):
+        assert title != fallback.replace("code_nobody_wrote_a_sentence_for", code), (
+            f"{code} still falls through to `default:`")
+        assert code not in title, f"{code}'s sentence shows the code itself: {title!r}"
+        assert not _LATIN_WORD.search(title.replace("llama-server", "")), (
+            f"{code}'s sentence is not in Russian: {title!r}")
+    assert len(set(titles)) == len(titles), (
+        "two chat refusals sharing one sentence is the bug this test exists to catch: "
+        f"{sorted(t for t in titles if titles.count(t) > 1)}")
+
+
+@_needs_node
+def test_every_provider_failure_reaches_the_page_with_a_sentence_of_its_own():
+    """The list above is written by hand; this is what keeps it honest.
+
+    `provider.py` is where a new chat failure gets invented (`ProviderError("...", ...)`), and it
+    is two files away from the dictionary that has to name it. Reading the raise sites out of the
+    source means the next one fails this test on the commit that adds it, rather than showing an
+    English code to whoever hits it first.
+    """
+    raised = set(re.findall(r'ProviderError\(\s*"([a-z_]+)"', _PROVIDER_SOURCE))
+    assert raised, "the raise sites moved -- this test is reading nothing"
+    missing = raised - set(_CHAT_CODES)
+    assert not missing, f"{sorted(missing)} can reach the page but is not in `_CHAT_CODES`"
 
 
 @_needs_node

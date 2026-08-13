@@ -793,8 +793,14 @@ export function errorText(payload) {
   const error = (payload && payload.error) || {};
   const detail = error.detail || {};
   switch (error.code) {
+    // Один код на два непохожих отказа: командная строка задачи, которую разобрал argparse
+    // (и тогда есть `detail.stderr` с его собственной фразой), и любое «тело запроса не той
+    // формы» — например `mode`, которого не знает генератор. Про второе «командная строка не
+    // годится» — неправда, а страница обязана называть вещи своими именами.
     case "args_invalid":
-      return { title: "Командная строка не годится", pre: detail.stderr || error.message };
+      return detail.stderr
+        ? { title: "Командная строка не годится", pre: detail.stderr }
+        : { title: "Запрос не той формы", pre: error.message };
     case "command_not_allowed":
       return { title: "Через очередь ставится только `generate` с чекпойнтом",
                pre: error.message };
@@ -821,6 +827,41 @@ export function errorText(payload) {
     case "internal_error":
       return { title: "Сервер споткнулся — смотрите его вывод в терминале",
                pre: detail.type || error.message };
+
+    /* -- чат: девять кодов, каждый со своей развязкой ------------------------------------
+       До этого места доходил только `default:` — «Отказ: chat_unreachable» английским кодом
+       на русской странице, одинаковый для «модель не подняли», «провайдер молчит» и «файл
+       сессии сломан», хотя чинятся они тремя разными действиями. Тексты разные ровно там,
+       где разное следующее действие человека. */
+    case "chat_not_found":
+      return { title: "Такой сессии чата больше нет — начните новую", pre: null };
+    case "chat_busy":
+      return { title: "Ход уже идёт — дождитесь ответа модели", pre: null };
+    case "chat_corrupt":
+      return { title: "Файл сессии повреждён — почините его или начните новый чат",
+               pre: detail.path || error.message };
+    case "bad_image":
+      // Сообщение сервера перечисляет разрешённые типы и предел размера — точнее заголовка.
+      return { title: "Кадр не годится для разговора с моделью", pre: error.message };
+    case "gpu_busy":
+      return { title: "Идёт прогон — локальная модель поднимется после него", pre: null };
+    case "provider_unavailable":
+      // `reason` из росписи («нет токена OPENROUTER_API_KEY») сервер уже положил в message.
+      return { title: "Провайдер недоступен", pre: error.message };
+    case "llama_did_not_start":
+      return { title: "llama-server не поднялся — хвост его лога ниже", pre: error.message };
+    case "chat_unreachable":
+      return { title: "Провайдер не ответил — проверьте адрес и что он запущен",
+               pre: error.message };
+    case "bad_provider_reply":
+      // Не то же, что `bad_model_json`: там модель не удержала схему, тут ходом не ответили
+      // вовсе — так отвечает OpenRouter, когда падает уже его собственный апстрим.
+      return { title: "Провайдер ответил не ходом — это его отказ, не модели",
+               pre: error.message };
+    case "bad_model_json":
+      return { title: "Модель не удержала формат ответа — попробуйте ещё раз или смените "
+                    + "провайдера", pre: error.message };
+
     default:
       return { title: error.code ? `Отказ: ${error.code}` : "Запрос не прошёл",
                pre: error.message || null };
@@ -1020,6 +1061,32 @@ export function chatWarningText(warning) {
   const it = warning || {};
   const head = WARNING_TEXT[it.code] || "Ход прошёл с оговоркой";
   return it.message ? `${head}: ${it.message}` : head;
+}
+
+/* Адрес — часть состояния модалки. Обрыв связи или перезагрузка страницы во время хода не
+   теряет разговор: сессия лежит в `<outdir>/chat/<id>.json`, а `#chat/<id>` открывает её
+   заново с историей с диска. Идентификатор — `secrets.token_hex(4)`, шестнадцатеричный. */
+export const CHAT_HASH = /^#chat\/([0-9a-f]+)$/;
+
+/**
+ * Что делать с адресом: закрыть окно, открыть сессию — или ничего.
+ *
+ * `current` — сессия, которая уже открыта **или прямо сейчас открывается**, и второе слово тут
+ * и есть весь смысл. Открытие модалки — это `location.hash = "#chat/<id>"`, а браузер ставит
+ * `hashchange` в очередь, а не зовёт обработчик тут же; страница поэтому вызывала синхронизацию
+ * руками сразу после присваивания. Сторож при этом смотрел на `chat`, который появляется только
+ * *после* `await` за сессией, — то есть в окне ожидания был пуст, `hashchange` успевал прийти
+ * ровно в него, и та же сессия читалась вторым GET и рисовалась второй раз (в ленте это видно
+ * как мигание, а первый ход мог уйти в перетёртое состояние).
+ *
+ * Отдельная чистая функция, а не условие внутри обработчика: сторож от гонки, проверяемый только
+ * глазами, — это тот же сторож, которого не было.
+ */
+export function chatHashAction(hash, current) {
+  const match = CHAT_HASH.exec(hash || "");
+  if (!match) return current ? { act: "close" } : { act: "nothing" };
+  if (match[1] === current) return { act: "nothing" };
+  return { act: "enter", id: match[1] };
 }
 
 /**
@@ -1647,10 +1714,10 @@ function startPage() {
 
   // -- диалог -----------------------------------------------------------------------------
 
-  /* Адрес — часть состояния модалки. Обрыв связи или перезагрузка страницы во время хода не
-     теряет разговор: сессия лежит в `<outdir>/chat/<id>.json`, а `#chat/<id>` открывает её
-     заново с историей с диска. Идентификатор — `secrets.token_hex(4)`, шестнадцатеричный. */
-  const CHAT_HASH = /^#chat\/([0-9a-f]+)$/;
+  /* Сессия, которая открыта или открывается прямо сейчас, — вход сторожа `chatHashAction`.
+     Отдельно от `chat` потому, что `chat` появляется только после ответа сервера, а гонка живёт
+     ровно в этом окне ожидания (см. докстроку `chatHashAction`). */
+  let chatWanted = null;
 
   /* Кнопка завершения зависит от источника: разговор о промпте библиотеки кончается файлом,
      о задаче — правкой задачи, а начатый из формы — текстом в редакторе. `clip` (ролик проекта)
@@ -1697,7 +1764,11 @@ function startPage() {
     const box = $("chat-log");
     box.innerHTML = chat.log.length
       ? chat.log.map((entry) =>
-          `<li class="turn ${entry.role}${entry.kind ? " " + entry.kind : ""}">`
+          // `role` и `kind` — свои, не с сервера, но в этом файле экранируется всё, что
+          // попадает в разметку, и исключение «тут значение точно наше» — ровно то место, где
+          // однажды окажется чужое (`role` приходит из `session.messages` с диска).
+          `<li class="turn ${escapeHtml(entry.role)}`
+          + `${entry.kind ? " " + escapeHtml(entry.kind) : ""}">`
           + `${escapeHtml(entry.text)}</li>`).join("")
       : `<li class="turn note">Опишите идею словами — модель соберёт промпт по формату. `
         + `Уже готовый текст можно вставить в окно слева и попросить привести к стандарту.</li>`;
@@ -1768,6 +1839,9 @@ function startPage() {
       closeChat();
       return;
     }
+    // Пока шёл GET, окно могли закрыть или увести на другую сессию: `chatWanted` — то же
+    // «ответ принадлежит тому, кто его заказал», что у `landTurn`, только для открытия.
+    if (chatWanted !== id) return;
     chat = {
       id,
       source: session.source || { kind: "new" },
@@ -1798,6 +1872,7 @@ function startPage() {
 
   function closeChat() {
     chat = null;
+    chatWanted = null;
     $("chat-modal").hidden = true;
     if (CHAT_HASH.test(window.location.hash || "")) window.location.hash = "";
   }
@@ -1812,13 +1887,13 @@ function startPage() {
   }
 
   async function syncChatFromHash() {
-    const match = CHAT_HASH.exec(window.location.hash || "");
-    if (!match) {
-      if (chat) closeChat();
-      return;
-    }
-    if (chat && chat.id === match[1]) return;
-    await enterChat(match[1]);
+    const action = chatHashAction(window.location.hash, chatWanted);
+    if (action.act === "close") { closeChat(); return; }
+    if (action.act === "nothing") return;
+    // Помечаем намерение до `await`, а не после: `hashchange` от нашего же присваивания хеша
+    // приходит именно в это окно, и сторож обязан застать его уже занятым.
+    chatWanted = action.id;
+    await enterChat(action.id);
   }
 
   /**
@@ -2070,9 +2145,23 @@ function startPage() {
 
   /** «Выгрузить и начать»: `POST /api/llm/unload`, затем то же перечитывание состояния, что и
    *  после любого действия над очередью (`withQueue`) — работник берёт освободившуюся задачу
-   *  сам, странице нужно только увидеть это на следующем `poll()`. */
+   *  сам, странице нужно только увидеть это на следующем `poll()`.
+   *
+   *  Кнопка глохнет на время запроса, и это не косметика. Выгрузка — `pkill llama-server` плюс
+   *  ожидание, пока порт умрёт: до десяти секунд, всё это время плашка стоит на месте и
+   *  выглядит нажимаемой. Второй клик посылал второй `pkill` в уже опустевшую память, а третий
+   *  — четвёртый; работника это не роняло, но человек в ответ на молчание жмёт ещё, и цена
+   *  ошибки тут — 31 ГБ, которые он *думает*, что снимает. Отпускается в `finally` и без
+   *  условий: кнопка принадлежит странице, а не запросу, и оставить её мёртвой — потребовать
+   *  перезагрузки (то же правило, что у «отправить» в модалке). */
   async function unloadAndStart() {
-    await withQueue(() => api("POST", "/api/llm/unload", {}));
+    const button = $("unload-banner-go");
+    button.disabled = true;
+    try {
+      await withQueue(() => api("POST", "/api/llm/unload", {}));
+    } finally {
+      button.disabled = false;
+    }
   }
 
   /** «Пусть ждёт»: прячет плашку до того момента, когда `{pending, llm}` действительно
