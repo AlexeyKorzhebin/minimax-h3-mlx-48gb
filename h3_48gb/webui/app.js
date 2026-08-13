@@ -813,6 +813,13 @@ export function errorText(payload) {
                   + Object.values(detail.roots || {}).join(", ") };
     case "job_not_pending":
       return { title: "Задачу уже забрал работник — список перечитан", pre: null };
+    // Отказ формы, а не чата, но встречают его там же — красной плашкой под кнопкой. Заголовок
+    // называет оба выхода, потому что их ровно два, и поле «Таблица AdaLN» названо так, как оно
+    // подписано на странице: искать «--adaln-cache» в форме негде.
+    case "checkpoint_without_adaln":
+      return { title: "У чекпойнта нет читаемой таблицы AdaLN — укажите её в поле «Таблица "
+                    + "AdaLN» или почините transformer/adaln_cache.safetensors",
+               pre: detail.cache || error.message };
     case "prompt_name_invalid":
       return { title: "Имя промпта должно быть вида имя.txt без каталогов", pre: null };
     case "queue_unwritable":

@@ -691,6 +691,44 @@ def test_a_hand_edited_session_is_a_named_refusal_and_not_a_five_hundred(_serve,
     assert fake_llama.requests == [], "битый файл — не повод платить за ход"
 
 
+@pytest.mark.parametrize("reply", [42, None, {"текст": "да"}, ["а", "б"], True])
+def test_a_reply_that_is_not_a_string_is_refused_instead_of_bricking_the_session(_serve, reply):
+    """Ход с нестроковым `reply` окирпичивал сессию — навсегда, и руками сервера.
+
+    `reply = turn.get("reply") or ""` не спрашивал тип. Провайдер, игнорирующий
+    `response_format` (внешние это делают: схема — просьба, а не гарантия), отвечает
+    `{"reply": 42}`, число уходит в `messages` как `content`, ход возвращает 200 — а следующее
+    же чтение упирается в `_check_session_shape`, который правильно говорит «реплика без
+    строкового content» и отказывает `chat_corrupt`. С этого места сессия мертва: 409 и на GET, и
+    на каждый следующий ход, и починить её можно только редактором. Файл написал сервер, а
+    выглядит это как порча руками.
+
+    Отказ — тот же `bad_model_json` и тем же приёмом, что проверка `isinstance(turn, dict)`
+    строкой выше: это ровно «модель не удержала формат», а не повод молча позвать `str()` —
+    приведение спрятало бы `42` в ленту как реплику модели.
+
+    `True` в списке не для красоты: `isinstance(True, int)` истинно, и любая проверка «число ли
+    это» пропустила бы булево. Вопрос задаётся один — строка ли.
+    """
+    fake = _FakeLlama(chat_payload={"choices": [{"message": {"content": json.dumps(
+        {"reply": reply, "prompt": None})}}]})
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": "старый текст"})["id"]
+
+        status, payload = srv.post_json_raw(f"/api/chat/{sid}/message",
+                                            {"text": "мрачнее", "prompt": "старый текст"})
+        assert status == 502, payload
+        assert payload["error"]["code"] == "bad_model_json", payload
+    finally:
+        fake.close()
+
+    # Сессия цела: ни половины обмена в ленте, ни `chat_corrupt` на чтении.
+    got = srv.get_json(f"/api/chat/{sid}")
+    assert got["messages"] == [], "отказавший ход не оставляет за собой ничего"
+    assert got["prompt"] == "старый текст"
+
+
 def test_a_session_the_server_itself_wrote_is_never_called_corrupt(_serve, fake_llama):
     """Обратная сторона: проверка формы обязана пропускать всё, что пишет сам сервер — и пустую
     сессию сразу после создания, и её же после хода."""

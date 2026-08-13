@@ -1786,12 +1786,17 @@ class _Handler(BaseHTTPRequestHandler):
         kernel's own refusal stays as the backstop for the limits this does not know.
         """
         name = f"{sid}.json"
-        if len(name.encode("utf-8", "surrogatepass")) > NAME_MAX_BYTES:
+        # Both numbers in the sentence are bytes, deliberately. The limit is a byte limit, and a
+        # Cyrillic id is two bytes a character: quoting the *character* count beside it read as
+        # «210 is over 255» and sent whoever hit it looking for a second rule.
+        name_bytes = len(name.encode("utf-8", "surrogatepass"))
+        if name_bytes > NAME_MAX_BYTES:
             raise CliError(
                 "path_outside_root",
-                f"a chat id has to fit in a filename ({NAME_MAX_BYTES} bytes), and this one is "
-                f"{len(sid)} characters long",
-                {"id": sid[:80], "chars": len(sid), "limit": NAME_MAX_BYTES},
+                f"a chat id has to fit in a filename of {NAME_MAX_BYTES} bytes, and this one "
+                f"needs {name_bytes} (id: {len(sid)} characters)",
+                {"id": sid[:80], "chars": len(sid), "bytes": name_bytes,
+                 "limit": NAME_MAX_BYTES},
             )
         directory = self._chat_dir(create=create)
         target = resolve_within(directory / f"{sid}.json", {"chat": directory}, write=True)
@@ -2051,7 +2056,27 @@ class _Handler(BaseHTTPRequestHandler):
             return 502, "application/json", _error_bytes(
                 "bad_model_json", f"модель вернула не объект: {type(turn).__name__}",
                 {"provider": name, "type": type(turn).__name__})
-        reply = turn.get("reply") or ""
+        reply = turn.get("reply")
+        if not isinstance(reply, str):
+            # The same question as `isinstance(turn, dict)` above, asked one level in, and asked
+            # here rather than papered over with `str()` for two reasons.
+            #
+            # It is a *format* failure, and `bad_model_json` is what that is called: the schema
+            # says `reply` is a string, and a provider that ignores `response_format` (external
+            # ones do -- the schema is a request, not a guarantee) answers `{"reply": 42}`.
+            # `str(42)` would put "42" in the transcript as something the model said.
+            #
+            # And without the check the number reached `messages` as a `content`, the turn
+            # answered 200, and the *next* read hit `_check_session_shape`, which correctly
+            # refused a message whose `content` is not a string. From then on the session was
+            # dead: `chat_corrupt` on every GET and every further turn, unfixable without an
+            # editor -- a file this server wrote itself and then declared hand-damaged. A
+            # refusal that leaves nothing behind cannot do that; see `chat_busy` on why the
+            # refusal must be taken before anything is written.
+            return 502, "application/json", _error_bytes(
+                "bad_model_json",
+                f"модель ответила не текстом: `reply` пришёл как {type(reply).__name__}",
+                {"provider": name, "type": type(reply).__name__})
         # Only the text of the turn is kept: see `_turn_content` on why the frame is not.
         session["messages"] += [{"role": "user", "content": text},
                                 {"role": "assistant", "content": reply}]

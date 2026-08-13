@@ -3481,6 +3481,12 @@ def test_opening_a_chat_reads_the_session_once_even_though_the_hash_fires_late()
 #: in a sentence (`llama-server`, the program the person has to go and look at) is stripped by the
 #: caller rather than weakened here.
 _LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
+#: Latin that is a *name*, not an untranslated word: the program to go and look at, the technique
+#: the whole project is named around, the file to go and fix. Translating any of them would make
+#: the sentence worse -- there is nothing to type into a terminal called «сервер ламы». Stripped
+#: before the Russian check rather than weakening the pattern, so the list of exceptions is
+#: visible and short, and anything not on it is still caught.
+_TECHNICAL_NAMES = ("llama-server", "transformer/adaln_cache.safetensors", "AdaLN")
 _PROVIDER_SOURCE = (PROJECT_ROOT / "h3_48gb" / "provider.py").read_text(encoding="utf-8")
 
 #: Codes the chat modal can put in front of a person, and where each is raised. A literal list
@@ -3491,6 +3497,15 @@ _CHAT_CODES = ("chat_not_found", "chat_busy", "chat_corrupt", "bad_image", "gpu_
                "provider_unavailable", "llama_did_not_start", "chat_unreachable",
                "bad_model_json", "bad_provider_reply")
 
+#: Everything else the page has to name in Russian. Not a chat code -- `checkpoint_without_adaln`
+#: comes back from `POST /api/jobs`, out of the dry-run that validates a submission -- but the
+#: person meets it in the same place, as a red box under the form, and the sentence has to say
+#: which field fixes it. Separate from `_CHAT_CODES` because the provider-derived test below is
+#: about the chat half specifically.
+_SUBMIT_CODES = ("checkpoint_without_adaln",)
+
+_PAGE_CODES = _CHAT_CODES + _SUBMIT_CODES
+
 
 @_needs_node
 def test_every_refusal_the_chat_can_produce_has_a_russian_sentence():
@@ -3498,21 +3513,28 @@ def test_every_refusal_the_chat_can_produce_has_a_russian_sentence():
     code on a Russian page, and the *same* sentence for «модель не подняли», «провайдер молчит»
     and «файл сессии сломан», which are three different things to go and do.
 
+    `_SUBMIT_CODES` rides along for the same reason and is checked identically: the page is one
+    page, and a code that arrives under the form rather than inside the modal is no less English
+    when nobody wrote a sentence for it.
+
     Every code is also required to be in `ERROR_CODES`, so a sentence for a code the server
     cannot produce (a typo, or a code that was renamed on one side only) fails here too: a
     branch that never runs reads as coverage and is worse than the fallback it replaced.
     """
-    for code in _CHAT_CODES:
+    for code in _PAGE_CODES:
         assert code in ERROR_CODES, f"{code!r} is not a code this system produces"
     titles, fallback = _node_eval("""
       const say = (code) => app.errorText({error: {code, message: "почему"}}).title;
       console.log(JSON.stringify([%s.map(say), say("code_nobody_wrote_a_sentence_for")]));
-    """ % json.dumps(list(_CHAT_CODES)))
-    for code, title in zip(_CHAT_CODES, titles):
+    """ % json.dumps(list(_PAGE_CODES)))
+    for code, title in zip(_PAGE_CODES, titles):
         assert title != fallback.replace("code_nobody_wrote_a_sentence_for", code), (
             f"{code} still falls through to `default:`")
         assert code not in title, f"{code}'s sentence shows the code itself: {title!r}"
-        assert not _LATIN_WORD.search(title.replace("llama-server", "")), (
+        plain = title
+        for name in _TECHNICAL_NAMES:
+            plain = plain.replace(name, "")
+        assert not _LATIN_WORD.search(plain), (
             f"{code}'s sentence is not in Russian: {title!r}")
     assert len(set(titles)) == len(titles), (
         "two chat refusals sharing one sentence is the bug this test exists to catch: "
