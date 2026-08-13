@@ -3946,3 +3946,22 @@ def test_a_failure_that_lands_nowhere_still_clears_its_own_pending_line():
     assert landed is False
     assert "pending" not in expected_log, f"the orphaned session must not keep its dots: {expected_log}"
     assert other_len == 0, "the foreign session that is actually on screen must stay untouched"
+
+
+@_needs_node
+def test_a_failed_turn_only_restores_the_field_if_nobody_has_started_a_new_draft():
+    """Fix round 1 (review, Important). The send button stays live for the whole turn -- a cold
+    model can take up to a minute -- so the person is free to start typing a new message while
+    the old one is still in flight. A refusal that landed must not clobber that fresh draft with
+    the stale text just because the old one failed: the old text is still visible as the `user`
+    line the failure note sits under, and the field belongs to whatever is being typed *now*.
+    """
+    restored, left_alone = _node_eval("""
+      console.log(JSON.stringify([
+        app.restoredInput("", "старое"),
+        app.restoredInput("новый черновик", "старое"),
+      ]));
+    """)
+    assert restored == "старое", "an empty field gets its unsent text back"
+    assert left_alone == "новый черновик", (
+        "a field that already has something in it must not be overwritten by the old draft")
