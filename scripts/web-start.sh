@@ -23,6 +23,30 @@ PORT=8765
 
 mkdir -p "$OUTDIR" "$LOGDIR"
 
+# Гонка идемпотентности: pgrep-проверка ниже и следующий за ней nohup не атомарны -- два
+# параллельных запуска этого скрипта оба могут пройти проверку "ещё не запущено" и оба стартовать.
+# Худший исход -- лишний, второй процесс падает с трейсбеком в лог, который никто не смотрит
+# (от реального дублирования воркера всё равно спасает его собственный flock на
+# queue/worker.lock, веб -- bind порта, но сам факт гонки и мусор в логе лучше не допускать).
+# Лок на весь скрипт делает «проверить и запустить» одной атомарной операцией: второй параллельный
+# запуск получает отказ сразу и тихо выходит, не трогая уже поднятые роли.
+#
+# `flock` (как в Linux-скриптах) здесь не подходит -- в macOS такой команды нет, только сисколл
+# flock(2). Нативный аналог -- `lockf(1)`: без command он берёт лок на уже открытый дескриптор
+# неблокирующе (`-t 0`) и держит его, пока дескриптор открыт, то есть до конца этого процесса --
+# лок освобождается сам, даже если скрипт упадёт или его убьют, без отдельного trap/cleanup.
+#
+# Дескриптор 9 наследуют и фоновые `nohup ... &` -- если не закрыть его явно в них (`9>&-` ниже),
+# лок переживёт сам скрипт: его будут держать открытыми h3 web/worker, которые остаются жить после
+# выхода родителя, и вообще любой следующий запуск скрипта будет видеть лок как занятый вечно, а не
+# только на время реальной гонки.
+LOCKFILE="$LOGDIR/web-start.lock"
+exec 9>"$LOCKFILE"
+if ! lockf -t 0 /dev/fd/9 2>/dev/null; then
+  echo "web-start уже выполняется — выходим"
+  exit 0
+fi
+
 WEB_PATTERN="h3_48gb.cli web"
 WORKER_PATTERN="h3_48gb.cli worker"
 
@@ -31,7 +55,7 @@ if pgrep -f "$WEB_PATTERN" > /dev/null; then
 else
   echo "запускаю h3 web на 127.0.0.1:$PORT, outdir=$OUTDIR"
   nohup caffeinate -dimsu "$PY" -m h3_48gb.cli web --outdir "$OUTDIR" --port "$PORT" \
-    >> "$LOGDIR/h3-web.log" 2>&1 &
+    >> "$LOGDIR/h3-web.log" 2>&1 9>&- &
   disown
   echo "  запущен, лог: $LOGDIR/h3-web.log"
 fi
@@ -41,7 +65,7 @@ if pgrep -f "$WORKER_PATTERN" > /dev/null; then
 else
   echo "запускаю h3 worker, outdir=$OUTDIR"
   nohup caffeinate -dimsu "$PY" -m h3_48gb.cli worker --outdir "$OUTDIR" \
-    >> "$LOGDIR/h3-worker.log" 2>&1 &
+    >> "$LOGDIR/h3-worker.log" 2>&1 9>&- &
   disown
   echo "  запущен, лог: $LOGDIR/h3-worker.log"
 fi
@@ -58,5 +82,9 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-echo "FAIL — h3 web не ответил за 30с. Смотри: tail -F $LOGDIR/h3-web.log"
+echo "FAIL — h3 web не ответил за 30с."
+echo "хвост $LOGDIR/h3-web.log:"
+tail -n 20 "$LOGDIR/h3-web.log" 2>/dev/null
+echo "хвост $LOGDIR/h3-worker.log:"
+tail -n 20 "$LOGDIR/h3-worker.log" 2>/dev/null
 exit 1
