@@ -137,6 +137,41 @@ def test_invalid_model_json_gets_one_retry_then_a_named_error(tmp_path):
         fake.close()
 
 
+def test_a_two_hundred_carrying_a_providers_own_error_is_a_named_refusal(tmp_path):
+    """OpenRouter answers 200 with `{"error": {...}}` when *its* upstream fails.
+
+    That body is valid JSON and has no `choices`, so the plain
+    `payload["choices"][0]["message"]["content"]` walked into a `KeyError` — which is not a
+    `ProviderError`, so `_locked_turn`'s `except provider.ProviderError` never saw it and the page
+    got a 500 «сервер споткнулся» for a failure that is entirely the provider's. The whole point
+    of the code contract is that the page can tell «модель/провайдер подвёл» from «сервер сломан»,
+    and 500 says the wrong one of the two.
+    """
+    for payload in ({"error": {"message": "x"}},           # OpenRouter's upstream-failure shape
+                    {"choices": []},                        # 200, no choice at all
+                    {"choices": [{"message": {}}]},         # a choice with no content
+                    {"choices": "нет"}):                    # `choices` that is not a list
+        fake = _FakeLlama(chat_payload=payload)
+        try:
+            with pytest.raises(provider.ProviderError) as err:
+                provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        finally:
+            fake.close()
+        assert err.value.code == "bad_provider_reply", payload
+        assert len(fake.requests) == 1, "ответ не по форме — не повод переспрашивать"
+
+    # The body reaches the message so a person can see what the provider actually said, and is
+    # cut, so a megabyte of HTML from a captive portal does not become the error message.
+    fake = _FakeLlama(chat_payload={"error": {"message": "ы" * 5000}})
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert "ыыы" in str(err.value)
+    assert len(str(err.value)) < 600, str(err.value)[:100]
+
+
 def test_external_provider_authorises_with_its_env_token(tmp_path):
     fake = _FakeLlama(chat_payload=_TURN)
     cfg = {"type": "openai", "base_url": f"http://127.0.0.1:{fake.port}",

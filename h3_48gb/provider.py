@@ -192,6 +192,13 @@ def chat(cfg: dict, env: dict, messages: list[dict]) -> dict:
     the optional bearer token differ. A model that fails to hold the JSON
     shape gets exactly one retry with a system reminder appended, then a
     named ProviderError carrying the raw text for diagnosis.
+
+    Three named failures leave here, and they are three because the page says
+    three different things: `chat_unreachable` (nobody answered),
+    `bad_provider_reply` (a 200 that is not a completion -- the provider's own
+    error envelope) and `bad_model_json` (a completion whose text is not the
+    schema). Only the last is worth a retry: the other two are not the model
+    failing to phrase an answer, they are there being no answer to phrase.
     """
     body = {"model": cfg.get("model", cfg.get("preset", "default")),
             "messages": messages,
@@ -214,7 +221,20 @@ def chat(cfg: dict, env: dict, messages: list[dict]) -> dict:
             # other transport failure -- never leak the raw urllib exception
             # (or headers, which may carry the bearer token) to the caller.
             raise ProviderError("chat_unreachable", f"провайдер недоступен: {err}")
-        return payload["choices"][0]["message"]["content"]
+        # A 200 does not mean the body is a completion. OpenRouter answers 200 with
+        # `{"error": {"message": ...}}` when *its* upstream fails, and a proxy in front of any
+        # provider can answer 200 with something else entirely. Walking that with plain
+        # subscripting raised `KeyError`/`TypeError`, which is not a `ProviderError` -- so the
+        # server's `except provider.ProviderError` missed it and the page was told 500 «сервер
+        # споткнулся» for a failure that never was this server's. The envelope is checked here,
+        # once, where the bytes are parsed.
+        try:
+            return payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            raise ProviderError(
+                "bad_provider_reply",
+                f"провайдер ответил 200, но не ходом: "
+                f"{json.dumps(payload, ensure_ascii=False)[:400]}")
 
     raw = ask(messages)
     try:

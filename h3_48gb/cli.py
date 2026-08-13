@@ -139,6 +139,7 @@ ERROR_CODES = {
     "llama_did_not_start": "llama-server was spawned but never answered /health; the log tail is in the message",
     "chat_unreachable": "the chat provider did not answer at all -- not started, crashed, or the wrong address",
     "bad_model_json": "the chat model would not hold the answer schema, twice in a row",
+    "bad_provider_reply": "the chat provider answered 200 with something that is not a completion -- OpenRouter's own `{\"error\": ...}` body, or a proxy's page; the body's first 400 characters are in the message",
     # Router-level refusals: produced by `web._router_code` (and by the standard library's own
     # error path behind it) rather than by a `raise CliError(...)`, which is why the contract test
     # reads `web.ROUTER_CODES` instead of only scanning source for raise sites. They belong in this
