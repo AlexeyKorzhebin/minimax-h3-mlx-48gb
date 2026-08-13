@@ -15,8 +15,10 @@
 * **путь из URL и путь из тела проверяются как пути** — id сессии и путь кадра приходят снаружи и
   превращаются в имя файла, поэтому у обоих есть тест на побег из корня.
 """
+import fcntl
 import http.client
 import json
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,6 +77,9 @@ class _Live:
 
     def post_json_raw(self, url: str, payload: dict) -> tuple[int, dict]:
         return self._request("POST", url, payload)
+
+    def delete_json_raw(self, url: str) -> tuple[int, dict]:
+        return self._request("DELETE", url)
 
 
 @pytest.fixture
@@ -265,6 +270,62 @@ def test_a_message_to_a_session_that_does_not_exist_is_a_named_404(_serve):
     assert (status, payload["error"]["code"]) == (404, "chat_not_found")
     status, payload = srv.post_json_raw("/api/chat/deadbeef/message", {"text": "x", "prompt": ""})
     assert (status, payload["error"]["code"]) == (404, "chat_not_found")
+
+
+# -- удаление сессии -----------------------------------------------------------------------------
+
+
+def test_deleting_a_chat_session_removes_the_session_and_its_lock(_serve, fake_llama):
+    """`DELETE /api/chat/<id>` — кнопка «очистить» в шапке модалки. Удаляет не только
+    `<id>.json`, но и `<id>.lock`: тот переживает каждый ход (`chat_session_lock` его не
+    стирает, только снимает замок), и если бы он оставался на диске, а `_chat_dir` со
+    временем очистили вручную, второй замок с тем же именем достался бы уже другой сессии.
+
+    Ход перед удалением — не украшение: без него `<id>.lock` ещё не существует
+    (`chat_session_lock` создаёт файл замка лениво, только когда кто-то через него проходит),
+    и тест ничего не доказал бы про его удаление."""
+    srv = _serve(providers_port=fake_llama.port)
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "мрачнее", "prompt": "п"})
+    session_path = Path(srv.root) / "chat" / f"{sid}.json"
+    lock_path = session_path.with_suffix(".lock")
+    assert session_path.is_file() and lock_path.is_file(), "ход должен был оставить оба файла"
+
+    status, answer = srv.delete_json_raw(f"/api/chat/{sid}")
+    assert status == 200 and answer == {"ok": True}, answer
+    assert not session_path.exists(), "сессия должна быть удалена"
+    assert not lock_path.exists(), "замок сессии должен быть удалён вместе с ней"
+
+
+def test_deleting_a_chat_session_that_does_not_exist_is_a_named_404(_serve):
+    srv = _serve()
+    status, payload = srv.delete_json_raw("/api/chat/deadbeef")
+    assert (status, payload["error"]["code"]) == (404, "chat_not_found"), payload
+
+
+def test_deleting_a_chat_session_mid_turn_is_refused_and_deletes_nothing(_serve):
+    """Если ход уже идёт, замок сессии занят другим потоком (`chat_session_lock`), и удаление
+    обязано отказаться тем же кодом, каким отказывается второй ход — `chat_busy`, 409 — а не
+    молча выждать и стереть файлы из-под модели, которая их как раз читает и пишет.
+
+    Замок держит `fcntl.flock` из самого теста, напрямую на том же `<id>.lock`, каким его
+    открыл бы сервер — тот же приём, каким `chat_session_lock` проверяется в `test_web.py`:
+    `flock` различает конкурирующие открытия файла даже в одном процессе, так что настоящий
+    ход модели поднимать не нужно."""
+    srv = _serve()
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    session_path = Path(srv.root) / "chat" / f"{sid}.json"
+    lock_path = session_path.with_suffix(".lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        status, payload = srv.delete_json_raw(f"/api/chat/{sid}")
+        assert (status, payload["error"]["code"]) == (409, "chat_busy"), payload
+        assert session_path.exists(), "занятый замок — ничего не должно быть удалено"
+        assert lock_path.exists(), "занятый замок — ничего не должно быть удалено"
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # -- очередь главнее ---------------------------------------------------------------------------

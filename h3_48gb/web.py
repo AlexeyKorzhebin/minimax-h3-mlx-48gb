@@ -1363,6 +1363,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/jobs/"):
             return self._cancel_job(path[len("/api/jobs/"):])
+        if path.startswith("/api/chat/"):
+            return self._delete_chat(path[len("/api/chat/"):])
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for DELETE {path}", {"path": path})
 
@@ -1918,6 +1920,39 @@ class _Handler(BaseHTTPRequestHandler):
             return 404, "application/json", _error_bytes(
                 "chat_not_found", f"нет сессии {sid}", {"id": sid})
         return 200, "application/json", _json_bytes({"ok": True, **session})
+
+    def _delete_chat(self, sid: str) -> tuple[int, str, bytes]:
+        """`DELETE /api/chat/<id>`: the session file and its lock, gone -- «очистить» in the
+        modal's head.
+
+        **Refused with `chat_busy`, not queued behind the turn.** `chat_session_lock` is the same
+        non-blocking guard `_chat_message` takes for a turn: a turn in flight holds it, so trying
+        to delete out from under a read-modify-write in progress fails immediately with 409 rather
+        than waiting a minute and then deleting a file the model is mid-write on. Nothing is
+        unlinked before the lock is granted, so a refused delete leaves both files exactly as they
+        were.
+
+        **The lock file too, not only the session.** `chat_session_lock`'s own docstring explains
+        why `<sid>.lock` outlives every turn it guards: it is never touched by `os.replace`, only
+        `flock`ed and released. Left behind, a `.lock` with no `.json` beside it is a lock some
+        *other* session id -- generated later by `secrets.token_hex(4)` reusing the same eight
+        hex digits -- would silently inherit, and finding out would take a very unlucky day.
+
+        **Existence is checked before the lock is taken**, the same order `_chat_message` uses:
+        an id nobody ever created should answer `chat_not_found`, not `chat_busy`, and the
+        `is_file` check inside `name_too_long_is_a_refusal` never creates the lock file the way
+        entering `chat_session_lock` itself would.
+        """
+        path = self._chat_path(sid)
+        with name_too_long_is_a_refusal("a chat id"):
+            exists = path.is_file()
+        if not exists:
+            return 404, "application/json", _error_bytes(
+                "chat_not_found", f"нет сессии {sid}", {"id": sid})
+        with chat_session_lock(path):
+            path.unlink(missing_ok=True)
+            path.with_suffix(".lock").unlink(missing_ok=True)
+        return 200, "application/json", _json_bytes({"ok": True})
 
     def _turn_content(self, text: str, image: str):
         """The user's turn, and a warning: plain text, or `[text, image_url]` plus `None`.

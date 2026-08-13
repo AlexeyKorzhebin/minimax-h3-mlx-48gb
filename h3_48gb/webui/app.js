@@ -1893,6 +1893,23 @@ function startPage() {
     closeChat();
   }
 
+  /* «очистить» в шапке — не «закрыть»: стирает сессию на диске, а не просто прячет окно.
+     Подтверждение обязательно, потому что отменить это уже нельзя (в отличие от простого
+     закрытия, после которого сессия остаётся и открывается снова тем же `#chat/<id>`).
+     После удаления модалка не закрывается, а сразу открывает пустую новую сессию — тем же
+     `openChatModal`, каким открывается кнопка «Новый диалог». */
+  async function requestDeleteChat() {
+    if (!chat) return;
+    if (!window.confirm("Удалить этот диалог целиком?")) return;
+    try {
+      await api("DELETE", "/api/chat/" + encodeURIComponent(chat.id));
+    } catch (error) {
+      if (error.payload) showError(error.payload);
+      return;
+    }
+    openChatModal({ kind: "new" });
+  }
+
   async function syncChatFromHash() {
     const action = chatHashAction(window.location.hash, chatWanted);
     if (action.act === "close") { closeChat(); return; }
@@ -2273,6 +2290,7 @@ function startPage() {
   // Смена провайдера меняет и смысл плашки: у внешнего поднимать нечего.
   $("chat-provider").addEventListener("change", () => renderLlmPlate());
   $("chat-close").addEventListener("click", requestCloseChat);
+  $("chat-delete").addEventListener("click", requestDeleteChat);
   $("chat-finish").addEventListener("click", finishChat);
   $("chat-form").addEventListener("submit", (event) => {
     event.preventDefault();
