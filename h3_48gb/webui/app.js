@@ -120,18 +120,30 @@ export function jobTag(job) {
   return stem.slice(stem.lastIndexOf("/") + 1) || job.id;
 }
 
-/** `/media/<прогон>/<файл>` строится из `output_stem`, который сервер хранит
- *  абсолютным: предпоследний сегмент — каталог прогона, последний — основа
- *  имени. Если задача пишет прямо в корень выхода, каталога прогона нет и
- *  ссылка не строится: `/media` требует ровно `<прогон>/<файл>`. */
-export function mediaParts(outputStem) {
-  const parts = String(outputStem || "").split("/").filter((x) => x !== "");
-  if (parts.length < 2) return null;
-  return { run: parts[parts.length - 2], stem: parts[parts.length - 1] };
+/** `/media/<прогон>/<файл>` строится из `output_stem` (абсолютный) и `outdir` —
+ *  тот самый `--outdir`, с которым запущен `h3 web`, из `/api/state` (`build_state`
+ *  в `web.py`). Fix round 1 (ревью A6, C1): раньше «прогон» брался по числу
+ *  сегментов (предпоследний), что верно ровно на глубине 1 — а своя папка
+ *  задачи (A6) плюс папка-дата, которую сама форма подставляет по умолчанию
+ *  (`defaultOutdir()`), вместе дают глубину 2 и больше. Без `outdir` сервера
+ *  границу между «корнем сервера» и «путём задачи» разобрать нечем — вся
+ *  строка `output_stem` абсолютна и ничем не выдаёт, где она начинается, — и
+ *  без него ссылка не строится. Остаток после `outdir/` целиком, до
+ *  последнего `/`, идёт в `run` одним куском (сервер, `_media`, сам разбирает
+ *  его до последнего `/`, а не по сегментам) — это и даёт произвольную
+ *  глубину: `2026-08-12/20260813-1435-kot-italy` не хуже, чем `2026-08-12`. */
+export function mediaParts(outputStem, outdir) {
+  const stem = String(outputStem || "");
+  const base = String(outdir || "");
+  if (!base || !stem.startsWith(`${base}/`)) return null;
+  const relative = stem.slice(base.length + 1);
+  const lastSlash = relative.lastIndexOf("/");
+  if (lastSlash <= 0) return null;
+  return { run: relative.slice(0, lastSlash), stem: relative.slice(lastSlash + 1) };
 }
 
-export function clipUrl(job) {
-  const parts = mediaParts(job.output_stem);
+export function clipUrl(job, outdir) {
+  const parts = mediaParts(job.output_stem, outdir);
   if (!parts) return null;
   return `/media/${encodeURIComponent(parts.run)}/${encodeURIComponent(parts.stem + ".mp4")}`;
 }
@@ -146,11 +158,11 @@ export function previewStep(job, completedForwards) {
   return Math.floor(done / every) * every;
 }
 
-export function previewUrl(job, completedForwards) {
+export function previewUrl(job, completedForwards, outdir) {
   const step = previewStep(job, completedForwards);
   if (step <= 0) return null;
   const explicit = argValue(job.args, "--preview-stem");
-  const parts = mediaParts(explicit || job.output_stem);
+  const parts = mediaParts(explicit || job.output_stem, outdir);
   if (!parts) return null;
   const name = `${parts.stem}-preview-step${String(step).padStart(2, "0")}.jpg`;
   return `/media/${encodeURIComponent(parts.run)}/${encodeURIComponent(name)}`;
@@ -199,13 +211,24 @@ export function canvasIsPacked(width, height) {
       && width > 0 && height > 0 && width % 32 === 0 && height % 32 === 0;
 }
 
-/** Три готовых канваса, за черновик/предпросмотр/финал. Ровно эти три —
- *  форма не растёт списком пресетов, у неё есть ручной ввод для всего
- *  остального. */
+/** Три готовых канваса — черновик/предпросмотр/финал — и каждый в двух ориентациях (C2).
+ *
+ *  Вертикальные добавлены не ради полноты списка: вертикальный ролик снимается тем же
+ *  черновиком, что и горизонтальный, а до этой задачи его размеры набирались руками в оба поля
+ *  и набирались неправильно. Ровно шесть — форма не растёт списком пресетов дальше, у неё есть
+ *  «своё…» с ручным вводом для всего остального.
+ *
+ *  Порядок — парами (гориз., верт.): выпадашка читается сверху вниз, и размер обязан стоять
+ *  рядом со своим поворотом, а не в отдельном хвосте списка. `label` — подпись пункта без
+ *  чисел; числа в подписи пишет разметка, и `test_every_canvas_preset_has_its_own_option_...`
+ *  сверяет, что она пишет именно эти. */
 export const CANVAS_PRESETS = [
   { key: "draft", label: "черновик", w: 448, h: 288 },
+  { key: "draft-v", label: "черновик верт.", w: 288, h: 448 },
   { key: "small", label: "малое", w: 896, h: 576 },
+  { key: "small-v", label: "малое верт.", w: 576, h: 896 },
   { key: "large", label: "большое", w: 1344, h: 768 },
+  { key: "large-v", label: "большое верт.", w: 768, h: 1344 },
 ];
 
 /**
@@ -213,12 +236,77 @@ export const CANVAS_PRESETS = [
  *
  * Чистая функция — ни одного обращения к DOM, поэтому её проверяет узел без браузера, как и
  * весь остальной пул чистых функций этого модуля. Заполнение `#width`/`#height` и пересчёт
- * оценки после клика делает обработчик в `startPage()`, тем же путём, что и ручной ввод (см.
+ * оценки после выбора делает обработчик в `startPage()`, тем же путём, что и ручной ввод (см.
  * подписку `FIELDS` на `input`).
  */
 export function applyCanvasPreset(key) {
   const preset = CANVAS_PRESETS.find((p) => p.key === key);
   return preset ? { width: preset.w, height: preset.h } : null;
+}
+
+/**
+ * Пункт выпадашки, которому отвечает канвас `width`×`height`, или `"custom"`, если ни один.
+ *
+ * Обратная сторона `applyCanvasPreset`: выпадашка обязана показывать то, что в полях, а не то,
+ * что в ней последний раз выбрали руками. С этой стороны приходят правка задачи
+ * (`fillFormFrom` — у задачи свои числа, и они могут не совпасть ни с одним пресетом) и ручной
+ * ввод в «своё…».
+ */
+export function canvasPresetKey(width, height) {
+  const preset = CANVAS_PRESETS.find((p) => p.w === Number(width) && p.h === Number(height));
+  return preset ? preset.key : "custom";
+}
+
+/** Последнее звено пути, как есть — тем же правилом, что и `pathBasename` в DOM-половине:
+ *  путь мог прийти с сервера (всегда `/`) или быть вписан руками на другой ОС. */
+function nameOfPath(value) {
+  const trimmed = String(value == null ? "" : value).trim();
+  if (!trimmed) return "";
+  const parts = trimmed.split(/[\\/]/);
+  return parts[parts.length - 1];
+}
+
+/** То же, но без расширения. Только для **файлов**: у каталога «расширения» не бывает, и
+ *  отрезать у него хвост по последней точке значит назвать другой каталог (правка по ревью C2 —
+ *  `h3-8bit-full.v2` превращался в `h3-8bit-full`, который у людей лежит рядом). */
+function stemOfPath(value) {
+  const name = nameOfPath(value);
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(0, dot) : name;
+}
+
+/**
+ * Одна строка вместо четырёх свёрнутых полей: «h3-8bit-full · 8 шагов · LoRA 1.00 · таблица l100».
+ *
+ * `<details>` с настройками модели закрыт по умолчанию (C2, требование 3) — и это правильно
+ * ровно до тех пор, пока свёрнутый вид говорит, что под ним лежит. Прогон по чужому чекпойнту
+ * или без LoRA стоит лишнего часа, а выглядит как обычный, и единственное, что стоит между
+ * человеком и этим часом, — вот эта строка.
+ *
+ * Отсутствующее не молчит, а называется: пустая LoRA — «LoRA нет» (без неё прогон идёт вчетверо
+ * дольше), пустая таблица AdaLN — «таблица чекпойнта» (сетку тогда задаёт сам чекпойнт, см.
+ * подпись поля). Молчание об этом читалось бы как «на месте».
+ *
+ * Чистая функция от объекта того же вида, что отдаёт `readForm()`: `{checkpoint, steps, lora,
+ * loraStrength, adaln}`. Ни одного обращения к DOM — её зовёт `refreshSubmitState`, а проверяет
+ * узел без браузера.
+ */
+export function modelSummary(form) {
+  const it = form || {};
+  // Чекпойнт — каталог (`--checkpoint` указывает на папку с весами), поэтому имя целиком:
+  // см. `stemOfPath` о том, чем это кончалось. Таблица AdaLN ниже — файл, и там стем уместен.
+  const checkpoint = nameOfPath(it.checkpoint) || "чекпойнт не указан";
+  const steps = Math.max(0, Math.round(Number(it.steps) || 0));
+  const lora = String(it.lora || "").trim()
+    ? `LoRA ${(Number(it.loraStrength) || 0).toFixed(2)}`
+    : "LoRA нет";
+  const adaln = stemOfPath(it.adaln);
+  // `adaln_8_l100.safetensors` -> `l100`: имена таблиц строятся из числа шагов и длины сетки,
+  // и в свёрнутой строке человеку нужен именно хвост, а не общий для всех префикс.
+  const table = adaln ? `таблица ${adaln.split("_").pop() || adaln}` : "таблица чекпойнта";
+  return [checkpoint,
+          `${steps} ${plural(steps, "шаг", "шага", "шагов")}`,
+          lora, table].join(" · ");
 }
 
 /* ===========================================================================
@@ -587,6 +675,21 @@ export function scaleHtml(analysis) {
     + `${(seg.b - seg.a).toFixed(1)}</div>`).join("");
 }
 
+/**
+ * A3: длительность, против которой модалка проверяет склейки — из состояния диалога
+ * (`chat.duration`), не из формы. Форма и модалка — два разных ролика: форма ставит задачу
+ * с одной длительностью, модалка тем временем может обсуждать совсем другую (например, чат
+ * открыт от задачи с её собственным `--duration`), и `paintPrompt` модалки обязан спорить с
+ * планами по числу, которое видел сервер в системном контексте (`duration: N s`,
+ * `_locked_turn`), а не по тому, что сейчас в поле `#duration` где-то ещё на странице.
+ *
+ * Чистая функция ровно потому, что от неё это и нужно: она не имеет доступа к DOM (`chat`
+ * само по себе — обычный объект), так что её нельзя случайно свести обратно к чтению формы.
+ */
+export function chatDuration(state) {
+  return (state && Number(state.duration)) || 10;
+}
+
 /* ===========================================================================
    ОЧЕРЕДЬ: СВОДКИ И СТРОКИ
    =========================================================================== */
@@ -667,17 +770,20 @@ export function stepsHtml(completed, total) {
   return html;
 }
 
-const SPEC_CELLS = (job) => {
+/** Технические параметры задачи одной строкой: режим, канвас, длительность, шаги.
+ *
+ *  До C2 это были четыре ячейки общей девятиколоночной сетки `--cols`, одной на все три списка.
+ *  Списков теперь два и оба карточные (макет: `.qitem` в очереди, `.rcard` в готовом), сравнивать
+ *  числа по вертикали между ними больше нечем и незачем — параметры стали подписью под именем. */
+const specText = (job) => {
   const e = job.estimate || {};
   const mode = argValue(job.args, "--mode") || "auto";
   const w = e.width ?? "?";
   const h = e.height ?? "?";
   const sec = e.duration_seconds ?? "?";
   const steps = e.steps ?? "?";
-  return `<span class="c l">${escapeHtml(mode)}</span>`
-       + `<span class="c">${escapeHtml(w)}×${escapeHtml(h)}</span>`
-       + `<span class="c">${escapeHtml(sec)} с</span>`
-       + `<span class="c">${escapeHtml(steps)}</span>`;
+  return `${escapeHtml(mode)} · ${escapeHtml(w)}×${escapeHtml(h)}`
+       + ` · ${escapeHtml(sec)} с · ${escapeHtml(steps)} шаг.`;
 };
 
 /**
@@ -688,22 +794,31 @@ const SPEC_CELLS = (job) => {
  * же породы: разговор кончается `PUT /api/jobs/<id>`, а он бывает только у ждущей. Копия —
  * исключение: она ничего не меняет в этой задаче, только читает её `args`/`note`, поэтому
  * уместна и у завершённой тоже (см. `finishedRowHtml`).
+ *
+ * C2: строка общей сетки стала карточкой `.qitem` из макета — номер в очереди слева, имя и
+ * параметры столбиком, действия справа. Заметка (`job.note`) остаётся: поле ввода из формы ушло
+ * (требование 4), но сама заметка приезжает с сервера у копий и у задач, поставленных не с этой
+ * страницы, и прятать её было бы прятанием чужих данных.
  */
-export function pendingRowHtml(job, { editingId = null } = {}) {
+export function pendingRowHtml(job, { editingId = null, index = null } = {}) {
   const peak = jobPeak(job);
   const over = peak > WARN_GB;
   const priority = Number(job.priority) || 0;
   const id = escapeHtml(job.id);
-  return `<div class="r wait${editingId === job.id ? " editing" : ""}">`
-    + `<span class="m wait"></span>`
-    + `<span class="name">${escapeHtml(jobTag(job))}`
+  const note = String(job.note || "");
+  return `<div class="qitem${editingId === job.id ? " editing" : ""}">`
+    + `<span class="idx">${index === null ? "" : escapeHtml(index)}</span>`
+    + `<span class="m wait" aria-hidden="true"></span>`
+    + `<span class="body">`
+    + `<span class="n">${escapeHtml(jobTag(job))}`
     + (priority > 0 ? ` <span class="prio">↑${priority}</span>` : "")
-    + `<span class="note">${escapeHtml(job.note)}</span></span>`
-    + SPEC_CELLS(job)
-    + `<span class="c">${formatDuration(jobSeconds(job))}</span>`
-    + `<span class="c mem${over ? " over" : ""}">${formatGb(peak)}`
+    + `</span>`
+    + `<span class="meta">${specText(job)} · ≈${formatDuration(jobSeconds(job))}`
+    + `<span class="mem${over ? " over" : ""}">${formatGb(peak)}`
     + `<i class="mg" title="из ${PHYSICAL_GB} ГБ, риска на ${WARN_GB}">`
-    + `<b style="width:${Math.min(100, peak / PHYSICAL_GB * 100)}%"></b></i></span>`
+    + `<b style="width:${Math.min(100, peak / PHYSICAL_GB * 100)}%"></b></i></span></span>`
+    + (note ? `<span class="note">${escapeHtml(note)}</span>` : "")
+    + `</span>`
     + `<span class="acts">`
     + `<button data-act="chat" data-id="${id}">Обсудить</button>`
     + `<button data-act="edit" data-id="${id}">Править</button>`
@@ -718,33 +833,80 @@ export function pendingRowHtml(job, { editingId = null } = {}) {
  * Завершённая задача: код возврата виден всегда, причина — у упавших.
  * Единственное действие — копия (см. `pendingRowHtml`): прогон уже случился,
  * отменять и поднимать нечего, а вот повторить теми же параметрами — обычное дело.
+ *
+ * `outdir` — необязательный (fix round 1, A6): без него `clipUrl` просто не
+ * построит ссылку (см. `mediaParts`), а не упадёт — карточка ещё покажет имя
+ * файла текстом, как до этой задачи, если `outdir` почему-то не пришёл.
+ *
+ * C2: строка стала карточкой `.rcard` из макета, и главное в ней — кадр.
+ *
+ * Откуда берётся число проходов для `previewUrl` — зависит от исхода, и это не мелочь (ревью C2,
+ * опасение 1). У успешной задачи это её собственная оценка (`estimate.forwards`): прогон дошёл до
+ * конца, значит прошёл их все, и оценка тут — факт, переживающий исчезновение прогона из `runs`
+ * сутки спустя. У упавшей `estimate.forwards` — обещание, а не факт: до последнего прохода она не
+ * дожила, и адрес кадра, построенный по нему, отвечал 404 на каждый опрос, раз в двадцать секунд,
+ * на каждую упавшую карточку. Сколько проходов было на самом деле, знает `runs.scan`
+ * (`run.completed`, посчитанный по чекпойнтам на диске) — отсюда третий аргумент.
+ *
+ * Кадра может не быть вовсе (прогон короче одного интервала записи, упал раньше первого, или его
+ * каталога уже нет в `runs`) — тогда рамка пустая: битая картинка хуже пустой.
  */
-export function finishedRowHtml(job) {
+export function finishedRowHtml(job, outdir, runs) {
   const code = job.exit_code;
   const ok = code === 0;
-  const clip = ok ? clipUrl(job) : null;
+  const clip = ok ? clipUrl(job, outdir) : null;
   const stem = String(job.output_stem || "");
   const name = stem.slice(stem.lastIndexOf("/") + 1);
   const id = escapeHtml(job.id);
-  const note = ok
-    ? (clip ? `<a class="clip" href="${clip}">${escapeHtml(name)}.mp4</a>`
-            : escapeHtml(name))
-    : `код возврата ${escapeHtml(code == null ? "неизвестен" : code)}`;
+  const e = job.estimate || {};
+  const run = ok ? null : runForJob(job, runs);
+  const completed = ok ? Number(e.forwards) || 0 : Number((run && run.completed) || 0);
+  const shot = previewUrl(job, completed, outdir);
+  // Код возврата стоит в `.meta` и только там: до этой правки упавшая карточка называла его
+  // дважды подряд — «код 1» строкой выше и «код возврата 1» строкой ниже.
+  const link = ok && clip
+    ? `<a class="clip" href="${clip}">${escapeHtml(name)}.mp4</a>`
+    : escapeHtml(name);
   const took = job.started_at && job.finished_at
     ? (Date.parse(job.finished_at) - Date.parse(job.started_at)) / 1000
     : NaN;
-  return `<div class="r ${ok ? "done" : "fail"}">`
-    + `<span class="m ${ok ? "done" : "fail"}"></span>`
-    + `<span class="name">${escapeHtml(jobTag(job))}<span class="note">${note}</span></span>`
-    + SPEC_CELLS(job)
-    + `<span class="c">${Number.isFinite(took) ? formatDuration(took) : "—"}</span>`
-    + `<span class="c">${job.finished_at ? formatClock(new Date(job.finished_at)) : "—"}</span>`
-    + `<span class="c l">код ${escapeHtml(code == null ? "?" : code)}</span>`
-    + (ok ? "" : `<span class="why">${escapeHtml(job.log_tail || "причина не записана")}</span>`)
-    + `<span class="acts">`
+  return `<article class="rcard ${ok ? "done" : "fail"}">`
+    + `<div class="frame">`
+    // Кадр мог не долететь на диск или быть стёрт вместе с прогоном: пустая рамка честнее битой.
+    + (shot ? `<img src="${shot}" alt="превью-кадр" onerror="this.hidden = true">` : "")
+    + `<span class="tc">${escapeHtml(e.width ?? "?")}×${escapeHtml(e.height ?? "?")}</span>`
+    + `<span class="dur">${escapeHtml(e.duration_seconds ?? "?")} с</span>`
+    + `</div>`
+    + `<div class="info">`
+    + `<div class="n"><span class="m ${ok ? "done" : "fail"}" aria-hidden="true"></span>`
+    + `${escapeHtml(jobTag(job))}</div>`
+    + `<div class="meta">${Number.isFinite(took) ? formatDuration(took) : "—"}`
+    + ` · ${job.finished_at ? formatClock(new Date(job.finished_at)) : "—"}`
+    + ` · код ${escapeHtml(code == null ? "?" : code)}</div>`
+    + `<div class="link">${link}</div>`
+    + (ok ? "" : `<div class="why">${escapeHtml(job.log_tail || "причина не записана")}</div>`)
+    + `<div class="acts">`
     + `<button data-act="dup" data-id="${id}">Копия</button>`
-    + `</span>`
-    + `</div>`;
+    + `</div>`
+    + `</div>`
+    + `</article>`;
+}
+
+/**
+ * Одно слово о том, что с очередью, для показания в чроме.
+ *
+ * Четыре исхода, а не три (правка по ревью C2): до неё «идёт» стояло на любой непаузной
+ * очереди при живом работнике — в том числе на пустой, где не идёт ничего, — и спорило с
+ * соседней строкой «Ничего не считается» в той же чроме.
+ *
+ * «Свободна» и «стоит» — разные вещи, и путать их дорого: свободная очередь возьмёт первую же
+ * поставленную задачу, стоящая не возьмёт (некому — работник не запущен или его не проверить).
+ * Пауза называется отдельно и первой: она снимается кнопкой, остальные два — нет.
+ */
+export function queueStateWord({ paused, workerState, running, pending } = {}) {
+  if (paused) return "на паузе";
+  if (workerState !== "alive") return "стоит";
+  return running || Number(pending) > 0 ? "идёт" : "свободна";
 }
 
 /** Нечитаемые файлы очереди. Их нет ни в одном списке, а человек считает
@@ -885,16 +1047,24 @@ export function errorText(payload) {
    =========================================================================== */
 
 /**
- * Чистая функция: `{pending, llm}` — сколько задач ждёт и в каком состоянии
- * локальная модель (`/api/llm`'s `status`) — в решение, показывать ли плашку.
+ * Чистая функция: `{pending, llm, paused}` — сколько задач ждёт, в каком состоянии локальная
+ * модель (`/api/llm`'s `status`) и стоит ли сама очередь (`/api/state`'s `paused`) — в решение,
+ * показывать ли плашку.
  *
  * `llm !== "up"` включает и `"down"`, и `"busy"`, и внешнего провайдера, у
  * которого `/api/llm` тоже отвечает `down` (см. `_llm_state` в `web.py`):
  * ни то ни другое не держит память этой машины, снимать нечего.
+ *
+ * `paused` гасит плашку раньше, чем до неё доходит очередь: A5 (пауза/старт очереди) — работник
+ * не берёт задачи, пока `is_paused`, так что «выгрузить и начать генерацию» на паузе — совет,
+ * которому нечего начинать, и он лишь путает человека, у которого очередь стоит по его же
+ * собственному решению, не по занятому GPU.
  */
 export function unloadBanner(state) {
   const pending = Number(state && state.pending) || 0;
   const llm = state && state.llm;
+  const paused = Boolean(state && state.paused);
+  if (paused) return { show: false };
   if (pending > 0 && llm === "up") {
     return { show: true,
              text: "Модель в памяти держит GPU — выгрузить и начать генерацию?" };
@@ -925,13 +1095,16 @@ export function unloadBannerVisible(state, dismissedKey) {
  * Переход дисмисс-состояния плашки на один опрос — то, чем страница пользуется на самом деле.
  *
  * `prev` — `{dismissedKey}`, посчитанный на предыдущем опросе (или `{dismissedKey: null}` до
- * первого клика «пусть ждёт»); `state` — свежий `{pending, llm}`. Отличие от `unloadBannerVisible`
- * ровно в том, что тут нашло ревью первого раунда: `dismissedKey` не переживает уход состояния от
- * себя. Без сгорания цикл «2 задачи, up → пусть ждёт → 3 задачи (плашка снова видна, задачу
- * добавили) → одну из трёх удалили, снова 2 задачи, up» молча гасил предупреждение во второй раз —
- * ключ `"2:up"` совпадал с тем, что отклонили в первый раз, хотя именно это повторное появление
- * никто не отклонял. Сгорание чинит это: как только ключ хоть раз разошёлся с `dismissedKey`,
- * старый дисмисс забывается, и попадание обратно в то же `{pending, llm}` снова спрашивает.
+ * первого клика «пусть ждёт»); `state` — свежий `{pending, llm, paused}`. Отличие от
+ * `unloadBannerVisible` ровно в том, что тут нашло ревью первого раунда: `dismissedKey` не
+ * переживает уход состояния от себя. Без сгорания цикл «2 задачи, up → пусть ждёт → 3 задачи
+ * (плашка снова видна, задачу добавили) → одну из трёх удалили, снова 2 задачи, up» молча гасил
+ * предупреждение во второй раз — ключ `"2:up"` совпадал с тем, что отклонили в первый раз, хотя
+ * именно это повторное появление никто не отклонял. Сгорание чинит это: как только ключ хоть раз
+ * разошёлся с `dismissedKey`, старый дисмисс забывается, и попадание обратно в то же
+ * `{pending, llm}` снова спрашивает. `paused` не входит в `bannerKey` — она гасит `show` через
+ * `unloadBanner` напрямую (см. его докстринг), а ключ дисмисса остаётся про то же `{pending, llm}`
+ * и после того, как пауза снята, помнит именно то, что было отклонено при её снятии.
  */
 export function nextBannerState(prev, state) {
   const key = bannerKey(state);
@@ -965,6 +1138,16 @@ export function buildArgs(form, { withPrompt = true } = {}) {
   if (form.image) args.push("--image", form.image);
   if (form.endImage) args.push("--end-image", form.endImage);
   return args;
+}
+
+/** Текст зоны загрузки кадра (A7): пусто — приглашение перетащить или выбрать файл, что-то
+ *  загружено (или вписано вручную) — имя файла. Чистая функция состояния зоны, а не поля ввода
+ *  напрямую: `state` — `{name}` c возможно отсутствующим или пустым `name`, ровно то, что
+ *  `updateUploadZone` (ниже, в DOM-половине) строит из текущего пути в поле, а node-тест — из
+ *  ничего вообще. */
+export function uploadZoneLabel(state) {
+  const name = (state && state.name) || "";
+  return name || "перетащи картинку или выбери файл";
 }
 
 /** Тег с сидом в хвосте. Без него три сида одной сцены упрутся в
@@ -1047,13 +1230,124 @@ export function buildPromptText(prompt) {
  *
  * Правка руками не теряется по построению: следующий ход уходит с текстом окна, а не с тем,
  * что модель прислала в прошлый раз (см. `sendChatMessage`).
+ *
+ * `turn.slug` (A4) следует тому же правилу, что и `session["slug"]` на сервере
+ * (`web._locked_turn`): ход, ничего не назвавший, не стирает то, что назвал предыдущий —
+ * `state.slug` переписывается только непустой строкой.
  */
 export function applyTurn(state, turn) {
   const answer = turn || {};
   if (!Array.isArray(state.log)) state.log = [];
   state.log.push({ role: "assistant", text: String(answer.reply == null ? "" : answer.reply) });
   if (answer.prompt) state.promptText = buildPromptText(answer.prompt);
+  if (typeof answer.slug === "string" && answer.slug) state.slug = answer.slug;
   return state;
+}
+
+/** Кириллица → латиница, буква в букву. Тег ограничен `[a-z0-9-]`
+ *  (см. `heuristicSlug`), и это единственное место, где кириллица в него превращается. */
+const SLUG_TRANSLIT = {
+  а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "e", ж: "zh", з: "z", и: "i",
+  й: "y", к: "k", л: "l", м: "m", н: "n", о: "o", п: "p", р: "r", с: "s", т: "t",
+  у: "u", ф: "f", х: "h", ц: "ts", ч: "ch", ш: "sh", щ: "sch", ъ: "", ы: "y",
+  ь: "", э: "e", ю: "yu", я: "ya",
+};
+
+/** Слова, которые `heuristicSlug` пропускает: не суть сцены, а разметка и грамматика вокруг
+ *  неё. `[Shot 1]` вырезается отдельным проходом (см. ниже) — здесь только стиль-слова, которыми
+ *  формат открывает `[Shot 1]` (docs/h3-prompt-system.md, «Cinematic, live-action, ...»), и три
+ *  английских артикля. */
+const SLUG_SKIP_WORDS = new Set(["live-action", "cinematic", "a", "an", "the"]);
+
+/**
+ * Итоговая чистка любого кандидата в тег — общая точка для `heuristicSlug` (слова уже почти
+ * чистые, собраны из латиницы/кириллицы промпта) и для `slug`, который прислала модель (A4):
+ * `PROMPT_SCHEMA` не накладывает на него никакого ограничения по алфавиту, это произвольный
+ * текст, и оба в итоге становятся `#tag`. Транслитерирует кириллицу, стягивает любой пробег
+ * символов вне `[a-z0-9-]` в одиночный дефис, срезает висящие дефисы по краям и по 24-символьному
+ * пределу (тому же, которым `heuristicSlug` режет собранные слова).
+ */
+export function normalizeSlug(text) {
+  const lower = String(text == null ? "" : text).toLowerCase();
+  const romanized = Array.from(lower)
+    .map((ch) => (ch in SLUG_TRANSLIT ? SLUG_TRANSLIT[ch] : ch))
+    .join("");
+  const cleaned = romanized.replace(/[^a-z0-9-]+/g, "-").replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return cleaned.slice(0, 24).replace(/-+$/, "");
+}
+
+/**
+ * Эвристический тег из промпта, когда модель не прислала свой `slug` (A4).
+ *
+ * Источник текста — поле `integrated_multimodal_description`, размеченное так же, как его читает
+ * подсветка (`fieldValue`): если заголовок поля есть, берётся текст до следующего заголовка;
+ * иначе (промпт ещё не разбит на поля) читается весь текст как есть. `[Shot N]` и стиль-слова, с
+ * которых `[Shot 1]` начинается по документу, значимого о сцене не говорят и пропускаются вместе
+ * с артиклями; первые три оставшихся слова склеиваются дефисом и уходят через `normalizeSlug` —
+ * ту же чистку и тот же 24-символьный предел, что и у слага модели.
+ */
+export function heuristicSlug(promptText) {
+  const text = String(promptText == null ? "" : promptText);
+  const field = fieldValue(text, "integrated_multimodal_description");
+  const body = (field ? field.text : text).replace(/\[Shot\s+\d+\]/gi, " ");
+  const words = body.match(/[\p{L}\p{N}]+(?:-[\p{L}\p{N}]+)*/gu) || [];
+  const picked = [];
+  for (const raw of words) {
+    if (SLUG_SKIP_WORDS.has(raw.toLowerCase())) continue;
+    picked.push(raw);
+    if (picked.length === 3) break;
+  }
+  return normalizeSlug(picked.join("-"));
+}
+
+/**
+ * Тег поля `#tag` после «в Редактор» (A4, fix round 1 — до этого слаг сессии подменял тег
+ * безусловно, стирая то, что человек вписал сам).
+ *
+ * «Слаг = имя по умолчанию, не диктат» — тот же принцип, по которому `submit()` трогает `#tag`
+ * только при пустом/`"run"` значении (см. `heuristicSlug`'s own call site). Заменяется только
+ * тег, который сейчас пуст, равен `"run"`, или равен `lastAutoTag` — тому автослагу, который эта
+ * же функция сама подставила в прошлый раз и который человек с тех пор не трогал руками. Любой
+ * другой текст в поле — чья-то правка, и остаётся как есть.
+ */
+export function tagFromSessionSlug(currentTag, slug, lastAutoTag) {
+  const clean = normalizeSlug(slug);
+  if (!clean) return currentTag;
+  const current = String(currentTag == null ? "" : currentTag).trim();
+  const overwritable = !current || current === "run" || current === lastAutoTag;
+  return overwritable ? clean : currentTag;
+}
+
+/**
+ * A4, fix round 2: где `lastAutoTag` (fix round 1) живёт между двумя открытиями модалки одной и
+ * той же сессии.
+ *
+ * `chat` умирает на каждом `closeChat()` — и `finishChat` закрывает модалку безусловно, на всех
+ * трёх путях. Сессию можно открыть заново (`#chat/<id>` тот же), и `enterChat` строит для неё
+ * совсем новый объект `chat` — своего `lastAutoTag` у него по построению больше нет, даже если
+ * предыдущее «в Редактор» только что что-то в `#tag` положило. Без памяти снаружи `chat` вторая
+ * подстановка на той же сессии не отличила бы «это моя прошлая работа, можно двигать дальше» от
+ * «человек вписал именно это руками» — и застряла бы на первом слаге навсегда, что и произошло
+ * (review round 2). Ключ — id сессии, а не что-то более глобальное: тег одной сессии не имеет
+ * права решать судьбу тега другой. Перезагрузка страницы обнуляет её вместе со всем остальным
+ * состоянием страницы (`chat`, `state`, содержимое `#tag` в DOM) — тем же самым, чем эта память и
+ * должна быть ограничена.
+ */
+const autoTagBySession = {};
+
+/** Запомнить `tag` как последнюю автоподстановку сессии `sid` в `map`. Принимает карту
+ *  параметром (а не читает `autoTagBySession` сама) — так тестируема без module-level состояния
+ *  и без DOM, своей собственной картой. */
+export function rememberAutoTag(map, sid, tag) {
+  if (sid) map[sid] = tag;
+  return map;
+}
+
+/** Что сессия `sid` получала автоподстановкой в прошлый раз, по данным `map` — или `""`, если
+ *  ничего (сессия только что открыта впервые, или это вообще не сессия). */
+export function recallAutoTag(map, sid) {
+  return (sid && map[sid]) || "";
 }
 
 /** Предупреждение хода — по коду, как и отказ: сервер шлёт `{code, message}` именно затем,
@@ -1096,6 +1390,80 @@ export function chatHashAction(hash, current) {
   return { act: "enter", id: match[1] };
 }
 
+/** Реплика по умолчанию для хода, в который брошена картинка без единого слова (A8, требование
+ *  2) — видна в ленте как обычная реплика `user`, а не выдумывается молча: человек должен знать,
+ *  о чём в итоге спросили модель. Текст — та же формулировка, что и абзац для модели в
+ *  `docs/h3-prompt-system.md` («опиши её и предложи промпт от неё»), только от первого лица
+ *  просьбы, а не от лица инструкции. */
+export const DEFAULT_IMAGE_TURN_TEXT = "Опиши кадр и предложи промпт от него";
+
+/**
+ * Тело хода, приложенного кадром (A8) — чистая функция, которую `sendChatMessage` зовёт перед
+ * `api()`, чтобы собрать `image`/`set_mode`/(при нужде) `text` для тела запроса.
+ *
+ * `state` — `{text, pendingImage, mode}`: `text` уже обрезан (`.trim()`), `pendingImage` —
+ * `{path, name}` только что загруженного через `/api/uploads` кадра или `null` (ничего не
+ * приложено), `mode` — текущий режим сессии (`chat.mode`), из того же списка, что и
+ * `web.CHAT_MODES` на сервере.
+ *
+ * Без кадра — пустой объект: обычный ход ничего не примешивает к телу, которое строит сам
+ * `sendChatMessage`. С кадром: `image` — путь, который вернул аплоад, и он уходит всегда; `text`
+ * подставляется, только когда поле ввода было пустым (см. `DEFAULT_IMAGE_TURN_TEXT`) — печатный
+ * текст едет как есть, без правки. `set_mode: "i2v"` появляется, только если режим сессии ещё
+ * не решил, каким кадром пользоваться (пустой или `t2va`); `i2v`/`flf` не трогаются — кадр там
+ * уже учтён, и незачем переписывать то, что сервер и так знает.
+ */
+export function attachmentBody(state) {
+  const pending = (state && state.pendingImage) || null;
+  if (!pending || !pending.path) return {};
+  const body = { image: pending.path };
+  const mode = (state && state.mode) || "";
+  if (!mode || mode === "t2va") body.set_mode = "i2v";
+  const text = String((state && state.text) || "").trim();
+  if (!text) body.text = DEFAULT_IMAGE_TURN_TEXT;
+  return body;
+}
+
+/**
+ * Плейсхолдер-запись хода, пока ответ модели не пришёл.
+ *
+ * Сервер синхронный (см. докстринг `_chat_message`) и до самого ответа не присылает ничего —
+ * стадии на клиенте больше взять неоткуда, кроме последнего известного `llmStatus`. `"down"` —
+ * единственный статус, за которым стоит настоящее ожидание (холодный старт может занять минуту),
+ * остальное (`"up"`, `"busy"`, пусто) получает менее тревожный текст. `kind: "pending"` — метка,
+ * по которой `landTurn`/`landFailure` находят и убирают эту запись, когда ответ (или отказ)
+ * приземлился; `role: "note"` — чтобы `renderChatLog` собрал ей тот же CSS-класс, что и другим
+ * служебным строкам ленты (`warn`/`bad`).
+ */
+export function pendingEntry(llmStatus) {
+  return { role: "note", kind: "pending",
+           text: llmStatus === "down" ? "поднимаю модель…" : "модель думает…" };
+}
+
+/**
+ * Что должно оказаться в поле ввода после отказа хода — `typed` (несостоявшаяся реплика) или то,
+ * что там уже есть.
+ *
+ * Кнопка «отправить» не блокируется на время хода (см. докстринг `sendChatMessage`), а холодная
+ * модель может думать до минуты — этого достаточно, чтобы человек успел начать новый черновик,
+ * пока старая реплика ещё летит и может отказать. Затирать этот черновик старым текстом молча
+ * нельзя: старый текст и так виден в ленте строкой `user`, под которой легла запись об отказе, а
+ * поле ввода принадлежит тому, что печатается *сейчас*. Поэтому `typed` возвращается только в
+ * пустое поле — если там уже что-то есть, оно остаётся как есть.
+ */
+export function restoredInput(currentValue, typed) {
+  return currentValue ? currentValue : typed;
+}
+
+/** Убирает плейсхолдер хода (см. `pendingEntry`) из лога состояния, если он там есть. По
+ *  ссылке и безусловно — до сторожа "чужая сессия", а не после: ответ, приземлившийся не туда,
+ *  всё равно обязан не оставить вечные точки на объекте состояния, который их получил. */
+function dropPending(state) {
+  if (state && Array.isArray(state.log)) {
+    state.log = state.log.filter((entry) => entry.kind !== "pending");
+  }
+}
+
 /**
  * Ответ хода — в ту сессию, которая его и просила, или никуда.
  *
@@ -1114,6 +1482,7 @@ export function chatHashAction(hash, current) {
  * (см. `hasUnsavedEdits`).
  */
 export function landTurn(current, expected, answer) {
+  dropPending(expected);
   if (!current || current !== expected) return false;
   applyTurn(current, answer);
   const warning = answer && answer.warning;
@@ -1131,6 +1500,7 @@ export function landTurn(current, expected, answer) {
  * отвечает на тот же вопрос второй раз и неверно.
  */
 export function landFailure(current, expected, payload, runningSeconds = 0) {
+  dropPending(expected);
   if (!current || current !== expected) return false;
   if (!Array.isArray(current.log)) current.log = [];
   const last = current.log[current.log.length - 1];
@@ -1264,6 +1634,51 @@ export function argsWithPrompt(args, text) {
 }
 
 /* ===========================================================================
+   ТЕМА (task C1)
+   Три состояния, в этом порядке по кругу: системная (нет атрибута — решает
+   браузер через `prefers-color-scheme`), тёмная, светлая. "system" хранится
+   как отсутствие `data-theme`, а не как строка "system" на `<html>` -- это
+   то же самое состояние, в котором страница жила до появления переключателя,
+   так что уже сохранённый (или вовсе отсутствующий) выбор не ломается.
+   =========================================================================== */
+const THEME_ORDER = ["system", "dark", "light"];
+export const THEME_STORAGE_KEY = "h3-theme";
+
+/** Следующее состояние по кругу. Значение, которого нет в списке (будущая
+ *  версия переключателя, или подправленный вручную localStorage), не
+ *  заклинивает цикл -- оно просто считается началом цикла, "system". */
+export function nextTheme(current) {
+  const i = THEME_ORDER.indexOf(current);
+  return THEME_ORDER[(i + 1) % THEME_ORDER.length];
+}
+
+/** Русская подпись состояния для кнопки в шапке. Тот же откат к "системная",
+ *  что и в `nextTheme` -- незнакомое значение не должно молчать пустой строкой. */
+export function themeLabel(value) {
+  if (value === "dark") return "Тёмная";
+  if (value === "light") return "Светлая";
+  return "Системная";
+}
+
+/** Ставит `data-theme` на `<html>` и запоминает выбор. DOM-эффект, поэтому не
+ *  чистая функция -- но, как и остальная страница ниже, безопасна для импорта
+ *  вне браузера: она не вызывается сама по себе, только по клику или на
+ *  старте `startPage()`. */
+export function applyTheme(value) {
+  const html = document.documentElement;
+  if (value === "dark" || value === "light") {
+    html.setAttribute("data-theme", value);
+  } else {
+    html.removeAttribute("data-theme");
+  }
+  try {
+    localStorage.setItem(THEME_STORAGE_KEY, value);
+  } catch {
+    /* приватный режим или заполненная квота -- тема всё равно применилась к этому показу */
+  }
+}
+
+/* ===========================================================================
    СТРАНИЦА
    Ниже — единственная половина файла, которая знает про DOM и про сеть.
    Вне браузера модуль импортируется ради функций выше и не делает ничего.
@@ -1275,6 +1690,28 @@ if (typeof document !== "undefined") {
 
 function startPage() {
   const $ = (id) => document.getElementById(id);
+
+  // -- тема -----------------------------------------------------------------------------
+  // Значение уже применено синхронно инлайновым скриптом в <head> (до отрисовки CSS, чтобы
+  // не мигнуть системной темой при сохранённом ручном выборе) -- здесь только подпись кнопки
+  // и подписка на клик. `applyTheme` безопасно вызвать второй раз: он идемпотентен.
+  (function initTheme() {
+    let saved = "system";
+    try { saved = localStorage.getItem(THEME_STORAGE_KEY) || "system"; } catch { /* см. applyTheme */ }
+    applyTheme(saved);
+    const button = $("theme-toggle");
+    const label = $("theme-toggle-label");
+    // "system" на <html> нет атрибутом (см. applyTheme) -- getAttribute тогда вернёт null,
+    // а nextTheme(null) не найдёт его в THEME_ORDER и не сдвинется с места.
+    const current = () => document.documentElement.getAttribute("data-theme") || "system";
+    const render = () => { label.textContent = themeLabel(current()); };
+    render();
+    button.addEventListener("click", () => {
+      applyTheme(nextTheme(current()));
+      render();
+    });
+  })();
+
   // `mode` подписан отдельно: у него сверх пересчёта есть своя работа — показать
   // или спрятать поля кадров.
   const FIELDS = ["width", "height", "duration", "steps", "seed", "tag",
@@ -1297,6 +1734,13 @@ function startPage() {
   // изменения молча гасил бы предупреждение, которое в этот раз никто не отклонял.
   let bannerState = { dismissedKey: null };
   let unloadBannerInput = { pending: 0, llm: "" };  // вход последней отрисовки — им отвечает клик
+  /* Заметка правящейся задачи (C2, требование 4). Поля ввода у неё больше нет: за всё время
+     существования формы её никто не заполнял, а место она занимала в самом видном углу. Сама
+     заметка при этом жива — сервер её хранит, копия наследует, и `pendingRowHtml` её рисует, —
+     поэтому правка задачи обязана вернуть на `PUT /api/jobs/<id>` ту же строку, с которой
+     пришла, а не пустую: иначе «Править» тихо стирала бы чужой текст. Новая задача уходит с
+     пустой заметкой, как и раньше уходила с пустым полем. */
+  let formNote = "";
 
   const readForm = () => ({
     width: Math.round(Number($("width").value) || 0),
@@ -1311,7 +1755,7 @@ function startPage() {
     loraStrength: Number(String($("lora-str").value).replace(",", ".")) || 1,
     adaln: $("adaln").value.trim(),
     outdir: $("outdir").value.trim(),
-    note: $("note").value.trim(),
+    note: formNote,
     prompt: $("prompt").value,
     image: $("image").value.trim(),
     endImage: $("end-image").value.trim(),
@@ -1394,36 +1838,66 @@ function startPage() {
     const queue = state.queue || {};
     const workerState = (state.worker || {}).state || "unknown";
 
-    // -- приборная строка
+    const paused = Boolean(state.paused);
+    const running = (queue.running || [])[0] || null;
+    const pending = queue.pending || [];
+
+    // -- чрома: три показания рядом, каждое в два слова (макет: `.readout`)
     $("rail").dataset.worker = workerState;
     $("worker-state").textContent = {
-      alive: "Работник запущен",
-      stopped: "Работник не запущен",
-      unknown: "Состояние работника неизвестно",
-    }[workerState] || "Состояние работника неизвестно";
-    $("worker-pid").textContent = {
+      alive: "запущен", stopped: "не запущен", unknown: "неизвестно",
+    }[workerState] || "неизвестно";
+    // Объяснение — в подсказке самого показания, а не отдельной строкой рядом: на узком окне
+    // от показания остаётся одна лампа, и второму слову там места нет. До правки по ревью C2
+    // этот текст пересчитывался на каждый опрос в элемент с `display: none`, то есть никуда.
+    $("worker").title = {
       alive: "задачи берутся из очереди",
       stopped: "очередь стоит, задачи не берутся",
       unknown: "замок не удалось проверить",
     }[workerState] || "";
+    // Четыре исхода, а не три (`queueStateWord`): пустая очередь при живом работнике —
+    // «свободна», и говорить о ней «идёт» рядом с «Ничего не считается» значит спорить с
+    // самим собой в одной чроме.
+    $("queue-state").textContent = queueStateWord(
+      { paused, workerState, running: Boolean(running), pending: pending.length });
+    $("queue-state").className = "v" + (paused || workerState !== "alive" ? " warn" : "");
+    $("llm-state").textContent = {
+      up: "поднята", busy: "занята прогоном", down: "выгружена",
+    }[llmStatus] || "неизвестно";
+    $("llm-state").className = "v" + (llmStatus === "up" ? " hot" : "");
 
     // -- идёт сейчас
-    const running = (queue.running || [])[0] || null;
     const progress = renderRunning(running, workerState, now);
     // Тот же остаток, что печатается в приборной строке, нужен модалке: `gpu_busy` без него —
     // отказ без совета, ждать минуту или три часа по нему не понять.
     runningLeft = progress.left;
 
     // -- ждут
-    const pending = queue.pending || [];
     renderUnloadBanner(pending.length);
     $("pending").innerHTML = pending
-      .map((job) => pendingRowHtml(job, { editingId: editing })).join("");
+      .map((job, i) => pendingRowHtml(job, { editingId: editing, index: i + 1 })).join("");
     $("pending-empty").hidden = pending.length > 0;
+    $("pending-count").textContent = pending.length || "";
     const summary = pendingSummary(pending, {
       now, runningSeconds: progress.left, workerState,
     });
-    $("pending-sum").textContent = summary.text;
+
+    /* -- пауза/старт очереди (A5, место из C2): кнопка вынесена из `<h2>` в собственную полосу
+       состояния над списком. `state.paused` решает подпись и то, какой маршрут бьёт нажатие
+       (см. `toggleQueuePause`) — оба из одного значения. Атрибута нажатости тут больше нет
+       (правка по ревью C2): у кнопки с меняющейся подписью он спорит с ней вслух — «Начать
+       расчёт, нажата». Состояние называет сама подпись, и она же читается скринридером.
+       Крупная строка рядом отвечает на единственный вопрос, ради которого на эту зону смотрят
+       издалека: считается сейчас или нет. */
+    $("queue-pause-toggle").textContent = paused ? "▶ Начать расчёт" : "⏸ Приостановить";
+    $("queue-title").textContent = paused ? "Очередь приостановлена"
+      : workerState !== "alive" ? "Работник не запущен"
+      : running ? "Идёт расчёт"
+      : pending.length ? "Очередь ждёт своей минуты" : "Очередь пуста";
+    $("queue-sub").textContent = paused
+      ? "работник не берёт задачи, пока не нажать «Начать расчёт»"
+      : workerState !== "alive" ? "запустите h3 worker — без него очередь стоит"
+      : summary.text || (running ? "в очереди больше ничего не ждёт" : "ставить нечего");
 
     const broken = brokenHtml(queue.broken);
     $("pending-bad").hidden = broken === "";
@@ -1431,7 +1905,8 @@ function startPage() {
 
     // -- закончилось за сутки
     const finished = finishedWithin([...(queue.done || []), ...(queue.failed || [])], now);
-    $("finished").innerHTML = finished.map(finishedRowHtml).join("");
+    $("finished").innerHTML = finished
+      .map((job) => finishedRowHtml(job, state.outdir, state.runs)).join("");
     $("finished-empty").hidden = finished.length > 0;
     const failed = finished.filter((job) => job.exit_code !== 0).length;
     $("done-sum").textContent = finished.length
@@ -1440,9 +1915,10 @@ function startPage() {
   }
 
   /** Плашка выгрузки над списком ждущих: см. `nextBannerState`. `pendingCount` приходит от
-   *  вызывающего — он уже разобрал `queue.pending`, второй раз разбирать незачем. */
+   *  вызывающего — он уже разобрал `queue.pending`, второй раз разбирать незачем. `paused`
+   *  берётся из последнего `/api/state` (A5): на паузе плашка не показывается — см. `unloadBanner`. */
   function renderUnloadBanner(pendingCount) {
-    unloadBannerInput = { pending: pendingCount, llm: llmStatus };
+    unloadBannerInput = { pending: pendingCount, llm: llmStatus, paused: Boolean(state && state.paused) };
     bannerState = nextBannerState(bannerState, unloadBannerInput);
     $("unload-banner").hidden = !bannerState.show;
     $("unload-banner-text").textContent = bannerState.show
@@ -1488,7 +1964,7 @@ function startPage() {
     const till = new Date(now.getTime() + remaining * 1000);
     const share = forwards ? Math.min(1, completed / forwards) : 0;
     const peak = jobPeak(job);
-    const shot = previewUrl(job, completed);
+    const shot = previewUrl(job, completed, state.outdir);
 
     const e = job.estimate || {};
     const cell = (k, v, cls = "") =>
@@ -1523,7 +1999,15 @@ function startPage() {
       cell("Кончится", formatClock(till)),
       cell("Пик памяти", formatGb(peak), peak > WARN_GB ? " over" : ""),
       `</div>`,
-      `<div class="bar"><i style="width:${share * 100}%"></i></div>`,
+      /* Сегменты проходов прямо в карточке задачи (C2, макет: `.now .steps`): в приборной
+         строке те же деления стоят на всю ширину экрана и отвечают «сколько осталось вообще»,
+         а здесь — «сколько осталось вот этой задаче», и смотрят на них с разного расстояния.
+         Та же `stepsHtml`, что и наверху: одно правило рисования, два места показа. */
+      `<div class="steps run-steps">${stepsHtml(completed, forwards)}</div>`,
+      `<div class="steps-legend">`,
+      `<span>проход ${completed} / ${forwards}</span>`,
+      `<span>${Math.round(share * 100)} %</span>`,
+      `</div>`,
       `<div class="run-foot">`,
       `старт <span class="num">`
         + `${job.started_at ? formatClock(new Date(job.started_at)) : "—"}</span> · `,
@@ -1546,10 +2030,10 @@ function startPage() {
 
   /* Разбор, подсветка и полоска планов — одни и те же для формы и для модалки: `ids` называет
      тройку элементов, в которые рисовать (`hl`/`scale`/`parse` у формы, `chat-*` у модалки).
-     Длительность берётся из формы в обоих случаях — сессия чата её не хранит, а разбору нужна
-     одна цифра, чтобы сказать, укладываются ли склейки в ролик. */
-  function paintPrompt(ids, text, { audio }) {
-    const declared = Number(String($("duration").value).replace(",", ".")) || 0;
+     Длительность приходит от вызывающего (A3): у формы это `#duration`, у модалки — состояние
+     чата через `chatDuration` (`renderChatPrompt`), а не общее поле формы — сессия и форма могут
+     говорить о ролике разной длины. */
+  function paintPrompt(ids, text, { audio, declared }) {
     const analysis = analysePrompt(text, declared, { audio });
     $(ids.hl).innerHTML = highlightHtml(text, analysis);
     const scale = scaleHtml(analysis);
@@ -1560,7 +2044,8 @@ function startPage() {
 
   function renderPrompt() {
     paintPrompt({ hl: "hl", scale: "scale", parse: "parse" }, $("prompt").value,
-                { audio: $("mode").value === "t2va" });
+                { audio: $("mode").value === "t2va",
+                  declared: Number(String($("duration").value).replace(",", ".")) || 0 });
 
     const box = $("prompt-src");
     const file = promptFileArg();
@@ -1625,6 +2110,8 @@ function startPage() {
     const packed = canvasIsPacked(form.width, form.height);
     $("canvas-hint").textContent = packed ? "Кратно 32" : "Должно быть кратно 32";
     $("canvas-hint").className = "hint" + (packed ? "" : " bad");
+    // Свёрнутые «Настройки модели» обязаны сказать, что под ними лежит (C2, требование 3).
+    $("model-summary").textContent = modelSummary(form);
     const verdict = lastEstimate ? memoryVerdict(lastEstimate.peak_gb)
                                  : { needsConfirm: false };
     $("submit").disabled = !submitAllowed({
@@ -1746,13 +2233,19 @@ function startPage() {
    * собирается из выбранного провайдера и последнего известного состояния (`llmPlateText`).
    */
   function renderLlmPlate(override) {
-    if (override) { $("chat-llm").textContent = override; return; }
+    if (override) { $("chat-llm").textContent = override; $("chat-llm-dot").className = "dot"; return; }
     const row = ((chat && chat.providers) || [])
       .find((item) => item.name === $("chat-provider").value);
-    $("chat-llm").textContent = llmPlateText((chat && chat.llmStatus) || "", {
+    const status = (chat && chat.llmStatus) || "";
+    $("chat-llm").textContent = llmPlateText(status, {
       external: Boolean(row) && row.type !== "llama-local",
       runningSeconds: runningLeft,
     });
+    /* Точка рядом со словом — форма макета. Янтарь достаётся только `busy`, то есть ровно
+       тому состоянию, в котором GPU действительно занят прогоном; «поднята» — зелёная, всё
+       остальное серое. Цвет здесь подтверждает слово, а не заменяет его. */
+    $("chat-llm-dot").className = "dot"
+      + (status === "busy" ? " hot" : status === "up" ? " ok" : "");
   }
 
   function renderChatPrompt() {
@@ -1763,22 +2256,45 @@ function startPage() {
       $("chat-prompt-text").value = chat.promptText;
     }
     paintPrompt({ hl: "chat-hl", scale: "chat-scale", parse: "chat-parse" }, chat.promptText,
-                { audio: (chat.mode || $("mode").value) === "t2va" });
+                { audio: (chat.mode || $("mode").value) === "t2va",
+                  declared: chatDuration(chat) });
+    // Приписка у заголовка окна — место макета под «черновик · не сохранён». Здесь она отвечает
+    // на единственный вопрос, который у этого окна есть: переживёт ли набранное закрытие. Не
+    // переживёт (`hasUnsavedEdits`) — об этом сказано до Esc, а не в диалоге после него.
+    $("chat-prompt-note").textContent = hasUnsavedEdits(chat) ? "правки не сохранены" : "";
   }
 
   function renderChatLog() {
     if (!chat) return;
     const box = $("chat-log");
     box.innerHTML = chat.log.length
-      ? chat.log.map((entry) =>
+      ? chat.log.map((entry) => {
           // `role` и `kind` — свои, не с сервера, но в этом файле экранируется всё, что
           // попадает в разметку, и исключение «тут значение точно наше» — ровно то место, где
           // однажды окажется чужое (`role` приходит из `session.messages` с диска).
-          `<li class="turn ${escapeHtml(entry.role)}`
-          + `${entry.kind ? " " + escapeHtml(entry.kind) : ""}">`
-          + `${escapeHtml(entry.text)}</li>`).join("")
-      : `<li class="turn note">Опишите идею словами — модель соберёт промпт по формату. `
-        + `Уже готовый текст можно вставить в окно слева и попросить привести к стандарту.</li>`;
+          // Три точки у `pending`-записи — разметка, не текст: `pendingEntry` остаётся чистой
+          // функцией, а анимация (CSS, `@keyframes pending-dot`) идёт своим ходом и гасится
+          // тем же `prefers-reduced-motion`, что и остальная страница.
+          const dots = entry.kind === "pending"
+            ? '<span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>' : "";
+          // A8, требование 2: ход, к которому приложен кадр, несёт пометку с именем файла —
+          // `sendChatMessage` кладёт его в `entry.attachment` в момент отправки, только для
+          // хода, который его реально приложил (история с диска этого поля не знает вовсе).
+          const attach = entry.attachment
+            ? `<span class="turn-attach">📎 ${escapeHtml(entry.attachment)}</span>` : "";
+          return `<li class="turn ${escapeHtml(entry.role)}`
+            + `${entry.kind ? " " + escapeHtml(entry.kind) : ""}">`
+            + `${attach}${escapeHtml(entry.text)}${dots}</li>`;
+        }).join("")
+      /* Пустая лента — не белое пятно, а короткая инструкция (C3, макет: пустое состояние).
+         Разговор начинается с чистого листа каждый раз, и лист обязан сказать, чего от него
+         ждут: три вещи, которые здесь можно сделать, в том порядке, в каком их делают. */
+      : `<li class="feed-empty">`
+        + `<span class="fe-t">Расскажите, что снимаем</span>`
+        + `<span>Опишите идею словами — модель соберёт промпт по формату MiniMax H3.</span>`
+        + `<span>Уже готовый текст вставьте в окно промпта и попросите привести к стандарту.</span>`
+        + `<span>Картинку можно перетащить прямо в поле ввода — станет опорным кадром.</span>`
+        + `</li>`;
     box.scrollTop = box.scrollHeight;   // свежая реплика видна без прокрутки
   }
 
@@ -1814,8 +2330,10 @@ function startPage() {
   }
 
   /** Новая сессия от источника и переход в неё. `opened` — что видно только странице:
-   *  текст промпта, режим, путь кадра (сервер сам их не знает) и `notice` — строка, которую
-   *  надо показать в ленте сразу (например, что промпт задачи прочитать не удалось). */
+   *  текст промпта, режим, путь кадра, длительность (сервер сам их не знает) и `notice` —
+   *  строка, которую надо показать в ленте сразу (например, что промпт задачи прочитать не
+   *  удалось). `opened.duration` — A3: `#duration` формы у нового диалога, `--duration` задачи
+   *  у диалога от неё (`openChatFromJob`); без источника — дефолт того же поля сервера. */
   async function openChatModal(source, opened = {}) {
     try {
       const answer = await api("POST", "/api/chat", {
@@ -1824,6 +2342,7 @@ function startPage() {
         mode: opened.mode || "",
         image: opened.image || "",
         end_image: opened.endImage || "",
+        duration: chatDuration(opened),
       });
       clearError();
       window.location.hash = `#chat/${answer.id}`;
@@ -1853,6 +2372,18 @@ function startPage() {
       id,
       source: session.source || { kind: "new" },
       mode: session.mode || "",
+      // A8: кадр сессии — тот, с которым её открыли, или тот, что подложил более ранний ход
+      // этой же модалки (`sendChatMessage`'s own `image`, приземлённый после ответа). Читается
+      // отсюда «в Редактор» (`finishChat`), той же дорогой, какой `slug` доезжает до `#tag`.
+      image: session.image || "",
+      // A8: кадр, который только что загрузился через `/api/uploads` (скрепка/dnd в поле
+      // ввода), но ещё не ушёл ходом — `null`, пока ничего не приложено; `sendChatMessage`
+      // сбрасывает его в начале хода, а `attachmentBody` читает как `state.pendingImage`.
+      pendingImage: null,
+      // A3: длительность сессии — редактируется прямо в шапке модалки (`chat-duration`) и
+      // уходит каждым ходом (`sendChatMessage`); `chatDuration` отвечает за дефолт, если сессия
+      // почему-то ничего не сказала.
+      duration: chatDuration(session),
       /* Окно восстанавливается из последнего ответа модели, а не из `prompt` сессии: `prompt`
          — это текст, с которым сессию открыли, и ходы его не переписывают (так устроен
          сервер). Правки руками между ходами в сессии не живут вовсе — они уходят следующим
@@ -1867,12 +2398,26 @@ function startPage() {
       sending: false,
       providers: [],       // роспись из /api/providers — по ней собирается плашка модели
       llmStatus: "",
+      // A4: последний известный слаг сессии — сервер хранит его тем же правилом, каким хранит
+      // `prompt_struct` (только непустая строка переписывает), `applyTurn` держит его свежим на
+      // каждом ходе, а «в Редактор» (`finishChat`) подставляет его в `#tag`.
+      slug: session.slug || "",
+      // A4, fix round 2: восстановлен из module-level `autoTagBySession`, не всегда с пустой
+      // строки — `chat` умер вместе с прошлым закрытием модалки этой же сессии, но подстановку,
+      // которую та модалка сделала в `#tag`, память переживает и здесь узнаётся обратно как
+      // «своя», а не как чужая ручная правка (fix round 1 гарантию строил только внутри одной
+      // открытой модалки; round 2 — на переоткрытие той же сессии).
+      lastAutoTag: recallAutoTag(autoTagBySession, id),
     };
     $("chat-modal").hidden = false;
     $("chat-finish").textContent = FINISH_LABEL[chat.source.kind] || FINISH_LABEL.new;
     $("chat-source").textContent = chatSourceText(chat.source);
+    $("chat-duration").value = chat.duration;
     renderChatPrompt();
     renderChatLog();
+    renderChatAttachment();   // A8: сбрасывает бейдж прошлой сессии -- новый `chat` начинается
+                               // с пустого `pendingImage`, а DOM без этого мог остаться на её
+                               // последнем состоянии (открытая/ошибочная загрузка).
     await loadProviders();
     $("chat-input").focus();
   }
@@ -1891,6 +2436,23 @@ function startPage() {
     if (hasUnsavedEdits(chat)
         && !window.confirm("Правки промпта не сохранены и пропадут. Закрыть?")) return;
     closeChat();
+  }
+
+  /* «очистить» в шапке — не «закрыть»: стирает сессию на диске, а не просто прячет окно.
+     Подтверждение обязательно, потому что отменить это уже нельзя (в отличие от простого
+     закрытия, после которого сессия остаётся и открывается снова тем же `#chat/<id>`).
+     После удаления модалка не закрывается, а сразу открывает пустую новую сессию — тем же
+     `openChatModal`, каким открывается кнопка «Новый диалог». */
+  async function requestDeleteChat() {
+    if (!chat) return;
+    if (!window.confirm("Удалить этот диалог целиком?")) return;
+    try {
+      await api("DELETE", "/api/chat/" + encodeURIComponent(chat.id));
+    } catch (error) {
+      if (error.payload) showError(error.payload);
+      return;
+    }
+    openChatModal({ kind: "new" });
   }
 
   async function syncChatFromHash() {
@@ -1912,24 +2474,54 @@ function startPage() {
    *
    * Кнопка отпускается до этой проверки и без всяких условий: она принадлежит модалке, а не
    * сессии, и оставить её мёртвой — значит потребовать перезагрузки страницы.
+   *
+   * Поле ввода чистится сразу, а не по ответу: сервер синхронный и до самого ответа ничего не
+   * шлёт, так что "реплика ушла" и "поле свободно для следующей" должны стать правдой в один и
+   * тот же клик — иначе от «отправить» ждали бы того же ответа, что и от самого хода. Исходный
+   * текст (`typed`, не обрезанный) при этом сохраняется, но возвращается в поле не безусловно —
+   * кнопка «отправить» весь ход остаётся живой, и человек мог успеть начать новый черновик, пока
+   * старая реплика летела; затирать его старым текстом молча нельзя (см. `restoredInput`). Ход
+   * при этом должен ещё и правда лечь в эту сессию, а не в чужую, на которую модалка успела
+   * перескочить.
+   *
+   * A8: кадр, приложенный скрепкой/dnd (`chat.pendingImage`, уже загруженный на сервер
+   * `/api/uploads` к этому моменту — см. `uploadChatImage`), уходит этим же ходом через
+   * `attachmentBody`: `image`/`set_mode`, и, если поле ввода было пустым, дефолтный текст
+   * реплики вместо неё. Кадр снимается с состояния модалки до отправки, той же логикой, что и
+   * поле ввода строкой выше, — а не по ответу, чтобы новый кадр можно было прикладывать, пока
+   * этот ход ещё летит.
    */
   async function sendChatMessage() {
     if (!chat || chat.sending) return;
-    const text = $("chat-input").value.trim();
-    if (!text) return;
+    const typed = $("chat-input").value;
+    const text = typed.trim();
+    const attachment = chat.pendingImage;
+    if (!text && !attachment) return;
+    const extra = attachmentBody({ text, pendingImage: attachment, mode: chat.mode });
+    const outgoingText = extra.text !== undefined ? extra.text : text;
     const session = chat;
     session.sending = true;
     $("chat-send").disabled = true;
     renderLlmPlate("жду ответа — на холодной модели это до минуты");
-    session.log.push({ role: "user", text });
+    session.log.push({ role: "user", text: outgoingText,
+                       attachment: attachment ? attachment.name : "" });
+    // Плейсхолдер хода — точки, что ход идёт, пока сервер ничего не прислал (см. `pendingEntry`).
+    session.log.push(pendingEntry(session.llmStatus));
+    $("chat-input").value = "";
+    clearChatAttachment();
     renderChatLog();
 
     let answer = null;
     let failure = null;
     try {
       answer = await api("POST", `/api/chat/${encodeURIComponent(session.id)}/message`,
-                         { text, prompt: session.promptText,
-                           provider: $("chat-provider").value });
+                         { text: outgoingText, prompt: session.promptText,
+                           provider: $("chat-provider").value,
+                           // A3: длительность из состояния модалки, не из формы — она может
+                           // расходиться с сессией с самого открытия, а с этого хода и сама
+                           // могла подвинуться в `chat-duration`.
+                           duration: chatDuration(session),
+                           image: extra.image, set_mode: extra.set_mode });
     } catch (error) {
       failure = error;
     }
@@ -1938,13 +2530,22 @@ function startPage() {
 
     if (answer) {
       if (!landTurn(chat, session, answer)) return;
-      // Поле очищается только когда ответ и правда лёг в эту сессию: иначе человек лишится
-      // текста, которого он в этой ленте даже не видел.
-      $("chat-input").value = "";
+      // Сервер уже применил `image`/`set_mode` к сессии (`_locked_turn`) -- состояние модалки
+      // догоняет тем же значением, которое сама и отправила, а не ждёт следующего перечитывания
+      // сессии, которого может не случиться до самого «в Редактор».
+      if (extra.image) chat.image = extra.image;
+      if (extra.set_mode) chat.mode = extra.set_mode;
       chat.llmStatus = (answer.llm || {}).status || chat.llmStatus;
       clearError();
     } else if (!landFailure(chat, session, failure && failure.payload, runningLeft)) {
       return;
+    } else {
+      // Ход не удался: `landFailure` уже вернул реплику в ленту, и поле получает обратно тот же
+      // текст, который в нём был до отправки — но только если человек не начал печатать что-то
+      // новое, пока ход летел (см. `restoredInput`). Кадр — тем же правилом: отказ не должен
+      // заставлять грузить файл заново.
+      $("chat-input").value = restoredInput($("chat-input").value, typed);
+      if (attachment && !chat.pendingImage) restoreChatAttachment(attachment);
     }
     renderLlmPlate();
     renderChatPrompt();
@@ -1982,6 +2583,10 @@ function startPage() {
       // `flf`-задача несёт второй кадр отдельным флагом — без него чат от такой задачи не видит
       // последний кадр вовсе, и модель не может написать инструкцию `mode: flf` (T4b).
       endImage: argValue(job.args, "--end-image") || "",
+      // A3: длительность задачи-источника, тем же путём, каким приходят режим и кадр выше —
+      // не форма, а сама задача решает, о скольких секундах будет разговор в модалке. Дефолт —
+      // тот же, что у `chatDuration`, когда `--duration` в её `args` не нашлось.
+      duration: Number(argValue(job.args, "--duration")) || 10,
       // Пустое окно у задачи, у которой промпт точно есть, — это не «промпт пуст», а «страница
       // его не достала». Молчать здесь значит предложить сохранить пустоту поверх работы.
       notice: prompt.trim() === ""
@@ -2051,10 +2656,38 @@ function startPage() {
     } else {
       /* «в Редактор»: дальше обычная постановка. Промпт перестаёт быть файловым — текст
          разошёлся с файлом ровно в тот момент, когда его переписала модель, и уйти он должен
-         строкой, а не как --prompt-file на старое содержимое. */
+         строкой, а не как --prompt-file на старое содержимое. Тег — слаг сессии (A4), если
+         модель его назвала и поле не занято ручной правкой (`tagFromSessionSlug`, fix round 1);
+         запомненное в `autoTagBySession` (fix round 2, module-level — не на `chat`, который эта
+         же функция вот-вот убьёт своим `closeChat()`) переживает закрытие модалки, так что
+         переоткрытая позже та же сессия узнаёт свою прошлую подстановку и двигает тег дальше,
+         а не решает, что поле уже кто-то тронул руками. */
       $("prompt").value = text;
       promptFromFile = null;
       $("prompt-file").value = "";
+      // A8: режим и кадр сессии — только когда сессия их действительно назвала. Пустой `chat.mode`
+      // ничего не значит (форма уже показывает свой собственный выбор, и `<select>` не умеет
+      // пустое значение), а непустой — это либо режим, с которым открыли сессию, либо `i2v`,
+      // которым её обновил дропнутый в диалог кадр (`_locked_turn`'s own `set_mode`); в обоих
+      // случаях форма обязана увидеть его так же безусловно, как несколькими строками выше
+      // видит текст промпта.
+      if (chat.mode) {
+        $("mode").value = chat.mode;
+        syncModeRows();
+      }
+      if (chat.image) {
+        $("image").value = chat.image;
+        updateUploadZone("image");
+      }
+      // Запоминается только тогда, когда `tagFromSessionSlug` действительно что-то подставила:
+      // безусловная память приняла бы и оставленный как есть ручной тег за «свой» автослаг, и
+      // тот же баг вернулся бы на следующем ходе этой сессии — только на шаг позже.
+      const nextTag = tagFromSessionSlug($("tag").value, chat.slug, chat.lastAutoTag);
+      if (nextTag !== $("tag").value) {
+        rememberAutoTag(autoTagBySession, chat.id, nextTag);
+        chat.lastAutoTag = nextTag;
+      }
+      $("tag").value = nextTag;
       renderPrompt();
       scheduleEstimate();
     }
@@ -2079,8 +2712,13 @@ function startPage() {
     $("outdir").value = argValue(job.args, "--outdir") || "";
     $("image").value = argValue(job.args, "--image") || "";
     $("end-image").value = argValue(job.args, "--end-image") || "";
-    $("note").value = job.note || "";
+    // C2, требование 4: поля ввода у заметки больше нет, но правка обязана вернуть на сервер ту
+    // же строку, с которой пришла (см. `formNote`) — иначе «Править» тихо стирала бы чужой текст.
+    formNote = job.note || "";
     syncModeRows();
+    syncCanvasPreset();
+    updateUploadZone("image");
+    updateUploadZone("end-image");
   }
 
   function setEditing(id) {
@@ -2088,6 +2726,8 @@ function startPage() {
     $("form-mode-note").textContent = id ? `Правка ждущей задачи ${id}` : "Новая задача";
     $("submit").textContent = id ? "Сохранить правку" : "Поставить в очередь";
     $("cancel-edit").hidden = !id;
+    // Выход из правки — конец чужой заметки: следующая постановка своей не имеет (см. `formNote`).
+    if (!id) formNote = "";
     if (id && state) {
       const job = (state.queue.pending || []).find((x) => x.id === id);
       if (job) {
@@ -2125,6 +2765,14 @@ function startPage() {
 
   async function submit() {
     const form = readForm();
+    // A4: `readForm` уже свело пустое `#tag` к «run» (`tag: $("tag").value.trim() || "run"`), так
+    // что «пуст или run» из требования — это ровно `form.tag === "run"` здесь. Эвристика молчит
+    // (пустая строка), когда в тексте не нашлось ни одного значимого слова — тогда тег остаётся
+    // тем же «run», который уже лежит в форме.
+    if (form.tag === "run") {
+      const slug = heuristicSlug(form.prompt);
+      if (slug) form.tag = slug;
+    }
     const body = { args: buildArgs(form), note: form.note };
     await withQueue(async () => {
       if (editing) {
@@ -2148,6 +2796,234 @@ function startPage() {
     const mode = $("mode").value;
     $("row-image").hidden = !(mode === "i2v" || mode === "flf");
     $("row-end-image").hidden = mode !== "flf";
+  }
+
+  /* -- разрешение выпадашкой (C2) ------------------------------------------------------------
+     Источник правды остался прежним: `#width`/`#height`, из которых читает `readForm` и которые
+     видит `buildArgs`. Выпадашка над ними — только способ их заполнить, а «своё…» открывает их
+     ручному вводу. Из этого следуют обе стороны синхронизации ниже: выбор пункта пишет числа,
+     а числа (правка задачи, ручной ввод) выбирают пункт — иначе список показывал бы «малое» на
+     канвасе 1024×576. */
+
+  /** Пункт списка — по тому, что сейчас в полях; поля ручного ввода видны только под «своё…». */
+  function syncCanvasPreset() {
+    const key = canvasPresetKey($("width").value, $("height").value);
+    $("canvas-preset").value = key;
+    $("row-canvas").hidden = key !== "custom";
+  }
+
+  /** Выбор пункта — в поля. «своё…» ничего не пишет: оно открывает то, что уже стоит, и человек
+   *  правит от него, а не от обнулённого канваса. */
+  function applyCanvasChoice() {
+    const key = $("canvas-preset").value;
+    const preset = applyCanvasPreset(key);
+    if (preset) {
+      $("width").value = preset.width;
+      $("height").value = preset.height;
+    }
+    $("row-canvas").hidden = key !== "custom";
+    // Тот же путь, что и ручной ввод в поля из FIELDS — см. подписку ниже.
+    scheduleEstimate();
+    renderPrompt();
+  }
+
+  /* -- зона загрузки кадра (A7) --------------------------------------------------------------
+     `#image`/`#end-image` are the only thing `buildArgs` ever reads: a drop zone just has to
+     put a path into one of them, the same as typing into it always did. The zone's own text is
+     always derived from that field's current value (`updateUploadZone`), never tracked as
+     separate state, so a job restored into the form (`fillFormFrom`), a path typed by hand
+     through "указать путь", and a freshly uploaded file all show up the same way. */
+
+  /** Имя файла из пути в поле `id` — с любым разделителем, потому что путь мог прийти с сервера
+   *  (всегда `/`) или быть вписан руками на другой ОС. */
+  function pathBasename(value) {
+    const trimmed = (value || "").trim();
+    if (!trimmed) return "";
+    const parts = trimmed.split(/[\\/]/);
+    return parts[parts.length - 1];
+  }
+
+  function updateUploadZone(id) {
+    const name = pathBasename($(id).value);
+    $(`${id}-zone-label`).textContent = uploadZoneLabel({ name });
+    $(`${id}-zone`).classList.toggle("loaded", Boolean(name));
+    $(`${id}-zone`).classList.remove("error");
+  }
+
+  /** Один POST, сырыми байтами: `Content-Type: application/octet-stream` и имя файла в
+   *  `X-Filename`, а не в теле — картинке незачем делать крюк через base64 и JSON, когда байты
+   *  и так уже есть в `File`. Имя закодировано `encodeURIComponent`: значение заголовка — ASCII
+   *  по спецификации и `fetch` сам бросит исключение на кириллице, если этого не сделать
+   *  (см. `_upload_frame` в `web.py`, где сервер это же значение `decodeURIComponent`ит назад). */
+  async function uploadFrame(id, file) {
+    const zone = $(`${id}-zone`);
+    zone.classList.remove("error");
+    zone.classList.add("busy");
+    try {
+      const response = await fetch("/api/uploads", {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream",
+                  "X-Filename": encodeURIComponent(file.name) },
+        body: file,
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const error = new Error("upload");
+        error.payload = payload;
+        throw error;
+      }
+      $(id).value = payload.path;
+      updateUploadZone(id);
+      scheduleEstimate();
+      renderPrompt();
+    } catch (error) {
+      zone.classList.add("error");
+      $(`${id}-zone-label`).textContent = error.payload
+        ? errorText(error.payload).title : "Файл не загрузился";
+    } finally {
+      zone.classList.remove("busy");
+    }
+  }
+
+  /** Зона `id-zone` рядом с полем `id`: клик или Enter/пробел открывают скрытый `id-file`,
+   *  перетаскивание принимает первый файл так же, а ссылка `id-manual` — запасной путь на случай,
+   *  когда файла для перетаскивания просто нет: путь уже известен (открыта правка задачи,
+   *  которую поставили не с этой страницы) и его проще вписать, чем найти на диске. */
+  function wireUploadZone(id) {
+    const zone = $(`${id}-zone`);
+    const fileInput = $(`${id}-file`);
+    const manual = $(`${id}-manual`);
+    const path = $(id);
+
+    zone.addEventListener("click", () => fileInput.click());
+    zone.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        fileInput.click();
+      }
+    });
+    zone.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      zone.classList.add("dragover");
+    });
+    zone.addEventListener("dragleave", () => zone.classList.remove("dragover"));
+    zone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      zone.classList.remove("dragover");
+      const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+      if (file) uploadFrame(id, file);
+    });
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (file) uploadFrame(id, file);
+      fileInput.value = "";     // тот же файл второй раз подряд тоже должен дать событие change
+    });
+    manual.addEventListener("click", (event) => {
+      event.preventDefault();
+      zone.hidden = true;
+      manual.hidden = true;
+      path.hidden = false;
+      path.focus();
+    });
+    updateUploadZone(id);
+  }
+
+  /* -- кадр в диалог (A8): скрепка и dnd в поле ввода чата -----------------------------------
+     Тот же `POST /api/uploads`, что и `uploadFrame` выше (A7), но результат не садится в поле
+     формы: до следующего хода он ждёт в `chat.pendingImage`, а бейдж под полем ввода — то, что
+     человек видит вместо него до отправки (`sendChatMessage`/`attachmentBody` решают, что с
+     ним сделать, когда ход действительно уходит). */
+
+  /** Бейдж загруженного, но ещё не отправленного кадра — из `chat.pendingImage`, тем же
+   *  правилом «состояние решает, DOM только рисует», что и весь остальной модаль. Снимает
+   *  `error`/`busy` при каждой перерисовке, чтобы след прошлой попытки не пережил следующую. */
+  function renderChatAttachment() {
+    const badge = $("chat-attachment");
+    const pending = chat && chat.pendingImage;
+    badge.hidden = !pending;
+    badge.classList.remove("error", "busy");
+    if (pending) $("chat-attachment-label").textContent = `📎 ${pending.name}`;
+  }
+
+  /** Кадр снят — либо ходом, который его унёс (`sendChatMessage`), либо крестиком бейджа. */
+  function clearChatAttachment() {
+    if (chat) chat.pendingImage = null;
+    renderChatAttachment();
+  }
+
+  /** Кадр возвращается в состояние модалки после отказавшего хода (`sendChatMessage`) — та же
+   *  логика, что `restoredInput` даёт полю ввода: отказ не должен заставлять грузить файл
+   *  заново, только чтобы повторить ту же реплику. */
+  function restoreChatAttachment(attachment) {
+    if (!chat) return;
+    chat.pendingImage = attachment;
+    renderChatAttachment();
+  }
+
+  /** Один POST, сырыми байтами -- тот же протокол, что и `uploadFrame` (см. его докстринг про
+   *  `X-Filename`), только пункт назначения другой: не поле формы, а `chat.pendingImage`. */
+  async function uploadChatImage(file) {
+    if (!chat) return;
+    const badge = $("chat-attachment");
+    badge.hidden = false;
+    badge.classList.remove("error");
+    badge.classList.add("busy");
+    $("chat-attachment-label").textContent = `загружаю ${file.name}…`;
+    try {
+      const response = await fetch("/api/uploads", {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream",
+                  "X-Filename": encodeURIComponent(file.name) },
+        body: file,
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const error = new Error("upload");
+        error.payload = payload;
+        throw error;
+      }
+      if (!chat) return;   // модалку закрыли, пока файл ещё грузился
+      chat.pendingImage = { path: payload.path, name: file.name };
+      renderChatAttachment();
+    } catch (error) {
+      badge.classList.remove("busy");
+      badge.classList.add("error");
+      $("chat-attachment-label").textContent = error.payload
+        ? errorText(error.payload).title : "Кадр не загрузился";
+      return;
+    }
+    badge.classList.remove("busy");
+  }
+
+  /** Скрепка `#chat-attach` (клик открывает `#chat-attach-file`), перетаскивание — прямо на
+   *  `#chat-input`, крестик бейджа снимает кадр без отправки. */
+  function wireChatAttach() {
+    const button = $("chat-attach");
+    const fileInput = $("chat-attach-file");
+    const input = $("chat-input");
+    const clear = $("chat-attachment-clear");
+
+    button.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (file) uploadChatImage(file);
+      fileInput.value = "";   // тот же файл второй раз подряд тоже должен дать событие change
+    });
+    input.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      input.classList.add("dragover");
+    });
+    input.addEventListener("dragleave", () => input.classList.remove("dragover"));
+    input.addEventListener("drop", (event) => {
+      event.preventDefault();
+      input.classList.remove("dragover");
+      const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+      if (file) uploadChatImage(file);
+    });
+    clear.addEventListener("click", (event) => {
+      event.preventDefault();
+      clearChatAttachment();
+    });
   }
 
   /** «Выгрузить и начать»: `POST /api/llm/unload`, затем то же перечитывание состояния, что и
@@ -2179,22 +3055,30 @@ function startPage() {
     renderQueue();
   }
 
+  /** Пауза/старт очереди (A5): маршрут выбирается по последнему известному `state.paused`, тем же
+   *  способом, что и подпись кнопки в `renderQueue`. Оба маршрута литеральные (не собранные из
+   *  переменной) — `test_the_page_asks_for_its_own_routes_in_a_way_the_provenance_check_accepts`
+   *  ищет URL прямо в тексте `api(...)`, и подставленная строка исчезла бы из этого списка так же,
+   *  как настоящий побег на чужой хост. Кнопка глохнет на время запроса — то же правило, что у
+   *  «выгрузить и начать» (`unloadAndStart`): без него двойной клик на паузе с медленным диском
+   *  послал бы два `POST /api/queue/pause` подряд, и это не опасно (сам маркер идемпотентен), но
+   *  кнопка, кликабельная на вид во время своего же запроса, всё равно врёт. */
+  async function toggleQueuePause() {
+    const button = $("queue-pause-toggle");
+    const paused = Boolean(state && state.paused);
+    button.disabled = true;
+    try {
+      await withQueue(() => (paused
+        ? api("POST", "/api/queue/start", {})
+        : api("POST", "/api/queue/pause", {})));
+    } finally {
+      button.disabled = false;
+    }
+  }
+
   // -- подписки ---------------------------------------------------------------------------
 
   document.addEventListener("click", (event) => {
-    const presetButton = event.target.closest("button[data-preset]");
-    if (presetButton) {
-      const preset = applyCanvasPreset(presetButton.dataset.preset);
-      if (preset) {
-        $("width").value = preset.width;
-        $("height").value = preset.height;
-        // Тот же путь, что и ручной ввод в поля из FIELDS — см. подписку ниже.
-        scheduleEstimate();
-        renderPrompt();
-      }
-      return;
-    }
-
     const button = event.target.closest("button[data-act]");
     if (!button) return;
     const id = button.dataset.id;
@@ -2219,6 +3103,7 @@ function startPage() {
   $("submit").addEventListener("click", submit);
   $("unload-banner-go").addEventListener("click", unloadAndStart);
   $("unload-banner-wait").addEventListener("click", dismissUnloadBanner);
+  $("queue-pause-toggle").addEventListener("click", toggleQueuePause);
   $("cancel-edit").addEventListener("click", () => setEditing(null));
   $("force").addEventListener("change", refreshSubmitState);
   $("save-prompt").addEventListener("click", savePrompt);
@@ -2232,9 +3117,24 @@ function startPage() {
     $("hl").scrollTop = $("prompt").scrollTop;
     $("hl").scrollLeft = $("prompt").scrollLeft;
   });
+  $("canvas-preset").addEventListener("change", applyCanvasChoice);
   for (const id of FIELDS) {
-    $(id).addEventListener("input", () => { scheduleEstimate(); renderPrompt(); });
+    $(id).addEventListener("input", () => {
+      scheduleEstimate();
+      renderPrompt();
+      if (id === "image" || id === "end-image") updateUploadZone(id);
+      /* Список при этом не трогается, и это правка по ревью C2. Поля канваса доступны только
+         под «своё…» — значит ручной ввод всегда идёт при выбранном «своё…», — а обработчик
+         перекидывал список на пресет, если числа с ним совпали. Список говорил «малое
+         896×576», поля ручного ввода оставались открытыми под ним, и выйти из этого было
+         нельзя: выбрать «малое», чтобы они закрылись, невозможно, оно уже выбрано и `change`
+         не срабатывает. Обратная сторона синхронизации жива в `syncCanvasPreset` — она про
+         числа, пришедшие не из клавиатуры (правка задачи, первая отрисовка). */
+    });
   }
+  wireUploadZone("image");
+  wireUploadZone("end-image");
+  wireChatAttach();
   $("mode").addEventListener("change", () => {
     syncModeRows();
     renderPrompt();     // t2va без звуковых секций — отказ, t2v без них — нет
@@ -2251,6 +3151,9 @@ function startPage() {
       // Кадр есть только у двух режимов, и только у них он уходит в сессию: модель смотрит на
       // него глазами, а t2v-разговору показывать нечего.
       image: (mode === "i2v" || mode === "flf") ? $("image").value.trim() : "",
+      // A3: сессия открывается со значением формы — то, что человек только что набрал в
+      // `#duration`, а не десять секунд по умолчанию.
+      duration: Number(String($("duration").value).replace(",", ".")) || 10,
     });
   });
 
@@ -2267,12 +3170,20 @@ function startPage() {
       if (error.payload) showError(error.payload);
       return;
     }
-    openChatModal({ kind: "prompt", name }, { prompt: text, mode: $("mode").value });
+    openChatModal({ kind: "prompt", name }, {
+      prompt: text,
+      mode: $("mode").value,
+      // Fix round 1 (review, Important): эта кнопка уже наследовала режим формы, но не
+      // длительность — сессия library-промпта всегда получала десять секунд по умолчанию,
+      // сколько бы ни стояло в `#duration`. Та же нормализация, что у `chat-new` рядом.
+      duration: Number(String($("duration").value).replace(",", ".")) || 10,
+    });
   });
 
   // Смена провайдера меняет и смысл плашки: у внешнего поднимать нечего.
   $("chat-provider").addEventListener("change", () => renderLlmPlate());
   $("chat-close").addEventListener("click", requestCloseChat);
+  $("chat-delete").addEventListener("click", requestDeleteChat);
   $("chat-finish").addEventListener("click", finishChat);
   $("chat-form").addEventListener("submit", (event) => {
     event.preventDefault();
@@ -2285,6 +3196,14 @@ function startPage() {
       event.preventDefault();
       sendChatMessage();
     }
+  });
+  /* A3: длительность модалки — своё состояние, не форма (`chatDuration`, `paintPrompt`). Правка
+     живёт в `chat.duration` и уходит следующим ходом (`sendChatMessage`) ровно как правка
+     промпта ниже — сервер обновляет сессию из тела запроса, а не читает старое значение с диска. */
+  $("chat-duration").addEventListener("input", () => {
+    if (!chat) return;
+    chat.duration = Number(String($("chat-duration").value).replace(",", ".")) || 10;
+    renderChatPrompt();
   });
   /* Правка руками живёт в состоянии модалки и уходит следующим ходом: сервер собирает
      системное сообщение из тела запроса, а не из сессии, поэтому модель видит именно то, что
@@ -2312,6 +3231,12 @@ function startPage() {
   // -- запуск -----------------------------------------------------------------------------
 
   syncModeRows();
+  syncCanvasPreset();
+  refreshSubmitState();   // сводка «Настроек модели» видна до первой оценки, а не после неё
+  // Адрес в чроме: у этой страницы бывает вторая копия себя на другом порту (свой сервер для
+  // проверок), и перепутать их — потерять вечер. Читается из адресной строки, а не из ответа
+  // сервера: сервер знает, на чём он слушает, а не то, как до него дошли.
+  $("host").textContent = window.location.host;
   renderPrompt();
   renderConnection();
   poll().then(() => { requestEstimate(); syncChatFromHash(); });

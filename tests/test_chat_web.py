@@ -15,9 +15,12 @@
 * **путь из URL и путь из тела проверяются как пути** — id сессии и путь кадра приходят снаружи и
   превращаются в имя файла, поэтому у обоих есть тест на побег из корня.
 """
+import fcntl
 import http.client
 import json
+import os
 import threading
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,6 +78,40 @@ class _Live:
 
     def post_json_raw(self, url: str, payload: dict) -> tuple[int, dict]:
         return self._request("POST", url, payload)
+
+    def delete_json_raw(self, url: str) -> tuple[int, dict]:
+        return self._request("DELETE", url)
+
+    def upload_raw(self, data: bytes, filename, *, headers=None) -> tuple[int, dict]:
+        """`POST /api/uploads` with a raw body -- the one route on this server that is not JSON,
+        so it cannot go through `_request` above (`Content-Type: application/octet-stream`, the
+        filename in a header rather than the body).
+
+        `filename` is `quote`d the way `app.js` sends it (`encodeURIComponent`): an HTTP header
+        value is plain ASCII, enforced by every browser's `fetch`, so a Cyrillic name has to be
+        percent-encoded before it can travel as `X-Filename` at all -- `web.py`'s `_upload_frame`
+        `unquote`s it back on arrival. `filename=None` omits `X-Filename` entirely, for the test
+        that checks it is required. `headers` overrides/extends the pair this sends by default,
+        so a test can still spell `X-Filename` itself if it wants a header this helper does not
+        set on its own.
+        """
+        request_headers = {"Content-Type": "application/octet-stream"}
+        if filename is not None:
+            request_headers["X-Filename"] = urllib.parse.quote(filename, safe="")
+        if headers:
+            request_headers.update(headers)
+        connection = http.client.HTTPConnection(web.LOOPBACK, self.port, timeout=30)
+        try:
+            connection.request("POST", "/api/uploads", body=data, headers=request_headers)
+            response = connection.getresponse()
+            content_type = response.getheader("Content-Type")
+            raw = response.read()
+            status = response.status
+        finally:
+            connection.close()
+        assert content_type == "application/json", (
+            f"POST /api/uploads answered {content_type!r}; the contract is JSON everywhere")
+        return status, json.loads(raw)
 
 
 @pytest.fixture
@@ -158,6 +195,59 @@ def test_a_session_remembers_the_mode_and_the_keyframe_it_was_opened_with(_serve
     assert got["source"] == {"kind": "clip", "id": "19-real-run"}
     assert got["mode"] == "i2v"
     assert Path(got["image"]) == png.resolve()
+
+
+def test_a_session_without_a_declared_duration_defaults_to_ten_seconds(_serve):
+    """A3: the field's own default (`index.html`'s `#duration` ships with `value="10"`), and the
+    number the modal's parse falls back to when nobody has ever set one -- a session opened before
+    this field existed, or one whose creator forgot the flag, still reads as a plain ten seconds
+    rather than an absent field the model has no line for."""
+    srv = _serve()
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    assert srv.get_json(f"/api/chat/{sid}")["duration"] == 10
+
+
+def test_a_session_opened_from_a_job_carries_the_jobs_declared_duration(_serve):
+    """A3, and the same client-side pattern `mode`/`image`/`end_image` already use (T4b):
+    `openChatFromJob` reads `--duration` out of the job's own `args` and hands it to this route
+    exactly the way it hands `--mode`, so this is the server half of that contract -- whatever
+    number arrives with a `source.kind == "job"` creation is the number the session remembers, not
+    the form's own `#duration`, which the page never even reads for this path."""
+    srv = _serve()
+    sid = srv.post_json("/api/chat", {"source": {"kind": "job", "id": "j-9"},
+                                      "prompt": "", "duration": 7})["id"]
+    assert srv.get_json(f"/api/chat/{sid}")["duration"] == 7
+
+
+def test_a_declared_duration_that_is_not_a_number_is_refused_the_way_a_bad_mode_is(_serve):
+    srv = _serve()
+    status, payload = srv.post_json_raw("/api/chat", {"source": {"kind": "new"}, "prompt": "",
+                                                      "duration": "10"})
+    assert (status, payload["error"]["code"]) == (400, "args_invalid")
+
+
+@pytest.mark.parametrize("duration", [float("nan"), float("inf"), float("-inf"), -5, 0, 1e300])
+def test_a_declared_duration_outside_the_sane_range_is_refused(_serve, duration):
+    """Fix round 1 (review, Important): `duration` reaches a browser as plain `Number(...)`, and
+    both halves of that are reachable without any special effort. `Number("-5") || 10` from the
+    page's own normalisation keeps `-5` (it is truthy), and Python's `json` module accepts the
+    `NaN`/`Infinity`/`-Infinity` tokens as an extension of the standard, so a hand-built request
+    -- or a bug in a future caller -- can put any of the six values below on the wire. Before this
+    fix `isinstance(value, (int, float))` alone let all of them through, and `duration: nan s`
+    reached the model verbatim (`_locked_turn`'s system context) instead of being refused at 400
+    the way a bad `mode` already is."""
+    srv = _serve()
+    status, payload = srv.post_json_raw("/api/chat", {"source": {"kind": "new"}, "prompt": "",
+                                                      "duration": duration})
+    assert (status, payload["error"]["code"]) == (400, "args_invalid"), (duration, payload)
+
+
+@pytest.mark.parametrize("duration", [2.4, 15])
+def test_a_declared_duration_inside_the_sane_range_is_accepted(_serve, duration):
+    srv = _serve()
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": "",
+                                      "duration": duration})["id"]
+    assert srv.get_json(f"/api/chat/{sid}")["duration"] == duration
 
 
 def test_a_session_remembers_the_end_image_and_mentions_it_in_the_turns_context(_serve,
@@ -267,6 +357,62 @@ def test_a_message_to_a_session_that_does_not_exist_is_a_named_404(_serve):
     assert (status, payload["error"]["code"]) == (404, "chat_not_found")
 
 
+# -- удаление сессии -----------------------------------------------------------------------------
+
+
+def test_deleting_a_chat_session_removes_the_session_and_its_lock(_serve, fake_llama):
+    """`DELETE /api/chat/<id>` — кнопка «очистить» в шапке модалки. Удаляет не только
+    `<id>.json`, но и `<id>.lock`: тот переживает каждый ход (`chat_session_lock` его не
+    стирает, только снимает замок), и если бы он оставался на диске, а `_chat_dir` со
+    временем очистили вручную, второй замок с тем же именем достался бы уже другой сессии.
+
+    Ход перед удалением — не украшение: без него `<id>.lock` ещё не существует
+    (`chat_session_lock` создаёт файл замка лениво, только когда кто-то через него проходит),
+    и тест ничего не доказал бы про его удаление."""
+    srv = _serve(providers_port=fake_llama.port)
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "мрачнее", "prompt": "п"})
+    session_path = Path(srv.root) / "chat" / f"{sid}.json"
+    lock_path = session_path.with_suffix(".lock")
+    assert session_path.is_file() and lock_path.is_file(), "ход должен был оставить оба файла"
+
+    status, answer = srv.delete_json_raw(f"/api/chat/{sid}")
+    assert status == 200 and answer == {"ok": True}, answer
+    assert not session_path.exists(), "сессия должна быть удалена"
+    assert not lock_path.exists(), "замок сессии должен быть удалён вместе с ней"
+
+
+def test_deleting_a_chat_session_that_does_not_exist_is_a_named_404(_serve):
+    srv = _serve()
+    status, payload = srv.delete_json_raw("/api/chat/deadbeef")
+    assert (status, payload["error"]["code"]) == (404, "chat_not_found"), payload
+
+
+def test_deleting_a_chat_session_mid_turn_is_refused_and_deletes_nothing(_serve):
+    """Если ход уже идёт, замок сессии занят другим потоком (`chat_session_lock`), и удаление
+    обязано отказаться тем же кодом, каким отказывается второй ход — `chat_busy`, 409 — а не
+    молча выждать и стереть файлы из-под модели, которая их как раз читает и пишет.
+
+    Замок держит `fcntl.flock` из самого теста, напрямую на том же `<id>.lock`, каким его
+    открыл бы сервер — тот же приём, каким `chat_session_lock` проверяется в `test_web.py`:
+    `flock` различает конкурирующие открытия файла даже в одном процессе, так что настоящий
+    ход модели поднимать не нужно."""
+    srv = _serve()
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    session_path = Path(srv.root) / "chat" / f"{sid}.json"
+    lock_path = session_path.with_suffix(".lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        status, payload = srv.delete_json_raw(f"/api/chat/{sid}")
+        assert (status, payload["error"]["code"]) == (409, "chat_busy"), payload
+        assert session_path.exists(), "занятый замок — ничего не должно быть удалено"
+        assert lock_path.exists(), "занятый замок — ничего не должно быть удалено"
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 # -- очередь главнее ---------------------------------------------------------------------------
 
 
@@ -319,6 +465,24 @@ def test_the_system_message_carries_the_format_doc_and_the_mode(_serve, fake_lla
     other = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
     srv.post_json(f"/api/chat/{other}/message", {"text": "опиши", "prompt": "п"})
     assert "mode: t2va" in fake_llama.requests[-1]["body"]["messages"][0]["content"]
+
+
+def test_the_system_message_carries_the_turns_declared_duration(_serve, fake_llama):
+    """A3: the modal's «Длительность, с» field lives in the page's own state, not the session it
+    was opened with, and it has to reach the model on *every* turn it changes, not only the first
+    -- a person may move the number after the session was already open. The session's own default
+    (ten, from `_create_chat`) is what the very first turn falls back to when it says nothing."""
+    srv = _serve(providers_port=fake_llama.port)
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "опиши", "prompt": "п", "duration": 7})
+    system = fake_llama.requests[-1]["body"]["messages"][0]["content"]
+    assert "duration: 7 s" in system
+    # persisted: the session file itself carries the edited number now, not only this one turn.
+    assert srv.get_json(f"/api/chat/{sid}")["duration"] == 7
+    # a second turn that says nothing about `duration` keeps the session's own last-known number,
+    # not the ten-second default `_create_chat` used when the session was first opened.
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "ещё", "prompt": ""})
+    assert "duration: 7 s" in fake_llama.requests[-1]["body"]["messages"][0]["content"]
 
 
 def test_the_history_of_the_session_travels_with_the_next_turn(_serve, fake_llama):
@@ -383,6 +547,82 @@ def test_the_reply_and_the_prompt_are_saved_and_survive_a_reload(_serve, fake_ll
     assert [(m["role"], m["content"]) for m in saved["messages"]] == [
         ("user", "мрачнее"), ("assistant", "Сделал мрачнее.")]
     assert saved["prompt_struct"]["non_diegetic_music"] == "N/A"
+
+
+# -- A4: слаг ------------------------------------------------------------------------------------
+
+
+def _turn_with_slug(slug):
+    """A well-formed turn (the shape `_TURN` fixes) carrying `slug` as given -- whatever type."""
+    return {"choices": [{"message": {"content": json.dumps(
+        {"reply": "ок", "prompt": None, "slug": slug})}}]}
+
+
+def test_a_turn_with_a_slug_is_saved_to_the_session_and_returned_to_the_client(_serve):
+    fake = _FakeLlama(chat_payload=_turn_with_slug("cat-italian-noon"))
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "правь", "prompt": ""})
+        assert answer["slug"] == "cat-italian-noon", answer
+        assert srv.get_json(f"/api/chat/{sid}")["slug"] == "cat-italian-noon"
+    finally:
+        fake.close()
+
+
+def test_a_later_turn_with_no_slug_keeps_the_sessions_last_known_one(_serve):
+    """The model does not owe a `slug` on every turn -- only when it hands back a `prompt` at all
+    (see the doc paragraph this pins). A turn that answers with `prompt: null` and no `slug` must
+    not erase what an earlier turn already named the session.
+
+    One fake server for both turns, mutated in place between them (`_FakeLlama` reads
+    `chat_payload` fresh out of its own closure on every request, so mutating the same dict the
+    handler already holds a reference to changes what the *next* request gets back, without
+    tearing down and re-pointing the roster at a second port mid-session).
+    """
+    payload = _turn_with_slug("cat-italian-noon")
+    fake = _FakeLlama(chat_payload=payload)
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "правь", "prompt": ""})
+        assert srv.get_json(f"/api/chat/{sid}")["slug"] == "cat-italian-noon"
+
+        payload.clear()
+        payload.update({"choices": [{"message": {"content": json.dumps(
+            {"reply": "ещё", "prompt": None})}}]})
+        answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "ещё раз", "prompt": ""})
+        assert answer.get("slug") is None, "этот ход ничего не назвал"
+        assert srv.get_json(f"/api/chat/{sid}")["slug"] == "cat-italian-noon", (
+            "второй ход без slug не должен был стереть слаг первого")
+    finally:
+        fake.close()
+
+
+@pytest.mark.parametrize("slug", [42, True, ["cat", "noon"], {"x": 1}, ""])
+def test_a_non_string_or_empty_slug_is_ignored_quietly_not_a_502(_serve, slug):
+    """A `slug` that ignores its own type -- a provider outside `response_format`'s reach can send
+    anything -- is the same situation `reply`'s own type check exists for (see
+    `test_a_reply_that_is_not_a_string_is_refused_instead_of_bricking_the_session`), but the
+    resolution is the opposite one, on purpose.
+
+    `reply` is required and structural: it becomes `messages[-1]["content"]`, and a bad type there
+    would brick the session the next time `_check_session_shape` reads it back -- so it is a 502.
+    `slug` is optional metadata that never reaches `messages` or the session-shape check at all;
+    treating a malformed one as "absent" costs nothing and keeps the promise `slug` not being in
+    `required` already makes -- its absence, however it came about, is never an error.
+    """
+    fake = _FakeLlama(chat_payload=_turn_with_slug(slug))
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        status, answer = srv.post_json_raw(f"/api/chat/{sid}/message",
+                                           {"text": "правь", "prompt": ""})
+        assert status == 200, answer
+        assert answer.get("slug") is None, answer
+        assert "slug" not in srv.get_json(f"/api/chat/{sid}")
+    finally:
+        fake.close()
 
 
 # -- кадр --------------------------------------------------------------------------------------
@@ -480,6 +720,144 @@ def test_a_keyframe_outside_every_root_is_refused_when_the_session_opens(_serve,
     status, payload = srv.post_json_raw("/api/chat", {"source": {"kind": "new"}, "prompt": "",
                                                       "mode": "i2v", "image": str(outside)})
     assert (status, payload["error"]["code"]) == (400, "path_outside_root")
+
+
+# -- A8: кадр приложен ходом (скрепка/dnd в поле чата) -------------------------------------------
+
+
+def test_a_turn_with_an_image_updates_the_session_and_attaches_the_new_frame(_serve, fake_llama):
+    """Кадр, приложенный самим ходом (`image` в теле `message`, задача A8) — не только уходит
+    модели этим же ходом (существующий механизм `_turn_content`), но и переживает ход: следующее
+    сообщение, которое вовсе не называет кадр, обязано снова увидеть именно его, а не пустоту.
+    `set_mode` идёт тем же ходом и должен обновить сохранённый режим сессии ровно так, как если
+    бы сессию открыли заново с этим режимом.
+    """
+    srv = _serve(providers_port=fake_llama.port)
+    png = Path(srv.root) / "dropped.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n0000")
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    answer = srv.post_json(f"/api/chat/{sid}/message",
+                           {"text": "опиши кадр", "prompt": "", "image": str(png),
+                            "set_mode": "i2v"})
+    assert answer.get("warning") is None, answer
+    sent = fake_llama.requests[-1]["body"]["messages"][-1]["content"]
+    kinds = [part["type"] for part in sent]
+    assert kinds == ["text", "image_url"]
+    assert sent[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    saved = srv.get_json(f"/api/chat/{sid}")
+    assert Path(saved["image"]) == png.resolve()
+    assert saved["mode"] == "i2v"
+
+    # Второй ход ничего не говорит про кадр — сессия обязана помнить прошлый.
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "ещё", "prompt": ""})
+    second = fake_llama.requests[-1]["body"]["messages"][-1]["content"]
+    assert [part["type"] for part in second] == ["text", "image_url"]
+
+
+def test_an_invalid_image_in_a_turn_is_a_hard_refusal_and_the_session_is_untouched(_serve,
+                                                                                   fake_llama):
+    """`image` в теле `message` — явное действие человека (скрепка, dnd), не «кадр из прошлого,
+    который мог протухнуть» (`_turn_content`'s own warning). Тот же файл, отклонённый как кадр
+    при создании сессии (`_chat_image_path`), отклоняется здесь так же жёстко: 400, а не ход,
+    отправленный без картинки с оговоркой. И, раз это отказ, ни сессия, ни счётчик обращений к
+    модели не должны были измениться.
+    """
+    srv = _serve(providers_port=fake_llama.port)
+    not_an_image = Path(srv.root) / "notes.txt"
+    not_an_image.write_text("не кадр", encoding="utf-8")
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    status, payload = srv.post_json_raw(
+        f"/api/chat/{sid}/message",
+        {"text": "опиши кадр", "prompt": "", "image": str(not_an_image)})
+    assert (status, payload["error"]["code"]) == (400, "bad_image"), payload
+    saved = srv.get_json(f"/api/chat/{sid}")
+    assert saved["image"] == "", "невалидный кадр не должен был попасть в сессию"
+    assert saved["messages"] == [], "отказанный ход не должен был лечь в историю"
+    assert fake_llama.requests == [], "модель не должна была получить платный вызов на отказе"
+
+
+def test_a_garbage_set_mode_in_a_turn_is_args_invalid(_serve, fake_llama):
+    """`set_mode` — тот же закрытый список, что и `mode` при создании сессии (`CHAT_MODES`), и
+    та же причина: мусор здесь становится либо инструкцией для модели, которую она честно
+    выполнит, либо решением страницы «звука нет», принятым по опечатке."""
+    srv = _serve(providers_port=fake_llama.port)
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": "", "mode": "t2va"})["id"]
+    status, payload = srv.post_json_raw(
+        f"/api/chat/{sid}/message", {"text": "х", "prompt": "", "set_mode": "видео"})
+    assert (status, payload["error"]["code"]) == (400, "args_invalid"), payload
+    assert sorted(payload["error"]["detail"]["modes"]) == sorted(web.CHAT_MODES), payload
+    saved = srv.get_json(f"/api/chat/{sid}")
+    assert saved["mode"] == "t2va", "отказанный set_mode не должен был перезаписать режим сессии"
+    assert saved["messages"] == [], "отказанный ход не должен был лечь в историю"
+
+
+# -- загрузка кадра (A7) ------------------------------------------------------------------------
+
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+
+
+def test_an_uploaded_frame_lands_in_the_outdirs_uploads_directory_and_is_returned_as_a_path(
+        _serve):
+    srv = _serve()
+    status, answer = srv.upload_raw(_PNG_BYTES, "start.png")
+    assert (status, answer["ok"]) == (200, True), answer
+    saved = Path(answer["path"])
+    assert saved.is_file()
+    assert saved.read_bytes() == _PNG_BYTES
+    assert saved.parent == (Path(srv.root) / "uploads").resolve()
+    assert saved.name.endswith("-start.png")
+
+
+def test_a_non_image_upload_is_refused_as_bad_image(_serve):
+    """Суффикс — та же проверка, что и у кадра сессии (`CHAT_IMAGE_SUFFIXES`), только раньше:
+    здесь она не пускает файл на диск вовсе, а не только в разговор с моделью."""
+    srv = _serve()
+    status, answer = srv.upload_raw(b"not a picture", "notes.txt")
+    assert (status, answer["error"]["code"]) == (400, "bad_image"), answer
+    assert not (Path(srv.root) / "uploads").exists(), "отказ не должен создавать файл на диске"
+
+
+def test_an_upload_over_the_size_limit_is_refused_as_bad_image(_serve, monkeypatch):
+    monkeypatch.setattr(web, "CHAT_IMAGE_MAX_BYTES", 8)
+    srv = _serve()
+    status, answer = srv.upload_raw(_PNG_BYTES, "big.png")
+    assert (status, answer["error"]["code"]) == (400, "bad_image"), answer
+    assert not (Path(srv.root) / "uploads").exists(), "отказ не должен создавать файл на диске"
+
+
+def test_a_traversal_filename_does_not_escape_the_uploads_directory(_serve):
+    """`X-Filename: ../x.png` — тот же побег из корня, что и путь кадра сессии
+    (`test_a_keyframe_outside_every_root_is_refused_when_the_session_opens`), только тут имя
+    приходит не путём, а заголовком, который и берётся за basename в `sanitize_upload_name`."""
+    srv = _serve()
+    status, answer = srv.upload_raw(_PNG_BYTES, "../x.png")
+    assert (status, answer["ok"]) == (200, True), answer
+    saved = Path(answer["path"])
+    # Файл создан ВНУТРИ uploads/, а не поднялся на уровень выше -- побег не удался.
+    assert saved.parent == (Path(srv.root) / "uploads").resolve()
+    assert saved.is_file()
+    assert not (Path(srv.root) / "x.png").exists(), "имя не должно было сбежать из uploads/"
+    # Имя очищено: разделитель не пережил sanitize_upload_name, «..» тоже не осталось.
+    assert ".." not in saved.name
+    assert "/" not in saved.name
+
+
+def test_a_cyrillic_or_spaced_filename_becomes_a_safe_name(_serve):
+    srv = _serve()
+    status, answer = srv.upload_raw(_PNG_BYTES, "Кадр номер 1.png")
+    assert (status, answer["ok"]) == (200, True), answer
+    saved = Path(answer["path"])
+    assert saved.is_file()
+    # Только безопасный алфавит остался в имени; ни кириллицы, ни пробела.
+    assert all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in saved.name), saved.name
+    assert saved.suffix == ".png"
+
+
+def test_an_upload_without_x_filename_is_a_bad_request(_serve):
+    srv = _serve()
+    status, answer = srv.upload_raw(_PNG_BYTES, None)
+    assert (status, answer["error"]["code"]) == (400, "bad_request"), answer
 
 
 # -- провайдеры и плашка модели ------------------------------------------------------------------
@@ -611,8 +989,16 @@ def test_a_chat_opened_from_a_library_prompt_survives_a_turn_end_to_end(_serve, 
     рядом здесь, потому что порознь каждая выглядит верной.
     """
     srv = _serve(providers_port=fake_llama.port)
+    # `duration: 6` — Fix round 1 (review, Important): `chat-prompt-open` («Обсудить») did not
+    # hand the form's `#duration` to `openChatModal` at all, unlike `mode` right beside it in the
+    # same object literal, so a chat opened from a library prompt always got the server's own
+    # ten-second default regardless of what the form said. This is the server half of that
+    # contract -- whatever number a fixed `chat-prompt-open` sends is the number the session
+    # remembers, the same way `test_a_session_opened_from_a_job_carries_the_jobs_declared_duration`
+    # pins the `job`-source half.
     opened = srv.post_json("/api/chat", {"source": {"kind": "prompt", "name": "x.txt"},
-                                         "prompt": "старый текст", "mode": "t2va"})
+                                         "prompt": "старый текст", "mode": "t2va",
+                                         "duration": 6})
     sid = opened["id"]
 
     answer = srv.post_json(f"/api/chat/{sid}/message",
@@ -624,6 +1010,7 @@ def test_a_chat_opened_from_a_library_prompt_survives_a_turn_end_to_end(_serve, 
     saved = json.loads((Path(srv.root) / "chat" / f"{sid}.json").read_text(encoding="utf-8"))
     assert saved["source"] == {"kind": "prompt", "name": "x.txt"}, (
         "источник решает, что делает кнопка завершения, и обязан пережить ход")
+    assert saved["duration"] == 6
     assert [(m["role"], m["content"]) for m in saved["messages"]] == [
         ("user", "сделай мрачнее"), ("assistant", "Сделал мрачнее.")]
     assert saved["prompt_struct"] == answer["prompt"]
@@ -781,6 +1168,10 @@ def test_duplicating_a_finished_job_lands_a_new_pending_job(_serve):
     job = _submit_job(srv.queue_root, srv.root, "готово", note="из готовой")
     running = q.claim(srv.queue_root)
     q.finish(srv.queue_root, running.id, 0, "ok")
+    # `job.output_stem` now sits inside the job's own subdirectory (task A6); a real run would
+    # have created it (`RunSpec.outdir.mkdir(...)` -- see `test_run_generate_creates_a_nonexistent_
+    # outdir` in `test_cli.py`), so this stands in for that.
+    Path(job.output_stem).parent.mkdir(parents=True, exist_ok=True)
     Path(f"{job.output_stem}.mp4").write_bytes(b"video")
 
     status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/duplicate", None)
@@ -826,6 +1217,36 @@ def test_duplicating_a_failed_job_lands_a_new_pending_job(_serve):
     assert by_id[new_id].state == "pending"
     assert by_id[new_id].note == "из упавшей"
     assert by_id[new_id].output_stem != job.output_stem
+
+
+def test_duplicating_a_job_gets_its_own_subdirectory_not_the_sources(_serve):
+    """Task A6, through the actual `/duplicate` route (`_duplicate_job` in `web.py`), which
+    resubmits the source job's own `args` -- already carrying `--outdir <source's own
+    subdirectory>` -- with only `--tag` rewritten. Without `queue._base_outdir` stripping that
+    existing subdirectory first, the copy would nest one level *inside* the source's own directory
+    rather than land beside it: `output_stem != output_stem` alone (already asserted by the other
+    duplicate tests) does not catch that, since a nested path is unequal too.
+    """
+    srv = _serve()
+    job = _submit_job(srv.queue_root, srv.root, "kot-italy", note="")
+    source_dir = Path(job.output_stem).parent
+    assert source_dir.parent == srv.root, (
+        "the fixture must submit a job whose own subdirectory sits directly under the outdir, or "
+        "this test cannot tell 'beside' from 'nested inside' apart")
+
+    status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/duplicate", None)
+    assert status == 200, answer
+    new_id = answer["id"]
+
+    jobs, broken = q.scan(srv.queue_root)
+    assert broken == []
+    by_id = {row.id: row for row in jobs}
+    duplicate_dir = Path(by_id[new_id].output_stem).parent
+
+    assert duplicate_dir != source_dir, "the duplicate must not reuse the source's own directory"
+    assert duplicate_dir.parent == srv.root, (
+        f"the duplicate's directory must be a sibling of the source's, directly under the outdir "
+        f"-- got {duplicate_dir}, nested under {duplicate_dir.parent}")
 
 
 def test_duplicating_an_unknown_job_is_a_named_404(_serve):

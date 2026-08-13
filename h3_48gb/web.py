@@ -32,6 +32,7 @@ import errno
 import fcntl
 import io
 import json
+import math
 import mimetypes
 import os
 import re
@@ -39,6 +40,7 @@ import secrets
 import subprocess
 import sys
 import urllib.parse
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -95,6 +97,13 @@ PATH_FLAGS = {
 #: weights through `read_bytes()`, whole, into this process's memory.
 MEDIA_SUFFIXES = frozenset({".mp4", ".jpg", ".jpeg", ".png", ".wav"})
 
+#: How long a browser may keep a file it got from `/media`, in seconds. A year -- the conventional
+#: "forever" of `immutable`, and the reason it is safe here is a property of the run directory
+#: rather than a guess: a preview frame carries its pass number in its own file name
+#: (`...-preview-step05.jpg`) and a clip is written once, when the run ends. Nothing under a run
+#: is rewritten in place, so a cache hit is always the same bytes. See `_cache_control`.
+MEDIA_MAX_AGE = 31_536_000
+
 
 class _AnySuffix:
     """The allowlist that allows everything, for a route whose root is its own bound.
@@ -134,6 +143,14 @@ PROMPTS_DIR = "prompts"
 #: purpose. `llama.log` lands in the same directory (see `provider.LlamaLocal.ensure_up`).
 CHAT_DIR = "chat"
 
+#: Where an uploaded keyframe lands, relative to the output directory: `<outdir>/uploads/`.
+#: `POST /api/uploads` (task A7) writes here and answers with a path inside it, which the page
+#: then puts straight into `#image`/`#end-image` -- those two fields have always taken a path,
+#: never a file, so a drag-and-drop upload only needs to land somewhere `--image`/`--end-image`
+#: can already point at. Under the outdir for the same reason `CHAT_DIR` is: a dropped frame is a
+#: working file on one machine, not something that belongs in the repository.
+UPLOAD_DIR = "uploads"
+
 #: What a chat session may say it was opened from. A closed list, and checked on creation: a
 #: session whose `kind` the page does not know is one the page can never open again, and the honest
 #: moment to say so is the moment it is written. `clip` is accepted and stored but not yet acted on
@@ -166,6 +183,23 @@ CHAT_MODES = frozenset({"t2v", "t2va", "i2v", "flf"})
 #: sentence about the given first frame, a `t2va` one must not.
 DEFAULT_CHAT_MODE = "t2va"
 
+#: The duration (seconds) a chat session is assumed to be about when neither it nor a turn says
+#: otherwise -- the same 10 the page's own `#duration` field ships with (`index.html`). It reaches
+#: the model as `## Context\nduration: <value> s` (`_locked_turn`), the number `analysePrompt`
+#: needs to say whether a shot's cut lands inside the declared runtime; a session that has never
+#: been told a duration must still give the model *some* answer rather than an absent field.
+DEFAULT_CHAT_DURATION = 10
+
+#: The longest a chat session may declare itself to be, in seconds. There is no such cap on
+#: `h3 generate --duration` itself (any positive float is a real request), but the chat's own
+#: `duration` is not a generation parameter: it is one line of context a person types into a
+#: plain `<input type=number>` (`#chat-duration`), and its only job past that is bounding what
+#: `analysePrompt`'s shot-cut check considers "past the end" of the clip. Sixty is a full minute
+#: of dialogue-and-shots -- far past anything this project has ever actually generated (see
+#: `prompts/`, all single-digit-to-ten-second scenes) -- and still small enough that a stray extra
+#: digit (`600`, `6000`) reads as obviously wrong rather than merely large.
+CHAT_DURATION_MAX = 60
+
 #: The only file types a chat turn will attach as a keyframe. An **allowlist**, and the same shape
 #: as `MEDIA_SUFFIXES` for the same reason -- with one addition that is not a formality.
 #:
@@ -182,8 +216,107 @@ CHAT_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
 #: The biggest keyframe a turn will carry. Not a security bound -- `CHAT_IMAGE_SUFFIXES` is that --
 #: but a limit on what is worth sending: base64 inflates by a third, and a 40 MB frame becomes 53 MB
 #: of context that a local model spends minutes on before answering. Bigger than `MAX_BODY_BYTES`
-#: on purpose: that one bounds what a *request* may carry, and a keyframe arrives as a path.
+#: on purpose: that one bounds what a *request* may carry, and a keyframe named by a *session*
+#: arrives as a path, already on disk.
+#:
+#: `POST /api/uploads` (task A7) is the one route where a keyframe *does* arrive as a request
+#: body -- a drag-and-drop file, not yet a path -- and `MAX_BODY_BYTES` still does not bound it:
+#: that route never calls `_json_request` (its body is raw bytes, not JSON), so the 4 MiB JSON
+#: limit is simply never in its path. What bounds the upload instead is this constant, deliberately
+#: reused rather than a second, larger number invented for the route: an upload over
+#: `CHAT_IMAGE_MAX_BYTES` would only stage a file `_turn_content` refuses to read the moment a
+#: chat turn tries to send it, so there is no size a bigger upload limit would actually let through.
 CHAT_IMAGE_MAX_BYTES = 16 * 1024 * 1024
+
+#: The longest a sanitized upload filename may be, in bytes -- matched against `X-Filename` after
+#: `sanitize_upload_name` has already stripped it to `[A-Za-z0-9._-]`. Well under `NAME_MAX_BYTES`
+#: (255, the filesystem's own bound) on purpose: `_upload_target` still prefixes the sanitized name
+#: with a timestamp-and-nonce stamp (`_upload_stamp`, ~22 bytes), and the two together have to fit
+#: inside the same 255-byte filename the kernel enforces.
+UPLOAD_NAME_MAX_BYTES = 100
+
+#: Cyrillic letters as their closest Latin spelling. A courtesy for the common case on this
+#: Russian-speaking machine, not a security boundary -- `_UPLOAD_NAME_UNSAFE` runs after this and
+#: would turn an untranslated «кадр.png» into the equally-safe but unreadable «----.png» on its
+#: own. Bare lowercase letters only; `_transliterate_cyrillic` handles case itself, the same way a
+#: human would read «Кадр» as capitalised «Kadr» rather than «KADR» or «kADR».
+_CYRILLIC_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
+    "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+    "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu",
+    "я": "ya",
+}
+
+#: What survives in a sanitized upload filename, once `_transliterate_cyrillic` has already run.
+#: A **replacement**, not a drop: `_UPLOAD_NAME_UNSAFE.sub("-", name)` turns every run of anything
+#: else -- a slash, a space, an untranslated character -- into one `-`, so two names that differ
+#: only in the replaced run do not collide into the same file, and no separator survives to be
+#: read by a filesystem as structure. The character class is `PROMPT_NAME`'s own alphabet
+#: (`[A-Za-z0-9_-]`) plus the dot a suffix needs.
+_UPLOAD_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _transliterate_cyrillic(text: str) -> str:
+    """`text` with every Cyrillic letter replaced by its closest Latin spelling.
+
+    See `_CYRILLIC_TRANSLIT`'s docstring for why this exists and what it is not.
+    """
+    pieces = []
+    for ch in text:
+        piece = _CYRILLIC_TRANSLIT.get(ch.lower())
+        if piece is None:
+            pieces.append(ch)
+        else:
+            pieces.append(piece.capitalize() if ch.isupper() and piece else piece)
+    return "".join(pieces)
+
+
+def sanitize_upload_name(raw: str) -> str:
+    """`raw` (an `X-Filename` header) reduced to a bare filename safe to place inside `uploads/`.
+
+    Three steps, in order, and each answers a different failure:
+
+    1. **basename, both slash spellings.** `X-Filename` is a header a person can set from `curl`
+       on any OS, so a POSIX-only `os.path.basename` would leave a backslash-separated
+       `..\\..\\x.png` untouched; both `/` and `\\` are normalised before anything splits on them.
+       `../x.png` and `/etc/passwd` collapse to their last segment here, before either reaches a
+       filesystem call.
+    2. **transliteration** (`_transliterate_cyrillic`) -- readability, not safety.
+    3. **the character filter** (`_UPLOAD_NAME_UNSAFE`) -- this is the step that actually makes
+       the name safe: nothing outside `[A-Za-z0-9._-]` survives, so nothing a filesystem would
+       read as a separator or a `..` segment can reach `_upload_target`. That function's own
+       `resolve_within` call is the second, independent line behind this one, exactly as
+       `resolve_prompt_name`'s docstring explains for `PROMPT_NAME` -- a whitelist here is not a
+       reason to skip the path check there, or the other way around.
+
+    Bounded at `UPLOAD_NAME_MAX_BYTES`. An empty result (a name that was nothing but separators
+    and unsafe characters) becomes `"upload"` rather than an empty string, so `_upload_target`
+    never has to reason about a sanitized name with nothing in it.
+    """
+    name = (raw or "").replace("\\", "/")
+    name = name.rsplit("/", 1)[-1].strip()
+    name = _transliterate_cyrillic(name)
+    name = _UPLOAD_NAME_UNSAFE.sub("-", name).strip("-")
+    if not name:
+        name = "upload"
+    encoded = name.encode("utf-8", "ignore")
+    if len(encoded) > UPLOAD_NAME_MAX_BYTES:
+        # `errors="ignore"` on the way back: a hard byte cut can land mid-character if a future
+        # widening of `_UPLOAD_NAME_UNSAFE` ever admits a multi-byte one, and dropping the partial
+        # tail is preferable to `UnicodeDecodeError` turning a 400 into a 500.
+        name = encoded[:UPLOAD_NAME_MAX_BYTES].decode("utf-8", "ignore").strip("-") or "upload"
+    return name
+
+
+def _upload_stamp() -> str:
+    """`YYYYmmdd-HHMMSS-<6 hex>`: readable at a glance in a directory listing (`queue.py`'s
+    `_stamp` shape), with a random tail (`queue.py`'s own `secrets`-based uniqueness) so that
+    dropping both a first and a last frame inside the same second -- an ordinary `flf` upload,
+    two POSTs a script or a fast double-drop can send within the same clock tick -- lands as two
+    files, not one silently overwriting the other.
+    """
+    return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
 
 #: HTTP status for each `CliError` code that is not a plain refusal of the request. Everything
 #: absent from here is 400: the caller asked for something this server will not do.
@@ -443,10 +576,37 @@ def build_state(queue_root, outdir) -> dict:
 
     Unparseable job files come back in `queue.broken` rather than being dropped -- a queue that is
     quietly one job short is the failure `scan` was written to prevent.
+
+    `paused` is `queue.is_paused(queue_root)` read fresh on every call, same as `worker`'s `state`:
+    the page's pause/resume button (`POST /api/queue/pause`/`/start`) and `main_loop`'s own gate
+    both act on the same marker file, and this is the one place a human sees whether either of them
+    has.
+
+    **Except when `queue_root` does not exist yet, when `paused` is `True` regardless of what
+    `is_paused` says.** `is_paused`'s own contract treats a missing marker as "not paused" -- its
+    deliberately safe direction, documented on that function, for a queue that *used to have* a
+    marker and lost it. A queue root that has never been created at all is a different situation:
+    nothing has called `queue.layout` yet (no job submitted, no worker started), and the moment
+    anything does, `layout` creates it paused (see its own docstring). Passing `is_paused`'s literal
+    answer through here would tell a human's very first page load "the queue is running" about a
+    queue that is guaranteed to start paused the instant it exists -- review round 1 caught exactly
+    this: the button would offer «⏸ Приостановить» before a single job could ever have run.
+
+    **`outdir` is the server's own, resolved the same way `_media` resolves it.** Fix round 1
+    (task A6 review): the page cannot build a `/media/<run>/<file>` link from `output_stem` alone
+    once a job's own subdirectory can sit at any depth inside `--outdir` -- the C1 finding was
+    exactly that `mediaParts` guessed the depth was always 1, which a job whose form-level
+    `--outdir` already named a subdirectory of its own (the page's own `defaultOutdir()` default,
+    `~/video-out/<date>`) breaks. The client has no other way to know where the server's own root
+    ends and a job's own path begins, so it is handed over here, once, as a plain string --
+    `str(Path(outdir).resolve())`, matching `_media`'s own `outdir = Path(self.server.outdir).
+    resolve()` exactly, so a prefix comparison on the client is comparing the same two strings
+    `_media` itself would produce.
     """
     with queue_errors(queue_root):
         jobs, broken = q.scan(queue_root)
         state = worker_state(queue_root)
+        paused = True if not Path(queue_root).is_dir() else q.is_paused(queue_root)
 
     grouped: dict[str, list[dict]] = {name: [] for name in q.QUEUE_STATES}
     for job in jobs:
@@ -456,6 +616,8 @@ def build_state(queue_root, outdir) -> dict:
     return {
         "ok": True,
         "worker": {"state": state},
+        "paused": paused,
+        "outdir": str(Path(outdir).resolve()),
         "queue": {**grouped,
                   "broken": [{"path": item.path, "error": item.error} for item in broken]},
         "runs": [run.as_dict() for run in runs_module.scan(Path(outdir))],
@@ -837,7 +999,7 @@ def name_too_long_is_a_refusal(what: str):
 
 
 @contextlib.contextmanager
-def queue_write_errors(queue_root, *, what="the request", output_stem=None):
+def queue_write_errors(queue_root, *, what="the request"):
     """`queue_errors` plus the three refusals that are not "the queue directory is unusable".
 
     Two are races with the worker or with another submission, not mistakes in the request, and
@@ -845,6 +1007,13 @@ def queue_write_errors(queue_root, *, what="the request", output_stem=None):
     the page's last poll and this click) and `output_stem_conflict` is 400 with the taken name in
     `detail`, because the only useful thing to tell someone is which name to change. The third is
     a name the filesystem itself refuses -- see `name_too_long_is_a_refusal`.
+
+    The taken name comes from `exc.output_stem`, not from a value the caller precomputed and
+    passed in (task A6 removed that parameter): `submit` now raises `OutputStemConflict` against
+    the *relocated* stem -- the job's own subdirectory included -- decided only once `submit` is
+    actually running, under its own lock. A value the caller had ready beforehand is, at best, the
+    unrelocated one `prepare_submission`'s dry run reported, which names a path that was never
+    really the one in conflict.
     """
     try:
         with queue_errors(queue_root):
@@ -860,8 +1029,38 @@ def queue_write_errors(queue_root, *, what="the request", output_stem=None):
         raise CliError(
             "output_stem_conflict",
             f"выходное имя уже занято: {exc}",
-            {"output_stem": str(output_stem) if output_stem is not None else None},
+            {"output_stem": exc.output_stem},
         ) from exc
+
+
+def _refuse_if_relocation_escapes_the_roots(args: list[str], output_stem: str,
+                                            roots: dict[str, Path]) -> None:
+    """`resolve_within` the output_stem `submit` will actually relocate to -- not the flat one
+    `prepare_submission`'s dry run reported -- or raise `path_outside_root`.
+
+    Fix round 1 (I2, review round 1, Important). `queue._base_outdir` strips a directory that
+    matches `queue._JOB_SUBDIR_RE` (`YYYYMMDD-HHMM-<slug>`) before nesting a fresh one under it --
+    right when that directory really is a job's own subdirectory from an earlier submission, wrong
+    when it is the server's *own* `--outdir`, spelled the same way by coincidence (or by a human
+    promoting an old job's own subdirectory to `--outdir` by hand). Left unchecked, every job
+    submitted to such a server lands one level *above* the server's own root, outside every root
+    this server may write to -- `prepare_submission`'s own `resolve_within` on `output_stem` cannot
+    catch this, because it runs *before* `submit` relocates anything.
+
+    Called **before** `submit` ever writes the job to `pending/`, not after: a check that ran after
+    would also have to cancel the job it had just created, and the worker could claim it in the
+    window between the two -- a real race that would leave a job in `running/` about to spawn `h3
+    generate` with an `--outdir` outside every root, unstoppable by the time this noticed. Checking
+    first means the job never exists at all if the relocation would have escaped.
+
+    The exact subdirectory this previews is not necessarily the one the real `submit` call moments
+    later will use -- its own clock reads a few instructions later, and could cross the minute
+    boundary `queue._dir_stamp` rounds to. Harmless here: whether a path escapes every root depends
+    only on the *base* directory `queue._base_outdir` decides on, which this computes identically,
+    never on the minute stamp appended after it.
+    """
+    preview_stem = q._relocate_to_job_subdir(list(args), str(output_stem), q._now())[1]
+    resolve_within(preview_stem, roots, write=True)
 
 
 def _duplicate_tag_candidates(args: list[str], output_stem: str):
@@ -988,6 +1187,36 @@ def _is_same_file(left, right) -> bool:
         return os.path.samefile(left, right)
     except OSError:
         return False
+
+
+def _is_within(path, other) -> bool:
+    """Whether `path` *is* `other`, or sits anywhere inside it -- checked level by level with
+    `_is_same_file`, never by comparing resolved path text.
+
+    Fix round 1 (task A6 review, C1): `/media` used to bound "the queue" by comparing `path`
+    against `other` directly, which was enough when a served directory was always exactly one
+    level under the outdir (`path` could only ever *be* the queue root, never something inside
+    it). Now that a served directory can sit at any depth (a job's own subdirectory nested inside
+    whatever `--outdir` the form already named), `queue/logs/x.jpg` has to be refused exactly as
+    `queue` itself already was -- so every ancestor of `path`, not just `path` itself, is checked.
+
+    Text comparison (`is_relative_to` on two resolved paths) would be wrong for the same reason
+    `_is_same_file` exists at all: `Path.resolve()` does not canonicalise case, so `<outdir>/QUEUE`
+    and `<outdir>/queue` are different *strings* on a case-insensitive volume even though the
+    filesystem calls them the same directory. `_is_same_file` at every level is what actually
+    answers "is this the queue's own file", the way the filesystem itself would.
+
+    Bounded by path depth: `.parent` strictly shortens `path` until it reaches the filesystem
+    root, where `.parent` returns itself -- the loop's own termination condition.
+    """
+    current = Path(path)
+    while True:
+        if _is_same_file(current, other):
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
 
 
 def _content_type(path: Path) -> str:
@@ -1343,8 +1572,14 @@ class _Handler(BaseHTTPRequestHandler):
             return self._create_chat()
         if path == "/api/llm/unload":
             return self._llm_unload()
+        if path == "/api/queue/pause":
+            return self._queue_pause()
+        if path == "/api/queue/start":
+            return self._queue_start()
         if path.startswith("/api/chat/") and path.endswith("/message"):
             return self._chat_message(path[len("/api/chat/"):-len("/message")])
+        if path == "/api/uploads":
+            return self._upload_frame()
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for POST {path}", {"path": path})
 
@@ -1363,6 +1598,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/jobs/"):
             return self._cancel_job(path[len("/api/jobs/"):])
+        if path.startswith("/api/chat/"):
+            return self._delete_chat(path[len("/api/chat/"):])
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for DELETE {path}", {"path": path})
 
@@ -1451,6 +1688,108 @@ class _Handler(BaseHTTPRequestHandler):
             )
         return raw
 
+    # -- uploads ----------------------------------------------------------------------------
+
+    def _upload_dir(self) -> Path:
+        """`<outdir>/uploads/`, created on first use -- the same lazy-`mkdir` shape as
+        `_chat_dir`, and for the same reason: a `GET`-only session that never uploads a frame
+        should not leave an empty `uploads/` behind on an outdir that may be a mounted disk.
+        """
+        directory = Path(self.server.outdir) / UPLOAD_DIR
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def _upload_target(self, sanitized_name: str) -> Path:
+        """`<outdir>/uploads/<stamp>-<sanitized_name>`, or `path_outside_root`.
+
+        `resolve_within`, then a second, independent line confirming the result is one file
+        directly inside the uploads directory -- the same belt-and-braces shape `_chat_path` and
+        `_job_id_of` both use for a name that arrived from outside. `sanitized_name` has already
+        been through `sanitize_upload_name` by the time it reaches here (`_upload_frame` is the
+        only caller), but this check does not trust that: a whitelist upstream is not a reason to
+        skip the path check downstream, exactly as `resolve_prompt_name`'s docstring says of
+        `PROMPT_NAME`.
+        """
+        directory = self._upload_dir()
+        target = resolve_within(directory / f"{_upload_stamp()}-{sanitized_name}",
+                                {"uploads": directory}, write=True)
+        if target.parent != directory.expanduser().resolve():
+            raise CliError(
+                "path_outside_root",
+                f"an upload names one file in the uploads directory, and {sanitized_name!r} "
+                "does not",
+                {"name": sanitized_name, "resolved": str(target)},
+            )
+        return target
+
+    def _upload_body(self) -> bytes:
+        """The raw bytes of an upload request, bounded by `CHAT_IMAGE_MAX_BYTES` -- see that
+        constant's own docstring for why `MAX_BODY_BYTES` never enters this route at all.
+
+        Read in one call by an honest `Content-Length`, the same shape `_json_request` reads its
+        own body with and for the same reason: the alternative, reading until the connection
+        closes, would block forever on a request that promised bytes and never sent them.
+        """
+        raw_length = self.headers.get("Content-Length") if self.headers else None
+        try:
+            length = int(raw_length or 0)
+        except ValueError as exc:
+            raise CliError("bad_request", f"Content-Length is not a number: {raw_length!r}",
+                           {"content_length": raw_length}) from exc
+        if length <= 0:
+            raise CliError("bad_request", "the upload body is empty",
+                           {"content_length": length})
+        if length > CHAT_IMAGE_MAX_BYTES:
+            raise CliError(
+                "bad_image",
+                f"кадр больше {CHAT_IMAGE_MAX_BYTES} байт ({length})",
+                {"content_length": length, "limit": CHAT_IMAGE_MAX_BYTES})
+        return self.rfile.read(length)
+
+    def _upload_frame(self) -> tuple[int, str, bytes]:
+        """`POST /api/uploads`: one keyframe from disk, dropped or picked in the browser, saved
+        under `<outdir>/uploads/` and answered with the path the rest of the page already knows
+        how to use -- `#image`/`#end-image` have always taken a path, never a file, so a drop
+        zone only has to produce one and put it there (see `h3_48gb/webui/app.js`).
+
+        The body is raw bytes with `X-Filename` naming the file, not JSON -- an image does not
+        fit inside a JSON string without a base64 detour this route has no reason to make when
+        the bytes can simply be the body.
+
+        **Cheap checks before expensive ones.** `X-Filename` is read and sanitized, and the
+        suffix it produces is checked against `CHAT_IMAGE_SUFFIXES`, before a single byte of the
+        body is read: a `.txt` dropped on the zone by mistake is refused off the headers alone,
+        the same order `_serve_file` uses (`resolve` -> `suffix` -> read) and for the same reason
+        -- a refusal should not cost the I/O of the thing being refused.
+        """
+        header_name = self._sole_header("X-Filename", "bad_request")
+        if not header_name:
+            raise CliError("bad_request", "X-Filename is required and must name one file",
+                           {"header": "X-Filename"})
+        # An HTTP header value is ISO-8859-1 by the letter of the spec and, in every browser that
+        # matters here, enforced as ByteString by `fetch`/`XMLHttpRequest` itself -- a Cyrillic
+        # name would throw in the page before the request was even sent. The page therefore sends
+        # `encodeURIComponent(file.name)` (`app.js`), and this is the matching `decodeURIComponent`
+        # on the way back in; a plain ASCII name round-trips through both unchanged, since nothing
+        # in it is a percent-sign.
+        raw_name = urllib.parse.unquote(header_name)
+        sanitized = sanitize_upload_name(raw_name)
+        suffix = Path(sanitized).suffix.lower()
+        if suffix not in CHAT_IMAGE_SUFFIXES:
+            raise CliError(
+                "bad_image",
+                f"кадром может быть только {sorted(CHAT_IMAGE_SUFFIXES)}, а {sanitized!r} — нет",
+                {"name": sanitized, "suffix": suffix, "allowed": sorted(CHAT_IMAGE_SUFFIXES)},
+            )
+        data = self._upload_body()
+        target = self._upload_target(sanitized)
+        try:
+            target.write_bytes(data)
+        except OSError as exc:
+            raise CliError("queue_unwritable", f"файл не сохранился: {target} ({exc})",
+                           {"path": str(target), "error": f"{type(exc).__name__}: {exc}"}) from exc
+        return 200, "application/json", _json_bytes({"ok": True, "path": str(target)})
+
     # -- jobs -------------------------------------------------------------------------------
 
     def _submit_job(self) -> tuple[int, str, bytes]:
@@ -1464,8 +1803,9 @@ class _Handler(BaseHTTPRequestHandler):
         # a number is the caller's mistake and should not cost a fork to discover.
         args, note = self._args_of(payload), self._note_of(payload)
         prepared = prepare_submission(args, self.server.roots)
-        with queue_write_errors(self.server.queue_root, what="--tag",
-                                output_stem=prepared["report"]["output_stem"]):
+        _refuse_if_relocation_escapes_the_roots(
+            prepared["args"], prepared["report"]["output_stem"], self.server.roots)
+        with queue_write_errors(self.server.queue_root, what="--tag"):
             job = q.submit(self.server.queue_root, prepared["args"], note,
                            prepared["report"], prepared["estimate"],
                            prompt_source=prepared["prompt_source"],
@@ -1483,8 +1823,7 @@ class _Handler(BaseHTTPRequestHandler):
         payload = self._json_request(allowed=("args", "note"))
         args, note = self._args_of(payload), self._note_of(payload)
         prepared = prepare_submission(args, self.server.roots)
-        with queue_write_errors(self.server.queue_root, what="the job id",
-                                output_stem=prepared["report"]["output_stem"]):
+        with queue_write_errors(self.server.queue_root, what="the job id"):
             job = q.update(self.server.queue_root, job_id, prepared["args"],
                            note, prepared["report"], prepared["estimate"],
                            prompt_source=prepared["prompt_source"],
@@ -1551,9 +1890,9 @@ class _Handler(BaseHTTPRequestHandler):
         candidates = _duplicate_tag_candidates(job.args, job.output_stem)
         for _ in range(DUPLICATE_ATTEMPTS):
             args, output_stem = next(candidates)
+            _refuse_if_relocation_escapes_the_roots(args, output_stem, self.server.roots)
             try:
-                with queue_write_errors(self.server.queue_root, what="the job id",
-                                        output_stem=output_stem):
+                with queue_write_errors(self.server.queue_root, what="the job id"):
                     new_job = q.submit(self.server.queue_root, args, job.note,
                                        {"output_stem": output_stem}, dict(job.estimate),
                                        prompt_source=job.prompt_source, prompt_text=prompt_text)
@@ -1666,6 +2005,51 @@ class _Handler(BaseHTTPRequestHandler):
                            {"field": key, "type": type(value).__name__})
         return value
 
+    @staticmethod
+    def _number_of(payload: dict, key: str, default):
+        """`payload[key]` as a finite number, or `default` when the field is absent or `null`.
+
+        Present and the wrong shape is `args_invalid`, the same rule `_string_of` applies to text
+        fields: a chat `duration` reaches the system context verbatim as `duration: <value> s`
+        (`_locked_turn`), and a malformed value there is a malformed instruction handed to the
+        model, not a UI nuance this route can silently paper over. `bool` is excluded even though
+        `isinstance(True, int)` is true in Python -- `true`/`false` are not seconds.
+
+        **`NaN`/`Infinity`/`-Infinity` are excluded too** (review circle 1, fix round 1), even
+        though all three are ordinary Python `float`s and `isinstance` alone cannot tell them from
+        a real number. Python's own `json` module accepts those three tokens as an extension of
+        the standard -- `json.loads("NaN")` is `float("nan")`, not a parse error -- so a
+        hand-built request can put one on the wire without breaking anything before this check.
+        `math.isfinite` is what actually excludes them.
+        """
+        value = payload.get(key)
+        if value is None:
+            return default
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value)):
+            raise CliError("args_invalid", f"`{key}` must be a finite number",
+                           {"field": key, "type": type(value).__name__})
+        return value
+
+    @staticmethod
+    def _check_chat_duration(value) -> None:
+        """`0 < value <= CHAT_DURATION_MAX`, or `args_invalid` -- the same refusal a `mode` the
+        generator does not know already gets (fix round 1, review circle 1, Important).
+
+        Runs on every `duration` this route computes, default included, but only a value this
+        route itself just parsed from a request can ever fail it: `DEFAULT_CHAT_DURATION` (10) and
+        every session's own last-known number were already checked the turn they were written, so
+        the only way to reach a value outside the range is to send one in *this* request's body --
+        `-5` (a browser's own `Number("-5") || 10` keeps a negative sign, it does not clear it),
+        `0`, or `1e300` (finite, and `_number_of` alone has no opinion on "too large").
+        """
+        if not (0 < value <= CHAT_DURATION_MAX):
+            raise CliError(
+                "args_invalid",
+                f"`duration` must be greater than 0 and at most {CHAT_DURATION_MAX}, and "
+                f"{value} is not",
+                {"value": value, "max": CHAT_DURATION_MAX})
+
     def _providers(self) -> tuple[int, str, bytes]:
         """`GET /api/providers`: the roster, exactly as the page may show it.
 
@@ -1752,6 +2136,27 @@ class _Handler(BaseHTTPRequestHandler):
             pname, pcfg = by_port[port]
             provider.LlamaLocal(pname, pcfg, self.server.outdir).shutdown()
         return 200, "application/json", _json_bytes({"ok": True, "status": "down"})
+
+    def _queue_pause(self) -> tuple[int, str, bytes]:
+        """`POST /api/queue/pause`: mark the queue paused, so `main_loop`'s gate stops claiming.
+
+        Never touches the job already in `running/` -- that gate sits *before* `claim`, never
+        inside `run_job` (see `main_loop`'s docstring) -- so a pause requested mid-generation takes
+        effect only for whatever the worker would have claimed next.
+        """
+        self._json_request(allowed=())
+        with queue_errors(self.server.queue_root):
+            q.set_paused(self.server.queue_root, True)
+        return 200, "application/json", _json_bytes({"ok": True, "paused": True})
+
+    def _queue_start(self) -> tuple[int, str, bytes]:
+        """`POST /api/queue/start`: clear the pause marker, so `main_loop`'s gate lets `claim`
+        through again on its next poll.
+        """
+        self._json_request(allowed=())
+        with queue_errors(self.server.queue_root):
+            q.set_paused(self.server.queue_root, False)
+        return 200, "application/json", _json_bytes({"ok": True, "paused": False})
 
     def _chat_dir(self, create: bool = False) -> Path:
         """`<outdir>/chat/`, made only when something is about to be written into it.
@@ -1843,7 +2248,8 @@ class _Handler(BaseHTTPRequestHandler):
         this server confirms is: the page navigates to `/#chat/<id>` the moment it gets the id, and
         a session that is not on disk by then is a page that opens on a 404.
         """
-        payload = self._json_request(allowed=("source", "prompt", "mode", "image", "end_image"))
+        payload = self._json_request(
+            allowed=("source", "prompt", "mode", "image", "end_image", "duration"))
         source = payload.get("source") or {"kind": "new"}
         if not isinstance(source, dict) or source.get("kind") not in CHAT_SOURCE_KINDS \
                 or not set(source) <= CHAT_SOURCE_KEYS:
@@ -1872,11 +2278,20 @@ class _Handler(BaseHTTPRequestHandler):
         # mentions the path in the system context): the model does not need to *see* the last
         # frame to reason about it, and sending it would double the per-turn upload for no benefit.
         end_image = self._string_of(payload, "end_image")
+        # `duration` (A3): the seconds the modal's parse (`analysePrompt`, on the page) checks
+        # shot cuts against. The page decides *which* number to send -- `#duration` on a session
+        # opened from the form, `--duration` out of a job's own `args` on one opened from the
+        # queue (`openChatFromJob`, the same client-side pattern `mode`/`image`/`end_image` use) --
+        # this route only stores whatever number arrives, defaulting the same way an absent
+        # `mode` does.
+        duration = self._number_of(payload, "duration", DEFAULT_CHAT_DURATION)
+        self._check_chat_duration(duration)
         session = {"id": secrets.token_hex(4),
                    "source": source,
                    "mode": mode,
                    "image": str(self._chat_image_path(image)) if image else "",
                    "end_image": str(self._chat_image_path(end_image)) if end_image else "",
+                   "duration": duration,
                    "messages": [],
                    "prompt": self._string_of(payload, "prompt")}
         self._write_session(self._chat_path(session["id"], create=True), session)
@@ -1918,6 +2333,39 @@ class _Handler(BaseHTTPRequestHandler):
             return 404, "application/json", _error_bytes(
                 "chat_not_found", f"нет сессии {sid}", {"id": sid})
         return 200, "application/json", _json_bytes({"ok": True, **session})
+
+    def _delete_chat(self, sid: str) -> tuple[int, str, bytes]:
+        """`DELETE /api/chat/<id>`: the session file and its lock, gone -- «очистить» in the
+        modal's head.
+
+        **Refused with `chat_busy`, not queued behind the turn.** `chat_session_lock` is the same
+        non-blocking guard `_chat_message` takes for a turn: a turn in flight holds it, so trying
+        to delete out from under a read-modify-write in progress fails immediately with 409 rather
+        than waiting a minute and then deleting a file the model is mid-write on. Nothing is
+        unlinked before the lock is granted, so a refused delete leaves both files exactly as they
+        were.
+
+        **The lock file too, not only the session.** `chat_session_lock`'s own docstring explains
+        why `<sid>.lock` outlives every turn it guards: it is never touched by `os.replace`, only
+        `flock`ed and released. Left behind, a `.lock` with no `.json` beside it is a lock some
+        *other* session id -- generated later by `secrets.token_hex(4)` reusing the same eight
+        hex digits -- would silently inherit, and finding out would take a very unlucky day.
+
+        **Existence is checked before the lock is taken**, the same order `_chat_message` uses:
+        an id nobody ever created should answer `chat_not_found`, not `chat_busy`, and the
+        `is_file` check inside `name_too_long_is_a_refusal` never creates the lock file the way
+        entering `chat_session_lock` itself would.
+        """
+        path = self._chat_path(sid)
+        with name_too_long_is_a_refusal("a chat id"):
+            exists = path.is_file()
+        if not exists:
+            return 404, "application/json", _error_bytes(
+                "chat_not_found", f"нет сессии {sid}", {"id": sid})
+        with chat_session_lock(path):
+            path.unlink(missing_ok=True)
+            path.with_suffix(".lock").unlink(missing_ok=True)
+        return 200, "application/json", _json_bytes({"ok": True})
 
     def _turn_content(self, text: str, image: str):
         """The user's turn, and a warning: plain text, or `[text, image_url]` plus `None`.
@@ -1990,6 +2438,13 @@ class _Handler(BaseHTTPRequestHandler):
         first, so a malformed request is still a 400 rather than a lock contention report; the
         session is re-read *inside* the lock, because the copy read before it may be a turn out of
         date by the time the lock is granted.
+
+        **`image`/`set_mode` (A8): a keyframe dropped on the chat's own input, mid-conversation.**
+        The page uploads the file first (`POST /api/uploads`, A7) and hands this route the path
+        it got back, in the same turn as the text -- one user action, one request, exactly the way
+        `mode`/`image` arrive together at `_create_chat`. Both are optional and both update the
+        session (`_locked_turn`) before this turn's own system/user messages are built, so the
+        frame the model is shown and the frame the session remembers afterward are the same one.
         """
         path = self._chat_path(sid)
         # `is_file` before the lock, so a bogus id does not leave a `.lock` file behind -- and
@@ -2000,7 +2455,8 @@ class _Handler(BaseHTTPRequestHandler):
         if not exists:
             return 404, "application/json", _error_bytes(
                 "chat_not_found", f"нет сессии {sid}", {"id": sid})
-        payload = self._json_request(allowed=("text", "prompt", "provider"))
+        payload = self._json_request(
+            allowed=("text", "prompt", "provider", "duration", "image", "set_mode"))
         with chat_session_lock(path):
             return self._locked_turn(sid, path, payload)
 
@@ -2011,6 +2467,42 @@ class _Handler(BaseHTTPRequestHandler):
             return 404, "application/json", _error_bytes(
                 "chat_not_found", f"нет сессии {sid}", {"id": sid})
         text = self._string_of(payload, "text")
+        # `image` (A8): a keyframe the person just dropped on the chat's own input, not one that
+        # has been sitting in the session since it opened. That difference is why this is a hard
+        # refusal (`_chat_image_path` raises straight through, uncaught) rather than folded into
+        # `_turn_content`'s warning below -- the warning is for a frame that *used to* be valid and
+        # stopped being one between turns; this is a path the person handed the server this very
+        # second, and an unreadable or wrong-suffix one is a mistake worth stopping the turn for,
+        # not a footnote on a reply they never asked to send it without a picture. Checked, and the
+        # session updated, before anything about this turn reaches the model or `_write_session`:
+        # a refusal here must leave the session exactly as it was (see `_chat_message`'s docstring
+        # on `image`/`set_mode`), which holds for free as long as nothing is written before it.
+        image = self._string_of(payload, "image")
+        if image:
+            session["image"] = str(self._chat_image_path(image))
+        # `set_mode` (A8): rides the same turn as the frame, because a dropped image and the mode
+        # it implies are one user action -- the same closed list `mode` is checked against at
+        # `_create_chat`, refused the same way (`args_invalid`), for the same two readers (the
+        # model's `## Context` line, and the page's own sound-section guess).
+        set_mode = self._string_of(payload, "set_mode")
+        if set_mode and set_mode not in CHAT_MODES:
+            raise CliError(
+                "args_invalid",
+                f"`set_mode` is one of {sorted(CHAT_MODES)} or empty, and {set_mode!r} is not",
+                {"set_mode": set_mode, "modes": sorted(CHAT_MODES)},
+            )
+        if set_mode:
+            session["mode"] = set_mode
+        # `duration` (A3): editable in the modal's own header (`chat-duration`), and re-sent with
+        # every turn -- a person may move the number after the session opened, and the next turn
+        # has to see what is in the field *now*, the same reasoning `_locked_turn`'s own docstring
+        # gives for `prompt` never coming from the saved session. Absent from this turn's body
+        # (a request built by hand, or an older page), the session's own last-known number stands;
+        # only a session that has never been told one at all falls back to the ten-second default.
+        duration = self._number_of(payload, "duration",
+                                   session.get("duration", DEFAULT_CHAT_DURATION))
+        self._check_chat_duration(duration)
+        session["duration"] = duration
         roster = provider.load_providers(self.server.outdir)
         name = self._string_of(payload, "provider") or roster["active"]
         cfg = roster["providers"].get(name)
@@ -2035,6 +2527,7 @@ class _Handler(BaseHTTPRequestHandler):
                           else "")
         system = (provider.system_prompt()
                   + "\n\n## Context\nmode: " + (session.get("mode") or DEFAULT_CHAT_MODE)
+                  + f"\nduration: {duration:g} s"
                   + end_image_line
                   + "\n\n## Current prompt\n" + self._string_of(payload, "prompt"))
         content, warning = self._turn_content(text, session.get("image") or "")
@@ -2082,33 +2575,58 @@ class _Handler(BaseHTTPRequestHandler):
                                 {"role": "assistant", "content": reply}]
         if turn.get("prompt"):
             session["prompt_struct"] = turn["prompt"]
+        # A4: `slug` is optional metadata (`PROMPT_SCHEMA`'s own `required` leaves it out), and
+        # deliberately held to a looser standard than `reply` a few lines up. `reply` is
+        # structural -- it becomes `messages[-1]["content"]`, and a wrong type there bricks the
+        # session the moment `_check_session_shape` reads it back, which is why it earns a 502.
+        # `slug` never touches `messages` or anything shape-checked; a model that ignores
+        # `response_format` and sends `slug: 42` costs nothing to treat as if it had sent nothing
+        # at all. So it is: not saved, not echoed, and the turn still answers 200 -- the same
+        # "absent is not an error" the field's own place outside `required` already promises,
+        # whether the absence is real or just a type this server declined to trust.
+        slug = turn.get("slug")
+        if isinstance(slug, str) and slug:
+            session["slug"] = slug
+        else:
+            slug = None
         self._write_session(path, session)
         return 200, "application/json", _json_bytes(
-            {"ok": True, "reply": reply, "prompt": turn.get("prompt"), "warning": warning,
-             "llm": self._llm_state(name, cfg)})
+            {"ok": True, "reply": reply, "prompt": turn.get("prompt"), "slug": slug,
+             "warning": warning, "llm": self._llm_state(name, cfg)})
 
     def _media(self, relative: str) -> tuple[int, str, bytes]:
-        """A preview frame or a finished clip from **one** run's directory under the outdir.
+        """A preview frame or a finished clip from **one** run's directory somewhere inside the
+        outdir -- at any depth, not just a direct child.
 
-        Four checks, and review circle 1 found the route shipping with only two of them. "Inside
-        the outdir" plus "inside the run directory" reads complete and is not: the *first segment*
-        of the URL decides what "the run directory" means, and three spellings make it collapse
-        back onto the outdir itself, at which point the second check compares the outdir with the
-        outdir and passes everything under it.
+        Fix round 1 (task A6 review, C1): a job's own `--outdir` can already sit more than one
+        level inside the server's own outdir (`defaultOutdir()` in `app.js` defaults the form to
+        `~/video-out/<date>`, one level down on its own; task A6's own per-job subdirectory adds a
+        second), so "the run directory" can no longer mean "the first URL segment, a direct child
+        of the outdir" -- the page cannot even name that one segment without knowing where the
+        server's own root ends, which is why `/api/state` now carries `outdir` (`build_state`).
+        This route follows: "the run directory" is now *everything before the last `/`*, and the
+        file is everything after it.
 
-        1. there must be a run segment and a file after it;
-        2. `<outdir>/<run>` must resolve inside the outdir -- this is what stops `..`;
-        3. it must be a **direct child** of the outdir. `/media//x`, `/media/./x` and
-           `/media/%2e/x` all resolve `<outdir>/<run>` to the outdir itself, and without this line
-           they served the whole output tree, `queue/logs/*.log` and `queue/pending/*.json`
-           included. Verified live before the fix, on all three spellings;
-        4. it must not be the queue, compared **by inode** (`os.path.samefile`) rather than by
-           path. `queue/` *is* a direct child of the outdir, so check 3 lets
-           `/media/queue/pending/<id>.json` through on its own -- and comparing the resolved paths
-           as text let `/media/QUEUE/...` through as well, because `Path.resolve()` does not
-           canonicalise case and this machine's volume is case-insensitive. `samefile` answers the
-           question the filesystem actually decides: on that same pair, path equality is `False`
-           and `samefile` is `True`;
+        Five checks, run in this order:
+
+        1. there must be a run segment and a file after it (`rpartition`'s own `not separator`);
+        2. no component of the **literal, unresolved** run path may be `.`, `..` or empty. This is
+           new here and it is not optional now that the run path can be more than one segment:
+           `resolve_within` alone answers "does this resolve inside the outdir", and
+           `run-a/../run-b` resolves to a path that is perfectly, legitimately inside the outdir --
+           `run-b`'s own directory -- while still being exactly the escape-from-one-run-into-
+           another review circle 1 first found (`test_media_cannot_step_out_of_one_run_into_
+           another`). The three collapsing spellings that check found (`//x`, `/./x`, `/%2e/x`)
+           are refused by the same rule: each puts an empty or `.` component in the run path;
+        3. `<outdir>/<run>` must resolve inside the outdir -- this is what stops a run path that
+           starts with enough literal `..` components to leave it entirely (`../../etc/passwd`);
+        4. it must not *be* the outdir itself, and it must not be the queue or anything inside the
+           queue, decided by inode identity (`_is_within`) at every level from the run directory up
+           to the outdir -- not by comparing resolved path text, which is wrong on a case-
+           insensitive volume (`_is_same_file`'s own docstring) and was already wrong before this
+           fix for the exact-match case; walking every ancestor is what makes `queue/logs/x.jpg`
+           refused exactly as `queue` itself already was, now that "inside the queue" is not
+           bounded to one level either;
         5. and the file itself must be one of `MEDIA_SUFFIXES` (in `_serve_file`), which is what
            makes the whole set survive a directory nobody thought of -- check 4 is a denylist by
            identity, and a denylist only ever covers the names someone listed.
@@ -2123,9 +2641,10 @@ class _Handler(BaseHTTPRequestHandler):
         the resolution is what held. `test_the_suffix_and_the_bytes_come_from_the_same_path` pins
         the property the five checks rest on.
 
-        The tail after the run segment is deliberately *not* flattened: a run directory has
+        The tail after the run path is deliberately *not* flattened further: a run directory has
         subdirectories of its own (`checkpoints/`), and everything below it is still inside it --
-        `19-real-run/checkpoints/step05.jpg` is a legitimate preview frame.
+        `19-real-run/checkpoints/step05.jpg` is a legitimate preview frame, and so, now, is
+        `2026-08-12/20260813-1435-kot-italy/h3-kot-italy-896x576.mp4`.
 
         **Threat model: the run directory is trusted.** A *hard* link named `clip.mp4` inside it,
         pointing at `queue/pending/<id>.json` or anywhere else on the volume, is served, and
@@ -2137,20 +2656,29 @@ class _Handler(BaseHTTPRequestHandler):
         the perimeter. What this route defends is the *remote* caller: a browser on someone else's
         page, which can send URLs and nothing else.
         """
-        run, separator, rest = relative.partition("/")
-        if not separator or not rest:
+        directory, separator, filename = relative.rpartition("/")
+        if not separator or not filename:
             return 404, "application/json", _error_bytes(
                 "not_found", "a media URL is /media/<run>/<file>", {"path": relative})
-        outdir = Path(self.server.outdir).resolve()
-        run_dir = resolve_within(Path(self.server.outdir) / run, {"outdir": outdir}, write=False)
-        if run_dir.parent != outdir or _is_same_file(run_dir, self.server.queue_root):
+        if any(part in ("", ".", "..") for part in directory.split("/")):
             raise CliError(
                 "path_outside_root",
-                f"/media serves one run's directory directly under the output directory, and "
-                f"{run!r} is not one",
-                {"path": relative, "run": run, "resolved": str(run_dir), "outdir": str(outdir)},
+                f"/media does not accept an empty, . or .. segment in a run's own path: "
+                f"{relative!r}",
+                {"path": relative, "run": directory},
             )
-        return _serve_file(run_dir, rest, suffixes=MEDIA_SUFFIXES)
+        outdir = Path(self.server.outdir).resolve()
+        run_dir = resolve_within(Path(self.server.outdir) / directory, {"outdir": outdir},
+                                 write=False)
+        if run_dir == outdir or _is_within(run_dir, self.server.queue_root):
+            raise CliError(
+                "path_outside_root",
+                f"/media serves one run's directory inside the output directory, and {directory!r} "
+                f"is not one",
+                {"path": relative, "run": directory, "resolved": str(run_dir),
+                 "outdir": str(outdir)},
+            )
+        return _serve_file(run_dir, filename, suffixes=MEDIA_SUFFIXES)
 
     def send_error(self, code, message=None, explain=None) -> None:
         """JSON, never the HTML page `BaseHTTPRequestHandler` would otherwise produce.
@@ -2167,14 +2695,45 @@ class _Handler(BaseHTTPRequestHandler):
                                 {"status": status, "explain": explain} if explain else
                                 {"status": status}))
 
+    def _cache_control(self, status: int) -> str:
+        """`no-store` for everything, and one exception: a file this route actually served
+        from a run directory.
+
+        `no-store` is the right default and stays the default -- the page is polled every 20
+        seconds and the queue changes under it, so a cached `/api/state` would show a worker
+        that stopped an hour ago, and a cached `app.js` would outlive the `h3 web` restart that
+        shipped a new one.
+
+        The exception is the one place where it cost rather than bought (task C3, C2 review):
+        the page redraws its result cards on every poll and writes the same `<img src>` back
+        into the DOM, so under blanket `no-store` an evening of ten finished runs re-fetched ten
+        preview frames three times a minute for bytes that cannot have changed. `MEDIA_MAX_AGE`
+        says why they cannot.
+
+        **Only 200, and only under `/media`.** A refusal is never cached, and the case that
+        makes that matter rather than a formality is the 404: the commonest one this route
+        answers is a preview frame the run has not written *yet*, and a cached one would keep
+        that card blank for the rest of the evening -- the browser would stop asking, and the
+        frame that appeared two minutes later would never be fetched.
+
+        The path is unquoted first, exactly as `_route_get` unquotes it before matching, so this
+        answer cannot disagree with the route that produced the body. `getattr` because
+        `send_error` reaches `_send` on a request line the base class failed to parse, where
+        there is no `self.path` at all.
+        """
+        if status != 200:
+            return "no-store"
+        path = urllib.parse.unquote(urllib.parse.urlsplit(getattr(self, "path", "")).path)
+        if not path.startswith("/media/"):
+            return "no-store"
+        return f"public, max-age={MEDIA_MAX_AGE}, immutable"
+
     def _send(self, status: int, content_type: str, body: bytes) -> None:
         """One place that writes a response, so `Content-Length` cannot be forgotten on one path."""
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        # The page is polled every 20 seconds and the queue changes under it; a cached `/api/state`
-        # would show a worker that stopped an hour ago.
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", self._cache_control(status))
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)

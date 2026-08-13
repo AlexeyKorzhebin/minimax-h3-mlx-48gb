@@ -66,6 +66,12 @@ LOG_TAIL_LINES = 40
 #: queue page, unlike this module's exception messages (see the module docstring).
 RESULT_RECOVERED_NOTE = "результат найден на диске, отметка потеряна"
 
+#: Name of the marker file directly under the queue root whose mere *existence* means "paused" --
+#: see `is_paused`. A bare name, not a path: every caller reaches it through `is_paused`/
+#: `set_paused`, so nothing outside this module needs to know it lives at the root rather than,
+#: say, under `leases/`.
+PAUSED_MARKER_NAME = "paused"
+
 
 class QueueError(Exception):
     """Base class for every refusal this module raises."""
@@ -76,7 +82,18 @@ class JobNotPending(QueueError):
 
 
 class OutputStemConflict(QueueError):
-    """Raised when `output_stem` is already claimed by a queued job or a file on disk."""
+    """Raised when `output_stem` is already claimed by a queued job or a file on disk.
+
+    `output_stem` is carried as an attribute, not just folded into the message: `submit` (task A6)
+    raises this against the *relocated* stem -- the job's own subdirectory included -- which a
+    caller reporting "which name is taken" (`web.py`'s `queue_write_errors`) needs verbatim rather
+    than reconstructed, and reconstructing it from `str(exc)` would parse a sentence this module's
+    own docstring says is not a contract (see the module docstring's "Exception messages" note).
+    """
+
+    def __init__(self, output_stem: str):
+        self.output_stem = output_stem
+        super().__init__(f"output_stem already claimed: {output_stem}")
 
 
 @dataclass(frozen=True)
@@ -185,21 +202,158 @@ def _tag_from_args(args: list[str]) -> str | None:
     return None
 
 
+#: The subdirectory `submit` gives every job's own output: `<outdir>/<YYYYMMDD-HHMM>-<slug>/`.
+#: Minute precision -- not `_stamp`'s seconds -- because a human reading directory names on disk
+#: does not need second-level uniqueness: the slug already separates two jobs queued in the same
+#: minute under different tags, and `submit`'s own id-claim retry loop (not this string) is what
+#: actually guarantees the *job*'s uniqueness. Matched by `_base_outdir` so that a job resubmitted
+#: from another job's own, already-relocated `args` -- `_duplicate_job` in `web.py` does exactly
+#: this, reusing the source job's `args` verbatim except for `--tag` -- gets a subdirectory that is
+#: a *sibling* of the source's, not nested inside it.
+_JOB_SUBDIR_RE = re.compile(r"^\d{8}-\d{4}-[a-z0-9-]+$")
+
+
+def _dir_stamp(created_at: str) -> str:
+    """`created_at` as `YYYYmmdd-HHMM` -- the timestamp half of a job's own output subdirectory.
+    Coarser than `_stamp` (seconds, used for the job id itself) on purpose; see `_JOB_SUBDIR_RE`.
+    """
+    return datetime.fromisoformat(created_at).strftime("%Y%m%d-%H%M")
+
+
+def _base_outdir(outdir: Path) -> Path:
+    """`outdir` with a trailing job subdirectory stripped, or `outdir` itself if its last
+    component does not look like one `submit` created (`_JOB_SUBDIR_RE`).
+
+    Without this, duplicating a job would nest the copy's subdirectory inside the source's rather
+    than beside it -- `_duplicate_job` (`web.py`) resubmits the source job's own `args`, whose
+    `--outdir` this module already relocated once, so the naive "always append a fresh
+    subdirectory onto whatever `--outdir` already says" reading of this feature would grow one
+    level deeper every time a job already sitting under a job subdirectory is duplicated again.
+    """
+    return outdir.parent if _JOB_SUBDIR_RE.fullmatch(outdir.name) else outdir
+
+
+def _last_outdir_token(args: list[str]) -> tuple[int, bool] | None:
+    """Where `--outdir`'s value sits in `args`: `(index, inline)`. `inline` means the
+    `--outdir=value` spelling, where the value is `args[index]` itself past the `=`; otherwise the
+    value is the separate token `args[index]`, one past the flag.
+
+    The *last* occurrence, matching argparse's own "a repeated flag, last spelling wins" rule: an
+    earlier, now-dead occurrence -- `check_path_flags` (`web.py`) rewrites every occurrence it
+    finds without removing any, so a caller can arrive here with `--outdir` twice -- must not be
+    the one this module edits, or the value the CLI will actually resolve is left untouched while
+    a value nothing reads gets the new subdirectory.
+
+    `None` if `args` has no `--outdir` at all: `_relocate_to_job_subdir` then falls back to the
+    dry-run report's own `output_stem`, which already names the directory the CLI actually
+    resolved -- its own default, for a caller that left the flag out.
+    """
+    found = None
+    for i, token in enumerate(args):
+        if token == "--outdir" and i + 1 < len(args):
+            found = (i + 1, False)
+        elif token.startswith("--outdir="):
+            found = (i, True)
+    return found
+
+
+def _relocate_to_job_subdir(args: list[str], output_stem: str,
+                            created_at: str) -> tuple[list[str], str]:
+    """Rewrite (or add) `--outdir` in `args` to `<base>/<YYYYMMDD-HHMM>-<slug>`, and return the
+    matching `output_stem` alongside the rewritten `args` -- `submit`'s "every job gets its own
+    output subdirectory" feature, in full.
+
+    `<base>` is *not* whatever `--outdir` already says in `args`: it is that value with any
+    existing job subdirectory stripped first (`_base_outdir`), so a duplicated job's own copy of
+    `args` -- which already names its source's subdirectory -- lands beside it, not inside it.
+
+    The directory is read off `output_stem` (`dry_run_report["output_stem"]`'s own parent) rather
+    than by parsing `--outdir` back out of `args` a second time: `prepare_submission` (`web.py`)
+    already guarantees the two agree -- `output_stem` is `outdir / f"h3-{tag}-{W}x{H}"`, computed
+    by the CLI's own dry run against exactly the `--outdir` in `args` -- and reading it off
+    `output_stem` instead also covers the one case where `args` carries no `--outdir` at all: the
+    report still names the directory the CLI's own default resolved to, which `args` alone cannot.
+
+    Only the filename half of `output_stem` (`h3-<tag>-<W>x<H>`) survives untouched; everything
+    about *where* it lives is replaced by the new subdirectory.
+    """
+    old_outdir = Path(output_stem).parent
+    base = _base_outdir(old_outdir)
+    subdir = f"{_dir_stamp(created_at)}-{_slug(_tag_from_args(args))}"
+    new_outdir = base / subdir
+    new_output_stem = str(new_outdir / Path(output_stem).name)
+
+    args = list(args)
+    token = _last_outdir_token(args)
+    if token is None:
+        args.extend(["--outdir", str(new_outdir)])
+    else:
+        index, inline = token
+        args[index] = f"--outdir={new_outdir}" if inline else str(new_outdir)
+    return args, new_output_stem
+
+
 def layout(root) -> dict[str, Path]:
     """Create every directory the queue needs under `root` and return their paths.
 
     Idempotent: called by `submit` and `scan` on every invocation (`root` may not exist yet the
     first time either runs), and safe to call again by hand, e.g. from a test that wants a queue
     on disk before writing a job file into it directly.
+
+    **A queue root that did not exist yet is created paused** (`set_paused(root, True)`, once,
+    only on this first call): a brand-new queue is one nobody has looked at, and a job submitted
+    to it before a human has seen the page should not start a multi-hour run unattended. The check
+    is "did `root` itself exist before this call", not "is the marker missing" -- `main_loop` calls
+    `layout` on every worker startup (see its docstring), and a marker a human explicitly removed
+    to resume the queue must not be resurrected by the next restart. An *existing* root is left
+    exactly as paused or unpaused as it already was, however incomplete its subdirectories are --
+    `root` existing at all is proof `layout` (or `submit`) ran here before, so there is nothing
+    "fresh" left to default.
     """
     root = Path(root)
+    freshly_created = not root.is_dir()
     root.mkdir(parents=True, exist_ok=True)
     paths = {"root": root}
     for name in ("pending", "running", "done", "failed", "leases", "results", "prompts", "logs"):
         path = root / name
         path.mkdir(parents=True, exist_ok=True)
         paths[name] = path
+    if freshly_created:
+        set_paused(root, True)
     return paths
+
+
+def is_paused(root) -> bool:
+    """Whether the queue at `root` is paused: does `<root>/paused` exist.
+
+    A missing marker means "not paused" -- **deliberately the safe direction**. The marker carries
+    no content and nothing durable-writes it (see `set_paused`), so a plain crash cannot corrupt it
+    the way a job file can; what can make it disappear is a human clearing the queue directory by
+    hand, a backup that drops zero-length files, or any other loss nobody asked for. Losing "paused"
+    resumes the queue, which a human watching the page notices within one `poll` interval and can
+    re-pause; losing "running" would leave the queue silently idle with a free GPU and no worker
+    ever explaining why nothing moves -- there is no poll interval that surfaces an *absence* of
+    activity as loudly as `unloadBanner`'s plate flags a *presence* of one. `main_loop` calls this,
+    not the reverse, at the top of every iteration -- see its docstring for exactly where.
+    """
+    return (Path(root) / PAUSED_MARKER_NAME).exists()
+
+
+def set_paused(root, value: bool) -> None:
+    """Create (`value=True`) or remove (`value=False`) `<root>/paused`.
+
+    Not routed through `write_text_durably`: the marker's only fact is whether the file exists, and
+    an interrupted `touch`/`unlink` leaves it either fully present or fully absent, never a
+    half-written mixture the way a truncated job file can be -- there is no partial state for a
+    crash to land in. `main_loop` polls `is_paused` again every `poll` seconds regardless, so even
+    the "wrong" outcome of an interrupted call self-heals on the next iteration rather than sticking.
+    """
+    path = Path(root) / PAUSED_MARKER_NAME
+    if value:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def write_text_durably(path, text: str) -> None:
@@ -341,15 +495,24 @@ def submit(root, args: list[str], note: str, dry_run_report: dict, estimate: dic
     other failure between the id claim and the final durable write (a full disk, a `write_text_durably`
     crash) is still possible, so everything from the claim onward is wrapped to unclaim the id and
     remove any prompt snapshot already written before the failure propagates.
+
+    **`submit` also gives the job its own output subdirectory.** Before anything else in `args` is
+    trusted, `--outdir` is rewritten (or added, if absent) to `<base>/<YYYYMMDD-HHMM>-<slug>` --
+    see `_relocate_to_job_subdir` -- and `output_stem` is rewritten to match. This is `submit`'s
+    own doing, not `h3 generate`'s: a direct CLI invocation, or a job already sitting in the queue
+    from before this feature existed, is never touched. The relocation happens ahead of the
+    `output_stem` conflict check, so what is actually checked -- and actually stored -- is the path
+    the run will actually write, subdirectory included.
     """
     root = Path(root)
     layout(root)
     output_stem = str(dry_run_report["output_stem"])
 
     with queue_lock(root, exclusive=True):
-        if _stem_taken(root, output_stem):
-            raise OutputStemConflict(f"output_stem already claimed: {output_stem}")
-
+        # Checked on the args exactly as the caller passed them, before `_relocate_to_job_subdir`
+        # ever touches `--outdir`: that call appends a token when `--outdir` is absent, and doing
+        # it first would make `--prompt-file` (itself the *last* token, with no value) look like it
+        # had one -- the appended `--outdir` -- and this refusal would never fire.
         if prompt_text is not None:
             if "--prompt-file" not in args or args.index("--prompt-file") + 1 >= len(args):
                 raise QueueError(
@@ -358,6 +521,11 @@ def submit(root, args: list[str], note: str, dry_run_report: dict, estimate: dic
                 )
 
         created_at = now() if now is not None else _now()
+        args, output_stem = _relocate_to_job_subdir(args, output_stem, created_at)
+
+        if _stem_taken(root, output_stem):
+            raise OutputStemConflict(output_stem)
+
         stamp = _stamp(created_at)
         slug = _slug(_tag_from_args(args))
 
@@ -861,7 +1029,7 @@ def update(root, job_id: str, args: list[str], note: str, dry_run_report: dict, 
             raise JobNotPending(f"job {job_id} is not pending")
         current = _load_job_or_raise(pending, "pending")
         if _stem_taken(root, output_stem, exclude_id=job_id):
-            raise OutputStemConflict(f"output_stem already claimed: {output_stem}")
+            raise OutputStemConflict(output_stem)
 
         if prompt_text is not None:
             if "--prompt-file" not in args or args.index("--prompt-file") + 1 >= len(args):

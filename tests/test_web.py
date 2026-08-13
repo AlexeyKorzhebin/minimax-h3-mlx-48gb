@@ -467,6 +467,16 @@ def test_api_state_reports_a_run_in_flight(server, monkeypatch):
         [("in_flight", 3, 7)]
 
 
+def test_api_state_reports_the_servers_own_outdir(server):
+    """Task A6, fix round 1 (C1). The page cannot build a `/media` link for a job whose own
+    subdirectory sits more than one level inside `--outdir` without knowing where the server's
+    own root ends -- `output_stem` alone, an absolute path, gives no such boundary. `build_state`'s
+    own docstring explains why this has to be resolved exactly the way `_media` resolves it.
+    """
+    _, body = _json(server, "/api/state")
+    assert body["outdir"] == str(server.outdir.resolve())
+
+
 def test_a_queue_that_cannot_be_read_is_a_500_naming_the_directory(server, monkeypatch):
     def unreadable(root):
         raise PermissionError(13, "Permission denied")
@@ -486,6 +496,66 @@ def test_an_unexpected_exception_becomes_json_with_its_type(server, monkeypatch)
     assert body["error"]["code"] == "internal_error"
     assert body["error"]["detail"]["type"] == "RuntimeError"
     assert "boom" not in json.dumps(body), "the message can carry a prompt or a path; only the type"
+
+
+# -- Task A5: pause/start the queue ---------------------------------------------------------------
+
+
+def test_api_state_reports_paused_true_for_a_freshly_created_queue(server):
+    """The `server` fixture's queue is created by `q.layout` and never touched afterward -- see
+    `queue.layout`'s docstring for why that must leave a brand-new queue paused.
+    """
+    _, body = _json(server, "/api/state")
+    assert body["paused"] is True
+
+
+def test_api_state_reports_paused_true_when_the_queue_root_does_not_exist_yet(tmp_path):
+    """Review round 1, Important. The `server` fixture above runs `q.layout` before the server
+    ever answers a request, so it cannot see the real window this closes: `h3 web` started, no
+    job submitted yet, no worker started yet -- nothing has called `q.layout(queue_root)`, so the
+    directory does not exist on disk at all. `q.is_paused` alone answers `False` there (a missing
+    marker is "not paused", its own deliberately safe direction -- see its docstring), and
+    `build_state` used to pass that straight through: the very first `/api/state` a human's browser
+    ever saw would say the queue is running, and the page would offer «⏸ Приостановить» for a
+    queue that, the instant anything actually creates it, starts paused (`queue.layout`'s own
+    contract). This builds its own server, deliberately skipping `q.layout` -- `server`'s fixture
+    calling it up front is exactly what let this window go uncovered.
+    """
+    outdir = tmp_path / "outdir"
+    outdir.mkdir()
+    root = outdir / "queue"
+    assert not root.exists(), "the whole point is a queue root nothing has created yet"
+    live = _serve(root, outdir)
+    try:
+        _, body = _json(live, "/api/state")
+        assert body["paused"] is True, (
+            "a queue root that does not exist yet must still answer paused=True -- it will be "
+            "created paused the instant anything (a submit, a worker) actually creates it")
+    finally:
+        live.httpd.shutdown()
+        live.httpd.server_close()
+
+
+def test_post_queue_pause_and_start_toggle_the_marker_and_report_it(server):
+    status, body = _json(server, "/api/queue/pause", method="POST")
+    assert status == 200 and body == {"ok": True, "paused": True}, body
+    assert q.is_paused(server.queue_root) is True, "the route must actually touch the marker file"
+
+    status, body = _json(server, "/api/queue/start", method="POST")
+    assert status == 200 and body == {"ok": True, "paused": False}, body
+    assert q.is_paused(server.queue_root) is False
+
+    _, state = _json(server, "/api/state")
+    assert state["paused"] is False, "/api/state must see the same marker the routes just cleared"
+
+
+def test_post_queue_pause_is_idempotent(server):
+    """A slow response and an impatient click can send the request twice; the second call must not
+    raise, and both must agree on the answer.
+    """
+    first = _json(server, "/api/queue/pause", method="POST")
+    second = _json(server, "/api/queue/pause", method="POST")
+    assert first == second == (200, {"ok": True, "paused": True})
 
 
 # -- Step 5/6: static, media, and traversal ------------------------------------------------------
@@ -919,6 +989,67 @@ def test_responses_carry_a_content_length_and_forbid_caching(server):
     status, headers, body = _request(server, "/api/state")
     assert status == 200
     assert int(headers["Content-Length"]) == len(body)
+    assert headers["Cache-Control"] == "no-store"
+
+
+@pytest.mark.parametrize("url", ["/api/state", "/static/app.js", "/static/style.css", "/"])
+def test_everything_the_page_polls_still_refuses_to_be_cached(server, url):
+    """The paired half of the rule below: only `/media` was let out, not caching in general.
+
+    `/api/state` is the whole point of `no-store` -- a cached one shows a worker that stopped an
+    hour ago -- and the three page files are the ones a browser would otherwise keep across a
+    `h3 web` restart that shipped a new `app.js`.
+    """
+    status, headers, _ = _request(server, url)
+    assert status == 200, f"{url} answered {status}, so this test proves nothing about it"
+    assert headers["Cache-Control"] == "no-store", url
+
+
+def test_a_served_media_file_may_be_cached_because_a_run_never_rewrites_one(server):
+    """C2 review: the cards re-requested every preview frame on every 20-second poll.
+
+    The page redraws its cards on each poll and writes the same `<img src>` back into the DOM.
+    Under blanket `no-store` that is one GET per card per poll for bytes that cannot have
+    changed: a preview frame carries its pass number in its own file name and a clip is written
+    once, when the run ends. Nothing under a run directory is rewritten in place, which is
+    exactly the precondition `immutable` states.
+    """
+    run = server.outdir / "19-run"
+    run.mkdir()
+    (run / "h3-x-preview-step05.jpg").write_bytes(b"\xff\xd8jpg")
+    status, headers, body = _request(server, "/media/19-run/h3-x-preview-step05.jpg")
+    assert status == 200 and body == b"\xff\xd8jpg"
+    cache = headers["Cache-Control"]
+    assert "no-store" not in cache, f"the frame is still uncacheable: {cache!r}"
+    assert "immutable" in cache, f"a run's file never changes, and the header must say so: {cache!r}"
+    age = re.search(r"max-age=(\d+)", cache)
+    assert age and int(age.group(1)) >= 3600, (
+        f"a lifetime shorter than an hour re-fetches within one evening's queue: {cache!r}")
+
+
+def test_a_media_frame_that_does_not_exist_yet_is_never_cached(server):
+    """The 404 must stay uncacheable, and this is the case that makes it matter rather than a
+    formality: the commonest 404 this route answers is a preview frame the run has not written
+    **yet**. A cached one would keep that card blank for the rest of the evening -- the browser
+    would stop asking, and the frame that appeared two minutes later would never be fetched.
+    """
+    run = server.outdir / "19-run"
+    run.mkdir()
+    status, headers, _ = _request(server, "/media/19-run/h3-x-preview-step05.jpg")
+    assert status == 404
+    assert headers["Cache-Control"] == "no-store"
+    # And once it lands, the same URL is cacheable -- otherwise the rule above is unreachable.
+    (run / "h3-x-preview-step05.jpg").write_bytes(b"\xff\xd8jpg")
+    status, headers, _ = _request(server, "/media/19-run/h3-x-preview-step05.jpg")
+    assert status == 200 and "immutable" in headers["Cache-Control"]
+
+
+def test_a_refused_media_url_is_not_cached_either(server):
+    """A traversal refusal is a 400, and a cached one would outlive the fix for whatever made the
+    page ask for it. Same reasoning as the 404 above, one status along.
+    """
+    status, headers, _ = _request(server, "/media/../../etc/passwd")
+    assert status == 400
     assert headers["Cache-Control"] == "no-store"
 
 
@@ -1784,20 +1915,38 @@ def test_posting_a_job_whose_output_name_is_taken_is_refused(queue_server):
 
 
 def test_editing_a_job_into_a_name_another_job_holds_is_refused(queue_server):
-    _queue_a_job(queue_server, tag="первая")
+    """Task A6: `submit` gives every job its own output subdirectory, so two jobs no longer share
+    one just by sharing a tag (`_job_args` always names a fresh `--outdir`, and `update` never
+    relocates it -- see `queue._relocate_to_job_subdir`'s docstring). The collision this test is
+    about still has to be refusable, though -- a human can still point an edit at *another job's*
+    own directory by hand -- so the edit below names `first`'s own `--outdir` explicitly, which is
+    exactly what the page's edit form would send (it pre-fills `#outdir` from `argValue(job.args,
+    "--outdir")`, i.e. the job's own, already-relocated directory).
+    """
+    first = _queue_a_job(queue_server, tag="первая")
     second = _queue_a_job(queue_server, tag="вторая")
+    first_outdir = str(Path(first["output_stem"]).parent)
     status, answer = _call(queue_server, "PUT", f"/api/jobs/{second['id']}",
-                           {"args": _job_args(queue_server, tag="первая"), "note": ""})
+                           {"args": _job_args(queue_server, "--outdir", first_outdir, tag="первая"),
+                            "note": ""})
     assert status == 400 and answer["error"]["code"] == "output_stem_conflict", answer
+    assert answer["error"]["detail"]["output_stem"] == first["output_stem"]
 
 
 def test_editing_a_job_without_renaming_it_is_not_a_conflict(queue_server):
     """The paired case, and the common one: changing a seed or a note leaves the output name where
     it was, and a conflict check that did not exclude the job being edited would refuse it.
+
+    The edit names the job's *own* `--outdir` explicitly (task A6): `update` never relocates it on
+    its own, so an edit built the way the page really builds one -- reusing `argValue(job.args,
+    "--outdir")` -- is what actually leaves the output name unchanged, not `_job_args`'s own flat
+    default.
     """
     job = _queue_a_job(queue_server, tag="та-же")
+    own_outdir = str(Path(job["output_stem"]).parent)
     status, answer = _call(queue_server, "PUT", f"/api/jobs/{job['id']}",
-                           {"args": _job_args(queue_server, "--seed", "7", tag="та-же"),
+                           {"args": _job_args(queue_server, "--seed", "7", "--outdir", own_outdir,
+                                              tag="та-же"),
                             "note": ""})
     assert status == 200, answer
     assert answer["job"]["output_stem"] == job["output_stem"]
@@ -2100,6 +2249,44 @@ def test_a_job_that_does_not_name_an_outdir_at_all_is_refused(queue_server):
     assert _pending(queue_server) == []
 
 
+def test_submitting_when_the_servers_own_outdir_looks_like_a_job_subdirectory_is_refused(tmp_path):
+    """Fix round 1 (I2, review round 1, Important). `queue._base_outdir` strips a trailing
+    directory that matches `queue._JOB_SUBDIR_RE` before nesting a fresh one under it -- exactly
+    right when that directory is a job's own subdirectory from an earlier submission, and exactly
+    wrong when it is the server's *own* `--outdir`, which just happens to be spelled the same way
+    (a leftover job subdirectory promoted to `--outdir` by hand, say). Left unchecked, every job
+    submitted to a server started that way lands one level *above* the server's own root -- outside
+    every root this server may write to, and nothing here would ever notice.
+
+    The probe: a server whose `--outdir` is itself named like a job subdirectory
+    (`20260813-1200-run`), and an ordinary submission naming that same directory as `--outdir` (the
+    form's own default, `_job_args`'s convention throughout this suite). `queue.submit` would
+    relocate straight past the server's root; this must be refused before the job ever reaches
+    `pending/`.
+    """
+    outdir = tmp_path / "base" / "20260813-1200-run"
+    outdir.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    (repo / "prompts").mkdir(parents=True)
+    models = tmp_path / "models"
+    bake_adaln_table(models / "ckpt")
+    webui = tmp_path / "webui"
+    webui.mkdir()
+    root = q.layout(outdir / "queue")["root"]
+    live = _serve(root, outdir, repo=repo, models=models, webui=webui)
+    try:
+        status, answer = _call(live, "POST", "/api/jobs",
+                               {"args": _job_args(live, tag="кот"), "note": ""})
+        assert status == 400, answer
+        assert answer["error"]["code"] == "path_outside_root", answer
+        assert _pending(live) == [], "nothing must be queued when the relocation escapes the root"
+        assert list((tmp_path / "base").iterdir()) == [outdir], (
+            "no stray directory may appear beside the server's own outdir")
+    finally:
+        live.httpd.shutdown()
+        live.httpd.server_close()
+
+
 def test_the_estimate_route_reads_the_bit_width_through_the_resolved_checkpoint(queue_server,
                                                                                 monkeypatch):
     """One request must not be quoted at 4 bits here and 8 bits on submission. `--checkpoint
@@ -2207,15 +2394,87 @@ def test_no_page_file_names_an_address_off_this_machine(name):
     assert not found, f"{name} names an external address: {found}"
 
 
-def test_the_page_follows_the_system_theme_and_stops_moving_when_asked():
-    """Two media queries, both required by the brief and neither visible to any other test here.
+#: The section of style.css every color has to live inside (task C1, requirement 1 and 4).
+_TOKENS_START = "/* tokens */"
+_TOKENS_END = "/* /tokens */"
+#: A hex triple/quad/hextet/octet, or an `rgb(`/`rgba(` call -- the two shapes a color literal
+#: takes in this file. `#chat-input`-style ID selectors do not match: a hex run has to be at least
+#: three characters and end on a word boundary, and every ID in this file either starts with a
+#: non-hex letter (`t`, `s`, `l`, ...) or the hex-looking run bleeds into more word characters
+#: (`adaln` -> `ada` + `ln`, no boundary) -- see
+#: `test_the_color_literal_pattern_does_not_mistake_an_id_selector_for_a_color`.
+_COLOR_LITERAL = re.compile(r"#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)")
+#: How many lines back a `theme-invariant` comment may sit and still count as documenting the
+#: literal below it -- generous enough for a two-line `linear-gradient(...), linear-gradient(...)`
+#: declaration, tight enough that a marker can't drift away from what it excuses.
+_EXCEPTION_WINDOW = 3
 
-    Presentation only, so no mutation was run against this one -- it is a spelling check on the
-    stylesheet, not a claim about behaviour.
+
+def test_the_page_follows_the_system_theme_and_stops_moving_when_asked():
+    """Dark is the page's native theme (task C1): it sits on bare `:root`, unconditional, and the
+    light palette only ever applies from inside a query -- never as the page's own default.
+
+    The guard matters as much as the query: without `:not([data-theme="dark"])`, a system flip to
+    light would repaint over a person's own choice of dark the next time the OS setting changed,
+    because a media query re-evaluates continuously while an inline style does not.
+
+    Presentation only, so no mutation was run against the media-query assertions -- they are a
+    spelling check on the stylesheet, not a claim about behaviour. `test_next_theme_cycles_...`
+    and `test_theme_label_is_russian_for_all_three_states` below cover the logic with a mutation.
     """
     css = _page_text("style.css")
-    assert "@media (prefers-color-scheme: dark)" in css
+    assert "@media (prefers-color-scheme: light)" in css
+    assert ':root:not([data-theme="dark"])' in css
+    assert ':root[data-theme="light"]' in css, "an explicit light choice must survive a dark system"
+    assert ':root[data-theme="dark"]' in css, "an explicit dark choice must survive a light system"
     assert "@media (prefers-reduced-motion: reduce)" in css
+
+
+def test_the_color_literal_pattern_does_not_mistake_an_id_selector_for_a_color():
+    """`_COLOR_LITERAL` runs over the whole file outside the tokens block, including every `#id`
+    selector style.css writes (`#chat-input`, `#adaln`, `#tag`, ...). This pins the pattern itself
+    against a sample of the real ones, so a future edit to the regex is caught here first instead
+    of silently blinding `test_no_color_literal_lives_outside_the_tokens_block` to a real offender.
+    """
+    ids = ["#chat-input", "#chat-duration", "#adaln", "#tag", "#seed", "#lora-str", "#end-image",
+           "#ckpt", "#chat-attachment-label"]
+    for selector in ids:
+        assert not _COLOR_LITERAL.search(selector), f"{selector!r} was mistaken for a color"
+    # And the pattern still has to catch real literals, or the exclusion above proves nothing.
+    for literal in ["#fff", "#0a0b0c", "rgba(0,0,0,.3)", "rgb(1,2,3)"]:
+        assert _COLOR_LITERAL.search(literal), f"{literal!r} should have matched"
+
+
+def test_no_color_literal_lives_outside_the_tokens_block():
+    """Requirement 4: every hex/rgb(a) literal in style.css has to be a token value. Colors live in
+    exactly one place, so a re-theme is a block swap, not a grep-and-fix across a thousand lines.
+
+    A short, undocumented-by-default exception survives review deliberately: a handful of glyphs
+    (a checkmark on a status dot, the toggle-knob face, the neutral `color-mix` darkening operator)
+    are painted against another *token's* own saturated fill rather than against page ink or
+    background, so they read fine in both themes without inverting. Each survivor is marked
+    `theme-invariant` in an English comment within a few lines of the literal it excuses -- an
+    undocumented literal still fails this test, which is the point: the exception has to be a
+    conscious, reviewable decision each time, not a silent hole in the check.
+    """
+    css = _page_text("style.css")
+    assert css.count(_TOKENS_START) == 1 and css.count(_TOKENS_END) == 1, (
+        "style.css must carry the /* tokens */ ... /* /tokens */ markers exactly once each")
+    start = css.index(_TOKENS_START)
+    end = css.index(_TOKENS_END, start) + len(_TOKENS_END)
+    assert start < end, "the markers must appear in order, open before close"
+    body = css[:start] + css[end:]
+
+    lines = body.splitlines()
+    offenders = []
+    for i, line in enumerate(lines):
+        if not _COLOR_LITERAL.search(line):
+            continue
+        window = "\n".join(lines[max(0, i - _EXCEPTION_WINDOW):i + 1])
+        if "theme-invariant" in window:
+            continue
+        offenders.append((i + 1, line.strip()))
+    assert not offenders, f"undocumented color literal(s) outside /* tokens */: {offenders}"
 
 
 def test_the_page_asks_for_its_own_routes_in_a_way_the_provenance_check_accepts():
@@ -2270,6 +2529,102 @@ def test_the_page_module_imports_outside_a_browser():
 
 
 @_needs_node
+def test_next_theme_cycles_system_dark_light_and_back():
+    """Requirement 2: exactly three states, system -> dark -> light -> system, forever. A fourth
+    click has to land back on `dark`, not drift or repeat a state out of order.
+    """
+    order = _node_eval(
+        'let v = "system"; const seen = [v];'
+        'for (let i = 0; i < 4; i++) { v = app.nextTheme(v); seen.push(v); }'
+        'console.log(JSON.stringify(seen));')
+    assert order == ["system", "dark", "light", "system", "dark"]
+
+
+@_needs_node
+def test_next_theme_recovers_from_an_unrecognised_stored_value():
+    """A `localStorage` value this version of the switcher never wrote (hand-edited, or left by a
+    future version) must not wedge the cycle -- it has to fall back into the loop, never throw and
+    never return `undefined`.
+    """
+    value = _node_eval('console.log(JSON.stringify(app.nextTheme("purple")));')
+    assert value in ("system", "dark", "light")
+
+
+@_needs_node
+def test_theme_label_is_russian_for_all_three_states():
+    """Requirement 2: the switcher's own caption, in the tone of the rest of the page's Russian."""
+    labels = _node_eval(
+        'console.log(JSON.stringify(["system", "dark", "light"].map(app.themeLabel)));')
+    assert labels == ["Системная", "Тёмная", "Светлая"]
+
+
+@_needs_node
+def test_theme_label_falls_back_to_system_for_an_unrecognised_value():
+    label = _node_eval('console.log(JSON.stringify(app.themeLabel("purple")));')
+    assert label == "Системная"
+
+
+@_needs_node
+def test_media_serves_the_clip_from_a_jobs_own_subdirectory(server):
+    """Task A6, end to end: `submit` gave this job its own subdirectory, and the page's own
+    `clipUrl` (app.js) -- not a hand-rolled reimplementation of it -- has to build a URL `/media`
+    actually serves, not merely one that looks plausible.
+
+    `--outdir` here is the server's own outdir directly, exactly as every other submission fixture
+    in this suite builds it (`_job_args`, `_submit_job` in `test_chat_web.py`): task A6 nests the
+    job's own subdirectory one level under that. `outdir` for `clipUrl` comes from `/api/state`
+    (`build_state`'s own field, fix round 1), exactly as the real page reads it -- not a value this
+    test already knows independently, which would prove nothing about the wire-up.
+    """
+    job = q.submit(server.queue_root, ["generate", "--tag", "kot-italy"], "",
+                   {"output_stem": str(server.outdir / "h3-kot-italy-896x576")}, {})
+    result_dir = Path(job.output_stem).parent
+    assert result_dir.parent == server.outdir, (
+        "the fixture must produce a job whose own subdirectory sits directly under the outdir")
+    result_dir.mkdir(parents=True, exist_ok=True)
+    Path(f"{job.output_stem}.mp4").write_bytes(b"\x00mp4")
+
+    _, state = _json(server, "/api/state")
+    url = _node_eval(
+        f"console.log(JSON.stringify(app.clipUrl({json.dumps(job.as_dict())}, "
+        f"{json.dumps(state['outdir'])})));")
+    assert url is not None, "clipUrl must still build a link for a relocated job"
+
+    status, headers, body = _request(server, url)
+    assert status == 200 and body == b"\x00mp4", (status, url, body[:40])
+
+
+@_needs_node
+def test_media_serves_the_clip_when_the_forms_own_outdir_already_nests_a_folder(server):
+    """Fix round 1 (C1), the review's own live probe. `defaultOutdir()` (app.js) suggests
+    `~/video-out/<date>` for the form's `--outdir` -- one level below the server's own root on its
+    own -- and task A6 nests the job's own subdirectory *inside that*, a second level. `clipUrl`
+    used to guess "run" by counting segments from the end of `output_stem` and got this case wrong
+    (it named the date folder as "run" and dropped the job's own subdirectory entirely); this pins
+    the fix with a real `/media` request against a real file, not by inspecting the URL string.
+    """
+    form_outdir = server.outdir / "2026-08-13"
+    job = q.submit(server.queue_root,
+                   ["generate", "--tag", "kot-italy", "--outdir", str(form_outdir)], "",
+                   {"output_stem": str(form_outdir / "h3-kot-italy-896x576")}, {})
+    result_dir = Path(job.output_stem).parent
+    assert result_dir.parent == form_outdir and result_dir.parent.parent == server.outdir, (
+        "the fixture must actually exercise two levels of nesting below the server's own outdir, "
+        "or this test cannot tell depth 1 from depth 2 apart")
+    result_dir.mkdir(parents=True, exist_ok=True)
+    Path(f"{job.output_stem}.mp4").write_bytes(b"\x00mp4")
+
+    _, state = _json(server, "/api/state")
+    url = _node_eval(
+        f"console.log(JSON.stringify(app.clipUrl({json.dumps(job.as_dict())}, "
+        f"{json.dumps(state['outdir'])})));")
+    assert url is not None, "clipUrl must build a link two levels deep"
+
+    status, headers, body = _request(server, url)
+    assert status == 200 and body == b"\x00mp4", (status, url, body[:40])
+
+
+@_needs_node
 def test_the_poll_interval_is_the_twenty_seconds_the_spec_asks_for():
     assert _node_eval("console.log(JSON.stringify(app.POLL_MS));") == 20000
 
@@ -2306,11 +2661,24 @@ def test_the_form_keeps_its_values_and_moves_on_to_the_next_seed_and_tag():
 
 
 @_needs_node
-def test_there_are_exactly_three_canvas_presets_draft_small_large():
+def test_there_are_six_canvas_presets_three_sizes_in_both_orientations():
+    """C2: три кнопки-пресета уступили место выпадашке, и в ней каждый из трёх размеров стоит
+    в обеих ориентациях.
+
+    До этой задачи вертикальный ролик приходилось набирать руками в оба поля, и набирался он
+    неправильно: 288×448 — это не «448×288 наоборот» для человека, который только что выбрал
+    черновик и хочет тот же черновик стоймя. Порядок пар (гориз., верт.) закреплён здесь же:
+    выпадашка читается сверху вниз, и размер обязан идти рядом со своим поворотом.
+    """
     presets = _node_eval("console.log(JSON.stringify(app.CANVAS_PRESETS));")
     assert [(p["key"], p["w"], p["h"]) for p in presets] == [
-        ("draft", 448, 288), ("small", 896, 576), ("large", 1344, 768),
+        ("draft", 448, 288), ("draft-v", 288, 448),
+        ("small", 896, 576), ("small-v", 576, 896),
+        ("large", 1344, 768), ("large-v", 768, 1344),
     ]
+    for preset in presets:
+        assert (preset["w"] > preset["h"]) is not preset["key"].endswith("-v"), (
+            f"{preset['key']} назван поворотом, которого у него нет: {preset}")
 
 
 @_needs_node
@@ -2320,9 +2688,297 @@ def test_applying_the_draft_preset_sets_448_by_288():
 
 
 @_needs_node
+def test_applying_a_vertical_preset_stands_the_canvas_on_its_short_side():
+    """Мутационная пара к тесту выше: пресет с ключом `-v` обязан отдать ту же пару чисел
+    перевёрнутой, а не ту же самую (или почти ту же — 288×449 не кратно 32 и до генератора
+    не доедет вовсе).
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify(["draft-v", "small-v", "large-v"]
+        .map((key) => app.applyCanvasPreset(key))));
+    """)
+    assert got == [{"width": 288, "height": 448}, {"width": 576, "height": 896},
+                   {"width": 768, "height": 1344}], got
+    for size in got:
+        assert size["width"] % 32 == 0 and size["height"] % 32 == 0, size
+
+
+@_needs_node
 def test_an_unknown_preset_key_is_not_silently_accepted():
     got = _node_eval('console.log(JSON.stringify(app.applyCanvasPreset("huge")));')
     assert got is None
+
+
+@_needs_node
+def test_every_canvas_preset_has_its_own_option_in_the_resolution_dropdown():
+    """Список в разметке и список в скрипте — один список.
+
+    Значения (`w`/`h`) живут в `CANVAS_PRESETS` и только там; подпись пункта пишет их для
+    человека, и разъехаться эти два списка не имеют права — выпадашка, обещающая «малое
+    896×576» и ставящая 1344×768, хуже отсутствующей.
+    """
+    page = _page_text("index.html")
+    select = re.search(r'<select[^>]*id="canvas-preset".*?</select>', page, re.S)
+    assert select, "разрешение выбирается выпадашкой #canvas-preset, а не кнопками-пресетами"
+    options = re.findall(r'<option value="([^"]+)"[^>]*>([^<]*)</option>', select.group(0))
+    keys = [value for value, _ in options]
+    assert keys[-1] == "custom", f"«своё…» — последний пункт списка, а список {keys}"
+
+    presets = _node_eval("console.log(JSON.stringify(app.CANVAS_PRESETS));")
+    assert keys[:-1] == [p["key"] for p in presets], (keys, [p["key"] for p in presets])
+    for (value, label), preset in zip(options, presets):
+        assert f'{preset["w"]}×{preset["h"]}' in label, (
+            f"пункт {value!r} подписан {label!r}, а пресет — {preset['w']}×{preset['h']}")
+    assert "data-preset=" not in page, "кнопки-пресеты заменены выпадашкой, а не дополнены ею"
+
+
+def test_typing_a_preset_sized_canvas_by_hand_does_not_lock_the_manual_fields_open():
+    """Правка по ревью C2, и это тупик, а не косметика.
+
+    Поля `#width`/`#height` доступны только под «своё…» — под пресетом их не видно и набрать
+    в них нечего. Значит ручной ввод всегда идёт при выбранном «своё…». Обработчик `input` при
+    этом перекидывал сам список на пресет, если числа с ним совпали: список говорил «малое
+    896×576», а поля ручного ввода оставались открытыми под ним. Хуже того, выйти из этого
+    состояния было уже нельзя — выбрать в списке «малое», чтобы поля закрылись, невозможно:
+    список уже стоит на «малое», `change` не срабатывает, и поля остаются открытыми до
+    перезагрузки страницы.
+
+    Поэтому пока открыт ручной ввод, в списке стоит «своё…» — что бы ни было набрано в полях.
+    Обратная сторона (`canvasPresetKey` в `syncCanvasPreset`) не трогается: она отвечает на
+    другой вопрос — что показать, когда числа пришли не из клавиатуры, а из правки задачи.
+    """
+    script = _page_text("app.js")
+    handler = re.search(r'for \(const id of FIELDS\) \{.*?\n  \}', script, re.S)
+    assert handler, "подписки полей формы на `input` в app.js больше нет"
+    assert "canvasPresetKey" not in handler.group(0), (
+        "ручной ввод не имеет права перекидывать список с «своё…» на пресет:\n"
+        + handler.group(0))
+    body = _js_function(script, "function syncCanvasPreset()")
+    assert "canvasPresetKey" in body, (
+        "вторая сторона синхронизации — числа не из клавиатуры — обязана остаться:\n" + body)
+
+
+@_needs_node
+def test_the_model_summary_folds_the_model_settings_into_one_line():
+    """C2, требование 3: свёрнутые «Настройки модели» обязаны сказать, что в них лежит.
+
+    Чистая функция, а не чтение DOM внутри рендера: строка, которую человек читает вместо
+    четырёх полей, — единственное, что стоит между ним и прогоном по чужому чекпойнту.
+    """
+    line = _node_eval("""
+      console.log(JSON.stringify(app.modelSummary({
+        checkpoint: "~/models/h3-8bit-full", steps: 8,
+        lora: "~/models/turbo/minimax_h3_turbo_v4_step600_ema.safetensors", loraStrength: 1,
+        adaln: "~/models/turbo/adaln_8_l100.safetensors"})));
+    """)
+    assert line == "h3-8bit-full · 8 шагов · LoRA 1.00 · таблица l100", line
+
+
+@_needs_node
+def test_the_model_summary_says_out_loud_that_there_is_no_lora():
+    """Мутационная пара к тесту выше. Пустая LoRA — не «поле, о котором нечего сказать»:
+    прогон без неё идёт вчетверо дольше и выглядит иначе, и молчание сводки об этом читается
+    как «LoRA на месте». Так же и с таблицей AdaLN: пустая — это «сетку берём из чекпойнта».
+    """
+    line, one_step = _node_eval("""
+      console.log(JSON.stringify([
+        app.modelSummary({checkpoint: "/m/h3-fp16", steps: 31, lora: "", loraStrength: 1,
+                          adaln: ""}),
+        app.modelSummary({checkpoint: "/m/h3-fp16", steps: 1, lora: "", loraStrength: 1,
+                          adaln: ""}),
+      ]));
+    """)
+    assert line == "h3-fp16 · 31 шаг · LoRA нет · таблица чекпойнта", line
+    assert one_step.startswith("h3-fp16 · 1 шаг · "), one_step
+
+
+@_needs_node
+def test_the_model_summary_keeps_a_checkpoint_directorys_name_whole():
+    """Правка по ревью C2. Чекпойнт — **каталог**, а не файл: `--checkpoint` указывает на
+    папку с весами. Сводка резала его имя по последней точке тем же правилом, что и таблицу
+    AdaLN (`adaln_8_l100.safetensors` → `l100`), и каталог `h3-8bit-full.v2` превращался в
+    `h3-8bit-full`, то есть в имя **другого** каталога, который у людей рядом и лежит.
+    Прогон по чужому чекпойнту стоит вечера, а сводка — единственное, что о нём говорит,
+    пока `<details>` свёрнут.
+
+    У таблицы AdaLN правило остаётся прежним: она файл, и `.safetensors` в свёрнутой строке —
+    шум. Обе половины проверяются вместе, иначе «не резать вовсе» прошло бы как исправление.
+    """
+    dotted, versioned, table = _node_eval("""
+      const f = (ckpt, adaln) => app.modelSummary(
+        {checkpoint: ckpt, steps: 8, lora: "", loraStrength: 1, adaln: adaln});
+      console.log(JSON.stringify([
+        f("~/models/h3-8bit-full.v2", ""),
+        f("/m/mlx/MiniMax-Hailuo-2.3", ""),
+        f("/m/h3-fp16", "~/models/turbo/adaln_8_l100.safetensors"),
+      ]));
+    """)
+    assert dotted.startswith("h3-8bit-full.v2 · "), (
+        "каталог назван целиком, а не до последней точки: " + dotted)
+    assert versioned.startswith("MiniMax-Hailuo-2.3 · "), versioned
+    assert table.endswith(" · таблица l100"), (
+        "у таблицы AdaLN расширение по-прежнему лишнее: " + table)
+
+
+@_needs_node
+def test_the_queue_calls_itself_free_rather_than_running_when_there_is_nothing_to_run():
+    """Правка по ревью C2. Показание «очередь» в чроме говорило «идёт» на любой непаузной
+    очереди при живом работнике — в том числе на пустой, где не идёт ничего и идти нечему.
+    Рядом при этом стояло «Ничего не считается», и строка спорила с соседкой.
+
+    Четыре исхода, а не три: пауза, некому вести, идёт, свободна. «Свободна» — не то же самое,
+    что «стоит»: работник жив и возьмёт первую же поставленную задачу, а «стоит» означает, что
+    не возьмёт.
+    """
+    got = _node_eval("""
+      const w = (o) => app.queueStateWord(o);
+      console.log(JSON.stringify([
+        w({paused: true,  workerState: "alive",   running: true,  pending: 3}),
+        w({paused: false, workerState: "stopped", running: false, pending: 3}),
+        w({paused: false, workerState: "alive",   running: true,  pending: 0}),
+        w({paused: false, workerState: "alive",   running: false, pending: 3}),
+        w({paused: false, workerState: "alive",   running: false, pending: 0}),
+      ]));
+    """)
+    assert got == ["на паузе", "стоит", "идёт", "идёт", "свободна"], got
+
+    script = _page_text("app.js")
+    body = _js_function(script, "function renderQueue()")
+    assert "queueStateWord(" in body, (
+        "показание в чроме обязано считаться этой функцией, а не вторым набором условий:\n"
+        + body)
+
+
+def test_the_queue_summary_is_not_printed_twice_in_the_same_panel():
+    """Правка по ревью C2. «4 задачи, ≈8 ч 04 мин, до 08:48» стояло разом в двух местах одной
+    панели: строкой `#queue-sub` под крупным состоянием и мелким `eyebrow` в её же шапке, в
+    двадцати сантиметрах выше. Две одинаковые строки в одном экране читаются как две разные —
+    глаз ищет между ними отличие, которого нет.
+    """
+    page = _page_text("index.html")
+    assert 'id="pending-sum"' not in page, (
+        "сводка очереди осталась одна — под крупным состоянием, где на неё и смотрят")
+    script = _page_text("app.js")
+    assert 'pending-sum' not in script, "скрипт не имеет права писать в снятый элемент"
+    body = _js_function(script, "function renderQueue()")
+    assert body.count("summary.text") == 1, (
+        "одна сводка — одно место, где она печатается:\n" + body)
+
+
+def test_the_worker_lamp_keeps_no_orphan_word_when_its_label_goes_away():
+    """Правка по ревью C2. На узком окне из показания работника пряталась подпись «работник»,
+    а значение оставалось: в чроме висело одинокое «● запущен», не сказав, что запущено.
+    Прячется пара целиком — лампа своей формой и цветом говорит то же самое и одна.
+    """
+    css = _page_text("style.css")
+    rule = re.search(r"@media\s*\(max-width:\s*1180px\)\s*\{(.*?)\n\}", css, re.S)
+    assert rule, "правила узкого окна на 1180 в style.css больше нет"
+    hidden = re.search(r"([^{}]*)\{\s*display:\s*none", rule.group(1))
+    assert hidden and ".stat.worker .k" in hidden.group(1) and ".stat.worker .v" in hidden.group(1), (
+        "подпись и значение работника прячутся одним правилом или не прячутся вовсе:\n"
+        + rule.group(1))
+
+
+def test_the_worker_state_explains_itself_where_a_reader_can_actually_see_it():
+    """Правка по ревью C2. Объяснение состояния («задачи берутся из очереди») пересчитывалось
+    на каждый опрос в элемент, у которого в CSS стоит `display: none` — то есть никуда. Мёртвый
+    пересчёт хуже отсутствующего: он выглядит как работающая функция.
+
+    Текст остаётся, но переезжает в `title` самого показания, где его видно по наведению.
+    """
+    page = _page_text("index.html")
+    assert 'id="worker-pid"' not in page, "невидимый элемент снят вместе со своим пересчётом"
+    css = _page_text("style.css")
+    assert ".v.sub" not in css, "правило, прятавшее его, тоже больше ни к чему не относится"
+    body = _js_function(_page_text("app.js"), "function renderQueue()")
+    assert re.search(r'\$\("worker"\)\.title\s*=', body), (
+        "объяснение обязано попасть туда, где его можно прочитать:\n" + body)
+    assert "задачи берутся из очереди" in body, (
+        "сам текст объяснения никуда не делся, он только переехал:\n" + body)
+
+
+@_needs_node
+def test_the_model_settings_are_collapsed_behind_a_summary_that_shows_their_values():
+    """Разметка половины требования 3: `<details>` свёрнут по умолчанию, сводка стоит прямо
+    в `<summary>`, и пересчитывает её скрипт, а не разметка.
+    """
+    page = _page_text("index.html")
+    details = re.search(r"<details[^>]*>.*?</details>", page, re.S)
+    assert details, "«Настройки модели» должны жить в <details>"
+    block = details.group(0)
+    opening = block[:block.index(">") + 1]
+    assert " open" not in opening, f"свёрнуто по умолчанию, а тег {opening!r}"
+    summary = re.search(r"<summary[^>]*>(.*?)</summary>", block, re.S)
+    assert summary and "Настройки модели" in summary.group(1), block[:400]
+    assert 'id="model-summary"' in summary.group(1), (
+        "сводка значений обязана стоять в самом <summary> — иначе в свёрнутом виде её не видно")
+    for field in ("ckpt", "lora", "lora-str", "adaln", "steps"):
+        assert f'id="{field}"' in block, f"поле {field} должно уехать под <details> вместе с ними"
+
+    script = _page_text("app.js")
+    assert "modelSummary(" in script and '$("model-summary")' in script, (
+        "сводка считается из формы на каждое изменение, а не написана в разметке руками")
+
+
+def test_the_queue_pause_button_stands_outside_the_heading_and_names_its_own_state():
+    """C2, требование 1 (леджер: aria) + правка по ревью C2.
+
+    Половина первая, из C2: кнопка стояла внутри `<h2>` — временное место из A5. Заголовок с
+    кнопкой внутри перестаёт быть заголовком: скринридер читает подпись кнопки как часть
+    названия раздела.
+
+    Половина вторая — снятие `aria-pressed`, и это не ослабление, а исправление лжи. APG знает
+    два законных устройства кнопки-переключателя, и они взаимоисключающие: либо имя кнопки
+    статично («Пауза») и состояние несёт `aria-pressed`, либо имя само называет состояние и
+    `aria-pressed` не ставится вовсе. У этой кнопки подпись ездит между «▶ Начать расчёт» и
+    «⏸ Приостановить» — то есть второй случай, — и `aria-pressed`, добавленный к меняющемуся
+    имени, читался вслух как «Начать расчёт, нажата»: ровно наоборот тому, что происходит.
+    Вместо снятой проверки встаёт проверка того, что состояние вообще названо словами и что
+    оба слова живут в одном месте, — иначе кнопка снова стала бы немым треугольником.
+    """
+    page = _page_text("index.html")
+    button = re.search(r'<button[^>]*id="queue-pause-toggle"[^>]*>', page)
+    assert button, "кнопки паузы очереди нет на странице"
+    assert "aria-pressed" not in button.group(0), (
+        "`aria-pressed` у кнопки с меняющейся подписью спорит с ней вслух:\n" + button.group(0))
+    # Комментарии выкидываются до разбора: в них написано, почему кнопка отсюда уехала, и
+    # `<h2>` внутри такого объяснения — не заголовок, а слово.
+    markup = re.sub(r"<!--.*?-->", "", page, flags=re.S)
+    for heading in re.findall(r"<h[1-6][^>]*>.*?</h[1-6]>", markup, re.S):
+        assert "queue-pause-toggle" not in heading, (
+            "кнопка внутри заголовка — заголовок перестаёт быть заголовком:\n" + heading)
+
+    body = _js_function(_page_text("app.js"), "function renderQueue()")
+    assert "aria-pressed" not in body, (
+        "снятый у разметки атрибут, который дорисовывает скрипт, — это тот же атрибут:\n" + body)
+    assert "Начать расчёт" in body and "Приостановить" in body, (
+        "состояние очереди обязано быть названо словами: без aria-pressed подпись — "
+        "единственное, что о нём говорит, и обе её половины ставит эта функция:\n" + body)
+
+
+@_needs_node
+def test_the_note_column_outlives_the_form_field_that_used_to_feed_it():
+    """C2, требование 4. Поле ввода «Заметка» убрано из формы, показ заметки — остаётся.
+
+    Проверено перед удалением (отчёт задачи): `job.note` доезжает до страницы в `/api/state`
+    для всех состояний и рисуется в двух местах — строкой ждущей задачи (`pendingRowHtml`) и
+    подвалом карточки идущего прогона. Заметка приходит и у задач, поставленных не этой
+    страницей, и у копий (`POST /api/jobs/<id>/duplicate` наследует её на сервере), так что
+    убрать показ значило бы прятать чужие данные. Убрано ровно поле ввода.
+    """
+    page = _page_text("index.html")
+    assert 'id="note"' not in page, "поле ввода «Заметка» убрано из формы"
+    row = _node_eval("""
+      console.log(JSON.stringify(app.pendingRowHtml({
+        id: "j", priority: 0, note: "первая ночная",
+        args: ["generate", "--tag", "кот"], estimate: {seconds: 1, peak_gb: 1},
+        output_stem: "/o/n/h3-кот"})));
+    """)
+    assert "первая ночная" in row, (
+        "заметка приходит с сервера и обязана быть видна — ушло поле ввода, не колонка")
+    script = _page_text("app.js")
+    assert '$("note")' not in script, "в разметке этого поля больше нет — читать нечего"
+    assert "job.note" in script, "показ заметки остаётся"
 
 
 @_needs_node
@@ -2479,6 +3135,71 @@ def test_every_way_a_shot_line_can_break_the_format_is_named(was, becomes, expec
     assert prompt != _GOOD_PROMPT, f"{was!r} is no longer in the prompt these rows edit"
     parsed = _parse(prompt, 10)
     assert any(k == kind and expect in t for k, t in parsed), _flat(parsed)
+
+
+@_needs_node
+def test_chat_duration_reads_the_sessions_own_state_not_the_forms_default():
+    """A3: `chatDuration` — чистая функция, и её сигнатура — всё требование сразу. Она берёт число
+    только из переданного состояния (`state.duration`), а не из формы: она не видит DOM вовсе (нет
+    `document`, значит и `$("duration")` из неё позвать нельзя), так что подменить сессию формой
+    внутри неё физически негде. Дефолт — десять секунд, тот же, с которым ставится `#duration`."""
+    default_no_state, default_no_duration, explicit = _node_eval("""
+      console.log(JSON.stringify([
+        app.chatDuration(null),
+        app.chatDuration({}),
+        app.chatDuration({duration: 7}),
+      ]));
+    """)
+    assert default_no_state == 10
+    assert default_no_duration == 10
+    assert explicit == 7
+
+
+@_needs_node
+def test_the_modal_parse_flags_a_cut_past_the_chat_sessions_own_duration():
+    """A3: длительность разбора в модалке идёт из состояния чата (`chatDuration`), не из формы —
+    та может показывать любое число, пока сессия объявила своё. Здесь сессия говорит «семь
+    секунд» (`chat.duration`), склейка четвёртого плана подвинута на 00:09.000, и разбор обязан
+    назвать её «за пределами» ровно как назвал бы declared-параметр напрямую (тот же путь, каким
+    `_locked_turn` кладёт `duration: 7 s` в системный контекст на сервере)."""
+    prompt = _GOOD_PROMPT.replace("[Shot 4] At 00:07.000", "[Shot 4] At 00:09.000")
+    notes = _node_eval("""
+      const state = {duration: 7};   // сессия чата, не форма
+      const a = app.analysePrompt(%s, app.chatDuration(state), {audio: true});
+      console.log(JSON.stringify(a.notes.map(n => [n.k, n.t])));
+    """ % json.dumps(prompt))
+    unescape = (lambda t: re.sub(r"<[^>]+>", "", t)
+                .replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"))
+    parsed = [(kind, unescape(text)) for kind, text in notes]
+    assert any(k == "bad" and "за пределами" in t and "00:09.000" in t for k, t in parsed), \
+        _flat(parsed)
+
+
+def test_the_library_prompt_dialog_button_hands_the_forms_duration_to_the_new_session():
+    """Fix round 1 (review, Important): `chat-prompt-open` («Обсудить») already reads `#mode` for
+    the session it opens (`mode: $("mode").value`, right beside `openChatModal`'s call) but never
+    read `#duration` at all -- unlike `chat-new`, a few lines below it in the same file, which
+    already sends `duration: Number(String($("duration").value).replace(",", ".")) || 10`. A chat
+    opened from a library prompt therefore always got the server's own ten-second default,
+    whatever the form's own field said.
+
+    The click handler itself cannot be driven from a `node`-only test -- `app.js`'s DOM half is
+    guarded behind `typeof document` (`_node_eval`'s own docstring: importing it outside a browser
+    wires nothing up) -- so this pins the handler's own source instead of its runtime behaviour:
+    the object literal it hands to `openChatModal` has to read `#duration` the same way it already
+    reads `#mode`. `test_a_chat_opened_from_a_library_prompt_survives_a_turn_end_to_end`
+    (`tests/test_chat_web.py`) is the route half of the same fix -- it proves the server stores
+    whatever `duration` a `source.kind == "prompt"` creation sends, exactly as it already does for
+    `job`; this proves the button actually sends the form's own number rather than the default.
+    """
+    app_js = (WEBUI / "app.js").read_text(encoding="utf-8")
+    start = app_js.index('$("chat-prompt-open").addEventListener')
+    assert start != -1
+    end = app_js.index("});", start)
+    handler = app_js[start:end]
+    assert 'mode: $("mode").value' in handler, handler   # the pattern this fix mirrors
+    assert '$("duration")' in handler, (
+        "chat-prompt-open must read #duration, the same way it already reads #mode:\n" + handler)
 
 
 @_needs_node
@@ -2662,81 +3383,86 @@ def test_only_a_waiting_job_carries_edit_top_and_delete():
 
 
 @_needs_node
-def test_the_finished_rows_copy_button_has_an_explicit_place_in_the_row_grid():
-    """Task 7 fix round 1. `.r` is one CSS grid (`--cols` in `style.css`) sized for exactly as
-    many columns as `pendingRowHtml` has direct children -- that is the whole point of one shared
-    grid across three different row shapes (see `--cols`'s own comment). `finishedRowHtml`'s
-    `<span class="acts">` is always one child *past* that count (two, on a failed row, next to
-    `.why`), so without an explicit `grid-column`/`grid-row` in the stylesheet it silently falls
-    into the next implicit row's first (16px, meant for the status dot) column and its text gets
-    clipped -- exactly the "опия" bug a browser render caught.
+def test_a_finished_run_is_a_card_with_its_own_preview_frame():
+    """Заменяет `test_the_finished_rows_copy_button_has_an_explicit_place_in_the_row_grid`.
 
-    This is checked from both ends, neither of them the literal number 10: the column count comes
-    from parsing `--cols` itself, and the child count is measured on the actual HTML the row
-    functions produce, not asserted as a constant.
+    Тот тест сторожил один конкретный способ сломать список готовых: `.r` — одна CSS-сетка с
+    девятью фиксированными дорожками (`--cols`), а `finishedRowHtml` рисовала на один
+    прямой потомок больше, чем дорожек, и лишний уезжал в первую колонку следующего
+    неявного ряда — 16 px под знак состояния, где текст кнопки обрезался в «опия».
+
+    В C2 зона «Готово» — карточки (`.results`, сетка по содержимому), а не общая с очередью
+    строчная сетка: у карточки нет фиксированных дорожек, в которые можно не влезть, и того
+    режима отказа больше не существует. Ослаблением это не будет только при одном условии —
+    если вместо снятой проверки встанет проверка того, ради чего карточки и вводились:
+    превью-кадр задачи виден картинкой, а не именем файла. Она ниже.
+
+    `previewUrl` — та же функция, что рисует кадр идущего прогона; для законченной задачи
+    число проходов берётся из её собственной оценки, так что имя кадра выводится, а не
+    угадывается, и кадра может не быть вовсе (прогон короче `--preview-every`).
     """
-    css = _page_text("style.css")
-    cols_match = re.search(r"--cols:\s*([^;]+);", css)
-    assert cols_match, "style.css must still define --cols for the row grid"
-    # A plain `.split()` would cut `minmax(180px, 1fr)` in two at its internal comma-space --
-    # `minmax(...)` is kept as one token the same way a naive split would wrongly break it apart.
-    column_count = len(re.findall(r"minmax\([^)]*\)|\S+", cols_match.group(1)))
-
-    ok_children, failed_children = _node_eval("""
-      // Counts *direct* children of the single outer <div>: a depth-aware tag scan, because the
-      // row's own children (.name, the memory gauge, ...) nest further tags inside themselves.
-      function directChildCount(rowHtml) {
-        const inner = rowHtml.replace(/^<div[^>]*>/, "").replace(/<\\/div>$/, "");
-        const tagRe = /<(\\/?)([a-zA-Z][a-zA-Z0-9]*)\\b[^>]*?(\\/)?>/g;
-        let depth = 0, count = 0, m;
-        while ((m = tagRe.exec(inner))) {
-          const closing = m[1], selfClosing = m[3];
-          if (selfClosing) continue;
-          if (closing) { depth -= 1; }
-          else { if (depth === 0) count += 1; depth += 1; }
-        }
-        return count;
-      }
-      const base = {id: "j", note: "", args: ["generate", "--tag", "кот"],
-                    estimate: {width: 896, height: 576, duration_seconds: 10, steps: 8},
-                    output_stem: "/o/n/h3-кот-896x576",
+    ok, no_preview = _node_eval("""
+      const base = {id: "j", note: "", args: ["generate", "--tag", "кот", "--preview-every", "5"],
+                    estimate: {width: 896, height: 576, duration_seconds: 10, steps: 8,
+                               forwards: 7, seconds: 3600, peak_gb: 35},
+                    output_stem: "/o/ночь/h3-кот-896x576", exit_code: 0,
                     started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
-      const ok = app.finishedRowHtml({...base, exit_code: 0});
-      const failed = app.finishedRowHtml({...base, exit_code: 1, log_tail: "boom"});
-      console.log(JSON.stringify([directChildCount(ok), directChildCount(failed)]));
+      console.log(JSON.stringify([
+        app.finishedRowHtml(base, "/o"),
+        app.finishedRowHtml({...base, estimate: {...base.estimate, forwards: 0}}, "/o"),
+      ]));
     """)
-    assert ok_children == column_count + 1, (
-        f"a finished/succeeded row must have exactly one child ({{.acts}}) past the grid's own "
-        f"{column_count} columns -- got {ok_children}; the count this test derives its "
-        f"expectation from, and the row's own shape, must have drifted apart")
-    assert failed_children == column_count + 2, (
-        f"a failed row adds .why on top of that -- got {failed_children}")
+    assert "<img" in ok and "-preview-step05.jpg" in ok, ok
+    assert "/media/%D0%BD%D0%BE%D1%87%D1%8C/" in ok, "кадр берётся из каталога прогона"
+    assert "кот" in ok, "слаг задачи — заголовок карточки"
+    assert "1 ч" in ok, "время счёта — то, ради чего в этот список вообще смотрят"
+    assert "<img" not in no_preview, (
+        "кадра ещё не записано — пустая рамка честнее битой картинки")
 
-    # The structural overflow above is real and expected (that many children never fit one row);
-    # what must not be true is that the browser is left to place the overflow on its own.
-    #
-    # The *presence* of a `grid-column` is not the property this test is about, and asserting only
-    # that let the bug back in: `grid-column: 1 / -1` is present, declared, explicit -- and puts
-    # the button back in the 16px marker column, which is exactly the clipping («опия») the rule
-    # exists to prevent. The value has to be checked, and the value it has to be is derived the
-    # same way the column count above is, from `--cols` itself.
-    tracks = re.findall(r"minmax\([^)]*\)|\S+", cols_match.group(1))
-    assert re.fullmatch(r"\d+px", tracks[0]), (
-        f"the grid's first track is the status marker's; it is {tracks[0]!r}, so the "
-        "«one column past the marker» this test computes below no longer means that")
-    marker_tracks = 1
-    first_content_column = str(marker_tracks + 1)
-    for state, what in (("done", "the succeeded row"), ("fail", "the failed row")):
-        rule = re.search(r"\.r\.%s\s+\.acts\s*\{([^}]*)\}" % state, css)
-        assert rule, (f"{what}'s .acts needs an explicit place in style.css, or it wraps into the "
-                      "next implicit row's marker column and gets clipped")
-        declared = re.search(r"grid-column:\s*([^;}]+)", rule.group(1))
-        assert declared, f"{what}'s .acts rule has no grid-column: {rule.group(1)!r}"
-        start = declared.group(1).split("/")[0].strip()
-        assert start == first_content_column, (
-            f"{what}'s .acts starts at column {start}, and the first column past the marker is "
-            f"{first_content_column}: a button placed on the marker's own track is the clipping "
-            "this rule exists to prevent, whether or not a grid-column was written down")
+    css = _page_text("style.css")
+    assert re.search(r"\.results\s*\{[^}]*grid-template-columns", css), (
+        "карточки готового стоят сеткой из макета, а не в поток")
+
+
+@_needs_node
+def test_a_failed_run_takes_its_frame_from_the_passes_it_actually_reached():
+    """Ревью C2, опасение 1. Кадр упавшей задачи строился из `estimate.forwards` — числа
+    проходов, которые она **должна была** пройти. Упавшая до них не дошла: адрес указывал на
+    кадр, которого нет, и каждый опрос (раз в двадцать секунд, пока карточка видна) отвечал
+    404 на каждую упавшую задачу в списке.
+
+    Сколько проходов задача действительно прошла, знает `runs.scan` — `run.completed`,
+    посчитанный по чекпойнтам на диске. Чекпойнты у упавшей есть: она падает после какого-то
+    прохода, а не до первого, и кадр с него — единственное, что от неё осталось посмотреть.
+    Поэтому не «прятать картинку у упавших», а брать у них правильную.
+
+    У успешной ничего не меняется: она прошла всё, что обещала, и `estimate.forwards` для неё
+    факт (и переживает исчезновение прогона из `runs`, которое сутки спустя обычное дело).
+    """
+    failed, orphan, ok = _node_eval("""
+      const base = {id: "j", note: "",
+                    args: ["generate", "--tag", "кот", "--preview-every", "5",
+                           "--outdir", "/o/ночь"],
+                    estimate: {width: 896, height: 576, duration_seconds: 10, steps: 8,
+                               forwards: 40, seconds: 3600, peak_gb: 35},
+                    output_stem: "/o/ночь/h3-кот-896x576",
+                    started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
+      const runs = [{outdir: "/o/ночь", completed: 12}];
+      console.log(JSON.stringify([
+        app.finishedRowHtml({...base, exit_code: 1}, "/o", runs),
+        app.finishedRowHtml({...base, exit_code: 1}, "/o", []),
+        app.finishedRowHtml({...base, exit_code: 0}, "/o", runs),
+      ]));
+    """)
+    assert "-preview-step10.jpg" in failed, (
+        "двенадцать пройденных проходов при записи раз в пять — последний кадр десятый:\n"
+        + failed)
+    assert "-preview-step40.jpg" not in failed, (
+        "сорок проходов упавшая не прошла, и кадра с сорокового на диске нет:\n" + failed)
+    assert "<img" not in orphan, (
+        "прогона нет в runs — сколько проходов было, неизвестно, и пустая рамка честнее 404")
+    assert "-preview-step40.jpg" in ok, (
+        "успешный прогон прошёл всё, что обещала оценка — у него кадр по-прежнему её:\n" + ok)
 
 
 @_needs_node
@@ -2775,16 +3501,47 @@ def test_progress_is_drawn_as_one_division_per_forward():
 
 
 @_needs_node
+def test_media_parts_builds_a_relative_path_of_any_depth_inside_outdir():
+    """Task A6, fix round 1 (C1). `mediaParts` used to guess "run" from the last two segments of
+    `output_stem`, which is only ever right when a job's own directory sits exactly one level
+    inside the outdir -- the review's own probe: `defaultOutdir()`'s date folder plus task A6's own
+    per-job subdirectory is *two* levels, and the old guess named the date folder, not the job's
+    own subdirectory.
+
+    Depth 1 and a flat stem (a job that writes straight into the outdir, no subdirectory at all --
+    something `/media` itself has never been able to serve, single level or not) are pinned
+    alongside depth 2 so a fix that only handles the deep case cannot pass by accident.
+    """
+    depth_two, depth_one, flat, no_outdir, outside_outdir = _node_eval("""
+      console.log(JSON.stringify([
+        app.mediaParts("/o/2026-08-13/20260813-1435-kot-italy/h3-kot-italy-896x576", "/o"),
+        app.mediaParts("/o/20260813-1435-kot-italy/h3-kot-italy-896x576", "/o"),
+        app.mediaParts("/o/h3-kot-italy-896x576", "/o"),
+        app.mediaParts("/o/2026-08-13/20260813-1435-kot-italy/h3-kot-italy-896x576", null),
+        app.mediaParts("/elsewhere/h3-kot-italy-896x576", "/o"),
+      ]));
+    """)
+    assert depth_two == {"run": "2026-08-13/20260813-1435-kot-italy", "stem": "h3-kot-italy-896x576"}
+    assert depth_one == {"run": "20260813-1435-kot-italy", "stem": "h3-kot-italy-896x576"}
+    assert flat is None, "a job with no subdirectory at all has no run segment for /media"
+    assert no_outdir is None, "without outdir there is no boundary to cut output_stem at"
+    assert outside_outdir is None, "a stem outside outdir names no run under it at all"
+
+
+@_needs_node
 def test_the_preview_frame_is_the_last_one_the_run_actually_wrote():
     """Requirement 8's thumbnail. The name is derived from the cadence and the count of finished
     forwards, so the page asks for a frame that exists instead of one it hopes for.
+
+    `outdir` (`/o`) is now required to build any link at all (task A6, fix round 1) -- `output_stem`
+    alone no longer says where the server's own root ends.
     """
     at_seven, at_two, from_stem = _node_eval("""
       const job = {args: ["generate", "--preview-every", "5"],
                    output_stem: "/o/ночь/h3-кот-896x576"};
-      console.log(JSON.stringify([app.previewUrl(job, 7), app.previewUrl(job, 2),
+      console.log(JSON.stringify([app.previewUrl(job, 7, "/o"), app.previewUrl(job, 2, "/o"),
                                   app.previewUrl({args: ["generate"],
-                                                  output_stem: "h3-кот"}, 9)]));
+                                                  output_stem: "h3-кот"}, 9, "/o")]));
     """)
     assert at_seven.endswith("-preview-step05.jpg"), at_seven
     assert at_seven.startswith("/media/%D0%BD%D0%BE%D1%87%D1%8C/"), at_seven
@@ -2830,6 +3587,9 @@ def test_the_output_directory_defaults_to_the_one_the_last_jobs_used():
 def test_finished_shows_the_exit_code_and_a_failure_shows_why():
     """Requirement 9. The reason is the worker's own `log_tail`; inventing a friendlier one would
     hide the only line that says what happened.
+
+    `outdir` (`/o`) is `finishedRowHtml`'s second argument now (task A6, fix round 1) -- without
+    it `clipUrl` cannot build a link at all and the row would fall back to plain text.
     """
     ok, failed = _node_eval("""
       const base = {id: "j", note: "", args: ["generate", "--tag", "кот"],
@@ -2837,15 +3597,21 @@ def test_finished_shows_the_exit_code_and_a_failure_shows_why():
                     output_stem: "/o/ночь/h3-кот-896x576",
                     started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
       console.log(JSON.stringify([
-        app.finishedRowHtml({...base, exit_code: 0}),
+        app.finishedRowHtml({...base, exit_code: 0}, "/o"),
         app.finishedRowHtml({...base, exit_code: 1,
-                             log_tail: "RuntimeError: [metal::malloc] 51.4 GB > 48.0 GB"}),
+                             log_tail: "RuntimeError: [metal::malloc] 51.4 GB > 48.0 GB"}, "/o"),
       ]));
     """)
     assert "код 0" in ok
     assert "код 1" in failed
     assert "metal::malloc" in failed, "a failed run with no visible reason is a mystery, not a row"
     assert 'href="/media/%D0%BD%D0%BE%D1%87%D1%8C/h3-%D0%BA%D0%BE%D1%82-896x576.mp4"' in ok, ok
+    # Правка по ревью C2: карточка упавшей задачи называла код возврата дважды подряд --
+    # «код 1» в строке чисел и «код возврата 1» строкой ниже, где у успешной стоит ссылка на
+    # ролик. Одно число -- одно место; строка ссылки у упавшей называет имя вывода.
+    assert failed.count("код") == 1, f"код возврата в карточке ровно один раз:\n{failed}"
+    assert "h3-кот-896x576" in failed, (
+        "освободившаяся строка называет имя вывода, а не пустует:\n" + failed)
 
 
 @_needs_node
@@ -2948,6 +3714,25 @@ def test_build_args_carries_the_adaln_cache_flag_only_when_the_field_is_set():
     assert "--adaln-cache" in with_table, with_table
     assert with_table[with_table.index("--adaln-cache") + 1] == "ADALN", with_table
     assert "--adaln-cache" not in without, without
+
+
+@_needs_node
+def test_the_upload_zone_shows_a_prompt_when_empty_and_the_name_once_loaded():
+    """A7: `uploadZoneLabel` is the one pure function the drop zone's text is built from --
+    `updateUploadZone` (the DOM half) just feeds it `{name}` derived from whatever is currently in
+    `#image`/`#end-image`, so this is what actually pins requirement 21's two states without a
+    browser.
+    """
+    empty, loaded, blank_name = _node_eval("""
+      console.log(JSON.stringify([
+        app.uploadZoneLabel(null),
+        app.uploadZoneLabel({name: "start.png"}),
+        app.uploadZoneLabel({name: ""}),
+      ]));
+    """)
+    assert empty == "перетащи картинку или выбери файл", empty
+    assert loaded == "start.png", loaded
+    assert blank_name == empty, "an empty name must read exactly like no state at all"
 
 
 def test_the_form_defaults_to_the_project_s_working_recipe():
@@ -3675,6 +4460,273 @@ def test_finishing_a_chat_about_a_job_puts_the_new_text_into_its_arguments():
     assert read_back == ["старый текст", None]
 
 
+# -- A4: слаг --------------------------------------------------------------------------------
+
+
+@_needs_node
+def test_heuristic_slug_takes_the_first_three_content_words_skipping_shot_tag_style_and_articles():
+    """A4: when the model does not send its own `slug`, the page builds one from whatever prompt
+    text is on screen -- specifically from `integrated_multimodal_description`, the field that
+    actually names the scene. `[Shot 1]`, the two style words the format opens every `[Shot 1]`
+    with (`Live-action`, `cinematic`; see docs/h3-prompt-system.md), and English articles carry no
+    scene content and must not end up as words of the tag.
+    """
+    got = _node_eval(r"""
+      console.log(JSON.stringify(app.heuristicSlug(
+        "integrated_multimodal_description: [Shot 1] Live-action, cinematic, a wide shot " +
+        "captures a sun-drenched Italian cobblestone street at noon.\n\n" +
+        "overall_soundscape: Wind.")));
+    """)
+    assert got == "wide-shot-captures", got
+
+
+@_needs_node
+def test_heuristic_slug_reads_the_whole_text_when_there_is_no_field_header():
+    """A prompt still in plain text (nothing typed yet went through the model) has no
+    `integrated_multimodal_description:` header at all -- the whole string is read instead of
+    coming back empty because a header never showed up.
+    """
+    got = _node_eval('console.log(JSON.stringify(app.heuristicSlug("A quiet harbor at dawn.")));')
+    # "A" is the one word the skip list drops (an article); "at" is a preposition, not one of the
+    # three literal skip categories (`[Shot N]`, the two named style words, a/an/the) -- so it is
+    # the third word kept, not "dawn".
+    assert got == "quiet-harbor-at", got
+
+
+@_needs_node
+def test_heuristic_slug_transliterates_cyrillic_into_latin():
+    got = _node_eval("""
+      console.log(JSON.stringify(app.heuristicSlug(
+        "integrated_multimodal_description: Кошка сидит на подоконнике итальянского дома.")));
+    """)
+    assert got == "koshka-sidit-na", got
+    assert re.fullmatch(r"[a-z0-9-]+", got), "тег обязан остаться в [a-z0-9-]"
+
+
+@_needs_node
+def test_heuristic_slug_is_capped_at_twenty_four_characters():
+    got = _node_eval("""
+      console.log(JSON.stringify(app.heuristicSlug(
+        "integrated_multimodal_description: An elephant construction site worker walks by.")));
+    """)
+    assert got == "elephant-construction-si", got
+    assert len(got) <= 24, got
+
+
+@_needs_node
+def test_heuristic_slug_is_empty_when_only_tags_style_words_and_articles_remain():
+    """Mutation guard: an implementation that forgets to filter (or forgets the three-word cap
+    entirely and just joins everything) would not produce an empty string here -- this is the
+    input every word of which the spec names as something to skip.
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify(app.heuristicSlug(
+        "integrated_multimodal_description: [Shot 1] Live-action, cinematic, a an the")));
+    """)
+    assert got == "", got
+
+
+@_needs_node
+def test_heuristic_slug_of_empty_or_missing_text_is_the_empty_string():
+    got = _node_eval(
+        'console.log(JSON.stringify([app.heuristicSlug(""), app.heuristicSlug(null)]));')
+    assert got == ["", ""], got
+
+
+@_needs_node
+def test_a_turn_with_a_slug_updates_the_chat_state_and_an_absent_one_leaves_it_alone():
+    """The mirror of `applyTurn`'s handling of `prompt` (see
+    `test_a_null_prompt_turn_leaves_the_editor_alone`): a turn naming a scene updates `state.slug`,
+    and a later turn that says nothing about it does not wipe out what an earlier one set.
+    """
+    out = _node_eval("""
+      const state = {promptText: "", log: [], slug: ""};
+      app.applyTurn(state, {reply: "ок", prompt: null, slug: "cat-italian-noon"});
+      const afterFirst = state.slug;
+      app.applyTurn(state, {reply: "ещё", prompt: null, slug: null});
+      console.log(JSON.stringify([afterFirst, state.slug]));
+    """)
+    assert out == ["cat-italian-noon", "cat-italian-noon"], out
+
+
+@_needs_node
+def test_tag_from_session_slug_replaces_the_tag_only_when_a_slug_exists():
+    out = _node_eval("""
+      console.log(JSON.stringify([
+        app.tagFromSessionSlug("run", "cat-italian-noon"),
+        app.tagFromSessionSlug("my-own-tag", ""),
+        app.tagFromSessionSlug("my-own-tag", null),
+        app.tagFromSessionSlug("my-own-tag", undefined),
+      ]));
+    """)
+    assert out == ["cat-italian-noon", "my-own-tag", "my-own-tag", "my-own-tag"], out
+
+
+# -- A4, fix round 1: «слаг = имя по умолчанию, не диктат» также для «в Редактор» ---------------
+
+
+@_needs_node
+def test_normalize_slug_strips_everything_outside_the_dash_alphabet():
+    """`normalizeSlug` is the one gate both `heuristicSlug` (built from the prompt's own words,
+    already close to clean) and the model's own `slug` (arbitrary text, A4's `PROMPT_SCHEMA`
+    places no charset constraint on it at all) go through before either becomes `#tag`. A
+    path-traversal-shaped string is the sharpest case: nothing about `../../../evil` may survive
+    except the one word actually made of letters.
+    """
+    got = _node_eval('console.log(JSON.stringify(app.normalizeSlug("../../../evil")));')
+    assert got == "evil", got
+    assert re.fullmatch(r"[a-z0-9-]*", got), got
+
+
+@_needs_node
+def test_tag_from_session_slug_leaves_a_hand_typed_tag_alone():
+    """The review finding this fixes: «в Редактор» overwrote `#tag` unconditionally, so a tag a
+    person had actually typed (`my-halloween-shoot`) was silently thrown away the moment a session
+    slug existed. `heuristicSlug`'s own place in `submit()` already only touches the tag when it
+    is empty/`"run"` -- this is the same principle, applied here too.
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify(
+        app.tagFromSessionSlug("my-halloween-shoot", "cat-italian-noon", "")));
+    """)
+    assert got == "my-halloween-shoot", got
+
+
+@_needs_node
+def test_tag_from_session_slug_overwrites_its_own_earlier_auto_slug_when_a_newer_one_arrives():
+    """A tag left at the *previous* auto-substitution (tracked by the caller as `lastAutoTag`,
+    per this same function's own contract) is not a hand-typed tag -- it is this function's own
+    last answer, still sitting there untouched, and a newer slug from a later turn must still be
+    able to move it forward. Only a tag that differs from both `"run"`/empty *and* the last
+    auto-slug counts as a person's own edit.
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify(app.tagFromSessionSlug(
+        "cat-italian-noon", "dog-parisian-dusk", "cat-italian-noon")));
+    """)
+    assert got == "dog-parisian-dusk", got
+
+
+
+# -- A4, fix round 2: та же память переживает переоткрытие сессии, не только один ход -----------
+
+
+@_needs_node
+def test_remember_and_recall_auto_tag_round_trip_through_a_plain_map():
+    """The two halves of `autoTagBySession`'s own contract, pinned as pure functions on a map the
+    test owns -- no module-level state, no DOM. A session that was never remembered recalls `""`,
+    the same "nothing yet" `tagFromSessionSlug` already treats as no last auto-tag at all.
+    """
+    out = _node_eval("""
+      const map = {};
+      app.rememberAutoTag(map, "s1", "cat-italian-noon");
+      console.log(JSON.stringify([
+        app.recallAutoTag(map, "s1"),
+        app.recallAutoTag(map, "never-remembered"),
+      ]));
+    """)
+    assert out == ["cat-italian-noon", ""], out
+
+
+@_needs_node
+def test_a_reopened_sessions_auto_tag_survives_where_the_chat_object_itself_does_not():
+    """Review round 2's finding: `finishChat` closes the modal unconditionally on every path
+    (`closeChat()` nulls `chat`), so `chat.lastAutoTag` (fix round 1) cannot outlive that close --
+    the next `enterChat` for the *same* session id builds a brand-new `chat` with no memory of its
+    own. Without something outside `chat`, a second «в Редактор» on the same session, after the
+    scene got renamed by a later turn, could never tell "the tag still says my own first answer"
+    from "a person retyped exactly that by hand" -- and would leave the tag stuck on the first
+    name forever.
+
+    Simulated end to end through the pure functions, standing in for two separate
+    `enterChat`/`finishChat` round trips of the same session id ("s1") sharing one `map` the way
+    `autoTagBySession` shares state across them on the real page.
+    """
+    out = _node_eval("""
+      const map = {};
+
+      // Round 1: сессия "s1" называет сцену впервые, «в Редактор» подставляет её в #tag.
+      let tag = "run";
+      const restoredBeforeFirst = app.recallAutoTag(map, "s1");   // ещё нечего вспоминать
+      const applied1 = app.tagFromSessionSlug(tag, "cat-italian-noon", restoredBeforeFirst);
+      if (applied1 !== tag) app.rememberAutoTag(map, "s1", applied1);
+      tag = applied1;
+
+      // Модалка закрылась -- `chat` того раунда мёртв. Сессию открыли заново: `lastAutoTag`
+      // восстанавливается из `map`, а не с пустой строки, как строил бы новый `chat` без неё.
+      const restoredOnReopen = app.recallAutoTag(map, "s1");
+
+      // Новый ход той же переоткрытой сессии переименовал сцену; поле #tag в DOM всё ещё то же,
+      // что раунд 1 туда положил -- человек его не трогал.
+      const applied2 = app.tagFromSessionSlug(tag, "dog-parisian-dusk", restoredOnReopen);
+
+      console.log(JSON.stringify([applied1, restoredOnReopen, applied2]));
+    """)
+    assert out == ["cat-italian-noon", "cat-italian-noon", "dog-parisian-dusk"], out
+
+
+def test_finishing_a_chat_to_the_editor_writes_the_sessions_slug_into_the_tag_field():
+    """The DOM half cannot run under `node` (see `_node_eval`'s own docstring and the identical
+    reasoning in `test_the_library_prompt_dialog_button_hands_the_forms_duration_to_the_new_session`
+    just above it in this file) -- this pins the handler's own source instead: the «в Редактор»
+    branch of `finishChat` has to route `chat.slug` through `tagFromSessionSlug` into `#tag`, and
+    `enterChat`/`finishChat` both have to go through the module-level `autoTagBySession` map (fix
+    round 2) -- `chat.lastAutoTag` alone (fix round 1) does not survive `closeChat()`, so a session
+    reopened later would forget its own earlier auto-tag and never be able to move it forward (see
+    `test_a_reopened_sessions_auto_tag_survives_where_the_chat_object_itself_does_not`).
+
+    A8: the same branch also has to carry `mode`/`image` into the form -- a frame dropped mid-
+    conversation (`sendChatMessage`'s own `image`/`set_mode`) updates `chat.mode`/`chat.image`,
+    and «в Редактор» is the one moment that state reaches `#mode`/`#image`, the same way the
+    session's own slug reaches `#tag` a few lines above it.
+    """
+    app_js = (WEBUI / "app.js").read_text(encoding="utf-8")
+    start = app_js.index("async function finishChat()")
+    assert start != -1
+    end = app_js.index("function fillFormFrom(job)", start)
+    body = app_js[start:end]
+    assert "tagFromSessionSlug(" in body and '$("tag").value' in body, body
+    assert "lastAutoTag" in body, (
+        "the last auto-substituted tag must be tracked in state, not just written once:\n" + body)
+    assert "rememberAutoTag(autoTagBySession" in body, (
+        "finishChat must persist an actual substitution into the module-level map, not only "
+        "onto the doomed `chat` object:\n" + body)
+    assert '$("mode").value = chat.mode' in body, (
+        "«в Редактор» must carry the session's own mode (i2v after a dropped frame, A8) into "
+        "the form:\n" + body)
+    assert '$("image").value = chat.image' in body, (
+        "«в Редактор» must carry the session's own keyframe path (A8) into the form, the same "
+        "way it already carries the slug into #tag:\n" + body)
+
+    enter_start = app_js.index("async function enterChat(id)")
+    enter_end = app_js.index("function closeChat()", enter_start)
+    enter_body = app_js[enter_start:enter_end]
+    assert "lastAutoTag" in enter_body, (
+        "a freshly opened session must start with no auto-tag memory of its own:\n" + enter_body)
+    assert "recallAutoTag(autoTagBySession" in enter_body, (
+        "enterChat must recover lastAutoTag from the module-level map -- reading only `session` "
+        "(which never carried this field) or defaulting to \"\" is exactly the bug fix round 2 "
+        "closes:\n" + enter_body)
+    assert "image: session.image" in enter_body, (
+        "A8: enterChat must read the session's own keyframe into `chat.image`, or a turn that "
+        "updated it server-side (`_locked_turn`'s `image`) would have nowhere client-side to "
+        "land before «в Редактор» reads it back out:\n" + enter_body)
+
+
+def test_submit_falls_back_to_the_heuristic_slug_when_the_tag_is_still_the_default():
+    """Same reasoning as the test above, pinned on `submit()`: requirement 4 (A4) is that a tag
+    left at the empty/`"run"` default is replaced by `heuristicSlug` of the form's own prompt text
+    at the moment a job is queued -- `readForm` already collapses an empty `#tag` to `"run"`
+    (`tag: $("tag").value.trim() || "run"`), so `"run"` alone is the condition to pin here.
+    """
+    app_js = (WEBUI / "app.js").read_text(encoding="utf-8")
+    start = app_js.index("async function submit()")
+    assert start != -1
+    end = app_js.index("function syncModeRows()", start)
+    body = app_js[start:end]
+    assert "heuristicSlug(" in body, body
+
+
 @_needs_node
 def test_an_answer_that_arrives_after_the_modal_moved_on_lands_nowhere():
     """Fix round 1, C1 and C2. A turn takes tens of seconds, and the modal is closeable (Esc, the
@@ -3808,6 +4860,39 @@ def test_the_unload_banner_shows_only_when_jobs_wait_on_a_loaded_model():
 
 
 @_needs_node
+def test_the_unload_banner_stays_hidden_while_the_queue_is_paused():
+    """Task A5. The worker will not take *any* job while `paused`, same as while llama's port is
+    alive -- "выгрузить и начать генерацию" on a paused queue is advice with nothing for it to
+    start, and it would tell a human their own pause decision is a stuck GPU.
+    """
+    paused_and_up, unpaused_and_up = _node_eval("""
+      console.log(JSON.stringify([
+        app.unloadBanner({pending: 2, llm: "up", paused: true}),
+        app.unloadBanner({pending: 2, llm: "up", paused: false}),
+      ]));
+    """)
+    assert paused_and_up["show"] is False, "the banner must not show while the queue is paused"
+    assert unpaused_and_up["show"] is True, (
+        "the same otherwise-triggering state must still show once unpaused")
+
+
+@_needs_node
+def test_next_banner_state_stays_hidden_while_the_queue_is_paused():
+    """Review round 1 (fix, cheap add): the brief asked for `paused` coverage on *both* functions
+    the page's banner logic is built from, and only `unloadBanner` had it above.
+    `renderUnloadBanner` -- what the page actually calls every poll -- goes through
+    `nextBannerState`, never `unloadBanner` directly, so a regression that broke the `paused` gate
+    only inside `nextBannerState`'s own body (as opposed to the `unloadBanner` call it wraps) would
+    have passed the whole suite without this.
+    """
+    banner = _node_eval("""
+      console.log(JSON.stringify(
+        app.nextBannerState({dismissedKey: null}, {pending: 2, llm: "up", paused: true})));
+    """)
+    assert banner["show"] is False
+
+
+@_needs_node
 def test_dismissing_the_banner_holds_until_the_state_actually_changes():
     """«Пусть ждёт» must not be a snooze that reappears on the very next poll: the page reruns
     `unloadBanner` every twenty seconds against the same `{pending, llm}` while nothing else has
@@ -3851,3 +4936,325 @@ def test_a_dismissal_burns_off_once_the_state_moves_past_it():
     """)
     assert trace == [True, False, True, True], (
         f"a return to the exact dismissed value after the state moved on must warn again: {trace}")
+
+
+# -- Task A2: LLM stages in the chat modal --------------------------------------------------------
+
+
+@_needs_node
+def test_pending_entry_text_depends_on_the_llm_status():
+    """The placeholder line the log gets the instant «отправить» is clicked has no answer to go
+    on yet, so its wording comes from the last known `llmStatus` alone: a cold model says it is
+    being raised, anything else (`up`, `busy`, unknown) just says the model is thinking.
+    """
+    down, up, busy, blank = _node_eval("""
+      console.log(JSON.stringify([
+        app.pendingEntry("down").text,
+        app.pendingEntry("up").text,
+        app.pendingEntry("busy").text,
+        app.pendingEntry("").text,
+      ]));
+    """)
+    assert "поднимаю" in down, down
+    assert "думает" in up and "думает" in busy and "думает" in blank
+    assert "поднимаю" not in up, "only a known-down model gets the cold-start wording"
+
+
+@_needs_node
+def test_landing_a_turn_clears_the_pending_placeholder_first():
+    """`sendChatMessage` pushes a `pendingEntry` right after the user's own line so the dots show
+    while the turn is in flight; `landTurn` has to take it back out before it applies the answer,
+    or the dots animate forever underneath the real reply.
+    """
+    out = _node_eval("""
+      const turn = {reply: "ок", prompt: null};
+      const state = {id: "a", promptText: "п", savedText: "п",
+                     log: [{role: "user", text: "мрачнее"}, app.pendingEntry("up")]};
+      app.landTurn(state, state, turn);
+      console.log(JSON.stringify(state.log.map((e) => e.kind || e.role)));
+    """)
+    assert out == ["user", "assistant"], f"pending must be gone, reply must be there: {out}"
+
+
+@_needs_node
+def test_landing_a_failure_clears_the_pending_placeholder_and_the_optimistic_line():
+    """A failed turn already pops the optimistic `user` line back out of the log (the text
+    returns to the input box instead). The pending placeholder sits *after* that line in the
+    real log, so removing it has to happen before that pop, or the pop's own `last.role ===
+    "user"` check finds the pending note instead and never fires.
+    """
+    out = _node_eval("""
+      const payload = {error: {code: "chat_unreachable", message: "connection refused"}};
+      const state = {id: "a", promptText: "п", savedText: "п",
+                     log: [{role: "user", text: "мрачнее"}, app.pendingEntry("up")]};
+      app.landFailure(state, state, payload, 0);
+      console.log(JSON.stringify(state.log.map((e) => e.role + "/" + (e.kind || ""))));
+    """)
+    assert out == ["note/bad"], out
+
+
+@_needs_node
+def test_a_turn_that_lands_nowhere_still_clears_its_own_pending_line():
+    """`landTurn`'s own docstring: a response arriving after the modal moved to another session
+    lands nowhere and must not touch that other session. But the orphaned `expected` object --
+    the one the dots were actually pushed onto -- must not keep them forever either, in case
+    anything still holds a reference to it.
+    """
+    out = _node_eval("""
+      const turn = {reply: "ок", prompt: null};
+      const expected = {id: "a", promptText: "п", savedText: "п",
+                        log: [{role: "user", text: "х"}, app.pendingEntry("up")]};
+      const other = {id: "b", promptText: "чужой", savedText: "чужой", log: []};
+      const landed = app.landTurn(other, expected, turn);
+      console.log(JSON.stringify([landed, expected.log.map((e) => e.kind || e.role),
+                                  other.log.length]));
+    """)
+    landed, expected_log, other_len = out
+    assert landed is False
+    assert "pending" not in expected_log, f"the orphaned session must not keep its dots: {expected_log}"
+    assert other_len == 0, "the foreign session that is actually on screen must stay untouched"
+
+
+@_needs_node
+def test_a_failure_that_lands_nowhere_still_clears_its_own_pending_line():
+    """Same guard, same rule, for `landFailure` (see the `landTurn` case above)."""
+    out = _node_eval("""
+      const payload = {error: {code: "chat_unreachable", message: "connection refused"}};
+      const expected = {id: "a", promptText: "п", savedText: "п",
+                        log: [{role: "user", text: "х"}, app.pendingEntry("up")]};
+      const other = {id: "b", promptText: "чужой", savedText: "чужой", log: []};
+      const landed = app.landFailure(other, expected, payload, 0);
+      console.log(JSON.stringify([landed, expected.log.map((e) => e.kind || e.role),
+                                  other.log.length]));
+    """)
+    landed, expected_log, other_len = out
+    assert landed is False
+    assert "pending" not in expected_log, f"the orphaned session must not keep its dots: {expected_log}"
+    assert other_len == 0, "the foreign session that is actually on screen must stay untouched"
+
+
+@_needs_node
+def test_a_failed_turn_only_restores_the_field_if_nobody_has_started_a_new_draft():
+    """Fix round 1 (review, Important). The send button stays live for the whole turn -- a cold
+    model can take up to a minute -- so the person is free to start typing a new message while
+    the old one is still in flight. A refusal that landed must not clobber that fresh draft with
+    the stale text just because the old one failed: the old text is still visible as the `user`
+    line the failure note sits under, and the field belongs to whatever is being typed *now*.
+    """
+    restored, left_alone = _node_eval("""
+      console.log(JSON.stringify([
+        app.restoredInput("", "старое"),
+        app.restoredInput("новый черновик", "старое"),
+      ]));
+    """)
+    assert restored == "старое", "an empty field gets its unsent text back"
+    assert left_alone == "новый черновик", (
+        "a field that already has something in it must not be overwritten by the old draft")
+
+
+# -- Task A8: a keyframe dropped straight into the chat's own input -------------------------------
+
+
+@_needs_node
+def test_attachment_body_is_empty_without_a_pending_image():
+    """`attachmentBody` only has an opinion once a frame has actually been uploaded -- an ordinary
+    text-only turn must not pick up `image`/`set_mode` keys it never asked for (`_json_request`
+    on the server side would refuse `image: undefined`... except `JSON.stringify` drops it, which
+    is exactly why an *absent* key here, not merely a falsy one, is what this pins)."""
+    out = _node_eval("""
+      console.log(JSON.stringify(
+        app.attachmentBody({text: "мрачнее", pendingImage: null, mode: "t2va"})));
+    """)
+    assert out == {}, out
+
+
+@_needs_node
+def test_attachment_body_defaults_the_text_and_claims_i2v_when_the_mode_is_still_undecided():
+    """The two rules requirement 2 (A8) names for a frame dropped with no words at all: the turn
+    still needs *some* text (so it shows up in the transcript like any other turn, not as a blank
+    bubble), and the session's mode moves to `i2v` -- but only when it was not already saying
+    something else on purpose (`t2va`, or a session that never declared one)."""
+    undecided, was_t2va = _node_eval("""
+      console.log(JSON.stringify([
+        app.attachmentBody({text: "", pendingImage: {path: "/out/uploads/1-a.png", name: "a.png"},
+                            mode: ""}),
+        app.attachmentBody({text: "  ", pendingImage: {path: "/out/uploads/1-a.png", name: "a.png"},
+                            mode: "t2va"}),
+      ]));
+    """)
+    for body in (undecided, was_t2va):
+        assert body["image"] == "/out/uploads/1-a.png", body
+        assert body["set_mode"] == "i2v", body
+        assert body["text"] == "Опиши кадр и предложи промпт от него", body
+
+
+@_needs_node
+def test_attachment_body_keeps_the_typed_text_and_leaves_a_decided_mode_alone():
+    """The mirror of the case above: text the person actually typed travels as-is (no default
+    substitution), and a mode that already names a keyframe (`i2v`/`flf`) is not overwritten --
+    the frame is already accounted for, and there is nothing for `set_mode` to decide."""
+    for mode in ("i2v", "flf"):
+        body = _node_eval(f"""
+          console.log(JSON.stringify(
+            app.attachmentBody({{text: "переделай фон", pendingImage:
+              {{path: "/out/uploads/2-b.png", name: "b.png"}}, mode: {json.dumps(mode)}}})));
+        """)
+        assert body == {"image": "/out/uploads/2-b.png"}, (mode, body)
+
+
+def test_the_chat_log_marks_a_turn_that_carried_an_attached_frame():
+    """Requirement 2 (A8): «в ленте у хода с кадром — пометка с именем файла». `renderChatLog` is
+    DOM-only and cannot run under `node` (see `_node_eval`'s own docstring) -- pinned on the
+    source instead, the same way the pending-dots markup a few lines above it in the real
+    function is."""
+    body = _js_function((WEBUI / "app.js").read_text(encoding="utf-8"), "function renderChatLog()")
+    assert "entry.attachment" in body, (
+        "a log entry carrying an attached frame's name must be rendered as a mark the person can "
+        "see, not silently dropped on the way to innerHTML:\n" + body)
+
+
+def test_send_chat_message_wires_the_attachment_into_the_outgoing_turn():
+    """`attachmentBody` is only worth the tests above if `sendChatMessage` actually calls it --
+    a pure function nobody wires up passes every test in this file and ships nothing."""
+    body = _js_function((WEBUI / "app.js").read_text(encoding="utf-8"), "async function sendChatMessage()")
+    assert "attachmentBody(" in body, body
+    assert "pendingImage" in body, (
+        "sendChatMessage must read the frame the attach button/dnd just uploaded "
+        "(`chat.pendingImage`) to build the turn's body:\n" + body)
+
+
+# -- Task C3: the chat modal by the second screen of the mock, and 360-1920 --------------------
+
+
+def _modal_markup() -> str:
+    """The `#chat-modal` subtree of `index.html`, comments stripped.
+
+    Comments are stripped for the same reason `test_the_queue_pause_button_...` strips them: this
+    file explains its own layout in them, and an explanation that names a class is not that class.
+    """
+    page = _page_text("index.html")
+    start = page.index('<div class="modal-back" id="chat-modal"')
+    return re.sub(r"<!--.*?-->", "", page[start:], flags=re.S)
+
+
+def test_the_chat_modal_is_the_two_column_window_of_the_second_screen():
+    """C3. Модалка была формой на подложке: одна колонка полей с внутренним отступом, шапка
+    диалога — просто строка кнопок посреди неё. Макет («Экран 2») строит её как окно —
+    собственная шапка со своим фоном, линия между половинами во всю высоту, подвал ввода, — и
+    из этого следует, что поля принадлежат частям, а не окну: иначе линия не доходит до краёв.
+
+    Проверяется каркас, а не пиксели: три части макета на месте и вложены друг в друга в том
+    порядке, в каком макет их рисует. Всё остальное про эту модалку — глазами и на скриншотах.
+    """
+    modal = _modal_markup()
+    for part in ("mhead", "mgrid", "mleft", "mright", "composer"):
+        assert f'class="{part}"' in modal or f'"{part}"' in modal, (
+            f"части макета «{part}» в модалке нет")
+    assert modal.index('class="mhead"') < modal.index('class="mgrid"'), (
+        "шапка стоит над колонками, а не между ними")
+    assert modal.index('class="mleft"') < modal.index('class="mright"'), (
+        "слева промпт, справа лента — порядок макета и порядок табуляции")
+    left = modal[modal.index('class="mleft"'):modal.index('class="mright"')]
+    for ident in ("chat-prompt-text", "chat-hl", "chat-scale", "chat-parse"):
+        assert f'id="{ident}"' in left, f"{ident} принадлежит окну промпта, а не ленте"
+    right = modal[modal.index('class="mright"'):]
+    for ident in ("chat-log", "chat-input", "chat-send", "chat-attach", "chat-attachment"):
+        assert f'id="{ident}"' in right, f"{ident} принадлежит ленте, а не окну промпта"
+
+
+def test_the_modal_head_carries_everything_the_conversation_is_steered_by():
+    """C3: «шапка: источник, провайдер, длительность, статус модели, кнопки». Все пять — в одной
+    полосе и в ней одной. Разговор длинный, окно закрывается по Esc, и вопрос «а с кем я сейчас
+    говорю и что будет, когда закончу» не должен требовать прокрутки.
+    """
+    modal = _modal_markup()
+    head = modal[modal.index('class="mhead"'):modal.index('class="mgrid"')]
+    for ident in ("chat-source", "chat-provider", "chat-duration", "chat-llm",
+                  "chat-finish", "chat-delete", "chat-close"):
+        assert f'id="{ident}"' in head, f"{ident} обязан стоять в шапке модалки"
+    assert 'id="chat-llm-dot"' in head, (
+        "состояние модели названо словом и подтверждено точкой — формой макета")
+
+    script = _page_text("app.js")
+    body = _js_function(script, "function renderLlmPlate(override)")
+    assert "chat-llm-dot" in body, (
+        "точка обязана двигаться вместе со словом, иначе она врёт молча:\n" + body)
+    assert '"busy"' in body and "hot" in body, (
+        "янтарной точка становится только под `busy` — это единственное её состояние, в котором "
+        "GPU действительно занят:\n" + body)
+
+
+def test_the_empty_feed_tells_the_person_what_this_window_is_for():
+    """C3: пустое состояние с подсказкой. Разговор начинается с чистого листа каждый раз, и
+    белое пятно на пол-окна — худший ответ на вопрос «а что тут делать».
+    """
+    body = _js_function(_page_text("app.js"), "function renderChatLog()")
+    assert "feed-empty" in body, (
+        "у пустой ленты собственная разметка, а не реплика-заглушка в общем пузыре:\n" + body)
+    assert "chat.log.length" in body, "подсказка показывается ровно на пустом логе"
+    css = _page_text("style.css")
+    assert ".feed-empty" in css, "пустое состояние должно быть оформлено, а не свалено в поток"
+
+
+def test_the_modal_folds_into_one_column_before_the_window_gets_narrow():
+    """C3, адаптив. Две колонки в модалке живут до 860 px — ниже промпт и лента встают друг под
+    друга. Без этого правила окно на планшете отдавало каждой половине по 300 px, и в левой
+    промпт переносился по слову.
+
+    Линия между половинами при этом обязана переехать: `border-right` у колонки, которая больше
+    не слева, рисует вертикальную черту посреди пустого места.
+    """
+    css = _page_text("style.css")
+    narrow = re.search(r"@media \(max-width: 860px\) \{(.*?)\n\}", css, re.S)
+    assert narrow, "ступени 860 в style.css больше нет"
+    assert re.search(r"\.mgrid\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)", narrow.group(1)), (
+        "модалка обязана складываться в одну колонку:\n" + narrow.group(1))
+    assert re.search(r"\.mleft\s*\{[^}]*border-right:\s*0", narrow.group(1)), (
+        "вертикальная линия под сложенными колонками — черта посреди пустоты:\n"
+        + narrow.group(1))
+
+
+def test_every_grid_track_on_the_page_may_shrink_below_its_contents():
+    """C3, адаптив, и это единственный способ проверить «ничего не вылезает за край» без
+    браузера. Дорожка `1fr` не сжимается меньше своего `min-content`: одно длинное слово в ней
+    — путь к чекпойнту, слаг задачи, строка `metal::malloc` — раздвигает сетку шире экрана, и
+    горизонтальная прокрутка появляется у всей страницы, а не у той карточки, где живёт слово.
+    `minmax(0, …)` снимает этот минимум, и тогда переносится содержимое, а не ломается раскладка.
+
+    Проверяются все сетки страницы разом: правило, соблюдённое в пяти местах из шести, ничего
+    не гарантирует, а шестое — всегда то, которое найдут пользователи.
+    """
+    css = _page_text("style.css")
+    offenders = []
+    for match in re.finditer(r"grid-template-columns:\s*([^;}]+)", css):
+        tracks = match.group(1).strip()
+        # `repeat(N, minmax(0, …))` и `minmax(0, …)` — годные; фиксированные px тоже (они и так
+        # не растут). Плохо ровно одно: `fr` без снятого минимума.
+        rest = re.sub(r"minmax\(0,[^)]*\)", "", tracks)
+        if re.search(r"[\d.]+fr\b", rest):
+            offenders.append(tracks)
+    assert not offenders, (
+        "дорожка `1fr` без `minmax(0, …)` растягивается длинным словом шире экрана: " + str(offenders))
+
+
+def test_nothing_in_the_chrome_refuses_to_shrink_except_the_clock():
+    """C3, живая проверка на 1024 и 1440: как только прогон пошёл, часы уезжали за правый край
+    окна. Чрома — одна flex-строка, и `flex: none` на строке идущего прогона означал «этот
+    кусок никогда не сжимается»; вместе с росписью показаний и адресом он не оставлял часам
+    места, а `flex: none` часов не давал сжаться и им. Горизонтальная прокрутка появлялась у
+    всей страницы, и появлялась она ровно в том состоянии, ради которого на страницу и смотрят.
+
+    Правило: сжимается всё, что несёт текст переменной длины (адрес, показания, строка
+    прогона), и не сжимается только то, у кого содержимое фиксировано — марка слева и часы
+    справа. Сжатие без `min-width: 0` не работает вовсе: у flex-элемента минимум по умолчанию
+    равен `min-content`, и именно он держал строку шире окна.
+    """
+    css = _page_text("style.css")
+    for selector in (r"\.rail-run", r"\.readout", r"\.host"):
+        rule = re.search(selector + r"\s*\{([^}]*)\}", css)
+        assert rule, f"правила {selector} в style.css нет"
+        body = rule.group(1)
+        assert "flex: none" not in body, (
+            f"{selector} с `flex: none` выталкивает часы за край окна:\n{body}")
+        assert "min-width: 0" in body, (
+            f"{selector} без `min-width: 0` не сожмётся, что бы ни говорил flex:\n{body}")
