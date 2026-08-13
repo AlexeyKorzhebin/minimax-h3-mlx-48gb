@@ -1092,14 +1092,32 @@ const SLUG_TRANSLIT = {
 const SLUG_SKIP_WORDS = new Set(["live-action", "cinematic", "a", "an", "the"]);
 
 /**
+ * Итоговая чистка любого кандидата в тег — общая точка для `heuristicSlug` (слова уже почти
+ * чистые, собраны из латиницы/кириллицы промпта) и для `slug`, который прислала модель (A4):
+ * `PROMPT_SCHEMA` не накладывает на него никакого ограничения по алфавиту, это произвольный
+ * текст, и оба в итоге становятся `#tag`. Транслитерирует кириллицу, стягивает любой пробег
+ * символов вне `[a-z0-9-]` в одиночный дефис, срезает висящие дефисы по краям и по 24-символьному
+ * пределу (тому же, которым `heuristicSlug` режет собранные слова).
+ */
+export function normalizeSlug(text) {
+  const lower = String(text == null ? "" : text).toLowerCase();
+  const romanized = Array.from(lower)
+    .map((ch) => (ch in SLUG_TRANSLIT ? SLUG_TRANSLIT[ch] : ch))
+    .join("");
+  const cleaned = romanized.replace(/[^a-z0-9-]+/g, "-").replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return cleaned.slice(0, 24).replace(/-+$/, "");
+}
+
+/**
  * Эвристический тег из промпта, когда модель не прислала свой `slug` (A4).
  *
  * Источник текста — поле `integrated_multimodal_description`, размеченное так же, как его читает
  * подсветка (`fieldValue`): если заголовок поля есть, берётся текст до следующего заголовка;
  * иначе (промпт ещё не разбит на поля) читается весь текст как есть. `[Shot N]` и стиль-слова, с
  * которых `[Shot 1]` начинается по документу, значимого о сцене не говорят и пропускаются вместе
- * с артиклями; первые три оставшихся слова транслитерируются, склеиваются дефисом и обрезаются до
- * 24 символов — предела, которым сервер ограничивает `--tag`-подобные имена.
+ * с артиклями; первые три оставшихся слова склеиваются дефисом и уходят через `normalizeSlug` —
+ * ту же чистку и тот же 24-символьный предел, что и у слага модели.
  */
 export function heuristicSlug(promptText) {
   const text = String(promptText == null ? "" : promptText);
@@ -1108,26 +1126,29 @@ export function heuristicSlug(promptText) {
   const words = body.match(/[\p{L}\p{N}]+(?:-[\p{L}\p{N}]+)*/gu) || [];
   const picked = [];
   for (const raw of words) {
-    const lower = raw.toLowerCase();
-    if (SLUG_SKIP_WORDS.has(lower)) continue;
-    const romanized = Array.from(lower).map((ch) => (ch in SLUG_TRANSLIT ? SLUG_TRANSLIT[ch] : ch))
-      .join("")
-      .replace(/[^a-z0-9-]/g, "");
-    if (!romanized) continue;
-    picked.push(romanized);
+    if (SLUG_SKIP_WORDS.has(raw.toLowerCase())) continue;
+    picked.push(raw);
     if (picked.length === 3) break;
   }
-  return picked.join("-").slice(0, 24).replace(/-+$/, "");
+  return normalizeSlug(picked.join("-"));
 }
 
 /**
- * Тег поля `#tag` после «в Редактор»: слаг сессии, если он вообще есть — так A4 (слаг от LLM)
- * долетает до имени вывода без лишнего клика. Пустой или отсутствующий слаг оставляет поле
- * как есть: нечего подставлять — нечего и менять.
+ * Тег поля `#tag` после «в Редактор» (A4, fix round 1 — до этого слаг сессии подменял тег
+ * безусловно, стирая то, что человек вписал сам).
+ *
+ * «Слаг = имя по умолчанию, не диктат» — тот же принцип, по которому `submit()` трогает `#tag`
+ * только при пустом/`"run"` значении (см. `heuristicSlug`'s own call site). Заменяется только
+ * тег, который сейчас пуст, равен `"run"`, или равен `lastAutoTag` — тому автослагу, который эта
+ * же функция сама подставила в прошлый раз и который человек с тех пор не трогал руками. Любой
+ * другой текст в поле — чья-то правка, и остаётся как есть.
  */
-export function tagFromSessionSlug(currentTag, slug) {
-  const clean = String(slug == null ? "" : slug).trim();
-  return clean || currentTag;
+export function tagFromSessionSlug(currentTag, slug, lastAutoTag) {
+  const clean = normalizeSlug(slug);
+  if (!clean) return currentTag;
+  const current = String(currentTag == null ? "" : currentTag).trim();
+  const overwritable = !current || current === "run" || current === lastAutoTag;
+  return overwritable ? clean : currentTag;
 }
 
 /** Предупреждение хода — по коду, как и отказ: сервер шлёт `{code, message}` именно затем,
@@ -2002,6 +2023,10 @@ function startPage() {
       // `prompt_struct` (только непустая строка переписывает), `applyTurn` держит его свежим на
       // каждом ходе, а «в Редактор» (`finishChat`) подставляет его в `#tag`.
       slug: session.slug || "",
+      // A4, fix round 1: свежая сессия ничего в `#tag` ещё не подставляла — `tagFromSessionSlug`
+      // получает пустую строку и потому не спутает уже стоящий в поле ручной тег со своим же
+      // прошлым автослагом (никакого «прошлого» у только что открытой модалки нет).
+      lastAutoTag: "",
     };
     $("chat-modal").hidden = false;
     $("chat-finish").textContent = FINISH_LABEL[chat.source.kind] || FINISH_LABEL.new;
@@ -2228,11 +2253,19 @@ function startPage() {
       /* «в Редактор»: дальше обычная постановка. Промпт перестаёт быть файловым — текст
          разошёлся с файлом ровно в тот момент, когда его переписала модель, и уйти он должен
          строкой, а не как --prompt-file на старое содержимое. Тег — слаг сессии (A4), если
-         модель его назвала: `tagFromSessionSlug` оставляет поле как есть, когда слага нет. */
+         модель его назвала и поле не занято ручной правкой (`tagFromSessionSlug`, fix round 1);
+         `chat.lastAutoTag` запоминает, что как раз было подставлено, чтобы следующий ход этой же
+         сессии (новый слаг после новой правки модели) мог подвинуть тег дальше, а не решил, что
+         поле уже кто-то тронул руками. */
       $("prompt").value = text;
       promptFromFile = null;
       $("prompt-file").value = "";
-      $("tag").value = tagFromSessionSlug($("tag").value, chat.slug);
+      // Запоминается только тогда, когда `tagFromSessionSlug` действительно что-то подставила:
+      // безусловное присваивание запомнило бы и оставленный как есть ручной тег как «свой»
+      // автослаг, и тот же баг вернулся бы на следующем ходе этой сессии — только на шаг позже.
+      const nextTag = tagFromSessionSlug($("tag").value, chat.slug, chat.lastAutoTag);
+      if (nextTag !== $("tag").value) chat.lastAutoTag = nextTag;
+      $("tag").value = nextTag;
       renderPrompt();
       scheduleEstimate();
     }

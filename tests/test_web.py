@@ -3842,11 +3842,59 @@ def test_tag_from_session_slug_replaces_the_tag_only_when_a_slug_exists():
     assert out == ["cat-italian-noon", "my-own-tag", "my-own-tag", "my-own-tag"], out
 
 
+# -- A4, fix round 1: «слаг = имя по умолчанию, не диктат» также для «в Редактор» ---------------
+
+
+@_needs_node
+def test_normalize_slug_strips_everything_outside_the_dash_alphabet():
+    """`normalizeSlug` is the one gate both `heuristicSlug` (built from the prompt's own words,
+    already close to clean) and the model's own `slug` (arbitrary text, A4's `PROMPT_SCHEMA`
+    places no charset constraint on it at all) go through before either becomes `#tag`. A
+    path-traversal-shaped string is the sharpest case: nothing about `../../../evil` may survive
+    except the one word actually made of letters.
+    """
+    got = _node_eval('console.log(JSON.stringify(app.normalizeSlug("../../../evil")));')
+    assert got == "evil", got
+    assert re.fullmatch(r"[a-z0-9-]*", got), got
+
+
+@_needs_node
+def test_tag_from_session_slug_leaves_a_hand_typed_tag_alone():
+    """The review finding this fixes: «в Редактор» overwrote `#tag` unconditionally, so a tag a
+    person had actually typed (`my-halloween-shoot`) was silently thrown away the moment a session
+    slug existed. `heuristicSlug`'s own place in `submit()` already only touches the tag when it
+    is empty/`"run"` -- this is the same principle, applied here too.
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify(
+        app.tagFromSessionSlug("my-halloween-shoot", "cat-italian-noon", "")));
+    """)
+    assert got == "my-halloween-shoot", got
+
+
+@_needs_node
+def test_tag_from_session_slug_overwrites_its_own_earlier_auto_slug_when_a_newer_one_arrives():
+    """A tag left at the *previous* auto-substitution (tracked by the caller as `lastAutoTag`,
+    per this same function's own contract) is not a hand-typed tag -- it is this function's own
+    last answer, still sitting there untouched, and a newer slug from a later turn must still be
+    able to move it forward. Only a tag that differs from both `"run"`/empty *and* the last
+    auto-slug counts as a person's own edit.
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify(app.tagFromSessionSlug(
+        "cat-italian-noon", "dog-parisian-dusk", "cat-italian-noon")));
+    """)
+    assert got == "dog-parisian-dusk", got
+
+
 def test_finishing_a_chat_to_the_editor_writes_the_sessions_slug_into_the_tag_field():
     """The DOM half cannot run under `node` (see `_node_eval`'s own docstring and the identical
     reasoning in `test_the_library_prompt_dialog_button_hands_the_forms_duration_to_the_new_session`
     just above it in this file) -- this pins the handler's own source instead: the «в Редактор»
-    branch of `finishChat` has to route `chat.slug` through `tagFromSessionSlug` into `#tag`.
+    branch of `finishChat` has to route `chat.slug` through `tagFromSessionSlug` into `#tag`, and
+    has to keep `chat.lastAutoTag` in step with whatever it just wrote -- the "state" fix round 1
+    added so a later turn's newer slug can still move a still-untouched auto-tag forward (see
+    `test_tag_from_session_slug_overwrites_its_own_earlier_auto_slug_when_a_newer_one_arrives`).
     """
     app_js = (WEBUI / "app.js").read_text(encoding="utf-8")
     start = app_js.index("async function finishChat()")
@@ -3854,6 +3902,14 @@ def test_finishing_a_chat_to_the_editor_writes_the_sessions_slug_into_the_tag_fi
     end = app_js.index("function fillFormFrom(job)", start)
     body = app_js[start:end]
     assert "tagFromSessionSlug(" in body and '$("tag").value' in body, body
+    assert "lastAutoTag" in body, (
+        "the last auto-substituted tag must be tracked in state, not just written once:\n" + body)
+
+    enter_start = app_js.index("async function enterChat(id)")
+    enter_end = app_js.index("function closeChat()", enter_start)
+    enter_body = app_js[enter_start:enter_end]
+    assert "lastAutoTag" in enter_body, (
+        "a freshly opened session must start with no auto-tag memory of its own:\n" + enter_body)
 
 
 def test_submit_falls_back_to_the_heuristic_slug_when_the_tag_is_still_the_default():
