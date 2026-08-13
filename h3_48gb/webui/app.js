@@ -913,6 +913,7 @@ export function buildArgs(form, { withPrompt = true } = {}) {
             "--mode", form.mode,
             "--checkpoint", form.checkpoint, "--outdir", form.outdir);
   if (form.lora) args.push("--turbo-lora", form.lora, "--turbo-strength", String(form.loraStrength));
+  if (form.adaln) args.push("--adaln-cache", form.adaln);
   if (form.image) args.push("--image", form.image);
   if (form.endImage) args.push("--end-image", form.endImage);
   return args;
@@ -1203,7 +1204,7 @@ function startPage() {
   // `mode` подписан отдельно: у него сверх пересчёта есть своя работа — показать
   // или спрятать поля кадров.
   const FIELDS = ["width", "height", "duration", "steps", "seed", "tag",
-                  "ckpt", "lora", "lora-str", "outdir", "image", "end-image"];
+                  "ckpt", "lora", "lora-str", "adaln", "outdir", "image", "end-image"];
 
   let state = null;            // последний удавшийся ответ /api/state
   let failures = 0;            // подряд неудавшихся опросов
@@ -1234,6 +1235,7 @@ function startPage() {
     checkpoint: $("ckpt").value.trim(),
     lora: $("lora").value.trim(),
     loraStrength: Number(String($("lora-str").value).replace(",", ".")) || 1,
+    adaln: $("adaln").value.trim(),
     outdir: $("outdir").value.trim(),
     note: $("note").value.trim(),
     prompt: $("prompt").value,
@@ -1991,6 +1993,7 @@ function startPage() {
     $("ckpt").value = argValue(job.args, "--checkpoint") || "";
     $("lora").value = argValue(job.args, "--turbo-lora") || "";
     $("lora-str").value = argValue(job.args, "--turbo-strength") || "1.00";
+    $("adaln").value = argValue(job.args, "--adaln-cache") || "";
     $("outdir").value = argValue(job.args, "--outdir") || "";
     $("image").value = argValue(job.args, "--image") || "";
     $("end-image").value = argValue(job.args, "--end-image") || "";

@@ -109,7 +109,7 @@
             <div class="ctl"><input class="num" id="duration" type="number" step="0.5" value="10"><span class="unit">с</span></div>
           </div>
           <div class="row"><label for="steps">Шаги</label>
-            <div class="ctl"><input class="num" id="steps" type="number" value="8"><span class="hint">8 — с перепечённой таблицей AdaLN, иначе 31</span></div>
+            <div class="ctl"><input class="num" id="steps" type="number" value="8"><span class="hint">8 — таблица AdaLN подставлена по умолчанию, иначе 31</span></div>
           </div>
           <div class="row"><label for="seed">Сид</label>
             <div class="ctl"><input class="num" id="seed" type="text" value="0"><span class="hint">После постановки сдвигается на следующий</span></div>
@@ -138,13 +138,16 @@
         <!-- Группа 2: чем считаем. Отделена воздухом, а не линией -->
         <div class="pgroup">
           <div class="row"><label for="ckpt">Чекпойнт</label>
-            <div class="ctl"><input class="mono path" id="ckpt" type="text" value="~/models/h3-converted"></div>
+            <div class="ctl"><input class="mono path" id="ckpt" type="text" value="~/models/h3-8bit-full"></div>
           </div>
           <div class="row"><label for="lora">LoRA</label>
-            <div class="ctl"><input class="mono path" id="lora" type="text" placeholder="пусто — без LoRA"></div>
+            <div class="ctl"><input class="mono path" id="lora" type="text" value="~/models/turbo/minimax_h3_turbo_v4_step600_ema.safetensors" placeholder="пусто — без LoRA"></div>
           </div>
           <div class="row"><label for="lora-str">Сила LoRA</label>
             <div class="ctl"><input class="num narrow" id="lora-str" type="number" step="0.05" value="1.00"><span class="hint">1.00 — измеренный оптимум на этом канвасе</span></div>
+          </div>
+          <div class="row"><label for="adaln">Таблица AdaLN</label>
+            <div class="ctl"><input class="mono path" id="adaln" type="text" value="~/models/turbo/adaln_8_l100.safetensors" placeholder="~/models/turbo/adaln_8_l100.safetensors"><span class="hint">пусто — 8 шагов отклонит dry-run (schedule_not_baked), останутся 31</span></div>
           </div>
           <div class="row"><label for="outdir">Каталог</label>
             <div class="ctl"><input class="mono path" id="outdir" type="text"></div>

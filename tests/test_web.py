@@ -2903,6 +2903,57 @@ def test_the_argument_list_the_form_builds_is_one_the_server_accepts(queue_serve
     assert [job["id"] for job in state["queue"]["pending"]] == [answer["job"]["id"]], state
 
 
+@_needs_node
+def test_build_args_carries_the_adaln_cache_flag_only_when_the_field_is_set():
+    """The project's working recipe needs `--adaln-cache` to bake 8 steps instead of 31 (see
+    `h3_48gb/cli.py`'s `schedule_not_baked`), and until now the form had no field for it at all --
+    a dry-run of the 8-step recipe was refused and the page silently fell back to 31 steps.
+
+    An empty `#adaln` must not turn into `--adaln-cache ""`: the CLI reads a present flag as a
+    real path and would refuse with `adaln_cache_unreadable` rather than just running without one.
+    """
+    base = {
+        "prompt": "кот", "width": 896, "height": 576, "duration": 10, "steps": 8,
+        "seed": 3, "tag": "ночь", "mode": "t2va", "checkpoint": "CKPT", "outdir": "OUT",
+        "lora": "LORA", "loraStrength": 1, "image": "", "endImage": "", "promptFile": None,
+    }
+    with_table, without = _node_eval(f"""
+      const base = {json.dumps(base)};
+      console.log(JSON.stringify([
+        app.buildArgs({{...base, adaln: "ADALN"}}),
+        app.buildArgs({{...base, adaln: ""}}),
+      ]));
+    """)
+    assert "--adaln-cache" in with_table, with_table
+    assert with_table[with_table.index("--adaln-cache") + 1] == "ADALN", with_table
+    assert "--adaln-cache" not in without, without
+
+
+def test_the_form_defaults_to_the_project_s_working_recipe():
+    """The project's working recipe is 8 steps, this checkpoint, this turbo LoRA at full strength,
+    and this baked AdaLN table -- so a fresh page has to open ready to run it, not to a checkpoint
+    that forces 31 steps because no one typed the table's path in yet.
+    """
+    page = _page_text("index.html")
+    assert re.search(r'id="ckpt"[^>]*value="~/models/h3-8bit-full"', page), (
+        "the checkpoint must default to the 8-bit build the recipe was measured on")
+    assert re.search(
+        r'id="lora"[^>]*value="~/models/turbo/minimax_h3_turbo_v4_step600_ema\.safetensors"', page)
+    assert re.search(r'id="lora-str"[^>]*value="1\.00"', page)
+    assert re.search(r'id="adaln"[^>]*value="~/models/turbo/adaln_8_l100\.safetensors"', page), (
+        "without this default, --steps 8 is refused as schedule_not_baked and the page falls "
+        "back to 31 steps")
+    assert re.search(r'id="steps"[^>]*value="8"', page)
+
+
+def test_editing_a_queued_job_restores_its_adaln_cache_flag():
+    """Requirement 3: editing a pending job has to read `--adaln-cache` back out of its stored
+    args, the same way it already does for `--turbo-lora` a line above it.
+    """
+    body = _js_function(_page_text("app.js"), "function fillFormFrom(job)")
+    assert '$("adaln").value = argValue(job.args, "--adaln-cache") || "";' in body, body
+
+
 def test_a_job_posted_through_the_api_is_in_the_next_state_the_page_polls(queue_server):
     """The whole loop the page runs on: post, poll, see it. Without this the page could be
     posting into a queue `/api/state` never reads and nothing would say so.
@@ -3248,7 +3299,7 @@ def test_the_new_file_entry_carries_a_sentinel_that_survives_the_html_parser():
 
 def test_a_posted_job_leaves_every_field_but_the_seed_and_the_tag_alone():
     """Requirement 2's other half. `advanceAfterSubmit` is tested above and says what the seed and
-    the tag become; nothing said what happens to the other twelve fields, and the report claimed
+    the tag become; nothing said what happens to the other thirteen fields, and the report claimed
     the requirement was checked automatically on the strength of that one test.
 
     The main use of this page is five jobs in an evening with one field changed each time. A
