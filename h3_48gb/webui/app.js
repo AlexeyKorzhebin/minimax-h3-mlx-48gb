@@ -1743,6 +1743,7 @@ function startPage() {
         prompt: opened.prompt || "",
         mode: opened.mode || "",
         image: opened.image || "",
+        end_image: opened.endImage || "",
       });
       clearError();
       window.location.hash = `#chat/${answer.id}`;
@@ -1894,6 +1895,9 @@ function startPage() {
       prompt,
       mode: argValue(job.args, "--mode") || "t2va",
       image: argValue(job.args, "--image") || "",
+      // `flf`-задача несёт второй кадр отдельным флагом — без него чат от такой задачи не видит
+      // последний кадр вовсе, и модель не может написать инструкцию `mode: flf` (T4b).
+      endImage: argValue(job.args, "--end-image") || "",
       // Пустое окно у задачи, у которой промпт точно есть, — это не «промпт пуст», а «страница
       // его не достала». Молчать здесь значит предложить сохранить пустоту поверх работы.
       notice: prompt.trim() === ""

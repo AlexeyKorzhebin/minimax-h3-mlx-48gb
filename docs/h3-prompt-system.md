@@ -33,8 +33,33 @@ word:
 For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
 ```
 
+When the context says `mode: flf` (a first-frame **and** a last-frame keyframe are both attached),
+`instruction` is instead this sentence, with `N` replaced by the index of the actual final shot and
+`S.SS` replaced by the video's total duration formatted to exactly two decimal places:
+
+```text
+How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot N) aligns with the S.SS-second mark of the target video.
+```
+
+An eight-second single-shot video, for example, writes `Picture 2 (from Shot 1) aligns with the
+8.00-second mark of the target video`. Picture 1 is always `[Shot 1]` at `0.00`, the same as for
+`mode: i2v`; only Picture 2's shot number and timestamp vary with the video actually being written.
+
 When the context says `mode: t2va` (no keyframe attached), there is no image-alignment sentence:
 `instruction` is `null`.
+
+### `mode: flf`: describe the path between the frames, not two static pictures
+
+Picture 1 is the opening and Picture 2 is the ending. The description must not repeat two static
+image descriptions — it describes how the subject moves, how poses change, how objects are
+manipulated, and how the composition, scene, or lighting transitions **between** the two pictures.
+
+A single shot is strongly preferred, so the model can interpolate continuously from the first frame
+to the last; use more than one shot only when the user explicitly asks for a cut. Whichever shot
+count is used, the last frame must be reached by the final `[Shot N]`, at the end of the video.
+
+Recommended structure: **first-frame state → observable intermediate changes → progressively
+narrowing differences → last-frame state.**
 
 ## `[Shot N]` and cuts
 
@@ -53,10 +78,11 @@ camera motion over a cut.
 
 `[Shot 1]` opens with the overall style and initial composition, stated in its first words:
 `Cinematic`, `live-action`, `2D-animated`, `3D CG`, `claymation`, `watercolor`, `vintage film`, and
-so on. For `mode: i2v`, the style, subjects, and composition are derived from the attached image —
-`[Shot 1]` anchors on what is actually in the picture (appearance, clothing, colors, key objects,
-spatial layout) and then describes how the scene develops forward from there. For `mode: t2va`, the
-style is chosen from the user's text instead.
+so on. For `mode: i2v` and `mode: flf`, the style, subjects, and composition are derived from the
+attached first-frame image — `[Shot 1]` anchors on what is actually in the picture (appearance,
+clothing, colors, key objects, spatial layout) and then describes how the scene develops forward
+from there. For `mode: flf` specifically, that forward development must end at the last-frame
+image (see below); for `mode: t2va`, the style is chosen from the user's text instead.
 
 ```text
 [Shot 1] Live-action, cinematic, a medium-wide shot frames...

@@ -161,5 +161,10 @@ def test_system_prompt_carries_the_format_and_the_preservation_rule():
     text = provider.system_prompt()
     for anchor in ("integrated_multimodal_description", "overall_soundscape",
                    "non_diegetic_music", "[Shot 1]", "<scenetrans>", "Arc Shot",
-                   "preserve", "JSON"):
+                   "preserve", "JSON",
+                   # T4: `mode: flf` (FL2VA) is documented, not left for the model to invent --
+                   # this is the literal instruction line from the upstream guide
+                   # (VIDEO_PROMPT_WRITING_GUIDE_base_en.md), verbatim except for its N/S.SS
+                   # placeholders.
+                   "How the reference pictures align with the target video"):
         assert anchor in text, anchor

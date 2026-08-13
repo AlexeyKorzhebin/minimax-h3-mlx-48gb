@@ -160,6 +160,32 @@ def test_a_session_remembers_the_mode_and_the_keyframe_it_was_opened_with(_serve
     assert Path(got["image"]) == png.resolve()
 
 
+def test_a_session_remembers_the_end_image_and_mentions_it_in_the_turns_context(_serve,
+                                                                                fake_llama):
+    """T4b: `openChatFromJob` did not carry `--end-image` into the session, so a chat opened from
+    a `flf` job's queue entry lost the last frame the moment it opened -- the model never learned
+    it existed and had no way to write the `mode: flf` instruction line correctly. `end_image` is
+    allowlisted and stored the same way `image` is (T4b), but never uploaded as a picture: only a
+    path mention reaches the system context (`_locked_turn`), because the model needs to know the
+    frame exists, not see its bytes on every turn.
+    """
+    srv = _serve(providers_port=fake_llama.port)
+    end = Path(srv.root) / "end.png"
+    end.write_bytes(b"\x89PNG\r\n\x1a\n0000")
+    sid = srv.post_json("/api/chat", {"source": {"kind": "job", "id": "j-1"}, "prompt": "",
+                                      "mode": "flf", "end_image": str(end)})["id"]
+    got = srv.get_json(f"/api/chat/{sid}")
+    assert Path(got["end_image"]) == end.resolve()
+
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "опиши путь", "prompt": ""})
+    request = fake_llama.requests[-1]["body"]
+    system = request["messages"][0]["content"]
+    assert f"end_image: {end.resolve()}" in system
+    # no `image` (first frame) was set on this session -- the turn's content must stay plain text,
+    # proving `end_image` never becomes an `image_url` payload on its own.
+    assert isinstance(request["messages"][-1]["content"], str)
+
+
 def test_a_source_the_server_does_not_know_is_refused_rather_than_stored(_serve):
     """`kind` — закрытый список: сессия с чужим видом источника молча пережила бы страницу,
     которая её открыть уже не сможет."""
