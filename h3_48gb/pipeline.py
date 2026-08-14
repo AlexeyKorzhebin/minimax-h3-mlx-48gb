@@ -38,8 +38,10 @@ from pathlib import Path
 from . import _upstream  # noqa: F401
 
 import mlx.core as mx
+import numpy as np
 
 from minimax_h3_mlx.config import DiTConfig, PipelineConfig
+from minimax_h3_mlx.packing import PIXEL_MEAN, PIXEL_STD, unpatchify_video_tokens
 from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
 
 from . import memory
@@ -345,8 +347,8 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
 
     # -- decoding: the diffusion phase is over, so stop paying for it ---------------------------
 
-    def _decode_video(self, rows, *args, **kwargs):
-        """Release the DiT before decoding, then decode.
+    def _decode_video(self, rows, num_latent_frames, latent_height, latent_width) -> np.ndarray:
+        """Release the DiT before decoding, then decode straight to uint8 inside the MLX graph.
 
         By the time this runs the last forward is done and the transformer will not be touched
         again — but upstream keeps it resident to the end of the call, so decoding pays for
@@ -359,13 +361,46 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         strand a lazy graph. That distinction is the whole reason the text encoder's unload works
         (see `LazyTextEncoder`): an unevaluated graph over a module's parameters pins all of them
         no matter what is deleted.
+
+        The body below is upstream's `_decode_video` (`upstream/minimax_h3_mlx/pipeline.py:359`)
+        with one change: upstream calls `np.array()` on the VAE's raw float32 output and then runs
+        the pixel-mean/std unnormalize, the [0, 1] clip and the *0.5 uint8 round entirely in numpy,
+        on the host. Every one of those reassigns `frames` to a brand-new full-size array — on a
+        10 s clip at the native canvas that is four float32 copies of the whole video (measured
+        +10.8 GB RSS beyond the VAE's own 15.4 GB MLX peak; see
+        `docs/FEASIBILITY-chunked-vae.md` and the probe it was measured with). None of that
+        arithmetic needs numpy: `mx.clip`, multiply and `.astype(mx.uint8)` do the same thing on
+        the still-lazy MLX graph, so the *only* array that ever crosses into numpy is the final
+        uint8 frame buffer — a quarter the size of one of the float32 copies upstream made, and
+        there is exactly one of it. `test_decode_video_matches_upstream_bytes` pins this against
+        upstream's own numpy path byte-for-byte on a random small latent.
         """
         mx.eval(rows)
         self.dit.unload()
         self._cache = None
         self._cache_timesteps = None
         memory.release()
-        return super()._decode_video(rows, *args, **kwargs)
+
+        cfg = self.video_vae.config
+        latents = unpatchify_video_tokens(
+            rows, num_latent_frames, latent_height, latent_width, cfg.latent_channels,
+            self.dit.config.patch_size,
+        )
+        mean = mx.array(np.array(cfg.latents_mean, np.float32)).reshape(1, -1, 1, 1, 1)
+        std = mx.array(np.array(cfg.latents_std, np.float32)).reshape(1, -1, 1, 1, 1)
+        latents = latents * std + mean
+
+        frames = self.video_vae.decode(latents.astype(mx.float32))
+        # The VAE decodes into ImageNet-normalized RGB over a [0, 1] base range.
+        pixel_mean = mx.array(np.array(PIXEL_MEAN, np.float32)).reshape(1, 3, 1, 1, 1)
+        pixel_std = mx.array(np.array(PIXEL_STD, np.float32)).reshape(1, 3, 1, 1, 1)
+        frames = frames * pixel_std + pixel_mean
+        frames = mx.clip(frames, 0.0, 1.0)
+        # Same `* 255.0 + 0.5` round-to-nearest upstream does in numpy, then the narrowing cast —
+        # both still lazy, both still on the MLX side of the `np.array()` barrier below.
+        frames = (frames * 255.0 + 0.5).astype(mx.uint8)
+        frames = frames[0].transpose(1, 2, 3, 0)  # -> (F, H, W, 3)
+        return np.array(frames)
 
     def _decode_audio(self, rows, *args, **kwargs):
         """Release the video VAE before the audio VAE loads — they are never needed together."""

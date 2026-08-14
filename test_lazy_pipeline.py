@@ -410,6 +410,45 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
+class FakeDiT:
+    """Only `.config.patch_size` and `.unload()` are read by `_decode_video`."""
+
+    def __init__(self, events: list[str], patch_size=(1, 1, 1)):
+        self._events = events
+        self.config = FakeConfig(patch_size)
+
+    def unload(self):
+        self._events.append("unload:dit")
+
+
+class FakeVideoVAEConfig:
+    latent_channels = 2
+    latents_mean = [0.0, 0.0]
+    latents_std = [1.0, 1.0]
+
+
+class FakeVideoVAE:
+    """`.config` and `.decode()` are read directly by `_decode_video` now that it no longer
+    delegates to `MiniMaxH3Pipeline._decode_video` (see `h3_48gb/pipeline.py`) — the numpy tail
+    was inlined and rewritten to finish in uint8 on the MLX side. `.decode()` ignores its input
+    and hands back a fixed tiny tensor, same trick `StubVAE` in
+    `tests/test_decode_video_uint8.py` uses to isolate this from the real 5.21 GB VAE."""
+
+    def __init__(self, events: list[str]):
+        self._events = events
+        self.config = FakeVideoVAEConfig()
+
+    def load(self):
+        self._events.append("load:video_vae")
+
+    def decode(self, latents):
+        self._events.append("decode:video")
+        return mx.zeros((1, 3, 1, 1, 1))
+
+    def unload(self):
+        self._events.append("unload:video_vae")
+
+
 def test_the_transformer_is_released_before_decoding() -> None:
     """Decoding must not pay for the transformer it will never touch again.
 
@@ -421,6 +460,8 @@ def test_the_transformer_is_released_before_decoding() -> None:
     The `mx.eval` before the unload is the same requirement `LazyTextEncoder` documents: an
     unevaluated graph over a module's parameters pins all of them regardless of what is dropped.
     """
+    from minimax_h3_mlx.packing import patchify_video_latents
+
     from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
     from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
 
@@ -437,19 +478,22 @@ def test_the_transformer_is_released_before_decoding() -> None:
         sigma_shift_video = 12.0
         sigma_shift_audio = 3.0
 
-    pipe = LazyMiniMaxH3Pipeline(Proxy("dit"), object(), Proxy("video_vae"), object(),
-                                 Config(), verbose=False)
+    dit = FakeDiT(events)
+    video_vae = FakeVideoVAE(events)
+    pipe = LazyMiniMaxH3Pipeline(dit, object(), video_vae, object(), Config(), verbose=False)
     pipe._cache = "a table"
 
-    original_video = MiniMaxH3Pipeline._decode_video
+    # `rows` for a single (1, 1, 1) latent voxel with 2 channels -- `FakeVideoVAE.decode` ignores
+    # it, but `unpatchify_video_tokens` inside `_decode_video` still runs on it and needs a shape
+    # that round-trips through `patch_size`.
+    rows = patchify_video_latents(mx.zeros((1, 2, 1, 1, 1)), (1, 1, 1))
+
     original_audio = MiniMaxH3Pipeline._decode_audio
-    MiniMaxH3Pipeline._decode_video = lambda self, rows, *a, **k: events.append("decode:video")
     MiniMaxH3Pipeline._decode_audio = lambda self, rows, *a, **k: events.append("decode:audio")
     try:
-        pipe._decode_video(mx.zeros((4, 8)))
+        pipe._decode_video(rows, 1, 1, 1)
         pipe._decode_audio(mx.zeros((4, 8)))
     finally:
-        MiniMaxH3Pipeline._decode_video = original_video
         MiniMaxH3Pipeline._decode_audio = original_audio
 
     check("the transformer goes before the video decode, not after",
@@ -468,6 +512,8 @@ def test_no_component_outlives_its_phase() -> None:
     the video VAE again before the audio VAE loads. None of them raises when missing — the run
     just needs more memory than the machine has, which is the whole problem this fork exists for.
     """
+    from minimax_h3_mlx.packing import patchify_video_latents
+
     from h3_48gb.pipeline import LazyMiniMaxH3Pipeline
     from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
 
@@ -485,22 +531,27 @@ def test_no_component_outlives_its_phase() -> None:
         sigma_shift_video = 12.0
         sigma_shift_audio = 3.0
 
-    video = Proxy("video_vae")
-    pipe = LazyMiniMaxH3Pipeline(Proxy("dit"), object(), video, Proxy("audio_vae"),
+    # `_decode_video` no longer delegates to `MiniMaxH3Pipeline._decode_video` (see
+    # `h3_48gb/pipeline.py` — the numpy postprocessing tail was inlined and rewritten to finish
+    # in uint8 on the MLX side), so `dit` and `video_vae` need enough of a real interface
+    # (`.config`, `video_vae.decode()`) to survive that method's own body, not just a plain
+    # load/unload `Proxy`.
+    dit = FakeDiT(events)
+    video = FakeVideoVAE(events)
+    pipe = LazyMiniMaxH3Pipeline(dit, object(), video, Proxy("audio_vae"),
                                  Config(), verbose=False)
 
-    originals = (MiniMaxH3Pipeline._encode_keyframes, MiniMaxH3Pipeline._decode_video,
-                 MiniMaxH3Pipeline._decode_audio)
+    rows = patchify_video_latents(mx.zeros((1, 2, 1, 1, 1)), (1, 1, 1))
+
+    originals = (MiniMaxH3Pipeline._encode_keyframes, MiniMaxH3Pipeline._decode_audio)
     MiniMaxH3Pipeline._encode_keyframes = lambda self, i, h, w: mx.zeros((2, 4))
-    MiniMaxH3Pipeline._decode_video = lambda self, r, *a, **k: "video"
     MiniMaxH3Pipeline._decode_audio = lambda self, r, *a, **k: "audio"
     try:
         pipe._encode_keyframes([object()], 512, 512)
-        pipe._decode_video(mx.zeros((2, 4)), 1, 1, 1)
+        pipe._decode_video(rows, 1, 1, 1)
         pipe._decode_audio(mx.zeros((2, 4)), 1)
     finally:
-        (MiniMaxH3Pipeline._encode_keyframes, MiniMaxH3Pipeline._decode_video,
-         MiniMaxH3Pipeline._decode_audio) = originals
+        (MiniMaxH3Pipeline._encode_keyframes, MiniMaxH3Pipeline._decode_audio) = originals
 
     check("the video VAE is released after keyframes, not held through diffusion",
           events[:2] == ["load:video_vae", "unload:video_vae"], f"got {events}")
