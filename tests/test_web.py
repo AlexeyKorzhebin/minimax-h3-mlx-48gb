@@ -4325,6 +4325,76 @@ def test_the_frame_zone_says_a_vertical_picture_gives_a_vertical_video():
     assert '<option value="auto"' in page, "пункт «из кадра (авто)» обязан быть в выпадашке"
 
 
+@_needs_node
+def test_the_new_task_button_clears_the_composition_but_not_the_recipe():
+    """Форма намеренно не очищается сама после постановки — за вечер сюда кладут пять задач,
+    меняя по одному полю, — но именно поэтому нужен явный выход: накидав ночную пачку, следующую
+    задачу человек начинает с чужого промпта, чужого кадра и чужого тега и вычищает их руками.
+
+    Граница ровно одна и она же — причина, по которой сброс не «перезагрузить страницу»:
+    сочинение (промпт, кадры, тег, сид, режим, длительность, канвас) обнуляется, рецепт
+    (чекпойнт, LoRA с её силой, таблица AdaLN, число шагов, папка вывода) не трогается. Рецепт
+    на этой машине один и тот же месяцами, и его повторный набор — та самая работа, ради отмены
+    которой форма и не чистится сама.
+    """
+    reset = _node_eval("console.log(JSON.stringify(app.resetFormState()));")
+
+    assert reset["prompt"] == "", reset
+    assert reset["prompt-file"] == "", "выпадашка библиотеки — на «промпт набран здесь»"
+    assert reset["image"] == "" and reset["end-image"] == "", "оба кадра обязаны уйти"
+    assert reset["tag"] == "run", reset
+    assert reset["seed"] == "0", "сид возвращается к нулю, как в разметке"
+    assert reset["mode"] == "t2va", reset
+    assert reset["duration"] == "10", reset
+    assert reset["canvas-preset"] == "small", "канвас — тот же пресет, что на чистой странице"
+    assert (reset["width"], reset["height"]) == ("896", "576"), reset
+
+    for recipe in ("ckpt", "lora", "lora-str", "adaln", "steps", "outdir"):
+        assert recipe not in reset, (
+            f"«{recipe}» — рецепт, а не сочинение: сброс не имеет права его трогать")
+
+
+def test_the_reset_defaults_are_the_ones_the_page_actually_opens_with():
+    """Второй список значений всегда разъезжается с первым. Здесь первый — разметка, и сверяется
+    с ней каждое значение, у которого в разметке есть пара: иначе «Новая задача» однажды начнёт
+    ставить сид 0 там, где чистая страница открывается с 1, и никто этого не заметит.
+    """
+    page = _page_text("index.html")
+    reset = _node_eval("console.log(JSON.stringify(app.resetFormState()));")
+    for ident in ("tag", "seed", "duration", "width", "height"):
+        found = re.search(rf'id="{ident}"[^>]*\svalue="([^"]*)"', page) \
+            or re.search(rf'value="([^"]*)"[^>]*\sid="{ident}"', page)
+        assert found, f"в разметке у #{ident} нет value — сверять не с чем"
+        assert reset[ident] == found.group(1), (
+            f"#{ident}: сброс ставит {reset[ident]!r}, разметка открывается с {found.group(1)!r}")
+    for ident, value in (("mode", "t2va"), ("canvas-preset", "small")):
+        assert re.search(rf'<option value="{value}" selected>', page), (
+            f"в разметке #{ident} по умолчанию не {value}")
+
+
+def test_the_new_task_button_stands_in_the_composition_heading_and_is_wired():
+    """Кнопка живёт в заголовке зоны «Сочинение» — там же, где написано, правится задача или
+    ставится новая, — а не среди полей, которые она стирает.
+    """
+    page = _page_text("index.html")
+    start = page.index('<section class="panel" id="form">')
+    head = page[start:page.index('panel-body', start)]
+    assert 'id="form-reset"' in head, (
+        "кнопка «Новая задача» обязана стоять в шапке зоны «Сочинение»:\n" + head)
+
+    script = _page_text("app.js")
+    assert '$("form-reset").addEventListener("click"' in script, "кнопка обязана быть подписана"
+    body = _js_function(script, "function applyFormReset()")
+    assert "resetFormState()" in body, (
+        "DOM-половина обязана брать значения из чистой функции, а не держать свой второй "
+        "список:\n" + body)
+    for touched in ("formNote", "setEditing(null)", "promptFromFile"):
+        assert touched in body, (
+            f"«{touched}» — состояние формы вне полей ввода, и сброс обязан его достать:\n" + body)
+    assert "location.reload" not in script, (
+        "сброс — не перезагрузка страницы: она унесла бы и рецепт, и открытый диалог")
+
+
 def test_the_form_defaults_to_the_project_s_working_recipe():
     """The project's working recipe is 8 steps, this checkpoint, this turbo LoRA at full strength,
     and this baked AdaLN table -- so a fresh page has to open ready to run it, not to a checkpoint

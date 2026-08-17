@@ -1151,6 +1151,42 @@ export function nextBannerState(prev, state) {
    ФОРМА
    =========================================================================== */
 
+/**
+ * Значения, к которым «Новая задача» возвращает форму: поле — значение.
+ *
+ * Форма намеренно не очищается сама после постановки (см. `advanceAfterSubmit`): за вечер сюда
+ * кладут пять задач, меняя по одному полю. Ровно поэтому и нужен явный выход — накидав ночную
+ * пачку, следующую задачу человек начинает с чужого промпта, чужого кадра и чужого тега и
+ * вычищает их руками, по одному полю, ничего при этом не пропустив только по везению.
+ *
+ * **Здесь только сочинение, и это единственная граница, которую надо помнить.** Рецепт —
+ * чекпойнт, LoRA с её силой, таблица AdaLN, число шагов, папка вывода — не в этом списке и не
+ * должен в нём оказаться: он один и тот же месяцами, и его повторный набор был бы той самой
+ * работой, ради отмены которой форма не чистится сама. По той же причине сброс не делается
+ * перезагрузкой страницы: та унесла бы и рецепт, и открытый диалог.
+ *
+ * Чистая функция, а не запись прямо в поля: список значений, проверяемый только глазами, — это
+ * список, который разъедется с разметкой (`test_the_reset_defaults_are_the_ones_the_page_...`
+ * сверяет каждое значение с `value=` в `index.html`).
+ */
+export function resetFormState() {
+  return {
+    prompt: "",
+    "prompt-file": "",      // «— промпт набран здесь —», см. `loadPromptList`
+    image: "",
+    "end-image": "",
+    tag: "run",
+    seed: "0",
+    mode: "t2va",
+    duration: "10",
+    "canvas-preset": "small",
+    // Числа под пресетом ставятся вместе с ним: `applyCanvasChoice` их перепишет, но форма
+    // обязана быть согласованной и до того, как что-нибудь её пересчитает.
+    width: "896",
+    height: "576",
+  };
+}
+
 /** Можно ли выводить канвас из кадра: есть режим с кадром и есть сам кадр.
  *
  *  Пункт «из кадра» без кадра — обещание, которое некому выполнить: CLI не найдёт, из чего
@@ -2847,6 +2883,32 @@ function startPage() {
     scheduleEstimate();
   }
 
+  /** «Новая задача»: сочинение — начисто, рецепт — как был.
+   *
+   *  Значения берутся из `resetFormState`, а здесь остаётся то, чего в полях ввода нет: заметка
+   *  правящейся задачи, режим правки, память о загруженном файле промпта, след ручного выбора
+   *  канваса — и зоны кадров, которые «указать путь» когда-то спрятала (единственное место, где
+   *  это вообще отменяется: сама ссылка обратного хода не имеет). */
+  function applyFormReset() {
+    for (const [id, value] of Object.entries(resetFormState())) $(id).value = value;
+    promptFromFile = null;    // «промпт набран здесь» — значит ни к какому файлу он не привязан
+    formNote = "";
+    canvasTouchedByHand = false;
+    for (const id of ["image", "end-image"]) {
+      $(`${id}-zone`).hidden = false;
+      $(`${id}-manual`).hidden = false;
+      $(id).hidden = true;
+      updateUploadZone(id);
+    }
+    syncModeRows();
+    syncCanvasPreset();
+    syncAutoCanvasOption();
+    // Последним: `setEditing(null)` сам зовёт `renderQueue`/`renderPrompt`/`scheduleEstimate`,
+    // и звать их до него значило бы рисовать форму, которая ещё считается правящей чужую задачу.
+    setEditing(null);
+    $("prompt").focus();
+  }
+
   async function withQueue(action) {
     busy = true;
     refreshSubmitState();
@@ -3293,6 +3355,7 @@ function startPage() {
   $("unload-banner-wait").addEventListener("click", dismissUnloadBanner);
   $("queue-pause-toggle").addEventListener("click", toggleQueuePause);
   $("cancel-edit").addEventListener("click", () => setEditing(null));
+  $("form-reset").addEventListener("click", applyFormReset);
   $("force").addEventListener("change", refreshSubmitState);
   $("save-prompt").addEventListener("click", savePrompt);
   $("prompt-file").addEventListener("change", (event) => {
