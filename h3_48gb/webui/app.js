@@ -1040,8 +1040,12 @@ export function errorText(payload) {
       return { title: "Файл сессии повреждён — почините его или начните новый чат",
                pre: detail.path || error.message };
     case "bad_image":
-      // Сообщение сервера перечисляет разрешённые типы и предел размера — точнее заголовка.
-      return { title: "Кадр не годится для разговора с моделью", pre: error.message };
+      // Условия — в заголовке, а не только в сообщении сервера под ним: заголовок читают первым,
+      // а иногда и единственным, и «кадр не годится» без единого условия оставляет человека
+      // гадать. Длину имени файла тут не поминаем — она больше не причина отказа, имя просто
+      // укорачивается (`sanitize_upload_name`).
+      return { title: "Кадром может быть png, jpg или webp до 16 МБ (разрешение любое)",
+               pre: error.message };
     case "gpu_busy":
       return { title: "Идёт прогон — локальная модель поднимется после него", pre: null };
     case "provider_unavailable":
@@ -1177,7 +1181,11 @@ export function buildArgs(form, { withPrompt = true } = {}) {
  *  ничего вообще. */
 export function uploadZoneLabel(state) {
   const name = (state && state.name) || "";
-  return name || "перетащи картинку или выбери файл";
+  // Пустое состояние называет условия целиком, а не приглашает молча. Отказ по этой зоне
+  // приходит одной строкой `bad_image`, и человек, у которого кадр не взяли, иначе гадает между
+  // форматом, размером и разрешением — при том, что разрешение тут не ограничено вовсе
+  // (канвас выводится из кадра, аспект сохраняется).
+  return name || "перетащи картинку или выбери файл — png, jpg, webp до 16 МБ, разрешение любое";
 }
 
 /** Тег с сидом в хвосте. Без него три сида одной сцены упрутся в
@@ -2929,7 +2937,10 @@ function startPage() {
     } catch (error) {
       zone.classList.add("error");
       $(`${id}-zone-label`).textContent = error.payload
-        ? errorText(error.payload).title : "Файл не загрузился";
+        // `pre`, а не `title`: в подписи шириной в одну строку настоящая причина от сервера
+        // («кадром может быть только […], а 'x.txt' — нет») полезнее общего заголовка.
+        ? errorText(error.payload).pre || errorText(error.payload).title
+        : "Файл не загрузился";
     } finally {
       zone.classList.remove("busy");
     }
@@ -3039,7 +3050,8 @@ function startPage() {
       badge.classList.remove("busy");
       badge.classList.add("error");
       $("chat-attachment-label").textContent = error.payload
-        ? errorText(error.payload).title : "Кадр не загрузился";
+        ? errorText(error.payload).pre || errorText(error.payload).title
+        : "Кадр не загрузился";
       return;
     }
     badge.classList.remove("busy");

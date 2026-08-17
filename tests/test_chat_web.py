@@ -848,22 +848,53 @@ def test_a_traversal_filename_does_not_escape_the_uploads_directory(_serve):
     assert "/" not in saved.name
 
 
-def test_a_prompt_length_filename_keeps_its_image_suffix(_serve):
-    """Генераторы называют файл промптом. Обрезка слева съедала `.png`, и `/api/uploads`
-    отказывал валидному кадру как `bad_image` — та же 400, что человек видит как
-    «кадр не годится для разговора с моделью»."""
+def test_a_prompt_length_filename_is_shortened_instead_of_refused(_serve):
+    """Генераторы называют файл промптом — двести байт с хвостиком. Обрезка слева съедала `.png`,
+    и `/api/uploads` отказывал валидному кадру как `bad_image`: человек видел «кадр не годится
+    для разговора с моделью» и не мог знать, что дело в длине имени, а не в картинке.
+
+    Длина имени — не свойство картинки, поэтому отказа тут быть не должно вовсе: имя укорачивается,
+    суффикс остаётся, кадр загружается.
+    """
     long_name = ("___description_of_thescene_ultra_realistic_cinematic_photography__"
-                 "high_speed_action_shot__location__russian_countryside__golden_rye_field.png")
-    assert len(long_name.encode()) > web.UPLOAD_NAME_MAX_BYTES
+                 "high_speed_action_shot__location__russian_countryside__golden_rye_field_"
+                 "at_sunset__shallow_depth_of_field__85mm_lens__no_text__no_watermark.png")
+    assert len(long_name.encode()) > 200, len(long_name.encode())
     sanitized = web.sanitize_upload_name(long_name)
     assert sanitized.endswith(".png"), sanitized
-    assert len(sanitized.encode()) <= web.UPLOAD_NAME_MAX_BYTES
+    assert len(sanitized.encode()) <= web.UPLOAD_NAME_MAX_BYTES, sanitized
+
     srv = _serve()
     status, answer = srv.upload_raw(_PNG_BYTES, long_name)
     assert (status, answer["ok"]) == (200, True), answer
     saved = Path(answer["path"])
     assert saved.suffix == ".png"
     assert saved.is_file()
+    assert len(saved.name.encode()) <= 255, "имя вместе со штампом обязано влезать в файловую систему"
+
+
+def test_two_long_names_that_share_a_beginning_do_not_become_the_same_name(_serve):
+    """Промпты одного вечера начинаются одинаково — «ultra realistic cinematic...» — и расходятся
+    к концу, то есть ровно в той части, которую обрезка выбрасывает. Без хвоста-хэша два разных
+    кадра получают одно имя и в списке `uploads/` различимы только штампом времени.
+    """
+    head = "ultra_realistic_cinematic_photography_of_a_russian_countryside_in_golden_hour_"
+    first = web.sanitize_upload_name(head + "with_a_red_tractor.png")
+    second = web.sanitize_upload_name(head + "with_a_blue_tractor.png")
+
+    assert first != second, f"разные имена схлопнулись в одно: {first}"
+    assert first.startswith(head[:40]), f"читаемое начало обязано выжить: {first}"
+    for name in (first, second):
+        assert name.endswith(".png")
+        assert len(name.encode()) <= web.UPLOAD_NAME_MAX_BYTES
+
+
+def test_a_short_name_is_left_exactly_as_it_was(_serve):
+    """Хвост-хэш — плата за обрезку, а не украшение: имя, которое влезает, обязано доехать до
+    диска буква в букву, иначе человек не найдёт свой файл по имени.
+    """
+    assert web.sanitize_upload_name("start.png") == "start.png"
+    assert web.sanitize_upload_name("kadr-2.jpeg") == "kadr-2.jpeg"
 
 
 def test_a_cyrillic_or_spaced_filename_becomes_a_safe_name(_serve):

@@ -4145,6 +4145,10 @@ def test_the_upload_zone_shows_a_prompt_when_empty_and_the_name_once_loaded():
     `updateUploadZone` (the DOM half) just feeds it `{name}` derived from whatever is currently in
     `#image`/`#end-image`, so this is what actually pins requirement 21's two states without a
     browser.
+
+    Пустое состояние обязано называть настоящие условия. «Перетащи картинку» их не называет, и
+    человек, у которого кадр не взяли, гадает между форматом, размером и разрешением — при том,
+    что разрешение тут не ограничено вовсе.
     """
     empty, loaded, blank_name = _node_eval("""
       console.log(JSON.stringify([
@@ -4153,9 +4157,35 @@ def test_the_upload_zone_shows_a_prompt_when_empty_and_the_name_once_loaded():
         app.uploadZoneLabel({name: ""}),
       ]));
     """)
-    assert empty == "перетащи картинку или выбери файл", empty
     assert loaded == "start.png", loaded
     assert blank_name == empty, "an empty name must read exactly like no state at all"
+    for word in ("png", "jpg", "webp", "16 МБ", "разрешение любое"):
+        assert word in empty, f"подпись зоны обязана называть условие «{word}»:\n{empty}"
+
+
+@_needs_node
+def test_a_refused_frame_says_what_a_frame_may_actually_be():
+    """`bad_image` — единственная 400, которую человек видит, уронив картинку в зону, и заголовок
+    «Кадр не годится для разговора с моделью» не говорит ни одного условия. Сообщение сервера под
+    ним перечисляет форматы и предел, но заголовок читают первым, а иногда и единственным.
+    """
+    title, pre = _node_eval("""
+      const it = app.errorText({error: {code: "bad_image", message: "кадр больше 16 МБ"}});
+      console.log(JSON.stringify([it.title, it.pre]));
+    """)
+    for word in ("png", "jpg", "webp", "16 МБ"):
+        assert word in title, f"заголовок отказа обязан называть условие «{word}»:\n{title}"
+    assert pre == "кадр больше 16 МБ", "точная причина от сервера обязана остаться под заголовком"
+
+
+def test_the_upload_zone_error_shows_the_servers_own_reason(_=None):
+    """Зона загрузки писала в подпись `errorText(...).title` — общий заголовок вроде «Кадр не
+    годится…», — а `pre` с настоящей причиной («кадром может быть только […], а 'x.txt' — нет»)
+    выбрасывала. Причина в подписи полезнее заголовка ровно там, где места на одну строку.
+    """
+    script = _page_text("app.js")
+    assert script.count("errorText(error.payload).pre || errorText(error.payload).title") == 2, (
+        "обе зоны — форма и модалка — обязаны показывать причину, а не общий заголовок")
 
 
 def test_the_form_defaults_to_the_project_s_working_recipe():
@@ -4695,7 +4725,11 @@ _LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
 #: the sentence worse -- there is nothing to type into a terminal called «сервер ламы». Stripped
 #: before the Russian check rather than weakening the pattern, so the list of exceptions is
 #: visible and short, and anything not on it is still caught.
-_TECHNICAL_NAMES = ("llama-server", "transformer/adaln_cache.safetensors", "AdaLN")
+_TECHNICAL_NAMES = ("llama-server", "transformer/adaln_cache.safetensors", "AdaLN",
+                    # Названия форматов. «Кадром может быть png, jpg или webp» — это и есть
+                    # условие, которое человек проверяет глазами по расширению своего файла;
+                    # «переносимая сетевая графика» ему для этого не поможет.
+                    "png", "jpg", "webp")
 _PROVIDER_SOURCE = (PROJECT_ROOT / "h3_48gb" / "provider.py").read_text(encoding="utf-8")
 
 #: Codes the chat modal can put in front of a person, and where each is raised. A literal list
