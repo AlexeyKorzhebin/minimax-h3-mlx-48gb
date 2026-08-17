@@ -261,7 +261,11 @@ def composite_windows(source: np.ndarray, refined: Sequence[np.ndarray], plan: S
     everything behind it is already one settled image.
 
     The ramp shrinks to fit an overlap narrower than `crossfade` instead of reading outside the
-    window. `plan_windows` refuses such a plan, but a caller may hand-build one.
+    window. On clips of a window or longer `plan_windows` never produces such an overlap, but on
+    sub-window clips it legitimately can: a 6-frame clip fits only 5-frame windows, and no
+    algorithm can carve a 12-frame ramp out of them. There the shrink is the designed behaviour,
+    not a fallback -- the R3 "crossfade >= 12" requirement is about seams between full windows,
+    and a clip that short has no full windows to seam.
     """
     if len(refined) != len(plan):
         raise ValueError(f"{len(refined)} refined windows for a plan of {len(plan)}.")

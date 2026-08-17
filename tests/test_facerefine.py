@@ -110,6 +110,22 @@ def test_plan_windows_on_a_clip_shorter_than_the_window_covers_it_fully_on_the_n
     assert plan_windows(55) == [Window(0, 39), Window(16, 39)]     # the 16-frame gap is gone
 
 
+@pytest.mark.parametrize("num_frames", [6, 11, 21, 33, 38])
+def test_short_clip_overlap_below_crossfade_is_a_known_limit_composite_shrinks_the_ramp(num_frames):
+    """Re-review of fix round 1: on sub-window clips the effective window can be so short that no
+    plan can hold a full `CROSSFADE_FRAMES` overlap (a 6-frame clip fits only 5-frame windows).
+    That is a geometric limit, not a planner bug -- what must hold instead is that
+    `composite_windows` takes such a plan as-is and shrinks the ramp, because the R3 crossfade
+    requirement is about seams between full windows, which a clip this short does not have."""
+    plan = plan_windows(num_frames)
+    assert plan[0].start == 0 and plan[-1].end == num_frames
+    source = np.zeros((num_frames, 4, 4, 3), dtype=np.uint8)
+    refined = [np.full((w.length, 4, 4, 3), 255, dtype=np.uint8) for w in plan]
+    out = composite_windows(source, refined, plan)
+    assert out.shape == source.shape
+    assert (out == 255).all()                         # every frame covered, no source leaks
+
+
 def test_plan_windows_never_leaves_a_frame_uncovered_at_any_length_from_five_up():
     """The regression this fix round exists for, pinned directly: at every legal clip length,
     every frame belongs to at least one window. (Failed on length 55 -- and the whole 5..120
