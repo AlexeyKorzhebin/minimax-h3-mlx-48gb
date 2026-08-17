@@ -3128,6 +3128,52 @@ def test_media_serves_the_clip_when_the_forms_own_outdir_already_nests_a_folder(
 
 
 @_needs_node
+def test_clip_url_carries_a_version_query_and_media_still_serves_it(server):
+    """BACKLOG "UX-мелочи", task 3. `/media` caches for a year (`MEDIA_MAX_AGE`, `immutable`) on
+    the promise that a given path is never rewritten with different bytes -- true for a preview
+    frame (its own step number is in the filename) but not for a `.mp4`: editing a failed job and
+    resubmitting it with the same tag writes over the *same* filename with different content, and a
+    browser holding the old bytes at that URL would never ask again.
+
+    `clipUrl` adds `?v=<job.finished_at>` for exactly this: the query changes whenever the job is
+    re-run (a new `finished_at`), busting the cache, and the server -- which never looks at the
+    query string at all (`urlsplit(self.path).path` in `_route_get`) -- must still serve `/media`
+    normally with one attached.
+    """
+    job = q.submit(server.queue_root, ["generate", "--tag", "kot-italy"], "",
+                   {"output_stem": str(server.outdir / "h3-kot-italy-896x576")}, {})
+    result_dir = Path(job.output_stem).parent
+    result_dir.mkdir(parents=True, exist_ok=True)
+    Path(f"{job.output_stem}.mp4").write_bytes(b"\x00mp4")
+    claimed = q.claim(server.queue_root)
+    finished = q.finish(server.queue_root, claimed.id, 0, "ok")
+
+    _, state = _json(server, "/api/state")
+    url = _node_eval(
+        f"console.log(JSON.stringify(app.clipUrl({json.dumps(finished.as_dict())}, "
+        f"{json.dumps(state['outdir'])})));")
+    assert url is not None
+    assert f"?v={urllib.parse.quote(finished.finished_at, safe='')}" in url, (
+        f"clipUrl must carry the job's own finished_at as ?v=, got {url}")
+
+    status, headers, body = _request(server, url)
+    assert status == 200 and body == b"\x00mp4", (
+        "a /media request with a ?v= query string must be served exactly like one without", url)
+
+
+@_needs_node
+def test_clip_url_has_no_version_query_before_the_job_has_ever_run():
+    """A job still `pending` has neither `started_at` nor `finished_at` -- nothing to build a
+    version out of -- so `clipUrl` must not tack on a bare, meaningless `?v=`.
+    """
+    job = {"output_stem": "/out/20260813-1435-a/h3-a-896x576.mp4"[:-4],
+           "started_at": None, "finished_at": None}
+    url = _node_eval(
+        f"console.log(JSON.stringify(app.clipUrl({json.dumps(job)}, {json.dumps('/out')})));")
+    assert url is not None and "?v=" not in url, url
+
+
+@_needs_node
 def test_the_poll_interval_is_the_twenty_seconds_the_spec_asks_for():
     assert _node_eval("console.log(JSON.stringify(app.POLL_MS));") == 20000
 
@@ -4138,7 +4184,10 @@ def test_finished_shows_the_exit_code_and_a_failure_shows_why():
     assert "код 0" in ok
     assert "код 1" in failed
     assert "metal::malloc" in failed, "a failed run with no visible reason is a mystery, not a row"
-    assert 'href="/media/%D0%BD%D0%BE%D1%87%D1%8C/h3-%D0%BA%D0%BE%D1%82-896x576.mp4"' in ok, ok
+    # `?v=<finished_at>` -- task 3, BACKLOG "UX-мелочи": `clipUrl` busts the year-long `/media`
+    # cache with the job's own `finished_at`, so the fixed URL below carries it too now.
+    assert ('href="/media/%D0%BD%D0%BE%D1%87%D1%8C/h3-%D0%BA%D0%BE%D1%82-896x576.mp4'
+            '?v=2026-08-12T02%3A00%3A00"') in ok, ok
     assert "<video" in ok and "<img" not in ok, "done shows its own clip, not a mid-diffusion mess"
     assert "<video" not in failed, "a failed run never has a clip to show"
     # Правка по ревью C2: карточка упавшей задачи называла код возврата дважды подряд --
