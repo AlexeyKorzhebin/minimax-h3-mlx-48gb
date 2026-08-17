@@ -597,6 +597,23 @@ def refine_clip(crops: np.ndarray, *, sigma: float = DEFAULT_SIGMA, seed: int = 
     return composite_windows(crops, refined, plan, crossfade=crossfade)
 
 
+def _reset_window_schedule(sched, grid_sigmas: list[float]) -> None:
+    """Clear a scheduler's step counter so a new window starts its own Euler walk at index 0.
+
+    `_run_windows` builds `video_sched`/`audio_sched` once, in phase 2 before the loop over
+    windows -- `_ensure_cache`'s AdaLN table only needs to be built once, and that is what forces
+    the schedulers to be built early too. But `MiniMaxH3Scheduler._step_index` is cleared only by
+    `set_timesteps` (`upstream/minimax_h3_mlx/scheduler.py`), not by finishing a run of `.step()`
+    calls, so without this reset window 2 continues stepping from window 1's final index, walks
+    off the end of the sigma grid (`sigmas[step_index + 1]` past the last entry), and divides
+    ``0.0 / 0.0`` into every latent -- Task 5's D1: a black rectangle from the second window on.
+    `set_timesteps(sigmas=...)` is exactly the call `MiniMaxH3Pipeline._build_schedules` already
+    makes from the cached grid (`h3_48gb/pipeline.py`), so calling it again per window reuses that
+    same logic instead of introducing a second way to seed a schedule.
+    """
+    sched.set_timesteps(sigmas=grid_sigmas)
+
+
 def _run_windows(crops, plan, table, *, sigma, seed, checkpoint, adaln_dir, prompt, turbo_lora,
                  turbo_strength, verbose, say) -> list[np.ndarray]:
     """The GPU half: one text encode, one VAE-encode pass, one denoise pass, one decode pass.
@@ -701,6 +718,10 @@ def _run_windows(crops, plan, table, *, sigma, seed, checkpoint, adaln_dir, prom
         # already finished.
         say(f"  window {index}/{len(plan)} frames {window.start}-{window.end - 1}")
         tick = time.perf_counter()
+        # Both schedulers walk the same 4-point grid on every window; reset the step counter each
+        # time so window 2+ does not pick up where the previous window's Euler walk left off (D1).
+        _reset_window_schedule(video_sched, grids[0])
+        _reset_window_schedule(audio_sched, grids[1])
         # One seed for the whole pass, re-set per window: the same noise realization over
         # co-registered content, and a window that does not depend on its position in the plan.
         mx.random.seed(seed)

@@ -443,6 +443,82 @@ def test_refine_clip_happy_path_on_cpu_with_the_gpu_half_mocked(monkeypatch, tmp
     assert out.dtype == np.uint8
 
 
+# -- D1 (Task 5 gate): scheduler state must reset between windows -------------------------------
+
+_D1_GRID = [0.25, 0.1805, 0.0984, 0.0]     # the shipped s0.25 4-point grid; sigmas[-1] == 0.0
+
+
+def _run_one_window(sched, num_steps: int):
+    """One window's worth of Euler steps, standing in for the inner loop of `_run_windows`'s
+    phase 2 -- a fixed model output plays the transformer's role, since the bug lives entirely in
+    the scheduler's own step-counter bookkeeping and never touches the DiT."""
+    import mlx.core as mx
+
+    x = mx.ones((2, 4))
+    for t in sched.timesteps.tolist()[:num_steps]:
+        x = sched.step(mx.zeros((2, 4)) + 0.1, float(t), x)
+    return x
+
+
+def test_run_windows_scheduler_state_is_finite_after_two_windows():
+    """D1 regression (Task 5's integration gate). `_run_windows` builds `video_sched` once, in
+    phase 2, *before* the loop over windows (`facerefine.py`'s phase-2 comment), and
+    `MiniMaxH3Scheduler._step_index` is cleared only by `set_timesteps` -- never by finishing a
+    window's steps. Two windows run back to back on one scheduler therefore walk the first
+    window's `_step_index` (3, for this 4-value grid) straight into the second window's first
+    `.step()` call, which reads `sigmas[3] == 0.0` over `sigmas[4]` (past the end of the array;
+    MLX returns 0.0 there) -- `0.0 / 0.0` is NaN, and every latent from window 2 on is NaN, which
+    decodes to a black rectangle. `facerefine._reset_window_schedule` is `_run_windows`'s fix:
+    called at the top of each window's loop body, right where this test calls it between windows
+    one and two."""
+    from h3_48gb import _upstream
+    _upstream.ensure_on_path()
+    from minimax_h3_mlx.scheduler import MiniMaxH3Scheduler
+    import mlx.core as mx
+
+    # First, the bug itself, pinned directly: two windows run back to back on one scheduler with
+    # no reset in between -- exactly what `_run_windows` did before this fix -- go non-finite.
+    # This is the scheduler's own documented step-counter behaviour (`upstream/` is not touched by
+    # this fix), so it is expected to hold forever, not just until the next refactor.
+    broken = MiniMaxH3Scheduler()
+    broken.set_timesteps(sigmas=_D1_GRID)          # mirrors `_build_schedules`, run once
+    _run_one_window(broken, len(_D1_GRID) - 1)     # window 1: leaves `_step_index` at 3
+    nan_out = _run_one_window(broken, len(_D1_GRID) - 1)   # window 2, no reset
+    assert not bool(mx.all(mx.isfinite(nan_out)).item()), \
+        "the un-reset scheduler no longer reproduces D1 -- has the upstream scheduler changed?"
+
+    # Now the fix: the same two windows, with `facerefine._reset_window_schedule` called where
+    # `_run_windows`'s loop calls it, at the top of each window's iteration.
+    sched = MiniMaxH3Scheduler()
+    sched.set_timesteps(sigmas=_D1_GRID)
+    _run_one_window(sched, len(_D1_GRID) - 1)      # window 1
+    facerefine._reset_window_schedule(sched, _D1_GRID)   # the fix, applied where window 2 starts
+    out = _run_one_window(sched, len(_D1_GRID) - 1)      # window 2
+
+    assert bool(mx.all(mx.isfinite(out)).item()), \
+        "window 2's output is not finite -- the scheduler carried window 1's step index over"
+
+
+def test_reset_window_schedule_clears_the_step_index_before_a_window_starts():
+    """The other half of D1: `_reset_window_schedule` must actually clear `_step_index`, not just
+    happen to leave the arithmetic finite for this one grid. `step_index` is `None` only right
+    after `set_timesteps`; a window that has already taken a step moves it forward, and only a
+    reset -- not merely re-reading the same grid -- brings it back to the start."""
+    from h3_48gb import _upstream
+    _upstream.ensure_on_path()
+    from minimax_h3_mlx.scheduler import MiniMaxH3Scheduler
+
+    sched = MiniMaxH3Scheduler()
+    sched.set_timesteps(sigmas=_D1_GRID)
+    assert sched.step_index is None
+
+    _run_one_window(sched, len(_D1_GRID) - 1)
+    assert sched.step_index == len(_D1_GRID) - 1      # advanced past window 1, not reset by itself
+
+    facerefine._reset_window_schedule(sched, _D1_GRID)
+    assert sched.step_index is None                   # a fresh window, ready to start at index 0
+
+
 # -- the one GPU test ----------------------------------------------------------------------------
 
 @pytest.mark.slow
