@@ -1307,9 +1307,11 @@ def _delete_flat_artifacts(stem: Path, job) -> None:
 
     `<stem>.mp4`, `.wav` and `.json` (the run's own report, `cli.py`'s `run_generate`) are every
     suffix a completed or half-finished run writes *directly* named after its stem, plus
-    `-raw.npz` (the uncompressed video+audio `run_generate` saves just before the two encoders
-    run) and the whole `-preview-stepNN.jpg` family (`preview.py`'s `preview_path`), globbed
-    because there is one per interval rather than one fixed name.
+    `-raw.npz` (the video+audio arrays `run_generate` saves just before the two encoders run, and
+    only under `--keep-raw` -- the page never passes it, so this one is usually already absent;
+    `missing_ok` covers both the old runs that have it and the new ones that do not) and the whole
+    `-preview-stepNN.jpg` family (`preview.py`'s `preview_path`), globbed because there is one per
+    interval rather than one fixed name.
 
     **The checkpoint is the one artifact `output_stem` does not name at all.** `checkpoint.py`
     names a resume file after the *request's identity digest*, not the output stem, precisely so

@@ -215,6 +215,21 @@ class RunSpec:
     #: per preview; `tae` is an approximation for watching progress and never for the delivered
     #: clip; `latent` is the VAE-free heat map.
     preview_decoder: str = "tae"
+    #: Keep `<stem>-raw.npz`, the video and audio arrays as they came out of the pipeline, next to
+    #: the encoded `.mp4`/`.wav`.
+    #:
+    #: Off by default, and that default was flipped after measuring what it cost: for a
+    #: fifteen-second native run the file is 807 MB against a 16 MB mp4, so a weekend of runs
+    #: leaves gigabytes of arrays nobody opens. What they are genuinely for is comparing latents
+    #: between runs during an experiment -- which happened, which is why this is a flag and not a
+    #: deleted branch.
+    #:
+    #: **What the default costs, stated plainly:** with this off, an encoder failure after a long
+    #: run loses the run. That was the original reason the file was written first and
+    #: unconditionally. The trade is deliberate -- ffmpeg failing is rare and immediately visible,
+    #: while the disk filling up is neither -- but anyone starting a run they cannot afford to
+    #: repeat should pass `--keep-raw` for exactly that insurance.
+    keep_raw: bool = False
     #: A Turbo LoRA to apply at run time, restoring the motion that few-step sampling loses.
     #: 1.0 is the author's own recommendation and, at the default canvas, the measured optimum on
     #: both axes: motion 113% of the 31-step reference (8 steps alone manage 52%), and detail equal
@@ -370,6 +385,12 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
                      help="decode a preview JPEG every N steps (default: 5); 0 disables previews")
     sub.add_argument("--preview-stem", type=Path, default=None,
                      help="prefix for <stem>-preview-stepNN.jpg (default: the run's output stem)")
+    sub.add_argument("--keep-raw", action="store_true",
+                     help="keep <stem>-raw.npz, the pipeline's video/audio arrays before "
+                          "encoding. Off by default: at 15 s native it is 807 MB against a "
+                          "16 MB mp4. Two reasons to pass it -- comparing latents between runs, "
+                          "and insurance for a long run, since it is written before the "
+                          "encoders and so survives an ffmpeg failure")
     # `tae` by default *because* previews are on by default: at 49.3 s each the real VAE would add
     # five minutes to every run. `vae` remains available for a preview that must be exact — TAE is
     # an approximation for watching progress, never for the delivered clip. Without the weights,
@@ -615,6 +636,7 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
         image=args.image, end_image=args.end_image,
         preview_every=args.preview_every, preview_stem=args.preview_stem,
         preview_decoder=args.preview_decoder,
+        keep_raw=getattr(args, "keep_raw", False),
         turbo_lora=args.turbo_lora, turbo_strength=args.turbo_strength,
         adaln_cache=args.adaln_cache,
         prompt_file=prompt_file,
@@ -785,27 +807,31 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
         raise CliError("checkpoint_locked", str(exc)) from exc
     elapsed = time.perf_counter() - started
 
-    # Raw first: an encoder failure then costs seconds, not a fifteen-hour run.
+    # Raw arrays, only when asked for (`--keep-raw`; see `RunSpec.keep_raw` for why the default
+    # flipped and what it costs). Still *first* when they are asked for, because that ordering is
+    # half of what the flag is for: written before the encoders, the file survives an ffmpeg
+    # failure, so the failure costs seconds instead of the run that produced it.
     # Write atomically: temp file, fsync, then rename over destination.
-    raw_path = Path(f"{stem}-raw.npz")
-    raw_temp = raw_path.with_name(f".{raw_path.stem}.tmp-{os.getpid()}{raw_path.suffix}")
-    try:
-        np.savez_compressed(str(raw_temp), video=result.video, audio=result.audio,
-                            sample_rate=result.sample_rate)
-        fd = os.open(raw_temp, os.O_RDONLY)
+    if spec.keep_raw:
+        raw_path = Path(f"{stem}-raw.npz")
+        raw_temp = raw_path.with_name(f".{raw_path.stem}.tmp-{os.getpid()}{raw_path.suffix}")
         try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(raw_temp, raw_path)
-        dir_fd = os.open(raw_path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except BaseException:
-        raw_temp.unlink(missing_ok=True)
-        raise
+            np.savez_compressed(str(raw_temp), video=result.video, audio=result.audio,
+                                sample_rate=result.sample_rate)
+            fd = os.open(raw_temp, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(raw_temp, raw_path)
+            dir_fd = os.open(raw_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except BaseException:
+            raw_temp.unlink(missing_ok=True)
+            raise
 
     # Import media functions inside the function to keep package imports light.
     from minimax_h3_mlx.media import save_mp4 as _save_mp4, save_wav as _save_wav
