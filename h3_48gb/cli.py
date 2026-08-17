@@ -22,14 +22,23 @@ than an ungrouped code, but it does not attempt to classify them further.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+# `facerefine` is safe to import eagerly: unlike `facetrack`/`facepaste` (which pull in `cv2` and
+# `scipy` at module scope) it has no import-time dependency heavier than `numpy`, and every MLX/
+# upstream import it needs lives inside `_run_windows`, not at module scope -- see its own module
+# docstring. Importing it here lets `face-refine`'s argparse defaults (`--sigma`, `--window`, ...)
+# read straight off `facerefine`'s own constants instead of a second, driftable copy of them.
+from . import facerefine
 
 #: The battle recipe, unchanged since the web form went live: 8-bit DiT (symlinked encoder/VAE),
 #: Turbo LoRA at strength 1.0, and the AdaLN table baked for its 8-step grid. `h3 generate "text"`
@@ -56,6 +65,34 @@ DEFAULT_OUTDIR = Path(os.environ.get("H3_OUTDIR") or Path.home() / "video-out")
 #: it likes. Only a fallback now, for a bare `--adaln-cache` whose header cannot be read at all
 #: (see `_grid_points_of`) -- `DEFAULT_STEPS` above is what an unadorned `h3 generate` actually asks for.
 BAKED_GRID_POINTS = 31
+
+#: `facetrack.detect_track`'s own default sampling interval, `facepaste.crop_window`'s own default
+#: scale and `out_size`, and `facepaste.paste_back`'s own default feather -- restated here rather
+#: than read off those modules' defaults directly (the way `--sigma`/`--window`/etc. read off
+#: `facerefine`'s) because `facetrack`/`facepaste` pull in `cv2` and `scipy` at import time, and
+#: `run_face_refine` imports them lazily for exactly that reason (see its own docstring). Keep
+#: these in sync by hand if either module's own default ever moves.
+DEFAULT_FACE_TRACK_EVERY = 5
+DEFAULT_FACE_CROP_SCALE = 2.75
+DEFAULT_FACE_CROP_SIZE = (448, 288)
+DEFAULT_FACE_PASTE_FEATHER = 0.10
+
+#: A hand-bumped compatibility marker for `h3_48gb.facetrack`'s detection/track semantics -- the
+#: same idea as `h3_48gb.checkpoint.FORMAT_VERSION`, but for a module Task 4 must not edit
+#: (`facetrack.py` belongs to Task 1). Recorded in every face-refine report's
+#: `checkpoint_identity_extra` so a report from before some future change to facetrack (a different
+#: YuNet score threshold, a different Savitzky-Golay window) is visibly not what this build would
+#: produce today, even though nothing here can read a "version" off `facetrack.py` itself. Bump by
+#: hand whenever such a change lands.
+FACETRACK_VERSION = 1
+
+#: How much of a source clip `_source_digest` reads, and no more -- large enough that a swapped or
+#: re-exported file almost certainly differs in the first few megabytes, small enough that hashing
+#: a multi-hundred-MB clip costs nothing. Paired with the file's own size in `_source_digest`'s
+#: output, the same "cheap identity, not a full hash" trade `h3_48gb.checkpoint.weights_fingerprint`
+#: makes for the weights directories, rather than reading gigabytes for one report field nothing
+#: ever resumes from.
+_SOURCE_DIGEST_HEAD_BYTES = 8 << 20
 
 
 #: safetensors headers are JSON and small — the largest table here is under 64 KB of header.
@@ -133,6 +170,9 @@ ERROR_CODES = {
     "prompt_both_given": "both a positional prompt and --prompt-file were given; pass exactly one",
     "prompt_missing": "no prompt: pass one positionally or with --prompt-file",
     "mode_mismatch": "--mode contradicts the --image/--end-image flags given",
+    "face_refine_input_not_found": "`face-refine`'s source clip does not exist",
+    "face_not_found": "`facetrack.detect_track` found no face anywhere in the source clip; "
+                      "face-refine has nothing to refine, and no output file is written",
     "worker_already_running": "another worker already holds queue/worker.lock on this machine",
     # Raised by `h3_48gb.web`, listed here because the contract is one contract: the CLI, the
     # worker and the server all answer with the same `{"ok": false, "error": {"code", ...}}`
@@ -501,6 +541,44 @@ def build_parser() -> argparse.ArgumentParser:
     doc = _subcommand(sub, "doctor", help="verify a converted checkpoint")
     doc.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     doc.add_argument("--json", action="store_true", help="emit a machine-readable report")
+
+    fr = _subcommand(sub, "face-refine",
+                     help="track and denoise a face in an existing clip (Task 1-3's engine, glued)")
+    fr.add_argument("input", type=Path, help="source .mp4 to refine")
+    fr.add_argument("--out", type=Path, default=None,
+                    help="output path (default: <stem>-faces.mp4 next to the input)")
+    fr.add_argument("--sigma", type=float, default=facerefine.DEFAULT_SIGMA,
+                    help=f"denoise strength, 0.15-0.25 in practice; `refine_clip` itself refuses "
+                         f"above {facerefine.SIGMA_CEILING} rather than clipping to it (default "
+                         f"{facerefine.DEFAULT_SIGMA})")
+    fr.add_argument("--seed", type=int, default=42,
+                    help="one seed for the whole pass, re-set per window (default 42)")
+    fr.add_argument("--window", type=int, default=facerefine.WINDOW_FRAMES,
+                    help=f"v2v window length in frames, on the VAE's native 17n+5 grid "
+                         f"(default {facerefine.WINDOW_FRAMES})")
+    fr.add_argument("--step", type=int, default=facerefine.WINDOW_STEP,
+                    help=f"frames to advance between windows (default {facerefine.WINDOW_STEP})")
+    fr.add_argument("--crossfade", type=int, default=facerefine.CROSSFADE_FRAMES,
+                    help=f"frames crossfaded at each window seam (default {facerefine.CROSSFADE_FRAMES})")
+    fr.add_argument("--every", type=int, default=DEFAULT_FACE_TRACK_EVERY,
+                    help=f"run face detection every N frames (default {DEFAULT_FACE_TRACK_EVERY})")
+    fr.add_argument("--scale", type=float, default=DEFAULT_FACE_CROP_SCALE,
+                    help=f"crop window size as a multiple of the detected face box "
+                         f"(default {DEFAULT_FACE_CROP_SCALE})")
+    fr.add_argument("--feather", type=float, default=DEFAULT_FACE_PASTE_FEATHER,
+                    help=f"paste-back feather fraction (default {DEFAULT_FACE_PASTE_FEATHER})")
+    fr.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT,
+                    help="the converted model weights (default: the battle recipe's 8bit-full)")
+    fr.add_argument("--adaln-dir", type=Path, default=facerefine.DEFAULT_ADALN_DIR,
+                    help=f"where the partial AdaLN tables, time curve and Turbo LoRA live "
+                         f"(default {facerefine.DEFAULT_ADALN_DIR})")
+    fr.add_argument("--turbo-lora", type=Path, default=DEFAULT_TURBO_LORA,
+                    help="Turbo LoRA applied at denoise time (default: the battle recipe's LoRA)")
+    fr.add_argument("--prompt", default=None,
+                    help="override the refine prompt; default: the source clip's own <stem>.json "
+                         "\"prompt\" field when there is one, else facerefine's generic "
+                         "close-up-of-a-face prompt")
+    fr.add_argument("--json", action="store_true", help="emit a machine-readable report")
     return parser
 
 
@@ -1226,6 +1304,332 @@ def run_doctor(checkpoint: Path) -> dict:
     return {"ok": not missing, "checkpoint": str(checkpoint), "missing": missing}
 
 
+# -- face-refine -----------------------------------------------------------------------------
+#
+# `h3 face-refine` glues Task 1-3's already-reviewed modules into one pass over an existing clip:
+#
+#     facetrack.detect_track -> facepaste.crop_window -> facerefine.refine_clip ->
+#     facepaste.paste_back -> mux against the source's own audio
+#
+# Nothing here reimplements any of the four modules' own logic; this section is I/O (reading and
+# writing an mp4 through ffmpeg, since nothing in this repo reads an arbitrary source clip back --
+# `h3_48gb`'s own writers only ever produce one) and the identity/report bookkeeping that ties a
+# face-refine run to the clip it started from.
+
+
+def _source_digest(path: Path) -> str:
+    """`sha256:<hex-of-the-first-8-MB>:<size>` for `path` -- a cheap identity for a source clip,
+    not a full-file hash. See `_SOURCE_DIGEST_HEAD_BYTES` for why the prefix is enough and reading
+    only it is the point.
+    """
+    path = Path(path)
+    size = path.stat().st_size
+    with open(path, "rb") as fh:
+        head = fh.read(_SOURCE_DIGEST_HEAD_BYTES)
+    return f"sha256:{hashlib.sha256(head).hexdigest()}:{size}"
+
+
+def _prompt_from_task_json(input_path: Path) -> str | None:
+    """The source clip's own sidecar `<stem>.json`'s `"prompt"` field, when there is one.
+
+    `run_generate` (this CLI's own `generate`/`resume`, and therefore every web-submitted job that
+    ran through the queue worker -- see `h3_48gb.web`) writes `<stem>.json` next to `<stem>.mp4`
+    with a `"prompt"` key holding the exact text the clip was generated from: `Path(f"{stem}.json")
+    .write_text(json.dumps(report, ...))` in `run_generate`, `report["prompt"] = spec.prompt`. A
+    face-refine pass over such a clip should describe the same shot rather than falling back to
+    `facerefine.DEFAULT_PROMPT`'s generic close-up, so this is tried before that default (see
+    `resolve_face_refine_prompt`) -- the review decision from Task 3: "prompt пробрасывать из
+    исходной задачи, когда есть" (`.superpowers/sdd/2026-08-17-face-refine/progress.md`).
+
+    Returns `None` for anything short of a genuine prompt: no sidecar file, unreadable or non-JSON
+    content, no `"prompt"` key, or a `"prompt"` that is not a non-empty string -- a missing or
+    broken sidecar is "no prompt known", not a face-refine failure, exactly the status `--prompt`
+    left unset already has.
+    """
+    sidecar = Path(input_path).with_suffix(".json")
+    if not sidecar.is_file():
+        return None
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    prompt = data.get("prompt") if isinstance(data, dict) else None
+    return prompt if isinstance(prompt, str) and prompt.strip() else None
+
+
+def resolve_face_refine_prompt(input_path: Path, prompt_arg: str | None) -> tuple[str | None, str]:
+    """The prompt `refine_clip` should use, and where it came from: `"cli"`, `"task_json"` or
+    `"default"` -- recorded in the report so a caller can tell a generic refine from one that
+    matched its source clip's own conditioning.
+
+    `--prompt` always wins when given (Task 3 review decision: "--prompt переопределяет всё").
+    Otherwise the source clip's sidecar JSON is tried (`_prompt_from_task_json`); with neither,
+    `None` reaches `refine_clip`, which supplies its own generic close-up-of-a-face prompt
+    (`facerefine.DEFAULT_PROMPT`).
+    """
+    if prompt_arg is not None:
+        return prompt_arg, "cli"
+    from_task = _prompt_from_task_json(input_path)
+    if from_task is not None:
+        return from_task, "task_json"
+    return None, "default"
+
+
+@dataclass(frozen=True)
+class VideoInfo:
+    """What `run_face_refine` needs to know about the source clip before touching a pixel: frame
+    geometry to size the raw pipe on both ends, the exact frame rate (kept as ffprobe's own
+    `"num/den"` string rather than rounded to a float) so the muxed output plays at the source's
+    own speed, and whether there is an audio stream to `-c:a copy` at all.
+    """
+
+    width: int
+    height: int
+    fps: str
+    has_audio: bool
+
+
+def probe_video(path: Path) -> VideoInfo:
+    """`ffprobe` the source clip's first video stream's geometry and frame rate, and whether it
+    carries an audio stream -- everything `read_video_frames`/`write_faces_mp4` need, gathered once
+    so neither has to shell out to ffprobe again.
+    """
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", str(path)],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffprobe could not read {path}: {proc.stderr.decode(errors='replace')[:500]}")
+    try:
+        streams = json.loads(proc.stdout)["streams"]
+    except (ValueError, KeyError) as exc:
+        raise RuntimeError(f"ffprobe returned unreadable JSON for {path}") from exc
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if video is None:
+        raise RuntimeError(f"{path}: ffprobe found no video stream")
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+    return VideoInfo(width=int(video["width"]), height=int(video["height"]),
+                     fps=str(video.get("r_frame_rate") or "25/1"), has_audio=has_audio)
+
+
+def ffmpeg_read_frames_cmd(path: Path) -> list[str]:
+    """The command `read_video_frames` pipes from: every frame of `path`, decoded to raw RGB24.
+
+    Split out from `read_video_frames` so the command itself -- what actually reaches the source
+    clip, in what order -- can be asserted on directly in a test, with no ffmpeg process involved.
+    """
+    return ["ffmpeg", "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+
+
+def read_video_frames(path: Path, info: VideoInfo) -> np.ndarray:
+    """Every frame of `path` as one `(frames, height, width, 3)` uint8 RGB array.
+
+    Reads the whole clip into memory at once -- correct at face-refine's own scale (a handful of
+    seconds, the same clips `h3 generate` produces) and simpler than a streaming decode; nothing
+    downstream (`facetrack.detect_track`, `facepaste.crop_window`) is written to stream either.
+    """
+    proc = subprocess.run(ffmpeg_read_frames_cmd(path), capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg could not decode {path}: {proc.stderr.decode(errors='replace')[:500]}")
+    raw = proc.stdout
+    frame_bytes = info.width * info.height * 3
+    if frame_bytes == 0 or len(raw) % frame_bytes:
+        raise RuntimeError(
+            f"{path}: ffmpeg produced {len(raw)} bytes, not a whole number of "
+            f"{info.width}x{info.height} RGB24 frames ({frame_bytes} bytes each)"
+        )
+    n_frames = len(raw) // frame_bytes
+    return np.frombuffer(raw, dtype=np.uint8).reshape(n_frames, info.height, info.width, 3)
+
+
+def ffmpeg_write_cmd(out_path: Path, source_path: Path, info: VideoInfo) -> list[str]:
+    """The command `write_faces_mp4` pipes rendered frames into: raw RGB24 on stdin, muxed against
+    `source_path`'s own audio track copied byte-for-byte (`-c:a copy`, never re-encoded) when it
+    has one, at the source's exact frame rate.
+
+    `-map 0:v:0 -map 1:a:0` rather than a bare second `-i source_path`: without an explicit map,
+    ffmpeg is free to pick either input's audio by its own stream-selection heuristics; an explicit
+    map makes "video from the pipe, audio from the source, unchanged" true by construction. Split
+    out from `write_faces_mp4` for the same "assert the command, not the subprocess" reason as
+    `ffmpeg_read_frames_cmd`.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{info.width}x{info.height}", "-r", info.fps, "-i", "pipe:0",
+    ]
+    if info.has_audio:
+        cmd += ["-i", str(source_path), "-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy"]
+    cmd += ["-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(out_path)]
+    return cmd
+
+
+def write_faces_mp4(out_path: Path, frames: np.ndarray, source_path: Path, info: VideoInfo) -> None:
+    """Encode `frames` (the same shape/dtype `read_video_frames` returned) to `out_path`, muxing
+    `source_path`'s own audio unchanged. Raises `RuntimeError` (ffmpeg's own stderr, truncated) if
+    ffmpeg exits non-zero.
+    """
+    cmd = ffmpeg_write_cmd(out_path, source_path, info)
+    proc = subprocess.run(cmd, input=np.ascontiguousarray(frames, dtype=np.uint8).tobytes(),
+                          capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg could not write {out_path}: {proc.stderr.decode(errors='replace')[:500]}")
+
+
+def face_refine_output_path(input_path: Path, out: Path | None) -> Path:
+    """`--out`, or `<stem>-faces.mp4` next to `input_path` when `--out` was not given."""
+    if out is not None:
+        return Path(out)
+    input_path = Path(input_path)
+    return input_path.with_name(f"{input_path.stem}-faces.mp4")
+
+
+def run_face_refine(
+    input_path: Path, *, out: Path | None = None,
+    sigma: float = facerefine.DEFAULT_SIGMA, seed: int = 42,
+    window: int = facerefine.WINDOW_FRAMES, step: int = facerefine.WINDOW_STEP,
+    crossfade: int = facerefine.CROSSFADE_FRAMES,
+    every: int = DEFAULT_FACE_TRACK_EVERY, scale: float = DEFAULT_FACE_CROP_SCALE,
+    out_size: tuple[int, int] = DEFAULT_FACE_CROP_SIZE, feather: float = DEFAULT_FACE_PASTE_FEATHER,
+    checkpoint: Path = DEFAULT_CHECKPOINT, adaln_dir: Path = facerefine.DEFAULT_ADALN_DIR,
+    turbo_lora: Path | None = DEFAULT_TURBO_LORA, prompt: str | None = None,
+    detect_track_fn=None, refine_clip_fn=None, crop_window_fn=None, paste_back_fn=None,
+    probe_fn=None, read_frames_fn=None, write_output_fn=None,
+    verbose: bool = True,
+) -> dict:
+    """Refine the tracked face in `input_path`, writing a new clip and returning a report dict.
+
+    The pipeline is exactly the four modules Task 1-3 built, glued in one pass, reading and writing
+    through ffmpeg (`probe_video`/`read_video_frames`/`write_faces_mp4`) rather than through any
+    in-repo video reader -- none existed for reading an arbitrary *source* clip back; `h3_48gb`'s
+    own writers (`minimax_h3_mlx.media.save_mp4`) only ever produce one:
+
+        `facetrack.detect_track` -> `facepaste.crop_window` -> `facerefine.refine_clip` ->
+        `facepaste.paste_back` -> mux against the source's own audio
+
+    No face anywhere in the source is not an error this function hides: `detect_track` returning
+    `None` raises `CliError("face_not_found", ...)` before a single byte of the output is written
+    (see the module docstring's "every refusal ... is a CliError" contract) -- no output file is
+    ever created for a clip with no face to refine.
+
+    `facetrack`/`facepaste` are imported lazily, inside this function, exactly like every other
+    heavy or optional dependency elsewhere in this file: they pull in `cv2` and `scipy` at module
+    scope, which `h3 --help` and every other subcommand have no business paying for. `facerefine`
+    itself is imported at module scope (see the top of this file) because it costs nothing to.
+
+    The `*_fn` parameters exist for tests -- the same "inject a stub instead of monkeypatching an
+    internal" shape `run_generate` uses for `pipeline_factory`/`save_mp4_fn`/`save_wav_fn`. Each
+    defaults to the real function it replaces when left `None`.
+    """
+    input_path = Path(input_path)
+    if not input_path.is_file():
+        raise CliError(
+            "face_refine_input_not_found",
+            f"face-refine's source clip does not exist: {input_path}",
+            {"input": str(input_path)},
+        )
+
+    probe = probe_fn or probe_video
+    read_frames = read_frames_fn or read_video_frames
+    write_output = write_output_fn or write_faces_mp4
+    refine_clip = refine_clip_fn or facerefine.refine_clip
+
+    if detect_track_fn is not None:
+        detect_track = detect_track_fn
+    else:
+        from . import facetrack
+        detect_track = facetrack.detect_track
+
+    if crop_window_fn is not None and paste_back_fn is not None:
+        crop_window, paste_back = crop_window_fn, paste_back_fn
+    else:
+        from . import facepaste
+        crop_window = crop_window_fn or facepaste.crop_window
+        paste_back = paste_back_fn or facepaste.paste_back
+
+    def say(message: str) -> None:
+        if verbose:
+            print(message, flush=True)
+
+    info = probe(input_path)
+    say(f"face-refine: reading {input_path.name} ({info.width}x{info.height}, fps {info.fps}, "
+        f"{'with audio' if info.has_audio else 'no audio track'})")
+    frames = read_frames(input_path, info)
+    n_frames = frames.shape[0]
+    say(f"face-refine: {n_frames} frames decoded")
+
+    say("face-refine: detecting the face track...")
+    track = detect_track(frames, every=every)
+    if track is None:
+        raise CliError(
+            "face_not_found",
+            f"лиц не найдено в {input_path}: facetrack не обнаружил ни одного лица ни на одном "
+            f"из проверенных кадров (every={every}, всего кадров {n_frames}) -- файл не создан",
+            {"input": str(input_path), "every": every, "frames": n_frames},
+        )
+    say(f"face-refine: face track found, median area {track.median_area:.0f} px^2")
+
+    say("face-refine: cropping the face window...")
+    crops, geometry = crop_window(frames, track, scale=scale, out_size=out_size)
+
+    prompt_text, prompt_source = resolve_face_refine_prompt(input_path, prompt)
+    say(f"face-refine: prompt source: {prompt_source}")
+
+    started = time.perf_counter()
+    refined = refine_clip(
+        crops, sigma=sigma, seed=seed, window=window, step=step, crossfade=crossfade,
+        checkpoint=checkpoint, adaln_dir=adaln_dir, prompt=prompt_text, turbo_lora=turbo_lora,
+        verbose=verbose,
+    )
+    elapsed = time.perf_counter() - started
+
+    say("face-refine: pasting the refined face back...")
+    final_frames = paste_back(frames, refined, geometry, track, feather=feather)
+
+    out_path = face_refine_output_path(input_path, out)
+    say(f"face-refine: writing {out_path.name}...")
+    write_output(out_path, final_frames, input_path, info)
+
+    return {
+        "ok": True,
+        "input": str(input_path),
+        "output": str(out_path),
+        "frames": n_frames,
+        "fps": info.fps,
+        "audio": info.has_audio,
+        "sigma": sigma,
+        "seed": seed,
+        "window": window,
+        "step": step,
+        "crossfade": crossfade,
+        "every": every,
+        "scale": scale,
+        "feather": feather,
+        "checkpoint": str(checkpoint),
+        "adaln_dir": str(adaln_dir),
+        "turbo_lora": str(turbo_lora) if turbo_lora else None,
+        "prompt": prompt_text,
+        "prompt_source": prompt_source,
+        "refine_seconds": round(elapsed, 1),
+        # Provenance for this specific report, not a resumable checkpoint (face-refine has no
+        # resume path) -- named after `h3_48gb.checkpoint.CheckpointingPipeline
+        # .checkpoint_identity_extra`'s own idea (what, outside the request itself, would make two
+        # runs different) because it is the same idea, applied to a report instead of a checkpoint
+        # file's metadata.
+        "checkpoint_identity_extra": {
+            "source_digest": _source_digest(input_path),
+            "sigma": sigma,
+            "window": window,
+            "step": step,
+            "crossfade": crossfade,
+            "facetrack_version": FACETRACK_VERSION,
+        },
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the CLI.
 
@@ -1286,6 +1690,16 @@ def main(argv: list[str] | None = None) -> int:
             ok = report["ok"]
             human = (f"checkpoint at {report['checkpoint']} looks complete" if ok else
                       f"checkpoint at {report['checkpoint']} is missing: {', '.join(report['missing'])}")
+        elif args.command == "face-refine":
+            report = run_face_refine(
+                args.input, out=args.out, sigma=args.sigma, seed=args.seed,
+                window=args.window, step=args.step, crossfade=args.crossfade,
+                every=args.every, scale=args.scale, feather=args.feather,
+                checkpoint=args.checkpoint, adaln_dir=args.adaln_dir, turbo_lora=args.turbo_lora,
+                prompt=args.prompt, verbose=not as_json,
+            )
+            ok = True
+            human = f"done in {report['refine_seconds'] / 60:.1f} min -> {report['output']}"
         else:  # pragma: no cover - argparse's `required=True` on the subcommand rules this out
             raise CliError("internal_error", f"unknown command {args.command!r}")
     except CliError as exc:
