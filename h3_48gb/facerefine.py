@@ -115,8 +115,7 @@ AUDIO_SHIFT = 3.0
 DEFAULT_PROMPT = (
     "integrated_multimodal_description: [Shot 1] Live-action, cinematic, an extreme close-up of a "
     "human face, sharply in focus. Fine skin texture, individual eyelashes, eyebrow hairs and "
-    "strands of hair are clearly resolved; the eyes are sharp and alive. Soft natural light, "
-    "natural colour, shallow depth of field, film grain.\n\n"
+    "strands of hair are clearly resolved; the eyes are sharp and alive.\n\n"
     "overall_soundscape: quiet room tone, a faint breath of air."
 )
 
@@ -146,9 +145,9 @@ def native_frame_count(num_frames: int) -> int:
 
     Rounded *down*, never up: rounding up would need frames the clip does not have, and padding
     them (repeating the last frame, which is what the VAE itself does internally) would feed the
-    refine a freeze-frame and then paste its invention over real footage. A clip shorter than one
-    window is refined over this truncated length and the remaining up-to-16 frames pass through
-    untouched -- see `composite_windows`.
+    refine a freeze-frame and then paste its invention over real footage. `plan_windows` uses this
+    as its effective window length on a clip shorter than `window`, then covers the rest of the
+    clip with further windows at this same truncated length -- see its docstring.
     """
     if num_frames < LATENTS_PER_CHUNK:
         raise ValueError(
@@ -163,24 +162,36 @@ def native_frame_count(num_frames: int) -> int:
 
 def plan_windows(num_frames: int, window: int = WINDOW_FRAMES, step: int = WINDOW_STEP,
                  crossfade: int = CROSSFADE_FRAMES) -> list[Window]:
-    """Lay `window`-long passes over `num_frames`, stepping `step`, tail pinned to the end.
+    """Lay passes over `num_frames`, stepping `step`, tail pinned to the end. Covers every frame.
 
-    Three cases, in the order they are decided:
+    One algorithm regardless of how `num_frames` compares to `window`: the effective window length
+    is ``w = min(window, native_frame_count(num_frames))`` -- `window` itself on a clip that has
+    enough frames for it, the clip's own truncated-to-the-grid length on one that does not (round
+    1's rule: truncate down rather than pad a freeze-frame up to the grid). Every window in the
+    returned plan is `w` frames long.
 
-    * **Shorter than one window** -- one window of `native_frame_count(num_frames)` frames at
-      index 0. The brief's rule, and the experiments': truncate down to the grid rather than pad
-      up to it. Up to 16 tail frames are then covered by no window at all; `composite_windows`
-      passes them through from the source, so they are un-refined rather than wrong.
-    * **Exactly one window** -- one window, no crossfade to worry about.
-    * **Longer** -- windows at ``0, step, 2*step, ...`` for as long as a full window still fits
-      strictly inside the clip, then one final window **pinned to the tail**
-      (``start = num_frames - window``). Pinning rather than padding is why every window is a
-      full-length native pass; the price is that the last overlap is usually wider than
-      ``window - step``, never narrower, which the crossfade only benefits from.
+    Starts land at ``0, advance, 2*advance, ...`` for as long as a full `w`-frame window still fits
+    strictly inside the clip, then one final window is **pinned to the tail**
+    (``start = num_frames - w``), where ``advance = min(step, w)``: on a clip long enough for a
+    full `window`, `w` equals `window` and `advance` equals `step` (already required to be no
+    larger), so nothing changes there; on a shorter clip `w` can be well under `step`, and
+    advancing by the raw `step` would then jump clean over frames no window's span reaches --
+    capping the advance at `w` is what keeps consecutive windows touching or overlapping instead
+    of leaving a gap. Pinning rather than padding the tail is why every window is a full-length
+    native pass; the price is that the last overlap is usually wider than ``window - step``, never
+    narrower, which the crossfade only benefits from. The pinned window can never duplicate its
+    predecessor: the loop only emits a start `s` while ``s + w < num_frames``, i.e. while
+    ``s < num_frames - w``, so the pinned start is strictly greater than every start already
+    emitted -- and because consecutive starts are never more than `w` apart while the tail start is
+    always within `w` of the last emitted start, the plan covers every frame from 0 to `num_frames`
+    with no gap, on a clip of any length >= 5.
 
-    The pinned window can never duplicate its predecessor: the loop only emits a start `s` while
-    ``s + window < num_frames``, i.e. while ``s < num_frames - window``, so the pinned start is
-    strictly greater than every start already emitted.
+    A middle window whose predecessor already overlaps the pinned tail by a full crossfade is
+    redundant -- it can add as little as one new frame for a full window's GPU cost -- so it is
+    dropped: while there are at least three starts and ``(starts[-3] + w) - starts[-1] >=
+    crossfade``, `starts[-2]` is removed. (`plan_windows(99)` would otherwise land a window at 42
+    that contributes past nothing the 0- and 43-start windows do not already cover between them;
+    dropping it gives ``[0, 43]`` with a 13-frame overlap, still >= `crossfade`.)
     """
     if window % FRAMES_PER_CHUNK != LATENTS_PER_CHUNK:
         raise ValueError(
@@ -197,16 +208,25 @@ def plan_windows(num_frames: int, window: int = WINDOW_FRAMES, step: int = WINDO
             f"window of {window} stepped by {step} leaves. Lower `crossfade` or `step`."
         )
 
-    if num_frames < window:
-        return [Window(0, native_frame_count(num_frames))]
+    w = min(window, native_frame_count(num_frames))
+    # `step` is validated against `window`, not against `w`: on a clip shorter than `window` the
+    # effective window `w` can be far smaller than `step`, and advancing by the raw `step` would
+    # then jump clean over frames no window's span reaches -- a real gap, not merely a seam wider
+    # than the crossfade wants. Capping the advance at `w` is a no-op whenever `w == window`
+    # (`step <= window` is already required), so the >= 56-frame regime is unaffected.
+    advance = min(step, w)
 
     starts: list[int] = []
     start = 0
-    while start + window < num_frames:
+    while start + w < num_frames:
         starts.append(start)
-        start += step
-    starts.append(num_frames - window)          # the tail window, pinned to the last frame
-    return [Window(s, window) for s in starts]
+        start += advance
+    starts.append(num_frames - w)                # the tail window, pinned to the last frame
+
+    while len(starts) >= 3 and (starts[-3] + w) - starts[-1] >= crossfade:
+        del starts[-2]
+
+    return [Window(s, w) for s in starts]
 
 
 # -- crossfade compositing -----------------------------------------------------------------------
@@ -227,7 +247,9 @@ def composite_windows(source: np.ndarray, refined: Sequence[np.ndarray], plan: S
 
     Windows are laid down in order onto an accumulator that starts as `source`, so:
 
-    * frames no window covers keep their source pixels **byte for byte** (the short-clip tail);
+    * frames no window covers keep their source pixels **byte for byte**. `plan_windows` itself
+      now always covers every frame (>= 5), so this only matters for a plan a caller hand-builds
+      with a gap in it;
     * the first window overwrites its whole span;
     * every later window hands over from the accumulated result across a `crossfade`-frame ramp
       **centred in the overlap** -- the placement round 3 measured, where an overlap of 28 and a
@@ -409,6 +431,15 @@ def ensure_partial_table(sigma: float, checkpoint: str | Path | None = None,
     exist. It stays in the signature because it is how Task 4 was specified to call this, because
     every other entry point in this module takes it, and because a future non-Turbo table would
     need the DiT's real `time_embedder` and therefore the checkpoint.
+
+    `strength` is the LoRA strength baked into the table's modulation rows -- distinct from, but
+    meant to travel with, the strength `apply_backbone_lora` applies to the backbone weights
+    themselves at denoise time. `refine_clip` has no `turbo_strength` parameter and always calls
+    this with the default `strength=1.0`, which is also what the backbone always gets, so the two
+    never disagree; a caller baking a table directly (as the bare-metal LoRA-strength experiments
+    did) is the only path that can set this to anything else, and the resulting file's name still
+    only encodes `sigma`, not `strength` -- do not point two different strengths at one `adaln_dir`
+    for the same sigma.
     """
     adaln_dir = Path(adaln_dir).expanduser()
     dest = adaln_dir / partial_table_name(sigma, points)
@@ -434,6 +465,16 @@ def _validate_request(crops, sigma: float) -> float:
     get that far. Returns the sigma quantized to the two decimals `partial_table_name` keys on --
     see there for why the quantization has to happen before the table is chosen.
     """
+    if isinstance(sigma, bool):
+        # `bool` is an `int` subclass in Python -- `isinstance(True, (int, float))` is true, so
+        # this has to be checked and refused *before* the numeric check below would silently wave
+        # `sigma=True` through as `1.0`.
+        raise ValueError(f"`sigma` must be a positive denoise strength, got {sigma!r}.")
+    if isinstance(sigma, (np.floating, np.integer)):
+        # A caller doing sigma arithmetic in numpy (e.g. off an array of candidate strengths) gets
+        # `np.float32`/`np.float64` back, not a Python `float`; cast before the `isinstance` check
+        # below rejects it for a reason that has nothing to do with the value being invalid.
+        sigma = float(sigma)
     if not isinstance(sigma, (int, float)) or not sigma > 0.0:
         raise ValueError(f"`sigma` must be a positive denoise strength, got {sigma!r}.")
     if sigma > SIGMA_CEILING:
@@ -442,6 +483,15 @@ def _validate_request(crops, sigma: float) -> float:
             "0.40 inventing expression -- opening an eye the source had squinting -- and the "
             "engraved over-sharpening of round 1 coming back. Above the cap this stops being a "
             "refine, so it is refused rather than clipped."
+        )
+    quantized = round(float(sigma), 2)
+    if not quantized > 0.0:
+        # Checked again *after* rounding: `sigma=0.004` clears the raw `> 0.0` check above but
+        # rounds to the `0.00` table name, which would silently run a no-op refine instead of the
+        # weak-but-real one the caller asked for.
+        raise ValueError(
+            f"`sigma` rounds to 0.0 at the two-decimal precision the table cache keys on, got "
+            f"{sigma!r}. Use a sigma of at least 0.005."
         )
     if not isinstance(crops, np.ndarray) or crops.ndim != 4 or crops.shape[-1] != 3:
         raise ValueError(
@@ -456,7 +506,7 @@ def _validate_request(crops, sigma: float) -> float:
             f"The crop is {width}x{height}; both sides must be multiples of "
             f"{VAE_SPATIAL_RATIO} (the video VAE's spatial compression). `facepaste`'s default "
             "448x288 is.")
-    return round(float(sigma), 2)
+    return quantized
 
 
 def _encode_window(pipe, frames: np.ndarray, mx, packing) -> "object":
@@ -497,7 +547,7 @@ def refine_clip(crops: np.ndarray, *, sigma: float = DEFAULT_SIGMA, seed: int = 
                 window: int = WINDOW_FRAMES, step: int = WINDOW_STEP,
                 crossfade: int = CROSSFADE_FRAMES, checkpoint: str | Path,
                 adaln_dir: str | Path = DEFAULT_ADALN_DIR, prompt: str | None = None,
-                turbo_lora: str | Path | None = None, turbo_strength: float = 1.0,
+                turbo_lora: str | Path | None = None,
                 verbose: bool = True,
                 progress: Callable[[str], None] | None = None) -> np.ndarray:
     """Refine a stack of face crops, window by window, and return frames of the same shape.
@@ -512,6 +562,12 @@ def refine_clip(crops: np.ndarray, *, sigma: float = DEFAULT_SIGMA, seed: int = 
     `checkpoint` is the model directory (`~/models/h3-8bit-full`); `adaln_dir` holds the partial
     tables, the time curve and the Turbo LoRA. `prompt` defaults to a generic close-up-of-a-face
     description -- pass the source clip's own prompt when it is known.
+
+    The backbone LoRA is always applied at strength 1.0 -- no round of experiments varied it, and
+    `ensure_partial_table`'s own `strength` (which bakes the LoRA's AdaLN half into the table
+    itself) is likewise always called at 1.0 here, so the two never disagree. There is no
+    `turbo_strength` parameter; pass a different LoRA via `turbo_lora` instead of trying to dial
+    this one down.
 
     Raises `ValueError` for anything refusable without a GPU and `RuntimeError` when the table on
     disk does not describe the schedule its name claims.
@@ -532,7 +588,7 @@ def refine_clip(crops: np.ndarray, *, sigma: float = DEFAULT_SIGMA, seed: int = 
 
     refined = _run_windows(crops, plan, table, sigma=sigma, seed=seed, checkpoint=checkpoint,
                            adaln_dir=Path(adaln_dir).expanduser(), prompt=prompt or DEFAULT_PROMPT,
-                           turbo_lora=turbo_lora, turbo_strength=turbo_strength, verbose=verbose,
+                           turbo_lora=turbo_lora, turbo_strength=1.0, verbose=verbose,
                            say=say)
     return composite_windows(crops, refined, plan, crossfade=crossfade)
 
@@ -556,6 +612,16 @@ def _run_windows(crops, plan, table, *, sigma, seed, checkpoint, adaln_dir, prom
 
     started = time.perf_counter()
     lora = Path(turbo_lora).expanduser() if turbo_lora else adaln_dir / TURBO_LORA_NAME
+    if not lora.exists():
+        # Checked before the checkpoint is even opened: `load_with_lora` below only runs when
+        # `pipe.dit.load()` fires in phase 2, by which point the text encoder (28 GB, ~9 s) and the
+        # VAE encode have already happened. A missing LoRA is a request-shape problem, not a GPU
+        # one, so it fails in milliseconds here instead of ~30 s and 21 GB in.
+        raise RuntimeError(
+            f"Turbo LoRA not found at {lora}. Face-refine's backbone pass needs it; pass "
+            "`turbo_lora=` to point at a different file, or place "
+            f"{TURBO_LORA_NAME} in `adaln_dir`."
+        )
     pipe = LazyMiniMaxH3Pipeline.from_pretrained(str(checkpoint), verbose=verbose,
                                                  adaln_cache=table)
     inner = pipe.dit.__dict__["_loader"]
@@ -626,6 +692,10 @@ def _run_windows(crops, plan, table, *, sigma, seed, checkpoint, adaln_dir, prom
 
     denoised = []
     for index, window in enumerate(plan, 1):
+        # Announced *before* the forward passes, not after: a caller timing an ETA off this
+        # message (Task 6) needs to see window `k` start, not learn about it only once it has
+        # already finished.
+        say(f"  window {index}/{len(plan)} frames {window.start}-{window.end - 1}")
         tick = time.perf_counter()
         # One seed for the whole pass, re-set per window: the same noise realization over
         # co-registered content, and a window that does not depend on its position in the plan.
@@ -659,8 +729,7 @@ def _run_windows(crops, plan, table, *, sigma, seed, checkpoint, adaln_dir, prom
                                           float(audio_sched.timesteps[stepno].item()), audio_rows)
             mx.eval(video_rows, audio_rows)
         denoised.append(video_rows)
-        say(f"  window {index}/{len(plan)} frames {window.start}-{window.end - 1} "
-            f"denoised in {time.perf_counter() - tick:.0f}s")
+        say(f"  window {index}/{len(plan)} denoised in {time.perf_counter() - tick:.0f}s")
 
     # -- phase 3: decode -------------------------------------------------------------------------
     # `_decode_video` releases the transformer on its first call; every window after that decodes

@@ -98,11 +98,29 @@ def test_plan_windows_always_covers_the_whole_clip_with_room_for_the_crossfade(n
         assert plan[i].end - plan[i + 1].start >= CROSSFADE_FRAMES
 
 
-def test_plan_windows_on_a_clip_shorter_than_the_window_truncates_down_to_the_grid():
-    """40 frames -> one 39-frame window; the odd frame at the tail is left to the source."""
-    assert plan_windows(40) == [Window(0, 39)]
+def test_plan_windows_on_a_clip_shorter_than_the_window_covers_it_fully_on_the_native_grid():
+    """Fix round 1: a clip shorter than `window` used to get *one* window truncated down to the
+    native grid and leave the tail frames un-refined -- 16 of 55, 16 of 38 (42% of the clip). The
+    effective window length is still `native_frame_count(num_frames)`, but the plan now lays down
+    as many of them as it takes to reach the last frame, so nothing is left un-refined."""
     assert plan_windows(39) == [Window(0, 39)]
     assert plan_windows(22) == [Window(0, 22)]
+    assert plan_windows(38) == [Window(0, 22), Window(16, 22)]     # overlap 6, per the brief
+    assert plan_windows(40) == [Window(0, 39), Window(1, 39)]
+    assert plan_windows(55) == [Window(0, 39), Window(16, 39)]     # the 16-frame gap is gone
+
+
+def test_plan_windows_never_leaves_a_frame_uncovered_at_any_length_from_five_up():
+    """The regression this fix round exists for, pinned directly: at every legal clip length,
+    every frame belongs to at least one window. (Failed on length 55 -- and the whole 5..120
+    sweep -- against the pre-fix `plan_windows`, which covered only `native_frame_count(55) == 39`
+    of the 55 frames.)"""
+    for num_frames in range(5, 121):
+        plan = plan_windows(num_frames)
+        covered = np.zeros(num_frames, dtype=bool)
+        for w in plan:
+            covered[w.start:w.end] = True
+        assert covered.all(), f"{num_frames} frames: {plan} leaves a gap"
 
 
 def test_plan_windows_rejects_a_clip_shorter_than_the_shortest_native_window():
@@ -127,6 +145,25 @@ def test_plan_windows_rejects_a_nonpositive_or_oversized_step():
         plan_windows(200, step=57)
 
 
+def test_plan_windows_drops_a_penultimate_window_the_tail_already_makes_redundant():
+    """99 frames would otherwise plan [0, 42, 43]: the window at 42 sits almost on top of the
+    pinned tail at 43 and adds about one new frame for a full window's 2.2 GPU-minutes. Once its
+    predecessor (start 0) already reaches within `crossfade` of the tail, the middle window is
+    dropped."""
+    plan = plan_windows(99)
+    assert plan == [Window(0, 56), Window(43, 56)]
+    assert plan[0].end - plan[1].start == 13                   # still >= CROSSFADE_FRAMES
+
+    plan = plan_windows(141)
+    assert plan == [Window(0, 56), Window(42, 56), Window(85, 56)]
+    overlaps = [plan[i].end - plan[i + 1].start for i in range(len(plan) - 1)]
+    assert all(o >= CROSSFADE_FRAMES for o in overlaps)
+    covered = np.zeros(141, bool)
+    for w in plan:
+        covered[w.start:w.end] = True
+    assert covered.all()
+
+
 # -- crossfade compositing -----------------------------------------------------------------------
 
 def _ramp(fade: int) -> np.ndarray:
@@ -147,10 +184,15 @@ def test_composite_of_a_single_window_is_that_window_verbatim():
 
 
 def test_composite_passes_frames_no_window_covers_through_byte_for_byte():
+    """`plan_windows` itself no longer produces a plan with a gap (fix round 1), but
+    `composite_windows` still has to behave on one, because nothing stops a caller from
+    hand-building one -- so the property is pinned directly against a hand-built plan rather than
+    through `plan_windows`."""
     rng = np.random.default_rng(0)
     source = rng.integers(0, 256, (40, 6, 8, 3), dtype=np.uint8)
+    plan = [Window(0, 39)]                              # frame 39 covered by no window
     refined = [_flat(39, 200)]
-    out = composite_windows(source, refined, plan_windows(40))
+    out = composite_windows(source, refined, plan)
     assert (out[39] == source[39]).all()               # the un-refined tail frame is untouched
     assert (out[:39] == 200).all()
 
@@ -188,6 +230,36 @@ def test_composite_rejects_a_window_whose_frames_do_not_match_the_plan():
         composite_windows(_flat(84, 0), [_flat(56, 1), _flat(55, 2)], plan_windows(84))
 
 
+def test_composite_tail_window_overlapping_two_predecessors_hands_off_cleanly():
+    """The 361-frame plan's pinned tail (start 305) overlaps *two* earlier windows at once: 45
+    frames of window 294-350 and, past that, 3 frames of window 252-308. Compositing against the
+    running accumulator rather than pairwise against only the immediately preceding window is what
+    the module docstring says makes this safe -- pin it: no frame is dropped, none is left at a
+    value from neither neighbour, and the run is monotonic through each handoff (values only ever
+    move from one window's flat value toward the next's, never overshoot and back)."""
+    plan = plan_windows(361)
+    assert [w.start for w in plan] == [0, 42, 84, 126, 168, 210, 252, 294, 305]      # unchanged
+
+    source = _flat(361, 0)
+    values = [10 * (i + 1) for i in range(len(plan))]          # 10, 20, ..., 90: one per window
+    refined = [_flat(w.length, v) for w, v in zip(plan, values)]
+    out = composite_windows(source, refined, plan, crossfade=CROSSFADE_FRAMES)
+
+    assert out.shape == source.shape and out.dtype == np.uint8
+    trace = out[:, 0, 0, 0].astype(int)
+    # No composite value falls outside the range the contributing windows could produce -- a
+    # dropped accumulator write or a mis-registered fade would show up as over/undershoot.
+    assert trace.min() >= min(values) and trace.max() <= max(values)
+    # Frames the tail window (value 90) owns outright, past every fade, land exactly on it --
+    # including the stretch inside the triple-overlap region that is closest to the tail's own
+    # start, which only a correct accumulator hand-off reaches undamaged.
+    assert (trace[350:361] == values[-1]).all()
+    # Monotonic end to end: every 3-window-deep region is still just a chain of two-window ramps,
+    # so the trace never reverses direction against the window values' own ascending order.
+    diffs = np.diff(trace)
+    assert (diffs >= 0).all()
+
+
 # -- the partial AdaLN table ---------------------------------------------------------------------
 
 def test_partial_table_name_is_the_two_decimal_sigma_the_experiments_baked():
@@ -197,7 +269,8 @@ def test_partial_table_name_is_the_two_decimal_sigma_the_experiments_baked():
 
 
 def test_partial_sigma_grid_matches_the_table_baked_for_sigma_025():
-    """The s0.25 grid documented in the plan: [0.250, 0.181, 0.098, 0]."""
+    """The s0.25 grid documented in the plan: [0.250, 0.180, 0.098, 0] (the grid is really 0.1805,
+    rounded to three decimals for the docstring)."""
     grid = partial_sigmas(0.25, 4, 12.0)
     assert grid[0] == pytest.approx(0.25, abs=1e-6)
     assert [round(float(v), 3) for v in grid] == [0.250, 0.180, 0.098, 0.0]
@@ -215,6 +288,25 @@ def test_partial_sigma_grid_is_shifted_per_modality_off_one_base_grid():
 
     assert [unshift(float(v), 12.0) for v in video] == pytest.approx(
         [unshift(float(a), 3.0) for a in audio], abs=1e-7)
+
+
+_SHIPPED_S025_TABLE = facerefine.DEFAULT_ADALN_DIR / partial_table_name(0.25)
+
+
+@pytest.mark.skipif(not _SHIPPED_S025_TABLE.exists(),
+                    reason=f"no {_SHIPPED_S025_TABLE} on this machine")
+def test_partial_sigmas_matches_the_grid_baked_into_the_shipped_s025_table():
+    """`partial_sigmas` isn't just consistent with itself -- it is the function `bake_partial.py`
+    used to bake the table that is actually sitting in `~/models/turbo/`, so it has to reproduce
+    that table's grids bit for bit, not just to three decimals."""
+    import mlx.core as mx
+
+    table = mx.load(str(_SHIPPED_S025_TABLE))
+    video = partial_sigmas(0.25, facerefine.GRID_POINTS, facerefine.VIDEO_SHIFT)
+    assert np.array(table["video_sigmas"]).tolist() == video.tolist()      # bit for bit
+    if "audio_sigmas" in table:
+        audio = partial_sigmas(0.25, facerefine.GRID_POINTS, facerefine.AUDIO_SHIFT)
+        assert np.array(table["audio_sigmas"]).tolist() == audio.tolist()  # bit for bit
 
 
 def test_ensure_partial_table_returns_an_existing_table_and_bakes_nothing(tmp_path, monkeypatch):
@@ -280,6 +372,59 @@ def test_refine_clip_refuses_crops_that_are_not_a_uint8_rgb_stack():
 def test_refine_clip_refuses_a_crop_whose_sides_are_not_multiples_of_the_vae_ratio():
     with pytest.raises(ValueError, match="16"):
         refine_clip(np.zeros((56, 100, 448, 3), np.uint8), checkpoint=Path("/nonexistent"))
+
+
+def test_validate_request_rejects_a_sigma_that_rounds_to_zero_only_after_rounding():
+    """0.004 clears the raw `sigma > 0.0` check but rounds to the `0.00` table name -- checked
+    again after quantizing so it does not silently become a no-op refine."""
+    with pytest.raises(ValueError):
+        facerefine._validate_request(_gray_crops(), 0.004)
+    # A sigma that survives rounding still works.
+    assert facerefine._validate_request(_gray_crops(), 0.006) == pytest.approx(0.01)
+
+
+def test_validate_request_accepts_numpy_floats():
+    assert facerefine._validate_request(_gray_crops(), np.float32(0.25)) == pytest.approx(0.25)
+    assert facerefine._validate_request(_gray_crops(), np.float64(0.15)) == pytest.approx(0.15)
+
+
+def test_validate_request_rejects_a_bool_sigma():
+    """`bool` is an `int` subclass, so `sigma=True` would otherwise sail through as `1.0`."""
+    with pytest.raises(ValueError):
+        facerefine._validate_request(_gray_crops(), True)
+    with pytest.raises(ValueError):
+        facerefine._validate_request(_gray_crops(), False)
+
+
+def test_refine_clip_has_no_turbo_strength_parameter():
+    """No round of experiments varied the backbone LoRA strength -- YAGNI'd out of the public
+    signature. The table's own `strength` still exists on `ensure_partial_table`, always called
+    at 1.0 from `refine_clip`."""
+    import inspect
+    assert "turbo_strength" not in inspect.signature(refine_clip).parameters
+    with pytest.raises(TypeError):
+        refine_clip(_gray_crops(), checkpoint=Path("/nonexistent"), turbo_strength=0.5)
+
+
+def test_refine_clip_happy_path_on_cpu_with_the_gpu_half_mocked(monkeypatch, tmp_path):
+    """Everything except `_run_windows` runs for real: validate -> plan -> ensure_table ->
+    composite, on a clip long enough to need more than one window (84 frames -> 2 windows). Proves
+    the wiring, not the v2v mechanics -- those are the GPU smoke test's job."""
+    crops = _gray_crops(84)
+    fake_table = tmp_path / "fake_table.safetensors"
+    monkeypatch.setattr(facerefine, "ensure_partial_table", lambda *a, **k: fake_table)
+
+    def fake_run_windows(crops_, plan, table, **kwargs):
+        assert table == fake_table
+        # One grey level per window, so the composite's crossfade is exercised for real.
+        return [np.full((w.length,) + crops_.shape[1:], 100 + 50 * i, np.uint8)
+                for i, w in enumerate(plan)]
+
+    monkeypatch.setattr(facerefine, "_run_windows", fake_run_windows)
+
+    out = refine_clip(crops, checkpoint=Path("/nonexistent"))
+    assert out.shape == crops.shape
+    assert out.dtype == np.uint8
 
 
 # -- the one GPU test ----------------------------------------------------------------------------
