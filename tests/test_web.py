@@ -2709,20 +2709,24 @@ def test_a_job_that_does_not_name_an_outdir_at_all_is_refused(queue_server):
     assert _pending(queue_server) == []
 
 
-def test_submitting_when_the_servers_own_outdir_looks_like_a_job_subdirectory_is_refused(tmp_path):
-    """Fix round 1 (I2, review round 1, Important). `queue._base_outdir` strips a trailing
-    directory that matches `queue._JOB_SUBDIR_RE` before nesting a fresh one under it -- exactly
-    right when that directory is a job's own subdirectory from an earlier submission, and exactly
-    wrong when it is the server's *own* `--outdir`, which just happens to be spelled the same way
-    (a leftover job subdirectory promoted to `--outdir` by hand, say). Left unchecked, every job
-    submitted to a server started that way lands one level *above* the server's own root -- outside
-    every root this server may write to, and nothing here would ever notice.
+def test_submitting_when_the_servers_own_outdir_looks_like_a_job_subdirectory_nests_inside_it(
+        tmp_path):
+    """Fix round 1 (I2, review round 1, Important) taught `queue._base_outdir` to strip a trailing
+    directory matching `queue._JOB_SUBDIR_RE` before nesting a fresh one under it, on shape alone --
+    right when that directory really is a job's own subdirectory from an earlier submission of
+    *this* queue, wrong when it is merely spelled the same way (the server's own `--outdir`, a
+    leftover job subdirectory from some other queue promoted to `--outdir` by hand, or a human
+    typing a look-alike path into the form). Fix round 2 (BACKLOG "UX-мелочи", task 7) narrowed the
+    strip to directories some job *this queue actually recorded* was relocated into
+    (`queue._outdir_is_a_known_job_subdir`) -- so this scenario, which used to escape the server's
+    own root and had to be refused, no longer strips at all: on a fresh queue nothing has ever used
+    this directory, so it is treated like any other outdir a human is free to write straight into.
 
-    The probe: a server whose `--outdir` is itself named like a job subdirectory
-    (`20260813-1200-run`), and an ordinary submission naming that same directory as `--outdir` (the
-    form's own default, `_job_args`'s convention throughout this suite). `queue.submit` would
-    relocate straight past the server's root; this must be refused before the job ever reaches
-    `pending/`.
+    The probe is the same as round 1's: a server whose `--outdir` is itself named like a job
+    subdirectory (`20260813-1200-run`), and an ordinary first submission naming that same directory
+    as `--outdir` (the form's own default, `_job_args`'s convention throughout this suite). Unlike
+    round 1, this must now succeed, with the job's own fresh subdirectory nested *inside* the
+    server's root rather than escaping above it.
     """
     outdir = tmp_path / "base" / "20260813-1200-run"
     outdir.mkdir(parents=True)
@@ -2737,9 +2741,13 @@ def test_submitting_when_the_servers_own_outdir_looks_like_a_job_subdirectory_is
     try:
         status, answer = _call(live, "POST", "/api/jobs",
                                {"args": _job_args(live, tag="кот"), "note": ""})
-        assert status == 400, answer
-        assert answer["error"]["code"] == "path_outside_root", answer
-        assert _pending(live) == [], "nothing must be queued when the relocation escapes the root"
+        assert status == 200, answer
+        pending = _pending(live)
+        assert len(pending) == 1
+        job_dir = Path(pending[0].output_stem).parent
+        assert job_dir.parent == outdir, (
+            f"the job's own subdirectory must nest inside the server's root {outdir}, not escape "
+            f"it -- got {job_dir}")
         assert list((tmp_path / "base").iterdir()) == [outdir], (
             "no stray directory may appear beside the server's own outdir")
     finally:

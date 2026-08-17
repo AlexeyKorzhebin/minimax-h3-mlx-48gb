@@ -220,17 +220,71 @@ def _dir_stamp(created_at: str) -> str:
     return datetime.fromisoformat(created_at).strftime("%Y%m%d-%H%M")
 
 
-def _base_outdir(outdir: Path) -> Path:
-    """`outdir` with a trailing job subdirectory stripped, or `outdir` itself if its last
-    component does not look like one `submit` created (`_JOB_SUBDIR_RE`).
+def _outdir_is_a_known_job_subdir(root, outdir: Path) -> bool:
+    """Whether some job this queue actually knows about -- `pending`, `running`, `done` or
+    `failed`, the same four states `defaultOutdir()` (`app.js`) reads from `state.queue` -- was
+    really relocated into `outdir`, i.e. `Path(job.output_stem).parent == outdir` for some job
+    file under `root`.
+
+    This is the evidence `_base_outdir` needs and the bare directory *name* cannot provide: a
+    directory shaped like `YYYYMMDD-HHMM-<slug>` proves nothing about who created it, only that it
+    is shaped the way `_relocate_to_job_subdir` shapes the subdirectories it creates. Actually
+    finding a job recorded under `root` whose own `output_stem` sits inside it is proof, because
+    nothing else in this codebase ever writes a job whose `output_stem` claims a directory it does
+    not use.
+
+    Broken or unreadable job files are skipped exactly like `_stem_taken` skips them: this is a
+    same-shape check, not `scan`, and is not the place to surface a corrupt job file.
+    """
+    root = Path(root)
+    for state in QUEUE_STATES:
+        directory = root / state
+        if not directory.is_dir():
+            continue
+        for file in directory.glob("*.json"):
+            try:
+                data = json.loads(file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            stem = data.get("output_stem")
+            if stem and Path(stem).parent == outdir:
+                return True
+    return False
+
+
+def _base_outdir(root, outdir: Path) -> Path:
+    """`outdir` with a trailing job subdirectory stripped, or `outdir` itself if either its last
+    component does not look like one `submit` created (`_JOB_SUBDIR_RE`), or -- fix round 2,
+    BACKLOG "UX-мелочи" -- no job `root` actually knows about was ever relocated into it.
+
+    Pattern alone used to be the whole test, and that is wrong in the direction of stripping too
+    eagerly: `defaultOutdir()` (`app.js`) pre-fills the web form's outdir field with whatever the
+    *previous* job's own, already-relocated `--outdir` was, so a human who edits that field, or who
+    simply types a similarly-shaped path from habit -- `--outdir ~/out/20260101-1200-myproject`,
+    never submitted through this queue before -- hands `submit` a string indistinguishable by shape
+    alone from one `_relocate_to_job_subdir` actually produced. Stripping it anyway silently moves
+    the job's output one level *above* the directory the human named, into its parent, which is not
+    what "I typed this directory as my own outdir" means.
+
+    The fix asks the queue itself, not the string, via `_outdir_is_a_known_job_subdir`: only a
+    directory that some job recorded under `root` actually used is "ours" to strip. A brand-new
+    directory nobody has ever been relocated into -- pattern match or not -- is treated like any
+    other outdir a human is free to write straight into, and `_relocate_to_job_subdir` nests a
+    fresh job subdirectory inside it exactly as it would for `~/video-out`.
 
     Without this, duplicating a job would nest the copy's subdirectory inside the source's rather
     than beside it -- `_duplicate_job` (`web.py`) resubmits the source job's own `args`, whose
     `--outdir` this module already relocated once, so the naive "always append a fresh
     subdirectory onto whatever `--outdir` already says" reading of this feature would grow one
     level deeper every time a job already sitting under a job subdirectory is duplicated again.
+    That case is exactly what `_outdir_is_a_known_job_subdir` still recognizes: the source job's own
+    record is sitting right there under `root`, `output_stem` and all.
     """
-    return outdir.parent if _JOB_SUBDIR_RE.fullmatch(outdir.name) else outdir
+    if not _JOB_SUBDIR_RE.fullmatch(outdir.name):
+        return outdir
+    if not _outdir_is_a_known_job_subdir(root, outdir):
+        return outdir
+    return outdir.parent
 
 
 def _last_outdir_token(args: list[str]) -> tuple[int, bool] | None:
@@ -257,7 +311,7 @@ def _last_outdir_token(args: list[str]) -> tuple[int, bool] | None:
     return found
 
 
-def _relocate_to_job_subdir(args: list[str], output_stem: str,
+def _relocate_to_job_subdir(root, args: list[str], output_stem: str,
                             created_at: str) -> tuple[list[str], str]:
     """Rewrite (or add) `--outdir` in `args` to `<base>/<YYYYMMDD-HHMM>-<slug>`, and return the
     matching `output_stem` alongside the rewritten `args` -- `submit`'s "every job gets its own
@@ -266,6 +320,8 @@ def _relocate_to_job_subdir(args: list[str], output_stem: str,
     `<base>` is *not* whatever `--outdir` already says in `args`: it is that value with any
     existing job subdirectory stripped first (`_base_outdir`), so a duplicated job's own copy of
     `args` -- which already names its source's subdirectory -- lands beside it, not inside it.
+    `root` is `_base_outdir`'s: stripping only happens for a directory some job under `root`
+    actually used, never on shape alone -- see `_base_outdir` for why.
 
     The directory is read off `output_stem` (`dry_run_report["output_stem"]`'s own parent) rather
     than by parsing `--outdir` back out of `args` a second time: `prepare_submission` (`web.py`)
@@ -278,7 +334,7 @@ def _relocate_to_job_subdir(args: list[str], output_stem: str,
     about *where* it lives is replaced by the new subdirectory.
     """
     old_outdir = Path(output_stem).parent
-    base = _base_outdir(old_outdir)
+    base = _base_outdir(root, old_outdir)
     subdir = f"{_dir_stamp(created_at)}-{_slug(_tag_from_args(args))}"
     new_outdir = base / subdir
     new_output_stem = str(new_outdir / Path(output_stem).name)
@@ -568,7 +624,7 @@ def submit(root, args: list[str], note: str, dry_run_report: dict, estimate: dic
                 )
 
         created_at = now() if now is not None else _now()
-        args, output_stem = _relocate_to_job_subdir(args, output_stem, created_at)
+        args, output_stem = _relocate_to_job_subdir(root, args, output_stem, created_at)
 
         if _stem_taken(root, output_stem):
             raise OutputStemConflict(output_stem)

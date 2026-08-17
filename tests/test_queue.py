@@ -59,12 +59,13 @@ def _assert_relocated(output_stem: str, base, filename: str, tag: str | None) ->
         f"the job subdirectory {stem.parent.name!r} must end with the tag's own slug")
 
 
-def _predicted_stem(output_stem: str, tag: str, created_at: str) -> str:
+def _predicted_stem(root, output_stem: str, tag: str, created_at: str) -> str:
     """Where `submit` will actually place `output_stem`, given a job whose `--tag` is `tag` and
     whose clock answers `created_at` -- for tests that need to plant a conflicting artifact, or a
     hand-written job file, at the exact path a real submission would collide with.
     """
-    _, relocated = q._relocate_to_job_subdir(["generate", "--tag", tag], output_stem, created_at)
+    _, relocated = q._relocate_to_job_subdir(root, ["generate", "--tag", tag], output_stem,
+                                             created_at)
     return relocated
 
 
@@ -316,6 +317,31 @@ def test_duplicating_a_relocated_job_gets_a_sibling_subdirectory_not_a_nested_on
     assert duplicate_dir == Path("/out/20260813-1440-a-copy")
 
 
+def test_a_user_outdir_that_merely_looks_like_a_job_subdirectory_is_not_stripped(tmp_path):
+    """BACKLOG "UX-мелочи", task 7. `_base_outdir` used to strip *any* `--outdir` whose last
+    component matched `queue._JOB_SUBDIR_RE` (`YYYYMMDD-HHMM-<slug>`), on the theory that only
+    `_relocate_to_job_subdir` ever produces that shape. That theory breaks the moment a human types
+    (or the web form's `defaultOutdir()` pre-fills, from a *previous* job's own already-relocated
+    `--outdir`) a directory that merely happens to look that way but was never actually used by any
+    job this queue knows about -- a fresh, stand-alone destination the human means literally.
+
+    The fix asks the queue's own records, not the string: nothing has ever been submitted to `root`
+    with `output_stem` inside `/out/20260101-0000-myproject`, so it must not be treated as an
+    existing job's own subdirectory and stripped up a level -- the new job's subdirectory must nest
+    *inside* it, exactly as it would inside any other outdir.
+    """
+    root = tmp_path / "queue"
+    user_dir = Path("/out/20260101-0000-myproject")
+    frozen = lambda: "2026-08-13T14:35:00"
+    job = q.submit(root, ["generate", "--tag", "a", "--outdir", str(user_dir)], "",
+                  {"output_stem": str(user_dir / "h3-a-896x576")}, {}, now=frozen)
+    job_dir = Path(job.output_stem).parent
+    assert job_dir.parent == user_dir, (
+        f"a user's own directory that merely looks like a job subdirectory must not be stripped -- "
+        f"the new job's subdirectory should nest inside {user_dir}, got {job_dir}")
+    assert job_dir != user_dir, "the job must still get its own fresh subdirectory, not write flat"
+
+
 def test_relocate_to_job_subdir_without_the_slug_is_wrong(tmp_path):
     """Mutation check: a version of `_relocate_to_job_subdir` that dropped the slug (stamp alone,
     e.g. because someone "simplified" `subdir = _dir_stamp(created_at)`) would still pass every
@@ -323,10 +349,11 @@ def test_relocate_to_job_subdir_without_the_slug_is_wrong(tmp_path):
     the same minute under different tags must not collide on the *directory*, only ever on the
     exact same `output_stem` if they also share a tag.
     """
+    root = tmp_path / "queue"
     stamp_only = "20260813-1435"  # what a slug-less implementation would produce
-    args_a, stem_a = q._relocate_to_job_subdir(["generate", "--tag", "a"],
+    args_a, stem_a = q._relocate_to_job_subdir(root, ["generate", "--tag", "a"],
                                                 "/out/h3-a-896x576", "2026-08-13T14:35:00")
-    args_b, stem_b = q._relocate_to_job_subdir(["generate", "--tag", "b"],
+    args_b, stem_b = q._relocate_to_job_subdir(root, ["generate", "--tag", "b"],
                                                 "/out/h3-b-896x576", "2026-08-13T14:35:00")
     assert Path(stem_a).parent != Path(stem_b).parent, (
         "two different tags in the same minute must not share a subdirectory")
@@ -408,7 +435,7 @@ def test_submit_refuses_when_any_artifact_of_that_stem_exists(tmp_path, suffix):
     root = tmp_path / "queue"
     frozen = lambda: "2026-08-11T13:05:00"
     flat_stem = str(tmp_path / "h3-a-896x576")
-    relocated = _predicted_stem(flat_stem, "a", frozen())
+    relocated = _predicted_stem(root, flat_stem, "a", frozen())
     Path(relocated).parent.mkdir(parents=True, exist_ok=True)
     Path(f"{relocated}{suffix}").write_bytes(b"")
     with pytest.raises(q.OutputStemConflict):
@@ -435,7 +462,8 @@ def test_submit_refuses_a_stem_a_running_job_already_claims(tmp_path):
     running_job = {
         "id": "20260811-000000-a-run1", "created_at": "2026-08-11T00:00:00",
         "args": ["generate", "--tag", "a"], "note": "", "prompt_source": None,
-        "prompt_sha256": None, "output_stem": _predicted_stem(_DRY["output_stem"], "a", frozen()),
+        "prompt_sha256": None,
+        "output_stem": _predicted_stem(root, _DRY["output_stem"], "a", frozen()),
         "estimate": {},
         "priority": 0, "started_at": "2026-08-11T00:00:00", "finished_at": None,
         "exit_code": None, "log_tail": None,
