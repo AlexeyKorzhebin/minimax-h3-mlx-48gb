@@ -94,7 +94,7 @@ def tiny_dit(quantize_qkv: bool = False, seed: int = 1234):
     return dit
 
 
-def packed_layout(n_text: int = 5, n_video: int = 9, n_audio: int = 3):
+def packed_layout(n_text: int = 5, n_video: int = 9, n_audio: int = 3) -> dict:
     """Text rows, then video, then audio — the upstream smoke test's packing."""
     seq = n_text + n_video + n_audio
     tags = mx.concatenate([mx.full((n_text,), TAG_TEXT, dtype=mx.int32),
@@ -321,6 +321,178 @@ def test_an_unpermuted_fused_lora_is_visibly_different(tmp_path):
     got_v, _ = forward(wrong, layout)
     assert float(mx.abs(got_v - want_v).max().item()) > 1e-4, (
         "the QKV permutation made no difference — the layout claim is untested")
+
+
+# ---------------------------------------------------------------- Task 3: q-chunk
+
+
+@pytest.fixture
+def count_sdpa(monkeypatch):
+    """Count `mx.fast.scaled_dot_product_attention` calls, so "chunked" can be *proved*.
+
+    Without this the chunking tests would pass on a build where the chunk size is larger than the
+    test sequence and the loop runs exactly once — i.e. on no chunking at all.
+    """
+    calls = []
+    real = mx.fast.scaled_dot_product_attention
+
+    def counting(q, k, v, **kwargs):
+        calls.append(q.shape[-2])
+        return real(q, k, v, **kwargs)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", counting)
+    return calls
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("seq,chunk", [(512, 128), (1024, 300), (2048, 1024)])
+def test_chunked_sdpa_is_bit_identical_to_whole_sequence_sdpa(seq, chunk, dtype):
+    """The identity the lever rests on, at the kernel: softmax normalizes within a query row.
+
+    Chunk sizes that do not divide the sequence are included — the ragged last chunk is the one
+    that would expose an off-by-one in the rotary slice or the reassembly.
+    """
+    mx.random.seed(0)
+    heads, head_dim = 8, 128
+    q, k, v = (mx.random.normal((1, heads, seq, head_dim)).astype(dtype) for _ in range(3))
+    scale = head_dim**-0.5
+
+    whole = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=None)
+    pieces = [mx.fast.scaled_dot_product_attention(q[:, :, i:i + chunk], k, v, scale=scale,
+                                                   mask=None)
+              for i in range(0, seq, chunk)]
+    exact(mx.concatenate(pieces, axis=2), whole, f"sdpa chunk {chunk} of {seq} in {dtype}")
+
+
+def test_mlx_switches_sdpa_kernel_on_very_short_sequences():
+    """Why the DiT-level chunking tests below use 512 rows and not 17.
+
+    Under ~512 query rows MLX picks a different attention kernel, and it does not accumulate in
+    the same order as the long one: chunking a 17-row sequence moves the result by ~1 ULP. That
+    is a fact about MLX at sizes this lever never runs at — chunking engages only above
+    `QUERY_CHUNK` (8192) rows — but it is worth pinning, because the day it stops being true a
+    16-row parity test would start passing for the wrong reason, and the day it becomes true at
+    8192 rows this test is the place the next reader will look.
+    """
+    mx.random.seed(0)
+    q, k, v = (mx.random.normal((1, 4, 17, 16)) for _ in range(3))
+    whole = mx.fast.scaled_dot_product_attention(q, k, v, scale=0.25, mask=None)
+    halves = mx.concatenate([mx.fast.scaled_dot_product_attention(q[:, :, i:i + 8], k, v,
+                                                                 scale=0.25, mask=None)
+                             for i in range(0, 17, 8)], axis=2)
+    mx.eval(whole, halves)
+    delta = float(mx.abs(whole - halves).max().item())
+    assert delta < 1e-5, f"this is a rounding difference, not a correctness one: {delta}"
+    assert not bool(mx.all(whole == halves).item()), (
+        "MLX now chunks short sequences exactly — retune the DiT-level tests, which avoid this "
+        "regime on purpose")
+
+
+@pytest.mark.parametrize("chunk", [128, 173, 512])
+def test_chunked_attention_is_bit_identical_in_a_full_forward(monkeypatch, chunk):
+    """End to end through the split attention, at a sequence long enough to be honest (512 rows)."""
+    layout = packed_layout(n_text=16, n_video=480, n_audio=16)
+    dit = tiny_dit()
+    from h3_48gb.dit import split_fused_attention
+
+    split_fused_attention(dit)
+    monkeypatch.setattr(updit, "QUERY_CHUNK", 1 << 30)
+    whole_v, whole_a = forward(dit, layout)
+
+    monkeypatch.setattr(updit, "QUERY_CHUNK", chunk)
+    chunked_v, chunked_a = forward(dit, layout)
+    exact(chunked_v, whole_v, f"q-chunk {chunk} video")
+    exact(chunked_a, whole_a, f"q-chunk {chunk} audio")
+
+
+def test_the_chunked_path_is_actually_entered(monkeypatch, count_sdpa):
+    """512 rows in chunks of 128 is four attention calls per block, not one.
+
+    The refiner runs first and only over the 16 text rows, which is under the chunk size — so the
+    expected trace is two whole-sequence calls followed by two blocks of four chunks each.
+    """
+    layout = packed_layout(n_text=16, n_video=480, n_audio=16)
+    dit = tiny_dit()
+    from h3_48gb.dit import split_fused_attention
+
+    split_fused_attention(dit)
+    monkeypatch.setattr(updit, "QUERY_CHUNK", 128)
+    forward(dit, layout)
+
+    assert count_sdpa == [16, 16] + [128] * 8, count_sdpa
+
+
+def test_a_narrow_matmul_is_not_row_chunk_stable_but_the_prepare_protocol_is():
+    """The reason `prepare_rows` exists, at the shape that made it necessary.
+
+    MLX splits a narrow reduction (7168-wide input, rank 64) differently at different row counts,
+    so a LoRA applied per chunk lands a bf16 ULP away from the same LoRA applied whole. The
+    protocol hoists exactly that one matmul out of the loop, and the per-chunk `addmm` that
+    remains *is* row-stable.
+    """
+    from h3_48gb.turbo import LoRALinear
+
+    mx.random.seed(0)
+    seq, hidden, rank, chunk = 4096, 7168, 64, 1500
+    base = nn.QuantizedLinear.from_linear(nn.Linear(hidden, 512, bias=False),
+                                          group_size=64, bits=8)
+    layer = LoRALinear(base, mx.random.normal((rank, hidden)).astype(mx.bfloat16),
+                       mx.random.normal((512, rank)).astype(mx.bfloat16), strength=1.0)
+    x = mx.random.normal((1, seq, hidden)).astype(mx.bfloat16)
+    mx.eval(x, base.parameters())
+
+    whole = layer(x)
+    naive = mx.concatenate([layer(x[:, i:i + chunk]) for i in range(0, seq, chunk)], axis=1)
+    # Through `dit.py`'s own helpers, not the layer's methods: the protocol is only worth anything
+    # if the chunked call sites actually route through it.
+    prepared = updit.prepare_rows(layer, x)
+    protocol = mx.concatenate(
+        [updit.apply_rows(layer, x, prepared, i, min(i + chunk, seq))
+         for i in range(0, seq, chunk)], axis=1)
+
+    exact(protocol, whole, "LoRA under the prepare_rows protocol")
+    mx.eval(naive)
+    assert not bool(mx.all(naive == whole).item()), (
+        "the naive per-chunk LoRA is bit-stable on this MLX after all — `prepare_rows` is now "
+        "only an optimization, and this test should say so instead of being deleted")
+
+
+def test_q_chunk_is_bit_identical_with_a_turbo_lora_attached(tmp_path, monkeypatch):
+    """The combination that actually ships: few-step runs are LoRA runs."""
+    from h3_48gb.dit import split_fused_attention
+    from h3_48gb.turbo import apply_backbone_lora
+
+    layout = packed_layout(n_text=16, n_video=480, n_audio=16)
+    dit = tiny_dit()
+    split_fused_attention(dit)
+    weights = _write_backbone_lora(tmp_path / "lora.safetensors", dit)
+    apply_backbone_lora(dit, weights, strength=1.0, num_heads=4, head_dim=16, verbose=False)
+
+    monkeypatch.setattr(updit, "QUERY_CHUNK", 1 << 30)
+    whole_v, whole_a = forward(dit, layout)
+    monkeypatch.setattr(updit, "QUERY_CHUNK", 173)
+    chunked_v, chunked_a = forward(dit, layout)
+    exact(chunked_v, whole_v, "q-chunk under LoRA, video")
+    exact(chunked_a, whole_a, "q-chunk under LoRA, audio")
+
+
+def test_a_masked_call_is_never_chunked(monkeypatch, count_sdpa):
+    """The chunk loop drops the mask, so masked calls must not reach it.
+
+    A mask is per (query, key) pair; slicing its query axis alongside q is a separate change, and
+    quietly ignoring it would turn a padded batch into a silently wrong one.
+    """
+    dit = tiny_dit()
+    from h3_48gb.dit import split_fused_attention
+
+    split_fused_attention(dit)
+    monkeypatch.setattr(updit, "QUERY_CHUNK", 4)
+
+    attention = dit.blocks[0].attn
+    x = mx.random.normal((1, 17, dit.config.hidden_size))
+    mask = mx.zeros((1, 1, 17, 17))
+    mx.eval(attention(x, None, mask))
+    assert count_sdpa == [17], f"a masked call was chunked into {count_sdpa}"
 
 
 def test_the_lightx2v_adapter_also_survives_the_split(tmp_path):

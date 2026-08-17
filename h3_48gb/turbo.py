@@ -66,11 +66,25 @@ class LoRALinear(nn.Module):
         self.strength = strength
 
     def __call__(self, x: mx.array) -> mx.array:
-        out = self.base(x)
         # `out + strength * (low @ B.T)` materializes a full output-sized delta before adding it:
         # 2.16 GB for `mlp.fc1` at 37,657 rows, live only long enough to be discarded. `addmm`
         # accumulates into `out` instead.
-        low = x @ self.lora_a.T
+        return self.apply_rows(x, self.prepare_rows(x))
+
+    # -- the row-chunking protocol `minimax_h3_mlx.dit.prepare_rows` defines ----------------------
+    #
+    # `x @ A.T` is the one narrow matmul in the model — rank 64 out of a 7168-wide input — and MLX
+    # splits a narrow reduction differently at different row counts, so computing it per chunk
+    # moves the result by a bf16 ULP against computing it whole. It is also the one thing cheap
+    # enough to hoist: `(seq, 64)` is 9 MB where the buffers being chunked are gigabytes. So the
+    # low-rank read happens once over the whole sequence and the chunks consume slices of it,
+    # which is what keeps `q-chunk` and `mlp-chunk` bit-identical rather than merely close.
+
+    def prepare_rows(self, x: mx.array) -> mx.array:
+        return x @ self.lora_a.T
+
+    def apply_rows(self, x: mx.array, low: mx.array) -> mx.array:
+        out = self.base(x)
         return mx.addmm(out, low.astype(out.dtype), self.lora_b.T.astype(out.dtype),
                         alpha=self.strength)
 

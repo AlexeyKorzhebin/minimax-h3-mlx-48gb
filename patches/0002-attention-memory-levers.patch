@@ -1,8 +1,8 @@
 diff --git a/minimax_h3_mlx/dit.py b/minimax_h3_mlx/dit.py
-index 4aa8cca..cf76e80 100644
+index 4aa8cca..32af8ce 100644
 --- a/minimax_h3_mlx/dit.py
 +++ b/minimax_h3_mlx/dit.py
-@@ -113,18 +113,62 @@ def apply_rotary(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+@@ -113,18 +113,104 @@ def apply_rotary(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
      """Rotate the leading ``rotary_dim`` channels of every head, pass the rest through.
  
      ``x`` is ``(batch, heads, seq, head_dim)``; ``cos``/``sin`` are ``(seq, rotary_dim)``.
@@ -48,6 +48,48 @@ index 4aa8cca..cf76e80 100644
 +    return x * cos + rotated * sin
 +
 +
++#: PATCHED IN THIS FORK (`patches/0002-attention-memory-levers.patch`). Attention runs over query
++#: rows in slices this wide once the sequence is longer than one. Softmax is per query row, so
++#: nothing crosses a slice boundary and the result is bit-identical — what changes is that q, the
++#: attention output and the rotary temporaries exist one slice at a time instead of all at once,
++#: while k and v stay whole. 8192 is empirical: large enough that the per-slice kernel launches
++#: and the `k`/`v` re-reads stay in the noise (forward time moved by well under a percent),
++#: small enough to take ~3 GB off a 73k-row forward. Read at call time, so a test can lower it.
++QUERY_CHUNK = 8192
++
++
++def prepare_rows(layer, x: mx.array):
++    """Whatever ``layer`` needs computed once over the *whole* sequence before row-chunked use.
++
++    PATCHED IN THIS FORK (`patches/0002-attention-memory-levers.patch`).
++
++    Chunking a linear layer by rows is arithmetically free — every output row reads one input row —
++    but it is not automatically *bit* free. MLX picks a GEMM tiling by shape, and for a narrow
++    output it splits the reduction differently at different row counts: measured on this machine,
++    ``x @ lora_a.T`` at 7168-wide input and rank 64 differs by one bf16 ULP between a 6247-row call
++    and the concatenation of 2048-row calls. Every spelling tried (``addmm`` into zeros, float32
++    accumulation) has the same property, so it is the kernel, not the expression.
++
++    That matters only for the LoRA side path, whose rank-r read is the one narrow matmul in the
++    model — and it happens to be the one thing small enough to hoist: ``(seq, 64)`` is 9 MB where
++    the activations being chunked are gigabytes. So a layer may declare a whole-sequence
++    precomputation here and consume slices of it in `apply_rows`, which keeps chunked and unchunked
++    forwards bit-identical instead of merely close. Layers that declare nothing are applied to the
++    slice directly, which for the quantized base projections is exact (verified: an 8-bit
++    ``QuantizedLinear`` gives identical bits on a slice and on the whole).
++    """
++    prepare = getattr(layer, "prepare_rows", None)
++    return None if prepare is None else prepare(x)
++
++
++def apply_rows(layer, x: mx.array, prepared, start: int, stop: int) -> mx.array:
++    """Apply ``layer`` to rows ``[start:stop]`` of ``x``, feeding it its own `prepare_rows` slice."""
++    rows = x[:, start:stop]
++    if prepared is None:
++        return layer(rows)
++    return layer.apply_rows(rows, prepared[:, start:stop])
++
++
 +def carve_rows(layer: nn.Module, rows: mx.array) -> nn.Module:
 +    """A copy of ``layer`` holding only ``rows`` of its output.
 +
@@ -73,7 +115,7 @@ index 4aa8cca..cf76e80 100644
  
  
  class Attention(nn.Module):
-@@ -141,12 +185,80 @@ class Attention(nn.Module):
+@@ -141,12 +227,114 @@ class Attention(nn.Module):
          self.k_norm = nn.RMSNorm(config.attention_head_dim, eps=config.qk_norm_eps)
          self.out_proj = nn.Linear(config.inner_dim, config.hidden_size, bias=False)
  
@@ -140,6 +182,38 @@ index 4aa8cca..cf76e80 100644
 +        out = out.transpose(0, 2, 1, 3).reshape(B, S, self.heads * self.head_dim)
 +        return self.out_proj(out.astype(x.dtype))
 +
++    def _chunked_call(self, x, rotary):
++        """`_split_call` with the query side taken ``QUERY_CHUNK`` rows at a time.
++
++        Every query row attends to the whole sequence and softmax normalizes within a row, so a
++        slice of query rows is a self-contained problem: k and v are built once and whole, and the
++        slice loop only ever narrows what is live on the q side. No mask is threaded through —
++        the caller's mask is per (query, key) pair and slicing it correctly is a different change;
++        `__call__` sends masked calls down the unchunked path instead.
++        """
++        B, S, _ = x.shape
++        v = self._heads(x, self.v_proj)
++        k = self._heads(x, self.k_proj, self.k_norm)
++        if rotary is not None:
++            k = apply_rotary(k, *rotary)
++        cos, sin = rotary if rotary is not None else (None, None)
++
++        prepared = prepare_rows(self.q_proj, x)
++        chunks = []
++        for start in range(0, S, QUERY_CHUNK):
++            stop = min(start + QUERY_CHUNK, S)
++            projected = apply_rows(self.q_proj, x, prepared, start, stop)
++            q = self.q_norm(
++                projected.reshape(B, stop - start, self.heads, self.head_dim)
++            ).transpose(0, 2, 1, 3)
++            if rotary is not None:
++                q = apply_rotary(q, cos[start:stop], sin[start:stop])
++            attended = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=None)
++            chunks.append(attended.transpose(0, 2, 1, 3)
++                          .reshape(B, stop - start, self.heads * self.head_dim))
++        out = mx.concatenate(chunks, axis=1)
++        return self.out_proj(out.astype(x.dtype))
++
 +    # --------------------------------------------------------------------------------------------
 +
      def __call__(
@@ -149,6 +223,8 @@ index 4aa8cca..cf76e80 100644
          mask: mx.array | None = None,
      ) -> mx.array:
 +        if self.is_split:
++            if mask is None and x.shape[-2] > QUERY_CHUNK:
++                return self._chunked_call(x, rotary)
 +            return self._split_call(x, rotary, mask)
 +
          B, S, _ = x.shape
