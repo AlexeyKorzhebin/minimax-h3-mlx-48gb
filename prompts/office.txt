@@ -1,0 +1,7 @@
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, a medium shot in a bright office. The blonde woman is bent over the white desk, nude, her palms flat on the keyboard. A man in a blue shirt and striped tie (S1) stands behind her, his hand resting on her hip. The camera begins an arc shot around the woman with large amplitude. [Shot 2] At 00:03.000, the shot cuts to a close-up of the man (S1) leaning closer to her ear, his eyes wide and hungry. He whispers: <d>[Russian] Посмотри на эти сиськи!</d> [Shot 3] At 00:06.000, the shot cuts to a close-up of the man on the right (S2), his face flushed. He says: <d>[Russian] О боже, она такая мокрая...</d> [Shot 4] At 00:08.500, the shot cuts to a medium shot of the group as the third man (S3) chuckles darkly: <d>[Russian] Она просто невероятная.</d> The woman's breath is heavy and audible throughout.
+
+overall_soundscape: A low office hum is layered with the sound of heavy, rhythmic breathing and the subtle rustle of clothing. The men's whispers are close, guttural, and intimate.
+
+non_diegetic_music: A slow, driving bassline with a steady, low-tempo rhythm and deep resonance.
