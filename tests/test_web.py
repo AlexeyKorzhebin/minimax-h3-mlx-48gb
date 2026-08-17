@@ -2401,6 +2401,90 @@ def test_the_estimate_route_answers_without_starting_a_subprocess(queue_server, 
     assert _pending(queue_server) == [], "/api/estimate must not queue anything"
 
 
+def _vertical_frame(live: _Live, width=768, height=1024, name="kadr.png") -> Path:
+    """A real image inside the outdir, because `resolve_canvas` opens it: the canvas derived from
+    a keyframe is a fact about the file's pixels, and a stub path proves nothing about it.
+    """
+    from PIL import Image
+
+    path = live.outdir / name
+    Image.new("RGB", (width, height), "red").save(path)
+    return path
+
+
+def test_the_estimate_of_a_keyframe_run_uses_the_canvas_derived_from_the_frame(queue_server):
+    """Без `--width/--height` формула брала `DEFAULT_CANVAS` — 896x512, горизонтальный, — и
+    вертикальный кадр получал оценку чужого канваса: время и память считались не для того ролика,
+    который поедет считаться.
+
+    Канвас из кадра знает только CLI (`resolve_canvas` -> `minimax_h3_mlx.packing`, который этому
+    процессу импортировать нельзя), поэтому здесь запускается тот же dry-run, что и при постановке,
+    и оценка считается по его `canvas`. Подписи оценки этот же канвас нужен, чтобы показать его
+    человеком, — оттого `width`/`height` в ответе.
+    """
+    frame = _vertical_frame(queue_server)
+    status, answer = _call(queue_server, "POST", "/api/estimate",
+                           {"args": _job_args(queue_server, "--image", str(frame),
+                                              "--mode", "i2v", "--duration", "10")})
+    assert status == 200, answer
+    got = (answer["estimate"]["width"], answer["estimate"]["height"])
+    assert got == (768, 1024), f"канвас обязан прийти из кадра, а не из DEFAULT_CANVAS: {got}"
+    assert got != web.DEFAULT_CANVAS
+
+
+def test_the_keyframe_estimate_works_without_a_prompt_because_estimates_have_none(queue_server):
+    """Оценка промпт не носит намеренно: `requestEstimate` строит аргументы с `withPrompt: false`,
+    чтобы не слать килобайты текста на каждое нажатие клавиши.
+
+    А dry-run без промпта отказывается (`prompt_missing`) — он собирает полный `RunSpec`. Значит
+    «из кадра» в форме давал бы `≈—` вместо оценки *всегда*, при любом промпте, потому что до
+    сервера промпт в этом запросе не доезжает вовсе. Канвас от промпта не зависит, поэтому
+    подставить недостающий на время dry-run — честно; отказать — нет.
+    """
+    frame = _vertical_frame(queue_server, name="bez-prompta.png")
+    args = [a for a in _job_args(queue_server, "--image", str(frame), "--mode", "i2v")
+            if a != "котик на подоконнике"]
+    assert not any(a == "--prompt-file" for a in args), args
+
+    status, answer = _call(queue_server, "POST", "/api/estimate", {"args": args})
+
+    assert status == 200, answer
+    assert (answer["estimate"]["width"], answer["estimate"]["height"]) == (768, 1024), answer
+
+
+def test_an_estimate_with_explicit_numbers_still_starts_no_subprocess(queue_server, monkeypatch):
+    """Оборотная сторона: dry-run включается только там, где канвас без него неизвестен. Форма
+    пересчитывает оценку на каждое нажатие клавиши, и подпроцесс на каждое нажатие — форк-бомба.
+    """
+    monkeypatch.setattr(web, "validate_args", lambda *a, **k: pytest.fail(
+        "явные --width/--height не требуют dry-run"))
+    frame = _vertical_frame(queue_server, name="kadr2.png")
+    status, answer = _call(queue_server, "POST", "/api/estimate",
+                           {"args": _job_args(queue_server, "--image", str(frame),
+                                              "--width", "896", "--height", "576")})
+    assert status == 200, answer
+    assert (answer["estimate"]["width"], answer["estimate"]["height"]) == (896, 576)
+
+
+def test_a_keyframe_job_queued_without_a_canvas_carries_the_derived_one(queue_server):
+    """Постановка без `--width/--height` обязана доезжать до очереди, а задача — нести выведенный
+    канвас: иначе «из кадра (авто)» в форме ставит задачу, про которую потом нельзя сказать, в
+    каком разрешении она посчитается.
+    """
+    frame = _vertical_frame(queue_server, width=1024, height=768, name="gorizont.png")
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, "--image", str(frame),
+                                              "--mode", "i2v")})
+    assert status == 200, answer
+    job = answer["job"]
+    assert (job["estimate"]["width"], job["estimate"]["height"]) == (1024, 768), job["estimate"]
+    # Имя вывода складывается из канваса (`h3-<тег>-<W>x<H>`), поэтому оно и есть второй,
+    # независимый след выведенного канваса — тот, который человек увидит на диске.
+    assert job["output_stem"].endswith("1024x768"), job["output_stem"]
+    assert "--width" not in job["args"], (
+        "аргументы задачи остаются без канваса — его выводит CLI, и выводит одинаково оба раза")
+
+
 def test_the_estimate_route_refuses_a_path_outside_the_roots(queue_server):
     """Without the path check this route reads `quant_config.json` from any directory a caller
     names, which turns an estimate into an existence oracle for the whole filesystem.
@@ -3092,17 +3176,22 @@ def test_every_canvas_preset_has_its_own_option_in_the_resolution_dropdown():
     Значения (`w`/`h`) живут в `CANVAS_PRESETS` и только там; подпись пункта пишет их для
     человека, и разъехаться эти два списка не имеют права — выпадашка, обещающая «малое
     896×576» и ставящая 1344×768, хуже отсутствующей.
+
+    Два пункта по краям — не пресеты и в `CANVAS_PRESETS` их нет: «из кадра (авто)» значит «не
+    слать `--width/--height` вовсе», «своё…» открывает поля ручного ввода. Ни у того, ни у
+    другого нет пары чисел, которую можно было бы сверить.
     """
     page = _page_text("index.html")
     select = re.search(r'<select[^>]*id="canvas-preset".*?</select>', page, re.S)
     assert select, "разрешение выбирается выпадашкой #canvas-preset, а не кнопками-пресетами"
     options = re.findall(r'<option value="([^"]+)"[^>]*>([^<]*)</option>', select.group(0))
     keys = [value for value, _ in options]
+    assert keys[0] == "auto", f"«из кадра» — первый пункт списка, а список {keys}"
     assert keys[-1] == "custom", f"«своё…» — последний пункт списка, а список {keys}"
 
     presets = _node_eval("console.log(JSON.stringify(app.CANVAS_PRESETS));")
-    assert keys[:-1] == [p["key"] for p in presets], (keys, [p["key"] for p in presets])
-    for (value, label), preset in zip(options, presets):
+    assert keys[1:-1] == [p["key"] for p in presets], (keys, [p["key"] for p in presets])
+    for (value, label), preset in zip(options[1:], presets):
         assert f'{preset["w"]}×{preset["h"]}' in label, (
             f"пункт {value!r} подписан {label!r}, а пресет — {preset['w']}×{preset['h']}")
     assert "data-preset=" not in page, "кнопки-пресеты заменены выпадашкой, а не дополнены ею"
@@ -4018,18 +4107,38 @@ def test_finished_shows_the_exit_code_and_a_failure_shows_why():
 
 
 @_needs_node
-def test_only_the_last_day_of_finished_runs_is_shown():
-    """Requirement 9's window. A queue that never forgets grows without bound and buries today."""
+def test_every_finished_run_is_shown_newest_first_with_no_window_at_all():
+    """Окно в сутки прятало работу, а не экономило место: из тринадцати роликов за выходные на
+    странице оставалось два, и человек читал это как «пропали».
+
+    Догадка, стоявшая за окном («список, который ничего не забывает, хоронит сегодняшнее»), не
+    подтвердилась ровно потому, что список отсортирован: сегодняшнее и так сверху, а вчерашнее
+    внизу никому не мешает. Порядок поэтому и проверяется — без него «показывать всё» стало бы
+    той самой свалкой, которой окно боялось.
+    """
     kept = _node_eval("""
-      const at = new Date("2026-08-12T22:00:00");
-      const rows = app.finishedWithin([
-        {id: "fresh", finished_at: "2026-08-12T20:00:00"},
+      const rows = app.finishedSorted([
         {id: "stale", finished_at: "2026-08-10T20:00:00"},
+        {id: "fresh", finished_at: "2026-08-12T20:00:00"},
+        {id: "ancient", finished_at: "2025-01-01T00:00:00"},
         {id: "yesterday", finished_at: "2026-08-12T01:00:00"},
-      ], at);
+      ]);
       console.log(JSON.stringify(rows.map(r => r.id)));
     """)
-    assert kept == ["fresh", "yesterday"], kept
+    assert kept == ["fresh", "yesterday", "stale", "ancient"], kept
+
+
+@_needs_node
+def test_the_finished_zone_no_longer_carries_a_window_to_forget_things_by():
+    """Структурно: константы окна не должно остаться вовсе. Оставленная «на всякий случай», она
+    тихо вернётся в фильтр следующей же правкой этого места.
+    """
+    script = _page_text("app.js")
+    assert "FINISHED_WINDOW_HOURS" not in script, "константа окна обязана исчезнуть целиком"
+    assert "finishedWithin" not in script, "фильтр по окну обязан исчезнуть вместе с ней"
+    page = _page_text("index.html")
+    assert "За сутки ничего не закончилось" not in page, (
+        "пустое состояние больше не про сутки — оно про «ничего ещё не считалось»")
 
 
 @_needs_node
@@ -4125,6 +4234,10 @@ def test_the_upload_zone_shows_a_prompt_when_empty_and_the_name_once_loaded():
     `updateUploadZone` (the DOM half) just feeds it `{name}` derived from whatever is currently in
     `#image`/`#end-image`, so this is what actually pins requirement 21's two states without a
     browser.
+
+    Пустое состояние обязано называть настоящие условия. «Перетащи картинку» их не называет, и
+    человек, у которого кадр не взяли, гадает между форматом, размером и разрешением — при том,
+    что разрешение тут не ограничено вовсе.
     """
     empty, loaded, blank_name = _node_eval("""
       console.log(JSON.stringify([
@@ -4133,9 +4246,180 @@ def test_the_upload_zone_shows_a_prompt_when_empty_and_the_name_once_loaded():
         app.uploadZoneLabel({name: ""}),
       ]));
     """)
-    assert empty == "перетащи картинку или выбери файл", empty
     assert loaded == "start.png", loaded
     assert blank_name == empty, "an empty name must read exactly like no state at all"
+    for word in ("png", "jpg", "webp", "16 МБ", "разрешение любое"):
+        assert word in empty, f"подпись зоны обязана называть условие «{word}»:\n{empty}"
+
+
+@_needs_node
+def test_a_refused_frame_says_what_a_frame_may_actually_be():
+    """`bad_image` — единственная 400, которую человек видит, уронив картинку в зону, и заголовок
+    «Кадр не годится для разговора с моделью» не говорит ни одного условия. Сообщение сервера под
+    ним перечисляет форматы и предел, но заголовок читают первым, а иногда и единственным.
+    """
+    title, pre = _node_eval("""
+      const it = app.errorText({error: {code: "bad_image", message: "кадр больше 16 МБ"}});
+      console.log(JSON.stringify([it.title, it.pre]));
+    """)
+    for word in ("png", "jpg", "webp", "16 МБ"):
+        assert word in title, f"заголовок отказа обязан называть условие «{word}»:\n{title}"
+    assert pre == "кадр больше 16 МБ", "точная причина от сервера обязана остаться под заголовком"
+
+
+def test_the_upload_zone_error_shows_the_servers_own_reason(_=None):
+    """Зона загрузки писала в подпись `errorText(...).title` — общий заголовок вроде «Кадр не
+    годится…», — а `pre` с настоящей причиной («кадром может быть только […], а 'x.txt' — нет»)
+    выбрасывала. Причина в подписи полезнее заголовка ровно там, где места на одну строку.
+    """
+    script = _page_text("app.js")
+    assert script.count("errorText(error.payload).pre || errorText(error.payload).title") == 2, (
+        "обе зоны — форма и модалка — обязаны показывать причину, а не общий заголовок")
+
+
+@_needs_node
+def test_the_auto_canvas_choice_sends_no_width_or_height_at_all():
+    """«из кадра (авто)»: CLI выводит канвас из кадра сам (аспект цел, кратность 32), но только
+    если не получил ни `--width`, ни `--height` — с одним из двух он отказывается
+    (`partial_canvas_with_image`), с обоими берёт их как есть.
+
+    Форма же слала оба всегда, поэтому автовывод из веба был недостижим: вертикальную картинку
+    молча растягивало в горизонтальный канвас пресета. Проверяется ровно отсутствие обоих флагов.
+    """
+    auto, auto_no_frame, preset = _node_eval("""
+      const base = {width: 896, height: 576, duration: 10, steps: 8, seed: 3, tag: "т",
+                    mode: "i2v", checkpoint: "C", outdir: "O", lora: "", adaln: "",
+                    endImage: "", promptFile: null, prompt: "кот"};
+      console.log(JSON.stringify([
+        app.buildArgs({...base, image: "/k/kadr.png", canvasFromImage: true}),
+        app.buildArgs({...base, image: "", canvasFromImage: true}),
+        app.buildArgs({...base, image: "/k/kadr.png", canvasFromImage: false}),
+      ]));
+    """)
+    assert "--width" not in auto and "--height" not in auto, auto
+    assert "--image" in auto, "кадр обязан остаться — из него и выводится канвас"
+    assert "--width" in auto_no_frame, (
+        "без кадра выводить не из чего: канвас обязан уехать числами, а не пропасть")
+    assert "--width" in preset and "--height" in preset, preset
+
+
+@_needs_node
+def test_the_auto_canvas_is_offered_only_when_a_frame_can_actually_supply_it():
+    """Пункт «из кадра» без кадра — обещание, которое некому выполнить: CLI подставит
+    `DEFAULT_CANVAS` и посчитает молча не то. Доступность — чистая функция от режима и кадра.
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify([
+        app.autoCanvasAllowed("i2v", "/k/a.png"),
+        app.autoCanvasAllowed("flf", "/k/a.png"),
+        app.autoCanvasAllowed("i2v", ""),
+        app.autoCanvasAllowed("t2v", "/k/a.png"),
+        app.autoCanvasAllowed("t2va", ""),
+      ]));
+    """)
+    assert got == [True, True, False, False, False], got
+
+
+@_needs_node
+def test_the_estimate_line_names_the_canvas_that_was_derived_from_the_frame():
+    """Канвас «из кадра» человек не выбирал и увидеть ему негде — кроме подписи оценки. Без неё
+    единственный способ узнать разрешение будущего ролика — дождаться файла на диске.
+    """
+    auto, plain = _node_eval("""
+      console.log(JSON.stringify([
+        app.canvasNote(true, {width: 576, height: 896}),
+        app.canvasNote(false, {width: 896, height: 576}),
+      ]));
+    """)
+    assert auto == "из кадра: 576×896", auto
+    assert plain == "", "выбранный руками пресет и так виден в выпадашке — второй раз незачем"
+
+
+def test_the_frame_zone_says_a_vertical_picture_gives_a_vertical_video():
+    """Аспект сохраняется — это и есть ответ на вопрос «а что будет с моей вертикальной
+    картинкой», который иначе выясняется только по готовому ролику.
+    """
+    page = _page_text("index.html")
+    assert "вертикальная картинка" in page.lower(), (
+        "зона кадра обязана сказать, что аспект сохраняется")
+    assert '<option value="auto"' in page, "пункт «из кадра (авто)» обязан быть в выпадашке"
+
+
+@_needs_node
+def test_the_new_task_button_clears_the_composition_but_not_the_recipe():
+    """Форма намеренно не очищается сама после постановки — за вечер сюда кладут пять задач,
+    меняя по одному полю, — но именно поэтому нужен явный выход: накидав ночную пачку, следующую
+    задачу человек начинает с чужого промпта, чужого кадра и чужого тега и вычищает их руками.
+
+    Граница ровно одна и она же — причина, по которой сброс не «перезагрузить страницу»:
+    сочинение (промпт, кадры, тег, сид, режим, длительность, канвас) обнуляется, рецепт
+    (чекпойнт, LoRA с её силой, таблица AdaLN, число шагов, папка вывода) не трогается. Рецепт
+    на этой машине один и тот же месяцами, и его повторный набор — та самая работа, ради отмены
+    которой форма и не чистится сама.
+    """
+    reset = _node_eval("console.log(JSON.stringify(app.resetFormState()));")
+
+    assert reset["prompt"] == "", reset
+    assert reset["prompt-file"] == "", "выпадашка библиотеки — на «промпт набран здесь»"
+    assert reset["image"] == "" and reset["end-image"] == "", "оба кадра обязаны уйти"
+    assert reset["tag"] == "run", reset
+    assert reset["seed"] == "0", "сид возвращается к нулю, как в разметке"
+    assert reset["mode"] == "t2va", reset
+    assert reset["duration"] == "10", reset
+    assert reset["canvas-preset"] == "small", "канвас — тот же пресет, что на чистой странице"
+    assert (reset["width"], reset["height"]) == ("896", "576"), reset
+
+    for recipe in ("ckpt", "lora", "lora-str", "adaln", "steps", "outdir"):
+        assert recipe not in reset, (
+            f"«{recipe}» — рецепт, а не сочинение: сброс не имеет права его трогать")
+
+
+def test_the_reset_defaults_are_the_ones_the_page_actually_opens_with():
+    """Второй список значений всегда разъезжается с первым. Здесь первый — разметка, и сверяется
+    с ней каждое значение, у которого в разметке есть пара: иначе «Новая задача» однажды начнёт
+    ставить сид 0 там, где чистая страница открывается с 1, и никто этого не заметит.
+    """
+    page = _page_text("index.html")
+    reset = _node_eval("console.log(JSON.stringify(app.resetFormState()));")
+    for ident in ("tag", "seed", "duration", "width", "height"):
+        found = re.search(rf'id="{ident}"[^>]*\svalue="([^"]*)"', page) \
+            or re.search(rf'value="([^"]*)"[^>]*\sid="{ident}"', page)
+        assert found, f"в разметке у #{ident} нет value — сверять не с чем"
+        assert reset[ident] == found.group(1), (
+            f"#{ident}: сброс ставит {reset[ident]!r}, разметка открывается с {found.group(1)!r}")
+    for ident, value in (("mode", "t2va"), ("canvas-preset", "small")):
+        assert re.search(rf'<option value="{value}" selected>', page), (
+            f"в разметке #{ident} по умолчанию не {value}")
+
+
+def test_the_new_task_button_stands_in_the_composition_heading_and_is_wired():
+    """Кнопка живёт в заголовке зоны «Сочинение» — там же, где написано, правится задача или
+    ставится новая, — а не среди полей, которые она стирает.
+    """
+    page = _page_text("index.html")
+    start = page.index('<section class="panel" id="form">')
+    head = page[start:page.index('panel-body', start)]
+    assert 'id="form-reset"' in head, (
+        "кнопка «Новая задача» обязана стоять в шапке зоны «Сочинение»:\n" + head)
+
+    # Комментарии срезаны по той же причине, что и в `_modal_markup`: этот файл объясняет сам
+    # себя в них, и объяснение, называющее надпись, — не эта надпись.
+    visible = re.sub(r"<!--.*?-->", "", head, flags=re.S)
+    assert visible.count("Новая задача") == 1, (
+        "«Новая задача» в шапке ровно одна: кнопка. Когда её надпись дублировала соседнюю строку "
+        "состояния, шапка читалась как опечатка:\n" + visible)
+
+    script = _page_text("app.js")
+    assert '$("form-reset").addEventListener("click"' in script, "кнопка обязана быть подписана"
+    body = _js_function(script, "function applyFormReset()")
+    assert "resetFormState()" in body, (
+        "DOM-половина обязана брать значения из чистой функции, а не держать свой второй "
+        "список:\n" + body)
+    for touched in ("formNote", "setEditing(null)", "promptFromFile"):
+        assert touched in body, (
+            f"«{touched}» — состояние формы вне полей ввода, и сброс обязан его достать:\n" + body)
+    assert "location.reload" not in script, (
+        "сброс — не перезагрузка страницы: она унесла бы и рецепт, и открытый диалог")
 
 
 def test_the_form_defaults_to_the_project_s_working_recipe():
@@ -4629,13 +4913,16 @@ def test_opening_a_chat_reads_the_session_once_even_though_the_hash_fires_late()
 
     Проверяется чистая функция-сторож на том самом порядке событий: «уже открывается» обязано
     закрывать дверь так же, как «уже открыто».
+
+    Закрытия по адресу тут больше нет — его убрали вместе с Esc и подложкой (см.
+    `test_the_address_bar_no_longer_closes_the_window_behind_the_persons_back`), — поэтому шаг
+    «закрыли» ниже делает то же, что делает кнопка: обнуляет `chatWanted` сам, как `closeChat`.
     """
     got = _node_eval("""
       const calls = [];
       let wanted = null;                       // то, что страница хранит рядом с `chat`
       function sync(hash) {                    // ровно тело `syncChatFromHash`
         const action = app.chatHashAction(hash, wanted);
-        if (action.act === "close") { wanted = null; return; }
         if (action.act === "nothing") return;
         wanted = action.id;
         calls.push(action.id);                 // здесь страница уходит в `await enterChat`
@@ -4645,22 +4932,20 @@ def test_opening_a_chat_reads_the_session_once_even_though_the_hash_fires_late()
       const opened = calls.slice();
       sync("#chat/ab12");                      // ещё один hashchange (F5 по тому же адресу)
       const still = calls.slice();
-      sync("");                                // закрыли — и снова открыли ту же сессию
-      sync("#chat/ab12");
+      wanted = null;                           // кнопка «закрыть»: ровно то, что делает closeChat
+      sync("#chat/ab12");                      // и снова открыли ту же сессию
       const reopened = calls.slice();
       sync("#chat/cd34");                      // другой разговор всё так же открывается
       console.log(JSON.stringify([opened, still, reopened, calls,
                                   app.chatHashAction("#not-a-chat", null),
-                                  app.chatHashAction("#not-a-chat", "ab12"),
                                   app.chatHashAction("#chat/ZZZZ", null)]));
     """)
-    opened, still, reopened, all_calls, no_hash, leaving, bad_id = got
+    opened, still, reopened, all_calls, no_hash, bad_id = got
     assert opened == ["ab12"], "программная установка хеша и его событие — одно открытие"
     assert still == ["ab12"], "повторный hashchange на том же адресе ничего не читает"
     assert reopened == ["ab12", "ab12"], "закрытая сессия открывается заново, а не глохнет"
     assert all_calls == ["ab12", "ab12", "cd34"]
     assert no_hash == {"act": "nothing"}, "без открытой сессии нечего закрывать"
-    assert leaving == {"act": "close"}
     assert bad_id == {"act": "nothing"}, "id не из `secrets.token_hex` — не адрес сессии"
 
 
@@ -4674,7 +4959,11 @@ _LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
 #: the sentence worse -- there is nothing to type into a terminal called «сервер ламы». Stripped
 #: before the Russian check rather than weakening the pattern, so the list of exceptions is
 #: visible and short, and anything not on it is still caught.
-_TECHNICAL_NAMES = ("llama-server", "transformer/adaln_cache.safetensors", "AdaLN")
+_TECHNICAL_NAMES = ("llama-server", "transformer/adaln_cache.safetensors", "AdaLN",
+                    # Названия форматов. «Кадром может быть png, jpg или webp» — это и есть
+                    # условие, которое человек проверяет глазами по расширению своего файла;
+                    # «переносимая сетевая графика» ему для этого не поможет.
+                    "png", "jpg", "webp")
 _PROVIDER_SOURCE = (PROJECT_ROOT / "h3_48gb" / "provider.py").read_text(encoding="utf-8")
 
 #: Codes the chat modal can put in front of a person, and where each is raised. A literal list
@@ -4745,27 +5034,24 @@ def test_every_provider_failure_reaches_the_page_with_a_sentence_of_its_own():
 
 
 @_needs_node
-def test_a_finished_job_whose_timestamp_cannot_be_read_still_leaves_the_window():
-    """«Закончилось за сутки» that never forgets grows without bound and buries today.
+def test_a_finished_job_whose_timestamp_cannot_be_read_is_still_placed_by_date():
+    """Выбрасывать за нечитаемую дату теперь нечего — окна нет, — но место в списке ей всё ещё
+    нужно, и «в конец» это не место: задача, у которой не записан `finished_at`, закончилась
+    тогда же, когда всё остальное, и уехать за прошлый год не должна.
 
-    A job whose `finished_at` will not parse is not thrown away -- it did finish, the moment is
-    just not written down -- but it is dated by the next stamp that does parse. Only a job with
-    no readable date at all stays, and the queue does not make those: `created_at` is written at
-    submission.
+    Поэтому сортировка берёт первую разобравшуюся дату из трёх, а не один `finished_at`. Задача,
+    у которой не читается ни одна, уходит вниз — такой в очереди не бывает (`created_at` пишется
+    при постановке), и место в самом низу для несуществующего случая честнее выдумки.
     """
-    kept = _node_eval("""
-      const at = new Date("2026-08-12T22:00:00");
-      console.log(JSON.stringify(app.finishedWithin([
-        {id: "fresh", finished_at: "2026-08-12T20:00:00"},
-        {id: "unreadable-but-recent", finished_at: "не время", created_at: "2026-08-12T19:00:00"},
-        {id: "unreadable-and-old", finished_at: "", started_at: "2026-08-01T10:00:00"},
+    order = _node_eval("""
+      console.log(JSON.stringify(app.finishedSorted([
         {id: "no-date-at-all", finished_at: null},
-      ], at).map((row) => row.id)));
+        {id: "old", finished_at: "2026-08-01T10:00:00"},
+        {id: "unreadable-but-recent", finished_at: "не время", created_at: "2026-08-12T19:00:00"},
+        {id: "fresh", finished_at: "2026-08-12T20:00:00"},
+      ]).map((row) => row.id)));
     """)
-    assert "fresh" in kept and "unreadable-but-recent" in kept, kept
-    assert "unreadable-and-old" not in kept, (
-        "a job that started eleven days ago did not finish in the last twenty-four hours")
-    assert "no-date-at-all" in kept, "nothing to date it by is not a reason to hide it"
+    assert order == ["fresh", "unreadable-but-recent", "old", "no-date-at-all"], order
 
 
 # -- Task 8: the chat modal -----------------------------------------------------------------------
@@ -5565,10 +5851,78 @@ def test_the_chat_modal_is_the_two_column_window_of_the_second_screen():
         assert f'id="{ident}"' in right, f"{ident} принадлежит ленте, а не окну промпта"
 
 
+def test_the_modal_closes_by_its_button_and_by_nothing_else():
+    """Окно диалога слетало от любого случайного жеста: Esc, промах мимо окна по подложке, шаг
+    «назад» в браузере. Разговор при этом переживал закрытие (сессия на диске), а правка промпта
+    руками — нет: она живёт только в `chat.promptText`, и её уносило вместе с окном.
+
+    Отсюда правило: закрывает — только кнопка «закрыть» (через `requestCloseChat`, то есть со
+    спросом о несохранённой правке) и «в Редактор»/сохранение (`finishChat`, который сам её
+    сохраняет). Проверяется структурно, по исходнику: обработчика, которого нет, не видно ни в
+    одном тесте на поведение — только в тексте страницы.
+    """
+    script = _page_text("app.js")
+    assert '"Escape"' not in script, (
+        "Esc обязан перестать закрывать модалку: обработчика на Escape не должно быть вовсе")
+    assert 'event.target === $("chat-modal")' not in script, (
+        "клик по подложке обязан перестать закрывать модалку")
+
+    # Кнопка на месте — правило «только кнопкой» бессмысленно, если кнопка отвалилась вместе с
+    # двумя жестами, а `requestCloseChat` — единственный путь, где спрашивают о правке.
+    assert '$("chat-close").addEventListener("click", requestCloseChat)' in script, (
+        "«закрыть» обязана остаться единственным жестом, закрывающим окно")
+    close_body = _js_function(script, "function requestCloseChat()")
+    assert "hasUnsavedEdits" in close_body and "confirm" in close_body, (
+        "спрос о несохранённой правке обязан пережить эту правку:\n" + close_body)
+
+
+def test_the_address_bar_no_longer_closes_the_window_behind_the_persons_back():
+    """Та же болезнь с другой стороны: `hashchange` закрывал окно, когда адрес переставал быть
+    `#chat/<id>` — то есть шаг «назад» в браузере уносил правку так же тихо, как Esc.
+
+    Закрытие кнопкой при этом не сломано: `closeChat` сам обнуляет `chatWanted`, не дожидаясь
+    события об адресе, — поэтому та же сессия открывается заново сразу после закрытия.
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify([app.chatHashAction("", "ab12"),
+                                  app.chatHashAction("#not-a-chat", "ab12"),
+                                  app.chatHashAction("#chat/ZZZZ", "ab12"),
+                                  app.chatHashAction("#chat/ab12", "ab12"),
+                                  app.chatHashAction("#chat/cd34", "ab12"),
+                                  app.chatHashAction("#chat/ab12", null)]));
+    """)
+    emptied, foreign, bad_id, same, other, fresh = got
+    assert emptied == {"act": "nothing"}, "пустой адрес больше не закрывает открытое окно"
+    assert foreign == {"act": "nothing"}, "чужой якорь больше не закрывает открытое окно"
+    assert bad_id == {"act": "nothing"}, "id не из `secrets.token_hex` — не адрес сессии"
+    assert same == {"act": "nothing"}, "повторный hashchange на том же адресе ничего не читает"
+    assert other == {"act": "enter", "id": "cd34"}, "другой разговор всё так же открывается"
+    assert fresh == {"act": "enter", "id": "ab12"}, "с пустого места сессия открывается"
+
+    script = _page_text("app.js")
+    body = _js_function(script, "function closeChat()")
+    assert "chatWanted = null" in body, (
+        "закрытие кнопкой обязано само забыть сессию: `hashchange` этого больше не сделает, и "
+        "без этой строки та же сессия не откроется второй раз:\n" + body)
+
+
+def test_enter_in_the_chat_field_sends_the_turn_instead_of_anything_else():
+    """Поле реплики — две строки, а не редактор: Enter отправляет, Shift+Enter переносит. Обе
+    ветки гасят событие, иначе Enter в поле внутри `<form>` уходит в submit и перезагружает
+    страницу — то есть выглядит как «окно слетело» ровно так же, как Esc.
+    """
+    script = _page_text("app.js")
+    assert 'event.key === "Enter" && !event.shiftKey' in script, (
+        "Enter без Shift обязан отправлять реплику")
+    submit = script[script.index('$("chat-form").addEventListener("submit"'):]
+    assert "event.preventDefault()" in submit[:200], (
+        "submit формы обязан быть погашен, иначе Enter перезагружает страницу")
+
+
 def test_the_modal_head_carries_everything_the_conversation_is_steered_by():
     """C3: «шапка: источник, провайдер, длительность, статус модели, кнопки». Все пять — в одной
-    полосе и в ней одной. Разговор длинный, окно закрывается по Esc, и вопрос «а с кем я сейчас
-    говорю и что будет, когда закончу» не должен требовать прокрутки.
+    полосе и в ней одной. Разговор длинный, а вопрос «а с кем я сейчас говорю и что будет, когда
+    закончу» не должен требовать прокрутки.
     """
     modal = _modal_markup()
     head = modal[modal.index('class="mhead"'):modal.index('class="mgrid"')]

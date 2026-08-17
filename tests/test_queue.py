@@ -1665,6 +1665,42 @@ def test_layout_does_not_repause_an_existing_queue(tmp_path):
         "it -- recreating it would pause the queue on every worker restart")
 
 
+def test_pause_if_drained_pauses_only_when_nothing_is_left_to_claim(tmp_path):
+    """«Опустела» здесь значит ровно то же, что значит `claim`, вернувший `None`, — и проверять это
+    надо тем же взглядом на каталог, а не отдельной прикидкой рядом.
+
+    Отсюда и сломанный файл в третьей части: `claim` его пропускает и отдаёт `None`, значит и
+    «опустела» обязана считать очередь пустой. Иначе нечитаемый огрызок в `pending/` навсегда
+    отменяет автопаузу — молча, и ровно в той очереди, где что-то уже пошло не так.
+    """
+    root = tmp_path / "queue"
+    q.submit(root, ["generate", "--tag", "a"], "", _stem(_DRY, str(tmp_path / "h3-a-1x1")), {})
+    q.set_paused(root, False)
+
+    assert q.pause_if_drained(root) is False, "с ждущей задачей пауза не ставится"
+    assert q.is_paused(root) is False
+
+    job = q.claim(root)
+    q.finish(root, job.id, 0, "")
+    assert q.pause_if_drained(root) is True, "без ждущих задач маркер обязан встать"
+    assert q.is_paused(root) is True
+
+    # Сломанный файл — не задача: `claim` его пропускает, значит очередь всё ещё пуста.
+    q.set_paused(root, False)
+    (root / "pending" / "broken.json").write_text("{не json", encoding="utf-8")
+    assert q.pause_if_drained(root) is True, (
+        "нечитаемый огрызок в pending/ не должен отменять автопаузу — `claim` его не возьмёт")
+
+
+def test_pause_if_drained_does_not_deadlock_against_the_queue_lock(tmp_path):
+    """`queue_lock` не реентрантный: два захвата в одном процессе — это висящий насмерть работник,
+    а не упавший тест. Проверяется тем, что вызов вообще возвращается в отведённое время.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    assert _answer_within(5, lambda: q.pause_if_drained(root)) is True
+
+
 # -- Global constraint: queue.py must stay importable without MLX -------------------------------
 
 

@@ -179,19 +179,51 @@ class _StubResult:
     seconds_per_step = 1.5
 
 
-def test_raw_arrays_are_written_before_encoding(tmp_path):
-    """A failure in mp4 encoding must not destroy hours of compute."""
+def test_raw_arrays_are_written_before_encoding_when_they_are_asked_for(tmp_path):
+    """`--keep-raw` writes the latents *before* the encoders run, not after: that ordering is the
+    whole point of the flag for a long run -- an ffmpeg failure then costs seconds instead of the
+    fifteen hours that produced the arrays.
+    """
     def exploding_save_mp4(*args, **kwargs):
         raise RuntimeError("ffmpeg unavailable")
 
     spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
-                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
+                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t",
+                   keep_raw=True)
     try:
         run_generate(spec, pipeline_factory=lambda _: (lambda **kw: _StubResult()),
                      save_mp4_fn=exploding_save_mp4)
     except RuntimeError:
         pass
     assert (tmp_path / "h3-t-64x64-raw.npz").exists(), "raw arrays must survive an encoder failure"
+
+
+def test_no_raw_file_is_written_without_the_flag(tmp_path):
+    """Умолчание перевернулось, и это главный тест пункта.
+
+    `<stem>-raw.npz` — сырые латенты рядом с готовым mp4: у 15-секундного нативного это 807 МБ
+    против 16 МБ самого ролика. За выходные их набирается на гигабайты, и почти всегда впустую —
+    читают их только при отладочных сверках, ради которых и оставлен флаг.
+    """
+    spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
+                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
+    assert spec.keep_raw is False, "по умолчанию сырые латенты не пишутся"
+
+    report = run_generate(spec, pipeline_factory=lambda _: (lambda **kw: _StubResult()))
+
+    assert not (tmp_path / "h3-t-64x64-raw.npz").exists(), (
+        "без --keep-raw файла сырых латентов быть не должно")
+    assert (tmp_path / "h3-t-64x64.mp4").exists(), "сам ролик при этом обязан быть на месте"
+    assert "raw" not in report, f"отчёт не должен обещать файл, которого нет: {report}"
+
+
+def test_the_keep_raw_flag_reaches_the_spec_from_the_command_line(tmp_path):
+    """Флаг и поле — одна вещь; разъехавшись, они дадут `--keep-raw`, который ничего не делает."""
+    ckpt = bake_adaln_table(tmp_path)
+    base = ["generate", "x", "--outdir", str(tmp_path), "--checkpoint", str(ckpt),
+            "--width", "64", "--height", "64", "--duration", "1.0", "--steps", "31"]
+    assert spec_from_args(build_parser().parse_args(base)).keep_raw is False
+    assert spec_from_args(build_parser().parse_args([*base, "--keep-raw"])).keep_raw is True
 
 
 def test_run_generate_creates_a_nonexistent_outdir(tmp_path):
@@ -219,12 +251,16 @@ def test_truncated_raw_file_is_not_left_at_destination(tmp_path):
     Exercises the atomic write pattern's critical window: after savez_compressed
     writes the temp file but before os.replace commits it. Verifies that temp
     file is cleaned up and destination remains absent.
+
+    `keep_raw=True` is what makes this test test anything: without the flag no raw file is written
+    at all, and every assertion below would pass by describing a file the run never attempted.
     """
     import unittest.mock as mock
     import glob
 
     spec = RunSpec(prompt="x", width=64, height=64, duration=1.0, steps=31, seed=0,
-                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
+                   checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t",
+                   keep_raw=True)
 
     # Patch os.replace to fail *after* the real savez_compressed has written the temp file.
     # This exercises the window between "write temp" and "atomic rename".

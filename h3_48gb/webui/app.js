@@ -28,9 +28,6 @@ export const PHYSICAL_GB = 48;
 export const WARN_GB = 40;
 export const BLOCK_GB = 46;
 
-/* Сколько назад смотрит список «закончилось». */
-export const FINISHED_WINDOW_HOURS = 24;
-
 /* Кадр превью пишется раз в N проходов; N — значение `--preview-every`,
    у CLI по умолчанию 5. */
 export const DEFAULT_PREVIEW_EVERY = 5;
@@ -736,25 +733,27 @@ export function pendingSummary(jobs, { now, runningSeconds = 0, workerState = "a
   };
 }
 
-/** Завершённые за сутки, свежие сверху.
+/** Все завершённые, свежие сверху.
  *
- *  Задача без разбираемого `finished_at` не отбрасывается сразу: она закончилась,
- *  момент просто не записан. Но и держать её вечно нельзя — список «за сутки»,
- *  который никогда ничего не забывает, растёт без предела и хоронит сегодняшнее.
- *  Поэтому дата берётся по первой разобравшейся из трёх, и только задача, у которой
- *  не читается ни одна, остаётся в списке насовсем: такой в очереди не бывает —
- *  `created_at` пишется при постановке. */
-export function finishedWithin(jobs, now, hours = FINISHED_WINDOW_HOURS) {
-  const at = (now instanceof Date ? now : new Date(now || Date.now())).getTime();
-  const window = hours * 3600 * 1000;
-  return (Array.isArray(jobs) ? jobs : [])
-    .filter((job) => {
-      const stamps = [job.finished_at, job.started_at, job.created_at]
-        .map((value) => Date.parse(value || ""))
-        .filter((stamp) => !Number.isNaN(stamp));
-      return stamps.length === 0 ? true : at - Math.max(...stamps) <= window;
-    })
-    .sort((a, b) => String(b.finished_at || "").localeCompare(String(a.finished_at || "")));
+ *  Окна тут больше нет. Список смотрел на сутки назад из догадки, что список, который
+ *  ничего не забывает, «хоронит сегодняшнее»; догадка не подтвердилась, а цена
+ *  оказалась настоящей — из тринадцати роликов за выходные на странице оставалось два,
+ *  и это читается как «пропали», а не как «убраны с глаз». Сегодняшнее и так сверху,
+ *  потому что список отсортирован, а вчерашнее внизу никому не мешает: карточки
+ *  прокручиваются страницей.
+ *
+ *  Дата для сортировки — первая разобравшаяся из трёх, а не один `finished_at`:
+ *  задача, у которой момент не записан, закончилась тогда же, когда всё остальное, и
+ *  уезжать за прошлый год не должна. Та, у которой не читается ни одна, уходит вниз —
+ *  такой в очереди не бывает, `created_at` пишется при постановке. */
+export function finishedSorted(jobs) {
+  const at = (job) => {
+    const stamps = [job.finished_at, job.started_at, job.created_at]
+      .map((value) => Date.parse(value || ""))
+      .filter((stamp) => !Number.isNaN(stamp));
+    return stamps.length ? Math.max(...stamps) : -Infinity;
+  };
+  return (Array.isArray(jobs) ? jobs : []).slice().sort((a, b) => at(b) - at(a));
 }
 
 /** Деления по числу проходов: «три из семи» считывается быстрее, чем «43 %». */
@@ -1041,8 +1040,12 @@ export function errorText(payload) {
       return { title: "Файл сессии повреждён — почините его или начните новый чат",
                pre: detail.path || error.message };
     case "bad_image":
-      // Сообщение сервера перечисляет разрешённые типы и предел размера — точнее заголовка.
-      return { title: "Кадр не годится для разговора с моделью", pre: error.message };
+      // Условия — в заголовке, а не только в сообщении сервера под ним: заголовок читают первым,
+      // а иногда и единственным, и «кадр не годится» без единого условия оставляет человека
+      // гадать. Длину имени файла тут не поминаем — она больше не причина отказа, имя просто
+      // укорачивается (`sanitize_upload_name`).
+      return { title: "Кадром может быть png, jpg или webp до 16 МБ (разрешение любое)",
+               pre: error.message };
     case "gpu_busy":
       return { title: "Идёт прогон — локальная модель поднимется после него", pre: null };
     case "provider_unavailable":
@@ -1149,9 +1152,72 @@ export function nextBannerState(prev, state) {
    =========================================================================== */
 
 /**
+ * Значения, к которым «Новая задача» возвращает форму: поле — значение.
+ *
+ * Форма намеренно не очищается сама после постановки (см. `advanceAfterSubmit`): за вечер сюда
+ * кладут пять задач, меняя по одному полю. Ровно поэтому и нужен явный выход — накидав ночную
+ * пачку, следующую задачу человек начинает с чужого промпта, чужого кадра и чужого тега и
+ * вычищает их руками, по одному полю, ничего при этом не пропустив только по везению.
+ *
+ * **Здесь только сочинение, и это единственная граница, которую надо помнить.** Рецепт —
+ * чекпойнт, LoRA с её силой, таблица AdaLN, число шагов, папка вывода — не в этом списке и не
+ * должен в нём оказаться: он один и тот же месяцами, и его повторный набор был бы той самой
+ * работой, ради отмены которой форма не чистится сама. По той же причине сброс не делается
+ * перезагрузкой страницы: та унесла бы и рецепт, и открытый диалог.
+ *
+ * Чистая функция, а не запись прямо в поля: список значений, проверяемый только глазами, — это
+ * список, который разъедется с разметкой (`test_the_reset_defaults_are_the_ones_the_page_...`
+ * сверяет каждое значение с `value=` в `index.html`).
+ */
+export function resetFormState() {
+  return {
+    prompt: "",
+    "prompt-file": "",      // «— промпт набран здесь —», см. `loadPromptList`
+    image: "",
+    "end-image": "",
+    tag: "run",
+    seed: "0",
+    mode: "t2va",
+    duration: "10",
+    "canvas-preset": "small",
+    // Числа под пресетом ставятся вместе с ним: `applyCanvasChoice` их перепишет, но форма
+    // обязана быть согласованной и до того, как что-нибудь её пересчитает.
+    width: "896",
+    height: "576",
+  };
+}
+
+/** Можно ли выводить канвас из кадра: есть режим с кадром и есть сам кадр.
+ *
+ *  Пункт «из кадра» без кадра — обещание, которое некому выполнить: CLI не найдёт, из чего
+ *  выводить, подставит `DEFAULT_CANVAS` и посчитает молча не то. Отдельная чистая функция, потому
+ *  что ответ нужен в трёх местах (доступность пункта, `buildArgs`, автопереключение после
+ *  загрузки кадра), и разъехавшись они дадут ровно ту тихую ошибку, от которой пункт заведён. */
+export function autoCanvasAllowed(mode, image) {
+  return (mode === "i2v" || mode === "flf") && Boolean((image || "").trim());
+}
+
+/** Подпись оценки про выведенный канвас — пустая, если канвас выбран руками.
+ *
+ *  Пресет человек видит в выпадашке; выведенный из кадра он не выбирал и увидеть ему негде, а
+ *  разрешение будущего ролика — не та вещь, которую узнают по файлу на диске. */
+export function canvasNote(fromImage, estimate) {
+  if (!fromImage || !estimate) return "";
+  const { width, height } = estimate;
+  if (!width || !height) return "";
+  return `из кадра: ${width}×${height}`;
+}
+
+/**
  * Список аргументов для `POST /api/jobs` (или `/api/estimate`, если
  * `withPrompt` снят: оценке промпт не нужен, а слать килобайты текста на
  * каждое нажатие клавиши незачем).
+ *
+ * `--width`/`--height` уходят всегда, **кроме** «из кадра (авто)»: `resolve_canvas` в CLI
+ * выводит канвас из кадра (аспект цел, кратность 32, аспект 1:4..4:1) ровно тогда, когда не
+ * получил ни того, ни другого — с одним из двух он отказывается (`partial_canvas_with_image`),
+ * с обоими берёт их как есть. Форма слала оба всегда, поэтому автовывод из веба был недостижим:
+ * вертикальную картинку молча растягивало в горизонтальный канвас пресета.
  */
 export function buildArgs(form, { withPrompt = true } = {}) {
   const args = ["generate"];
@@ -1159,8 +1225,12 @@ export function buildArgs(form, { withPrompt = true } = {}) {
     if (form.promptFile) args.push("--prompt-file", form.promptFile);
     else if (form.prompt) args.push(form.prompt);
   }
-  args.push("--width", String(form.width), "--height", String(form.height),
-            "--duration", String(form.duration), "--steps", String(form.steps),
+  // Условие смотрит и на кадр, а не только на выбранный пункт: выпадашка могла остаться на
+  // «из кадра» после того, как кадр убрали, и молчаливый `DEFAULT_CANVAS` — худший исход из всех.
+  if (!(form.canvasFromImage && autoCanvasAllowed(form.mode, form.image))) {
+    args.push("--width", String(form.width), "--height", String(form.height));
+  }
+  args.push("--duration", String(form.duration), "--steps", String(form.steps),
             "--seed", String(form.seed), "--tag", form.tag,
             "--mode", form.mode,
             "--checkpoint", form.checkpoint, "--outdir", form.outdir);
@@ -1178,7 +1248,11 @@ export function buildArgs(form, { withPrompt = true } = {}) {
  *  ничего вообще. */
 export function uploadZoneLabel(state) {
   const name = (state && state.name) || "";
-  return name || "перетащи картинку или выбери файл";
+  // Пустое состояние называет условия целиком, а не приглашает молча. Отказ по этой зоне
+  // приходит одной строкой `bad_image`, и человек, у которого кадр не взяли, иначе гадает между
+  // форматом, размером и разрешением — при том, что разрешение тут не ограничено вовсе
+  // (канвас выводится из кадра, аспект сохраняется).
+  return name || "перетащи картинку или выбери файл — png, jpg, webp до 16 МБ, разрешение любое";
 }
 
 /** Тег с сидом в хвосте. Без него три сида одной сцены упрутся в
@@ -1401,7 +1475,12 @@ export function chatWarningText(warning) {
 export const CHAT_HASH = /^#chat\/([0-9a-f]+)$/;
 
 /**
- * Что делать с адресом: закрыть окно, открыть сессию — или ничего.
+ * Что делать с адресом: открыть сессию — или ничего.
+ *
+ * Закрывать — никогда. Раньше адрес, переставший быть `#chat/<id>`, закрывал окно, и шаг «назад»
+ * в браузере уносил несохранённую правку промпта так же тихо, как это делали Esc и подложка.
+ * Теперь окно закрывает только кнопка, а `closeChat` сам обнуляет `chatWanted`, не дожидаясь
+ * события об адресе, — иначе та же сессия после закрытия не открылась бы второй раз.
  *
  * `current` — сессия, которая уже открыта **или прямо сейчас открывается**, и второе слово тут
  * и есть весь смысл. Открытие модалки — это `location.hash = "#chat/<id>"`, а браузер ставит
@@ -1416,7 +1495,7 @@ export const CHAT_HASH = /^#chat\/([0-9a-f]+)$/;
  */
 export function chatHashAction(hash, current) {
   const match = CHAT_HASH.exec(hash || "");
-  if (!match) return current ? { act: "close" } : { act: "nothing" };
+  if (!match) return { act: "nothing" };
   if (match[1] === current) return { act: "nothing" };
   return { act: "enter", id: match[1] };
 }
@@ -1791,6 +1870,7 @@ function startPage() {
     image: $("image").value.trim(),
     endImage: $("end-image").value.trim(),
     promptFile: promptFileArg(),
+    canvasFromImage: autoCanvasChosen(),
   });
 
   /* Промпт уходит файлом, только если он в точности равен файлу: иначе на
@@ -1934,14 +2014,17 @@ function startPage() {
     $("pending-bad").hidden = broken === "";
     $("pending-bad").innerHTML = broken;
 
-    // -- закончилось за сутки
-    const finished = finishedWithin([...(queue.done || []), ...(queue.failed || [])], now);
+    // -- закончилось: всё, что есть, свежее сверху
+    const finished = finishedSorted([...(queue.done || []), ...(queue.failed || [])]);
     $("finished").innerHTML = finished
       .map((job) => finishedRowHtml(job, state.outdir, state.runs)).join("");
     $("finished-empty").hidden = finished.length > 0;
     const failed = finished.filter((job) => job.exit_code !== 0).length;
+    // Счётчик теперь общий, а не «за сутки», — и это единственное место, где видно, сколько
+    // всего насчитано: числу в заголовке верят больше, чем длине прокрученного списка.
     $("done-sum").textContent = finished.length
-      ? `${finished.length}, из них упало ${failed}`
+      ? `${finished.length} ${plural(finished.length, "ролик", "ролика", "роликов")}`
+        + (failed ? `, из них упало ${failed}` : "")
       : "";
   }
 
@@ -2117,10 +2200,14 @@ function startPage() {
     lastEstimate = estimate;
     const forwards = Number(estimate.forwards) || 0;
     $("est-time").textContent = "≈" + formatDuration(estimate.seconds);
+    // Выведенный канвас — единственное место, где человек его видит: пункт «из кадра» чисел не
+    // показывает, а в `#width`/`#height` под ним лежит не он.
+    const note = canvasNote(autoCanvasChosen(), estimate);
     $("est-sub").innerHTML = `${forwards} `
       + `${plural(forwards, "проход", "прохода", "проходов")} по `
       + `<span class="num">${formatFine(estimate.seconds_per_forward)}</span>, `
-      + `DiT ${escapeHtml(estimate.bits)} бит`;
+      + `DiT ${escapeHtml(estimate.bits)} бит`
+      + (note ? `, ${escapeHtml(note)}` : "");
     $("mem-num").textContent = "~" + formatGb(estimate.peak_gb);
 
     const verdict = memoryVerdict(estimate.peak_gb);
@@ -2460,8 +2547,8 @@ function startPage() {
     if (CHAT_HASH.test(window.location.hash || "")) window.location.hash = "";
   }
 
-  /* Закрытие по жесту человека — Esc, подложка, «закрыть». Правка руками нигде, кроме этого
-     окна, не живёт (сервер хранит ответы модели), поэтому одним нажатием она не выбрасывается.
+  /* Единственный жест, закрывающий окно, — кнопка «закрыть». Правка руками нигде, кроме этого
+     окна, не живёт (сервер хранит ответы модели), поэтому даже она спрашивает.
      `finishChat` спрашивать не должен: он этот текст как раз и сохраняет. */
   function requestCloseChat() {
     if (hasUnsavedEdits(chat)
@@ -2488,7 +2575,6 @@ function startPage() {
 
   async function syncChatFromHash() {
     const action = chatHashAction(window.location.hash, chatWanted);
-    if (action.act === "close") { closeChat(); return; }
     if (action.act === "nothing") return;
     // Помечаем намерение до `await`, а не после: `hashchange` от нашего же присваивания хеша
     // приходит именно в это окно, и сторож обязан застать его уже занятым.
@@ -2760,14 +2846,25 @@ function startPage() {
     // же строку, с которой пришла (см. `formNote`) — иначе «Править» тихо стирала бы чужой текст.
     formNote = job.note || "";
     syncModeRows();
-    syncCanvasPreset();
+    /* Задача, поставленная «из кадра», несёт канвас только в оценке — в её `args` нет ни
+       `--width`, ни `--height`, потому что выводил его CLI. Правка обязана вернуться на тот же
+       пункт, иначе «Править» молча превращает автовывод в пресет по числам из оценки: для
+       кадра 768×1344 это «большое верт.», для кадра 700×1000 — «своё…», и оба раза правка
+       меняет то, о чём её не просили. */
+    const hadCanvas = argValue(job.args, "--width") !== null;
+    $("canvas-preset").value = hadCanvas ? $("canvas-preset").value : "auto";
     updateUploadZone("image");
     updateUploadZone("end-image");
+    syncCanvasPreset();
+    syncAutoCanvasOption();
   }
 
   function setEditing(id) {
     editing = id;
-    $("form-mode-note").textContent = id ? `Правка ждущей задачи ${id}` : "Новая задача";
+    /* Пусто вне правки, а не «Новая задача»: рядом теперь стоит кнопка с ровно этой надписью, и
+       две «Новых задачи» в одной строке читаются как опечатка. Строка эта и нужна только чтобы
+       предупредить о правке чужой задачи — состояние «ничего не правится» видно по самой форме. */
+    $("form-mode-note").textContent = id ? `Правка ждущей задачи ${id}` : "";
     $("submit").textContent = id ? "Сохранить правку" : "Поставить в очередь";
     $("cancel-edit").hidden = !id;
     // Выход из правки — конец чужой заметки: следующая постановка своей не имеет (см. `formNote`).
@@ -2787,6 +2884,32 @@ function startPage() {
     renderQueue();
     renderPrompt();
     scheduleEstimate();
+  }
+
+  /** «Новая задача»: сочинение — начисто, рецепт — как был.
+   *
+   *  Значения берутся из `resetFormState`, а здесь остаётся то, чего в полях ввода нет: заметка
+   *  правящейся задачи, режим правки, память о загруженном файле промпта, след ручного выбора
+   *  канваса — и зоны кадров, которые «указать путь» когда-то спрятала (единственное место, где
+   *  это вообще отменяется: сама ссылка обратного хода не имеет). */
+  function applyFormReset() {
+    for (const [id, value] of Object.entries(resetFormState())) $(id).value = value;
+    promptFromFile = null;    // «промпт набран здесь» — значит ни к какому файлу он не привязан
+    formNote = "";
+    canvasTouchedByHand = false;
+    for (const id of ["image", "end-image"]) {
+      $(`${id}-zone`).hidden = false;
+      $(`${id}-manual`).hidden = false;
+      $(id).hidden = true;
+      updateUploadZone(id);
+    }
+    syncModeRows();
+    syncCanvasPreset();
+    syncAutoCanvasOption();
+    // Последним: `setEditing(null)` сам зовёт `renderQueue`/`renderPrompt`/`scheduleEstimate`,
+    // и звать их до него значило бы рисовать форму, которая ещё считается правящей чужую задачу.
+    setEditing(null);
+    $("prompt").focus();
   }
 
   async function withQueue(action) {
@@ -2849,15 +2972,50 @@ function startPage() {
      а числа (правка задачи, ручной ввод) выбирают пункт — иначе список показывал бы «малое» на
      канвасе 1024×576. */
 
-  /** Пункт списка — по тому, что сейчас в полях; поля ручного ввода видны только под «своё…». */
+  /* Трогал ли человек выпадашку разрешения сам. Нужно ровно одному месту — автопереключению на
+     «из кадра» после загрузки кадра: подставлять умолчание можно, перебивать явный выбор нельзя,
+     а отличить одно от другого по значению выпадашки невозможно (выбранное руками «малое»
+     выглядит ровно как «малое», стоявшее там с загрузки страницы). */
+  let canvasTouchedByHand = false;
+
+  /** Пункт списка — по тому, что сейчас в полях; поля ручного ввода видны только под «своё…».
+   *
+   *  «из кадра» этот путь не трогает: у него нет своих чисел в полях, по которым его можно было
+   *  бы узнать обратно (в `#width`/`#height` под ним лежит последний пресет — тот, на который
+   *  форма вернётся, если кадр уберут), так что вывести его из полей нельзя, и перезаписывать
+   *  выбор человека нечем. */
   function syncCanvasPreset() {
+    if ($("canvas-preset").value === "auto" && autoCanvasChosen()) {
+      $("row-canvas").hidden = true;
+      return;
+    }
     const key = canvasPresetKey($("width").value, $("height").value);
     $("canvas-preset").value = key;
     $("row-canvas").hidden = key !== "custom";
   }
 
+  /** Выбран ли «из кадра» — и вправе ли он быть выбран прямо сейчас.
+   *
+   *  Второе условие не формальность: режим и кадр меняются после выбора пункта, и «из кадра»,
+   *  переживший удаление кадра, — это молчаливый `DEFAULT_CANVAS` вместо ошибки. */
+  function autoCanvasChosen() {
+    return $("canvas-preset").value === "auto"
+      && autoCanvasAllowed($("mode").value, $("image").value);
+  }
+
+  /** Доступность пункта «из кадра»: только под i2v/flf с кадром. Если он был выбран и перестал
+   *  быть возможным — форма возвращается к пресету по числам, которые всё это время лежали в
+   *  полях, а не остаётся на пункте, который больше ничего не значит. */
+  function syncAutoCanvasOption() {
+    const allowed = autoCanvasAllowed($("mode").value, $("image").value);
+    const option = $("canvas-preset").querySelector('option[value="auto"]');
+    if (option) option.disabled = !allowed;
+    if (!allowed && $("canvas-preset").value === "auto") syncCanvasPreset();
+  }
+
   /** Выбор пункта — в поля. «своё…» ничего не пишет: оно открывает то, что уже стоит, и человек
-   *  правит от него, а не от обнулённого канваса. */
+   *  правит от него, а не от обнулённого канваса. «из кадра» тоже ничего не пишет — и по той же
+   *  причине: числа под ним остаются тем, к чему форма вернётся, если кадр уберут. */
   function applyCanvasChoice() {
     const key = $("canvas-preset").value;
     const preset = applyCanvasPreset(key);
@@ -2892,6 +3050,22 @@ function startPage() {
     $(`${id}-zone-label`).textContent = uploadZoneLabel({ name });
     $(`${id}-zone`).classList.toggle("loaded", Boolean(name));
     $(`${id}-zone`).classList.remove("error");
+    // Кадр появился или пропал — от этого зависит, возможен ли вообще пункт «из кадра».
+    syncAutoCanvasOption();
+  }
+
+  /** После загрузки кадра форма сама встаёт на «из кадра». Это верный ответ по умолчанию: кадр
+   *  уронили ради него самого, и растянуть его в чужой аспект — не то, чего хотели. Выбор
+   *  человека при этом не перебивается: если он уже поставил пресет руками, здесь ничего не
+   *  происходит — переключается только пункт, оставшийся с прошлого раза «по умолчанию». */
+  function preferAutoCanvasAfterUpload(id) {
+    if (id !== "image") return;                       // канвас выводится из первого кадра
+    if (!autoCanvasAllowed($("mode").value, $("image").value)) return;
+    if (canvasTouchedByHand) return;
+    $("canvas-preset").value = "auto";
+    $("row-canvas").hidden = true;
+    scheduleEstimate();
+    renderPrompt();
   }
 
   /** Один POST, сырыми байтами: `Content-Type: application/octet-stream` и имя файла в
@@ -2918,12 +3092,16 @@ function startPage() {
       }
       $(id).value = payload.path;
       updateUploadZone(id);
+      preferAutoCanvasAfterUpload(id);
       scheduleEstimate();
       renderPrompt();
     } catch (error) {
       zone.classList.add("error");
       $(`${id}-zone-label`).textContent = error.payload
-        ? errorText(error.payload).title : "Файл не загрузился";
+        // `pre`, а не `title`: в подписи шириной в одну строку настоящая причина от сервера
+        // («кадром может быть только […], а 'x.txt' — нет») полезнее общего заголовка.
+        ? errorText(error.payload).pre || errorText(error.payload).title
+        : "Файл не загрузился";
     } finally {
       zone.classList.remove("busy");
     }
@@ -3033,7 +3211,8 @@ function startPage() {
       badge.classList.remove("busy");
       badge.classList.add("error");
       $("chat-attachment-label").textContent = error.payload
-        ? errorText(error.payload).title : "Кадр не загрузился";
+        ? errorText(error.payload).pre || errorText(error.payload).title
+        : "Кадр не загрузился";
       return;
     }
     badge.classList.remove("busy");
@@ -3179,6 +3358,7 @@ function startPage() {
   $("unload-banner-wait").addEventListener("click", dismissUnloadBanner);
   $("queue-pause-toggle").addEventListener("click", toggleQueuePause);
   $("cancel-edit").addEventListener("click", () => setEditing(null));
+  $("form-reset").addEventListener("click", applyFormReset);
   $("force").addEventListener("change", refreshSubmitState);
   $("save-prompt").addEventListener("click", savePrompt);
   $("prompt-file").addEventListener("change", (event) => {
@@ -3191,7 +3371,10 @@ function startPage() {
     $("hl").scrollTop = $("prompt").scrollTop;
     $("hl").scrollLeft = $("prompt").scrollLeft;
   });
-  $("canvas-preset").addEventListener("change", applyCanvasChoice);
+  $("canvas-preset").addEventListener("change", () => {
+    canvasTouchedByHand = true;   // с этого момента загрузка кадра пункт уже не перебивает
+    applyCanvasChoice();
+  });
   for (const id of FIELDS) {
     $(id).addEventListener("input", () => {
       scheduleEstimate();
@@ -3211,6 +3394,7 @@ function startPage() {
   wireChatAttach();
   $("mode").addEventListener("change", () => {
     syncModeRows();
+    syncAutoCanvasOption();   // t2v кадра не несёт — «из кадра» под ним невозможно
     renderPrompt();     // t2va без звуковых секций — отказ, t2v без них — нет
     scheduleEstimate();
   });
@@ -3291,21 +3475,19 @@ function startPage() {
     $("chat-hl").scrollTop = $("chat-prompt-text").scrollTop;
     $("chat-hl").scrollLeft = $("chat-prompt-text").scrollLeft;
   });
-  /* Клик по подложке и Esc закрывают модалку — привычные два жеста. Ход и лента при этом не
-     теряются (сессия на диске, `#chat/<id>` открывает её обратно), а вот правка руками живёт
-     только здесь — о ней `requestCloseChat` спрашивает. */
-  $("chat-modal").addEventListener("click", (event) => {
-    if (event.target === $("chat-modal")) requestCloseChat();
-  });
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && chat) requestCloseChat();
-  });
+  /* Окно закрывается ровно одним жестом — кнопкой «закрыть» (и ещё «в Редактор», который сам
+     сохраняет то, о чём иначе пришлось бы спрашивать). Esc и клик по подложке отсюда убраны, а
+     не оставлены «на всякий случай»: ход и лента закрытие переживают (сессия на диске), но
+     правка промпта руками живёт только в `chat.promptText`, и случайный промах мимо окна уносил
+     её молча. Привычность жеста не стоит потерянной работы — а спрос через `confirm` на каждый
+     промах превращается в диалог, который жмут не глядя. */
   window.addEventListener("hashchange", syncChatFromHash);
 
   // -- запуск -----------------------------------------------------------------------------
 
   syncModeRows();
   syncCanvasPreset();
+  syncAutoCanvasOption();  // на чистой форме кадра нет — пункт «из кадра» гаснет сразу
   refreshSubmitState();   // сводка «Настроек модели» видна до первой оценки, а не после неё
   // Адрес в чроме: у этой страницы бывает вторая копия себя на другом порту (свой сервер для
   // проверок), и перепутать их — потерять вечер. Читается из адресной строки, а не из ответа

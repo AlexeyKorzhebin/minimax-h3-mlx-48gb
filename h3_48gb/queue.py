@@ -356,6 +356,40 @@ def set_paused(root, value: bool) -> None:
         path.unlink(missing_ok=True)
 
 
+def pause_if_drained(root) -> bool:
+    """Pause the queue if `pending/` holds nothing `claim` would take. Returns whether it paused.
+
+    The worker calls this after every finished job, so that a queue which empties itself stops
+    instead of standing ready to grab whatever lands in it next. The reason is the morning after a
+    night's batch: the run finished hours ago, the worker is still looping, and the two jobs a
+    human drops into the form to *look at* before starting would begin computing on their own.
+
+    **The emptiness check and the marker go under one exclusive `queue_lock` acquisition**, which is
+    what makes this a function here rather than two lines in `main_loop`. Unlocked, a `submit`
+    landing between the look and the touch is seen by neither: the walk misses the file that is
+    still being written, and the job that does land is then held by a marker placed after it. Under
+    the lock the two orderings are the only two possible ones, and both are correct -- a submit that
+    wins the lock first is seen (no pause), and one that loses it lands on a paused queue and waits
+    for a human, which is exactly what the marker is for.
+
+    "Nothing to take" is deliberately `claim`'s notion of it and not `any(glob("*.json"))`: `claim`
+    skips a file that does not parse, so a corrupt leftover in `pending/` would otherwise cancel the
+    auto-pause for ever -- silently, and precisely in a queue where something has already gone wrong.
+    """
+    root = Path(root)
+    with queue_lock(root, exclusive=True):
+        directory = root / "pending"
+        if directory.is_dir():
+            for file in directory.glob("*.json"):
+                try:
+                    _build_job(json.loads(file.read_text(encoding="utf-8")), "pending")
+                except (OSError, ValueError, QueueError):
+                    continue
+                return False
+        set_paused(root, True)
+        return True
+
+
 def write_text_durably(path, text: str) -> None:
     """Write `text` to `path` so that a crash leaves either the old content or the new content,
     never a mixture, and never loses a rename to a power cut.

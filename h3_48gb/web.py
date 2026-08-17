@@ -30,6 +30,7 @@ import base64
 import contextlib
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import math
@@ -312,6 +313,13 @@ CHAT_IMAGE_MAX_BYTES = 16 * 1024 * 1024
 #: inside the same 255-byte filename the kernel enforces.
 UPLOAD_NAME_MAX_BYTES = 100
 
+#: How much of an over-long name's readable head survives `sanitize_upload_name`'s cut, in bytes.
+#: Bounded separately from `UPLOAD_NAME_MAX_BYTES` rather than being "whatever the suffix leaves
+#: over": sixty bytes is already more than anyone reads off a file listing, and spending the rest
+#: of the allowance on staying clear of the filesystem's 255-byte limit (which the name shares with
+#: `_upload_stamp`'s prefix) is worth more than forty more characters nobody reads.
+UPLOAD_NAME_STEM_MAX_BYTES = 60
+
 #: Cyrillic letters as their closest Latin spelling. A courtesy for the common case on this
 #: Russian-speaking machine, not a security boundary -- `_UPLOAD_NAME_UNSAFE` runs after this and
 #: would turn an untranslated «кадр.png» into the equally-safe but unreadable «----.png» on its
@@ -367,9 +375,29 @@ def sanitize_upload_name(raw: str) -> str:
        `resolve_prompt_name`'s docstring explains for `PROMPT_NAME` -- a whitelist here is not a
        reason to skip the path check there, or the other way around.
 
-    Bounded at `UPLOAD_NAME_MAX_BYTES`. An empty result (a name that was nothing but separators
-    and unsafe characters) becomes `"upload"` rather than an empty string, so `_upload_target`
-    never has to reason about a sanitized name with nothing in it.
+    **A name too long is shortened, never refused.** Length is a property of the name, not of the
+    picture, so there is nothing here for a person to fix and nothing to tell them. Image
+    generators name the file after the prompt -- two hundred characters is ordinary -- and the old
+    cut took the first `UPLOAD_NAME_MAX_BYTES` bytes from the left, which ate `.png`; since
+    `_upload_frame` decides "is this an image" from the suffix alone, a valid frame came back as
+    `bad_image`, i.e. "кадр не годится для разговора с моделью", for having a long name.
+
+    The cut therefore keeps two things and drops only the middle:
+
+    * **the suffix**, because that is what makes the file an image to every later reader; and
+    * **a short digest of the whole sanitized name**, because the part being dropped is exactly the
+      part where prompt-named files differ. An evening's frames all begin
+      `ultra_realistic_cinematic_...` and diverge at the end, so a stem-only cut collapses them
+      into one name. `_upload_target`'s timestamp stamp already keeps the *path* unique, so this is
+      about a human reading `uploads/` and telling two frames apart, not about collisions.
+
+    The readable head is bounded by `UPLOAD_NAME_STEM_MAX_BYTES` rather than by whatever the suffix
+    leaves over: sixty bytes is already more than anyone reads off a file listing, and the rest of
+    the allowance is better spent staying well clear of the 255-byte limit the stamp shares.
+
+    An empty result (a name that was nothing but separators and unsafe characters) becomes
+    `"upload"` rather than an empty string, so `_upload_target` never has to reason about a
+    sanitized name with nothing in it.
     """
     name = (raw or "").replace("\\", "/")
     name = name.rsplit("/", 1)[-1].strip()
@@ -378,12 +406,27 @@ def sanitize_upload_name(raw: str) -> str:
     if not name:
         name = "upload"
     encoded = name.encode("utf-8", "ignore")
-    if len(encoded) > UPLOAD_NAME_MAX_BYTES:
-        # `errors="ignore"` on the way back: a hard byte cut can land mid-character if a future
-        # widening of `_UPLOAD_NAME_UNSAFE` ever admits a multi-byte one, and dropping the partial
-        # tail is preferable to `UnicodeDecodeError` turning a 400 into a 500.
-        name = encoded[:UPLOAD_NAME_MAX_BYTES].decode("utf-8", "ignore").strip("-") or "upload"
-    return name
+    if len(encoded) <= UPLOAD_NAME_MAX_BYTES:
+        return name
+
+    # Not a security digest: it exists so two prompt-named frames stay distinguishable in a
+    # listing. `blake2b` with a four-byte digest is eight hex characters, short enough to read.
+    digest = hashlib.blake2b(encoded, digest_size=4).hexdigest()
+    suffix = Path(name).suffix
+    tail = f"-{digest}{suffix}"
+    budget = min(UPLOAD_NAME_STEM_MAX_BYTES,
+                 UPLOAD_NAME_MAX_BYTES - len(tail.encode("utf-8")))
+    # `errors="ignore"` on the way back: a hard byte cut can land mid-character if a future
+    # widening of `_UPLOAD_NAME_UNSAFE` ever admits a multi-byte one, and dropping the partial
+    # tail is preferable to `UnicodeDecodeError` turning a 400 into a 500.
+    if budget < 1:
+        # The "suffix" alone eats the whole allowance, which means it is not really a suffix --
+        # a name like `x.` followed by two hundred characters. Nothing here is worth preserving
+        # selectively, so fall back to the plain bounded cut.
+        return encoded[:UPLOAD_NAME_MAX_BYTES].decode("utf-8", "ignore").strip("-") or "upload"
+    stem = Path(name).stem.encode("utf-8", "ignore")
+    stem = stem[:budget].decode("utf-8", "ignore").rstrip("-.") or "upload"
+    return stem + tail
 
 
 def _upload_stamp() -> str:
@@ -776,6 +819,53 @@ def quant_bits(checkpoint) -> int:
         if bits in WEIGHTS_GB:
             return int(bits)
     return 4
+
+
+def canvas_comes_from_the_image(parsed) -> bool:
+    """Whether this request leaves the canvas for the CLI to derive from the keyframe.
+
+    True for exactly the shape the form's «из кадра (авто)» sends: a keyframe and neither
+    `--width` nor `--height`. `resolve_canvas` treats that as "derive from the image, aspect
+    intact"; with only one of the two it refuses (`partial_canvas_with_image`), and with both it
+    uses them as given.
+
+    A predicate rather than an inline condition because two callers need the same answer and must
+    not drift: `_estimate_only` uses it to decide whether the formula needs a dry run first, and
+    the docstring of `estimate` explains what happens when nobody asks. `parsed` is an
+    `argparse.Namespace` from `_parse_args`, not an argv list -- the question is about resolved
+    flags, and scanning strings for `"--width"` would miss `--width=896`.
+    """
+    return (getattr(parsed, "image", None) is not None
+            and getattr(parsed, "width", None) is None
+            and getattr(parsed, "height", None) is None)
+
+
+#: Stand-in prompt for the canvas-only dry run in `_estimate_only`. Never reaches a queue, a file
+#: or a model: `validate_args` builds a `RunSpec` and returns, and the only three fields read back
+#: out of its report are the canvas, the duration and the step count.
+_CANVAS_DRY_RUN_PROMPT = "оценка канваса"
+
+
+def _argv_for_canvas_dry_run(argv: list[str], parsed) -> list[str]:
+    """`argv` with a placeholder prompt added if it has none, for the canvas dry run.
+
+    An estimate deliberately carries no prompt -- `requestEstimate` builds its arguments with
+    `withPrompt: false` so that typing does not send kilobytes of text per keystroke -- while
+    `generate --dry-run` refuses a request without one (`prompt_missing`), because it assembles a
+    whole `RunSpec`. Left alone, those two facts cancel the feature outright: «из кадра» would
+    show no estimate at all, for *any* prompt, since the prompt never reaches this route to begin
+    with.
+
+    Substituting one is honest here in a way it would not be at submission: the canvas comes from
+    the keyframe's pixels, and the duration and step count from flags -- the three values
+    `_estimate_only` reads back are the three a prompt cannot influence. The real prompt is still
+    required by `prepare_submission`, which is where a missing one is a genuine refusal.
+    """
+    if parsed.prompt is not None or parsed.prompt_file is not None:
+        return argv
+    # After the subcommand, where `spec_from_args` expects the positional -- appending would put
+    # it after a flag that takes a value and make it that flag's argument instead.
+    return [argv[0], _CANVAS_DRY_RUN_PROMPT, *argv[1:]]
 
 
 def estimate(args, checkpoint, *, report=None) -> dict:
@@ -1245,9 +1335,11 @@ def _delete_flat_artifacts(stem: Path, job) -> None:
 
     `<stem>.mp4`, `.wav` and `.json` (the run's own report, `cli.py`'s `run_generate`) are every
     suffix a completed or half-finished run writes *directly* named after its stem, plus
-    `-raw.npz` (the uncompressed video+audio `run_generate` saves just before the two encoders
-    run) and the whole `-preview-stepNN.jpg` family (`preview.py`'s `preview_path`), globbed
-    because there is one per interval rather than one fixed name.
+    `-raw.npz` (the video+audio arrays `run_generate` saves just before the two encoders run, and
+    only under `--keep-raw` -- the page never passes it, so this one is usually already absent;
+    `missing_ok` covers both the old runs that have it and the new ones that do not) and the whole
+    `-preview-stepNN.jpg` family (`preview.py`'s `preview_path`), globbed because there is one per
+    interval rather than one fixed name.
 
     **The checkpoint is the one artifact `output_stem` does not name at all.** `checkpoint.py`
     names a resume file after the *request's identity digest*, not the output stem, precisely so
@@ -1962,9 +2054,12 @@ class _Handler(BaseHTTPRequestHandler):
             raise CliError("bad_request", "the upload body is empty",
                            {"content_length": length})
         if length > CHAT_IMAGE_MAX_BYTES:
+            # Мегабайты, а не байты: «кадр больше 16777216 байт (18446744)» человек читает как
+            # два незнакомых числа, а условие тут одно и простое.
             raise CliError(
                 "bad_image",
-                f"кадр больше {CHAT_IMAGE_MAX_BYTES} байт ({length})",
+                f"кадр больше {CHAT_IMAGE_MAX_BYTES // (1024 * 1024)} МБ "
+                f"({length / (1024 * 1024):.1f} МБ)",
                 {"content_length": length, "limit": CHAT_IMAGE_MAX_BYTES})
         return self.rfile.read(length)
 
@@ -2000,7 +2095,8 @@ class _Handler(BaseHTTPRequestHandler):
         if suffix not in CHAT_IMAGE_SUFFIXES:
             raise CliError(
                 "bad_image",
-                f"кадром может быть только {sorted(CHAT_IMAGE_SUFFIXES)}, а {sanitized!r} — нет",
+                f"кадром может быть png, jpg или webp, а {sanitized!r} — нет "
+                f"(разрешение любое, размер до {CHAT_IMAGE_MAX_BYTES // (1024 * 1024)} МБ)",
                 {"name": sanitized, "suffix": suffix, "allowed": sorted(CHAT_IMAGE_SUFFIXES)},
             )
         data = self._upload_body()
@@ -2257,10 +2353,25 @@ class _Handler(BaseHTTPRequestHandler):
     def _estimate_only(self) -> tuple[int, str, bytes]:
         """`POST /api/estimate`: the cost of an argument list, without queueing anything.
 
-        No subprocess here: the estimate is a formula, and the form recomputes it on every
+        Normally no subprocess: the estimate is a formula, and the form recomputes it on every
         keystroke. The command allowlist and the path check still run -- without the path check
         this route would read `quant_config.json` from any directory a caller named, which turns
         an estimate into an existence oracle for the whole filesystem.
+
+        **The one exception is a keyframe run with no canvas** (`canvas_comes_from_the_image`),
+        which the form now sends deliberately: «из кадра (авто)» omits `--width`/`--height` so the
+        CLI derives the canvas from the frame, aspect intact. The formula cannot follow it there --
+        the derivation lives in `minimax_h3_mlx.packing`, which this process may never import (see
+        the module docstring and `test_web_module_does_not_import_mlx`) -- so without the dry run
+        `estimate` would silently fall back to `DEFAULT_CANVAS`, i.e. price a vertical frame as a
+        landscape video. Duplicating the arithmetic here instead would be the worse answer: two
+        implementations of the same rule drift, and this one would drift towards *quietly wrong
+        numbers* rather than an error.
+
+        The subprocess is affordable exactly because it is bounded to this case: a dry run with a
+        keyframe measures ~0.12 s (it opens the image and builds a `RunSpec`, no weights), the form
+        debounces estimates by 250 ms, and every other keystroke -- a preset, a duration, a step
+        count -- still takes the formula-only path.
         """
         payload = self._json_request(allowed=("args",))
         args = self._args_of(payload)
@@ -2269,8 +2380,11 @@ class _Handler(BaseHTTPRequestHandler):
         # ~/models/h3-8bit` reaches `quant_bits` as a directory literally named `~` otherwise, and
         # the form would be told 4 bits here and 8 bits on submission for one request.
         argv = check_path_flags(args, self.server.roots)
+        parsed = _parse_args(argv)
+        report = validate_args(_argv_for_canvas_dry_run(argv, parsed)) \
+            if canvas_comes_from_the_image(parsed) else None
         return 200, "application/json", _json_bytes(
-            {"ok": True, "estimate": estimate(argv, checkpoint=_parse_args(argv).checkpoint)})
+            {"ok": True, "estimate": estimate(argv, checkpoint=parsed.checkpoint, report=report)})
 
     # -- prompts ----------------------------------------------------------------------------
 
