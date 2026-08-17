@@ -16,11 +16,22 @@
 нужен YuNet ONNX или ultralytics. Артефакты/скрипты: ~/Research/TestVideo/face-refine-exp/.
 Дальше: этап 1 по FEASIBILITY (v2v-вход в пайплайн + CV-обвязка).
 
-### 2. Проекты — мульти-клиповые сценарии
+### 2. Проекты — мульти-клиповые сценарии (+ музыкальная дорожка)
 Спека не написана. Суть: сценарий из N роликов, автокейфреймы из предпоследней секунды,
 автосклейка, чат в контексте ролика сценария (как баллада, но кнопкой). Задел: kind:"clip"
 в чат-сессиях. Идеи из lyric-video-director: coverage-complete timeline + валидатор,
 visual bible, tracer-пилот, дисциплина ffmpeg-сборки.
+**Эксперимент Music3 2026-08-17: УСПЕХ — проектировать сразу с дорожкой «песня».**
+mlx-community/MiniMax-Music3-8bit + mlx-audio (pip, Python API: load_model(Path!) +
+model.generate(text=caption, lyrics, duration, steps<=30, seed) → 44.1 кГц стерео).
+Веса 14.18 ГБ в ~/models/music3/. Русский вокал разборчив (Whisper расшифровал почти
+дословно), цензуры НЕТ (острые строки спеты дословно — связка «наш Qwen пишет → Music3
+поёт» свободна из коробки). Стоимость: ~11× медленнее реалтайма (3 мин песни ≈ 33 мин),
+пик до 32 ГБ → отдельный kind в очереди под тем же GPU-локом, что видео; загрузка 3.5 с
+(mmap), можно резидентно. Грабли: load_model только Path (str виснет как HF repo id);
+hf download на репо виснет — качать ~/models/music3/fetch-parallel.sh. Демо:
+~/Research/TestVideo/music3-demo/ (night-studio-ru.mp3 90 с, obedience-test-ru.mp3 45 с,
+спектрограммы, gen.py/analyze.sh в ~/models/music3/).
 
 ### 3. Кеширование шагов (Spectrum / EasyCache)
 До 42% скорости у порта Bambushu; ломает лица на малых канвасах — проверять строго A/B
