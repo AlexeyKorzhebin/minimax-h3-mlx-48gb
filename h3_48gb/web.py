@@ -1697,6 +1697,23 @@ class _Handler(BaseHTTPRequestHandler):
 
     server_version = "h3-web"
 
+    #: Seconds a connection may sit open without sending a byte before this handler gives up on it
+    #: (BACKLOG "UX-мелочи", task 5). `socketserver.StreamRequestHandler.setup` reads this class
+    #: attribute and calls `self.connection.settimeout(timeout)` on its own -- nothing here has to
+    #: touch the socket directly -- and `BaseHTTPRequestHandler.handle_one_request` already catches
+    #: the resulting `socket.timeout` and sets `close_connection = True`, so setting this attribute
+    #: is the entire fix. Without it, a client that opens a connection and never sends anything
+    #: (slow-loris, or just a stalled network path) ties up a handler thread forever:
+    #: `daemon_threads=True` on `_Server` only means the *process* can still exit, not that a
+    #: leaked thread is ever reclaimed while `h3 web` keeps running.
+    #:
+    #: No long-poll route exists here to conflict with a read timeout -- `/api/state` and friends
+    #: are all polled by the page on its own interval, never held open waiting for a server-side
+    #: event -- so a generous-but-finite number is free to pick without starving anything real.
+    #: 60 s is far longer than any route here takes to answer (`DRY_RUN_TIMEOUT` alone is on the
+    #: order of seconds) and far shorter than "forever".
+    timeout = 60
+
     def do_GET(self) -> None:
         self._respond(self._route_get)
 

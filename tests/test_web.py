@@ -2801,6 +2801,41 @@ def test_two_browsers_posting_the_same_tag_at_once_produce_one_job(queue_server)
     assert len(_pending(queue_server)) == 1
 
 
+def test_a_connection_that_sends_nothing_is_closed_by_the_socket_timeout():
+    """BACKLOG "UX-мелочи", task 5. `ThreadingHTTPServer` has no per-connection read timeout by
+    default: a client that opens a socket and never sends a byte (slow-loris, or just a stalled
+    network path) ties up a handler thread forever. `daemon_threads=True` on `_Server` only lets
+    the *process* exit anyway -- it does not reclaim a leaked thread while `h3 web` keeps running.
+
+    `_Handler.timeout` is the fix, and it is entirely inherited machinery:
+    `socketserver.StreamRequestHandler.setup` reads the class attribute and calls
+    `self.connection.settimeout(...)` itself, and `BaseHTTPRequestHandler.handle_one_request`
+    already catches the resulting `socket.timeout` and closes the connection. This test drives that
+    real mechanism end to end through a real socket, with a subclass carrying a much shorter
+    `timeout` than production's -- otherwise this test would itself have to wait a minute.
+    """
+    import http.server
+    import socket
+
+    class _ShortTimeoutHandler(web._Handler):
+        timeout = 0.2
+
+    httpd = http.server.HTTPServer((web.LOOPBACK, 0), _ShortTimeoutHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with socket.create_connection((web.LOOPBACK, httpd.server_address[1]), timeout=5) as sock:
+            # Not a single byte sent -- the server must close on its own initiative, not because
+            # this test asked for anything.
+            received = sock.recv(1)
+            assert received == b"", (
+                "an idle connection sending nothing must be closed by the handler's own timeout, "
+                f"got {received!r} instead of an EOF")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 # -- Step 7: the page -----------------------------------------------------------------------------
 
 WEBUI = PROJECT_ROOT / "h3_48gb" / "webui"
