@@ -46,3 +46,7 @@ h3_48gb = ["webui/*.html", "webui/*.css", "webui/*.js"]
 # cover three of the four core patches and were invisible to the previously documented
 # `pytest tests/ test_preview.py`.
 norecursedirs = ["upstream", ".venv"]
+# `slow` marks a test that needs the GPU and minutes of wall time (the face-refine v2v smoke).
+# Registered so an ordinary run does not warn; the tests themselves also gate on an environment
+# variable, because a marker alone would still let a bare `pytest tests/` run them.
+markers = ["slow: needs the GPU and minutes of wall time; opt in with an env var"]
