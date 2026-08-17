@@ -840,6 +840,34 @@ def canvas_comes_from_the_image(parsed) -> bool:
             and getattr(parsed, "height", None) is None)
 
 
+#: Stand-in prompt for the canvas-only dry run in `_estimate_only`. Never reaches a queue, a file
+#: or a model: `validate_args` builds a `RunSpec` and returns, and the only three fields read back
+#: out of its report are the canvas, the duration and the step count.
+_CANVAS_DRY_RUN_PROMPT = "оценка канваса"
+
+
+def _argv_for_canvas_dry_run(argv: list[str], parsed) -> list[str]:
+    """`argv` with a placeholder prompt added if it has none, for the canvas dry run.
+
+    An estimate deliberately carries no prompt -- `requestEstimate` builds its arguments with
+    `withPrompt: false` so that typing does not send kilobytes of text per keystroke -- while
+    `generate --dry-run` refuses a request without one (`prompt_missing`), because it assembles a
+    whole `RunSpec`. Left alone, those two facts cancel the feature outright: «из кадра» would
+    show no estimate at all, for *any* prompt, since the prompt never reaches this route to begin
+    with.
+
+    Substituting one is honest here in a way it would not be at submission: the canvas comes from
+    the keyframe's pixels, and the duration and step count from flags -- the three values
+    `_estimate_only` reads back are the three a prompt cannot influence. The real prompt is still
+    required by `prepare_submission`, which is where a missing one is a genuine refusal.
+    """
+    if parsed.prompt is not None or parsed.prompt_file is not None:
+        return argv
+    # After the subcommand, where `spec_from_args` expects the positional -- appending would put
+    # it after a flag that takes a value and make it that flag's argument instead.
+    return [argv[0], _CANVAS_DRY_RUN_PROMPT, *argv[1:]]
+
+
 def estimate(args, checkpoint, *, report=None) -> dict:
     """How long this request will take and how much memory it will need, by the fitted model.
 
@@ -2353,7 +2381,8 @@ class _Handler(BaseHTTPRequestHandler):
         # the form would be told 4 bits here and 8 bits on submission for one request.
         argv = check_path_flags(args, self.server.roots)
         parsed = _parse_args(argv)
-        report = validate_args(argv) if canvas_comes_from_the_image(parsed) else None
+        report = validate_args(_argv_for_canvas_dry_run(argv, parsed)) \
+            if canvas_comes_from_the_image(parsed) else None
         return 200, "application/json", _json_bytes(
             {"ok": True, "estimate": estimate(argv, checkpoint=parsed.checkpoint, report=report)})
 

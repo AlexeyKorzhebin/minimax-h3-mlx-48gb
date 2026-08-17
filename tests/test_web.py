@@ -2432,6 +2432,26 @@ def test_the_estimate_of_a_keyframe_run_uses_the_canvas_derived_from_the_frame(q
     assert got != web.DEFAULT_CANVAS
 
 
+def test_the_keyframe_estimate_works_without_a_prompt_because_estimates_have_none(queue_server):
+    """Оценка промпт не носит намеренно: `requestEstimate` строит аргументы с `withPrompt: false`,
+    чтобы не слать килобайты текста на каждое нажатие клавиши.
+
+    А dry-run без промпта отказывается (`prompt_missing`) — он собирает полный `RunSpec`. Значит
+    «из кадра» в форме давал бы `≈—` вместо оценки *всегда*, при любом промпте, потому что до
+    сервера промпт в этом запросе не доезжает вовсе. Канвас от промпта не зависит, поэтому
+    подставить недостающий на время dry-run — честно; отказать — нет.
+    """
+    frame = _vertical_frame(queue_server, name="bez-prompta.png")
+    args = [a for a in _job_args(queue_server, "--image", str(frame), "--mode", "i2v")
+            if a != "котик на подоконнике"]
+    assert not any(a == "--prompt-file" for a in args), args
+
+    status, answer = _call(queue_server, "POST", "/api/estimate", {"args": args})
+
+    assert status == 200, answer
+    assert (answer["estimate"]["width"], answer["estimate"]["height"]) == (768, 1024), answer
+
+
 def test_an_estimate_with_explicit_numbers_still_starts_no_subprocess(queue_server, monkeypatch):
     """Оборотная сторона: dry-run включается только там, где канвас без него неизвестен. Форма
     пересчитывает оценку на каждое нажатие клавиши, и подпроцесс на каждое нажатие — форк-бомба.
@@ -4381,6 +4401,13 @@ def test_the_new_task_button_stands_in_the_composition_heading_and_is_wired():
     head = page[start:page.index('panel-body', start)]
     assert 'id="form-reset"' in head, (
         "кнопка «Новая задача» обязана стоять в шапке зоны «Сочинение»:\n" + head)
+
+    # Комментарии срезаны по той же причине, что и в `_modal_markup`: этот файл объясняет сам
+    # себя в них, и объяснение, называющее надпись, — не эта надпись.
+    visible = re.sub(r"<!--.*?-->", "", head, flags=re.S)
+    assert visible.count("Новая задача") == 1, (
+        "«Новая задача» в шапке ровно одна: кнопка. Когда её надпись дублировала соседнюю строку "
+        "состояния, шапка читалась как опечатка:\n" + visible)
 
     script = _page_text("app.js")
     assert '$("form-reset").addEventListener("click"' in script, "кнопка обязана быть подписана"
