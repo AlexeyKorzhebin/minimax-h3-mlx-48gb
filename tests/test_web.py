@@ -2709,20 +2709,24 @@ def test_a_job_that_does_not_name_an_outdir_at_all_is_refused(queue_server):
     assert _pending(queue_server) == []
 
 
-def test_submitting_when_the_servers_own_outdir_looks_like_a_job_subdirectory_is_refused(tmp_path):
-    """Fix round 1 (I2, review round 1, Important). `queue._base_outdir` strips a trailing
-    directory that matches `queue._JOB_SUBDIR_RE` before nesting a fresh one under it -- exactly
-    right when that directory is a job's own subdirectory from an earlier submission, and exactly
-    wrong when it is the server's *own* `--outdir`, which just happens to be spelled the same way
-    (a leftover job subdirectory promoted to `--outdir` by hand, say). Left unchecked, every job
-    submitted to a server started that way lands one level *above* the server's own root -- outside
-    every root this server may write to, and nothing here would ever notice.
+def test_submitting_when_the_servers_own_outdir_looks_like_a_job_subdirectory_nests_inside_it(
+        tmp_path):
+    """Fix round 1 (I2, review round 1, Important) taught `queue._base_outdir` to strip a trailing
+    directory matching `queue._JOB_SUBDIR_RE` before nesting a fresh one under it, on shape alone --
+    right when that directory really is a job's own subdirectory from an earlier submission of
+    *this* queue, wrong when it is merely spelled the same way (the server's own `--outdir`, a
+    leftover job subdirectory from some other queue promoted to `--outdir` by hand, or a human
+    typing a look-alike path into the form). Fix round 2 (BACKLOG "UX-мелочи", task 7) narrowed the
+    strip to directories some job *this queue actually recorded* was relocated into
+    (`queue._outdir_is_a_known_job_subdir`) -- so this scenario, which used to escape the server's
+    own root and had to be refused, no longer strips at all: on a fresh queue nothing has ever used
+    this directory, so it is treated like any other outdir a human is free to write straight into.
 
-    The probe: a server whose `--outdir` is itself named like a job subdirectory
-    (`20260813-1200-run`), and an ordinary submission naming that same directory as `--outdir` (the
-    form's own default, `_job_args`'s convention throughout this suite). `queue.submit` would
-    relocate straight past the server's root; this must be refused before the job ever reaches
-    `pending/`.
+    The probe is the same as round 1's: a server whose `--outdir` is itself named like a job
+    subdirectory (`20260813-1200-run`), and an ordinary first submission naming that same directory
+    as `--outdir` (the form's own default, `_job_args`'s convention throughout this suite). Unlike
+    round 1, this must now succeed, with the job's own fresh subdirectory nested *inside* the
+    server's root rather than escaping above it.
     """
     outdir = tmp_path / "base" / "20260813-1200-run"
     outdir.mkdir(parents=True)
@@ -2737,9 +2741,13 @@ def test_submitting_when_the_servers_own_outdir_looks_like_a_job_subdirectory_is
     try:
         status, answer = _call(live, "POST", "/api/jobs",
                                {"args": _job_args(live, tag="кот"), "note": ""})
-        assert status == 400, answer
-        assert answer["error"]["code"] == "path_outside_root", answer
-        assert _pending(live) == [], "nothing must be queued when the relocation escapes the root"
+        assert status == 200, answer
+        pending = _pending(live)
+        assert len(pending) == 1
+        job_dir = Path(pending[0].output_stem).parent
+        assert job_dir.parent == outdir, (
+            f"the job's own subdirectory must nest inside the server's root {outdir}, not escape "
+            f"it -- got {job_dir}")
         assert list((tmp_path / "base").iterdir()) == [outdir], (
             "no stray directory may appear beside the server's own outdir")
     finally:
@@ -2791,6 +2799,41 @@ def test_two_browsers_posting_the_same_tag_at_once_produce_one_job(queue_server)
     refused = next(answer for status, answer in results if status == 400)
     assert refused["error"]["code"] == "output_stem_conflict", refused
     assert len(_pending(queue_server)) == 1
+
+
+def test_a_connection_that_sends_nothing_is_closed_by_the_socket_timeout():
+    """BACKLOG "UX-мелочи", task 5. `ThreadingHTTPServer` has no per-connection read timeout by
+    default: a client that opens a socket and never sends a byte (slow-loris, or just a stalled
+    network path) ties up a handler thread forever. `daemon_threads=True` on `_Server` only lets
+    the *process* exit anyway -- it does not reclaim a leaked thread while `h3 web` keeps running.
+
+    `_Handler.timeout` is the fix, and it is entirely inherited machinery:
+    `socketserver.StreamRequestHandler.setup` reads the class attribute and calls
+    `self.connection.settimeout(...)` itself, and `BaseHTTPRequestHandler.handle_one_request`
+    already catches the resulting `socket.timeout` and closes the connection. This test drives that
+    real mechanism end to end through a real socket, with a subclass carrying a much shorter
+    `timeout` than production's -- otherwise this test would itself have to wait a minute.
+    """
+    import http.server
+    import socket
+
+    class _ShortTimeoutHandler(web._Handler):
+        timeout = 0.2
+
+    httpd = http.server.HTTPServer((web.LOOPBACK, 0), _ShortTimeoutHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with socket.create_connection((web.LOOPBACK, httpd.server_address[1]), timeout=5) as sock:
+            # Not a single byte sent -- the server must close on its own initiative, not because
+            # this test asked for anything.
+            received = sock.recv(1)
+            assert received == b"", (
+                "an idle connection sending nothing must be closed by the handler's own timeout, "
+                f"got {received!r} instead of an EOF")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 # -- Step 7: the page -----------------------------------------------------------------------------
@@ -3082,6 +3125,52 @@ def test_media_serves_the_clip_when_the_forms_own_outdir_already_nests_a_folder(
 
     status, headers, body = _request(server, url)
     assert status == 200 and body == b"\x00mp4", (status, url, body[:40])
+
+
+@_needs_node
+def test_clip_url_carries_a_version_query_and_media_still_serves_it(server):
+    """BACKLOG "UX-мелочи", task 3. `/media` caches for a year (`MEDIA_MAX_AGE`, `immutable`) on
+    the promise that a given path is never rewritten with different bytes -- true for a preview
+    frame (its own step number is in the filename) but not for a `.mp4`: editing a failed job and
+    resubmitting it with the same tag writes over the *same* filename with different content, and a
+    browser holding the old bytes at that URL would never ask again.
+
+    `clipUrl` adds `?v=<job.finished_at>` for exactly this: the query changes whenever the job is
+    re-run (a new `finished_at`), busting the cache, and the server -- which never looks at the
+    query string at all (`urlsplit(self.path).path` in `_route_get`) -- must still serve `/media`
+    normally with one attached.
+    """
+    job = q.submit(server.queue_root, ["generate", "--tag", "kot-italy"], "",
+                   {"output_stem": str(server.outdir / "h3-kot-italy-896x576")}, {})
+    result_dir = Path(job.output_stem).parent
+    result_dir.mkdir(parents=True, exist_ok=True)
+    Path(f"{job.output_stem}.mp4").write_bytes(b"\x00mp4")
+    claimed = q.claim(server.queue_root)
+    finished = q.finish(server.queue_root, claimed.id, 0, "ok")
+
+    _, state = _json(server, "/api/state")
+    url = _node_eval(
+        f"console.log(JSON.stringify(app.clipUrl({json.dumps(finished.as_dict())}, "
+        f"{json.dumps(state['outdir'])})));")
+    assert url is not None
+    assert f"?v={urllib.parse.quote(finished.finished_at, safe='')}" in url, (
+        f"clipUrl must carry the job's own finished_at as ?v=, got {url}")
+
+    status, headers, body = _request(server, url)
+    assert status == 200 and body == b"\x00mp4", (
+        "a /media request with a ?v= query string must be served exactly like one without", url)
+
+
+@_needs_node
+def test_clip_url_has_no_version_query_before_the_job_has_ever_run():
+    """A job still `pending` has neither `started_at` nor `finished_at` -- nothing to build a
+    version out of -- so `clipUrl` must not tack on a bare, meaningless `?v=`.
+    """
+    job = {"output_stem": "/out/20260813-1435-a/h3-a-896x576.mp4"[:-4],
+           "started_at": None, "finished_at": None}
+    url = _node_eval(
+        f"console.log(JSON.stringify(app.clipUrl({json.dumps(job)}, {json.dumps('/out')})));")
+    assert url is not None and "?v=" not in url, url
 
 
 @_needs_node
@@ -4095,7 +4184,10 @@ def test_finished_shows_the_exit_code_and_a_failure_shows_why():
     assert "код 0" in ok
     assert "код 1" in failed
     assert "metal::malloc" in failed, "a failed run with no visible reason is a mystery, not a row"
-    assert 'href="/media/%D0%BD%D0%BE%D1%87%D1%8C/h3-%D0%BA%D0%BE%D1%82-896x576.mp4"' in ok, ok
+    # `?v=<finished_at>` -- task 3, BACKLOG "UX-мелочи": `clipUrl` busts the year-long `/media`
+    # cache with the job's own `finished_at`, so the fixed URL below carries it too now.
+    assert ('href="/media/%D0%BD%D0%BE%D1%87%D1%8C/h3-%D0%BA%D0%BE%D1%82-896x576.mp4'
+            '?v=2026-08-12T02%3A00%3A00"') in ok, ok
     assert "<video" in ok and "<img" not in ok, "done shows its own clip, not a mid-diffusion mess"
     assert "<video" not in failed, "a failed run never has a clip to show"
     # Правка по ревью C2: карточка упавшей задачи называла код возврата дважды подряд --

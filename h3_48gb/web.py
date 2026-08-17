@@ -1205,7 +1205,7 @@ def queue_write_errors(queue_root, *, what="the request"):
         ) from exc
 
 
-def _refuse_if_relocation_escapes_the_roots(args: list[str], output_stem: str,
+def _refuse_if_relocation_escapes_the_roots(queue_root, args: list[str], output_stem: str,
                                             roots: dict[str, Path]) -> None:
     """`resolve_within` the output_stem `submit` will actually relocate to -- not the flat one
     `prepare_submission`'s dry run reported -- or raise `path_outside_root`.
@@ -1219,6 +1219,11 @@ def _refuse_if_relocation_escapes_the_roots(args: list[str], output_stem: str,
     this server may write to -- `prepare_submission`'s own `resolve_within` on `output_stem` cannot
     catch this, because it runs *before* `submit` relocates anything.
 
+    `queue_root` is `_base_outdir`'s, since fix round 2 (BACKLOG "UX-мелочи"): stripping now asks
+    whether some job under `queue_root` actually used the directory, not the directory's shape
+    alone, so this preview needs the same `root` the real `submit` call moments later will use to
+    answer the same question the same way.
+
     Called **before** `submit` ever writes the job to `pending/`, not after: a check that ran after
     would also have to cancel the job it had just created, and the worker could claim it in the
     window between the two -- a real race that would leave a job in `running/` about to spawn `h3
@@ -1231,7 +1236,7 @@ def _refuse_if_relocation_escapes_the_roots(args: list[str], output_stem: str,
     only on the *base* directory `queue._base_outdir` decides on, which this computes identically,
     never on the minute stamp appended after it.
     """
-    preview_stem = q._relocate_to_job_subdir(list(args), str(output_stem), q._now())[1]
+    preview_stem = q._relocate_to_job_subdir(queue_root, list(args), str(output_stem), q._now())[1]
     resolve_within(preview_stem, roots, write=True)
 
 
@@ -1692,6 +1697,23 @@ class _Handler(BaseHTTPRequestHandler):
 
     server_version = "h3-web"
 
+    #: Seconds a connection may sit open without sending a byte before this handler gives up on it
+    #: (BACKLOG "UX-мелочи", task 5). `socketserver.StreamRequestHandler.setup` reads this class
+    #: attribute and calls `self.connection.settimeout(timeout)` on its own -- nothing here has to
+    #: touch the socket directly -- and `BaseHTTPRequestHandler.handle_one_request` already catches
+    #: the resulting `socket.timeout` and sets `close_connection = True`, so setting this attribute
+    #: is the entire fix. Without it, a client that opens a connection and never sends anything
+    #: (slow-loris, or just a stalled network path) ties up a handler thread forever:
+    #: `daemon_threads=True` on `_Server` only means the *process* can still exit, not that a
+    #: leaked thread is ever reclaimed while `h3 web` keeps running.
+    #:
+    #: No long-poll route exists here to conflict with a read timeout -- `/api/state` and friends
+    #: are all polled by the page on its own interval, never held open waiting for a server-side
+    #: event -- so a generous-but-finite number is free to pick without starving anything real.
+    #: 60 s is far longer than any route here takes to answer (`DRY_RUN_TIMEOUT` alone is on the
+    #: order of seconds) and far shorter than "forever".
+    timeout = 60
+
     def do_GET(self) -> None:
         self._respond(self._route_get)
 
@@ -2122,7 +2144,8 @@ class _Handler(BaseHTTPRequestHandler):
         args, note = self._args_of(payload), self._note_of(payload)
         prepared = prepare_submission(args, self.server.roots)
         _refuse_if_relocation_escapes_the_roots(
-            prepared["args"], prepared["report"]["output_stem"], self.server.roots)
+            self.server.queue_root, prepared["args"], prepared["report"]["output_stem"],
+            self.server.roots)
         with queue_write_errors(self.server.queue_root, what="--tag"):
             job = q.submit(self.server.queue_root, prepared["args"], note,
                            prepared["report"], prepared["estimate"],
@@ -2208,7 +2231,8 @@ class _Handler(BaseHTTPRequestHandler):
         candidates = _duplicate_tag_candidates(job.args, job.output_stem)
         for _ in range(DUPLICATE_ATTEMPTS):
             args, output_stem = next(candidates)
-            _refuse_if_relocation_escapes_the_roots(args, output_stem, self.server.roots)
+            _refuse_if_relocation_escapes_the_roots(
+                self.server.queue_root, args, output_stem, self.server.roots)
             try:
                 with queue_write_errors(self.server.queue_root, what="the job id"):
                     new_job = q.submit(self.server.queue_root, args, job.note,

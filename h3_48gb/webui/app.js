@@ -139,10 +139,31 @@ export function mediaParts(outputStem, outdir) {
   return { run: relative.slice(0, lastSlash), stem: relative.slice(lastSlash + 1) };
 }
 
+/** Версия для `?v=` на ссылке `/media`, не трогая годовой `immutable`-кэш сервера (`_cache_control`
+ *  в `web.py`, `MEDIA_MAX_AGE`): у сервера нет способа отличить «тот же файл» от «файл с тем же
+ *  именем переписан», а редактирование/повтор упавшей задачи с тем же тегом пишет именно поверх
+ *  старого имени. `finished_at` — как только он есть, он не меняется, и он единственное на клиенте,
+ *  что различает два прогона *одной и той же* задачи (id у задачи один и тот же что до, что после
+ *  повтора). Пока прогон не завершился, `finished_at` ещё `null` — тогда берём `started_at`: он уже
+ *  проставлен и всё равно меняется на каждый новый прогон той же задачи, только на менее точный
+ *  момент. Нет ни того, ни другого (задача только легла в очередь) — версии не будет: ссылка ещё не
+ *  строится (`clipUrl`/`previewUrl` сами возвращают `null`, пока файла с большой вероятностью нет).
+ */
+function mediaVersion(job) {
+  return job.finished_at || job.started_at || "";
+}
+
+/** `url`, если версии нет — так `previewUrl`/`clipUrl` не выдают лишний `?v=`, когда version
+ *  ещё нечем наполнить, ровно как остальной модуль возвращает `null`, а не мусорную ссылку. */
+function withVersion(url, version) {
+  return version ? `${url}?v=${encodeURIComponent(version)}` : url;
+}
+
 export function clipUrl(job, outdir) {
   const parts = mediaParts(job.output_stem, outdir);
   if (!parts) return null;
-  return `/media/${encodeURIComponent(parts.run)}/${encodeURIComponent(parts.stem + ".mp4")}`;
+  const url = `/media/${encodeURIComponent(parts.run)}/${encodeURIComponent(parts.stem + ".mp4")}`;
+  return withVersion(url, mediaVersion(job));
 }
 
 /** Последний записанный кадр превью, или `null`, пока ни одного нет.
@@ -162,7 +183,8 @@ export function previewUrl(job, completedForwards, outdir) {
   const parts = mediaParts(explicit || job.output_stem, outdir);
   if (!parts) return null;
   const name = `${parts.stem}-preview-step${String(step).padStart(2, "0")}.jpg`;
-  return `/media/${encodeURIComponent(parts.run)}/${encodeURIComponent(name)}`;
+  const url = `/media/${encodeURIComponent(parts.run)}/${encodeURIComponent(name)}`;
+  return withVersion(url, mediaVersion(job));
 }
 
 /* ===========================================================================

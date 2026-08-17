@@ -260,7 +260,13 @@ Everything the page can do, the API can do, and it is the same validation either
 is checked by running `h3 generate --dry-run --json` in a subprocess before it is written, so an
 argument list the CLI would refuse is refused at the moment you press the button rather than four
 jobs into the night. `POST /api/jobs`, `PUT /api/jobs/<id>`, `POST /api/jobs/<id>/top`,
-`DELETE /api/jobs/<id>`, `POST /api/estimate`, `GET|PUT /api/prompts/<name>`, `GET /api/state`.
+`POST /api/jobs/<id>/duplicate` (re-queue a job's own args and note as a fresh pending job),
+`POST /api/jobs/<id>/reveal` (`open -R` the job's own output directory in Finder),
+`DELETE /api/jobs/<id>`, `POST /api/estimate`, `GET|PUT /api/prompts/<name>`, `GET /api/state`,
+`POST /api/queue/pause` / `POST /api/queue/start` (stop or resume the worker taking new jobs,
+without touching one already running), `GET /api/llm` / `POST /api/llm/unload` (whether a local
+chat model is resident, and telling it to free the GPU), `POST /api/uploads` (a chat keyframe,
+saved under `<outdir>/uploads/`), `DELETE /api/chat/<id>` (drop a chat session's own file).
 
 The page itself is three files in `h3_48gb/webui/` — `index.html`, `style.css`, `app.js` — with no
 build step, no dependency and no address off this machine in any of them.
