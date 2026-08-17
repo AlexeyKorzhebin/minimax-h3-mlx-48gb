@@ -1,9 +1,9 @@
 """Face detection and track math -- YuNet mocked out for everything except one real-frame test.
 
-Track math (`_build_track`, `_select_largest`, `FaceTrack.box`/`detected`) is tested directly,
-without touching `cv2` or a real detector at all: `detect_track`'s own wiring (load the detector,
-sample every Nth frame, hand samples to `_build_track`) is tested separately with the detector
-monkeypatched to return a fixed list of boxes per call. Only
+Track math (`_build_track`, `_associate_tracks`, `_select_subject_track`, `FaceTrack.box`/
+`detected`) is tested directly, without touching `cv2` or a real detector at all: `detect_track`'s
+own wiring (load the detector, sample every Nth frame, hand samples to `_build_track`) is tested
+separately with the detector monkeypatched to return a fixed list of boxes per call. Only
 `test_detect_track_finds_a_real_face_in_a_real_frame` below exercises the real YuNet ONNX model,
 against a real frame cut from ~/Research/TestVideo/face-refine-exp/round2/SOURCE-crop.mp4 --
 synthetic drawn "faces" are not something YuNet detects (see the task brief), so there is no
@@ -23,16 +23,32 @@ from h3_48gb import facetrack as ft
 
 
 # --------------------------------------------------------------------------------------------
-# `_select_largest`
+# `_associate_tracks` / `_select_subject_track`
 # --------------------------------------------------------------------------------------------
 
-def test_select_largest_picks_the_box_with_the_biggest_area():
-    boxes = [(0.0, 0.0, 10.0, 10.0), (0.0, 0.0, 30.0, 10.0), (0.0, 0.0, 5.0, 5.0)]
-    assert ft._select_largest(boxes) == (0.0, 0.0, 30.0, 10.0)
+def test_associate_tracks_groups_by_nearest_center_into_separate_tracks():
+    detections = [
+        (0, [(0.0, 0.0, 10.0, 10.0), (100.0, 100.0, 10.0, 10.0)]),
+        (5, [(2.0, 1.0, 10.0, 10.0), (98.0, 102.0, 10.0, 10.0)]),
+    ]
+    tracks = ft._associate_tracks(detections)
+    assert len(tracks) == 2
+    assert sorted(len(track) for track in tracks) == [2, 2]
 
 
-def test_select_largest_is_none_for_an_empty_list():
-    assert ft._select_largest([]) is None
+def test_select_subject_track_keeps_the_track_with_the_larger_median_area():
+    detections = [
+        (0, [(0.0, 0.0, 10.0, 10.0), (500.0, 500.0, 30.0, 30.0)]),
+        (5, [(2.0, 1.0, 10.0, 10.0), (498.0, 502.0, 30.0, 30.0)]),
+    ]
+    subject = ft._select_subject_track(detections)
+    assert len(subject) == 2
+    for _, box in subject:
+        assert box[2] == pytest.approx(30.0)
+
+
+def test_select_subject_track_is_empty_with_no_detections():
+    assert ft._select_subject_track([]) == []
 
 
 # --------------------------------------------------------------------------------------------
@@ -75,11 +91,47 @@ def test_constant_extrapolation_holds_each_tails_own_anchor_value():
         assert x == pytest.approx(100.0)
 
 
+def test_constant_extrapolation_holds_in_working_mode_with_savgol_active():
+    # Same constant-tails claim as `test_constant_extrapolation_holds_each_tails_own_anchor_value`,
+    # but with `every=5` and enough frames that `_smooth`'s window (2*every+1 = 11) actually
+    # engages savgol -- that test uses `every=1`, which keeps the window below the 5-sample floor
+    # and never exercises smoothing at all. With savgol active, `np.interp`'s exact constant tails
+    # get run through the filter too: far from the anchors the fit over a locally-constant window
+    # reproduces the constant exactly, but close to the ramp-to-flat kink the quadratic fit can
+    # overshoot slightly (verified on this exact data: up to ~0.73, well under 1% of the 0-100
+    # range) -- both facts are asserted here, not just the middle case that was already covered.
+    samples = [(20, (0.0, 0.0, 10.0, 10.0)), (40, (100.0, 0.0, 10.0, 10.0))]
+    track = ft._build_track(samples, n_frames=60, every=5)
+    # Far tails (more than half a smoothing window away from the nearest anchor): exact.
+    for frame_idx in range(0, 15):
+        x, _, _, _ = track.box(frame_idx)
+        assert x == pytest.approx(0.0, abs=1e-6)
+    for frame_idx in range(45, 60):
+        x, _, _, _ = track.box(frame_idx)
+        assert x == pytest.approx(100.0, abs=1e-6)
+    # Near the kink: bounded overshoot, not an exact hold, but nowhere near sweeping off to the
+    # other anchor's value.
+    for frame_idx in range(0, 60):
+        x, _, _, _ = track.box(frame_idx)
+        assert -1.5 <= x <= 101.5
+
+
 def test_median_area_uses_raw_detections_not_the_smoothed_track():
-    samples = [(0, (0.0, 0.0, 10.0, 10.0)), (5, (0.0, 0.0, 20.0, 20.0)),
-               (10, (0.0, 0.0, 30.0, 30.0))]
-    track = ft._build_track(samples, n_frames=11, every=5)
-    assert track.median_area == pytest.approx(400.0)  # median of 100, 400, 900
+    # Two small detections flank one huge spike in the middle: the RAW median (of just the three
+    # sample areas 100, 10000, 100) is 100. But a broad, far-apart triangle -- size ramping
+    # linearly from 10 up to 100 and back down over the full 0-100 frame span -- spends most of
+    # its per-frame area values well above 100 before ever reaching the two small endpoints, so a
+    # buggy implementation that computed median_area from the smoothed/interpolated per-frame
+    # series instead of the raw samples would land far from 100 (numerically, ~3025 -- verified by
+    # direct computation on this exact data). Only reading the median off the three raw sample
+    # areas lands on exactly 100.
+    samples = [
+        (0, (0.0, 0.0, 10.0, 10.0)),      # area 100
+        (50, (0.0, 0.0, 100.0, 100.0)),   # area 10000
+        (100, (0.0, 0.0, 10.0, 10.0)),    # area 100
+    ]
+    track = ft._build_track(samples, n_frames=101, every=5)
+    assert track.median_area == pytest.approx(100.0)
 
 
 def test_smoothing_reduces_jitter_between_dense_noisy_detections():
@@ -164,6 +216,57 @@ def test_detect_track_is_none_when_nothing_is_ever_detected(monkeypatch):
 def test_detect_track_rejects_every_less_than_one():
     with pytest.raises(ValueError):
         ft.detect_track(iter([]), every=0)
+
+
+def test_track_does_not_switch_between_two_similarly_sized_faces(monkeypatch):
+    """Two static faces of nearly equal size (80px and 78px), far apart in frame, with YuNet-style
+    detection jitter (sigma=3px) on both position and size, sampled every 5 frames across 100
+    frames: `detect_track` must settle on ONE face's identity for the whole clip.
+
+    Picking the larger detection independently in each *sampled frame* (no association across
+    frames -- the pre-fix behavior) flips between the two faces roughly every other sample, since
+    jitter alone is enough to make either one look larger on a given frame -- and interpolating/
+    smoothing across that mixed selection sweeps the box across the entire distance between the
+    two faces. A correct implementation associates detections into per-face candidate tracks first
+    and keeps only the one with the larger median area, so the box stays near one face throughout.
+    """
+    rng = np.random.default_rng(20260817)
+    n_frames = 100
+    every = 5
+    face_a = (50.0, 50.0, 80.0, 80.0)      # top-left corner, 80x80 -- center (90, 90)
+    face_b = (500.0, 400.0, 78.0, 78.0)    # far away, 78x78 -- center (539, 439)
+
+    def jittered(box):
+        x, y, w, h = box
+        return (
+            x + rng.normal(0, 3), y + rng.normal(0, 3),
+            w + rng.normal(0, 3), h + rng.normal(0, 3),
+        )
+
+    fake_boxes_by_frame = {
+        frame_idx: [jittered(face_a), jittered(face_b)]
+        for frame_idx in range(0, n_frames, every)
+    }
+
+    monkeypatch.setattr(ft, "_load_detector", lambda: object())
+
+    def fake_detect_faces(detector, frame):
+        frame_idx = int(frame[0, 0, 0])
+        return fake_boxes_by_frame.get(frame_idx, [])
+
+    monkeypatch.setattr(ft, "_detect_faces", fake_detect_faces)
+
+    frames = [_frame_stamped(i) for i in range(n_frames)]
+    track = ft.detect_track(iter(frames), every=every)
+
+    assert track is not None
+    sample_frames = range(0, n_frames, every)
+    centers_x = [track.box(i)[0] + track.box(i)[2] / 2.0 for i in sample_frames]
+    # If the track stayed on one face throughout, every sampled center clusters tightly around
+    # either ~90 or ~539. If it kept switching identities (the bug), centers span nearly the full
+    # ~450px distance between the two faces.
+    spread = max(centers_x) - min(centers_x)
+    assert spread < 50.0, f"track center x spread {spread:.1f}px across the clip -- looks like it switched faces"
 
 
 # --------------------------------------------------------------------------------------------

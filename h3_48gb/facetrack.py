@@ -16,10 +16,15 @@ smooths the result afterward, on center and size separately: a Savitzky-Golay fi
 accelerating/decelerating motion (unlike a moving average, which lags behind it) while still
 damping frame-to-frame detector noise.
 
-**Why the largest face, not the first.** `detect_track` has no re-identification across frames --
-each detection is independent -- so when YuNet's own NMS still returns more than one face in a
-frame (a poster on the wall, a second person walking through), the subject being tracked is
-assumed to be the most prominent one in frame, which in practice is the largest bounding box.
+**Why the largest face, not the first.** A frame can have more than one face in it (a poster on the
+wall, a second person walking through) even after YuNet's own NMS, and across the whole clip the
+faces seen are not necessarily always the same set. `detect_track` re-identifies faces *across*
+sampled frames by nearest-center association (`_associate_tracks`) into separate candidate tracks
+-- one per face that appears anywhere in the clip -- and then keeps only the candidate whose median
+box area is largest across its own detections (`_select_subject_track`): the subject being tracked
+is assumed to be whichever face is the most prominent *as a whole*, not whichever box happens to be
+biggest in any single frame (a bystander who briefly steps close to the camera should not steal the
+track from the subject one frame later).
 
 **Deliberately no dependency on `mlx`.** A face-refine pass runs once per already-decoded clip,
 CPU-only, and must not pay for loading a 33B-parameter transformer to do it -- same reasoning as
@@ -56,8 +61,9 @@ _PLACEHOLDER_INPUT_SIZE = (320, 320)
 
 #: YuNet's own demo defaults (opencv_zoo). `score_threshold` is deliberately looser than the demo's
 #: 0.9: this is a crop-window tracker, not a security gate, and a lower threshold trades a few more
-#: false positives (which `_select_largest` and the track math both already have to tolerate, since
-#: a false positive from a *different* frame is indistinguishable from a real one to this module)
+#: false positives (which `_associate_tracks` and the track math both already have to tolerate,
+#: since a false positive is just another short-lived candidate track, discarded by
+#: `_select_subject_track` unless it happens to outscore the real subject on median area)
 #: for fewer missed detections on a face that is turned, lit badly, or partly out of frame -- the
 #: exact conditions a face-refine crop most needs to keep tracking through.
 _SCORE_THRESHOLD = 0.8
@@ -107,15 +113,92 @@ def _detect_faces(detector, frame: np.ndarray) -> list[tuple[float, float, float
     return [(float(row[0]), float(row[1]), float(row[2]), float(row[3])) for row in faces]
 
 
-def _select_largest(
-    boxes: list[tuple[float, float, float, float]],
-) -> tuple[float, float, float, float] | None:
-    """The largest of `boxes` by area, or `None` if `boxes` is empty -- see the module docstring's
-    "why the largest face" note.
+def _center(box: tuple[float, float, float, float]) -> tuple[float, float]:
+    x, y, w, h = box
+    return (x + w / 2.0, y + h / 2.0)
+
+
+def _associate_tracks(
+    detections: list[tuple[int, list[tuple[float, float, float, float]]]],
+) -> list[list[tuple[int, tuple[float, float, float, float]]]]:
+    """Group every sampled frame's detections into candidate per-face tracks, by greedy nearest-
+    center matching between consecutive sampled frames -- the association `detect_track` was
+    missing (see facetrack review finding C1): without it, picking the biggest box in *each frame
+    independently* silently mixes together whichever faces happen to be in frame, with no notion
+    that "the largest box in frame 5" and "the largest box in frame 10" might be two different
+    people.
+
+    `detections` is `(frame_idx, boxes)` per sampled frame, in the order `detect_track` sampled
+    them (already increasing by construction, but not assumed here). Each returned track is a list
+    of `(frame_idx, box)` pairs, exactly the shape `_build_track` wants for one identity.
+
+    The matching is deliberately simple -- Euclidean distance between box centers, greedy nearest-
+    first, one match per detection per frame -- rather than IoU: consecutive samples are `every`
+    frames apart, and jitter aside, a real face's box does not reliably overlap itself that far
+    apart if the face or camera is moving, whereas its *center* moves by a bounded, roughly
+    continuous amount. Distinct faces in a normal frame are far apart relative to that jitter, so
+    nearest-center is enough to keep them apart without needing a hard gating distance: a
+    detection only ever prefers a closer track over a farther one, and greedy assignment (closest
+    pairs claimed first) keeps one open track from stealing two detections in the same frame.
+
+    An open track that gets no match in a given sampled frame is simply left waiting -- its last
+    known box stays the matching target for future frames -- rather than closed off, since a face
+    can drop out for a few samples (turned away, occluded) and reappear closer to where it was than
+    to any other track.
     """
-    if not boxes:
-        return None
-    return max(boxes, key=lambda box: box[2] * box[3])
+    tracks: list[list[tuple[int, tuple[float, float, float, float]]]] = []
+
+    for frame_idx, boxes in detections:
+        if not boxes:
+            continue
+        # Candidate (track, box) pairs, nearest first -- greedy assignment below claims the
+        # closest pairs first so two detections in the same frame cannot both grab the same track.
+        candidates = []
+        for track_i, track in enumerate(tracks):
+            last_center = _center(track[-1][1])
+            for box_i, box in enumerate(boxes):
+                dist = np.hypot(*(np.array(_center(box)) - np.array(last_center)))
+                candidates.append((dist, track_i, box_i))
+        candidates.sort(key=lambda item: item[0])
+
+        matched_tracks: set[int] = set()
+        matched_boxes: set[int] = set()
+        for _dist, track_i, box_i in candidates:
+            if track_i in matched_tracks or box_i in matched_boxes:
+                continue
+            matched_tracks.add(track_i)
+            matched_boxes.add(box_i)
+            tracks[track_i].append((frame_idx, boxes[box_i]))
+
+        # Every unmatched box in this frame starts a new candidate track (a new face entering
+        # frame, or -- on the very first sampled frame -- every face seen so far).
+        for box_i, box in enumerate(boxes):
+            if box_i not in matched_boxes:
+                tracks.append([(frame_idx, box)])
+
+    return tracks
+
+
+def _select_subject_track(
+    detections: list[tuple[int, list[tuple[float, float, float, float]]]],
+) -> list[tuple[int, tuple[float, float, float, float]]]:
+    """The one candidate track, among all the faces `_associate_tracks` separated out, whose
+    median box area is largest -- "the subject" of a face-refine crop, same "largest, but by
+    median across the whole clip rather than a single frame" rule the module docstring's "why the
+    largest face" note describes, now applied to a whole identity instead of one frame's boxes.
+
+    Empty input (no detections anywhere) yields no tracks and therefore an empty result, which
+    `_build_track` already treats as "no face to track" (`None`).
+    """
+    tracks = _associate_tracks(detections)
+    if not tracks:
+        return []
+
+    def median_area(track: list[tuple[int, tuple[float, float, float, float]]]) -> float:
+        areas = [box[2] * box[3] for _, box in track]
+        return float(np.median(areas))
+
+    return max(tracks, key=median_area)
 
 
 def _smooth(series: np.ndarray, every: int) -> np.ndarray:
@@ -147,7 +230,7 @@ def _smooth(series: np.ndarray, every: int) -> np.ndarray:
     return savgol_filter(series, window_length=window, polyorder=2)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class FaceTrack:
     """A face's bounding box, as a function of every frame index in `[0, n_frames)` -- built once,
     by `_build_track`, from however many real YuNet detections `detect_track` actually got.
@@ -276,18 +359,25 @@ def detect_track(frames_iter, every: int = 5) -> FaceTrack | None:
     `frames_iter` -- so a missing model file (`_load_detector`'s `RuntimeError`) fails immediately
     and predictably, the same "validate before doing any work" shape as `cli.RunSpec.__post_init__`,
     rather than however many frames into a possibly-expensive iterator.
+
+    Every box YuNet finds on a sampled frame is kept (not just the largest -- see
+    `_select_subject_track`/`_associate_tracks`): picking the largest *per frame* independently,
+    with no association between frames, is exactly the bug facetrack review finding C1 describes --
+    it silently mixes different faces together whenever their sizes are close, producing a track
+    that sweeps across the whole clip instead of following one person.
     """
     if every < 1:
         raise ValueError(f"every must be >= 1, got {every}")
 
     detector = _load_detector()
-    samples: list[tuple[int, tuple[float, float, float, float]]] = []
+    detections: list[tuple[int, list[tuple[float, float, float, float]]]] = []
     n_frames = 0
     for frame_idx, frame in enumerate(frames_iter):
         n_frames = frame_idx + 1
         if frame_idx % every == 0:
-            box = _select_largest(_detect_faces(detector, frame))
-            if box is not None:
-                samples.append((frame_idx, box))
+            boxes = _detect_faces(detector, frame)
+            if boxes:
+                detections.append((frame_idx, boxes))
 
+    samples = _select_subject_track(detections)
     return _build_track(samples, n_frames, every)
