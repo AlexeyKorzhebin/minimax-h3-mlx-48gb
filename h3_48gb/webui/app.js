@@ -28,9 +28,6 @@ export const PHYSICAL_GB = 48;
 export const WARN_GB = 40;
 export const BLOCK_GB = 46;
 
-/* Сколько назад смотрит список «закончилось». */
-export const FINISHED_WINDOW_HOURS = 24;
-
 /* Кадр превью пишется раз в N проходов; N — значение `--preview-every`,
    у CLI по умолчанию 5. */
 export const DEFAULT_PREVIEW_EVERY = 5;
@@ -736,25 +733,27 @@ export function pendingSummary(jobs, { now, runningSeconds = 0, workerState = "a
   };
 }
 
-/** Завершённые за сутки, свежие сверху.
+/** Все завершённые, свежие сверху.
  *
- *  Задача без разбираемого `finished_at` не отбрасывается сразу: она закончилась,
- *  момент просто не записан. Но и держать её вечно нельзя — список «за сутки»,
- *  который никогда ничего не забывает, растёт без предела и хоронит сегодняшнее.
- *  Поэтому дата берётся по первой разобравшейся из трёх, и только задача, у которой
- *  не читается ни одна, остаётся в списке насовсем: такой в очереди не бывает —
- *  `created_at` пишется при постановке. */
-export function finishedWithin(jobs, now, hours = FINISHED_WINDOW_HOURS) {
-  const at = (now instanceof Date ? now : new Date(now || Date.now())).getTime();
-  const window = hours * 3600 * 1000;
-  return (Array.isArray(jobs) ? jobs : [])
-    .filter((job) => {
-      const stamps = [job.finished_at, job.started_at, job.created_at]
-        .map((value) => Date.parse(value || ""))
-        .filter((stamp) => !Number.isNaN(stamp));
-      return stamps.length === 0 ? true : at - Math.max(...stamps) <= window;
-    })
-    .sort((a, b) => String(b.finished_at || "").localeCompare(String(a.finished_at || "")));
+ *  Окна тут больше нет. Список смотрел на сутки назад из догадки, что список, который
+ *  ничего не забывает, «хоронит сегодняшнее»; догадка не подтвердилась, а цена
+ *  оказалась настоящей — из тринадцати роликов за выходные на странице оставалось два,
+ *  и это читается как «пропали», а не как «убраны с глаз». Сегодняшнее и так сверху,
+ *  потому что список отсортирован, а вчерашнее внизу никому не мешает: карточки
+ *  прокручиваются страницей.
+ *
+ *  Дата для сортировки — первая разобравшаяся из трёх, а не один `finished_at`:
+ *  задача, у которой момент не записан, закончилась тогда же, когда всё остальное, и
+ *  уезжать за прошлый год не должна. Та, у которой не читается ни одна, уходит вниз —
+ *  такой в очереди не бывает, `created_at` пишется при постановке. */
+export function finishedSorted(jobs) {
+  const at = (job) => {
+    const stamps = [job.finished_at, job.started_at, job.created_at]
+      .map((value) => Date.parse(value || ""))
+      .filter((stamp) => !Number.isNaN(stamp));
+    return stamps.length ? Math.max(...stamps) : -Infinity;
+  };
+  return (Array.isArray(jobs) ? jobs : []).slice().sort((a, b) => at(b) - at(a));
 }
 
 /** Деления по числу проходов: «три из семи» считывается быстрее, чем «43 %». */
@@ -1939,14 +1938,17 @@ function startPage() {
     $("pending-bad").hidden = broken === "";
     $("pending-bad").innerHTML = broken;
 
-    // -- закончилось за сутки
-    const finished = finishedWithin([...(queue.done || []), ...(queue.failed || [])], now);
+    // -- закончилось: всё, что есть, свежее сверху
+    const finished = finishedSorted([...(queue.done || []), ...(queue.failed || [])]);
     $("finished").innerHTML = finished
       .map((job) => finishedRowHtml(job, state.outdir, state.runs)).join("");
     $("finished-empty").hidden = finished.length > 0;
     const failed = finished.filter((job) => job.exit_code !== 0).length;
+    // Счётчик теперь общий, а не «за сутки», — и это единственное место, где видно, сколько
+    // всего насчитано: числу в заголовке верят больше, чем длине прокрученного списка.
     $("done-sum").textContent = finished.length
-      ? `${finished.length}, из них упало ${failed}`
+      ? `${finished.length} ${plural(finished.length, "ролик", "ролика", "роликов")}`
+        + (failed ? `, из них упало ${failed}` : "")
       : "";
   }
 

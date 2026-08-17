@@ -4018,18 +4018,38 @@ def test_finished_shows_the_exit_code_and_a_failure_shows_why():
 
 
 @_needs_node
-def test_only_the_last_day_of_finished_runs_is_shown():
-    """Requirement 9's window. A queue that never forgets grows without bound and buries today."""
+def test_every_finished_run_is_shown_newest_first_with_no_window_at_all():
+    """Окно в сутки прятало работу, а не экономило место: из тринадцати роликов за выходные на
+    странице оставалось два, и человек читал это как «пропали».
+
+    Догадка, стоявшая за окном («список, который ничего не забывает, хоронит сегодняшнее»), не
+    подтвердилась ровно потому, что список отсортирован: сегодняшнее и так сверху, а вчерашнее
+    внизу никому не мешает. Порядок поэтому и проверяется — без него «показывать всё» стало бы
+    той самой свалкой, которой окно боялось.
+    """
     kept = _node_eval("""
-      const at = new Date("2026-08-12T22:00:00");
-      const rows = app.finishedWithin([
-        {id: "fresh", finished_at: "2026-08-12T20:00:00"},
+      const rows = app.finishedSorted([
         {id: "stale", finished_at: "2026-08-10T20:00:00"},
+        {id: "fresh", finished_at: "2026-08-12T20:00:00"},
+        {id: "ancient", finished_at: "2025-01-01T00:00:00"},
         {id: "yesterday", finished_at: "2026-08-12T01:00:00"},
-      ], at);
+      ]);
       console.log(JSON.stringify(rows.map(r => r.id)));
     """)
-    assert kept == ["fresh", "yesterday"], kept
+    assert kept == ["fresh", "yesterday", "stale", "ancient"], kept
+
+
+@_needs_node
+def test_the_finished_zone_no_longer_carries_a_window_to_forget_things_by():
+    """Структурно: константы окна не должно остаться вовсе. Оставленная «на всякий случай», она
+    тихо вернётся в фильтр следующей же правкой этого места.
+    """
+    script = _page_text("app.js")
+    assert "FINISHED_WINDOW_HOURS" not in script, "константа окна обязана исчезнуть целиком"
+    assert "finishedWithin" not in script, "фильтр по окну обязан исчезнуть вместе с ней"
+    page = _page_text("index.html")
+    assert "За сутки ничего не закончилось" not in page, (
+        "пустое состояние больше не про сутки — оно про «ничего ещё не считалось»")
 
 
 @_needs_node
@@ -4746,27 +4766,24 @@ def test_every_provider_failure_reaches_the_page_with_a_sentence_of_its_own():
 
 
 @_needs_node
-def test_a_finished_job_whose_timestamp_cannot_be_read_still_leaves_the_window():
-    """«Закончилось за сутки» that never forgets grows without bound and buries today.
+def test_a_finished_job_whose_timestamp_cannot_be_read_is_still_placed_by_date():
+    """Выбрасывать за нечитаемую дату теперь нечего — окна нет, — но место в списке ей всё ещё
+    нужно, и «в конец» это не место: задача, у которой не записан `finished_at`, закончилась
+    тогда же, когда всё остальное, и уехать за прошлый год не должна.
 
-    A job whose `finished_at` will not parse is not thrown away -- it did finish, the moment is
-    just not written down -- but it is dated by the next stamp that does parse. Only a job with
-    no readable date at all stays, and the queue does not make those: `created_at` is written at
-    submission.
+    Поэтому сортировка берёт первую разобравшуюся дату из трёх, а не один `finished_at`. Задача,
+    у которой не читается ни одна, уходит вниз — такой в очереди не бывает (`created_at` пишется
+    при постановке), и место в самом низу для несуществующего случая честнее выдумки.
     """
-    kept = _node_eval("""
-      const at = new Date("2026-08-12T22:00:00");
-      console.log(JSON.stringify(app.finishedWithin([
-        {id: "fresh", finished_at: "2026-08-12T20:00:00"},
-        {id: "unreadable-but-recent", finished_at: "не время", created_at: "2026-08-12T19:00:00"},
-        {id: "unreadable-and-old", finished_at: "", started_at: "2026-08-01T10:00:00"},
+    order = _node_eval("""
+      console.log(JSON.stringify(app.finishedSorted([
         {id: "no-date-at-all", finished_at: null},
-      ], at).map((row) => row.id)));
+        {id: "old", finished_at: "2026-08-01T10:00:00"},
+        {id: "unreadable-but-recent", finished_at: "не время", created_at: "2026-08-12T19:00:00"},
+        {id: "fresh", finished_at: "2026-08-12T20:00:00"},
+      ]).map((row) => row.id)));
     """)
-    assert "fresh" in kept and "unreadable-but-recent" in kept, kept
-    assert "unreadable-and-old" not in kept, (
-        "a job that started eleven days ago did not finish in the last twenty-four hours")
-    assert "no-date-at-all" in kept, "nothing to date it by is not a reason to hide it"
+    assert order == ["fresh", "unreadable-but-recent", "old", "no-date-at-all"], order
 
 
 # -- Task 8: the chat modal -----------------------------------------------------------------------

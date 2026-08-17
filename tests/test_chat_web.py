@@ -848,6 +848,24 @@ def test_a_traversal_filename_does_not_escape_the_uploads_directory(_serve):
     assert "/" not in saved.name
 
 
+def test_a_prompt_length_filename_keeps_its_image_suffix(_serve):
+    """Генераторы называют файл промптом. Обрезка слева съедала `.png`, и `/api/uploads`
+    отказывал валидному кадру как `bad_image` — та же 400, что человек видит как
+    «кадр не годится для разговора с моделью»."""
+    long_name = ("___description_of_thescene_ultra_realistic_cinematic_photography__"
+                 "high_speed_action_shot__location__russian_countryside__golden_rye_field.png")
+    assert len(long_name.encode()) > web.UPLOAD_NAME_MAX_BYTES
+    sanitized = web.sanitize_upload_name(long_name)
+    assert sanitized.endswith(".png"), sanitized
+    assert len(sanitized.encode()) <= web.UPLOAD_NAME_MAX_BYTES
+    srv = _serve()
+    status, answer = srv.upload_raw(_PNG_BYTES, long_name)
+    assert (status, answer["ok"]) == (200, True), answer
+    saved = Path(answer["path"])
+    assert saved.suffix == ".png"
+    assert saved.is_file()
+
+
 def test_a_cyrillic_or_spaced_filename_becomes_a_safe_name(_serve):
     srv = _serve()
     status, answer = srv.upload_raw(_PNG_BYTES, "Кадр номер 1.png")

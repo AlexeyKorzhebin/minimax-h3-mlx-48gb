@@ -367,9 +367,12 @@ def sanitize_upload_name(raw: str) -> str:
        `resolve_prompt_name`'s docstring explains for `PROMPT_NAME` -- a whitelist here is not a
        reason to skip the path check there, or the other way around.
 
-    Bounded at `UPLOAD_NAME_MAX_BYTES`. An empty result (a name that was nothing but separators
-    and unsafe characters) becomes `"upload"` rather than an empty string, so `_upload_target`
-    never has to reason about a sanitized name with nothing in it.
+    Bounded at `UPLOAD_NAME_MAX_BYTES`. The cut keeps the suffix: image generators name the file
+    after the prompt, often two hundred characters, and `_upload_frame` decides "is this an image"
+    from the suffix alone. Truncating from the left used to eat `.png` and refuse a valid frame
+    as `bad_image`. An empty result (a name that was nothing but separators and unsafe characters)
+    becomes `"upload"` rather than an empty string, so `_upload_target` never has to reason about
+    a sanitized name with nothing in it.
     """
     name = (raw or "").replace("\\", "/")
     name = name.rsplit("/", 1)[-1].strip()
@@ -378,12 +381,19 @@ def sanitize_upload_name(raw: str) -> str:
     if not name:
         name = "upload"
     encoded = name.encode("utf-8", "ignore")
-    if len(encoded) > UPLOAD_NAME_MAX_BYTES:
-        # `errors="ignore"` on the way back: a hard byte cut can land mid-character if a future
-        # widening of `_UPLOAD_NAME_UNSAFE` ever admits a multi-byte one, and dropping the partial
-        # tail is preferable to `UnicodeDecodeError` turning a 400 into a 500.
-        name = encoded[:UPLOAD_NAME_MAX_BYTES].decode("utf-8", "ignore").strip("-") or "upload"
-    return name
+    if len(encoded) <= UPLOAD_NAME_MAX_BYTES:
+        return name
+    suffix = Path(name).suffix
+    suffix_bytes = suffix.encode("utf-8")
+    budget = UPLOAD_NAME_MAX_BYTES - len(suffix_bytes)
+    # `errors="ignore"` on the way back: a hard byte cut can land mid-character if a future
+    # widening of `_UPLOAD_NAME_UNSAFE` ever admits a multi-byte one, and dropping the partial
+    # tail is preferable to `UnicodeDecodeError` turning a 400 into a 500.
+    if not suffix or budget < 1:
+        return encoded[:UPLOAD_NAME_MAX_BYTES].decode("utf-8", "ignore").strip("-") or "upload"
+    stem = Path(name).stem.encode("utf-8", "ignore")
+    stem = stem[:budget].decode("utf-8", "ignore").rstrip("-.") or "upload"
+    return stem + suffix
 
 
 def _upload_stamp() -> str:
