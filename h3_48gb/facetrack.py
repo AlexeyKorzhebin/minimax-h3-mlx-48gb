@@ -39,6 +39,15 @@ import cv2
 import numpy as np
 from scipy.signal import savgol_filter
 
+#: A hand-bumped marker for this module's own detection/track semantics -- bump it whenever a
+#: change here (a different YuNet score threshold, a different Savitzky-Golay window, ...) would
+#: make a track computed before the change not reproducible after it. `h3_48gb.cli.FACETRACK_VERSION`
+#: is a separate, CLI-side copy of this same number (Task 4 does not otherwise touch this module),
+#: recorded in every face-refine report's `checkpoint_identity_extra`; `test_cli_facerefine.py`
+#: pins the two together so a bump on one side that forgets the other is a red test, not a silently
+#: stale report field.
+TRACK_ALGO_VERSION = 1
+
 #: Where the YuNet ONNX weights must live. Not configurable: this module has exactly one detector,
 #: and a fixed path means every caller (and every error message) agrees on where to look, the same
 #: way `cli.DEFAULT_CHECKPOINT` is a fixed path rather than a parameter threaded through every call.

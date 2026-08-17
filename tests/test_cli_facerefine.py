@@ -157,6 +157,12 @@ def test_face_refine_input_is_required():
         parser.parse_args(["face-refine"])
 
 
+def test_face_refine_force_flag_defaults_to_false_and_can_be_set():
+    parser = build_parser()
+    assert parser.parse_args(["face-refine", "clip.mp4"]).force is False
+    assert parser.parse_args(["face-refine", "clip.mp4", "--force"]).force is True
+
+
 def test_restated_cli_defaults_agree_with_the_modules_they_are_restated_from():
     """`DEFAULT_FACE_TRACK_EVERY`/`DEFAULT_FACE_CROP_SCALE`/`DEFAULT_FACE_CROP_SIZE`/
     `DEFAULT_FACE_PASTE_FEATHER` exist in `cli.py` only because `facetrack`/`facepaste` are too
@@ -255,9 +261,29 @@ def test_ffmpeg_read_frames_cmd_decodes_to_rawvideo_rgb24_on_stdout():
     cmd = ffmpeg_read_frames_cmd(Path("/a/clip.mp4"))
     assert cmd[0] == "ffmpeg"
     assert "-i" in cmd and cmd[cmd.index("-i") + 1] == "/a/clip.mp4"
-    assert cmd[-3:] == ["-pix_fmt", "rgb24", "pipe:1"] or "pipe:1" in cmd
+    # M8: this used to be `cmd[-3:] == [...] or "pipe:1" in cmd` -- the `or` meant the assertion
+    # could never fail (the right side is true whenever the left side is), so the exact-tail shape
+    # was never actually checked. Strict now.
+    assert cmd[-3:] == ["-pix_fmt", "rgb24", "pipe:1"]
     assert "rawvideo" in cmd
     assert "rgb24" in cmd
+
+
+def test_ffmpeg_read_frames_cmd_disables_autorotate_and_maps_the_first_video_stream():
+    """I1: without `-noautorotate`, a clip carrying a rotation display-matrix (any portrait phone
+    video) decodes already transposed -- `ffprobe` (via `probe_video`) reports the stream's stored
+    geometry, but the rawvideo bytes on the pipe would be the rotated one, same byte count, wrong
+    width/height, and `read_video_frames`'s `reshape` would silently scramble the frame instead of
+    raising. Verified empirically against ffmpeg 8.1.2 in review: a 64x32 source with a 90-degree
+    display matrix decodes to 32x64 without this flag, 64x32 with it.
+    """
+    cmd = ffmpeg_read_frames_cmd(Path("/a/clip.mp4"))
+    assert "-noautorotate" in cmd
+    # Must land before `-i`: it is a per-input decoding option, not a global one.
+    assert cmd.index("-noautorotate") < cmd.index("-i")
+    # M1: explicit stream selection, the same reasoning `ffmpeg_write_cmd`'s own `-map` already
+    # documents -- "the first video stream" by construction, not by ffmpeg's own heuristics.
+    assert "-map" in cmd and cmd[cmd.index("-map") + 1] == "0:v:0"
 
 
 def test_ffmpeg_write_cmd_copies_audio_from_the_source_when_present():
@@ -281,6 +307,21 @@ def test_ffmpeg_write_cmd_omits_audio_mapping_when_the_source_has_none():
     assert "-map" not in cmd
     assert "-c:a" not in cmd
     assert str(Path("/src/clip.mp4")) not in cmd  # never opened as a second input
+
+
+def test_ffmpeg_write_cmd_caps_duration_at_the_shorter_stream_when_muxing_audio():
+    """M5: `-shortest` when there is a source audio track -- the piped video's own duration
+    (`len(frames) / fps`) need not match the source audio's exactly (a face track that drops
+    trailing frames, or a source whose audio simply runs longer), and without `-shortest` ffmpeg
+    pads the shorter stream instead of ending where it does.
+    """
+    info = VideoInfo(width=64, height=48, fps="24/1", has_audio=True)
+    cmd = ffmpeg_write_cmd(Path("/out/clip-faces.mp4"), Path("/src/clip.mp4"), info)
+    assert "-shortest" in cmd
+
+    silent_info = VideoInfo(width=64, height=48, fps="24/1", has_audio=False)
+    silent_cmd = ffmpeg_write_cmd(Path("/out/clip-faces.mp4"), Path("/src/clip.mp4"), silent_info)
+    assert "-shortest" not in silent_cmd  # nothing to be shorter than
 
 
 # --------------------------------------------------------------------------------------------
@@ -310,6 +351,29 @@ def test_probe_reports_no_audio_when_the_source_has_none(tmp_path):
     assert info.has_audio is False
 
 
+def test_probe_video_falls_back_to_25fps_when_ffprobe_reports_0_over_0(tmp_path, monkeypatch):
+    """M2: `probe_video`'s original fallback (`video.get("r_frame_rate") or "25/1"`) only caught an
+    absent/empty key -- ffprobe answers the literal string `"0/0"` (truthy) for a stream whose rate
+    it could not determine, which would reach `ffmpeg_write_cmd`'s `-r` unfiltered and ask ffmpeg
+    to mux at zero frames per second.
+    """
+    import json as json_mod
+
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    class _FakeProc:
+        returncode = 0
+        stdout = json_mod.dumps({
+            "streams": [{"codec_type": "video", "width": 32, "height": 32, "r_frame_rate": "0/0"}],
+        }).encode()
+        stderr = b""
+
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _FakeProc())
+    info = probe_video(clip)
+    assert info.fps == "25/1"
+
+
 @requires_ffmpeg
 def test_write_faces_mp4_round_trips_frame_count_and_keeps_the_source_audio(tmp_path):
     clip = tmp_path / "src.mp4"
@@ -328,6 +392,24 @@ def test_write_faces_mp4_round_trips_frame_count_and_keeps_the_source_audio(tmp_
     assert out_frames.shape[0] == frames.shape[0]
 
 
+@requires_ffmpeg
+def test_write_faces_mp4_raises_and_leaves_no_output_file_when_ffmpeg_fails(tmp_path):
+    """M9c: a real ffmpeg failure at write time (here: an output directory that does not exist,
+    which ffmpeg cannot create) must raise and must not leave a half-written or otherwise present
+    file at the destination -- a caller checking `out_path.exists()` after catching the error must
+    see the honest "nothing was written" it would see for any other refusal.
+    """
+    clip = tmp_path / "src.mp4"
+    _make_clip(clip, width=32, height=32, fps=4, frames=4, audio=False)
+    info = probe_video(clip)
+    frames = read_video_frames(clip, info)
+
+    bad_out = tmp_path / "does" / "not" / "exist" / "out.mp4"
+    with pytest.raises(RuntimeError):
+        write_faces_mp4(bad_out, frames, clip, info)
+    assert not bad_out.exists()
+
+
 # --------------------------------------------------------------------------------------------
 # run_face_refine: input missing
 # --------------------------------------------------------------------------------------------
@@ -337,6 +419,201 @@ def test_run_face_refine_refuses_a_missing_input(tmp_path):
         run_face_refine(tmp_path / "absent.mp4")
     assert excinfo.value.code == "face_refine_input_not_found"
     assert "absent.mp4" in excinfo.value.message
+
+
+# --------------------------------------------------------------------------------------------
+# I5: --sigma/--every validated before any I/O, against facerefine's own SIGMA_CEILING
+# --------------------------------------------------------------------------------------------
+
+def test_run_face_refine_refuses_sigma_above_the_ceiling_before_touching_the_input(tmp_path):
+    """Checked before `input_path.is_file()`: an absent input still reports `sigma_out_of_range`,
+    not `face_refine_input_not_found` -- proof the check runs before any I/O, per the brief.
+    """
+    absent = tmp_path / "absent.mp4"
+    with pytest.raises(CliError) as excinfo:
+        run_face_refine(absent, sigma=facerefine.SIGMA_CEILING + 0.01)
+    assert excinfo.value.code == "sigma_out_of_range"
+    assert not absent.exists()
+
+
+def test_run_face_refine_refuses_zero_and_negative_sigma(tmp_path):
+    absent = tmp_path / "absent.mp4"
+    for bad in (0.0, -0.1):
+        with pytest.raises(CliError) as excinfo:
+            run_face_refine(absent, sigma=bad)
+        assert excinfo.value.code == "sigma_out_of_range"
+
+
+def test_run_face_refine_sigma_ceiling_itself_is_accepted_not_refused():
+    """The bound is read off `facerefine.SIGMA_CEILING`, closed at the top (`<=`, not `<`): passing
+    exactly the ceiling must clear the sigma check and fail on the next thing instead (the absent
+    input), not on `sigma_out_of_range` -- proof the two bounds (this one and `refine_clip`'s own)
+    cannot silently drift apart into an off-by-epsilon disagreement.
+    """
+    with pytest.raises(CliError) as excinfo:
+        run_face_refine(Path("/does/not/exist-clip.mp4"), sigma=facerefine.SIGMA_CEILING)
+    assert excinfo.value.code == "face_refine_input_not_found"
+
+
+def test_run_face_refine_refuses_every_less_than_one_before_touching_the_input(tmp_path):
+    absent = tmp_path / "absent.mp4"
+    with pytest.raises(CliError) as excinfo:
+        run_face_refine(absent, every=0)
+    assert excinfo.value.code == "invalid_every"
+    assert not absent.exists()
+
+    with pytest.raises(CliError) as excinfo:
+        run_face_refine(absent, every=-3)
+    assert excinfo.value.code == "invalid_every"
+
+
+# --------------------------------------------------------------------------------------------
+# I3: --checkpoint/--turbo-lora/--adaln-dir validated before decode
+# --------------------------------------------------------------------------------------------
+
+def test_run_face_refine_refuses_a_missing_checkpoint_before_decode(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    def fake_probe(path):
+        raise AssertionError("probe_video must not run before --checkpoint is validated")
+
+    with pytest.raises(CliError) as excinfo:
+        run_face_refine(clip, checkpoint=tmp_path / "no-such-checkpoint", probe_fn=fake_probe)
+    assert excinfo.value.code == "checkpoint_not_found"
+
+
+def test_run_face_refine_refuses_a_missing_turbo_lora_before_decode(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    def fake_probe(path):
+        raise AssertionError("probe_video must not run before --turbo-lora is validated")
+
+    with pytest.raises(CliError) as excinfo:
+        run_face_refine(clip, turbo_lora=tmp_path / "no-such-lora.safetensors", probe_fn=fake_probe)
+    assert excinfo.value.code == "lora_not_found"
+
+
+def test_run_face_refine_refuses_a_missing_adaln_dir_before_decode(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    def fake_probe(path):
+        raise AssertionError("probe_video must not run before --adaln-dir is validated")
+
+    with pytest.raises(CliError) as excinfo:
+        run_face_refine(clip, adaln_dir=tmp_path / "no-such-adaln-dir", probe_fn=fake_probe)
+    assert excinfo.value.code == "adaln_dir_not_found"
+
+
+def test_run_face_refine_accepts_none_turbo_lora_without_checking_a_path(tmp_path):
+    """`turbo_lora=None` means "no LoRA"; it must not be treated as a missing-file refusal."""
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    n_frames = 4
+    frames = np.zeros((n_frames, 32, 32, 3), dtype=np.uint8)
+    fake_info = VideoInfo(width=32, height=32, fps="4/1", has_audio=False)
+    track = _dense_track(n_frames, box=(4.0, 4.0, 10.0, 10.0))
+
+    report = run_face_refine(
+        clip, turbo_lora=None,
+        probe_fn=lambda path: fake_info,
+        read_frames_fn=lambda path, info: frames,
+        write_output_fn=lambda *a, **k: None,
+        detect_track_fn=lambda f, every: track,
+        refine_clip_fn=_fake_refine_clip,
+        verbose=False,
+    )
+    assert report["turbo_lora"] is None
+
+
+# --------------------------------------------------------------------------------------------
+# I2: --out safety -- refuse out==input, refuse an existing --out without --force
+# --------------------------------------------------------------------------------------------
+
+def test_run_face_refine_refuses_when_out_resolves_to_the_input(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"original bytes, must survive the refusal untouched")
+    with pytest.raises(CliError) as excinfo:
+        run_face_refine(clip, out=clip)
+    assert excinfo.value.code == "face_refine_output_is_input"
+    assert clip.read_bytes() == b"original bytes, must survive the refusal untouched"
+
+
+def test_run_face_refine_refuses_when_out_resolves_to_the_input_via_a_relative_spelling(
+    tmp_path, monkeypatch,
+):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(CliError) as excinfo:
+        run_face_refine(clip, out=Path("clip.mp4"))
+    assert excinfo.value.code == "face_refine_output_is_input"
+
+
+def test_run_face_refine_refuses_an_existing_out_without_force(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    out_path = face_refine_output_path(clip, None)
+    out_path.write_bytes(b"a previous face-refine result, must not be silently replaced")
+
+    with pytest.raises(CliError) as excinfo:
+        run_face_refine(clip)
+    assert excinfo.value.code == "output_exists"
+    assert out_path.read_bytes() == b"a previous face-refine result, must not be silently replaced"
+
+
+def test_run_face_refine_force_overwrites_an_existing_out(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    out_path = face_refine_output_path(clip, None)
+    out_path.write_bytes(b"stale")
+
+    n_frames = 4
+    frames = np.zeros((n_frames, 32, 32, 3), dtype=np.uint8)
+    fake_info = VideoInfo(width=32, height=32, fps="4/1", has_audio=False)
+    track = _dense_track(n_frames, box=(4.0, 4.0, 10.0, 10.0))
+    written = {}
+
+    report = run_face_refine(
+        clip, force=True,
+        probe_fn=lambda path: fake_info,
+        read_frames_fn=lambda path, info: frames,
+        write_output_fn=lambda p, *a: written.setdefault("out_path", Path(p)),
+        detect_track_fn=lambda f, every: track,
+        refine_clip_fn=_fake_refine_clip,
+        verbose=False,
+    )
+    assert report["ok"] is True
+    assert written["out_path"] == out_path
+
+
+# --------------------------------------------------------------------------------------------
+# M6: --out under a directory that does not exist yet gets one, rather than failing the run
+# --------------------------------------------------------------------------------------------
+
+def test_run_face_refine_creates_the_parent_directory_of_a_custom_out(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    custom_out = tmp_path / "brand" / "new" / "dir" / "result.mp4"
+    assert not custom_out.parent.exists()
+
+    n_frames = 4
+    frames = np.zeros((n_frames, 32, 32, 3), dtype=np.uint8)
+    fake_info = VideoInfo(width=32, height=32, fps="4/1", has_audio=False)
+    track = _dense_track(n_frames, box=(4.0, 4.0, 10.0, 10.0))
+
+    run_face_refine(
+        clip, out=custom_out,
+        probe_fn=lambda path: fake_info,
+        read_frames_fn=lambda path, info: frames,
+        write_output_fn=lambda *a, **k: None,
+        detect_track_fn=lambda f, every: track,
+        refine_clip_fn=_fake_refine_clip,
+        verbose=False,
+    )
+    assert custom_out.parent.is_dir()
 
 
 # --------------------------------------------------------------------------------------------
@@ -399,15 +676,12 @@ def test_main_face_refine_no_face_json_reports_the_stable_code(tmp_path, monkeyp
     code = main(["face-refine", str(clip), "--json"])
     assert code == 1
     payload = json.loads(capsys.readouterr().out)
-    assert payload == {
-        "ok": False,
-        "error": {
-            "code": "face_not_found",
-            "message": payload["error"]["message"],
-            "detail": payload["error"]["detail"],
-        },
-    }
-    assert payload["error"]["detail"]["every"] == 5
+    # M11: was `payload == {..., "message": payload["error"]["message"], ...}` -- comparing a
+    # field against itself is a tautology that can never fail. Explicit expected values instead.
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "face_not_found"
+    assert "не найдено" in payload["error"]["message"]
+    assert payload["error"]["detail"] == {"input": str(clip), "every": 5, "frames": 6}
 
 
 def test_main_face_refine_happy_path_prints_the_done_line_and_returns_zero(tmp_path, monkeypatch, capsys):
@@ -565,6 +839,153 @@ def test_run_face_refine_passes_window_step_crossfade_sigma_seed_through(tmp_pat
     assert refine_calls[0]["crossfade"] == 4
 
 
+# --------------------------------------------------------------------------------------------
+# M4: the report (and the "done" line) distinguish the whole pass from the refine call alone
+# --------------------------------------------------------------------------------------------
+
+def test_run_face_refine_report_distinguishes_total_pass_time_from_refine_time(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    n_frames = 4
+    frames = np.zeros((n_frames, 32, 32, 3), dtype=np.uint8)
+    fake_info = VideoInfo(width=32, height=32, fps="4/1", has_audio=False)
+    track = _dense_track(n_frames, box=(4.0, 4.0, 10.0, 10.0))
+
+    def slow_probe(path):
+        import time as time_mod
+        # Long enough that `round(..., 1)` cannot round it away to the same 0.0 as the instant
+        # refine stub -- `total_seconds` and `refine_seconds` must differ at the report's own
+        # precision, not merely in theory.
+        time_mod.sleep(0.15)
+        return fake_info
+
+    report = run_face_refine(
+        clip,
+        probe_fn=slow_probe,
+        read_frames_fn=lambda path, info: frames,
+        write_output_fn=lambda *a, **k: None,
+        detect_track_fn=lambda f, every: track,
+        refine_clip_fn=_fake_refine_clip,  # instant -- no sleep
+        verbose=False,
+    )
+    assert "total_seconds" in report and "refine_seconds" in report
+    # The stub refine is instant; `slow_probe` is not -- `total_seconds` (the whole pass) must
+    # exceed `refine_seconds` (just the `refine_clip` call), proof it is not just an alias for it.
+    assert report["total_seconds"] > report["refine_seconds"]
+
+
+def test_main_face_refine_done_line_reports_total_time_alongside_refine_time(tmp_path, monkeypatch, capsys):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    n_frames = 4
+    fake_info = VideoInfo(width=32, height=32, fps="4/1", has_audio=False)
+    fake_frames = np.zeros((n_frames, 32, 32, 3), dtype=np.uint8)
+    track = _dense_track(n_frames, box=(4.0, 4.0, 10.0, 10.0))
+
+    monkeypatch.setattr(cli, "probe_video", lambda path: fake_info)
+    monkeypatch.setattr(cli, "read_video_frames", lambda path, info: fake_frames)
+    monkeypatch.setattr(cli, "write_faces_mp4", lambda *a, **k: None)
+    monkeypatch.setattr(ft, "detect_track", lambda frames, every=5: track)
+    monkeypatch.setattr(facerefine, "refine_clip", lambda crops, **kwargs: crops)
+
+    code = main(["face-refine", str(clip)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "done in" in out
+    assert "refine" in out
+
+
+# --------------------------------------------------------------------------------------------
+# M9b: at least one progress-stage line reaches stdout under verbose=True
+# --------------------------------------------------------------------------------------------
+
+def test_run_face_refine_prints_progress_stage_lines_when_verbose(tmp_path, capsys):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    n_frames = 4
+    frames = np.zeros((n_frames, 32, 32, 3), dtype=np.uint8)
+    fake_info = VideoInfo(width=32, height=32, fps="4/1", has_audio=False)
+    track = _dense_track(n_frames, box=(4.0, 4.0, 10.0, 10.0))
+
+    run_face_refine(
+        clip,
+        probe_fn=lambda path: fake_info,
+        read_frames_fn=lambda path, info: frames,
+        write_output_fn=lambda *a, **k: None,
+        detect_track_fn=lambda f, every: track,
+        refine_clip_fn=_fake_refine_clip,
+        verbose=True,
+    )
+    out = capsys.readouterr().out
+    assert "face-refine: reading" in out
+    assert "face-refine: detecting the face track" in out
+    assert "face-refine: writing" in out
+
+
+# --------------------------------------------------------------------------------------------
+# I4: checkpoint_identity_extra's provenance is written to a sidecar next to the output
+# --------------------------------------------------------------------------------------------
+
+def test_run_face_refine_writes_a_provenance_sidecar_next_to_the_output(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"clip bytes for the sidecar's own source digest")
+    n_frames = 4
+    frames = np.zeros((n_frames, 32, 32, 3), dtype=np.uint8)
+    fake_info = VideoInfo(width=32, height=32, fps="4/1", has_audio=False)
+    track = _dense_track(n_frames, box=(4.0, 4.0, 10.0, 10.0))
+
+    report = run_face_refine(
+        clip, sigma=0.1234,
+        probe_fn=lambda path: fake_info,
+        read_frames_fn=lambda path, info: frames,
+        write_output_fn=lambda *a, **k: None,
+        detect_track_fn=lambda f, every: track,
+        refine_clip_fn=_fake_refine_clip,
+        verbose=False,
+    )
+    out_path = Path(report["output"])
+    sidecar = out_path.with_suffix(".json")
+    assert sidecar.is_file()
+    on_disk = json.loads(sidecar.read_text())
+    assert on_disk == report
+    extra = on_disk["checkpoint_identity_extra"]
+    assert extra["source_digest"].startswith("sha256:")
+    assert extra["facetrack_version"] == FACETRACK_VERSION
+    # M3-quantized: 0.1234 rounds to 0.12, matching the two-decimal precision `refine_clip`'s own
+    # `_validate_request` keys its partial-table cache on -- the report should say what actually
+    # ran, not the raw flag value that would mislead a later comparison into seeing a difference
+    # where the table used was identical.
+    assert on_disk["sigma"] == 0.12
+    assert extra["sigma"] == 0.12
+
+
+def test_run_face_refine_sidecar_survives_a_json_round_trip_for_a_later_prompt_chain(tmp_path):
+    """The whole point of I4: a face-refine pass *over* a face-refine output must find its own
+    prompt via `resolve_face_refine_prompt` -- which only works if the sidecar this test writes is
+    readable back as `<stem>.json` next to `<stem>.mp4`, with a `"prompt"` field.
+    """
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    n_frames = 4
+    frames = np.zeros((n_frames, 32, 32, 3), dtype=np.uint8)
+    fake_info = VideoInfo(width=32, height=32, fps="4/1", has_audio=False)
+    track = _dense_track(n_frames, box=(4.0, 4.0, 10.0, 10.0))
+
+    report = run_face_refine(
+        clip, prompt="a specific face, lit from the left",
+        probe_fn=lambda path: fake_info,
+        read_frames_fn=lambda path, info: frames,
+        write_output_fn=lambda *a, **k: None,
+        detect_track_fn=lambda f, every: track,
+        refine_clip_fn=_fake_refine_clip,
+        verbose=False,
+    )
+    out_path = Path(report["output"])
+    chained_prompt, chained_source = resolve_face_refine_prompt(out_path, None)
+    assert chained_prompt == "a specific face, lit from the left"
+    assert chained_source == "task_json"
+
+
 def test_run_face_refine_falls_back_to_task_json_prompt_when_no_flag_given(tmp_path):
     clip = tmp_path / "h3-run-896x512.mp4"
     clip.write_bytes(b"x")
@@ -667,3 +1088,18 @@ def test_source_digest_is_stable_for_the_same_content():
         path = Path(tmp) / "clip.mp4"
         path.write_bytes(b"deterministic content")
         assert cli._source_digest(path) == cli._source_digest(path)
+
+
+# --------------------------------------------------------------------------------------------
+# M10: `cli.FACETRACK_VERSION` is a hand-bumped copy of `facetrack.TRACK_ALGO_VERSION`
+# --------------------------------------------------------------------------------------------
+
+def test_facetrack_version_marker_is_pinned_to_the_module_it_describes():
+    """Task 4 may not otherwise touch `facetrack.py`, so `cli.FACETRACK_VERSION` cannot read the
+    real version off the module the way `--sigma`/`--window`/etc. read off `facerefine`'s own
+    constants -- it is a separate, hand-maintained copy instead. This pins the two together so a
+    bump on one side that forgets the other (a real change to `facetrack`'s detection/track
+    semantics, with the CLI-side marker left stale) is a red test, not a silently wrong
+    `checkpoint_identity_extra.facetrack_version` in every report from then on.
+    """
+    assert cli.FACETRACK_VERSION == ft.TRACK_ALGO_VERSION

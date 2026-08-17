@@ -148,7 +148,8 @@ def baked_grid_points(checkpoint: Path) -> int | None:
 ERROR_CODES = {
     "geometry_not_multiple_of_32": "--width or --height is not a multiple of 32; the port cannot pack it",
     "schedule_not_baked": "--steps does not equal the one grid size the baked AdaLN table covers",
-    "checkpoint_not_found": "`resume` was asked for, but no checkpoint matches this run's identity",
+    "checkpoint_not_found": "`resume` was asked for, but no checkpoint matches this run's identity; "
+                           "or `face-refine --checkpoint` names a model directory that does not exist",
     "checkpoint_mismatch": "a checkpoint exists but was written for a different request or model",
     "checkpoint_corrupt": "a checkpoint exists but could not be read",
     "checkpoint_locked": "another process already holds the lock for this checkpoint",
@@ -173,6 +174,12 @@ ERROR_CODES = {
     "face_refine_input_not_found": "`face-refine`'s source clip does not exist",
     "face_not_found": "`facetrack.detect_track` found no face anywhere in the source clip; "
                       "face-refine has nothing to refine, and no output file is written",
+    "adaln_dir_not_found": "`face-refine --adaln-dir` names a directory that does not exist",
+    "sigma_out_of_range": "`face-refine --sigma` is not in (0, facerefine.SIGMA_CEILING]",
+    "invalid_every": "`face-refine --every` must be >= 1: a face-detection cadence of 0 or less samples nothing",
+    "face_refine_output_is_input": "`face-refine --out` resolves to the same file as the source clip; "
+                                   "refining in place would overwrite the source mid-decode",
+    "output_exists": "`face-refine`'s output path already exists; pass --force to overwrite it",
     "worker_already_running": "another worker already holds queue/worker.lock on this machine",
     # Raised by `h3_48gb.web`, listed here because the contract is one contract: the CLI, the
     # worker and the server all answer with the same `{"ok": false, "error": {"code", ...}}`
@@ -547,6 +554,8 @@ def build_parser() -> argparse.ArgumentParser:
     fr.add_argument("input", type=Path, help="source .mp4 to refine")
     fr.add_argument("--out", type=Path, default=None,
                     help="output path (default: <stem>-faces.mp4 next to the input)")
+    fr.add_argument("--force", action="store_true",
+                    help="overwrite --out if it already exists (default: refuse)")
     fr.add_argument("--sigma", type=float, default=facerefine.DEFAULT_SIGMA,
                     help=f"denoise strength, 0.15-0.25 in practice; `refine_clip` itself refuses "
                          f"above {facerefine.SIGMA_CEILING} rather than clipping to it (default "
@@ -1409,17 +1418,35 @@ def probe_video(path: Path) -> VideoInfo:
     if video is None:
         raise RuntimeError(f"{path}: ffprobe found no video stream")
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
-    return VideoInfo(width=int(video["width"]), height=int(video["height"]),
-                     fps=str(video.get("r_frame_rate") or "25/1"), has_audio=has_audio)
+    # `r_frame_rate` is ffprobe's own contract for "the stream's frame rate", but it answers
+    # `"0/0"` (not absent, not `None` -- a literal zero-over-zero string) for a stream whose rate it
+    # could not determine, which the `or` above alone does not catch: `"0/0"` is truthy. Piping that
+    # straight into `-r` at write time would ask ffmpeg to mux at zero frames per second.
+    fps_raw = video.get("r_frame_rate")
+    fps = str(fps_raw) if fps_raw and str(fps_raw) != "0/0" else "25/1"
+    return VideoInfo(width=int(video["width"]), height=int(video["height"]), fps=fps,
+                     has_audio=has_audio)
 
 
 def ffmpeg_read_frames_cmd(path: Path) -> list[str]:
     """The command `read_video_frames` pipes from: every frame of `path`, decoded to raw RGB24.
 
+    `-noautorotate` disables ffmpeg's own display-matrix auto-rotation: without it, a clip carrying
+    a rotation side-data tag (any portrait video shot on a phone) is decoded already transposed --
+    `ffprobe` reports the stream's *stored* geometry (say 64x32), ffmpeg's rawvideo output is
+    actually 32x64, `read_video_frames`'s `len(raw) % frame_bytes` guard cannot tell (same byte
+    count, wrong shape), and the `reshape` below silently produces a scrambled frame instead of
+    raising. `-noautorotate` keeps the decoded pixels in the stream's stored orientation, matching
+    what `probe_video` reported and what `write_faces_mp4` will mux back out.
+
+    `-map 0:v:0` picks the first video stream explicitly rather than trusting ffmpeg's own
+    stream-selection heuristics, the same reasoning `ffmpeg_write_cmd`'s own `-map` has.
+
     Split out from `read_video_frames` so the command itself -- what actually reaches the source
     clip, in what order -- can be asserted on directly in a test, with no ffmpeg process involved.
     """
-    return ["ffmpeg", "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    return ["ffmpeg", "-v", "error", "-noautorotate", "-i", str(path), "-map", "0:v:0",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
 
 
 def read_video_frames(path: Path, info: VideoInfo) -> np.ndarray:
@@ -1428,6 +1455,11 @@ def read_video_frames(path: Path, info: VideoInfo) -> np.ndarray:
     Reads the whole clip into memory at once -- correct at face-refine's own scale (a handful of
     seconds, the same clips `h3 generate` produces) and simpler than a streaming decode; nothing
     downstream (`facetrack.detect_track`, `facepaste.crop_window`) is written to stream either.
+
+    The returned array is a `np.frombuffer` view over `proc.stdout`'s own bytes and is therefore
+    **not writeable** (`.flags.writeable is False`) -- any caller that needs to mutate frames in
+    place (none of `detect_track`/`crop_window` do; they read only) must `.copy()` first, or numpy
+    raises `ValueError: assignment destination is read-only`.
     """
     proc = subprocess.run(ffmpeg_read_frames_cmd(path), capture_output=True)
     if proc.returncode != 0:
@@ -1451,9 +1483,13 @@ def ffmpeg_write_cmd(out_path: Path, source_path: Path, info: VideoInfo) -> list
 
     `-map 0:v:0 -map 1:a:0` rather than a bare second `-i source_path`: without an explicit map,
     ffmpeg is free to pick either input's audio by its own stream-selection heuristics; an explicit
-    map makes "video from the pipe, audio from the source, unchanged" true by construction. Split
-    out from `write_faces_mp4` for the same "assert the command, not the subprocess" reason as
-    `ffmpeg_read_frames_cmd`.
+    map makes "video from the pipe, audio from the source, unchanged" true by construction.
+    `-shortest` when there is an audio track: the piped video's duration is exactly `len(frames) /
+    fps`, which need not match the source audio's own duration to the frame (frame-count paths like
+    a face track that drops trailing frames, or a source whose audio runs a hair longer than its
+    video), and without `-shortest` ffmpeg pads the short side, leaving a silent or frozen tail
+    instead of ending where the shorter of the two streams does. Split out from `write_faces_mp4`
+    for the same "assert the command, not the subprocess" reason as `ffmpeg_read_frames_cmd`.
     """
     cmd = [
         "ffmpeg", "-y", "-v", "error",
@@ -1461,7 +1497,7 @@ def ffmpeg_write_cmd(out_path: Path, source_path: Path, info: VideoInfo) -> list
         "-s", f"{info.width}x{info.height}", "-r", info.fps, "-i", "pipe:0",
     ]
     if info.has_audio:
-        cmd += ["-i", str(source_path), "-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy"]
+        cmd += ["-i", str(source_path), "-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy", "-shortest"]
     cmd += ["-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(out_path)]
     return cmd
 
@@ -1488,7 +1524,7 @@ def face_refine_output_path(input_path: Path, out: Path | None) -> Path:
 
 
 def run_face_refine(
-    input_path: Path, *, out: Path | None = None,
+    input_path: Path, *, out: Path | None = None, force: bool = False,
     sigma: float = facerefine.DEFAULT_SIGMA, seed: int = 42,
     window: int = facerefine.WINDOW_FRAMES, step: int = facerefine.WINDOW_STEP,
     crossfade: int = facerefine.CROSSFADE_FRAMES,
@@ -1524,13 +1560,86 @@ def run_face_refine(
     internal" shape `run_generate` uses for `pipeline_factory`/`save_mp4_fn`/`save_wav_fn`. Each
     defaults to the real function it replaces when left `None`.
     """
+    run_started = time.perf_counter()
     input_path = Path(input_path)
+
+    # I5: the cheapest possible refusals, checked before any I/O at all -- a bad `--sigma` or
+    # `--every` must not cost the ffprobe/ffmpeg read that follows. The sigma ceiling is read off
+    # `facerefine.SIGMA_CEILING` rather than duplicated as a literal, so the two bounds cannot
+    # drift; `refine_clip`'s own `_validate_request` enforces the identical bound again once the
+    # pipeline is loaded -- this is the early, decode-free refusal, not a replacement for that one.
+    if isinstance(sigma, bool) or not isinstance(sigma, (int, float)) \
+            or not (0 < sigma <= facerefine.SIGMA_CEILING):
+        raise CliError(
+            "sigma_out_of_range",
+            f"--sigma must be in (0, {facerefine.SIGMA_CEILING}], got {sigma!r}",
+            {"sigma": sigma, "ceiling": facerefine.SIGMA_CEILING},
+        )
+    if every < 1:
+        raise CliError(
+            "invalid_every",
+            f"--every must be >= 1 (a face-detection sample every N frames), got {every}",
+            {"every": every},
+        )
+
     if not input_path.is_file():
         raise CliError(
             "face_refine_input_not_found",
             f"face-refine's source clip does not exist: {input_path}",
             {"input": str(input_path)},
         )
+
+    # I3: the three flags that name a path on disk, checked before a single frame is decoded -- a
+    # typo in --checkpoint/--turbo-lora/--adaln-dir would otherwise cost the minutes of ffmpeg
+    # decode and YuNet detection that follow before `refine_clip` ever got a chance to notice the
+    # same typo itself, and under --json the eventual failure would arrive as an opaque
+    # `internal_error` (a `FileNotFoundError` from deep inside `ensure_partial_table`) rather than
+    # a stable code naming which flag was wrong.
+    if not Path(checkpoint).exists():
+        raise CliError(
+            "checkpoint_not_found",
+            f"--checkpoint does not exist: {checkpoint}",
+            {"checkpoint": str(checkpoint)},
+        )
+    if turbo_lora is not None and not Path(turbo_lora).exists():
+        raise CliError(
+            "lora_not_found",
+            f"--turbo-lora does not exist: {turbo_lora}",
+            {"path": str(turbo_lora)},
+        )
+    if not Path(adaln_dir).exists():
+        raise CliError(
+            "adaln_dir_not_found",
+            f"--adaln-dir does not exist: {adaln_dir}",
+            {"adaln_dir": str(adaln_dir)},
+        )
+
+    # I2: an --out that resolves to the source clip itself, or to a file that already exists
+    # without --force, refused before decode. `ffmpeg_write_cmd`'s `-y` would otherwise truncate a
+    # silent source clip the moment writing began (an ffmpeg with an audio track refuses on its
+    # own, which is how this was first noticed -- a silent one does not), and a second run over the
+    # same --out would silently replace a previous result with no warning either way. `.resolve()`
+    # on both sides so `--out clip.mp4` run from the clip's own directory is caught the same as an
+    # absolute path spelled differently.
+    out_path = face_refine_output_path(input_path, out)
+    if out_path.resolve() == input_path.resolve():
+        raise CliError(
+            "face_refine_output_is_input",
+            f"--out resolves to the source clip itself ({input_path}); refining in place would "
+            "overwrite the source while it is still being read. Pass a different --out.",
+            {"input": str(input_path), "output": str(out_path)},
+        )
+    if out_path.exists() and not force:
+        raise CliError(
+            "output_exists",
+            f"{out_path} already exists; pass --force to overwrite it",
+            {"output": str(out_path)},
+        )
+    # M6: `--out` naming a path under a directory that does not exist yet is a normal thing to ask
+    # for (the default `<stem>-faces.mp4` never hits this -- it is always the input's own
+    # directory, which by definition exists) -- create it rather than failing the whole run over a
+    # missing `mkdir -p`.
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     probe = probe_fn or probe_video
     read_frames = read_frames_fn or read_video_frames
@@ -1589,18 +1698,26 @@ def run_face_refine(
     say("face-refine: pasting the refined face back...")
     final_frames = paste_back(frames, refined, geometry, track, feather=feather)
 
-    out_path = face_refine_output_path(input_path, out)
     say(f"face-refine: writing {out_path.name}...")
     write_output(out_path, final_frames, input_path, info)
 
-    return {
+    # The sigma actually applied, not the one the caller typed: `refine_clip`'s own
+    # `_validate_request` quantizes to two decimals before it ever keys the partial-table cache
+    # (see `facerefine.py`'s module docstring on why), so `sigma=0.1234` runs as 0.12 -- the report
+    # (and its provenance sidecar below) should say the number that determined the table, not the
+    # number that would mislead a later `--sigma` comparison into thinking two runs differ when
+    # they used the identical table.
+    report_sigma = round(float(sigma), 2)
+    total_elapsed = time.perf_counter() - run_started
+
+    report = {
         "ok": True,
         "input": str(input_path),
         "output": str(out_path),
         "frames": n_frames,
         "fps": info.fps,
         "audio": info.has_audio,
-        "sigma": sigma,
+        "sigma": report_sigma,
         "seed": seed,
         "window": window,
         "step": step,
@@ -1613,7 +1730,13 @@ def run_face_refine(
         "turbo_lora": str(turbo_lora) if turbo_lora else None,
         "prompt": prompt_text,
         "prompt_source": prompt_source,
+        # M4: `refine_seconds` alone (only the `refine_clip` call) undercounted the pass a "done in"
+        # line should honestly report -- probing, decoding, detecting, cropping and pasting/writing
+        # are not free, and on a real clip are seconds, not nothing. `total_seconds` is the whole
+        # pass, from the top of this function to here; `refine_seconds` stays alongside it so the
+        # GPU-bound half is still visible on its own.
         "refine_seconds": round(elapsed, 1),
+        "total_seconds": round(total_elapsed, 1),
         # Provenance for this specific report, not a resumable checkpoint (face-refine has no
         # resume path) -- named after `h3_48gb.checkpoint.CheckpointingPipeline
         # .checkpoint_identity_extra`'s own idea (what, outside the request itself, would make two
@@ -1621,13 +1744,22 @@ def run_face_refine(
         # file's metadata.
         "checkpoint_identity_extra": {
             "source_digest": _source_digest(input_path),
-            "sigma": sigma,
+            "sigma": report_sigma,
             "window": window,
             "step": step,
             "crossfade": crossfade,
             "facetrack_version": FACETRACK_VERSION,
         },
     }
+    # I4: written next to the output unconditionally -- human mode or --json, it does not matter --
+    # the same "one report, one place on disk" contract `run_generate` keeps for its own `<stem>
+    # .json` (this file's `_prompt_from_task_json` reads exactly that sidecar). Without this, a
+    # face-refine run's own provenance (source digest, the sigma/window/step/crossfade it actually
+    # used) lived only in stdout and vanished the moment the terminal scrolled -- and a face-refine
+    # pass run *over* a face-refine output could never find its own prompt, because there was no
+    # sidecar for it to read.
+    out_path.with_suffix(".json").write_text(json.dumps(report, indent=2))
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1692,14 +1824,15 @@ def main(argv: list[str] | None = None) -> int:
                       f"checkpoint at {report['checkpoint']} is missing: {', '.join(report['missing'])}")
         elif args.command == "face-refine":
             report = run_face_refine(
-                args.input, out=args.out, sigma=args.sigma, seed=args.seed,
+                args.input, out=args.out, force=args.force, sigma=args.sigma, seed=args.seed,
                 window=args.window, step=args.step, crossfade=args.crossfade,
                 every=args.every, scale=args.scale, feather=args.feather,
                 checkpoint=args.checkpoint, adaln_dir=args.adaln_dir, turbo_lora=args.turbo_lora,
                 prompt=args.prompt, verbose=not as_json,
             )
             ok = True
-            human = f"done in {report['refine_seconds'] / 60:.1f} min -> {report['output']}"
+            human = (f"done in {report['total_seconds'] / 60:.1f} min "
+                     f"(refine {report['refine_seconds'] / 60:.1f} min) -> {report['output']}")
         else:  # pragma: no cover - argparse's `required=True` on the subcommand rules this out
             raise CliError("internal_error", f"unknown command {args.command!r}")
     except CliError as exc:
