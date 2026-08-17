@@ -360,6 +360,54 @@ def test_main_loop_runs_the_queue_in_order_and_counts_what_it_ran(tmp_path):
     assert q.job_path(root, second.id, "done").exists()
 
 
+def test_the_queue_pauses_itself_once_it_runs_dry_but_not_between_jobs(tmp_path):
+    """Очередь, опустевшая сама собой, обязана встать на паузу.
+
+    Иначе вечер выглядит так: ночная пачка досчиталась, человек утром кидает в форму пару задач,
+    чтобы посмотреть на них перед запуском, — и они стартуют сами, потому что работник всё ещё
+    крутится и берёт всё, что видит. Маркер после последней задачи возвращает решение «считать»
+    человеку.
+
+    Ровно два утверждения, и второе не менее важно первого: *между* задачами паузы быть не должно,
+    иначе пачка из десяти роликов встанет после первого же.
+    """
+    root = tmp_path / "queue"
+    _queued(root, tmp_path, tag="a")
+    _queued(root, tmp_path, tag="b")
+    q.set_paused(root, False)
+    spawned: list[list[str]] = []
+
+    ran = _answer_within(10, lambda: worker.main_loop(
+        root, poll=0.01, stop=_stop_after(1.0), spawn=_recording(spawned)))
+
+    assert ran == 2, f"пауза не должна вставать между задачами, пока pending непуст, ran {ran}"
+    assert [cmd[cmd.index("--tag") + 1] for cmd in spawned] == ["a", "b"], (
+        "обе задачи обязаны отсчитаться подряд")
+    assert q.is_paused(root) is True, "опустевшая очередь обязана поставить маркер паузы"
+
+
+def test_a_job_added_after_the_queue_drained_waits_for_a_human(tmp_path):
+    """Вторая половина того же правила: маркер, поставленный опустевшей очередью, обязан
+    удерживать следующую задачу — иначе он не значит ничего.
+    """
+    root = tmp_path / "queue"
+    _queued(root, tmp_path, tag="a")
+    q.set_paused(root, False)
+    spawned: list[list[str]] = []
+    _answer_within(10, lambda: worker.main_loop(
+        root, poll=0.01, stop=_stop_after(0.6), spawn=_recording(spawned)))
+    assert q.is_paused(root) is True
+
+    _queued(root, tmp_path, tag="b")            # человек накидал новую поверх стоящего маркера
+    after: list[list[str]] = []
+    ran = _answer_within(10, lambda: worker.main_loop(
+        root, poll=0.01, stop=_stop_after(0.6), spawn=_recording(after)))
+
+    assert (ran, after) == (0, []), "задача поверх стоящего маркера не должна стартовать сама"
+    assert q.job_path(root, q.scan(root)[0][0].id, "pending").exists(), (
+        "она обязана остаться ждущей, а не пропасть")
+
+
 # -- Step 7: a live job elsewhere defers the queue, and the queue resumes afterwards -------------
 
 

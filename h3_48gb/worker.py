@@ -314,6 +314,16 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir
     wreckage from a killed worker and still respects a live lease or a resident model -- pausing
     the *selection* of new work must not also pause the bookkeeping that keeps `running/` honest.
 
+    That third gate is also raised from inside this loop and not only by a human: once a finished
+    job leaves nothing in `pending/`, `q.pause_if_drained` puts the marker up. A queue that empties
+    itself stops rather than standing ready to grab whatever lands next -- the morning after a
+    night's batch, the two jobs a human drops into the form to *look at* before starting would
+    otherwise begin computing on their own. The check happens after each `run_job` and not on the
+    `claim`-returned-`None` branch on purpose: pausing on an idle pass would also pause a queue a
+    human had just resumed and not yet filled. See `pause_if_drained` for why the emptiness test and
+    the marker share one lock acquisition, and note that it cannot fire between two queued jobs --
+    with the second still in `pending/` the queue is not drained.
+
     `stop` is anything with `is_set()`/`wait()`; `_stop_signals` sets the one created here when the
     first `SIGTERM`/`SIGINT` arrives. It stops the *selection* of new jobs only -- a job already
     running is never interrupted by it, which is why the check sits at the top of the loop and
@@ -365,5 +375,6 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir
                 continue
             run_job(root, job, spawn=spawn)
             ran += 1
+            q.pause_if_drained(root)
 
     return ran
