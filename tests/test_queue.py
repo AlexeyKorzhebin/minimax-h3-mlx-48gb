@@ -1610,6 +1610,22 @@ def test_a_missing_paused_marker_reads_as_not_paused(tmp_path):
     assert q.is_paused(root) is False
 
 
+def test_is_paused_reads_as_not_paused_when_the_marker_cannot_even_be_stat_ed(tmp_path,
+                                                                              monkeypatch):
+    """BACKLOG "UX-мелочи", task 2. `Path.exists` only swallows the errnos that mean "there is
+    nothing here" (`ENOENT` and friends); a directory this process cannot `stat` at all --
+    permissions changed under it, a network mount gone away -- raises `PermissionError` straight
+    through instead of returning `False`. `is_paused`'s own docstring already promises the safe
+    direction ("a missing marker means not paused") for exactly this class of failure, so the
+    exception must not reach `main_loop` -- it must read the same as a missing marker.
+    """
+    def broken_exists(self):
+        raise PermissionError("no permission to stat this")
+
+    monkeypatch.setattr(Path, "exists", broken_exists)
+    assert q.is_paused(tmp_path / "queue") is False
+
+
 def test_set_paused_and_is_paused_round_trip(tmp_path):
     """The pair on a queue that already exists, independent of whatever `layout` set the marker to
     when it created the directory (see the next two tests for that half).

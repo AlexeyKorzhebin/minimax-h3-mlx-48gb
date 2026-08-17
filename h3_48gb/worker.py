@@ -282,9 +282,23 @@ def _llm_holds_gpu(outdir) -> bool:
     can raise a `llama-local` provider that is not `active` without ever touching that field, so
     "active provider is external, some other local one is resident" used to be invisible here --
     the worker would claim a 27 GB job right next to a 30 GB resident model it never looked at.
+
+    **Never lets a broken `providers.json` reach `main_loop`** (BACKLOG "UX-мелочи", task 1). This
+    gate only ever *observes* -- it holds no lock, changes nothing -- so a file that is mid-write, a
+    human's bad hand-edit, or any other reason `json.loads` chokes is not a reason to take the whole
+    worker down with it. Answering `False` (no LLM visible) is the same direction `reconcile`/`claim`
+    already fail toward when something is wrong, and the one line to stderr is deliberate: silently
+    swallowing it would let a corrupt file sit unnoticed for days, with the queue quietly never
+    respecting a resident model it can no longer see.
     """
-    roster = provider.load_providers(outdir)
-    return any(provider.port_alive(port) for port in provider.local_ports(roster))
+    try:
+        roster = provider.load_providers(outdir)
+        return any(provider.port_alive(port) for port in provider.local_ports(roster))
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring: nothing here may
+        # be allowed to kill the loop over a file this gate only ever reads.
+        print(f"h3 worker: providers.json unreadable, treating the LLM gate as clear: {exc}",
+              file=sys.stderr)
+        return False
 
 
 def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir=None) -> int:
@@ -297,24 +311,29 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir
     It sleeps `poll` and reconciles again instead of waiting for ever -- once the other run is
     gone, the queue has to move.
 
-    The same "take nothing, sleep, look again" shape applies when a resident local LLM holds the
-    GPU instead of another lease (`_llm_holds_gpu`): a 27 GB generation cannot start next to a
-    30 GB model. Unlike a live lease, nothing here ever unloads the LLM -- only a human, confirming
-    on the chat page, does that via `POST /api/llm/unload` -- so the check sits right after
-    `reconcile` and before `claim`, purely observing the port until the human's confirmation makes
-    it go quiet.
+    The next gate of the same "take nothing, sleep, look again" shape is `q.is_paused(root)`. A
+    human pauses the queue from the page (`POST /api/queue/pause`) for reasons this loop cannot see
+    -- about to close the laptop, wants the machine quiet for something else -- and the job already
+    in `running/` (there can be at most one, this worker's own) is never interrupted by a pause,
+    exactly as it is never interrupted by `stop`. Ordered right after `reconcile`, so a paused queue
+    still recovers wreckage from a killed worker -- pausing the *selection* of new work must not
+    also pause the bookkeeping that keeps `running/` honest.
 
-    A third gate of the same shape sits right next to the LLM one, after it and still before
-    `claim`: `q.is_paused(root)`. A human pauses the queue from the page (`POST /api/queue/pause`)
-    for reasons this loop cannot see -- about to close the laptop, wants the machine quiet for
-    something else -- and the answer is the same "take nothing new, sleep, look again" as the other
-    two gates, for the same reason: the job already in `running/` (there can be at most one, this
-    worker's own) is never interrupted by a pause, exactly as it is never interrupted by `stop`.
-    Ordered after `reconcile` and the LLM check, not before them, so a paused queue still recovers
-    wreckage from a killed worker and still respects a live lease or a resident model -- pausing
-    the *selection* of new work must not also pause the bookkeeping that keeps `running/` honest.
+    **Ordered *before* the LLM gate, not after it** (BACKLOG "UX-мелочи", task 1; it used to sit
+    after). `_llm_holds_gpu` reads `providers.json` through `provider.load_providers`, and that file
+    lives entirely outside this loop's control -- a human can leave it mid-edit or simply broken.
+    `_llm_holds_gpu` itself no longer lets that kill the worker (see its own docstring), but even a
+    clean, correctly-swallowed failure there must not stand between a human pausing the queue and
+    the queue actually pausing: pausing is the one control this loop promises always works, laptop
+    about to close or not, so it cannot depend on a file it does not own being well-formed.
 
-    That third gate is also raised from inside this loop and not only by a human: once a finished
+    A third gate of the same shape sits right after the pause check, still before `claim`: a
+    resident local LLM holding the GPU (`_llm_holds_gpu`) -- a 27 GB generation cannot start next to
+    a 30 GB model. Unlike a live lease, nothing here ever unloads the LLM -- only a human, confirming
+    on the chat page, does that via `POST /api/llm/unload` -- so this purely observes the port until
+    the human's confirmation makes it go quiet.
+
+    The pause gate is also raised from inside this loop and not only by a human: once a finished
     job leaves nothing in `pending/`, `q.pause_if_drained` puts the marker up. A queue that empties
     itself stops rather than standing ready to grab whatever lands next -- the morning after a
     night's batch, the two jobs a human drops into the form to *look at* before starting would
@@ -360,11 +379,11 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir
                 if stop.wait(poll):
                     break
                 continue
-            if _llm_holds_gpu(outdir):
+            if q.is_paused(root):
                 if stop.wait(poll):
                     break
                 continue
-            if q.is_paused(root):
+            if _llm_holds_gpu(outdir):
                 if stop.wait(poll):
                     break
                 continue

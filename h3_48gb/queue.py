@@ -335,8 +335,21 @@ def is_paused(root) -> bool:
     ever explaining why nothing moves -- there is no poll interval that surfaces an *absence* of
     activity as loudly as `unloadBanner`'s plate flags a *presence* of one. `main_loop` calls this,
     not the reverse, at the top of every iteration -- see its docstring for exactly where.
+
+    **The same "not paused" answer, not an exception, for any `OSError` `Path.exists` can raise**
+    (BACKLOG "UX-мелочи", task 2) -- not only a plain missing file. `Path.exists` only swallows the
+    handful of errnos that mean "there is nothing here" (`ENOENT`, `ENOTDIR`, ...); a directory this
+    process cannot even `stat` -- permissions changed under it, a network mount gone away -- raises
+    `PermissionError`/`OSError` straight through, which used to reach `main_loop` unhandled despite
+    this docstring already claiming the safe direction. The fix-open reasoning above already covers
+    this case: a queue a human cannot even ask "are you paused?" about is no safer standing frozen
+    than one that resumes and gets re-paused once the underlying problem -- permissions, a missing
+    mount -- is fixed and the check starts answering normally again.
     """
-    return (Path(root) / PAUSED_MARKER_NAME).exists()
+    try:
+        return (Path(root) / PAUSED_MARKER_NAME).exists()
+    except OSError:
+        return False
 
 
 def set_paused(root, value: bool) -> None:

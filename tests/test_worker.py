@@ -574,6 +574,59 @@ def test_worker_leaves_a_pending_job_alone_while_the_queue_is_paused(tmp_path):
     assert spawned, "the worker never resumed once the queue was unpaused"
 
 
+# -- BACKLOG "UX-мелочи", task 1: the pause gate must survive a broken providers.json ------------
+
+
+def test_worker_stays_paused_and_alive_with_a_broken_providers_json(tmp_path):
+    """Before this fix, `main_loop` checked the LLM gate (`_llm_holds_gpu`, which reads
+    `providers.json` through `provider.load_providers`) *before* `q.is_paused`. A `providers.json`
+    that fails to parse -- mid-write, a bad hand-edit -- raised straight out of `load_providers`,
+    which killed the worker before the pause check ever ran, even though the queue was paused and
+    would have refused the job regardless. Pausing has to work no matter what nonsense sits in a
+    file the worker does not own.
+
+    The probe runs the loop in a thread so a crash is observable as the thread dying rather than as
+    an exception this test would otherwise never see (daemon threads swallow it).
+    """
+    root = tmp_path / "queue"
+    outdir = tmp_path
+    _queued(root, tmp_path, tag="a")
+    assert q.is_paused(root) is True, "a freshly created queue must start paused"
+    (outdir / "providers.json").write_text("{ this is not json", encoding="utf-8")
+    spawned: list[list[str]] = []
+    crashed: list[BaseException] = []
+    stop = threading.Event()
+
+    def run():
+        try:
+            worker.main_loop(root, poll=0.05, stop=stop, spawn=_recording(spawned), outdir=outdir)
+        except BaseException as exc:  # noqa: BLE001 -- the point is that nothing escapes main_loop
+            crashed.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    time.sleep(0.3)
+    assert thread.is_alive(), f"the worker died on a broken providers.json: {crashed}"
+    assert spawned == [], "a paused queue must not take a job, broken providers.json or not"
+    stop.set()
+    thread.join(timeout=5)
+    assert crashed == [], f"the worker must survive a broken providers.json: {crashed}"
+
+
+def test_llm_holds_gpu_survives_a_broken_providers_json(tmp_path, capsys):
+    """`_llm_holds_gpu` itself must not propagate a broken roster: it answers `False` (no LLM
+    visible, the same direction `reconcile`/`claim` already fail toward) and writes exactly one
+    line to stderr, rather than dying and rather than staying silent -- a corrupt file that never
+    logged anything could sit unnoticed for days with the gate quietly never firing again.
+    """
+    outdir = tmp_path
+    (outdir / "providers.json").write_text("{ this is not json", encoding="utf-8")
+    assert worker._llm_holds_gpu(outdir) is False
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1, f"expected exactly one line on stderr, got: {err!r}"
+    assert "providers.json" in err
+
+
 # -- Step 9: stopping ----------------------------------------------------------------------------
 
 
