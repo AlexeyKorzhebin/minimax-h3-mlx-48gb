@@ -1,8 +1,8 @@
 diff --git a/minimax_h3_mlx/dit.py b/minimax_h3_mlx/dit.py
-index 4aa8cca..32af8ce 100644
+index 4aa8cca..c5ad74d 100644
 --- a/minimax_h3_mlx/dit.py
 +++ b/minimax_h3_mlx/dit.py
-@@ -113,18 +113,104 @@ def apply_rotary(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+@@ -113,18 +113,109 @@ def apply_rotary(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
      """Rotate the leading ``rotary_dim`` channels of every head, pass the rest through.
  
      ``x`` is ``(batch, heads, seq, head_dim)``; ``cos``/``sin`` are ``(seq, rotary_dim)``.
@@ -56,6 +56,11 @@ index 4aa8cca..32af8ce 100644
 +#: and the `k`/`v` re-reads stay in the noise (forward time moved by well under a percent),
 +#: small enough to take ~3 GB off a 73k-row forward. Read at call time, so a test can lower it.
 +QUERY_CHUNK = 8192
++
++#: PATCHED IN THIS FORK. The same idea for the feed-forward, which is row-local outright — see
++#: `FeedForward.__call__`. Same width and for the same reason: the two levers only pay off
++#: together, and one number is one thing to retune.
++FFN_ROW_CHUNK = 8192
 +
 +
 +def prepare_rows(layer, x: mx.array):
@@ -115,7 +120,7 @@ index 4aa8cca..32af8ce 100644
  
  
  class Attention(nn.Module):
-@@ -141,12 +227,114 @@ class Attention(nn.Module):
+@@ -141,12 +232,114 @@ class Attention(nn.Module):
          self.k_norm = nn.RMSNorm(config.attention_head_dim, eps=config.qk_norm_eps)
          self.out_proj = nn.Linear(config.inner_dim, config.hidden_size, bias=False)
  
@@ -230,3 +235,39 @@ index 4aa8cca..32af8ce 100644
          B, S, _ = x.shape
          # Raw-checkpoint QKV rows are per-head interleaved: (..., heads, 3, head_dim).
          qkv = self.qkv_proj(x).reshape(B, S, self.heads, 3, self.head_dim)
+@@ -175,9 +368,32 @@ class FeedForward(nn.Module):
+         self._ffn = config.ffn_hidden_size
+ 
+     def __call__(self, x: mx.array) -> mx.array:
+-        fused = self.fc1(x)
+-        gate, value = fused[..., : self._ffn], fused[..., self._ffn :]
+-        return self.fc2(nn.silu(gate) * value)
++        # PATCHED IN THIS FORK (`patches/0002-attention-memory-levers.patch`). The MLP is entirely
++        # row-local, and its widest buffer by far is `fc1`'s fused `[gate; value]` output: twice
++        # the FFN width, 57 KB per row against the 14 KB of the hidden stream, and it has to be
++        # live at the same time as the activation it feeds. Building it a chunk at a time leaves
++        # only the activation full-size — worth ~3.8 GB at 73k rows, and it is what uncovers the
++        # attention saving underneath, which until now was hidden below this horn.
++        #
++        # `fc2` deliberately still runs once, over the whole activation, rather than per chunk.
++        # Per chunk it would re-do its LoRA's narrow `act @ A.T` at a chunk's row count and land a
++        # bf16 ULP off (see `prepare_rows`) — and unlike `fc1`'s, that read cannot be hoisted,
++        # because the activation it reads is the very thing being built. One whole-tensor call is
++        # both exact and no more expensive: the output it writes is full-size either way.
++        S = x.shape[-2]
++        if S <= FFN_ROW_CHUNK:
++            fused = self.fc1(x)
++            gate, value = fused[..., : self._ffn], fused[..., self._ffn :]
++            return self.fc2(nn.silu(gate) * value)
++
++        prepared = prepare_rows(self.fc1, x)
++        activated = []
++        for start in range(0, S, FFN_ROW_CHUNK):
++            stop = min(start + FFN_ROW_CHUNK, S)
++            fused = apply_rows(self.fc1, x, prepared, start, stop)
++            gate, value = fused[..., : self._ffn], fused[..., self._ffn :]
++            activated.append(nn.silu(gate) * value)
++        return self.fc2(mx.concatenate(activated, axis=-2))
+ 
+ 
+ class AdaLayerNormModulation(nn.Module):

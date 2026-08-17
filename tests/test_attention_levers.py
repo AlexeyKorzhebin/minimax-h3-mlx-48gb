@@ -495,6 +495,90 @@ def test_a_masked_call_is_never_chunked(monkeypatch, count_sdpa):
     assert count_sdpa == [17], f"a masked call was chunked into {count_sdpa}"
 
 
+# ---------------------------------------------------------------- Task 4: mlp-chunk
+
+
+@pytest.mark.parametrize("chunk", [128, 173, 512])
+@pytest.mark.parametrize("with_lora", [False, True])
+def test_chunked_feed_forward_is_bit_identical(monkeypatch, tmp_path, chunk, with_lora):
+    """Row-local arithmetic, so this is an identity — including with a LoRA on `fc1`."""
+    from h3_48gb.dit import split_fused_attention
+    from h3_48gb.turbo import apply_backbone_lora
+
+    layout = packed_layout(n_text=16, n_video=480, n_audio=16)
+    dit = tiny_dit()
+    split_fused_attention(dit)
+    if with_lora:
+        weights = _write_backbone_lora(tmp_path / "lora.safetensors", dit)
+        apply_backbone_lora(dit, weights, strength=1.0, num_heads=4, head_dim=16, verbose=False)
+
+    monkeypatch.setattr(updit, "FFN_ROW_CHUNK", 1 << 30)
+    whole_v, whole_a = forward(dit, layout)
+    monkeypatch.setattr(updit, "FFN_ROW_CHUNK", chunk)
+    chunked_v, chunked_a = forward(dit, layout)
+
+    exact(chunked_v, whole_v, f"mlp-chunk {chunk} video (lora={with_lora})")
+    exact(chunked_a, whole_a, f"mlp-chunk {chunk} audio (lora={with_lora})")
+
+
+def test_the_two_chunk_levers_compose(monkeypatch, tmp_path):
+    """Attention and MLP chunked at once, at different sizes, under a LoRA. The shipping case."""
+    from h3_48gb.dit import split_fused_attention
+    from h3_48gb.turbo import apply_backbone_lora
+
+    layout = packed_layout(n_text=16, n_video=480, n_audio=16)
+    dit = tiny_dit()
+    split_fused_attention(dit)
+    weights = _write_backbone_lora(tmp_path / "lora.safetensors", dit)
+    apply_backbone_lora(dit, weights, strength=1.0, num_heads=4, head_dim=16, verbose=False)
+
+    monkeypatch.setattr(updit, "QUERY_CHUNK", 1 << 30)
+    monkeypatch.setattr(updit, "FFN_ROW_CHUNK", 1 << 30)
+    whole_v, whole_a = forward(dit, layout)
+
+    monkeypatch.setattr(updit, "QUERY_CHUNK", 173)
+    monkeypatch.setattr(updit, "FFN_ROW_CHUNK", 128)
+    got_v, got_a = forward(dit, layout)
+    exact(got_v, whole_v, "q-chunk + mlp-chunk video")
+    exact(got_a, whole_a, "q-chunk + mlp-chunk audio")
+
+
+def test_fc1_is_chunked_and_fc2_is_not(monkeypatch):
+    """Both halves of the shape of this lever, pinned structurally.
+
+    `fc1` chunked is the whole point — its fused output is twice the FFN width and is what the
+    peak is made of. `fc2` *not* chunked is the deliberate other half: its LoRA reads the
+    activation, which is the thing being built, so its narrow `act @ A.T` cannot be hoisted the
+    way `fc1`'s can, and running it per chunk would land a bf16 ULP off at production width. The
+    doll-sized model in this file cannot see that ULP, so the decision is pinned by call shape
+    instead — `test_a_narrow_matmul_is_not_row_chunk_stable...` is where the ULP itself lives.
+    """
+    dit = tiny_dit()
+    block = dit.blocks[0].mlp
+    seen = {"fc1": [], "fc2": []}
+
+    def watch(name, real):
+        class Watched:
+            def __call__(self, rows):
+                seen[name].append(rows.shape[-2])
+                return real(rows)
+
+        return Watched()
+
+    block.fc1, block.fc2 = watch("fc1", block.fc1), watch("fc2", block.fc2)
+    x = mx.random.normal((1, 512, dit.config.hidden_size))
+
+    monkeypatch.setattr(updit, "FFN_ROW_CHUNK", 128)
+    mx.eval(block(x))
+    assert seen["fc1"] == [128, 128, 128, 128], seen["fc1"]
+    assert seen["fc2"] == [512], f"fc2 must see the whole activation once, saw {seen['fc2']}"
+
+    seen["fc1"].clear(), seen["fc2"].clear()
+    monkeypatch.setattr(updit, "FFN_ROW_CHUNK", 1 << 30)
+    mx.eval(block(x))
+    assert seen["fc1"] == [512] and seen["fc2"] == [512]
+
+
 def test_the_lightx2v_adapter_also_survives_the_split(tmp_path):
     """LightX2V trains q/k/v separately, so on a split model it needs no conversion at all."""
     from h3_48gb.dit import split_fused_attention
