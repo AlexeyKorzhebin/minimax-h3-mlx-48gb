@@ -34,11 +34,58 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
 from minimax_h3_mlx.config import DiTConfig
-from minimax_h3_mlx.dit import FinalLayer, MiniMaxH3DiT
+from minimax_h3_mlx.dit import Attention, FinalLayer, MiniMaxH3DiT
 from minimax_h3_mlx.load import SKIP_KEYS, is_fp32_key, shard_paths
 
 #: Module names the mere.run build folds into `adaln_cache.safetensors`.
 CACHE_COVERED = ("time_embedder", "adaln_proj")
+
+
+def attention_levers_patch_applied() -> bool:
+    """Whether the vendored `upstream/` carries `patches/0002-attention-memory-levers.patch`.
+
+    Checked by name rather than by reading source: the carve is a *method* the patch adds, so its
+    absence is unambiguous, and a check that cannot be satisfied by a comment cannot be fooled by
+    one either.
+    """
+    return hasattr(Attention, "split_projections")
+
+
+def split_fused_attention(model: MiniMaxH3DiT, verbose: bool = False) -> int:
+    """Carve every attention's fused ``qkv_proj`` into ``q_proj`` / ``k_proj`` / ``v_proj``.
+
+    Done once, here, rather than per forward: the gather touches the *weights*, so paying for it
+    at load time costs one pass over 6 GB and nothing afterwards. The saving is on the activation
+    side — see `Attention.split_projections` for why the fused staging is the expensive part —
+    and it is worth ~3 GB of peak on a long native forward.
+
+    Resident weights do not grow. The carve allocates the three parts and then drops the fused
+    projection, so the transient overshoot is one layer's worth (~150 MB at the shipped size),
+    not the whole stack's.
+
+    Returns the number of attention layers split.
+    """
+    if not attention_levers_patch_applied():
+        raise RuntimeError(
+            "`upstream/minimax_h3_mlx/dit.py` has no `Attention.split_projections`, so "
+            "patches/0002-attention-memory-levers.patch is not applied to this checkout. Apply it "
+            "(`git -C upstream apply ../patches/0002-attention-memory-levers.patch`, see README) "
+            "or load with `split_qkv=False` — unsplit is correct, just ~3 GB heavier at the peak."
+        )
+
+    attentions = [block.attn for block in model.blocks]
+    refiner = getattr(model, "token_refiner", None)
+    if refiner is not None:
+        attentions += [block.attn for block in refiner.blocks]
+
+    for attention in attentions:
+        attention.split_projections()
+    from . import memory
+
+    memory.release()
+    if verbose:
+        print(f"  fused QKV split into q/k/v on {len(attentions)} attention layers")
+    return len(attentions)
 
 
 class _NoTimestepEmbedder(nn.Module):
@@ -126,6 +173,7 @@ def load_dit_cached(
     model_dir: str | Path,
     dtype: mx.Dtype | None = None,
     verbose: bool = False,
+    split_qkv: bool = True,
 ) -> MiniMaxH3DiT:
     """Load a converted mere.run transformer directory.
 
@@ -209,4 +257,10 @@ def load_dit_cached(
 
     model.update(tree_unflatten(list(weights.items())))
     mx.eval(model.parameters())
+
+    # After the weights are real: the carve gathers rows out of them, so it cannot run against the
+    # lazy tree, and running it here means every consumer — pipeline, LoRA, checkpoint resume —
+    # sees the same split model without having to know the option exists.
+    if split_qkv:
+        split_fused_attention(model, verbose=verbose)
     return model

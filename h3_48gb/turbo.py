@@ -20,6 +20,13 @@ mere.run had rewritten it into. The LoRA is in slabs. Measured rather than assum
 slab is half the magnitude of q and k (0.0051 against 0.0102 and 0.0108), and that structure
 vanishes entirely under the per-head grouping (0.0086/0.0087/0.0088). Applying an unpermuted
 ``lora_B`` raises nothing; it just scrambles which head each correction lands on.
+
+**...unless the projection has been split.** `h3_48gb.dit.split_fused_attention` carves the fused
+layer into ``q_proj``/``k_proj``/``v_proj`` at load time, and those carved rows come out in slab
+order — so against a split attention the same adapter is three contiguous *slices* of the
+unpermuted ``lora_B``, with no permutation at all. Both spellings are supported and are checked
+against each other bit-for-bit (`tests/test_attention_levers.py`), because the two are exactly the
+kind of pair that silently diverges.
 """
 from __future__ import annotations
 
@@ -77,6 +84,45 @@ def _resolve(root: nn.Module, path: str):
     return node, parts[-1]
 
 
+#: The three sub-projections a split attention carries, in the order a slab-ordered `lora_B` is in.
+SPLIT_PARTS = ("q_proj", "k_proj", "v_proj")
+
+
+def _is_split(attention: nn.Module) -> bool:
+    """Whether `Attention.split_projections` has carved this layer (see `h3_48gb.dit`)."""
+    return getattr(attention, "is_split", False)
+
+
+def wrap_qkv_lora(attention: nn.Module, a: mx.array, b: mx.array, strength: float,
+                  permutation: mx.array, permute: bool = True) -> int:
+    """Attach a fused-QKV LoRA to `attention`, split or not. Returns layers wrapped.
+
+    The two layouts need opposite treatment and both are easy to get silently wrong:
+
+    * **Fused.** ``lora_B`` is in the release's ``[all-q; all-k; all-v]`` slab order and the
+      projection is in per-head interleave, so the rows must be permuted. Applying an unpermuted
+      ``lora_B`` raises nothing — it just scrambles which head each correction lands on.
+    * **Split.** ``q_proj``'s rows were gathered out of the interleave as ``[h0, h1, ...]``, which
+      *is* the q slab. So the three parts are contiguous thirds of the unpermuted ``lora_B`` and
+      the permutation must **not** be applied. Same numbers as the fused path, reached by slicing
+      instead of by gathering: this is the simplification the split buys.
+
+    ``lora_A`` is shared by all three — it is the same rank-r read of the same input — so the
+    three parts differ only in ``lora_B``.
+    """
+    if not _is_split(attention):
+        base = attention.qkv_proj
+        attention.qkv_proj = LoRALinear(base, a, b[permutation] if permute else b, strength)
+        return 1
+
+    rows = b.shape[0] // 3
+    for index, part in enumerate(SPLIT_PARTS):
+        base = getattr(attention, part)
+        setattr(attention, part,
+                LoRALinear(base, a, b[index * rows:(index + 1) * rows], strength))
+    return len(SPLIT_PARTS)
+
+
 def apply_backbone_lora(dit, weights_path: Path | str, strength: float = 1.0,
                         num_heads: int = 56, head_dim: int = 128, verbose: bool = True,
                         permute_qkv: bool = True) -> dict:
@@ -111,13 +157,17 @@ def apply_backbone_lora(dit, weights_path: Path | str, strength: float = 1.0,
                 continue
 
             a, b = lora[key_a], lora[key_b]
-            if target == PERMUTED_TARGET and permute_qkv:
+            if target == PERMUTED_TARGET:
                 if b.shape[0] != 3 * num_heads * head_dim:
                     raise ValueError(
                         f"{key_b} has {b.shape[0]} rows, expected 3 * {num_heads} * {head_dim} = "
                         f"{3 * num_heads * head_dim}; the QKV permutation would be wrong.")
-                b = b[permutation]
-                permuted += 1
+                attention, _ = _resolve(dit, path)
+                wrapped += wrap_qkv_lora(attention, a, b, strength, permutation,
+                                         permute=permute_qkv)
+                permuted += int(permute_qkv and not _is_split(attention))
+                added_bytes += a.nbytes + b.nbytes
+                continue
 
             owner, attribute = _resolve(dit, path)
             base = getattr(owner, attribute)
@@ -140,10 +190,13 @@ def apply_backbone_lora(dit, weights_path: Path | str, strength: float = 1.0,
             f"the LoRA carries {len(unapplied)} backbone targets this run never applied: "
             f"{unapplied[:4]} — a partial application is indistinguishable from a weak LoRA.")
 
-    report = {"wrapped": wrapped, "permuted": permuted, "added_gb": added_bytes / 1e9,
-              "strength": strength}
+    split = sum(1 for path in paths if path.endswith(PERMUTED_TARGET)
+                and _is_split(_resolve(dit, path)[0]))
+    report = {"wrapped": wrapped, "permuted": permuted, "split": split,
+              "added_gb": added_bytes / 1e9, "strength": strength}
     if verbose:
-        print(f"  turbo: {wrapped} projections wrapped ({permuted} QKV permuted), "
+        layout = f"{permuted} QKV permuted" if not split else f"{split} QKV split into q/k/v"
+        print(f"  turbo: {wrapped} projections wrapped ({layout}), "
               f"+{report['added_gb']:.2f} GB, strength {strength}")
     return report
 
@@ -234,9 +287,21 @@ def apply_lightx2v_lora(dit, weights_path: Path | str, strength: float = 1.0,
         qkv = {part: factors(f"{source_block}.attn.to_{part}") for part in ("q", "k", "v")
                if f"{source_block}.attn.to_{part}.lora_A.default.weight" in lora}
         if len(qkv) == 3:
-            owner, attribute = _resolve(dit, f"{our_block}.attn.qkv_proj")
-            setattr(owner, attribute,
-                    SplitQKVLoRALinear(getattr(owner, attribute), qkv, permutation, scale))
+            attention, _ = _resolve(dit, f"{our_block}.attn.qkv_proj")
+            if _is_split(attention):
+                # Against a split attention this adapter needs no conversion at all: it was
+                # trained as three separate `to_q`/`to_k`/`to_v` and the model now *has* three
+                # separate projections in the same order, so each is a plain `LoRALinear`.
+                # `SplitQKVLoRALinear` below exists only for the fused layout.
+                for part, name in zip(("q", "k", "v"), SPLIT_PARTS):
+                    a, b = qkv[part]
+                    setattr(attention, name, LoRALinear(getattr(attention, name), a, b, scale))
+            else:
+                # `num_heads`/`head_dim` were accepted here and then not forwarded, so the
+                # wrapper always used its 56x128 defaults. Invisible at the shipped size and
+                # fatal at any other — the reshape simply cannot run.
+                attention.qkv_proj = SplitQKVLoRALinear(
+                    attention.qkv_proj, qkv, permutation, scale, num_heads, head_dim)
             wrapped += 1
         for source_suffix, our_suffix in LIGHTX2V_RENAMES.items():
             key = f"{source_block}.{source_suffix}"
