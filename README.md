@@ -32,14 +32,20 @@ different instruments, and the honest version of that is in
 [`docs/RESULTS.md`](docs/RESULTS.md)** — including the fact that the RSS trace never sampled the
 encoding phase at all, so the 28.2 GB and the 11.5 GB were never observed by the same tool.
 
-## The four patches
+## The four modules, and the two source patches
 
-Everything lives in `h3_48gb/`; `upstream/` is a vendored clone, pinned to commit `fcd9e9b` and
-otherwise untouched but for two source patches applied during setup below
-(`patches/0001-keyframe-masked-scatter.patch`, without which keyframe runs die inside the text
-encoder — text-only runs never reach it; and `patches/0002-attention-memory-levers.patch`, four
-bit-identical rewrites of the DiT's Q/K/V and MLP staging that buy ~10 GB of peak). Patching from the outside keeps the two separable, but the pin is not optional: this
-fork rebinds `FinalLayer.__class__`, binds `inspect.signature(MiniMaxH3Pipeline.__call__)` in three
+Everything this fork adds lives in `h3_48gb/`, applied to upstream from the outside — the four
+modules below. `upstream/` itself is a vendored clone, pinned to commit `fcd9e9b`, and carries
+exactly two source edits, both applied during setup below:
+
+* `patches/0001-keyframe-masked-scatter.patch`, without which keyframe runs die inside the text
+  encoder. Text-only runs never reach it.
+* `patches/0002-attention-memory-levers.patch`, four bit-identical rewrites of the DiT's Q/K/V and
+  MLP staging. Measured worth: 8.65 GB off the peak of a 15 s native forward, 4.92 GB at 10 s (see
+  `docs/RESULTS.md`, "Attention memory levers"). Nothing about the outputs changes.
+
+Patching from the outside keeps the two trees separable, but the pin is not optional: this fork
+rebinds `FinalLayer.__class__`, binds `inspect.signature(MiniMaxH3Pipeline.__call__)` in three
 places, and `docs/DESIGN.md` cites upstream by line number. Later upstream commits are untested
 here, and any of those three couplings can break silently on one.
 
@@ -104,9 +110,10 @@ git -C upstream checkout fcd9e9b
 git -C upstream apply ../patches/0001-keyframe-masked-scatter.patch
 
 #    The second patch is the attention/MLP memory levers (docs/RESULTS.md, "Attention memory
-#    levers"): four bit-identical rewrites of `dit.py`'s Q/K/V and MLP staging that take ~10 GB off
-#    the peak of a long native forward. Skipping it costs memory, not correctness — but the long
-#    canvases in the results table do not fit without it.
+#    levers"): four bit-identical rewrites of `dit.py`'s Q/K/V and MLP staging, worth 8.65 GB off
+#    the peak of a 15 s native forward. Skipping it costs memory, not correctness — but
+#    `load_dit_cached` splits the fused QKV by default and will refuse with a message naming this
+#    command, so an unpatched checkout must pass `split_qkv=False`.
 git -C upstream apply ../patches/0002-attention-memory-levers.patch
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt

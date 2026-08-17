@@ -123,11 +123,23 @@ def wrap_qkv_lora(attention: nn.Module, a: mx.array, b: mx.array, strength: floa
 
     ``lora_A`` is shared by all three — it is the same rank-r read of the same input — so the
     three parts differ only in ``lora_B``.
+
+    ``permute=False`` is a fused-layout debugging switch (it is what proves, in the tests, that the
+    permutation changes anything at all). It has no meaning against a split attention — there is no
+    permutation being applied for it to turn off — so asking for it here raises rather than being
+    quietly ignored, which would hand back a model that looks like the one that was asked for.
     """
     if not _is_split(attention):
         base = attention.qkv_proj
         attention.qkv_proj = LoRALinear(base, a, b[permutation] if permute else b, strength)
         return 1
+
+    if not permute:
+        raise ValueError(
+            "`permute_qkv=False` is meaningless against a split attention: the carved q/k/v rows "
+            "are already in the adapter's own slab order, so there is no permutation to skip. "
+            "Load with `split_qkv=False` if the unpermuted fused layout is what you meant to test."
+        )
 
     rows = b.shape[0] // 3
     for index, part in enumerate(SPLIT_PARTS):
@@ -163,31 +175,30 @@ def apply_backbone_lora(dit, weights_path: Path | str, strength: float = 1.0,
                   for b in range(len(refiner.blocks)) for t in BACKBONE_TARGETS]
 
     for path in paths:
-        if True:
-            target = path.rsplit(".", 2)[-2] + "." + path.rsplit(".", 1)[-1]
-            key_a, key_b = f"{path}.lora_A.weight", f"{path}.lora_B.weight"
-            if key_a not in lora or key_b not in lora:
-                missing.append(path)
-                continue
+        target = path.rsplit(".", 2)[-2] + "." + path.rsplit(".", 1)[-1]
+        key_a, key_b = f"{path}.lora_A.weight", f"{path}.lora_B.weight"
+        if key_a not in lora or key_b not in lora:
+            missing.append(path)
+            continue
 
-            a, b = lora[key_a], lora[key_b]
-            if target == PERMUTED_TARGET:
-                if b.shape[0] != 3 * num_heads * head_dim:
-                    raise ValueError(
-                        f"{key_b} has {b.shape[0]} rows, expected 3 * {num_heads} * {head_dim} = "
-                        f"{3 * num_heads * head_dim}; the QKV permutation would be wrong.")
-                attention, _ = _resolve(dit, path)
-                wrapped += wrap_qkv_lora(attention, a, b, strength, permutation,
-                                         permute=permute_qkv)
-                permuted += int(permute_qkv and not _is_split(attention))
-                added_bytes += a.nbytes + b.nbytes
-                continue
-
-            owner, attribute = _resolve(dit, path)
-            base = getattr(owner, attribute)
-            setattr(owner, attribute, LoRALinear(base, a, b, strength))
-            wrapped += 1
+        a, b = lora[key_a], lora[key_b]
+        if target == PERMUTED_TARGET:
+            if b.shape[0] != 3 * num_heads * head_dim:
+                raise ValueError(
+                    f"{key_b} has {b.shape[0]} rows, expected 3 * {num_heads} * {head_dim} = "
+                    f"{3 * num_heads * head_dim}; the QKV permutation would be wrong.")
+            attention, _ = _resolve(dit, path)
+            wrapped += wrap_qkv_lora(attention, a, b, strength, permutation,
+                                     permute=permute_qkv)
+            permuted += int(permute_qkv and not _is_split(attention))
             added_bytes += a.nbytes + b.nbytes
+            continue
+
+        owner, attribute = _resolve(dit, path)
+        base = getattr(owner, attribute)
+        setattr(owner, attribute, LoRALinear(base, a, b, strength))
+        wrapped += 1
+        added_bytes += a.nbytes + b.nbytes
 
     if missing:
         raise KeyError(

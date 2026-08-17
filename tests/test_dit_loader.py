@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 
 from h3_48gb import _upstream  # noqa: F401
-from h3_48gb.dit import load_dit_cached, strip_modulation_path
+from h3_48gb.dit import attention_levers_patch_applied, load_dit_cached, strip_modulation_path
 
 from minimax_h3_mlx.config import DiTConfig
 from minimax_h3_mlx.dit import MiniMaxH3DiT
@@ -29,6 +29,16 @@ from mlx.utils import tree_flatten
 TINY = dict(hidden_size=64, num_layers=2, token_refiner_num_layers=1, num_attention_heads=2,
             attention_head_dim=32, ffn_hidden_size=128, text_dim=48, time_embed_hidden_size=64,
             time_embed_dim=32, adaln_out_features=1152, final_adaln_out_features=128)
+
+#: `load_dit_cached` splits the fused QKV by default, which needs the levers patch. On a checkout
+#: that never applied it these tests would fail deep inside the loader, and the failure would read
+#: like a broken loader rather than like a missing setup step. Skip with the command instead.
+needs_levers_patch = pytest.mark.skipif(
+    not attention_levers_patch_applied(),
+    reason=("upstream/ is missing patches/0002-attention-memory-levers.patch, which "
+            "`load_dit_cached` needs for its default `split_qkv=True`. Apply it with:  "
+            "git -C upstream apply ../patches/0002-attention-memory-levers.patch"),
+)
 
 
 def _write_checkpoint(tmp_path, extra: dict[str, np.ndarray] | None = None):
@@ -50,11 +60,34 @@ def _modulation_keys(tmp_path) -> list[str]:
     return strip_modulation_path(MiniMaxH3DiT(DiTConfig(**TINY)))
 
 
+@needs_levers_patch
 def test_a_build_without_the_modulation_path_loads(tmp_path):
     """mere.run's shape: the tensors are simply absent."""
     assert load_dit_cached(_write_checkpoint(tmp_path)) is not None
 
 
+def test_a_build_loads_unsplit_when_the_carve_is_declined(tmp_path):
+    """The escape hatch, and the only path through the loader that needs no `upstream/` patch.
+
+    Deliberately *not* marked with `needs_levers_patch`: it is what an unpatched checkout is told
+    to use, so it is exactly the case that must keep working there.
+    """
+    model = load_dit_cached(_write_checkpoint(tmp_path), split_qkv=False)
+    assert model is not None
+    assert all(hasattr(block.attn, "qkv_proj") for block in model.blocks)
+    assert not any(hasattr(block.attn, "q_proj") for block in model.blocks)
+
+
+@needs_levers_patch
+def test_a_loaded_build_has_its_qkv_carved_by_default(tmp_path):
+    """The default is the split one — every consumer downstream is written against that."""
+    model = load_dit_cached(_write_checkpoint(tmp_path))
+    attentions = [b.attn for b in model.blocks] + [b.attn for b in model.token_refiner.blocks]
+    assert attentions and all(attn.is_split for attn in attentions)
+    assert not any(hasattr(attn, "qkv_proj") for attn in attentions)
+
+
+@needs_levers_patch
 def test_a_build_that_ships_the_modulation_path_also_loads(tmp_path):
     """pipenetwork's shape. Before this, 206 real tensors read as 206 unexpected keys.
 

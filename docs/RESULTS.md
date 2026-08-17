@@ -1220,7 +1220,9 @@ RSS; the two instruments are not interchangeable and this table is entirely the 
 
 **The saving grows with the clip, and that is the point.** It is not a constant overhead being
 removed: the chunked paths hold one 8192-row slice regardless of how long the sequence is, so the
-fraction they save rises from 4% of activations at 2.4 s to 37% at 15 s. The 15 s native forward is
+share of *activations* they remove rises from 20% at 2.4 s (4.85 GB above resident weights, down
+to 3.87) to 37% at 15 s (23.27 GB, down to 14.62). Against the whole peak — activations plus the
+21.54 GB of resident weights, which no lever touches — that is 3.7% and 19.3%. The 15 s forward is
 the case the whole exercise was for — at 44.81 GB it was above this machine's 40.2 GB recommended
 working set and ran on swap; at 36.16 GB it is under it.
 
@@ -1288,6 +1290,29 @@ costs **1.53 GB**, paid deliberately.
   whose accumulation order differs, so chunking a 17-row sequence moves by a ULP. The lever never
   enters that regime (it engages above 8192 rows), but a doll-sized parity test written without
   knowing this would have passed for the wrong reason.
+
+### How to re-check it
+
+Both instruments are in the repo, not in a scratch directory, because the thing they measure is
+exactly the thing a later refactor gives back without failing a test.
+
+    ./.venv/bin/python scripts/levers_parity.py --blocks 0 \
+        --lora ~/models/turbo/minimax_h3_turbo_v4_step600_ema.safetensors
+    ./.venv/bin/python scripts/levers_ladder.py --durations 2.4 5 10 15
+
+`scripts/levers_parity.py` is **mandatory before any change to a chunked path, and after any MLX
+upgrade**. It loads the real checkpoint twice in one process — once unsplit with frozen copies of
+the pre-patch upstream code, once as the repo now loads it — and compares outputs bit for bit. It
+defaults its chunk widths to 2048/1500 rather than the shipped 8192 on purpose: a parity canvas is
+~6.2k rows, so at 8192 both chunked branches fall through to their unchunked fallbacks and the run
+proves nothing about chunking at all. That is precisely how the reconnaissance probe reported
+`max|Δ| = 0` for variants whose chunk loops had never executed.
+
+`scripts/levers_ladder.py` produces the table above, plus the `fc2`-chunked variant that is not
+shipped. It refuses to measure while the queue has a job running, since a peak measured against
+another process is fiction. `scripts/dit_probe.py` holds what the two share — packed geometry, the
+synthetic modulation table, and the frozen pre-patch code — so a benchmark and a parity checker
+cannot end up disagreeing about what "stock" means.
 
 ### Still open
 

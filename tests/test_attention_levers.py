@@ -234,6 +234,48 @@ def test_the_split_forward_is_bit_identical_to_the_fused_one(quantized):
     exact(split_a, fused_a, f"qkv-split audio (quantized={quantized})")
 
 
+@pytest.fixture
+def unpatched_upstream(monkeypatch):
+    """An `upstream/` that never had `patches/0002-...` applied, without touching the real one.
+
+    Deleting the method the patch adds is the whole of it — `attention_levers_patch_applied` asks
+    exactly that question, and a check that cannot be satisfied by a comment cannot be faked by
+    one. Simulated rather than actually un-applying the patch because the alternative is a test
+    that rewrites the working tree and leaves it broken when it fails.
+    """
+    monkeypatch.delattr(updit.Attention, "split_projections")
+
+
+def test_an_unpatched_upstream_is_detected(unpatched_upstream):
+    from h3_48gb.dit import attention_levers_patch_applied
+
+    assert not attention_levers_patch_applied()
+
+
+def test_an_unpatched_upstream_refuses_loudly_and_says_how_to_fix_it(unpatched_upstream):
+    """The refusal is the whole value of the check: silently loading unsplit would cost ~3 GB
+    of peak and say nothing, which on a 48 GB machine is the difference between a clip that
+    renders and one that swaps.
+    """
+    from h3_48gb.dit import split_fused_attention
+
+    with pytest.raises(RuntimeError) as raised:
+        split_fused_attention(tiny_dit())
+
+    message = str(raised.value)
+    assert "0002-attention-memory-levers.patch" in message
+    assert "git -C upstream apply" in message, "the message must carry the command, not just blame"
+    assert "split_qkv=False" in message, "and the escape hatch, for anyone who cannot patch"
+
+
+def test_the_patch_check_is_what_gates_the_carve():
+    """Guard against the check drifting away from the thing it claims to detect."""
+    from h3_48gb.dit import attention_levers_patch_applied
+
+    assert attention_levers_patch_applied()
+    assert hasattr(updit.Attention, "split_projections")
+
+
 def test_splitting_twice_is_a_no_op():
     """`split_fused_attention` runs at load; a resumed run must not be able to double-carve."""
     dit = tiny_dit()
@@ -303,6 +345,25 @@ def test_the_turbo_lora_survives_the_split_bit_for_bit(tmp_path):
     assert report_split["wrapped"] == report_fused["wrapped"] + 2 * n_attn
     assert report_split["added_gb"] == report_fused["added_gb"], (
         "splitting `lora_B` must not duplicate it")
+
+
+def test_asking_a_split_attention_not_to_permute_is_refused(tmp_path):
+    """`permute_qkv=False` has no meaning once the projection is split, so it must not be ignored.
+
+    Silently accepting it would hand back a model that is *correct* but is not the one the caller
+    asked for — and the caller only ever asks for it to prove the permutation matters, so a quiet
+    no-op would make that proof vacuous.
+    """
+    from h3_48gb.dit import split_fused_attention
+    from h3_48gb.turbo import apply_backbone_lora
+
+    dit = tiny_dit()
+    split_fused_attention(dit)
+    weights = _write_backbone_lora(tmp_path / "lora.safetensors", dit)
+
+    with pytest.raises(ValueError, match="meaningless against a split attention"):
+        apply_backbone_lora(dit, weights, strength=1.0, num_heads=4, head_dim=16,
+                            verbose=False, permute_qkv=False)
 
 
 def test_an_unpermuted_fused_lora_is_visibly_different(tmp_path):
