@@ -31,13 +31,30 @@ from pathlib import Path
 
 import numpy as np
 
-DEFAULT_CHECKPOINT = Path.home() / "models/h3-converted"
+#: The battle recipe, unchanged since the web form went live: 8-bit DiT (symlinked encoder/VAE),
+#: Turbo LoRA at strength 1.0, and the AdaLN table baked for its 8-step grid. `h3 generate "text"`
+#: with no flags reproduces exactly what the form sends (`h3_48gb/webui/app.js`'s `buildArgs`,
+#: `h3_48gb/webui/index.html`'s `value=` attributes on `#ckpt`/`#lora`/`#lora-str`/`#steps`/
+#: `#adaln`) -- this used to require four flags nobody remembered to type, and the CLI is the
+#: only door left open once the form owns the daily runs.
+DEFAULT_CHECKPOINT = Path.home() / "models/h3-8bit-full"
+#: Pairs with `DEFAULT_STEPS`: restores the motion that 8-step sampling alone loses. 1.0 is the
+#: measured optimum at the default canvas -- see `RunSpec.turbo_lora`'s docstring for the numbers.
+DEFAULT_TURBO_LORA = Path.home() / "models/turbo/minimax_h3_turbo_v4_step600_ema.safetensors"
+#: The table that makes `DEFAULT_STEPS` possible at all: `RunSpec.__post_init__` refuses any
+#: `--steps` that does not match the grid this file (or the checkpoint's own cache) was baked for.
+DEFAULT_ADALN_CACHE = Path.home() / "models/turbo/adaln_8_l100.safetensors"
+#: The grid `DEFAULT_ADALN_CACHE` covers. Eight steps with the Turbo LoRA above is the form's own
+#: choice, not a lucky guess: `31` (`BAKED_GRID_POINTS` below) is four times the wall-clock cost
+#: for a run this fork's own web panel never sends.
+DEFAULT_STEPS = 8
 #: Where clips land. Deliberately not under the weights directory: output is disposable and
 #: models are 46 GB you do not want to delete by accident while clearing space. `H3_OUTDIR`
 #: overrides it, so a permanent choice does not need a flag on every command.
 DEFAULT_OUTDIR = Path(os.environ.get("H3_OUTDIR") or Path.home() / "video-out")
-#: The grid this fork shipped against. Only a fallback now: the real number is read from the
-#: checkpoint's own AdaLN cache, since a cache can be baked for any grid (see `baked_grid_points`).
+#: The grid mere.run's own checkpoint shipped against, before this fork baked a table for any grid
+#: it likes. Only a fallback now, for a bare `--adaln-cache` whose header cannot be read at all
+#: (see `_grid_points_of`) -- `DEFAULT_STEPS` above is what an unadorned `h3 generate` actually asks for.
 BAKED_GRID_POINTS = 31
 
 
@@ -361,7 +378,7 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--height", type=int, default=None,
                      help="canvas height (default: 512, or derived from --image)")
     sub.add_argument("--duration", type=float, default=5.0)
-    sub.add_argument("--steps", type=int, default=BAKED_GRID_POINTS)
+    sub.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     sub.add_argument("--seed", type=int, default=0)
     sub.add_argument("--tag", default="run")
     sub.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT,
@@ -399,10 +416,12 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
     # Long runs must go through this CLI rather than a throwaway script, because this is where
     # checkpointing lives: a 2h14m run driven by a bare `pipe(...)` call has no resume point and
     # is lost entirely if the process dies. That happened once; hence these flags.
-    sub.add_argument("--adaln-cache", type=Path, default=None,
-                     help="AdaLN table baked for a different step count (scripts/bake_adaln.py)")
-    sub.add_argument("--turbo-lora", type=Path, default=None,
-                     help="apply a Turbo LoRA at run time (pairs with a few-step --steps)")
+    sub.add_argument("--adaln-cache", type=Path, default=DEFAULT_ADALN_CACHE,
+                     help="AdaLN table baked for a different step count (scripts/bake_adaln.py); "
+                          "default is the table baked for --steps 8")
+    sub.add_argument("--turbo-lora", type=Path, default=DEFAULT_TURBO_LORA,
+                     help="apply a Turbo LoRA at run time (pairs with a few-step --steps); "
+                          "defaults to the battle recipe's LoRA")
     sub.add_argument("--turbo-strength", type=float, default=1.0,
                      help="LoRA strength (default 1.0; lower it toward 0.8 if the image over-sharpens)")
     sub.add_argument("--preview-decoder", choices=("vae", "tae", "latent"), default="tae",

@@ -33,7 +33,7 @@ import pytest
 
 from h3_48gb import queue as q
 from h3_48gb import web
-from h3_48gb.cli import DEFAULT_CHECKPOINT, ERROR_CODES, CliError, build_parser
+from h3_48gb.cli import BAKED_GRID_POINTS, DEFAULT_CHECKPOINT, ERROR_CODES, CliError, build_parser
 # `flock` is only honest when the holder is a separate process -- see the module docstring.
 from test_cli import bake_adaln_table
 from test_queue import _DRY, _external_lock
@@ -1679,11 +1679,22 @@ def _call(live: _Live, method: str, url: str, payload=None, *, headers=None):
 def _job_args(live: _Live, *extra, tag="ночь", prompt="котик на подоконнике"):
     """A minimal argument list `h3 generate --dry-run` accepts, with every path inside a root.
 
-    `--steps` is left at its default: with no baked AdaLN table in the fake checkpoint,
-    `RunSpec.__post_init__` requires exactly `BAKED_GRID_POINTS`, and spelling that out here would
-    couple every submission test to a constant none of them are about.
+    `--steps` and `--adaln-cache` are spelled out explicitly, pinned to `BAKED_GRID_POINTS` and
+    the fake checkpoint's own baked table (`bake_adaln_table`'s own default covers exactly that
+    grid) -- neither is left at the CLI's own default any more. `h3 generate` now defaults
+    `--adaln-cache` to the web form's recipe table (`DEFAULT_ADALN_CACHE`, `h3_48gb/cli.py`), a
+    real file under `~/models` baked for 8 steps, not 31; submission (`POST /api/jobs`) validates
+    through a `generate --dry-run` *subprocess* (`validate_args`, `h3_48gb/web.py`) that inherits
+    this process's environment rather than anything `queue_server` built, so an omitted
+    `--adaln-cache` there no longer means "use the fake checkpoint's own table" -- it means "reach
+    past the fixture and use the real one instead", 8 grid points against a fake checkpoint baked
+    for 31. Naming both flags explicitly is what keeps this helper self-contained the way its
+    checkpoint already is; a caller after a different grid overrides either by repeating it later
+    in `extra` (argparse keeps the last spelling of a repeated flag).
     """
     args = ["generate", "--outdir", str(live.outdir), "--checkpoint", str(live.models / "ckpt"),
+            "--adaln-cache", str(live.models / "ckpt" / "transformer" / "adaln_cache.safetensors"),
+            "--steps", str(BAKED_GRID_POINTS),
             "--tag", tag, *extra]
     # `--prompt-file` and a positional prompt together are `prompt_both_given`, so naming a file
     # drops the positional one rather than making every caller remember to.
@@ -4271,16 +4282,25 @@ def test_the_argument_list_the_form_builds_is_one_the_server_accepts(queue_serve
     """
     lora = queue_server.models / "turbo.safetensors"
     lora.write_bytes(b"\x00")
+    # `steps: 31` needs its own `--adaln-cache` naming the fake checkpoint's own table: `h3
+    # generate`'s *default* table (`DEFAULT_ADALN_CACHE`, `h3_48gb/cli.py`) is baked for 8, not
+    # 31, and submission validates through a `--dry-run` subprocess that reaches past this test's
+    # fixtures onto that real default when the flag is absent (see `_job_args`'s docstring for the
+    # full story) -- so a form request that means to ask for 31 steps has to say which table backs
+    # them, exactly as a human filling in the field would.
     args = _node_eval("""
       console.log(JSON.stringify(app.buildArgs({
         prompt: "кот на подоконнике", width: 896, height: 576, duration: 10, steps: 31,
         seed: 3, tag: "ночь", mode: "t2va", checkpoint: "CKPT", outdir: "OUT",
-        lora: "LORA", loraStrength: 0.45, image: "", endImage: "", promptFile: null,
+        lora: "LORA", loraStrength: 0.45, adaln: "ADALN", image: "", endImage: "",
+        promptFile: null,
       })));
     """)
     args = [str(queue_server.models / "ckpt") if a == "CKPT"
             else str(queue_server.outdir) if a == "OUT"
-            else str(lora) if a == "LORA" else a for a in args]
+            else str(lora) if a == "LORA"
+            else str(queue_server.models / "ckpt" / "transformer" / "adaln_cache.safetensors")
+            if a == "ADALN" else a for a in args]
 
     status, answer = _call(queue_server, "POST", "/api/estimate", {"args": args})
     assert status == 200, answer
@@ -4677,7 +4697,10 @@ def test_one_origin_header_still_works(queue_server):
            f"Connection: close\r\n\r\n").encode() + _ESTIMATE_BODY
     status, answer = _raw_exchange(queue_server, raw)
     assert status == 200, answer
-    assert answer["estimate"]["forwards"] == 30
+    # `_ESTIMATE_BODY` names no `--checkpoint`/`--steps` at all, so this rides `/api/estimate`'s
+    # in-process `_parse_args` straight to the CLI's own defaults -- `DEFAULT_STEPS` (`cli.py`),
+    # now 8 (the web form's battle recipe), not the old unadorned 31. `forwards` is `steps - 1`.
+    assert answer["estimate"]["forwards"] == 7
 
 
 def test_the_two_provenance_refusals_have_different_codes(queue_server):

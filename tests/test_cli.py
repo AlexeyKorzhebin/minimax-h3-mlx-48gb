@@ -52,21 +52,92 @@ def bake_adaln_table(checkpoint: Path, points: int = BAKED_GRID_POINTS) -> Path:
     return Path(checkpoint)
 
 
+def stub_default_recipe(monkeypatch, tmp_path, *, steps: int | None = None) -> Path:
+    """Point the CLI's own recipe defaults at a throwaway fixture instead of the real weights.
+
+    `DEFAULT_CHECKPOINT`/`DEFAULT_TURBO_LORA`/`DEFAULT_ADALN_CACHE` (`h3_48gb/cli.py`) now name the
+    web form's battle recipe -- real files this machine happens to have -- so any test that used to
+    get away with never passing `--checkpoint` now silently depends on `~/models` existing exactly
+    as it does today. Call this first and it does not: `DEFAULT_CHECKPOINT` becomes a fixture baked
+    under `tmp_path`, and the LoRA/AdaLN overrides go back to `None`, the pre-recipe default, which
+    is what every test in this file *not* about the recipe itself actually wants -- among other
+    things, it is what keeps `install_turbo_lora` (`run_generate`) from reaching for a real LoRA on
+    a stub pipe that has no `.dit` to apply it to.
+
+    Tests that exist specifically to pin the recipe's values do not call this -- see
+    `test_generate_defaults_reproduce_the_web_forms_battle_recipe` and
+    `test_spec_carries_every_field_that_identifies_a_run`.
+    """
+    import h3_48gb.cli as cli_module
+
+    grid = steps if steps is not None else cli_module.DEFAULT_STEPS
+    checkpoint = bake_adaln_table(tmp_path / "default-checkpoint", points=grid)
+    monkeypatch.setattr(cli_module, "DEFAULT_CHECKPOINT", checkpoint)
+    monkeypatch.setattr(cli_module, "DEFAULT_ADALN_CACHE", None)
+    monkeypatch.setattr(cli_module, "DEFAULT_TURBO_LORA", None)
+    return checkpoint
+
+
 def test_parser_defaults_to_the_baked_schedule():
+    """8 steps, not 31: the web form's battle recipe pairs a Turbo LoRA with the AdaLN table baked
+    for its 8-step grid (`DEFAULT_STEPS`, `DEFAULT_ADALN_CACHE` in `h3_48gb/cli.py`), and an
+    unadorned `h3 generate` now reproduces exactly that -- see
+    `test_generate_defaults_reproduce_the_web_forms_battle_recipe` for the rest of the recipe.
+    """
     args = build_parser().parse_args(["generate", "a cat"])
-    assert args.steps == 31, "the shipped AdaLN table only covers 31 grid points"
+    assert args.steps == 8, "the default recipe's AdaLN table covers 8 grid points"
 
 
-def test_spec_carries_every_field_that_identifies_a_run():
+def test_generate_defaults_reproduce_the_web_forms_battle_recipe():
+    """`h3 generate "text"` with no flags must give a working recipe: the 8-bit checkpoint, 8
+    steps, the Turbo LoRA at strength 1.0, and the AdaLN table baked for that grid -- exactly what
+    the web form sends (`h3_48gb/webui/app.js`'s `buildArgs`, and the `value=` attributes on
+    `#ckpt`/`#lora`/`#lora-str`/`#steps`/`#adaln` in `h3_48gb/webui/index.html`).
+
+    Deliberately not run through `spec_from_args`: this only has to show the *values* argparse
+    hands back, and `build_parser().parse_args` never opens a file to do it. `--dry-run` (elsewhere
+    in this file) is what confirms these values also resolve to real, readable weights on a machine
+    that has them -- a claim this test does not make, and does not need `~/models` to check.
+    """
+    import h3_48gb.cli as cli_module
+
+    args = build_parser().parse_args(["generate", "a cat"])
+    assert args.checkpoint == cli_module.DEFAULT_CHECKPOINT == Path.home() / "models/h3-8bit-full"
+    assert args.steps == 8
+    assert args.turbo_lora == cli_module.DEFAULT_TURBO_LORA == (
+        Path.home() / "models/turbo/minimax_h3_turbo_v4_step600_ema.safetensors")
+    assert args.turbo_strength == 1.0
+    assert args.adaln_cache == cli_module.DEFAULT_ADALN_CACHE == (
+        Path.home() / "models/turbo/adaln_8_l100.safetensors")
+
+
+def test_spec_carries_every_field_that_identifies_a_run(tmp_path, monkeypatch):
+    """Every default the recipe sets must reach `RunSpec`, not just `--width`/`--height`/etc.
+
+    Checkpoint, LoRA and AdaLN table are fixtures under `tmp_path`, patched in as the module's own
+    defaults (`stub_default_recipe` does not apply here -- it *clears* the LoRA/AdaLN defaults for
+    tests that are not about the recipe; this one is, so it wires up all three instead).
+    """
+    import h3_48gb.cli as cli_module
+
+    checkpoint = bake_adaln_table(tmp_path / "ckpt", points=8)
+    adaln = bake_adaln_table(tmp_path / "alt-adaln", points=8) / "transformer" / "adaln_cache.safetensors"
+    lora = tmp_path / "lora.safetensors"
+    lora.write_bytes(b"x" * 64)
+    monkeypatch.setattr(cli_module, "DEFAULT_CHECKPOINT", checkpoint)
+    monkeypatch.setattr(cli_module, "DEFAULT_ADALN_CACHE", adaln)
+    monkeypatch.setattr(cli_module, "DEFAULT_TURBO_LORA", lora)
+
     args = build_parser().parse_args(
         ["generate", "a cat", "--width", "1344", "--height", "768",
          "--duration", "5", "--seed", "7", "--tag", "demo"]
     )
     spec = spec_from_args(args)
     assert spec == RunSpec(
-        prompt="a cat", width=1344, height=768, duration=5.0, steps=31, seed=7,
-        checkpoint=Path.home() / "models/h3-converted",
+        prompt="a cat", width=1344, height=768, duration=5.0, steps=8, seed=7,
+        checkpoint=checkpoint,
         outdir=DEFAULT_OUTDIR, tag="demo",
+        turbo_lora=lora, turbo_strength=1.0, adaln_cache=adaln,
     )
 
 
@@ -217,8 +288,9 @@ def test_no_raw_file_is_written_without_the_flag(tmp_path):
     assert "raw" not in report, f"отчёт не должен обещать файл, которого нет: {report}"
 
 
-def test_the_keep_raw_flag_reaches_the_spec_from_the_command_line(tmp_path):
+def test_the_keep_raw_flag_reaches_the_spec_from_the_command_line(tmp_path, monkeypatch):
     """Флаг и поле — одна вещь; разъехавшись, они дадут `--keep-raw`, который ничего не делает."""
+    stub_default_recipe(monkeypatch, tmp_path, steps=31)
     ckpt = bake_adaln_table(tmp_path)
     base = ["generate", "x", "--outdir", str(tmp_path), "--checkpoint", str(ckpt),
             "--width", "64", "--height", "64", "--duration", "1.0", "--steps", "31"]
@@ -959,8 +1031,9 @@ def test_generate_exposes_preview_and_checkpoint_flags():
     assert args.restart is False and args.no_checkpoint is False
 
 
-def test_preview_arguments_reach_the_pipeline(tmp_path):
+def test_preview_arguments_reach_the_pipeline(tmp_path, monkeypatch):
     """`--preview-every`/`--preview-stem` were parsed by nothing and reached nothing before this."""
+    stub_default_recipe(monkeypatch, tmp_path)
     seen = {}
 
     def recording_pipe(**kwargs):
@@ -978,7 +1051,8 @@ def test_preview_arguments_reach_the_pipeline(tmp_path):
     assert seen["preview_stem"] == str(tmp_path / "h3-t-64x64")
 
 
-def test_preview_stem_can_be_pointed_elsewhere(tmp_path):
+def test_preview_stem_can_be_pointed_elsewhere(tmp_path, monkeypatch):
+    stub_default_recipe(monkeypatch, tmp_path)
     seen = {}
 
     def recording_pipe(**kwargs):
@@ -994,12 +1068,13 @@ def test_preview_stem_can_be_pointed_elsewhere(tmp_path):
     assert seen["preview_stem"] == str(tmp_path / "elsewhere" / "peek")
 
 
-def test_previews_disabled_explicitly_pass_no_stem(tmp_path):
+def test_previews_disabled_explicitly_pass_no_stem(tmp_path, monkeypatch):
     """`--preview-every 0` must also clear the stem: the pipeline refuses a stem it will never use.
 
     Previews are on by default now, so this is the explicit opt-*out* path rather than the
     default one — but the invariant it guards is unchanged.
     """
+    stub_default_recipe(monkeypatch, tmp_path)
     seen = {}
 
     def recording_pipe(**kwargs):
@@ -1347,7 +1422,8 @@ def test_renaming_a_keyframe_keeps_the_same_checkpoint(tmp_path):
     assert path_a == path_b
 
 
-def test_checkpoint_dir_overrides_the_default_location(tmp_path):
+def test_checkpoint_dir_overrides_the_default_location(tmp_path, monkeypatch):
+    stub_default_recipe(monkeypatch, tmp_path)
     seen = {}
 
     def recording_pipe(**kwargs):
@@ -1365,9 +1441,10 @@ def test_checkpoint_dir_overrides_the_default_location(tmp_path):
     assert seen["checkpoint_dir"] == str(elsewhere)
 
 
-def test_no_checkpoint_turns_checkpointing_off(tmp_path):
+def test_no_checkpoint_turns_checkpointing_off(tmp_path, monkeypatch):
     """`checkpoint_dir=None` is what makes `CheckpointingPipeline.__call__` fall through
     to upstream's untouched `__call__` — so this must be `None`, not a directory that is unused."""
+    stub_default_recipe(monkeypatch, tmp_path)
     seen = {}
 
     def recording_pipe(**kwargs):
@@ -1384,8 +1461,9 @@ def test_no_checkpoint_turns_checkpointing_off(tmp_path):
     assert seen["checkpoint_dir"] is None
 
 
-def test_restart_disables_resumption(tmp_path):
+def test_restart_disables_resumption(tmp_path, monkeypatch):
     """The escape hatch from `checkpoint_mismatch`: keep checkpointing, ignore what is on disk."""
+    stub_default_recipe(monkeypatch, tmp_path)
     seen = {}
 
     def recording_pipe(**kwargs):
@@ -1473,7 +1551,8 @@ def test_checkpoint_locked_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path)
         raise AssertionError("a CheckpointLocked must surface as a machine-readable CliError")
 
 
-def test_second_writer_reports_checkpoint_locked_not_internal_error_under_json(tmp_path, capsys):
+def test_second_writer_reports_checkpoint_locked_not_internal_error_under_json(
+        tmp_path, monkeypatch, capsys):
     """The task's literal scenario: a second writer hitting an already-occupied checkpoint, under
     `--json`. Without the `except CheckpointLocked` handler in `run_generate` (`cli.py`), this
     exception is not a `CliError` at all -- it falls through `main`'s last-resort
@@ -1481,6 +1560,7 @@ def test_second_writer_reports_checkpoint_locked_not_internal_error_under_json(t
     MCP wrapper could branch on. Deleting that one handler and rerunning this test is the
     mutation check for this fix: it must fail with `checkpoint_locked != internal_error`.
     """
+    stub_default_recipe(monkeypatch, tmp_path)
     import unittest.mock as mock
 
     from h3_48gb.checkpoint import CheckpointLocked
@@ -1697,6 +1777,7 @@ def _chatty_pipeline_factory(checkpoint, verbose=True, **kwargs):
 def test_main_json_output_stays_parseable_with_a_chatty_pipeline(tmp_path, monkeypatch, capsys):
     """Regression for the reviewer-reproduced bug: progress lines interleaved with the JSON report
     made `json.loads(stdout)` raise `JSONDecodeError`. `verbose` must reach both writers."""
+    stub_default_recipe(monkeypatch, tmp_path)
     monkeypatch.setattr("h3_48gb.cli._default_pipeline_factory", _chatty_pipeline_factory)
     monkeypatch.setattr("minimax_h3_mlx.media.save_mp4", lambda *a, **kw: None)
     monkeypatch.setattr("minimax_h3_mlx.media.save_wav", lambda *a, **kw: None)
@@ -1713,6 +1794,7 @@ def test_main_json_output_stays_parseable_with_a_chatty_pipeline(tmp_path, monke
 def test_main_human_mode_still_shows_pipeline_progress(tmp_path, monkeypatch, capsys):
     """The fix for the bug above must not go too far and silence progress that was never the
     problem: a five-hour render without --json still needs to show it is doing something."""
+    stub_default_recipe(monkeypatch, tmp_path)
     monkeypatch.setattr("h3_48gb.cli._default_pipeline_factory", _chatty_pipeline_factory)
     monkeypatch.setattr("minimax_h3_mlx.media.save_mp4", lambda *a, **kw: None)
     monkeypatch.setattr("minimax_h3_mlx.media.save_wav", lambda *a, **kw: None)
@@ -2047,7 +2129,7 @@ def test_the_step_count_is_read_from_the_checkpoint_not_hardcoded(tmp_path):
 
 @pytest.mark.parametrize("break_it", ["absent", "broken_symlink", "junk", "directory"])
 def test_a_checkpoint_with_no_readable_adaln_table_is_refused_before_the_weights_load(
-        tmp_path, break_it):
+        tmp_path, break_it, monkeypatch):
     """Это стоило прогона: битый симлинк на неиспечённый файл — и отказ пришёл после 21 ГБ.
 
     `baked_grid_points` возвращает `None` одинаково на «таблицы нет» и «таблица не читается», а
@@ -2060,7 +2142,13 @@ def test_a_checkpoint_with_no_readable_adaln_table_is_refused_before_the_weights
 
     Четыре способа «нет читаемой таблицы» проверяются вместе, потому что они и в коде одно: тот
     самый битый симлинк, отсутствие файла, мусор вместо safetensors и каталог с нужным именем.
+
+    `stub_default_recipe` clears the CLI's own `--adaln-cache` default (`DEFAULT_ADALN_CACHE`,
+    `h3_48gb/cli.py`): the `main(...)` call below passes `--checkpoint` but not `--adaln-cache`,
+    and since the recipe now supplies a real table by default, an unpatched default would paper
+    over exactly the refusal this test exists to check.
     """
+    stub_default_recipe(monkeypatch, tmp_path)
     checkpoint = tmp_path / "ckpt"
     (checkpoint / "transformer").mkdir(parents=True)
     table = checkpoint / "transformer" / "adaln_cache.safetensors"
