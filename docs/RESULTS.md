@@ -1196,3 +1196,103 @@ measure inside a detected face or body crop rather than over the whole frame, so
 move it; or compare seeds under a prompt that pins the camera to a single static shot, so there is
 nothing left for the model to direct. Until one of those exists, the honest instrument for questions
 about surface quality is a person looking at the clip at the working canvas.
+
+## Attention memory levers: 44.8 GB to 36.2 GB at 15 s, and not one bit changed
+
+Four rewrites of how the DiT stages its Q/K/V and its MLP, landed 2026-08-17 as
+`patches/0002-attention-memory-levers.patch` plus a load-time carve in `h3_48gb/dit.py`. None of
+them is an approximation, a lower precision, or a dropped term: every one is an arithmetic
+identity, and the gate each had to pass was a forward compared to the unpatched code at `atol=0,
+rtol=0` — bit for bit, not "within tolerance".
+
+| clip | packed rows | stock peak | levers peak | delta | stock fwd | levers fwd |
+|-----:|------------:|-----------:|------------:|------:|----------:|-----------:|
+| 2.4 s | 22,791 | 26.39 GB | 25.40 GB | −0.98 | 10.4 s | 10.3 s |
+| 5 s | 38,081 | 29.64 GB | 28.00 GB | −1.65 | 22.5 s | 22.5 s |
+| 10 s | 73,757 | 37.23 GB | 32.31 GB | −4.92 | 70.2 s | 67.9 s |
+| 15 s | 109,433 | 44.81 GB | 36.16 GB | **−8.65** | 138.8 s | 138.0 s |
+
+1344x768, two transformer blocks, 19 distinct noise levels, 8-bit DiT (21.54 GB resident weights
+plus AdaLN table). Two blocks rather than fifty because the peak of a DiT forward is block-local —
+each block's intermediates die with the block — so a 2-block forward reproduces the 50-block peak
+at a twenty-fifth of the cost. Peaks are MLX's own allocator counter (`mx.get_peak_memory`), not
+RSS; the two instruments are not interchangeable and this table is entirely the first one.
+
+**The saving grows with the clip, and that is the point.** It is not a constant overhead being
+removed: the chunked paths hold one 8192-row slice regardless of how long the sequence is, so the
+fraction they save rises from 4% of activations at 2.4 s to 37% at 15 s. The 15 s native forward is
+the case the whole exercise was for — at 44.81 GB it was above this machine's 40.2 GB recommended
+working set and ran on swap; at 36.16 GB it is under it.
+
+**Wall clock is unchanged to within a percent**, and slightly better at 10 s (70.2 -> 67.9 s). The
+chunk loops add kernel launches and re-read `k`/`v` per slice; that cost lands inside the noise of
+what the narrower buffers buy back.
+
+### The four
+
+* **rope-lean** (−1.02 GB at 10 s). `apply_rotary` split the head into a rotated and a
+  passed-through part, rotated one, and concatenated them back: five full-size temporaries for
+  elementwise work. Padding `cos`/`sin` to the full `head_dim` with 1 and 0 makes the pass-through
+  channels fall out of the same expression — `x*1 + rotated*0` is exact at any float width — and
+  two temporaries do the job of five.
+* **qkv-split** (−1.64 GB). The fused `attn.qkv_proj` is carved into `q_proj`/`k_proj`/`v_proj` at
+  load time by gathering output rows. Fused, the `(seq, 3*inner_dim)` projection — 4.8 GB at 73k
+  rows — must be entirely live before q, k or v can be sliced out of it. Split, k and v are built
+  and reduced to their final form before q is projected at all. Exact under quantization because
+  MLX groups affine quantization along the *input* axis: `scales`/`biases` are
+  `(rows, in/group_size)`, so a row carries its own scale and a row gather moves it intact.
+  Resident weights do not grow — the fused layer is dropped.
+* **q-chunk** (0.00 GB on its own, then −2.26 GB jointly with the next one). Attention over 8192
+  query rows at a time, `k`/`v` whole. Softmax normalizes within a query row, so a slice of query
+  rows is a self-contained problem. On its own it moved the peak by *nothing*, because until the
+  MLP horn came down the peak was the MLP's — the discovery probe had measured its −3.3 GB on top
+  of `mlp-chunk` and the plan's task order inverted that. It did make the forward faster.
+* **mlp-chunk** (−2.26 GB with the above). `fc1`'s fused `[gate; value]` output is twice the FFN
+  width — 57 KB per row against the hidden stream's 14 KB — and has to be live alongside the
+  activation it feeds. Built a chunk at a time, only the activation stays full-size.
+
+### The bit that nearly wasn't exact
+
+Chunking a linear layer by rows is arithmetically free and *not* automatically bit-free. MLX picks
+a GEMM tiling by shape, and for a narrow output it splits the reduction differently at different
+row counts. Measured here: `x @ lora_A.T` at 7168-wide input and rank 64 differs by one bf16 ULP
+between a 6247-row call and the concatenation of 2048-row calls. Every spelling tried — `addmm`
+into zeros, float32 accumulation — has the same property, so it is the kernel and not the
+expression. The first chunked run with the Turbo LoRA attached came back at `max|Δ| = 0.536` on a
+scale of 154, which is exactly one bf16 ULP, and exactly not zero.
+
+The LoRA's rank-r read is the only narrow matmul in the model, and it is also the only thing small
+enough to hoist: `(seq, 64)` is 9 MB where the buffers being chunked are gigabytes. So `dit.py`
+grew a two-function protocol — a layer may declare a whole-sequence `prepare_rows` and consume
+slices of it in `apply_rows` — and `LoRALinear` implements it. The `addmm` left in the loop *is*
+row-stable, as is the 8-bit `QuantizedLinear` base; both were checked rather than assumed. With
+that, everything returns to 0.0.
+
+The same reasoning is why **`fc2` still runs once over the whole activation** instead of per chunk.
+Its LoRA reads the activation, which is the very thing the chunking is building, so its narrow read
+cannot be hoisted. Chunking it too was measured — 30.78 GB against 32.31 at 10 s — so the exactness
+costs **1.53 GB**, paid deliberately.
+
+### What was checked
+
+* `tests/test_attention_levers.py`, 38 tests: each lever against a frozen copy of the stock
+  upstream code at `atol=0, rtol=0`; the carve under 8-bit quantization; the Turbo LoRA over split
+  and fused projections against each other; LightX2V likewise; the two chunk levers composed.
+  Guards throughout against a test passing for the wrong reason — that the rotation happens at all,
+  that the QKV permutation still matters, that the chunk loop is actually entered, that a masked
+  call is never chunked.
+* Real weights, `h3-8bit-full`, all 50 blocks at 512x512, chunk sizes lowered to 2048/1500 so the
+  chunked paths are genuinely entered: `max|Δ| = 0.000e+00` on both outputs, with the Turbo LoRA
+  (`minimax_h3_turbo_v4_step600_ema`, strength 1.0) and without it.
+* One MLX fact is pinned on purpose: below ~512 query rows MLX takes a different attention kernel
+  whose accumulation order differs, so chunking a 17-row sequence moves by a ULP. The lever never
+  enters that regime (it engages above 8192 rows), but a doll-sized parity test written without
+  knowing this would have passed for the wrong reason.
+
+### Still open
+
+The queue's pre-run memory estimate (`h3_48gb/web.py`, `peak_gb = 9.3*rows/37657 + weights`) is
+fitted to whole-run measurements from 2026-08-11 and has **not** been re-fitted. It is now
+pessimistic for the diffusion phase — but a run's peak is not necessarily its diffusion peak (the
+largest single allocation this project has observed is the 28.22 GB text encoder), so re-fitting it
+honestly needs end-to-end runs, which the probe above is not.

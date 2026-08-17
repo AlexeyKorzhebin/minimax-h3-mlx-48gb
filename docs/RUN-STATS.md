@@ -6,6 +6,14 @@ collected from raw logs and JSON — not hand-curated, and not a substitute for
 disagree, `RESULTS.md` is the one that was re-derived from first principles after a locale bug
 corrupted a memory CSV (see its "A correction" section); this file just says what the logs say.
 
+**Every peak in this file predates 2026-08-17.** On that day four bit-identical rewrites of the
+DiT's Q/K/V and MLP staging landed (`RESULTS.md`, "Attention memory levers"), and the diffusion
+peak of a long native forward fell by about a fifth — 37.2 GB to 32.3 GB at 10 s, more in absolute
+terms the longer the clip. Nothing about the *outputs* changed, so the rows below remain valid as a
+record of what was rendered and how long it took; their memory column is simply no longer what the
+same request would cost today. The pre-run estimate the queue shows is likewise still fitted to
+pre-lever runs — re-fitting it needs whole-run measurements, which these are not.
+
 ## How this was collected
 
 `scripts/collect_run_stats.py` walks four sources and merges rows by `--tag`:
