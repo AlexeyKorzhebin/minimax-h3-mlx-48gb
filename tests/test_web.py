@@ -2401,6 +2401,70 @@ def test_the_estimate_route_answers_without_starting_a_subprocess(queue_server, 
     assert _pending(queue_server) == [], "/api/estimate must not queue anything"
 
 
+def _vertical_frame(live: _Live, width=768, height=1024, name="kadr.png") -> Path:
+    """A real image inside the outdir, because `resolve_canvas` opens it: the canvas derived from
+    a keyframe is a fact about the file's pixels, and a stub path proves nothing about it.
+    """
+    from PIL import Image
+
+    path = live.outdir / name
+    Image.new("RGB", (width, height), "red").save(path)
+    return path
+
+
+def test_the_estimate_of_a_keyframe_run_uses_the_canvas_derived_from_the_frame(queue_server):
+    """Без `--width/--height` формула брала `DEFAULT_CANVAS` — 896x512, горизонтальный, — и
+    вертикальный кадр получал оценку чужого канваса: время и память считались не для того ролика,
+    который поедет считаться.
+
+    Канвас из кадра знает только CLI (`resolve_canvas` -> `minimax_h3_mlx.packing`, который этому
+    процессу импортировать нельзя), поэтому здесь запускается тот же dry-run, что и при постановке,
+    и оценка считается по его `canvas`. Подписи оценки этот же канвас нужен, чтобы показать его
+    человеком, — оттого `width`/`height` в ответе.
+    """
+    frame = _vertical_frame(queue_server)
+    status, answer = _call(queue_server, "POST", "/api/estimate",
+                           {"args": _job_args(queue_server, "--image", str(frame),
+                                              "--mode", "i2v", "--duration", "10")})
+    assert status == 200, answer
+    got = (answer["estimate"]["width"], answer["estimate"]["height"])
+    assert got == (768, 1024), f"канвас обязан прийти из кадра, а не из DEFAULT_CANVAS: {got}"
+    assert got != web.DEFAULT_CANVAS
+
+
+def test_an_estimate_with_explicit_numbers_still_starts_no_subprocess(queue_server, monkeypatch):
+    """Оборотная сторона: dry-run включается только там, где канвас без него неизвестен. Форма
+    пересчитывает оценку на каждое нажатие клавиши, и подпроцесс на каждое нажатие — форк-бомба.
+    """
+    monkeypatch.setattr(web, "validate_args", lambda *a, **k: pytest.fail(
+        "явные --width/--height не требуют dry-run"))
+    frame = _vertical_frame(queue_server, name="kadr2.png")
+    status, answer = _call(queue_server, "POST", "/api/estimate",
+                           {"args": _job_args(queue_server, "--image", str(frame),
+                                              "--width", "896", "--height", "576")})
+    assert status == 200, answer
+    assert (answer["estimate"]["width"], answer["estimate"]["height"]) == (896, 576)
+
+
+def test_a_keyframe_job_queued_without_a_canvas_carries_the_derived_one(queue_server):
+    """Постановка без `--width/--height` обязана доезжать до очереди, а задача — нести выведенный
+    канвас: иначе «из кадра (авто)» в форме ставит задачу, про которую потом нельзя сказать, в
+    каком разрешении она посчитается.
+    """
+    frame = _vertical_frame(queue_server, width=1024, height=768, name="gorizont.png")
+    status, answer = _call(queue_server, "POST", "/api/jobs",
+                           {"args": _job_args(queue_server, "--image", str(frame),
+                                              "--mode", "i2v")})
+    assert status == 200, answer
+    job = answer["job"]
+    assert (job["estimate"]["width"], job["estimate"]["height"]) == (1024, 768), job["estimate"]
+    # Имя вывода складывается из канваса (`h3-<тег>-<W>x<H>`), поэтому оно и есть второй,
+    # независимый след выведенного канваса — тот, который человек увидит на диске.
+    assert job["output_stem"].endswith("1024x768"), job["output_stem"]
+    assert "--width" not in job["args"], (
+        "аргументы задачи остаются без канваса — его выводит CLI, и выводит одинаково оба раза")
+
+
 def test_the_estimate_route_refuses_a_path_outside_the_roots(queue_server):
     """Without the path check this route reads `quant_config.json` from any directory a caller
     names, which turns an estimate into an existence oracle for the whole filesystem.
@@ -3092,17 +3156,22 @@ def test_every_canvas_preset_has_its_own_option_in_the_resolution_dropdown():
     Значения (`w`/`h`) живут в `CANVAS_PRESETS` и только там; подпись пункта пишет их для
     человека, и разъехаться эти два списка не имеют права — выпадашка, обещающая «малое
     896×576» и ставящая 1344×768, хуже отсутствующей.
+
+    Два пункта по краям — не пресеты и в `CANVAS_PRESETS` их нет: «из кадра (авто)» значит «не
+    слать `--width/--height` вовсе», «своё…» открывает поля ручного ввода. Ни у того, ни у
+    другого нет пары чисел, которую можно было бы сверить.
     """
     page = _page_text("index.html")
     select = re.search(r'<select[^>]*id="canvas-preset".*?</select>', page, re.S)
     assert select, "разрешение выбирается выпадашкой #canvas-preset, а не кнопками-пресетами"
     options = re.findall(r'<option value="([^"]+)"[^>]*>([^<]*)</option>', select.group(0))
     keys = [value for value, _ in options]
+    assert keys[0] == "auto", f"«из кадра» — первый пункт списка, а список {keys}"
     assert keys[-1] == "custom", f"«своё…» — последний пункт списка, а список {keys}"
 
     presets = _node_eval("console.log(JSON.stringify(app.CANVAS_PRESETS));")
-    assert keys[:-1] == [p["key"] for p in presets], (keys, [p["key"] for p in presets])
-    for (value, label), preset in zip(options, presets):
+    assert keys[1:-1] == [p["key"] for p in presets], (keys, [p["key"] for p in presets])
+    for (value, label), preset in zip(options[1:], presets):
         assert f'{preset["w"]}×{preset["h"]}' in label, (
             f"пункт {value!r} подписан {label!r}, а пресет — {preset['w']}×{preset['h']}")
     assert "data-preset=" not in page, "кнопки-пресеты заменены выпадашкой, а не дополнены ею"
@@ -4186,6 +4255,74 @@ def test_the_upload_zone_error_shows_the_servers_own_reason(_=None):
     script = _page_text("app.js")
     assert script.count("errorText(error.payload).pre || errorText(error.payload).title") == 2, (
         "обе зоны — форма и модалка — обязаны показывать причину, а не общий заголовок")
+
+
+@_needs_node
+def test_the_auto_canvas_choice_sends_no_width_or_height_at_all():
+    """«из кадра (авто)»: CLI выводит канвас из кадра сам (аспект цел, кратность 32), но только
+    если не получил ни `--width`, ни `--height` — с одним из двух он отказывается
+    (`partial_canvas_with_image`), с обоими берёт их как есть.
+
+    Форма же слала оба всегда, поэтому автовывод из веба был недостижим: вертикальную картинку
+    молча растягивало в горизонтальный канвас пресета. Проверяется ровно отсутствие обоих флагов.
+    """
+    auto, auto_no_frame, preset = _node_eval("""
+      const base = {width: 896, height: 576, duration: 10, steps: 8, seed: 3, tag: "т",
+                    mode: "i2v", checkpoint: "C", outdir: "O", lora: "", adaln: "",
+                    endImage: "", promptFile: null, prompt: "кот"};
+      console.log(JSON.stringify([
+        app.buildArgs({...base, image: "/k/kadr.png", canvasFromImage: true}),
+        app.buildArgs({...base, image: "", canvasFromImage: true}),
+        app.buildArgs({...base, image: "/k/kadr.png", canvasFromImage: false}),
+      ]));
+    """)
+    assert "--width" not in auto and "--height" not in auto, auto
+    assert "--image" in auto, "кадр обязан остаться — из него и выводится канвас"
+    assert "--width" in auto_no_frame, (
+        "без кадра выводить не из чего: канвас обязан уехать числами, а не пропасть")
+    assert "--width" in preset and "--height" in preset, preset
+
+
+@_needs_node
+def test_the_auto_canvas_is_offered_only_when_a_frame_can_actually_supply_it():
+    """Пункт «из кадра» без кадра — обещание, которое некому выполнить: CLI подставит
+    `DEFAULT_CANVAS` и посчитает молча не то. Доступность — чистая функция от режима и кадра.
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify([
+        app.autoCanvasAllowed("i2v", "/k/a.png"),
+        app.autoCanvasAllowed("flf", "/k/a.png"),
+        app.autoCanvasAllowed("i2v", ""),
+        app.autoCanvasAllowed("t2v", "/k/a.png"),
+        app.autoCanvasAllowed("t2va", ""),
+      ]));
+    """)
+    assert got == [True, True, False, False, False], got
+
+
+@_needs_node
+def test_the_estimate_line_names_the_canvas_that_was_derived_from_the_frame():
+    """Канвас «из кадра» человек не выбирал и увидеть ему негде — кроме подписи оценки. Без неё
+    единственный способ узнать разрешение будущего ролика — дождаться файла на диске.
+    """
+    auto, plain = _node_eval("""
+      console.log(JSON.stringify([
+        app.canvasNote(true, {width: 576, height: 896}),
+        app.canvasNote(false, {width: 896, height: 576}),
+      ]));
+    """)
+    assert auto == "из кадра: 576×896", auto
+    assert plain == "", "выбранный руками пресет и так виден в выпадашке — второй раз незачем"
+
+
+def test_the_frame_zone_says_a_vertical_picture_gives_a_vertical_video():
+    """Аспект сохраняется — это и есть ответ на вопрос «а что будет с моей вертикальной
+    картинкой», который иначе выясняется только по готовому ролику.
+    """
+    page = _page_text("index.html")
+    assert "вертикальная картинка" in page.lower(), (
+        "зона кадра обязана сказать, что аспект сохраняется")
+    assert '<option value="auto"' in page, "пункт «из кадра (авто)» обязан быть в выпадашке"
 
 
 def test_the_form_defaults_to_the_project_s_working_recipe():

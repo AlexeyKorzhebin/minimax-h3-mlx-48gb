@@ -129,11 +129,15 @@
 
         <!-- Разрешение — выпадашкой, а не тремя кнопками (C2): шесть готовых канвасов
              (три размера в двух ориентациях) плюс «своё…», открывающее поля ниже.
-             Значения живут в CANVAS_PRESETS, подписи — здесь; тест сверяет их между собой. -->
+             Значения живут в CANVAS_PRESETS, подписи — здесь; тест сверяет их между собой.
+             «из кадра (авто)» — не пресет и в CANVAS_PRESETS его нет: он значит «не слать
+             --width/--height вовсе», чтобы канвас вывел CLI из самого кадра. Доступен только
+             под i2v/flf с загруженным кадром — app.js его включает и гасит. -->
         <div class="field">
           <label for="canvas-preset">Разрешение</label>
           <div class="sel">
             <select id="canvas-preset">
+              <option value="auto" disabled>из кадра (авто)</option>
               <option value="draft">черновик 448×288</option>
               <option value="draft-v">черновик верт. 288×448</option>
               <option value="small" selected>малое 896×576</option>
@@ -204,6 +208,9 @@
             <input class="inp mono path" id="image" type="text"
                    placeholder="~/video-out/кадры/start.png" hidden>
           </div>
+          <!-- Ответ на «а что будет с моей вертикальной картинкой», который иначе выясняется
+               только по готовому ролику: под «из кадра (авто)» аспект сохраняется. -->
+          <span class="hint">вертикальная картинка даст вертикальное видео (аспект сохраняется)</span>
         </div>
         <div class="field full" id="row-end-image" hidden>
           <label for="end-image-file">Последний кадр</label>

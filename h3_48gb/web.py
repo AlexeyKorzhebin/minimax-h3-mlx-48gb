@@ -821,6 +821,25 @@ def quant_bits(checkpoint) -> int:
     return 4
 
 
+def canvas_comes_from_the_image(parsed) -> bool:
+    """Whether this request leaves the canvas for the CLI to derive from the keyframe.
+
+    True for exactly the shape the form's «из кадра (авто)» sends: a keyframe and neither
+    `--width` nor `--height`. `resolve_canvas` treats that as "derive from the image, aspect
+    intact"; with only one of the two it refuses (`partial_canvas_with_image`), and with both it
+    uses them as given.
+
+    A predicate rather than an inline condition because two callers need the same answer and must
+    not drift: `_estimate_only` uses it to decide whether the formula needs a dry run first, and
+    the docstring of `estimate` explains what happens when nobody asks. `parsed` is an
+    `argparse.Namespace` from `_parse_args`, not an argv list -- the question is about resolved
+    flags, and scanning strings for `"--width"` would miss `--width=896`.
+    """
+    return (getattr(parsed, "image", None) is not None
+            and getattr(parsed, "width", None) is None
+            and getattr(parsed, "height", None) is None)
+
+
 def estimate(args, checkpoint, *, report=None) -> dict:
     """How long this request will take and how much memory it will need, by the fitted model.
 
@@ -2304,10 +2323,25 @@ class _Handler(BaseHTTPRequestHandler):
     def _estimate_only(self) -> tuple[int, str, bytes]:
         """`POST /api/estimate`: the cost of an argument list, without queueing anything.
 
-        No subprocess here: the estimate is a formula, and the form recomputes it on every
+        Normally no subprocess: the estimate is a formula, and the form recomputes it on every
         keystroke. The command allowlist and the path check still run -- without the path check
         this route would read `quant_config.json` from any directory a caller named, which turns
         an estimate into an existence oracle for the whole filesystem.
+
+        **The one exception is a keyframe run with no canvas** (`canvas_comes_from_the_image`),
+        which the form now sends deliberately: «из кадра (авто)» omits `--width`/`--height` so the
+        CLI derives the canvas from the frame, aspect intact. The formula cannot follow it there --
+        the derivation lives in `minimax_h3_mlx.packing`, which this process may never import (see
+        the module docstring and `test_web_module_does_not_import_mlx`) -- so without the dry run
+        `estimate` would silently fall back to `DEFAULT_CANVAS`, i.e. price a vertical frame as a
+        landscape video. Duplicating the arithmetic here instead would be the worse answer: two
+        implementations of the same rule drift, and this one would drift towards *quietly wrong
+        numbers* rather than an error.
+
+        The subprocess is affordable exactly because it is bounded to this case: a dry run with a
+        keyframe measures ~0.12 s (it opens the image and builds a `RunSpec`, no weights), the form
+        debounces estimates by 250 ms, and every other keystroke -- a preset, a duration, a step
+        count -- still takes the formula-only path.
         """
         payload = self._json_request(allowed=("args",))
         args = self._args_of(payload)
@@ -2316,8 +2350,10 @@ class _Handler(BaseHTTPRequestHandler):
         # ~/models/h3-8bit` reaches `quant_bits` as a directory literally named `~` otherwise, and
         # the form would be told 4 bits here and 8 bits on submission for one request.
         argv = check_path_flags(args, self.server.roots)
+        parsed = _parse_args(argv)
+        report = validate_args(argv) if canvas_comes_from_the_image(parsed) else None
         return 200, "application/json", _json_bytes(
-            {"ok": True, "estimate": estimate(argv, checkpoint=_parse_args(argv).checkpoint)})
+            {"ok": True, "estimate": estimate(argv, checkpoint=parsed.checkpoint, report=report)})
 
     # -- prompts ----------------------------------------------------------------------------
 

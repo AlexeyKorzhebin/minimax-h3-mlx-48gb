@@ -1151,10 +1151,37 @@ export function nextBannerState(prev, state) {
    ФОРМА
    =========================================================================== */
 
+/** Можно ли выводить канвас из кадра: есть режим с кадром и есть сам кадр.
+ *
+ *  Пункт «из кадра» без кадра — обещание, которое некому выполнить: CLI не найдёт, из чего
+ *  выводить, подставит `DEFAULT_CANVAS` и посчитает молча не то. Отдельная чистая функция, потому
+ *  что ответ нужен в трёх местах (доступность пункта, `buildArgs`, автопереключение после
+ *  загрузки кадра), и разъехавшись они дадут ровно ту тихую ошибку, от которой пункт заведён. */
+export function autoCanvasAllowed(mode, image) {
+  return (mode === "i2v" || mode === "flf") && Boolean((image || "").trim());
+}
+
+/** Подпись оценки про выведенный канвас — пустая, если канвас выбран руками.
+ *
+ *  Пресет человек видит в выпадашке; выведенный из кадра он не выбирал и увидеть ему негде, а
+ *  разрешение будущего ролика — не та вещь, которую узнают по файлу на диске. */
+export function canvasNote(fromImage, estimate) {
+  if (!fromImage || !estimate) return "";
+  const { width, height } = estimate;
+  if (!width || !height) return "";
+  return `из кадра: ${width}×${height}`;
+}
+
 /**
  * Список аргументов для `POST /api/jobs` (или `/api/estimate`, если
  * `withPrompt` снят: оценке промпт не нужен, а слать килобайты текста на
  * каждое нажатие клавиши незачем).
+ *
+ * `--width`/`--height` уходят всегда, **кроме** «из кадра (авто)»: `resolve_canvas` в CLI
+ * выводит канвас из кадра (аспект цел, кратность 32, аспект 1:4..4:1) ровно тогда, когда не
+ * получил ни того, ни другого — с одним из двух он отказывается (`partial_canvas_with_image`),
+ * с обоими берёт их как есть. Форма слала оба всегда, поэтому автовывод из веба был недостижим:
+ * вертикальную картинку молча растягивало в горизонтальный канвас пресета.
  */
 export function buildArgs(form, { withPrompt = true } = {}) {
   const args = ["generate"];
@@ -1162,8 +1189,12 @@ export function buildArgs(form, { withPrompt = true } = {}) {
     if (form.promptFile) args.push("--prompt-file", form.promptFile);
     else if (form.prompt) args.push(form.prompt);
   }
-  args.push("--width", String(form.width), "--height", String(form.height),
-            "--duration", String(form.duration), "--steps", String(form.steps),
+  // Условие смотрит и на кадр, а не только на выбранный пункт: выпадашка могла остаться на
+  // «из кадра» после того, как кадр убрали, и молчаливый `DEFAULT_CANVAS` — худший исход из всех.
+  if (!(form.canvasFromImage && autoCanvasAllowed(form.mode, form.image))) {
+    args.push("--width", String(form.width), "--height", String(form.height));
+  }
+  args.push("--duration", String(form.duration), "--steps", String(form.steps),
             "--seed", String(form.seed), "--tag", form.tag,
             "--mode", form.mode,
             "--checkpoint", form.checkpoint, "--outdir", form.outdir);
@@ -1803,6 +1834,7 @@ function startPage() {
     image: $("image").value.trim(),
     endImage: $("end-image").value.trim(),
     promptFile: promptFileArg(),
+    canvasFromImage: autoCanvasChosen(),
   });
 
   /* Промпт уходит файлом, только если он в точности равен файлу: иначе на
@@ -2132,10 +2164,14 @@ function startPage() {
     lastEstimate = estimate;
     const forwards = Number(estimate.forwards) || 0;
     $("est-time").textContent = "≈" + formatDuration(estimate.seconds);
+    // Выведенный канвас — единственное место, где человек его видит: пункт «из кадра» чисел не
+    // показывает, а в `#width`/`#height` под ним лежит не он.
+    const note = canvasNote(autoCanvasChosen(), estimate);
     $("est-sub").innerHTML = `${forwards} `
       + `${plural(forwards, "проход", "прохода", "проходов")} по `
       + `<span class="num">${formatFine(estimate.seconds_per_forward)}</span>, `
-      + `DiT ${escapeHtml(estimate.bits)} бит`;
+      + `DiT ${escapeHtml(estimate.bits)} бит`
+      + (note ? `, ${escapeHtml(note)}` : "");
     $("mem-num").textContent = "~" + formatGb(estimate.peak_gb);
 
     const verdict = memoryVerdict(estimate.peak_gb);
@@ -2774,9 +2810,17 @@ function startPage() {
     // же строку, с которой пришла (см. `formNote`) — иначе «Править» тихо стирала бы чужой текст.
     formNote = job.note || "";
     syncModeRows();
-    syncCanvasPreset();
+    /* Задача, поставленная «из кадра», несёт канвас только в оценке — в её `args` нет ни
+       `--width`, ни `--height`, потому что выводил его CLI. Правка обязана вернуться на тот же
+       пункт, иначе «Править» молча превращает автовывод в пресет по числам из оценки: для
+       кадра 768×1344 это «большое верт.», для кадра 700×1000 — «своё…», и оба раза правка
+       меняет то, о чём её не просили. */
+    const hadCanvas = argValue(job.args, "--width") !== null;
+    $("canvas-preset").value = hadCanvas ? $("canvas-preset").value : "auto";
     updateUploadZone("image");
     updateUploadZone("end-image");
+    syncCanvasPreset();
+    syncAutoCanvasOption();
   }
 
   function setEditing(id) {
@@ -2863,15 +2907,50 @@ function startPage() {
      а числа (правка задачи, ручной ввод) выбирают пункт — иначе список показывал бы «малое» на
      канвасе 1024×576. */
 
-  /** Пункт списка — по тому, что сейчас в полях; поля ручного ввода видны только под «своё…». */
+  /* Трогал ли человек выпадашку разрешения сам. Нужно ровно одному месту — автопереключению на
+     «из кадра» после загрузки кадра: подставлять умолчание можно, перебивать явный выбор нельзя,
+     а отличить одно от другого по значению выпадашки невозможно (выбранное руками «малое»
+     выглядит ровно как «малое», стоявшее там с загрузки страницы). */
+  let canvasTouchedByHand = false;
+
+  /** Пункт списка — по тому, что сейчас в полях; поля ручного ввода видны только под «своё…».
+   *
+   *  «из кадра» этот путь не трогает: у него нет своих чисел в полях, по которым его можно было
+   *  бы узнать обратно (в `#width`/`#height` под ним лежит последний пресет — тот, на который
+   *  форма вернётся, если кадр уберут), так что вывести его из полей нельзя, и перезаписывать
+   *  выбор человека нечем. */
   function syncCanvasPreset() {
+    if ($("canvas-preset").value === "auto" && autoCanvasChosen()) {
+      $("row-canvas").hidden = true;
+      return;
+    }
     const key = canvasPresetKey($("width").value, $("height").value);
     $("canvas-preset").value = key;
     $("row-canvas").hidden = key !== "custom";
   }
 
+  /** Выбран ли «из кадра» — и вправе ли он быть выбран прямо сейчас.
+   *
+   *  Второе условие не формальность: режим и кадр меняются после выбора пункта, и «из кадра»,
+   *  переживший удаление кадра, — это молчаливый `DEFAULT_CANVAS` вместо ошибки. */
+  function autoCanvasChosen() {
+    return $("canvas-preset").value === "auto"
+      && autoCanvasAllowed($("mode").value, $("image").value);
+  }
+
+  /** Доступность пункта «из кадра»: только под i2v/flf с кадром. Если он был выбран и перестал
+   *  быть возможным — форма возвращается к пресету по числам, которые всё это время лежали в
+   *  полях, а не остаётся на пункте, который больше ничего не значит. */
+  function syncAutoCanvasOption() {
+    const allowed = autoCanvasAllowed($("mode").value, $("image").value);
+    const option = $("canvas-preset").querySelector('option[value="auto"]');
+    if (option) option.disabled = !allowed;
+    if (!allowed && $("canvas-preset").value === "auto") syncCanvasPreset();
+  }
+
   /** Выбор пункта — в поля. «своё…» ничего не пишет: оно открывает то, что уже стоит, и человек
-   *  правит от него, а не от обнулённого канваса. */
+   *  правит от него, а не от обнулённого канваса. «из кадра» тоже ничего не пишет — и по той же
+   *  причине: числа под ним остаются тем, к чему форма вернётся, если кадр уберут. */
   function applyCanvasChoice() {
     const key = $("canvas-preset").value;
     const preset = applyCanvasPreset(key);
@@ -2906,6 +2985,22 @@ function startPage() {
     $(`${id}-zone-label`).textContent = uploadZoneLabel({ name });
     $(`${id}-zone`).classList.toggle("loaded", Boolean(name));
     $(`${id}-zone`).classList.remove("error");
+    // Кадр появился или пропал — от этого зависит, возможен ли вообще пункт «из кадра».
+    syncAutoCanvasOption();
+  }
+
+  /** После загрузки кадра форма сама встаёт на «из кадра». Это верный ответ по умолчанию: кадр
+   *  уронили ради него самого, и растянуть его в чужой аспект — не то, чего хотели. Выбор
+   *  человека при этом не перебивается: если он уже поставил пресет руками, здесь ничего не
+   *  происходит — переключается только пункт, оставшийся с прошлого раза «по умолчанию». */
+  function preferAutoCanvasAfterUpload(id) {
+    if (id !== "image") return;                       // канвас выводится из первого кадра
+    if (!autoCanvasAllowed($("mode").value, $("image").value)) return;
+    if (canvasTouchedByHand) return;
+    $("canvas-preset").value = "auto";
+    $("row-canvas").hidden = true;
+    scheduleEstimate();
+    renderPrompt();
   }
 
   /** Один POST, сырыми байтами: `Content-Type: application/octet-stream` и имя файла в
@@ -2932,6 +3027,7 @@ function startPage() {
       }
       $(id).value = payload.path;
       updateUploadZone(id);
+      preferAutoCanvasAfterUpload(id);
       scheduleEstimate();
       renderPrompt();
     } catch (error) {
@@ -3209,7 +3305,10 @@ function startPage() {
     $("hl").scrollTop = $("prompt").scrollTop;
     $("hl").scrollLeft = $("prompt").scrollLeft;
   });
-  $("canvas-preset").addEventListener("change", applyCanvasChoice);
+  $("canvas-preset").addEventListener("change", () => {
+    canvasTouchedByHand = true;   // с этого момента загрузка кадра пункт уже не перебивает
+    applyCanvasChoice();
+  });
   for (const id of FIELDS) {
     $(id).addEventListener("input", () => {
       scheduleEstimate();
@@ -3229,6 +3328,7 @@ function startPage() {
   wireChatAttach();
   $("mode").addEventListener("change", () => {
     syncModeRows();
+    syncAutoCanvasOption();   // t2v кадра не несёт — «из кадра» под ним невозможно
     renderPrompt();     // t2va без звуковых секций — отказ, t2v без них — нет
     scheduleEstimate();
   });
@@ -3321,6 +3421,7 @@ function startPage() {
 
   syncModeRows();
   syncCanvasPreset();
+  syncAutoCanvasOption();  // на чистой форме кадра нет — пункт «из кадра» гаснет сразу
   refreshSubmitState();   // сводка «Настроек модели» видна до первой оценки, а не после неё
   // Адрес в чроме: у этой страницы бывает вторая копия себя на другом порту (свой сервер для
   // проверок), и перепутать их — потерять вечер. Читается из адресной строки, а не из ответа
