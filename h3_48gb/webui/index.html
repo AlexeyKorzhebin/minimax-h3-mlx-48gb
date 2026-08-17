@@ -413,8 +413,9 @@
              или «обновить задачу» — её ставит app.js при открытии. -->
         <button class="inverse" id="chat-finish" type="button">в Редактор</button>
         <button class="ghost" id="chat-delete" type="button">очистить</button>
-        <button class="ghost" id="chat-close" type="button">закрыть
-          <span class="kbd">esc</span></button>
+        <!-- Без подсказки «esc»: Esc эту модалку больше не закрывает (как и клик по подложке),
+             а надпись про клавишу, которая ничего не делает, — хуже отсутствия надписи. -->
+        <button class="ghost" id="chat-close" type="button">закрыть</button>
       </span>
     </div>
 

@@ -1401,7 +1401,12 @@ export function chatWarningText(warning) {
 export const CHAT_HASH = /^#chat\/([0-9a-f]+)$/;
 
 /**
- * Что делать с адресом: закрыть окно, открыть сессию — или ничего.
+ * Что делать с адресом: открыть сессию — или ничего.
+ *
+ * Закрывать — никогда. Раньше адрес, переставший быть `#chat/<id>`, закрывал окно, и шаг «назад»
+ * в браузере уносил несохранённую правку промпта так же тихо, как это делали Esc и подложка.
+ * Теперь окно закрывает только кнопка, а `closeChat` сам обнуляет `chatWanted`, не дожидаясь
+ * события об адресе, — иначе та же сессия после закрытия не открылась бы второй раз.
  *
  * `current` — сессия, которая уже открыта **или прямо сейчас открывается**, и второе слово тут
  * и есть весь смысл. Открытие модалки — это `location.hash = "#chat/<id>"`, а браузер ставит
@@ -1416,7 +1421,7 @@ export const CHAT_HASH = /^#chat\/([0-9a-f]+)$/;
  */
 export function chatHashAction(hash, current) {
   const match = CHAT_HASH.exec(hash || "");
-  if (!match) return current ? { act: "close" } : { act: "nothing" };
+  if (!match) return { act: "nothing" };
   if (match[1] === current) return { act: "nothing" };
   return { act: "enter", id: match[1] };
 }
@@ -2460,8 +2465,8 @@ function startPage() {
     if (CHAT_HASH.test(window.location.hash || "")) window.location.hash = "";
   }
 
-  /* Закрытие по жесту человека — Esc, подложка, «закрыть». Правка руками нигде, кроме этого
-     окна, не живёт (сервер хранит ответы модели), поэтому одним нажатием она не выбрасывается.
+  /* Единственный жест, закрывающий окно, — кнопка «закрыть». Правка руками нигде, кроме этого
+     окна, не живёт (сервер хранит ответы модели), поэтому даже она спрашивает.
      `finishChat` спрашивать не должен: он этот текст как раз и сохраняет. */
   function requestCloseChat() {
     if (hasUnsavedEdits(chat)
@@ -2488,7 +2493,6 @@ function startPage() {
 
   async function syncChatFromHash() {
     const action = chatHashAction(window.location.hash, chatWanted);
-    if (action.act === "close") { closeChat(); return; }
     if (action.act === "nothing") return;
     // Помечаем намерение до `await`, а не после: `hashchange` от нашего же присваивания хеша
     // приходит именно в это окно, и сторож обязан застать его уже занятым.
@@ -3291,15 +3295,12 @@ function startPage() {
     $("chat-hl").scrollTop = $("chat-prompt-text").scrollTop;
     $("chat-hl").scrollLeft = $("chat-prompt-text").scrollLeft;
   });
-  /* Клик по подложке и Esc закрывают модалку — привычные два жеста. Ход и лента при этом не
-     теряются (сессия на диске, `#chat/<id>` открывает её обратно), а вот правка руками живёт
-     только здесь — о ней `requestCloseChat` спрашивает. */
-  $("chat-modal").addEventListener("click", (event) => {
-    if (event.target === $("chat-modal")) requestCloseChat();
-  });
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && chat) requestCloseChat();
-  });
+  /* Окно закрывается ровно одним жестом — кнопкой «закрыть» (и ещё «в Редактор», который сам
+     сохраняет то, о чём иначе пришлось бы спрашивать). Esc и клик по подложке отсюда убраны, а
+     не оставлены «на всякий случай»: ход и лента закрытие переживают (сессия на диске), но
+     правка промпта руками живёт только в `chat.promptText`, и случайный промах мимо окна уносил
+     её молча. Привычность жеста не стоит потерянной работы — а спрос через `confirm` на каждый
+     промах превращается в диалог, который жмут не глядя. */
   window.addEventListener("hashchange", syncChatFromHash);
 
   // -- запуск -----------------------------------------------------------------------------

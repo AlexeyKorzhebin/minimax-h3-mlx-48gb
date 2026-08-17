@@ -4629,13 +4629,16 @@ def test_opening_a_chat_reads_the_session_once_even_though_the_hash_fires_late()
 
     Проверяется чистая функция-сторож на том самом порядке событий: «уже открывается» обязано
     закрывать дверь так же, как «уже открыто».
+
+    Закрытия по адресу тут больше нет — его убрали вместе с Esc и подложкой (см.
+    `test_the_address_bar_no_longer_closes_the_window_behind_the_persons_back`), — поэтому шаг
+    «закрыли» ниже делает то же, что делает кнопка: обнуляет `chatWanted` сам, как `closeChat`.
     """
     got = _node_eval("""
       const calls = [];
       let wanted = null;                       // то, что страница хранит рядом с `chat`
       function sync(hash) {                    // ровно тело `syncChatFromHash`
         const action = app.chatHashAction(hash, wanted);
-        if (action.act === "close") { wanted = null; return; }
         if (action.act === "nothing") return;
         wanted = action.id;
         calls.push(action.id);                 // здесь страница уходит в `await enterChat`
@@ -4645,22 +4648,20 @@ def test_opening_a_chat_reads_the_session_once_even_though_the_hash_fires_late()
       const opened = calls.slice();
       sync("#chat/ab12");                      // ещё один hashchange (F5 по тому же адресу)
       const still = calls.slice();
-      sync("");                                // закрыли — и снова открыли ту же сессию
-      sync("#chat/ab12");
+      wanted = null;                           // кнопка «закрыть»: ровно то, что делает closeChat
+      sync("#chat/ab12");                      // и снова открыли ту же сессию
       const reopened = calls.slice();
       sync("#chat/cd34");                      // другой разговор всё так же открывается
       console.log(JSON.stringify([opened, still, reopened, calls,
                                   app.chatHashAction("#not-a-chat", null),
-                                  app.chatHashAction("#not-a-chat", "ab12"),
                                   app.chatHashAction("#chat/ZZZZ", null)]));
     """)
-    opened, still, reopened, all_calls, no_hash, leaving, bad_id = got
+    opened, still, reopened, all_calls, no_hash, bad_id = got
     assert opened == ["ab12"], "программная установка хеша и его событие — одно открытие"
     assert still == ["ab12"], "повторный hashchange на том же адресе ничего не читает"
     assert reopened == ["ab12", "ab12"], "закрытая сессия открывается заново, а не глохнет"
     assert all_calls == ["ab12", "ab12", "cd34"]
     assert no_hash == {"act": "nothing"}, "без открытой сессии нечего закрывать"
-    assert leaving == {"act": "close"}
     assert bad_id == {"act": "nothing"}, "id не из `secrets.token_hex` — не адрес сессии"
 
 
@@ -5565,10 +5566,78 @@ def test_the_chat_modal_is_the_two_column_window_of_the_second_screen():
         assert f'id="{ident}"' in right, f"{ident} принадлежит ленте, а не окну промпта"
 
 
+def test_the_modal_closes_by_its_button_and_by_nothing_else():
+    """Окно диалога слетало от любого случайного жеста: Esc, промах мимо окна по подложке, шаг
+    «назад» в браузере. Разговор при этом переживал закрытие (сессия на диске), а правка промпта
+    руками — нет: она живёт только в `chat.promptText`, и её уносило вместе с окном.
+
+    Отсюда правило: закрывает — только кнопка «закрыть» (через `requestCloseChat`, то есть со
+    спросом о несохранённой правке) и «в Редактор»/сохранение (`finishChat`, который сам её
+    сохраняет). Проверяется структурно, по исходнику: обработчика, которого нет, не видно ни в
+    одном тесте на поведение — только в тексте страницы.
+    """
+    script = _page_text("app.js")
+    assert '"Escape"' not in script, (
+        "Esc обязан перестать закрывать модалку: обработчика на Escape не должно быть вовсе")
+    assert 'event.target === $("chat-modal")' not in script, (
+        "клик по подложке обязан перестать закрывать модалку")
+
+    # Кнопка на месте — правило «только кнопкой» бессмысленно, если кнопка отвалилась вместе с
+    # двумя жестами, а `requestCloseChat` — единственный путь, где спрашивают о правке.
+    assert '$("chat-close").addEventListener("click", requestCloseChat)' in script, (
+        "«закрыть» обязана остаться единственным жестом, закрывающим окно")
+    close_body = _js_function(script, "function requestCloseChat()")
+    assert "hasUnsavedEdits" in close_body and "confirm" in close_body, (
+        "спрос о несохранённой правке обязан пережить эту правку:\n" + close_body)
+
+
+def test_the_address_bar_no_longer_closes_the_window_behind_the_persons_back():
+    """Та же болезнь с другой стороны: `hashchange` закрывал окно, когда адрес переставал быть
+    `#chat/<id>` — то есть шаг «назад» в браузере уносил правку так же тихо, как Esc.
+
+    Закрытие кнопкой при этом не сломано: `closeChat` сам обнуляет `chatWanted`, не дожидаясь
+    события об адресе, — поэтому та же сессия открывается заново сразу после закрытия.
+    """
+    got = _node_eval("""
+      console.log(JSON.stringify([app.chatHashAction("", "ab12"),
+                                  app.chatHashAction("#not-a-chat", "ab12"),
+                                  app.chatHashAction("#chat/ZZZZ", "ab12"),
+                                  app.chatHashAction("#chat/ab12", "ab12"),
+                                  app.chatHashAction("#chat/cd34", "ab12"),
+                                  app.chatHashAction("#chat/ab12", null)]));
+    """)
+    emptied, foreign, bad_id, same, other, fresh = got
+    assert emptied == {"act": "nothing"}, "пустой адрес больше не закрывает открытое окно"
+    assert foreign == {"act": "nothing"}, "чужой якорь больше не закрывает открытое окно"
+    assert bad_id == {"act": "nothing"}, "id не из `secrets.token_hex` — не адрес сессии"
+    assert same == {"act": "nothing"}, "повторный hashchange на том же адресе ничего не читает"
+    assert other == {"act": "enter", "id": "cd34"}, "другой разговор всё так же открывается"
+    assert fresh == {"act": "enter", "id": "ab12"}, "с пустого места сессия открывается"
+
+    script = _page_text("app.js")
+    body = _js_function(script, "function closeChat()")
+    assert "chatWanted = null" in body, (
+        "закрытие кнопкой обязано само забыть сессию: `hashchange` этого больше не сделает, и "
+        "без этой строки та же сессия не откроется второй раз:\n" + body)
+
+
+def test_enter_in_the_chat_field_sends_the_turn_instead_of_anything_else():
+    """Поле реплики — две строки, а не редактор: Enter отправляет, Shift+Enter переносит. Обе
+    ветки гасят событие, иначе Enter в поле внутри `<form>` уходит в submit и перезагружает
+    страницу — то есть выглядит как «окно слетело» ровно так же, как Esc.
+    """
+    script = _page_text("app.js")
+    assert 'event.key === "Enter" && !event.shiftKey' in script, (
+        "Enter без Shift обязан отправлять реплику")
+    submit = script[script.index('$("chat-form").addEventListener("submit"'):]
+    assert "event.preventDefault()" in submit[:200], (
+        "submit формы обязан быть погашен, иначе Enter перезагружает страницу")
+
+
 def test_the_modal_head_carries_everything_the_conversation_is_steered_by():
     """C3: «шапка: источник, провайдер, длительность, статус модели, кнопки». Все пять — в одной
-    полосе и в ней одной. Разговор длинный, окно закрывается по Esc, и вопрос «а с кем я сейчас
-    говорю и что будет, когда закончу» не должен требовать прокрутки.
+    полосе и в ней одной. Разговор длинный, а вопрос «а с кем я сейчас говорю и что будет, когда
+    закончу» не должен требовать прокрутки.
     """
     modal = _modal_markup()
     head = modal[modal.index('class="mhead"'):modal.index('class="mgrid"')]
