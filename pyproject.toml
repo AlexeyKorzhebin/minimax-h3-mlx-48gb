@@ -16,6 +16,11 @@ dependencies = [
     "safetensors>=0.4",
     "huggingface_hub>=0.30",
     "pillow>=10.0",
+    # h3_48gb/facetrack.py: YuNet face detection (opencv-python) and Savitzky-Golay track
+    # smoothing (scipy). CPU-only and deliberately independent of the mlx stack above -- see that
+    # module's docstring -- but still a real runtime dependency once it is used.
+    "opencv-python>=4.9",
+    "scipy>=1.11",
 ]
 
 [project.optional-dependencies]

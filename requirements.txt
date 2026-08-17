@@ -14,5 +14,10 @@ safetensors>=0.4
 huggingface_hub>=0.30
 pillow>=10.0
 
+# h3_48gb/facetrack.py: YuNet face detection and Savitzky-Golay track smoothing. CPU-only, no
+# mlx dependency -- see that module's docstring.
+opencv-python>=4.9
+scipy>=1.11
+
 # Test suite: ./.venv/bin/python -m pytest tests/ test_preview.py -q
 pytest>=8.0
