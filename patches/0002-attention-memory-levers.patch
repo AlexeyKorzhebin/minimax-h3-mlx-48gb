@@ -1,0 +1,51 @@
+diff --git a/minimax_h3_mlx/dit.py b/minimax_h3_mlx/dit.py
+index 4aa8cca..e7b726b 100644
+--- a/minimax_h3_mlx/dit.py
++++ b/minimax_h3_mlx/dit.py
+@@ -113,18 +113,38 @@ def apply_rotary(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+     """Rotate the leading ``rotary_dim`` channels of every head, pass the rest through.
+ 
+     ``x`` is ``(batch, heads, seq, head_dim)``; ``cos``/``sin`` are ``(seq, rotary_dim)``.
++
++    PATCHED IN THIS FORK (`patches/0002-attention-memory-levers.patch`). The straightforward
++    spelling splits ``x`` into a rotated and a passed-through half, rotates the first, and
++    concatenates the two back together::
++
++        x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
++        x1, x2 = x_rot[..., :half], x_rot[..., half:]
++        rotated = mx.concatenate([-x2, x1], axis=-1)
++        out = x_rot * cos + rotated * sin
++        return out if x_pass.shape[-1] == 0 else mx.concatenate([out, x_pass], axis=-1)
++
++    That is five full-size temporaries (``x_rot``, ``rotated``, the two products, the final
++    concatenate) for what is elementwise work. Padding ``cos``/``sin`` out to the full
++    ``head_dim`` with 1 and 0 makes the pass-through channels fall out of the *same* expression —
++    ``x * 1 + rotated * 0`` is the identity, exactly, at any float width — so the split and the
++    trailing concatenate both disappear and two temporaries do the job of five. Worth ~1 GB of
++    peak on a 15 s native forward; bit-identical, which `tests/test_attention_levers.py` pins.
+     """
+     rotary_dim = cos.shape[-1]
+-    x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
++    head_dim = x.shape[-1]
++    half = rotary_dim // 2
++    pad = head_dim - rotary_dim
++    if pad:
++        cos = mx.concatenate([cos, mx.ones((cos.shape[0], pad), dtype=cos.dtype)], axis=-1)
++        sin = mx.concatenate([sin, mx.zeros((sin.shape[0], pad), dtype=sin.dtype)], axis=-1)
+     cos = cos.astype(x.dtype)[None, None, :, :]
+     sin = sin.astype(x.dtype)[None, None, :, :]
+-    half = rotary_dim // 2
+-    x1, x2 = x_rot[..., :half], x_rot[..., half:]
+-    rotated = mx.concatenate([-x2, x1], axis=-1)
+-    out = x_rot * cos + rotated * sin
+-    if x_pass.shape[-1] == 0:
+-        return out
+-    return mx.concatenate([out, x_pass], axis=-1)
++    pieces = [-x[..., half:rotary_dim], x[..., :half]]
++    if pad:
++        pieces.append(x[..., rotary_dim:])
++    rotated = mx.concatenate(pieces, axis=-1)
++    return x * cos + rotated * sin
+ 
+ 
+ class Attention(nn.Module):

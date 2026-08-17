@@ -35,9 +35,10 @@ encoding phase at all, so the 28.2 GB and the 11.5 GB were never observed by the
 ## The four patches
 
 Everything lives in `h3_48gb/`; `upstream/` is a vendored clone, pinned to commit `fcd9e9b` and
-otherwise untouched but for a single source patch that keyframe runs cannot do without
-(`patches/0001-keyframe-masked-scatter.patch`, applied during setup below — text-only runs never
-reach it). Patching from the outside keeps the two separable, but the pin is not optional: this
+otherwise untouched but for two source patches applied during setup below
+(`patches/0001-keyframe-masked-scatter.patch`, without which keyframe runs die inside the text
+encoder — text-only runs never reach it; and `patches/0002-attention-memory-levers.patch`, four
+bit-identical rewrites of the DiT's Q/K/V and MLP staging that buy ~10 GB of peak). Patching from the outside keeps the two separable, but the pin is not optional: this
 fork rebinds `FinalLayer.__class__`, binds `inspect.signature(MiniMaxH3Pipeline.__call__)` in three
 places, and `docs/DESIGN.md` cites upstream by line number. Later upstream commits are untested
 here, and any of those three couplings can break silently on one.
@@ -101,6 +102,12 @@ git -C upstream checkout fcd9e9b
 #    which broadcasts, so any keyframe run dies inside the text encoder. Skip this and `--image`
 #    is refused up front with `upstream_patch_missing`; text-only runs are unaffected.
 git -C upstream apply ../patches/0001-keyframe-masked-scatter.patch
+
+#    The second patch is the attention/MLP memory levers (docs/RESULTS.md, "Attention memory
+#    levers"): four bit-identical rewrites of `dit.py`'s Q/K/V and MLP staging that take ~10 GB off
+#    the peak of a long native forward. Skipping it costs memory, not correctness — but the long
+#    canvases in the results table do not fit without it.
+git -C upstream apply ../patches/0002-attention-memory-levers.patch
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 ./.venv/bin/pip install -e .   # installs the `h3` console script
