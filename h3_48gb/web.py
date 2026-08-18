@@ -50,6 +50,7 @@ from h3_48gb import provider
 from h3_48gb import queue as q
 from h3_48gb import runs as runs_module
 from h3_48gb.cli import DEFAULT_CANVAS, ERROR_CODES, CliError, build_parser
+from h3_48gb.project import PROJECT_KINDS
 from h3_48gb.worker import WORKER_LOCK_NAME
 
 #: The only address this server ever binds. Not a parameter, and deliberately not one: a flag that
@@ -3027,9 +3028,18 @@ class _Handler(BaseHTTPRequestHandler):
         # every turn the way `_turn_content` pays for the first frame.
         end_image_line = (f"\nend_image: {session['end_image']}" if session.get("end_image")
                           else "")
+        # Task 5 ("Проекты"): `kind` -- present only once a turn of *this* session has actually
+        # answered with a `project` object (see below), never set at creation the way `mode` is.
+        # A project's `kind` (`video`/`clip`/`song`) is something the model decides while talking
+        # to the person, not something the page can know before the conversation starts -- so the
+        # line is absent, not a placeholder, until there is a real answer to put there. Once
+        # present, it rides every later turn's context so the model does not lose track of which
+        # kind of project it already committed this session to.
+        kind_line = f"\nkind: {session['kind']}" if session.get("kind") else ""
         system = (provider.system_prompt()
                   + "\n\n## Context\nmode: " + (session.get("mode") or DEFAULT_CHAT_MODE)
                   + f"\nduration: {duration:g} s"
+                  + kind_line
                   + end_image_line
                   + "\n\n## Current prompt\n" + self._string_of(payload, "prompt"))
         content, warning = self._turn_content(text, session.get("image") or "")
@@ -3091,10 +3101,28 @@ class _Handler(BaseHTTPRequestHandler):
             session["slug"] = slug
         else:
             slug = None
+        # Task 5 ("Проекты"): `project` follows the same rule `slug` just did -- optional,
+        # outside `PROMPT_SCHEMA`'s `required`, and a provider outside `response_format`'s reach
+        # can send anything, so a malformed one is ignored quietly rather than earning a 502.
+        # Saved whole under `project` (mirrors `prompt_struct` holding the single-clip `prompt`),
+        # and `kind` besides it at the session's top level -- "по образцу", the same place
+        # `mode`/`duration` already live -- so a later turn's `## Context` line above, and Task 6's
+        # project-creation route, can both read the current kind without reaching into `project`.
+        # Neither is set at session creation the way `mode` is (see `kind_line`'s own comment
+        # above): the model decides a project's `kind` while talking to the person, this route
+        # only ever records what it decided.
+        project = turn.get("project")
+        if isinstance(project, dict):
+            session["project"] = project
+            kind = project.get("kind")
+            if isinstance(kind, str) and kind in PROJECT_KINDS:
+                session["kind"] = kind
+        else:
+            project = None
         self._write_session(path, session)
         return 200, "application/json", _json_bytes(
             {"ok": True, "reply": reply, "prompt": turn.get("prompt"), "slug": slug,
-             "warning": warning, "llm": self._llm_state(name, cfg)})
+             "project": project, "warning": warning, "llm": self._llm_state(name, cfg)})
 
     def _media(self, relative: str) -> tuple[int, str, bytes]:
         """A preview frame or a finished clip from **one** run's directory somewhere inside the

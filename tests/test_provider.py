@@ -246,3 +246,153 @@ def test_a_turn_with_no_slug_at_all_is_still_a_valid_parse(tmp_path):
     finally:
         fake.close()
     assert turn.get("slug") is None
+
+
+# -- Task 5 ("Проекты"): the `project` field ---------------------------------------------------
+
+
+def test_prompt_schema_carries_an_optional_project_field_outside_required():
+    """`project` extends `PROMPT_SCHEMA` the same way `slug` did (A4): outside `required`, so
+    every turn this schema ever produced before Task 5 -- none of them carrying the key at all --
+    stays a valid answer to this same schema, and an ordinary single-clip editing session never
+    has to grow one.
+    """
+    schema = provider.PROMPT_SCHEMA["schema"]
+    assert schema["properties"]["project"]["type"] == ["object", "null"]
+    assert "project" not in schema["required"]
+
+
+def test_project_kind_enum_matches_the_kinds_project_json_itself_uses():
+    """One list, not two -- `h3_48gb.project.PROJECT_KINDS` is the source of truth a project.json
+    on disk already spells out (Task 1); a schema that independently respelled its own three
+    strings could silently drift from it.
+    """
+    from h3_48gb.project import PROJECT_KINDS
+    schema = provider.PROMPT_SCHEMA["schema"]
+    assert schema["properties"]["project"]["properties"]["kind"]["enum"] == list(PROJECT_KINDS)
+
+
+def _project_fields() -> dict:
+    return provider.PROMPT_SCHEMA["schema"]["properties"]["project"]["properties"]
+
+
+def test_project_schema_requires_all_four_keys_present_and_nullable_where_unused():
+    """The same shape convention `prompt`'s own fields already use: every key always present,
+    `null` standing in for "not this kind's business" -- `scenes` for a `song`, `lyrics`/`caption`
+    for a `video`.
+    """
+    project = provider.PROMPT_SCHEMA["schema"]["properties"]["project"]
+    assert sorted(project["required"]) == ["caption", "kind", "lyrics", "scenes"]
+    fields = _project_fields()
+    assert fields["scenes"]["type"] == ["array", "null"]
+    assert fields["lyrics"]["type"] == ["string", "null"]
+    assert fields["caption"]["type"] == ["string", "null"]
+
+
+def test_project_scenes_are_full_prompt_strings_with_a_duration_field():
+    scene = _project_fields()["scenes"]["items"]
+    assert scene["properties"]["prompt"]["type"] == "string"
+    assert scene["properties"]["duration"]["type"] == "number"
+    assert scene["required"] == ["prompt", "duration"]
+
+
+def _video_project_payload() -> dict:
+    return {"choices": [{"message": {"content": json.dumps({
+        "reply": "вот сценарий из двух сцен",
+        "prompt": None,
+        "slug": None,
+        "project": {
+            "kind": "video",
+            "scenes": [
+                {"prompt": "[Shot 1] Cinematic, a fox crosses a snowy field…", "duration": 8},
+                {"prompt": "[Shot 1] Cinematic, the same fox reaches the treeline…",
+                 "duration": 6},
+            ],
+            "lyrics": None,
+            "caption": None,
+        },
+    })}}]}
+
+
+def test_a_video_scenario_turn_round_trips_through_chat(tmp_path):
+    """The video variant: `scenes` carries the sequence, `lyrics`/`caption` stay `null`."""
+    fake = _FakeLlama(chat_payload=_video_project_payload())
+    try:
+        turn = provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn["project"]["kind"] == "video"
+    assert len(turn["project"]["scenes"]) == 2
+    assert turn["project"]["scenes"][0]["duration"] == 8
+    assert turn["project"]["lyrics"] is None and turn["project"]["caption"] is None
+
+
+def _song_project_payload() -> dict:
+    return {"choices": [{"message": {"content": json.dumps({
+        "reply": "вот лирика и caption",
+        "prompt": None,
+        "slug": None,
+        "project": {
+            "kind": "song",
+            "scenes": None,
+            "lyrics": "[intro]\nТиши, тиши.\n[verse]\nСпи, мой князь.\n[chorus]\nЛуна встаёт.\n"
+                      "[outro]\nСпи, мой князь.",
+            "caption": "Global Metadata: Wistful lullaby, slow, acoustic.\n\n"
+                       "Vocal Details: a mother trying to sound calm while she is not.\n\n"
+                       "Arrangement: sparse intro, strings build into the chorus.",
+        },
+    })}}]}
+
+
+def test_a_song_scenario_turn_round_trips_through_chat(tmp_path):
+    """The song/clip variant: `lyrics`/`caption` carry the song, `scenes` stays `null` -- a
+    clip's scenes are only built later, from the finished song's real section timing.
+    """
+    fake = _FakeLlama(chat_payload=_song_project_payload())
+    try:
+        turn = provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn["project"]["kind"] == "song"
+    assert turn["project"]["scenes"] is None
+    assert "[intro]" in turn["project"]["lyrics"]
+    assert "Arrangement" in turn["project"]["caption"]
+
+
+def test_a_turn_with_no_project_at_all_is_still_a_valid_parse(tmp_path):
+    """The regression guard: `_TURN` is the shape every ordinary video-editing test answers with,
+    and it carries no `project` key at all -- `chat` must not choke on its absence, and nothing
+    about the single-clip `prompt` path may change.
+    """
+    fake = _FakeLlama(chat_payload=_TURN)
+    try:
+        turn = provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn.get("project") is None
+    assert turn["prompt"]["non_diegetic_music"] == "N/A"
+
+
+def test_system_prompt_carries_the_scenario_and_song_rules():
+    """The rules Task 5's brief pins verbatim: N scenes of 5-10 s connected by a repeated visual
+    bible; the "Колыбельная" lessons on `lyrics` (clean structural tags only, no English acting
+    directions inside them) and `caption` (three named sections); honest limits on Music3's
+    vocal acting; and the suno-import conversion rule.
+    """
+    text = provider.system_prompt()
+    for anchor in (
+            # scenario / visual bible
+            "visual bible", "5 to 10 seconds", "verbatim",
+            # lyrics: clean tags only
+            "[intro]", "[pre-chorus]", "[bridge]", "[outro]",
+            "Never write an English acting direction inside a tag",
+            # caption: the three named sections, in words
+            "Global Metadata", "Vocal Details", "Arrangement",
+            "emotional frame", "acting task",
+            # honest expectations about Music3's vocal acting
+            "Music3's vocal", "a real ceiling", "import the finished mp3",
+            # suno import conversion
+            "Style Prompt", "split at the",
+            # the schema line itself, extended with `project`
+            '"project": object | null'):
+        assert anchor in text, anchor

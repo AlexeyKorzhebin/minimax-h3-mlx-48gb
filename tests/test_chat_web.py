@@ -630,6 +630,124 @@ def test_a_non_string_or_empty_slug_is_ignored_quietly_not_a_502(_serve, slug):
         fake.close()
 
 
+# -- Task 5 ("Проекты"): `project` и `kind` -----------------------------------------------------
+
+
+def _turn_with_project(project, *, reply="ок"):
+    """A well-formed turn (the shape `_TURN` fixes) carrying `project` as given -- whatever shape."""
+    return {"choices": [{"message": {"content": json.dumps(
+        {"reply": reply, "prompt": None, "project": project})}}]}
+
+
+_VIDEO_PROJECT = {
+    "kind": "video",
+    "scenes": [{"prompt": "[Shot 1] Cinematic, a fox crosses a snowy field…", "duration": 8}],
+    "lyrics": None,
+    "caption": None,
+}
+
+_SONG_PROJECT = {
+    "kind": "song",
+    "scenes": None,
+    "lyrics": "[intro]\nТиши, тиши.\n[outro]\nСпи, мой князь.",
+    "caption": "Global Metadata: Wistful lullaby.",
+}
+
+
+def test_a_turn_with_a_project_is_saved_to_the_session_and_the_kind_follows_it(_serve):
+    fake = _FakeLlama(chat_payload=_turn_with_project(_VIDEO_PROJECT))
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "сделай ролик", "prompt": ""})
+        assert answer["project"] == _VIDEO_PROJECT
+        saved = srv.get_json(f"/api/chat/{sid}")
+        assert saved["project"] == _VIDEO_PROJECT
+        assert saved["kind"] == "video"
+    finally:
+        fake.close()
+
+
+def test_the_sessions_kind_rides_a_later_turns_context(_serve):
+    """Once one turn of a session has answered with a `project`, the session remembers its
+    `kind` -- and the *next* turn's system context carries it, the same way `mode`/`duration`
+    already do (`test_the_system_message_carries_the_format_doc_and_the_mode`), so the model does
+    not lose track of which kind of project this session already committed to.
+
+    One fake server mutated in place between turns, the same trick
+    `test_a_later_turn_with_no_slug_keeps_the_sessions_last_known_one` uses -- the second turn
+    answers with no `project` at all, and both the session's own `kind`/`project` and the *next*
+    turn's context are checked to have survived it, non-destructively, the same rule `slug` and
+    `prompt_struct` already follow.
+    """
+    payload = _turn_with_project(_SONG_PROJECT)
+    fake = _FakeLlama(chat_payload=payload)
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "песню", "prompt": ""})
+        assert srv.get_json(f"/api/chat/{sid}")["kind"] == "song"
+
+        payload.clear()
+        payload.update({"choices": [{"message": {"content": json.dumps(
+            {"reply": "ещё", "prompt": None})}}]})
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "ещё раз", "prompt": ""})
+        system = fake.requests[-1]["body"]["messages"][0]["content"]
+        assert "kind: song" in system
+        saved = srv.get_json(f"/api/chat/{sid}")
+        assert saved["kind"] == "song", "второй ход без project не должен был стереть kind первого"
+        assert saved["project"] == _SONG_PROJECT
+    finally:
+        fake.close()
+
+
+@pytest.mark.parametrize("project", [
+    42, "video", ["video"],
+    {"kind": "movie", "scenes": None, "lyrics": None, "caption": None},  # `kind` вне списка
+])
+def test_a_malformed_or_unrecognised_project_is_handled_without_a_502(_serve, project):
+    """A provider outside `response_format`'s reach can send anything for `project`, the same
+    situation `slug`'s own malformed-value test covers. A `dict` is still saved verbatim (a
+    session on disk should keep whatever the model actually said, even a `kind` this server does
+    not recognise yet), but only a `kind` inside `h3_48gb.project.PROJECT_KINDS` ever becomes the
+    session's own top-level `kind` -- and anything that is not even a `dict` is treated as if the
+    turn had said nothing about a project at all.
+    """
+    fake = _FakeLlama(chat_payload=_turn_with_project(project))
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        status, answer = srv.post_json_raw(f"/api/chat/{sid}/message",
+                                           {"text": "х", "prompt": ""})
+        assert status == 200, answer
+        saved = srv.get_json(f"/api/chat/{sid}")
+        if isinstance(project, dict):
+            assert answer["project"] == project
+            assert saved["project"] == project
+            assert "kind" not in saved
+        else:
+            assert answer["project"] is None
+            assert "project" not in saved
+            assert "kind" not in saved
+    finally:
+        fake.close()
+
+
+def test_an_ordinary_session_never_carries_a_kind_line_in_its_context(_serve, fake_llama):
+    """`_TURN` (every other chat test's default answer) carries no `project` -- an everyday
+    single-clip editing session must never grow a `kind:` line in its context just from existing;
+    the line only appears once a real turn has actually named one (see the test above)."""
+    srv = _serve(providers_port=fake_llama.port)
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "опиши", "prompt": "п"})
+    system = fake_llama.requests[-1]["body"]["messages"][0]["content"]
+    # The format doc itself talks *about* `kind` (its own `### kind: "video"` heading) -- only
+    # the `## Context` block this route appends is under test here.
+    context = system.split("## Context", 1)[1]
+    assert "\nkind:" not in context
+    assert "kind" not in srv.get_json(f"/api/chat/{sid}")
+
+
 # -- кадр --------------------------------------------------------------------------------------
 
 

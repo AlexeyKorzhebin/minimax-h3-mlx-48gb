@@ -14,6 +14,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from h3_48gb.project import PROJECT_KINDS
+
 
 class ProviderError(Exception):
     def __init__(self, code: str, message: str):
@@ -46,6 +48,49 @@ PROMPT_SCHEMA = {
             # this schema ever produced before A4 had no such key, and a schema that suddenly
             # demanded one would make every one of those old, already-saved turns invalid.
             "slug": {"type": ["string", "null"]},
+            # Task 5 ("Проекты"): a scenario -- a scripted multi-scene video, or lyrics+caption for
+            # a song/clip -- alongside (never instead of) the single-clip `prompt` above. Optional
+            # and outside `required` for the exact same backward-compatibility reason `slug` is:
+            # every ordinary video-editing turn this schema ever produced, before this project
+            # field existed, carried no such key, and a schema that suddenly demanded one would
+            # make every one of those turns invalid. `kind` mirrors `h3_48gb.project.PROJECT_KINDS`
+            # (the single source of truth a `project.json` on disk already uses) rather than a
+            # second, independently-spelled list living here -- see the import at the top of this
+            # module. `scenes`/`lyrics`/`caption` are all nullable and all always present (the same
+            # "every key required, unwanted ones null" shape `prompt`'s own fields already use):
+            # a `kind: "video"` answer sets `scenes` and leaves `lyrics`/`caption` null; a
+            # `kind: "clip"`/`"song"` answer does the reverse -- a clip's scenes are only built
+            # later, from the finished song's real section timing (design spec, "Сценарий").
+            "project": {
+                "type": ["object", "null"],
+                "properties": {
+                    "kind": {"type": "string", "enum": list(PROJECT_KINDS)},
+                    "scenes": {
+                        "type": ["array", "null"],
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                # A full, self-contained H3 prompt (docs/h3-prompt-system.md's own
+                                # three-field format, flattened to the text the CLI's own
+                                # `--prompt-file` already takes) -- not the structured
+                                # instruction/description/soundscape/music object `prompt` above
+                                # is, because a scene is written before its mode (`t2v` for the
+                                # first scene, `i2v` off an automatic keyframe for every scene
+                                # after it) is known; the pipeline prepends whichever `instruction`
+                                # line applies once it actually submits the scene as a job.
+                                "prompt": {"type": "string"},
+                                "duration": {"type": "number"},
+                            },
+                            "required": ["prompt", "duration"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "lyrics": {"type": ["string", "null"]},
+                    "caption": {"type": ["string", "null"]},
+                },
+                "required": ["kind", "scenes", "lyrics", "caption"],
+                "additionalProperties": False,
+            },
         },
         "required": ["reply", "prompt"],
         "additionalProperties": False,
