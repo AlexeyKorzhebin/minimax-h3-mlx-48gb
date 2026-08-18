@@ -27,6 +27,11 @@ against the lyrics line by line to find each section's start timestamp and flag 
 ships, so their presence on disk should mean the *whole* job succeeded, not just that ffmpeg ran --
 see `run_song`'s own docstring.
 
+**`align_track`** (task 3, design spec addendum "импортированный трек") is the other, shorter
+pipeline this module offers: for a `track.source == "import"` project, an mp3 already exists (a
+human uploaded it, e.g. a Suno export) and neither generation nor mastering apply -- only step (3)
+runs, against the file as given. See `align_track`'s own docstring.
+
 **Calibration** (2026-08-18 "Колыбельная" run, a real slow song, referenced throughout this
 module's docstrings): ~28 s of singing per section on a slow track (`SECONDS_PER_SECTION`);
 Music3 routinely finishes *before* `--duration` once the lyrics are exhausted (that run's audio
@@ -550,6 +555,50 @@ def check_lyrics_sung(lyrics: str, segments: list[dict], *,
         undersung = matched_fraction < UNDERSUNG_LINE_THRESHOLD
 
     return sections, undersung
+
+
+def align_track(track_dir, mp3_path, lyrics: str, *,
+                 music3_python=DEFAULT_MUSIC3_PYTHON, run=subprocess.run) -> SongResult:
+    """The `track.source == "import"` path (design spec addendum, "импортированный трек"): no
+    Music3 generation, no mastering -- an imported mp3 is already the finished product -- just
+    `mlx_whisper` transcription and the same section-alignment `run_song` uses, so a clip-on-a-song
+    project built from an imported track gets scene boundaries the identical way a generated one
+    does.
+
+    Returns a `SongResult` shaped exactly like `run_song`'s, so task 3's worker glue does not need
+    to know which path produced it before calling `project.Project.update_track(**fields)`:
+    `wav`/`mastered_wav`/`mp3`/`mastered_mp3` all point at `mp3_path` itself (there is no separate
+    wav, mastering pass or mp3 encode step for an import -- the file the human uploaded *is* all
+    four of those roles at once). `duration` is the timestamp of the last Whisper segment (there is
+    no `[audio] ... dur=` line to parse the way `_generate_wav` gets one, since nothing was
+    generated) -- `0.0` if `mlx_whisper` found no segments at all, which `check_lyrics_sung` already
+    treats as "nothing matched" rather than a crash.
+
+    `track_dir` is created if missing, matching `run_song`; only `whisper.json` lands inside it
+    (there is no `song.*` to write -- the caller already has the audio at `mp3_path`).
+
+    Raises `SongRunError` if `mlx_whisper` fails, exactly as `run_song`'s own `_transcribe` does --
+    never a bare subprocess/JSON exception.
+    """
+    track_dir = Path(track_dir)
+    track_dir.mkdir(parents=True, exist_ok=True)
+    mp3_path = Path(mp3_path)
+
+    whisper_data = _transcribe(music3_python, mp3_path, track_dir, run=run)
+    segments = whisper_data.get("segments", [])
+    duration = segments[-1]["end"] if segments else 0.0
+    sections, undersung = check_lyrics_sung(lyrics, segments, duration=duration)
+
+    return SongResult(
+        wav=mp3_path,
+        mastered_wav=mp3_path,
+        mp3=mp3_path,
+        mastered_mp3=mp3_path,
+        duration=duration,
+        transcript=(whisper_data.get("text") or "").strip(),
+        sections=sections,
+        undersung=undersung,
+    )
 
 
 def run_song(track_dir, lyrics: str, caption: str, duration: float, *, seed: int, steps: int = 30,

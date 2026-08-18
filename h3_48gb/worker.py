@@ -154,46 +154,231 @@ def _release_lease(fd: int) -> None:
         os.close(fd)
 
 
+def _project_arg(args: list[str]) -> Path:
+    """The value following `--project` in a `kind="song"`/`kind="assemble"` job's `args` (task 3's
+    brief: `["song", "--project", <path>]` / `["assemble", "--project", <path>]`). Raises
+    `ValueError` if the token is missing -- a job in this shape without it is malformed, not a case
+    either dispatcher can run.
+    """
+    for i, token in enumerate(args):
+        if token == "--project" and i + 1 < len(args):
+            return Path(args[i + 1])
+    raise ValueError(f"job args have no --project value: {args!r}")
+
+
+@contextlib.contextmanager
+def _caffeinate_block(spawn=subprocess.Popen):
+    """Hold the machine awake (`caffeinate -dimsu`, no target command) for the duration of the
+    block -- the in-process equivalent of what a `KIND_GENERATE` job gets for free by putting
+    `caffeinate` in front of the spawned child's own argv (`job_command`). `KIND_SONG`/
+    `KIND_ASSEMBLE` jobs run their heavy subprocesses (Music3, ffmpeg, `mlx_whisper`) from
+    *inside* this worker process, as `h3_48gb.songrun`'s/`h3_48gb.assemble`'s own blocking
+    `subprocess.run` calls, rather than as one spawned child `run_job` can wrap the usual way -- so
+    there is no argv to put `caffeinate` in front of. This wraps the call by hand instead: start a
+    bare `caffeinate -dimsu` (no target -- it simply asserts its claims until told to stop, see
+    `man caffeinate`) before the block and terminate it after, success or failure. Skipping this
+    would leave exactly the 2026-08-10 exposure the module docstring describes (a sleeping machine
+    took the GPU firmware down mid-run) unguarded for every song/assemble job, which is why "GPU
+    lock/lease/pause unchanged; song жрёт GPU так же, как generate" (task 3 brief) is read here as
+    including this, not only the lease.
+
+    `spawn` is the same injection point `run_job` already takes for its `KIND_GENERATE` child, so a
+    test substitutes one fake for both rather than needing a second seam.
+    """
+    proc = spawn(["caffeinate", "-dimsu"])
+    try:
+        yield
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+#: Music3 runs roughly 11-13x slower than the song it produces (design spec, "Трек": "~11-13x
+#: реалтайма"); task 3's brief pins the queue-facing wall-clock estimate at the upper bound, 13x,
+#: so the number a human sees errs toward "this will take a little less", never the other way.
+SONG_WALLCLOCK_FACTOR = 13.0
+
+
+def song_job_wallclock_estimate_seconds(lyrics: str) -> float:
+    """How long a `kind="song"` job is expected to take **to run** (wall clock), as opposed to how
+    long the song itself will play: `h3_48gb.songrun.estimate_duration(lyrics)` (the song's own
+    length estimate) times `SONG_WALLCLOCK_FACTOR`. For the caller that submits a song job
+    (`queue.submit(..., kind=q.KIND_SONG, estimate={...})`) to build `estimate`'s number from --
+    this module has no opinion about the rest of that dict's shape, matching `queue.Job.estimate`'s
+    own "whatever the caller put there" contract.
+    """
+    from h3_48gb import songrun
+    return songrun.estimate_duration(lyrics) * SONG_WALLCLOCK_FACTOR
+
+
+def _run_song_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
+    """The `kind="song"` job body (task 3): load the project `job.args` names, run
+    `h3_48gb.songrun.run_song` (or, for an imported track, `align_track` -- the align-only path,
+    design spec addendum "импортированный трек") against its `track`, and record the result on the
+    project through the **locked** mutators (`update_track`/`set_stage_status`), never `save()` --
+    see `project.py`'s own docstring for why a blind `save()` on a live project risks clobbering a
+    concurrent write.
+
+    Returns `(exit_code, log_text)`, the same shape `run_job` already gets back from a spawned
+    subprocess, so the rest of `run_job`'s contract (write the result marker, `q.finish`) does not
+    need to know or care that nothing was actually spawned for this job as a whole.
+
+    **An `undersung` take is still `exit_code == 0`** (task 3, review decision): the mp3s exist,
+    the job did what it was asked, and the design spec's gate is a human listening and deciding,
+    not this function refusing to hand off a take that might need a redo. The warning travels on
+    the *project* (`track.undersung`), not on the job's own exit code -- a `kind="song"` job that
+    actually raises (a subprocess failed to start, the project file will not load, `track.source`
+    is `"import"` with no `mp3` set) is the only case this returns non-zero for.
+
+    Never lets a bare exception escape: whatever `h3_48gb.project`/`h3_48gb.songrun` raise is
+    caught and turned into `(1, <message>)`, because a job whose body raises must still let
+    `run_job` write a result marker and move the file out of `running/` -- an uncaught exception
+    here would instead take the whole worker process down mid-loop.
+    """
+    from h3_48gb import project as project_module
+    from h3_48gb import songrun
+
+    log_lines: list[str] = []
+    try:
+        project_path = _project_arg(job.args)
+        proj = project_module.load_project(project_path)
+        track = proj.track
+        lyrics = track.get("lyrics") or ""
+        caption = track.get("caption") or ""
+        track_dir = proj.path.parent / "track"
+
+        with _caffeinate_block(spawn=spawn):
+            if track.get("source") == "import":
+                mp3_path = track.get("mp3")
+                if not mp3_path:
+                    raise songrun.SongRunError(
+                        "track.source is 'import' but track.mp3 is not set")
+                log_lines.append(f"align-only (imported track): {mp3_path}")
+                result = songrun.align_track(track_dir, mp3_path, lyrics)
+            else:
+                duration = songrun.estimate_duration(lyrics)
+                seed = track.get("seed") or 0
+                log_lines.append(
+                    f"generating: estimated duration={duration}s seed={seed}")
+                result = songrun.run_song(track_dir, lyrics, caption, duration, seed=seed)
+
+        proj.update_track(
+            wav=str(result.wav), mp3=str(result.mp3), mastered_mp3=str(result.mastered_mp3),
+            sections=result.sections, status="awaiting_approval", undersung=result.undersung,
+        )
+        proj.set_stage_status("track", "awaiting_approval")
+        log_lines.append(
+            f"song job done: undersung={result.undersung}, duration={result.duration}s")
+        return 0, "\n".join(log_lines) + "\n"
+    except Exception as exc:  # noqa: BLE001 -- a song job's own failure must route to failed/,
+        # not crash the worker loop; see the docstring.
+        log_lines.append(f"song job failed: {type(exc).__name__}: {exc}")
+        return 1, "\n".join(log_lines) + "\n"
+
+
+def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
+    """The `kind="assemble"` job body (task 3 dispatches; the implementation is task 4's). A lazy
+    `import h3_48gb.assemble` -- not a module-level one -- so this module keeps working, and every
+    `kind="generate"`/`kind="song"` job keeps running, on a checkout that has task 3 but not yet
+    task 4: the import failing is reported as an honest job failure (`assemble` "появится в Task
+    4"), not an `ImportError` that takes the worker process down. A test substitutes a fake
+    `h3_48gb.assemble` module (`sys.modules["h3_48gb.assemble"]`) to exercise the dispatch without
+    the real module existing.
+    """
+    log_lines: list[str] = []
+    try:
+        try:
+            from h3_48gb import assemble
+        except ImportError as exc:
+            log_lines.append(
+                f"assemble job failed: h3_48gb.assemble ещё не реализован (появится в Task 4): "
+                f"{exc}")
+            return 1, "\n".join(log_lines) + "\n"
+
+        project_path = _project_arg(job.args)
+        with _caffeinate_block(spawn=spawn):
+            assemble.run(project_path)
+        log_lines.append("assemble job done")
+        return 0, "\n".join(log_lines) + "\n"
+    except Exception as exc:  # noqa: BLE001 -- same reasoning as `_run_song_job`.
+        log_lines.append(f"assemble job failed: {type(exc).__name__}: {exc}")
+        return 1, "\n".join(log_lines) + "\n"
+
+
 def run_job(root, job, spawn=subprocess.Popen) -> int:
-    """Run one claimed job to completion and file its result. Returns the subprocess's exit code.
+    """Run one claimed job to completion and file its result. Returns the job's exit code.
 
     The order is the contract, and every step of it is load-bearing:
 
-    1. take the lease -- before the child exists, so there is no window in which the job is in
+    1. take the lease -- before the job's work starts, so there is no window in which the job is in
        `running/` with nothing holding its lease;
-    2. start `job_command(job)` in its **own session** (`start_new_session=True`), stdout and
-       stderr appended to `queue/logs/<id>.log`. The new session is what makes the second stop
-       signal able to reach the whole tree -- `caffeinate` is only the parent of the Python that
-       holds the 36 GB, and signalling the parent alone orphans the child;
-    3. wait for it;
-    4. write the result marker **durably**;
-    5. only then release the lease;
-    6. and only then move the job out of `running/`.
+    2. run the job, dispatched by `job.kind` (task 3, "Проекты" -- see the three branches below);
+    3. write the result marker **durably**;
+    4. only then release the lease;
+    5. and only then move the job out of `running/`.
 
-    Steps 4 and 5 in the other order leave a job that looks free, has no marker and has no `.mp4`,
+    Steps 3 and 4 in the other order leave a job that looks free, has no marker and has no `.mp4`,
     i.e. indistinguishable from one that never got anywhere -- reconciliation would re-queue a run
     that had already finished, and the rerun would overwrite its output.
 
+    **Dispatch by `job.kind`, all three under the one lease held for step 1-4 above** -- the lease
+    is what makes "this job is running right now" observable from another process, and that fact
+    does not depend on *how* the job runs:
+
+    * `KIND_GENERATE` -- unchanged from before this field existed: `job_command(job)` in its own
+      session (`start_new_session=True`), stdout and stderr appended to `queue/logs/<id>.log`. The
+      new session is what makes the second stop signal able to reach the whole tree -- `caffeinate`
+      is only the parent of the Python that holds the 36 GB, and signalling the parent alone
+      orphans the child.
+    * `KIND_SONG` -- `_run_song_job`, in this process: `h3_48gb.songrun.run_song`/`align_track`
+      against the project `job.args` names, then the track's status onto the project through its
+      own locked mutators. See `_run_song_job`'s docstring for why an undersung take is still
+      success.
+    * `KIND_ASSEMBLE` -- `_run_assemble_job`, in this process: a lazy `h3_48gb.assemble.run` (task
+      4; not implemented yet, see that function's docstring for the honest failure this dispatches
+      to until it is).
+
+    Only the `KIND_GENERATE` branch sets `_current_child` -- the song/assemble branches run their
+    own subprocesses (Music3, ffmpeg, `mlx_whisper`) as blocking `subprocess.run` calls with no
+    `Popen` handle this module ever sees, so the two-stage stop signal's "kill the child's process
+    group" has nothing of theirs to reach; a `SIGTERM` still stops the worker from taking the
+    *next* job (see `_stop_signals`), it just cannot interrupt one of these already in flight. Known
+    gap, not solved by this task -- see the task 3 report.
+
     `spawn` is injectable because every test of this function must not start a real generation: a
-    second MLX process on this machine is 36 GB against a 48 GB budget.
+    second MLX process on this machine is 36 GB against a 48 GB budget. The same `spawn` is reused
+    by `_caffeinate_block` for the song/assemble branches' `caffeinate` companion process, so one
+    fake covers both.
     """
     global _current_child
     root = Path(root)
     lease = _acquire_lease(root, job.id)
     try:
-        # Append rather than truncate: a job returned to `pending/` by reconciliation resumes from
-        # its checkpoint, and the log of the attempt that was interrupted is the only record of why
-        # it was interrupted.
-        with open(q.log_path(root, job.id), "ab") as stream:
-            proc = spawn(job_command(job), stdout=stream, stderr=subprocess.STDOUT,
-                         start_new_session=True)
-            _current_child = proc
-            try:
-                exit_code = proc.wait()
-            finally:
-                _current_child = None
-        finished_at = _now()
-        log_tail = q.read_log_tail(root, job.id)
+        if job.kind == q.KIND_GENERATE:
+            # Append rather than truncate: a job returned to `pending/` by reconciliation resumes
+            # from its checkpoint, and the log of the attempt that was interrupted is the only
+            # record of why it was interrupted.
+            with open(q.log_path(root, job.id), "ab") as stream:
+                proc = spawn(job_command(job), stdout=stream, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+                _current_child = proc
+                try:
+                    exit_code = proc.wait()
+                finally:
+                    _current_child = None
+            finished_at = _now()
+            log_tail = q.read_log_tail(root, job.id)
+        else:
+            if job.kind == q.KIND_SONG:
+                exit_code, log_text = _run_song_job(job, spawn=spawn)
+            elif job.kind == q.KIND_ASSEMBLE:
+                exit_code, log_text = _run_assemble_job(job, spawn=spawn)
+            else:
+                exit_code, log_text = 1, f"unknown job kind {job.kind!r}\n"
+            with open(q.log_path(root, job.id), "ab") as stream:
+                stream.write(log_text.encode("utf-8"))
+            finished_at = _now()
+            log_tail = q.read_log_tail(root, job.id)
         q.write_result_marker(root, job.id, exit_code, finished_at)
     finally:
         _release_lease(lease)

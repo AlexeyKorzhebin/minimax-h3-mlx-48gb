@@ -693,11 +693,16 @@ def test_run_song_result_fields_match_update_track_field_names():
     just a hand-picked subset -- a hard-coded `{"mp3", "mastered_mp3", "sections"}` subset (the
     original version of this test) would silently miss a future rename dropping e.g. `wav` from
     that overlap, since the subset check would keep passing either way.
+
+    `undersung` joined this set in task 3: `_TRACK_FIELDS` grew an `undersung` field specifically so
+    the worker's song-job dispatch (`h3_48gb.worker._run_song_job`) could pass
+    `SongResult.undersung` straight through to `update_track(undersung=...)` the same way it already
+    does for `wav`/`mp3`/`mastered_mp3`/`sections` -- see the task 3 report.
     """
     from h3_48gb import project as p
     result_fields = set(sr.SongResult.__dataclass_fields__)
     track_fields = set(p._TRACK_FIELDS)
-    assert result_fields & track_fields == {"wav", "mp3", "mastered_mp3", "sections"}
+    assert result_fields & track_fields == {"wav", "mp3", "mastered_mp3", "sections", "undersung"}
 
 
 def test_run_song_propagates_a_generation_failure_as_song_run_error(tmp_path):

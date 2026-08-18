@@ -471,6 +471,35 @@ def test_update_track_rejects_an_unknown_field(tmp_path):
         project.update_track(not_a_real_field="x")
 
 
+def test_a_fresh_track_defaults_source_to_generate_and_undersung_to_false(tmp_path):
+    """Task 3 (design spec addendum, "импортированный трек"): every track before this addendum was
+    a Music3 generation, so a project that never sets `source` explicitly must still read as one --
+    the default has to be `"generate"`, not `None` or a missing key a caller has to special-case.
+    `undersung` defaults `False` for the same reason: nothing has flagged a warning on a track that
+    has not been through a song job yet.
+    """
+    project = p.create_project(tmp_path, "song", "song")
+    assert project.track["source"] == "generate"
+    assert project.track["undersung"] is False
+
+
+def test_update_track_accepts_source_and_undersung(tmp_path):
+    """`_TRACK_FIELDS` grew these two fields for task 3's worker glue
+    (`h3_48gb.worker._run_song_job`), which writes both through `update_track` once a song job
+    finishes -- `source` when a project is set up for import (task 6, out of this module's scope)
+    and `undersung` from `songrun.SongResult.undersung` after every song job, generated or
+    imported.
+    """
+    project = p.create_project(tmp_path, "song", "song")
+    project.update_track(source="import", undersung=True)
+    assert project.track["source"] == "import"
+    assert project.track["undersung"] is True
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.track["source"] == "import"
+    assert reloaded.track["undersung"] is True
+
+
 def test_update_assembly_partially_updates_and_leaves_other_fields_alone(tmp_path):
     project = p.create_project(tmp_path, "video", "x")
     project.update_assembly(final_path="/x/final.mp4")

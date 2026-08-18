@@ -180,6 +180,18 @@ def _empty_track() -> dict:
         # `STAGE_STATUSES` -- do not invent the enum speculatively here before task 3 knows what
         # it needs.
         "status": "draft",
+        # Task 3 (design spec addendum, "импортированный трек"): whether this track's audio comes
+        # from Music3 generation or was uploaded ready-made. `"generate"` is the default because
+        # every track before this addendum was one -- a fresh project never has to think about the
+        # field unless it is actually an import. `"import"` means the queue's song job skips
+        # generation and mastering entirely and only runs the Whisper alignment pass (see
+        # `h3_48gb.songrun.align_track`, `h3_48gb.worker`'s song-job dispatch).
+        "source": "generate",
+        # Task 3: `h3_48gb.songrun.SongResult.undersung` copied straight onto the track once a song
+        # job finishes, so the track gate (task 6) can show the "трек короче лирики" warning next
+        # to a track that is otherwise a complete success (mp3s exist, the job is `done`) -- an
+        # `undersung` take is a warning on an approved-looking result, not a failure.
+        "undersung": False,
     }
 
 
