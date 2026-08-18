@@ -25,6 +25,7 @@ import pytest
 from h3_48gb import songrun as sr
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
 # -- estimate_duration / count_sections ----------------------------------------------------------
@@ -138,6 +139,33 @@ def test_whisper_mishearing_v_viskah_to_peska_still_matches_at_50_percent_overla
     assert sr._overlap(line_words, heard_words) >= sr.LINE_MATCH_THRESHOLD
 
 
+# -- I5: an absolute word-count floor alongside the 50% fraction --------------------------------
+
+
+def test_i5_word_floor_rejects_a_short_line_at_50_percent_with_only_one_shared_word():
+    """`LINE_MATCH_THRESHOLD`'s *fraction* alone is not enough for a short line -- a 2-word line
+    clears 50% with just one shared word. `MIN_SHARED_WORDS` (2026-08-18 review, I5) adds an
+    absolute floor of 2 shared words on top of the fraction, so a short line's thin, coincidental
+    overlap with an unrelated segment (the real report: the outro's short "Спи, мой князь." class
+    of line, built from words -- "спи", "мой" -- that recur all over the song) can no longer clear
+    the bar alone.
+    """
+    line_words = sr._word_set("Спи, мой.")
+    foreign_words = sr._word_set("мой дорогой друг")
+    assert sr._overlap(line_words, foreign_words) == pytest.approx(0.5)
+    assert not sr._line_matches_segment(line_words, foreign_words)
+
+
+def test_i5_word_floor_does_not_reject_the_real_mishearing_regression():
+    """The floor must not raise the *effective* bar above 50% for a normal-length line -- the real
+    "в висках" -> "песка" mishearing shares exactly 2 words and must still pass both the fraction
+    and the floor (this is `MIN_SHARED_WORDS`'s own value, not a coincidence).
+    """
+    line_words = sr._word_set("Имя древнее в висках")
+    heard_words = sr._word_set("Имя древнее песка")
+    assert sr._line_matches_segment(line_words, heard_words)
+
+
 def test_check_lyrics_sung_matches_the_mishearing_end_to_end():
     lyrics = "[chorus]\nИмя древнее в висках"
     segments = [_seg(10.0, 13.0, "Имя древнее песка")]
@@ -233,23 +261,154 @@ def test_a_repeated_section_name_gets_two_separate_entries_matched_in_order():
     assert sections[2]["start"] == 6.0, "second chorus must not match the first chorus's segment"
 
 
+# -- C1 regression: a repeated section must not steal an earlier occurrence's segment -----------
+
+
+def test_c1_minimal_repro_second_identical_section_does_not_steal_the_first_ones_segment():
+    """Minimal synthetic repro (2026-08-18 review, C1). Four short lines, packed two-per-segment
+    into two Whisper segments -- realistic packing granularity (a segment spanning 2 short lyric
+    lines is normal; the whole 4-line section landing in one giant segment is not, and is not what
+    this reproduces) -- followed by an identical repeat of all four lines with no segments of its
+    own at all (the second occurrence was never actually re-recorded).
+
+    With the old `pointer = found` (never advancing past a claimed segment), the repeat's lines
+    could walk straight back into the first occurrence's own last-claimed segment purely because
+    the text was identical -- stealing its timestamp for the (unsung) second occurrence and, via
+    `_section_ends`, truncating the first occurrence's own `end` to that same stolen value.
+    """
+    lyrics = "\n".join([
+        "[chorus]", "hello world", "foo bar", "baz qux", "quux corge",
+        "[chorus]", "hello world", "foo bar", "baz qux", "quux corge",
+    ])
+    segments = [
+        _seg(10.0, 15.0, "hello world foo bar"),
+        _seg(15.0, 20.0, "baz qux quux corge"),
+    ]
+
+    sections, undersung = sr.check_lyrics_sung(lyrics, segments, duration=30.0)
+    assert sections[0] == {"name": "chorus", "start": 10.0, "end": 30.0}, (
+        "the first (really sung) chorus's end must reach the track duration, not get truncated "
+        "by the unsung repeat")
+    assert sections[1] == {"name": "chorus", "start": None, "end": None}, (
+        "the second, unsung chorus must not steal the first chorus's segments just because the "
+        "lyric text is identical")
+    assert undersung is True
+
+
+def test_c1_fixture_repro_real_kolybelnaya_chorus_repeated_second_occurrence_unsung():
+    """Real-data regression (2026-08-18 review, C1) built from the actual "Колыбельная" fixture
+    (`tests/data/kolybelnaya-lyrics.txt`/`kolybelnaya-whisper.txt`) -- this is the real bug the
+    reviewer reproduced: a repeated `[chorus]` (the real lyric's own chorus text, which really does
+    recur verbatim) where the second occurrence was not actually sung got assigned a start *inside*
+    the first occurrence's own span, and the first occurrence's `end` got truncated to that stolen
+    value.
+
+    The lyric lines and the Whisper wording (including the real mishearing "в висках" ->
+    "песка") are copied verbatim from the fixture files; only the segment timestamps are synthetic
+    (the fixture's `whisper.txt` is flat text with no timestamps at all) and only the "two
+    occurrences back to back, second one unsung" arrangement is this test's own construction --
+    picked to isolate the exact pointer bug from the rest of the song. Segments are packed 2 real
+    lines each, matching Whisper's real few-seconds-per-segment granularity, not one giant blob for
+    the whole chorus.
+    """
+    lyrics_text = (DATA_DIR / "kolybelnaya-lyrics.txt").read_text(encoding="utf-8")
+    whisper_text = (DATA_DIR / "kolybelnaya-whisper.txt").read_text(encoding="utf-8")
+    assert "песка" in whisper_text, "fixture must contain the real в висках -> песка mishearing"
+
+    section_names, lines = sr._parse_lyrics(lyrics_text)
+    chorus_lines = [text for idx, text in lines if section_names[idx] == "chorus"][:8]
+    assert len(chorus_lines) == 8
+    lyrics = "[chorus]\n" + "\n".join(chorus_lines) + "\n[chorus]\n" + "\n".join(chorus_lines)
+
+    # The real Whisper transcript's own wording for these 8 lines (kolybelnaya-whisper.txt),
+    # mishearings and all -- "в висках" -> "песка", "лишь тьма" -> "лилишь тьма".
+    heard = [
+        "Спи, мой князь, мой белый сокол", "Спи, мое родное сердце",
+        "Имя древнее песка", "Пронеси сквозь все столетия",
+        "Спи, мой светлый, не услышишь", "Как над башней лилишь тьма",
+        "Только знай, над низкой крышей", "Ждет восток и в нем заря",
+    ]
+    segments = []
+    t = 80.0
+    for i in range(0, 8, 2):
+        segments.append(_seg(t, t + 3.5, heard[i] + " " + heard[i + 1]))
+        t += 3.5
+
+    sections, undersung = sr.check_lyrics_sung(lyrics, segments, duration=95.0)
+    assert sections[0]["start"] == 80.0
+    assert sections[0]["end"] == 95.0, "first chorus's end must not be truncated by the repeat"
+    assert sections[1] == {"name": "chorus", "start": None, "end": None}, (
+        "the unsung second chorus must not steal a timestamp from inside the first chorus")
+    assert undersung is True
+
+
 def test_undersung_threshold_is_exactly_60_percent_of_the_last_third():
-    # 9 lines -> last third is lines[6:], 3 lines. 2/3 matched = 66.7% -> not undersung.
-    lyrics = "\n".join(f"line{i}" for i in range(9))
-    segments = [_seg(float(i), float(i) + 1, f"line{i}") for i in range(9) if i not in (7,)]
+    # 9 lines (2 words each -- MIN_SHARED_WORDS's floor needs >= 2 shared words to match at all)
+    # -> last third is lines[6:], 3 lines. 2/3 matched = 66.7% -> not undersung.
+    lyrics = "\n".join(f"line{i} word{i}" for i in range(9))
+    segments = [_seg(float(i), float(i) + 1, f"line{i} word{i}") for i in range(9) if i not in (7,)]
     _, undersung = sr.check_lyrics_sung(lyrics, segments)
     assert undersung is False
 
     # Drop one more of the last three matches (now 1/3 = 33%) -> undersung.
-    segments_worse = [_seg(float(i), float(i) + 1, f"line{i}") for i in range(9) if i not in (7, 8)]
+    segments_worse = [_seg(float(i), float(i) + 1, f"line{i} word{i}")
+                       for i in range(9) if i not in (7, 8)]
     _, undersung_worse = sr.check_lyrics_sung(lyrics, segments_worse)
     assert undersung_worse is True
+
+
+def test_undersung_threshold_boundary_is_exactly_60_percent_not_a_hair_below():
+    """The minor from the 2026-08-18 review: an exact-60% case, not just "somewhere above/below
+    60%" -- 5 lines in the tail, exactly 3 matched = 0.6 = `UNDERSUNG_LINE_THRESHOLD` itself, and
+    `undersung` is defined as strictly *below* the threshold, so exactly-60% must NOT be undersung.
+    """
+    # 15 lines -> last third is lines[10:], 5 lines. 2-word lines to clear MIN_SHARED_WORDS.
+    lyrics = "\n".join(f"line{i} word{i}" for i in range(15))
+    # Match all of the first two-thirds (10 lines) plus exactly 3 of the last 5 (indices 10-12).
+    matched = list(range(10)) + [10, 11, 12]
+    segments = [_seg(float(i), float(i) + 1, f"line{i} word{i}") for i in matched]
+    _, undersung = sr.check_lyrics_sung(lyrics, segments)
+    assert undersung is False, "exactly 60% of the tail matched must not count as undersung"
+
+
+def test_i1_section_ends_gives_none_end_to_a_section_with_no_start():
+    """I1 (2026-08-18 review): a section whose own `start` is `None` (nothing in it matched) must
+    always get `end=None` too -- there is no timestamp to anchor either boundary to. Before the
+    fix, `_section_ends` computed `end[i]` from "the next known start after i" regardless of
+    whether `starts[i]` itself was `None`, so an unsung section in the *middle* of the list could
+    still inherit a real `end` value that belonged to a section after it.
+    """
+    starts = [0.0, None, 5.0]
+    ends = sr._section_ends(starts, duration=20.0)
+    assert ends == [5.0, None, 20.0]
+
+
+def test_i1_section_ends_trailing_none_start_also_gets_none_end():
+    starts = [0.0, 5.0, None]
+    ends = sr._section_ends(starts, duration=20.0)
+    assert ends == [5.0, 20.0, None]
 
 
 def test_check_lyrics_sung_on_empty_lyrics_is_not_undersung():
     sections, undersung = sr.check_lyrics_sung("", [])
     assert sections == []
     assert undersung is False
+
+
+# -- C2: MASTER_FILTER's exact EQ chain, confirmed by the chain's owner -------------------------
+
+
+def test_c2_master_filter_is_the_full_seven_entry_eq_chain():
+    """C2 (2026-08-18 review): the plan-brief's EQ chain was a five-entry transcription shortcut,
+    not the actual proven chain -- the owner confirmed the full seven-entry `firequalizer` curve.
+    Pinned as an exact-string regression so this cannot silently drift back to a shortened version.
+    """
+    assert sr.MASTER_FILTER == (
+        "highpass=f=38,"
+        "firequalizer=gain_entry='entry(60,-2.5);entry(120,-1.5);entry(3000,1.5);entry(5000,2);"
+        "entry(8000,3.5);entry(12000,4);entry(16000,3)',"
+        "loudnorm=I=-13.6:TP=-1:LRA=11"
+    )
 
 
 # -- master / to_mp3: the one real-ffmpeg test -----------------------------------------------
@@ -289,6 +448,31 @@ def test_master_and_to_mp3_run_a_real_ffmpeg_on_a_synthetic_sine(tmp_path):
 def test_master_raises_song_run_error_on_a_missing_input_file(tmp_path):
     with pytest.raises(sr.SongRunError):
         sr.master(tmp_path / "does-not-exist.wav", tmp_path / "out.wav")
+
+
+# -- I6: _run wraps a bare OSError/FileNotFoundError, never lets one escape ----------------------
+
+
+def test_i6_run_wraps_oserror_as_song_run_error():
+    """I6 (2026-08-18 review): if `run` itself raises (e.g. the resolved binary does not exist --
+    `_mlx_whisper_binary`'s own docstring flags this as a real, unguarded risk), `_run` must not
+    let a bare `OSError`/`FileNotFoundError` escape -- the caller (task 3's worker glue) catches
+    exactly one exception type for "this song job failed", the same discipline `_run` already
+    applies to a nonzero exit code.
+    """
+    def broken_run(cmd, **kwargs):
+        raise FileNotFoundError("no such file: fake-binary")
+
+    with pytest.raises(sr.SongRunError, match="fake-binary"):
+        sr._run(["fake-binary"], broken_run, "fake step")
+
+
+def test_i6_run_or_raise_wraps_oserror_as_song_run_error():
+    def broken_run(cmd, **kwargs):
+        raise OSError("permission denied")
+
+    with pytest.raises(sr.SongRunError, match="permission denied"):
+        sr._run_or_raise(["fake-binary"], broken_run, "fake step")
 
 
 # -- _mlx_whisper_binary ---------------------------------------------------------------------
@@ -389,6 +573,24 @@ def test_generate_wav_raises_when_stdout_has_no_dur_line(tmp_path):
         sr._generate_wav("python3", "modeldir", "c", "l", 90.0, 30, 7, tmp_path, run=fake)
 
 
+def test_i3_generate_wav_writes_gen_log_before_raising_on_a_nonzero_exit(tmp_path):
+    """I3 (2026-08-18 review): `gen.log` must land on disk *before* `_generate_wav` raises on a
+    nonzero exit code -- Music3's own stdout (the `[timing]`/peak-memory lines) is the only
+    diagnostic this module has for a failed generation, and it must survive the failure.
+    """
+    fake = _FakeRun()
+    fake.add(_is_generate_call, lambda cmd: _Result(
+        returncode=1, stdout="[timing] model load: 3.5 s\n[mem] peak=41.2 GB\n", stderr="cuda OOM"))
+
+    with pytest.raises(sr.SongRunError, match="cuda OOM"):
+        sr._generate_wav("python3", "modeldir", "c", "l", 90.0, 30, 7, tmp_path, run=fake)
+
+    log = (tmp_path / "gen.log").read_text(encoding="utf-8")
+    assert "model load" in log
+    assert "peak=41.2 GB" in log
+    assert "cuda OOM" in log
+
+
 def test_transcribe_reads_back_the_json_the_cli_would_have_written(tmp_path):
     fake = _FakeRun()
 
@@ -486,11 +688,16 @@ def test_run_song_result_fields_match_update_track_field_names():
     """`SongResult`'s field names line up 1:1 with `project.Project.update_track`'s accepted
     keywords for the fields this module actually produces -- task 3 hands the result straight
     through as `project.update_track(**{f: getattr(result, f) for f in (...)})`-shaped calls.
+
+    Checked over the *entire* set of fields the two have in common (minor, 2026-08-18 review), not
+    just a hand-picked subset -- a hard-coded `{"mp3", "mastered_mp3", "sections"}` subset (the
+    original version of this test) would silently miss a future rename dropping e.g. `wav` from
+    that overlap, since the subset check would keep passing either way.
     """
     from h3_48gb import project as p
     result_fields = set(sr.SongResult.__dataclass_fields__)
-    assert {"mp3", "mastered_mp3", "sections"} <= result_fields
-    assert {"mp3", "mastered_mp3", "sections"} <= set(p._TRACK_FIELDS)
+    track_fields = set(p._TRACK_FIELDS)
+    assert result_fields & track_fields == {"wav", "mp3", "mastered_mp3", "sections"}
 
 
 def test_run_song_propagates_a_generation_failure_as_song_run_error(tmp_path):
@@ -519,6 +726,77 @@ def test_run_song_flags_an_undersung_take(tmp_path):
     result = sr.run_song(track_dir, lyrics=lyrics, caption="c", duration=90.0, seed=1,
                           music3_python="p", model_dir="m", run=fake)
     assert result.undersung is True
+
+
+# -- I4: a retry starts clean, and a failed run never leaves a fake-finished mp3 behind ----------
+
+
+def test_i4_run_song_removes_stale_song_and_whisper_files_before_generating(tmp_path):
+    """I4 (2026-08-18 review): `run_song` deletes any `song.*`/`whisper.json` already in
+    `track_dir` before doing anything else -- a half-finished take from an earlier failed attempt
+    (task 3 retries with the *same* `track_dir`) must not be left sitting there looking like a
+    complete, playable track once this run has actually finished.
+    """
+    track_dir = tmp_path / "track"
+    track_dir.mkdir()
+    (track_dir / "song.wav").write_bytes(b"stale half-finished take from a crashed retry")
+    (track_dir / "song.mastered.mp3").write_bytes(b"stale mastered mp3 from a crashed retry")
+    (track_dir / "whisper.json").write_text('{"stale": true}', encoding="utf-8")
+
+    segments = [{"start": 0.0, "end": 3.0, "text": "spi moy malenkiy"}]
+    fake = _wire_full_fake_pipeline(track_dir, whisper_segments=segments, audio_dur="10.0")
+    result = sr.run_song(track_dir, lyrics="[intro]\nspi moy malenkiy", caption="c", duration=10.0,
+                          seed=1, music3_python="p", model_dir="m", run=fake)
+
+    assert result.wav.read_bytes() == b"fake raw wav"
+    assert result.mastered_mp3.read_bytes() != b"stale mastered mp3 from a crashed retry"
+
+
+def test_i4_run_song_propagates_a_mastering_failure_and_leaves_no_mastered_mp3(tmp_path):
+    track_dir = tmp_path / "track"
+    fake = _FakeRun()
+
+    def handle_generate(cmd):
+        out_path = Path(cmd[cmd.index("--output") + 1])
+        out_path.write_bytes(b"fake raw wav")
+        return _Result(stdout=f"[audio] {out_path}  shape=(1,2)  sr=44100  dur=10.0s\n")
+
+    def handle_ffmpeg(cmd):
+        return _Result(returncode=1, stderr="ffmpeg mastering exploded")
+
+    fake.add(_is_generate_call, handle_generate)
+    fake.add(_is_ffmpeg_call, handle_ffmpeg)
+
+    with pytest.raises(sr.SongRunError, match="mastering exploded"):
+        sr.run_song(track_dir, lyrics="[intro]\nx", caption="c", duration=10.0, seed=1,
+                    music3_python="p", model_dir="m", run=fake)
+    assert not (track_dir / "song.mastered.mp3").exists()
+
+
+def test_i4_run_song_propagates_a_whisper_failure_and_leaves_no_mastered_mp3(tmp_path):
+    track_dir = tmp_path / "track"
+    fake = _FakeRun()
+
+    def handle_generate(cmd):
+        out_path = Path(cmd[cmd.index("--output") + 1])
+        out_path.write_bytes(b"fake raw wav")
+        return _Result(stdout=f"[audio] {out_path}  shape=(1,2)  sr=44100  dur=10.0s\n")
+
+    def handle_ffmpeg(cmd):
+        Path(cmd[-1]).write_bytes(b"fake ffmpeg output")
+        return _Result()
+
+    def handle_whisper(cmd):
+        return _Result(returncode=1, stderr="mlx_whisper crashed: no such weights")
+
+    fake.add(_is_generate_call, handle_generate)
+    fake.add(_is_ffmpeg_call, handle_ffmpeg)
+    fake.add(_is_mlx_whisper_call, handle_whisper)
+
+    with pytest.raises(sr.SongRunError, match="mlx_whisper crashed"):
+        sr.run_song(track_dir, lyrics="[intro]\nx", caption="c", duration=10.0, seed=1,
+                    music3_python="p", model_dir="m", run=fake)
+    assert not (track_dir / "song.mastered.mp3").exists()
 
 
 # -- no-mlx discipline --------------------------------------------------------------------------

@@ -17,11 +17,15 @@ boundary as a subprocess's stdout or an output file it wrote, never as an import
 `song.wav` (see `_generate_wav` for the "Music3 stops early once the lyrics run out" duration
 subtlety -- `--duration` is an upper bound, not a promise). (2) `master` runs the mastering ffmpeg
 chain (highpass + presence/air EQ + loudness normalization -- `MASTER_FILTER`) into
-`song.mastered.wav`. (3) `to_mp3` encodes *both* wavs to mp3 (`libmp3lame -q:a 1`) -- the raw take
-and the mastered one are both kept, matching `project.py`'s `track.mp3`/`track.mastered_mp3`
-fields. (4) `_transcribe` runs `mlx_whisper` (also under `music3_python` -- it is installed in the
-same venv) on the mastered wav, and `check_lyrics_sung` compares the transcript against the lyrics
-line by line to find each section's start timestamp and flag an undersung take.
+`song.mastered.wav`. (3) `_transcribe` runs `mlx_whisper` (also under `music3_python` -- it is
+installed in the same venv) on the mastered wav, and `check_lyrics_sung` compares the transcript
+against the lyrics line by line to find each section's start timestamp and flag an undersung take.
+(4) Only once that has actually succeeded does `to_mp3` encode *both* wavs to mp3 (`libmp3lame
+-q:a 1`) -- the raw take and the mastered one are both kept, matching `project.py`'s
+`track.mp3`/`track.mastered_mp3` fields. Encoding last, after validation, is deliberate (I4,
+2026-08-18 review): `song.mp3`/`song.mastered.mp3` are the product a `kind="song"` track actually
+ships, so their presence on disk should mean the *whole* job succeeded, not just that ffmpeg ran --
+see `run_song`'s own docstring.
 
 **Calibration** (2026-08-18 "Колыбельная" run, a real slow song, referenced throughout this
 module's docstrings): ~28 s of singing per section on a slow track (`SECONDS_PER_SECTION`);
@@ -76,19 +80,28 @@ SECONDS_PER_SECTION = 28.0
 DURATION_PAD_SECONDS = 15.0
 
 #: The mastering chain (design spec, "Трек": "ffmpeg: highpass, presence/air EQ, доводка до
-#: -13.6 LUFS"), reproduced exactly as the task brief specifies it, values and all:
-#: `highpass=38` cuts sub-bass rumble below the vocal's usable range; the `firequalizer` entries
-#: carve a dip at 60 Hz (-2.5 dB, keeps the low end from masking the vocal) and lift presence/air
-#: at 3/8/12 kHz (+1.5/+3.5/+4 dB, the band Music3's raw output tends to leave dull); `loudnorm`
-#: brings the result to -13.6 LUFS integrated, -1 dBTP true-peak ceiling, 11 LU loudness range --
-#: the same target the three tracks this chain was proven on (task brief) were mastered to. The
-#: single quotes around `entry(...)` are ffmpeg's own filtergraph escaping (protects the commas
-#: inside each `entry()` from being read as filter-option separators) -- **not** shell quoting;
-#: this string is passed as one `subprocess` argv element, never through a shell, so the quotes
-#: must stay exactly as ffmpeg's own parser expects them.
+#: -13.6 LUFS"), reproduced exactly as the task brief specifies it, values and all -- the *full*
+#: seven-entry `firequalizer` curve confirmed by the chain's owner (2026-08-18 review, C2: the
+#: five-entry version this module originally shipped with was a plan-brief transcription
+#: shortcut, not the actual proven chain): `highpass=38` cuts sub-bass rumble below the vocal's
+#: usable range; the `firequalizer` entries carve a dip at 60/120 Hz (-2.5/-1.5 dB, keeps the low
+#: end from masking the vocal) and lift presence/air at 3/5/8/12/16 kHz (+1.5/+2/+3.5/+4/+3 dB,
+#: the band Music3's raw output tends to leave dull); `loudnorm` brings the result to -13.6 LUFS
+#: integrated, -1 dBTP true-peak ceiling, 11 LU loudness range -- the same target the three tracks
+#: this chain was proven on (task brief) were mastered to. `loudnorm` here runs in its default
+#: single-pass (dynamic) mode, not two-pass -- deliberate, not an oversight: two-pass needs a
+#: first analysis pass over the *whole* file before encoding, which single-pass avoids, at the
+#: cost of the normalizer adapting on the fly and audibly lifting quiet tails (an instrumental
+#: fade, a wordless outro) more than a two-pass run would. The single quotes around `entry(...)`
+#: are ffmpeg's own filtergraph escaping (protects the commas inside each `entry()` from being
+#: read as filter-option separators) -- **not** shell quoting; this string is passed as one
+#: `subprocess` argv element, never through a shell, so the quotes must stay exactly as ffmpeg's
+#: own parser expects them. `MASTER_FILTER`'s exact string is pinned by a regression test in
+#: `test_songrun.py` -- this value must not silently drift again.
 MASTER_FILTER = (
     "highpass=f=38,"
-    "firequalizer=gain_entry='entry(60,-2.5);entry(3000,1.5);entry(8000,3.5);entry(12000,4)',"
+    "firequalizer=gain_entry='entry(60,-2.5);entry(120,-1.5);entry(3000,1.5);entry(5000,2);"
+    "entry(8000,3.5);entry(12000,4);entry(16000,3)',"
     "loudnorm=I=-13.6:TP=-1:LRA=11"
 )
 
@@ -110,6 +123,16 @@ _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
 #: overlap. Pushing this threshold above 0.5 would misclassify that real, correctly-sung line as
 #: unsung; see `test_songrun.py`'s regression test built directly from this example.
 LINE_MATCH_THRESHOLD = 0.5
+
+#: The *fraction* `LINE_MATCH_THRESHOLD` alone is not enough of a floor for very short lines -- a
+#: 2-word line needs only *one* shared word to clear 50%, and a 1-word line clears it with any
+#: word at all. The real "Колыбельная" run's own short lines (the outro's "Спи, мой князь.",
+#: three words, two of which -- "спи", "мой" -- recur all over the song) are exactly this shape:
+#: cheap to spuriously match. `_line_matches_segment` requires *both* the 50% fraction *and* this
+#: absolute count of shared words, so a thin coincidence on a short line can no longer clear the
+#: bar on fraction alone. The real mishearing regression ("в висках" -> "песка") shares exactly 2
+#: words and survives this floor unchanged -- see `test_songrun.py`.
+MIN_SHARED_WORDS = 2
 
 #: The undersung gate (design spec, "Трек": "недопетый хвост ловится Whisper-проверкой"; task
 #: brief: "порог: <60% строк последней трети найдены"). Below this fraction of the *last third* of
@@ -152,7 +175,17 @@ class SongResult:
     #: to the lyrics.
     transcript: str
     #: One entry per section *occurrence* in the lyrics, in order (a lyric with two `[chorus]`
-    #: tags gets two separate section entries) -- see `check_lyrics_sung`.
+    #: tags gets two separate section entries), `{"name": str, "start": float | None,
+    #: "end": float | None}` -- see `check_lyrics_sung`. **`start`/`end` can both be `None`** -- a
+    #: section no line of which matched anything in the Whisper transcript (never sung, or sung
+    #: too poorly to match) has no timestamp to anchor either boundary to; task 6 (clip scenes cut
+    #: to these boundaries) must skip such a section rather than assume every entry has real
+    #: numbers. Even when both are numbers, **`end - start` is not that section's singing
+    #: duration** -- `end` is simply the *next* section's own known start (or the track's total
+    #: `duration` for a trailing section), so it silently swallows any unsung section(s) in
+    #: between (their own `start`/`end` are `None`, per `_section_ends`) into the *previous* sung
+    #: section's span. A clip-scene cutter that needs to know "was this whole span actually sung"
+    #: cannot get that from `end - start` alone.
     sections: list[dict] = field(default_factory=list)
     #: `True` if the last third of the lyrics' lines look unsung (design spec: "трек короче
     #: лирики, увеличь длительность"). `False` does not mean every line was matched, only that the
@@ -161,13 +194,28 @@ class SongResult:
     undersung: bool = False
 
 
-def _run(cmd: list[str], run, what: str) -> subprocess.CompletedProcess:
+def _run_or_raise(cmd: list[str], run, what: str) -> subprocess.CompletedProcess:
     """`run(cmd, capture_output=True, text=True)`, raising `SongRunError` (never a bare
-    `CalledProcessError`) if it exits non-zero. `what` names the step in the raised message (e.g.
+    `OSError`/`FileNotFoundError`) if the subprocess could not even be started (e.g. `music3_python`
+    or `mlx_whisper`'s binary does not exist at the resolved path -- I6, 2026-08-18 review: `run`
+    itself can raise before ever producing a `CompletedProcess` to check a return code on). Does
+    **not** check the exit code -- callers that need to do something with the output (write a log)
+    before deciding whether a nonzero exit is fatal call this directly instead of `_run` (see
+    `_generate_wav`).
+    """
+    try:
+        return run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        raise SongRunError(f"{what} failed to start: {exc}") from exc
+
+
+def _run(cmd: list[str], run, what: str) -> subprocess.CompletedProcess:
+    """`_run_or_raise`, plus raising `SongRunError` (never a bare `CalledProcessError`) if the
+    process exits non-zero. `what` names the step in the raised message (e.g.
     `"music3-generate.py"`) so a failure log reads as "which of the four pipeline steps broke",
     not just an exit code.
     """
-    result = run(cmd, capture_output=True, text=True)
+    result = _run_or_raise(cmd, run, what)
     if result.returncode != 0:
         raise SongRunError(f"{what} exited {result.returncode}: {(result.stderr or '').strip()}")
     return result
@@ -189,6 +237,12 @@ def _generate_wav(music3_python, model_dir, caption: str, lyrics: str, duration:
     for 295 s and got 268 s of audio back -- the lyrics simply ran out first). Raises
     `SongRunError` if that line is missing from stdout -- a change to the script's output format,
     or a crash that exited 0 some other way, must not silently hand back a fabricated duration.
+
+    `gen.log` is written *before* this function looks at the exit code (I3, 2026-08-18 review) --
+    Music3's own stdout (the `[timing]`/`[audio] ... dur=` lines, and the peak-memory report) is
+    the only diagnostic this module has for a failed generation; raising on a nonzero exit before
+    that output ever reaches disk would throw away the one piece of evidence a human debugging the
+    failure actually needs.
     """
     caption_path = track_dir / "caption.txt"
     lyrics_path = track_dir / "lyrics.txt"
@@ -204,9 +258,12 @@ def _generate_wav(music3_python, model_dir, caption: str, lyrics: str, duration:
            "--steps", str(steps),
            "--seed", str(seed),
            "--output", str(wav_path)]
-    result = _run(cmd, run, "music3-generate.py")
+    result = _run_or_raise(cmd, run, "music3-generate.py")
     (track_dir / "gen.log").write_text(
         (result.stdout or "") + (result.stderr or ""), encoding="utf-8")
+    if result.returncode != 0:
+        raise SongRunError(
+            f"music3-generate.py exited {result.returncode}: {(result.stderr or '').strip()}")
 
     match = _DURATION_RE.search(result.stdout or "")
     if match is None:
@@ -358,31 +415,65 @@ def _overlap(line_words: set[str], segment_words: set[str]) -> float:
     return len(line_words & segment_words) / len(line_words)
 
 
+def _line_matches_segment(line_words: set[str], segment_words: set[str],
+                           threshold: float = LINE_MATCH_THRESHOLD) -> bool:
+    """`True` if `line_words` and `segment_words` count as "the same line" -- both `_overlap(...)
+    >= threshold` (the 50% fraction) *and* at least `MIN_SHARED_WORDS` words actually in common.
+    The fraction alone lets a short line (2 words needs only 1 shared word for 50%) clear the bar
+    on a thin, coincidental overlap; the absolute floor closes that specifically for short lines
+    without moving the threshold itself (see `MIN_SHARED_WORDS`'s own docstring for the real
+    "Колыбельная" example this is pinned to).
+    """
+    if not line_words:
+        return False
+    shared = len(line_words & segment_words)
+    return shared >= MIN_SHARED_WORDS and shared / len(line_words) >= threshold
+
+
 def _match_lines_to_segments(line_word_sets: list[set[str]],
                               segment_word_sets: list[set[str]],
                               threshold: float = LINE_MATCH_THRESHOLD) -> list[int | None]:
-    """For each lyric line (in order), the index into `segment_word_sets` of the first segment,
-    searched forward from a pointer that only ever advances, whose overlap with that line meets
-    `threshold` -- or `None` if none does before the segments run out.
+    """For each lyric line (in order), the index into `segment_word_sets` it matches, or `None` if
+    nothing does. A pointer only ever advances (never backward), which is what keeps a *repeated*
+    section (the same chorus sung twice) from matching every occurrence of its lines to the
+    *first* time Whisper heard them: once a line matches segment K, the *next new* search starts
+    at K + 1, so a later, unrelated line cannot walk back into a segment an earlier line already
+    claimed.
 
-    The pointer never moving backward is what keeps a *repeated* section (the same chorus sung
-    twice) from matching every occurrence of its lines to the *first* time Whisper heard them: once
-    line N has matched segment K, line N+1 can only match segment K or later, so the second
-    chorus's lines are forced to match the second chorus's segments, not the first's. The pointer
-    also does not advance past K on a match -- several consecutive short lyric lines routinely fall
-    inside one longer Whisper segment, and all of them should be allowed to match it.
+    That would, on its own, also break the legitimate case the pointer's *not* supposed to break:
+    several consecutive short lyric lines routinely fall inside one longer Whisper segment, and
+    all of them should still be allowed to match it even though the pointer has moved past its
+    index. So each line first checks whether it *also* matches the segment the immediately
+    preceding line matched (`prev_match`, checked before the forward search, not after) -- if so,
+    it reuses that segment without needing the forward search to find it again. This reuse is
+    strictly one line's privilege at a time, handed off from line to line only while each next line
+    keeps matching that same segment; the moment a line does not (a real content change, or the
+    segments simply run out), the chain breaks and the *next* line is back to searching forward
+    from the pointer only -- it cannot itself reach back into old territory. C1 (2026-08-18 review,
+    real "Колыбельная" data): with the old "pointer never advances" version, a second, unsung
+    occurrence of an identical section (the second `[chorus]`, never actually re-recorded) matched
+    the *first* occurrence's own last segment purely because the text was identical and the pointer
+    had never moved past it -- stealing a start timestamp from inside the first chorus's own span
+    and, via `_section_ends`, truncating the first chorus's `end` to that same stolen value. See
+    `test_songrun.py`'s regression built from the real chorus text and a real Whisper mishearing.
     """
     pointer = 0
+    prev_match: int | None = None
     matches: list[int | None] = []
     for words in line_word_sets:
         found = None
-        for i in range(pointer, len(segment_word_sets)):
-            if _overlap(words, segment_word_sets[i]) >= threshold:
-                found = i
-                break
+        if prev_match is not None and _line_matches_segment(
+                words, segment_word_sets[prev_match], threshold):
+            found = prev_match
+        else:
+            for i in range(pointer, len(segment_word_sets)):
+                if _line_matches_segment(words, segment_word_sets[i], threshold):
+                    found = i
+                    break
         matches.append(found)
         if found is not None:
-            pointer = found
+            pointer = max(pointer, found + 1)
+        prev_match = found
     return matches
 
 
@@ -395,6 +486,8 @@ def _section_ends(starts: list[float | None], duration: float | None) -> list[fl
     """
     ends: list[float | None] = [None] * len(starts)
     for i in range(len(starts)):
+        if starts[i] is None:
+            continue
         ends[i] = next((s for s in starts[i + 1:] if s is not None), None)
     if duration is not None:
         for i in range(len(starts)):
@@ -428,7 +521,8 @@ def check_lyrics_sung(lyrics: str, segments: list[dict], *,
 
     Matching is intentionally fuzzy, not exact string equality (task brief) -- Whisper mishears
     individual words in sung audio (`LINE_MATCH_THRESHOLD`'s own docstring has the real example),
-    so `_overlap` scores each line against each segment by word overlap rather than requiring a
+    so `_line_matches_segment` scores each line against each segment by word overlap (a fraction,
+    `LINE_MATCH_THRESHOLD`, *and* an absolute floor, `MIN_SHARED_WORDS`) rather than requiring a
     verbatim match.
     """
     section_names, lines = _parse_lyrics(lyrics)
@@ -481,20 +575,38 @@ def run_song(track_dir, lyrics: str, caption: str, duration: float, *, seed: int
     Nothing here writes to `project.json` -- returning a `SongResult` and leaving the
     `project.update_track(**fields)` call to the caller (task 3) is deliberate: this function does
     not know which project a song job belongs to, only how to run one.
+
+    **Retries start clean** (I4, 2026-08-18 review): before generating anything, `run_song` deletes
+    any `song.*`/`whisper.json` already sitting in `track_dir` from a previous, failed attempt.
+    Task 3: a retried song job must call `run_song` with the *same* `track_dir` it used the first
+    time, not a fresh one -- this is what makes that safe. Without it, a half-finished take from an
+    earlier failed attempt (say, mastering crashed after `song.wav` was written but before
+    `song.mastered.mp3` existed) would leave `song.mp3`/`song.wav` sitting in `track_dir` looking
+    like a complete, playable track to anything that only checks "does the file exist", even though
+    the job as a whole never finished and no `SongResult` was ever produced for it.
     """
     track_dir = Path(track_dir)
     track_dir.mkdir(parents=True, exist_ok=True)
+    for stale in [*track_dir.glob("song.*"), track_dir / "whisper.json"]:
+        stale.unlink(missing_ok=True)
 
     wav_path, actual_duration = _generate_wav(
         music3_python, model_dir, caption, lyrics, duration, steps, seed, track_dir, run=run)
 
     mastered_wav = master(wav_path, track_dir / "song.mastered.wav", run=run)
-    mp3 = to_mp3(wav_path, track_dir / "song.mp3", run=run)
-    mastered_mp3 = to_mp3(mastered_wav, track_dir / "song.mastered.mp3", run=run)
 
+    # Transcribe (and mp3-encode only after that succeeds, I4, 2026-08-18 review): `song.mp3`/
+    # `song.mastered.mp3` are the product a `kind="song"` track ships -- their presence on disk is
+    # what makes an unfinished take look like a done one. Encoding them only once Whisper has
+    # actually run keeps a Whisper failure (a real, not-uncommon step to fail: its own venv, its
+    # own downloaded weights) from leaving a `song.mastered.mp3` behind that looks complete but
+    # was never actually validated.
     whisper_data = _transcribe(music3_python, mastered_wav, track_dir, run=run)
     segments = whisper_data.get("segments", [])
     sections, undersung = check_lyrics_sung(lyrics, segments, duration=actual_duration)
+
+    mp3 = to_mp3(wav_path, track_dir / "song.mp3", run=run)
+    mastered_mp3 = to_mp3(mastered_wav, track_dir / "song.mastered.mp3", run=run)
 
     return SongResult(
         wav=wav_path,
