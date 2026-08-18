@@ -3117,6 +3117,14 @@ class _Handler(BaseHTTPRequestHandler):
             kind = project.get("kind")
             if isinstance(kind, str) and kind in PROJECT_KINDS:
                 session["kind"] = kind
+            else:
+                # Review M2: `session["project"]` was just overwritten wholesale (above), so a
+                # `kind` a previous turn set must not go on claiming to describe *this* `project`
+                # -- leaving it in place would let `session["kind"]` and
+                # `session["project"]["kind"]` disagree the moment this turn's own `kind` is
+                # missing or unrecognised, exactly the pair Task 6's project-creation route reads
+                # as if they always matched.
+                session.pop("kind", None)
         else:
             project = None
         self._write_session(path, session)

@@ -361,6 +361,46 @@ def test_scene_generate_args_produces_a_different_output_stem_on_each_call(tmp_p
     assert args1[args1.index("--tag") + 1] != args2[args2.index("--tag") + 1]
 
 
+# -- _scene_generate_args: the i2v instruction line (review round, I2) ---------------------------
+
+
+def test_scene_generate_args_prepends_the_i2v_instruction_when_a_keyframe_is_attached():
+    """Review I2: a scene submitted with `--image` runs as `mode: i2v`, and
+    `docs/h3-prompt-system.md`'s own format ("The first line, for image-conditioned modes")
+    requires that run's prompt to *open* with a specific literal sentence -- `scene["prompt"]`
+    itself never carries it (Task 5's own report, "scenario mode": the model is told never to
+    write `instruction` into a scene, the pipeline must add it once it knows the scene is i2v).
+    Without this, a keyframed scene's clip loses the one sentence that tells H3 the picture is a
+    real reference and not just an arbitrary conditioning image -- the same gap `buildPromptText`
+    (`webui/app.js`) closes for an ordinary chat turn's own `prompt.instruction` field.
+    """
+    scene = _make_scene(1, prompt="integrated_multimodal_description: a fox runs\n\n"
+                                   "overall_soundscape: wind\n\nnon_diegetic_music: N/A")
+
+    args, _ = assemble._scene_generate_args(scene, "/tmp/keyframe-000.png", Path("/tmp/scenes"))
+
+    prompt_arg = args[1]
+    assert prompt_arg.startswith(
+        "For the target video, at 0.00 seconds into the target video, "
+        "<Picture 1> (from [Shot 1]) is fully referenced.\n\n")
+    assert scene["prompt"] in prompt_arg
+
+
+def test_scene_generate_args_leaves_a_t2v_scenes_prompt_untouched():
+    """The counterpart: a scene with no keyframe (`t2v`, scene 0 with no `start_image`) must not
+    grow an i2v instruction line -- that sentence is a lie about a run that has no reference image
+    at all.
+    """
+    scene = _make_scene(0, prompt="integrated_multimodal_description: a fox runs\n\n"
+                                   "overall_soundscape: wind\n\nnon_diegetic_music: N/A")
+
+    args, _ = assemble._scene_generate_args(scene, None, Path("/tmp/scenes"))
+
+    prompt_arg = args[1]
+    assert prompt_arg == scene["prompt"]
+    assert "is fully referenced" not in prompt_arg
+
+
 # -- advance_project(): the scene chain -------------------------------------------------------------
 
 

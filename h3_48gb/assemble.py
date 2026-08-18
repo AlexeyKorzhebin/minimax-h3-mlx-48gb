@@ -87,6 +87,19 @@ DEFAULT_SCENE_STEPS = 8
 #: than this (task brief: "время = max(0, dur-1.5)").
 KEYFRAME_LEAD_SECONDS = 1.5
 
+#: Review round I2: `docs/h3-prompt-system.md`'s own "The first line, for image-conditioned
+#: modes" -- the literal, word-for-word sentence a `mode: i2v` run's prompt must open with,
+#: reproduced verbatim rather than derived. Task 5's own system prompt tells the model never to
+#: write this line into a scene's own `prompt` text (the scene is written before its mode is
+#: known -- `t2v` for scene 0, `i2v` off an automatic keyframe for every scene after it), so this
+#: module has to add it itself once it actually knows a keyframe exists, the same way
+#: `webui/app.js`'s `buildPromptText` joins an ordinary chat turn's own `prompt.instruction` field
+#: onto the three labelled fields with a blank line between them.
+SCENE_I2V_INSTRUCTION = (
+    "For the target video, at 0.00 seconds into the target video, "
+    "<Picture 1> (from [Shot 1]) is fully referenced."
+)
+
 #: Task brief: "для kind=clip длительность final == длительность трека ±0.5 с". Applied to every
 #: `audio_mode` whose final audio *is* the track (`"song"`/`"mix"`), not only `kind == "clip"` --
 #: see the module docstring's "Lyric-video-director's proven rules" for why the audio_mode is the
@@ -495,6 +508,13 @@ def _scene_generate_args(scene: dict, keyframe, scenes_dir: Path) -> tuple[list[
     `buildArgs` (`if (form.image) args.push("--image", form.image);`) -- there is no separate
     `i2v`-flavoured flag; `--mode` is never passed at all, since it is derived from `--image`'s
     presence alone (`cli.py`'s own `_add_run_flags` and `resolve_mode`).
+
+    Review round I2: when a keyframe exists, the prompt handed to the CLI is prefixed with
+    `SCENE_I2V_INSTRUCTION` -- the literal sentence `docs/h3-prompt-system.md` requires every
+    `mode: i2v` run's prompt to open with, separated from `scene["prompt"]`'s own three labelled
+    fields by a blank line, the same joining rule `webui/app.js`'s `buildPromptText` already uses
+    for an ordinary chat turn's `instruction` field. A `t2v` scene (no keyframe -- scene 0 with no
+    uploaded start frame) gets no such line: `scene["prompt"]` is passed through untouched.
     """
     idx = scene["idx"]
     width, height = DEFAULT_SCENE_CANVAS
@@ -508,7 +528,10 @@ def _scene_generate_args(scene: dict, keyframe, scenes_dir: Path) -> tuple[list[
     # local rather than importing a queue-private helper) makes every attempt's own tag unique
     # regardless of timing, without needing an attempt counter on the scene's own schema.
     tag = f"scene-{idx}-{secrets.token_hex(2)}"
-    args = ["generate", scene["prompt"],
+    prompt = scene["prompt"]
+    if keyframe is not None:
+        prompt = f"{SCENE_I2V_INSTRUCTION}\n\n{prompt}"
+    args = ["generate", prompt,
             "--width", str(width), "--height", str(height),
             "--duration", str(scene["duration"]),
             "--tag", tag,

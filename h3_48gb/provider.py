@@ -79,7 +79,12 @@ PROMPT_SCHEMA = {
                                 # after it) is known; the pipeline prepends whichever `instruction`
                                 # line applies once it actually submits the scene as a job.
                                 "prompt": {"type": "string"},
-                                "duration": {"type": "number"},
+                                # Review I1: the brief's own "5 to 10 seconds" (docs/h3-prompt-
+                                # system.md, "Scenario mode") wasn't a schema bound before this --
+                                # a model answering `duration: 60` passed validation silently and
+                                # that number went straight into a GPU `generate` job with nothing
+                                # downstream re-checking it.
+                                "duration": {"type": "number", "minimum": 5, "maximum": 10},
                             },
                             "required": ["prompt", "duration"],
                             "additionalProperties": False,

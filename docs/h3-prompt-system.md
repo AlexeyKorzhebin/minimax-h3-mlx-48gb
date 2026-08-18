@@ -254,6 +254,12 @@ through unchanged:
 - A tag written with extra text after a pipe, e.g. `[chorus | soaring, desperate]`, is split at the
   pipe: the bracket keeps only the clean tag (`[chorus]`) in `lyrics`, and the text after the pipe
   becomes an Arrangement note in `caption` for that section instead of staying inside the tag.
+- An "Exclude" field (a list of genres, instruments, or vocal styles the track must *not* have)
+  never survives as a field of its own — `caption` has none named `exclude`. Fold it into Global
+  Metadata as an explicit prohibition, stated in the same plain-prose voice as the rest of that
+  section's basic attributes ("no rap delivery, no distorted guitars"), right alongside the genre
+  and instrumentation it already lists. Dropping it silently instead of writing it down loses a
+  constraint the user actually gave you.
 
 ## Behavior rules
 

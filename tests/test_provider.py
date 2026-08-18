@@ -296,6 +296,31 @@ def test_project_scenes_are_full_prompt_strings_with_a_duration_field():
     assert scene["required"] == ["prompt", "duration"]
 
 
+def test_project_scene_duration_is_bounded_to_the_five_to_ten_second_scene_length():
+    """Review I1: the brief says scenes are 5-10 s (`docs/h3-prompt-system.md`'s "Scenario mode"),
+    but without `minimum`/`maximum` on the schema itself a model that answers `duration: 60` (or
+    `2`) passes validation silently and that number rides straight into a GPU `generate` job --
+    nothing downstream re-checks it. Validated with `jsonschema` itself, not just dict inspection,
+    so this test would actually catch a provider whose completion violates the bound, the same way
+    a real `response_format` rejection would.
+    """
+    import jsonschema
+
+    duration_schema = _project_fields()["scenes"]["items"]["properties"]["duration"]
+    assert duration_schema["minimum"] == 5
+    assert duration_schema["maximum"] == 10
+
+    def _scene(duration):
+        return {"prompt": "x", "duration": duration}
+
+    scene_schema = _project_fields()["scenes"]["items"]
+    for bad in (60, 2):
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(_scene(bad), scene_schema)
+    for good in (5, 7.5, 10):
+        jsonschema.validate(_scene(good), scene_schema)
+
+
 def _video_project_payload() -> dict:
     return {"choices": [{"message": {"content": json.dumps({
         "reply": "вот сценарий из двух сцен",
@@ -393,6 +418,8 @@ def test_system_prompt_carries_the_scenario_and_song_rules():
             "Music3's vocal", "a real ceiling", "import the finished mp3",
             # suno import conversion
             "Style Prompt", "split at the",
+            # review M1: an "Exclude" field converts to an explicit prohibition, not silence
+            "Exclude", "explicit prohibition",
             # the schema line itself, extended with `project`
             '"project": object | null'):
         assert anchor in text, anchor

@@ -701,6 +701,36 @@ def test_the_sessions_kind_rides_a_later_turns_context(_serve):
         fake.close()
 
 
+def test_a_later_turns_bad_kind_does_not_leave_the_sessions_kind_stale(_serve):
+    """Review M2: `session["kind"]` is a mirror of `session["project"]["kind"]`, but the first
+    turn's `## Context` fix (`test_the_sessions_kind_rides_a_later_turns_context`) only proved the
+    mirror survives a turn that says nothing about `project` at all. A *second* turn that answers
+    with a `project` again, this time with a `kind` this server does not recognise, overwrites
+    `session["project"]` wholesale (the same loyalty rule `prompt_struct` already follows) -- and
+    if `session["kind"]` from the *first* turn were left untouched, it would go on claiming
+    `"video"` while `session["project"]["kind"]` says `"movie"`, a pair nothing downstream (Task
+    6's project-creation route, the next turn's own `kind:` context line) could trust.
+    """
+    payload = _turn_with_project(_VIDEO_PROJECT)
+    fake = _FakeLlama(chat_payload=payload)
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "ролик", "prompt": ""})
+        assert srv.get_json(f"/api/chat/{sid}")["kind"] == "video"
+
+        bad_project = {"kind": "movie", "scenes": None, "lyrics": None, "caption": None}
+        payload.clear()
+        payload.update(_turn_with_project(bad_project))
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "ещё", "prompt": ""})
+
+        saved = srv.get_json(f"/api/chat/{sid}")
+        assert saved["project"] == bad_project
+        assert "kind" not in saved, "session['kind'] must not keep claiming a stale 'video'"
+    finally:
+        fake.close()
+
+
 @pytest.mark.parametrize("project", [
     42, "video", ["video"],
     {"kind": "movie", "scenes": None, "lyrics": None, "caption": None},  # `kind` вне списка
