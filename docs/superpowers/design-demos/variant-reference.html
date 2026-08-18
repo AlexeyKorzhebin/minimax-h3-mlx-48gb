@@ -1,0 +1,1026 @@
+<!--
+  ЭТАЛОН: Linear (linear.app) — десктопное приложение и его дизайн-система.
+  Проверено поиском по реальным источникам (VoltAgent/awesome-design-md → design-md/linear.app/DESIGN.md;
+  linear.app/now/how-we-redesigned-the-linear-ui; linear.app/changelog/2020-12-04-themes).
+
+  ЧТО ПЕРЕНЕСЕНО (школа, не копия):
+  1. Темнота как основа, а не «тема»: лестница поверхностей от canvas #08090a через #0f1011 / #141516 / #18191a,
+     иерархия строится градациями светимости и прозрачности, а не цветом. Границы — волосяные 1px #23252a,
+     глубина рисуется линией и светимостью, а не тенями и не свечением.
+  2. Типографика Inter в узкой полосе веса 400–590 (без жирного), с плотным отрицательным трекингом
+     (-0.4…-0.02em на заголовках), 13px eyebrow с положительным +0.4px на служебных подписях.
+     Сетка 4px, радиусы 6/8/10/12. Моноширинный — только промпт, пути и цифры, с tabular-nums.
+  3. Один функциональный акцент. У Linear это лавандовый #5e6ad2; здесь он заменён на сигнальный янтарь
+     — он горит ИСКЛЮЧИТЕЛЬНО там, где GPU реально считает (текущая задача, шаги прохода, счётчик VRAM).
+     Главное действие взято из другого приёма Linear — «inverse button»: светлая плашка на тёмном,
+     максимальный контраст без цвета. Фиолетовый убран намеренно, чтобы не читалось как стартап-лендинг.
+-->
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniMax H3 — локальная станция</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  /* лестница поверхностей */
+  --canvas:#08090a;
+  --s1:#0f1011;
+  --s2:#141516;
+  --s3:#18191a;
+  --s4:#1d1e20;
+  /* волосяные границы */
+  --line:#23252a;
+  --line-2:#34343a;
+  --line-3:#3e3e44;
+  /* чернила */
+  --ink:#f7f8f8;
+  --ink-2:#d0d6e0;
+  --ink-3:#8a8f98;
+  --ink-4:#62666d;
+  /* единственный акцент — вычисление в полёте */
+  --signal:#e0a33e;
+  --signal-weak:rgba(224,163,62,.14);
+  --signal-line:rgba(224,163,62,.28);
+  /* семантика, приглушённая */
+  --ok:#4f9b6a;
+  --warn:#c9784a;
+  --warn-weak:rgba(201,120,74,.10);
+  --warn-line:rgba(201,120,74,.26);
+  /* подсветка формата */
+  --key:#7fa8bd;
+  --shot:#b39a72;
+
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+  --sans:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  --r-xs:4px; --r-sm:6px; --r-md:8px; --r-lg:10px; --r-xl:12px;
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{
+  background:var(--canvas);
+  color:var(--ink);
+  font-family:var(--sans);
+  font-size:14px;
+  line-height:1.5;
+  letter-spacing:-.011em;
+  font-feature-settings:"cv01","ss03";
+  -webkit-font-smoothing:antialiased;
+  padding-bottom:96px;
+}
+::selection{background:rgba(224,163,62,.24)}
+
+/* ─────────────────────────── чрома ─────────────────────────── */
+.chrome{
+  position:sticky; top:0; z-index:20;
+  height:56px;
+  background:rgba(8,9,10,.86);
+  backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);
+  display:flex; align-items:center; gap:16px;
+  padding:0 24px;
+}
+.mark{
+  display:flex; align-items:center; gap:10px;
+  padding-right:16px; border-right:1px solid var(--line);
+  height:24px;
+}
+.mark .glyph{
+  width:22px;height:22px;border-radius:var(--r-sm);
+  border:1px solid var(--line-2);
+  background:var(--s3);
+  display:grid;place-items:center;
+  font-family:var(--mono); font-size:10px; font-weight:500;
+  color:var(--ink-2); letter-spacing:0;
+}
+.mark .name{font-size:13px;font-weight:510;letter-spacing:-.01em}
+.mark .name span{color:var(--ink-4);font-weight:400}
+.chrome .host{
+  font-family:var(--mono);font-size:12px;color:var(--ink-4);letter-spacing:0;
+}
+.chrome .spacer{flex:1}
+.readout{display:flex;align-items:center;gap:2px}
+.stat{
+  display:flex;align-items:baseline;gap:6px;
+  padding:5px 10px;border-radius:var(--r-sm);
+}
+.stat .k{font-size:11px;color:var(--ink-4);letter-spacing:.02em;text-transform:uppercase}
+.stat .v{font-family:var(--mono);font-size:12px;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.stat .v.hot{color:var(--signal)}
+.dot{width:5px;height:5px;border-radius:50%;flex:none}
+.dot.idle{background:var(--ink-4)}
+.dot.run{background:var(--signal)}
+.dot.ok{background:var(--ok)}
+
+/* ─────────────────────────── каркас ─────────────────────────── */
+.shell{max-width:1380px;margin:0 auto;padding:24px}
+.grid-main{
+  display:grid;
+  grid-template-columns:minmax(0,1.32fr) minmax(0,1fr);
+  gap:20px;
+  align-items:start;
+}
+
+.panel{
+  background:var(--s1);
+  border:1px solid var(--line);
+  border-radius:var(--r-xl);
+  overflow:hidden;
+}
+.panel-head{
+  display:flex;align-items:center;gap:12px;
+  padding:14px 16px;
+  border-bottom:1px solid var(--line);
+  background:var(--s2);
+}
+.panel-head h2{
+  font-size:13px;font-weight:510;letter-spacing:-.01em;color:var(--ink);
+}
+.panel-head .num{
+  font-family:var(--mono);font-size:11px;color:var(--ink-4);
+  width:18px;height:18px;border:1px solid var(--line-2);border-radius:var(--r-xs);
+  display:grid;place-items:center;letter-spacing:0;flex:none;
+}
+.panel-head .spacer{flex:1}
+.panel-body{padding:16px}
+
+.eyebrow{
+  font-size:11px;font-weight:500;letter-spacing:.4px;text-transform:uppercase;
+  color:var(--ink-4);
+}
+
+/* ─────────────────────────── кнопки ─────────────────────────── */
+.btn{
+  font-family:var(--sans);font-size:13px;font-weight:510;letter-spacing:-.005em;
+  padding:7px 12px;border-radius:var(--r-md);
+  border:1px solid var(--line-2);
+  background:var(--s3);color:var(--ink-2);
+  cursor:pointer;white-space:nowrap;
+  display:inline-flex;align-items:center;gap:7px;
+  transition:background .12s ease,border-color .12s ease,color .12s ease;
+}
+.btn:hover{background:var(--s4);border-color:var(--line-3);color:var(--ink)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--ink-3)}
+.btn.ghost:hover{background:var(--s3);color:var(--ink-2)}
+.btn.inverse{
+  background:var(--ink);color:#0a0b0c;border-color:var(--ink);font-weight:590;
+}
+.btn.inverse:hover{background:#fff;border-color:#fff}
+.btn.lg{padding:11px 16px;font-size:14px;border-radius:var(--r-lg)}
+.btn.wide{width:100%;justify-content:center}
+.btn .kbd{
+  font-family:var(--mono);font-size:11px;color:rgba(10,11,12,.45);letter-spacing:0;
+}
+.btn.inverse svg{opacity:.7}
+.tri{width:0;height:0;border-left:7px solid currentColor;border-top:4.5px solid transparent;border-bottom:4.5px solid transparent}
+.pause{display:inline-flex;gap:2.5px}
+.pause i{width:2.5px;height:9px;background:currentColor;display:block}
+
+/* ─────────────────────────── редактор ─────────────────────────── */
+.editor-bar{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+.editor-bar .spacer{flex:1}
+
+.sel{position:relative;display:inline-flex}
+.sel::after{
+  content:"";position:absolute;right:10px;top:50%;margin-top:-2px;
+  width:6px;height:6px;border-right:1.2px solid var(--ink-4);border-bottom:1.2px solid var(--ink-4);
+  transform:rotate(45deg) translateY(-2px);pointer-events:none;
+}
+.sel select{
+  appearance:none;-webkit-appearance:none;
+  font-family:var(--sans);font-size:13px;font-weight:400;letter-spacing:-.005em;
+  color:var(--ink-2);background:var(--s2);
+  border:1px solid var(--line);border-radius:var(--r-md);
+  padding:7px 28px 7px 10px;width:100%;cursor:pointer;
+}
+.sel select:hover{border-color:var(--line-2);color:var(--ink)}
+.sel select:focus{outline:2px solid rgba(224,163,62,.35);outline-offset:-1px}
+.sel select option{background:#141516;color:#d0d6e0}
+
+.editor{
+  background:var(--canvas);
+  border:1px solid var(--line-2);
+  border-radius:var(--r-lg);
+  overflow:hidden;
+}
+.editor .code{
+  font-family:var(--mono);
+  font-size:12.5px;line-height:1.72;letter-spacing:0;
+  color:var(--ink-2);
+  padding:14px 16px;
+  min-height:186px;
+  white-space:pre-wrap;
+  word-break:break-word;
+}
+.editor .code .k{color:var(--key)}
+.editor .code .sh{color:var(--shot)}
+.editor .code .ts{color:var(--ink);background:rgba(255,255,255,.05);border-radius:3px;padding:0 3px}
+.editor .code .el{color:var(--ink-4)}
+.editor .code p{margin-bottom:.72em}
+.editor .code p:last-child{margin-bottom:0}
+.caret{
+  display:inline-block;width:1.5px;height:1.05em;background:var(--signal);
+  vertical-align:text-bottom;margin-left:1px;
+  animation:blink 1.15s steps(1,end) infinite;
+}
+@keyframes blink{0%,49%{opacity:1}50%,100%{opacity:0}}
+.editor .foot{
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:8px 16px;border-top:1px solid var(--line);
+  background:var(--s1);
+}
+.editor .foot span{
+  font-family:var(--mono);font-size:11px;color:var(--ink-4);letter-spacing:0;
+  font-variant-numeric:tabular-nums;
+}
+.editor .foot .valid{color:var(--ok);display:inline-flex;align-items:center;gap:6px;font-family:var(--sans);letter-spacing:-.005em;font-size:11.5px}
+
+/* ─────────────────────────── параметры ─────────────────────────── */
+.params{
+  display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:12px;margin-top:16px;
+}
+.field{display:flex;flex-direction:column;gap:6px;min-width:0}
+.field > label{font-size:11.5px;color:var(--ink-3);letter-spacing:-.005em}
+.field .sel{width:100%}
+
+.inp{
+  font-family:var(--mono);font-size:13px;letter-spacing:0;
+  color:var(--ink);background:var(--s2);
+  border:1px solid var(--line);border-radius:var(--r-md);
+  padding:7px 10px;width:100%;
+  font-variant-numeric:tabular-nums;
+}
+.inp:focus{outline:2px solid rgba(224,163,62,.35);outline-offset:-1px}
+.inp-unit{position:relative;display:flex}
+.inp-unit .u{
+  position:absolute;right:10px;top:50%;transform:translateY(-50%);
+  font-family:var(--mono);font-size:11px;color:var(--ink-4);pointer-events:none;
+}
+
+.seg{display:flex;background:var(--s2);border:1px solid var(--line);border-radius:var(--r-md);padding:2px;gap:2px}
+.seg input{position:absolute;opacity:0;pointer-events:none}
+.seg label{
+  flex:1;text-align:center;cursor:pointer;
+  font-family:var(--mono);font-size:12px;letter-spacing:0;
+  color:var(--ink-4);padding:5px 4px;border-radius:var(--r-xs);
+  transition:background .12s,color .12s;
+}
+.seg label:hover{color:var(--ink-2)}
+.seg input:checked + label{background:var(--s4);color:var(--ink);box-shadow:inset 0 0 0 1px var(--line-2)}
+
+.drop{
+  grid-column:1/-1;
+  border:1px dashed var(--line-2);border-radius:var(--r-lg);
+  background:var(--s2);
+  padding:16px;
+  display:flex;align-items:center;gap:14px;
+}
+.drop .thumb{
+  width:56px;height:36px;border-radius:var(--r-sm);flex:none;
+  border:1px solid var(--line);
+  background:
+    repeating-linear-gradient(45deg,rgba(255,255,255,.022) 0 4px,transparent 4px 8px),
+    var(--s3);
+}
+.drop .txt{min-width:0}
+.drop .txt b{display:block;font-size:13px;font-weight:500;color:var(--ink-2);letter-spacing:-.008em}
+.drop .txt small{font-size:11.5px;color:var(--ink-4);font-family:var(--mono);letter-spacing:0}
+.drop .spacer{flex:1}
+.drop.dim{opacity:.55}
+
+/* details — настройки модели */
+details.adv{
+  grid-column:1/-1;
+  border:1px solid var(--line);border-radius:var(--r-lg);
+  background:var(--s2);
+}
+details.adv > summary{
+  list-style:none;cursor:pointer;
+  padding:10px 14px;
+  display:flex;align-items:center;gap:9px;
+  font-size:13px;font-weight:500;color:var(--ink-2);letter-spacing:-.008em;
+}
+details.adv > summary::-webkit-details-marker{display:none}
+details.adv > summary::before{
+  content:"";width:5px;height:5px;flex:none;
+  border-right:1.3px solid var(--ink-4);border-bottom:1.3px solid var(--ink-4);
+  transform:rotate(-45deg);transition:transform .15s ease;
+}
+details.adv[open] > summary::before{transform:rotate(45deg)}
+details.adv > summary:hover{color:var(--ink)}
+details.adv > summary .hint{
+  margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--ink-4);letter-spacing:0;
+  font-variant-numeric:tabular-nums;
+}
+.adv-body{
+  border-top:1px solid var(--line);padding:14px;
+  display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;
+}
+.adv-body .full{grid-column:1/-1}
+
+/* оценка + CTA */
+.estimate{
+  margin-top:16px;
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  padding:11px 14px;
+  border:1px solid var(--line);border-radius:var(--r-lg);
+  background:var(--s2);
+}
+.estimate .big{
+  font-family:var(--mono);font-size:14px;font-weight:500;color:var(--ink);letter-spacing:0;
+  font-variant-numeric:tabular-nums;
+}
+.estimate .sep{color:var(--ink-4)}
+.estimate .m{font-family:var(--mono);font-size:12.5px;color:var(--ink-3);letter-spacing:0;font-variant-numeric:tabular-nums}
+.estimate .spacer{flex:1}
+.cta-row{margin-top:12px;display:flex;gap:10px}
+.cta-row .btn.inverse{flex:1}
+
+/* ─────────────────────────── очередь ─────────────────────────── */
+.qstate{
+  padding:16px;
+  border-bottom:1px solid var(--line);
+  background:
+    linear-gradient(180deg,rgba(255,255,255,.014),transparent);
+}
+.qstate .row{display:flex;align-items:center;gap:12px}
+.qstate .title{
+  font-size:20px;font-weight:500;letter-spacing:-.4px;color:var(--ink);line-height:1.2;
+}
+.qstate .sub{
+  margin-top:4px;font-size:12px;color:var(--ink-4);
+  font-family:var(--mono);letter-spacing:0;font-variant-numeric:tabular-nums;
+}
+.qstate .spacer{flex:1}
+
+.now{padding:16px;border-bottom:1px solid var(--line);background:var(--s2)}
+.now .head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.now .name{
+  font-family:var(--mono);font-size:13px;font-weight:500;color:var(--ink);letter-spacing:0;
+}
+.now .meta{
+  font-family:var(--mono);font-size:12px;color:var(--ink-3);letter-spacing:0;
+  font-variant-numeric:tabular-nums;
+}
+.now .meta em{font-style:normal;color:var(--signal)}
+.now .spacer{flex:1}
+.steps{display:flex;gap:3px;margin:12px 0 8px}
+.steps i{
+  flex:1;height:4px;border-radius:2px;background:var(--s4);
+  box-shadow:inset 0 0 0 1px var(--line);
+  overflow:hidden;display:block;position:relative;
+}
+.steps i.done{background:var(--signal);box-shadow:none}
+.steps i.cur{background:var(--signal-weak);box-shadow:inset 0 0 0 1px var(--signal-line)}
+.steps i.cur::after{
+  content:"";position:absolute;inset:0;width:62%;background:var(--signal);border-radius:2px;
+}
+.steps-legend{display:flex;justify-content:space-between}
+.steps-legend span{font-family:var(--mono);font-size:11px;color:var(--ink-4);letter-spacing:0;font-variant-numeric:tabular-nums}
+
+/* плашка-предупреждение */
+.warnbar{
+  margin:16px;
+  border:1px solid var(--warn-line);border-radius:var(--r-lg);
+  background:var(--warn-weak);
+  padding:13px 14px;
+}
+.warnbar .t{
+  font-size:13px;color:var(--ink-2);letter-spacing:-.008em;line-height:1.45;
+  display:flex;gap:9px;align-items:flex-start;
+}
+.warnbar .t .dot{margin-top:6px;background:var(--warn)}
+.warnbar .t b{font-weight:500;color:var(--ink)}
+.warnbar .acts{display:flex;gap:8px;margin-top:11px;padding-left:14px;flex-wrap:wrap}
+.warnbar .btn{background:rgba(255,255,255,.04);border-color:var(--warn-line)}
+.warnbar .btn:hover{background:rgba(255,255,255,.07)}
+
+/* ждущие */
+.waiting{padding:16px}
+.waiting > .eyebrow{margin-bottom:10px;display:flex;justify-content:space-between}
+.qitem{
+  border:1px solid var(--line);border-radius:var(--r-lg);
+  background:var(--s2);
+  padding:11px 12px;
+  display:flex;align-items:center;gap:12px;
+}
+.qitem + .qitem{margin-top:8px}
+.qitem .idx{
+  font-family:var(--mono);font-size:11px;color:var(--ink-4);letter-spacing:0;
+  width:14px;flex:none;text-align:right;
+}
+.qitem .body{min-width:0;flex:1}
+.qitem .n{
+  font-family:var(--mono);font-size:12.5px;color:var(--ink-2);letter-spacing:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.qitem .m{
+  font-family:var(--mono);font-size:11px;color:var(--ink-4);letter-spacing:0;margin-top:3px;
+  font-variant-numeric:tabular-nums;
+}
+.acts-inline{display:flex;align-items:center;gap:0;flex:none}
+.acts-inline a{
+  font-size:11.5px;color:var(--ink-4);text-decoration:none;letter-spacing:-.005em;
+  padding:4px 7px;border-radius:var(--r-xs);cursor:pointer;white-space:nowrap;
+}
+.acts-inline a:hover{color:var(--ink);background:var(--s4)}
+.acts-inline a.del:hover{color:var(--warn)}
+.acts-inline s{color:var(--line-2);text-decoration:none;font-size:11px}
+
+/* ─────────────────────────── готово ─────────────────────────── */
+.section-gap{margin-top:20px}
+.results{
+  display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;
+  padding:16px;
+}
+.rcard{
+  border:1px solid var(--line);border-radius:var(--r-lg);
+  background:var(--s2);overflow:hidden;
+  transition:border-color .12s ease;
+}
+.rcard:hover{border-color:var(--line-2)}
+.frame{
+  position:relative;
+  aspect-ratio:14/9;
+  background:
+    radial-gradient(120% 120% at 22% 8%, rgba(224,163,62,.085), transparent 58%),
+    radial-gradient(90% 90% at 85% 100%, rgba(127,168,189,.06), transparent 60%),
+    linear-gradient(162deg,#1c1d20 0%,#141517 46%,#0b0c0d 100%);
+  border-bottom:1px solid var(--line);
+}
+.frame::after{
+  content:"";position:absolute;inset:0;pointer-events:none;
+  background:repeating-linear-gradient(0deg,rgba(255,255,255,.018) 0 1px,transparent 1px 3px);
+}
+.frame .tc{
+  position:absolute;left:10px;bottom:9px;z-index:1;
+  font-family:var(--mono);font-size:10.5px;letter-spacing:0;
+  color:var(--ink-3);
+  background:rgba(8,9,10,.62);
+  border:1px solid rgba(255,255,255,.07);
+  border-radius:var(--r-xs);padding:2px 6px;
+  font-variant-numeric:tabular-nums;
+}
+.frame .dur{
+  position:absolute;right:10px;bottom:9px;z-index:1;
+  font-family:var(--mono);font-size:10.5px;letter-spacing:0;color:var(--ink-3);
+  font-variant-numeric:tabular-nums;
+}
+.frame.splice{display:grid;grid-template-columns:repeat(3,1fr)}
+.frame.splice > u{
+  text-decoration:none;position:relative;
+  display:grid;place-items:end start;
+  padding:0 0 9px 9px;
+  font-family:var(--mono);font-size:10px;color:var(--ink-4);letter-spacing:0;
+  font-variant-numeric:tabular-nums;z-index:1;
+}
+.frame.splice > u + u{border-left:1px solid rgba(255,255,255,.09)}
+
+.rcard .info{padding:11px 12px}
+.rcard .info .n{
+  font-size:13px;font-weight:500;color:var(--ink);letter-spacing:-.01em;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.rcard .info .m{
+  font-family:var(--mono);font-size:11px;color:var(--ink-4);letter-spacing:0;margin-top:4px;
+  font-variant-numeric:tabular-nums;
+}
+.rcard .info .acts-inline{margin:8px -7px -4px}
+
+/* ─────────────────────────── разделитель экрана 2 ─────────────────────────── */
+.screen-div{
+  max-width:1380px;margin:56px auto 0;padding:0 24px;
+  display:flex;align-items:center;gap:16px;
+}
+.screen-div .l{flex:1;height:1px;background:var(--line)}
+.screen-div h2{
+  font-size:12px;font-weight:500;letter-spacing:.4px;text-transform:uppercase;
+  color:var(--ink-3);white-space:nowrap;
+}
+
+/* ─────────────────────────── модалка ─────────────────────────── */
+.stage{
+  max-width:1380px;margin:20px auto 0;padding:32px 24px;
+  background:radial-gradient(80% 100% at 50% 0%,rgba(0,0,0,.55),rgba(0,0,0,.25));
+  border-radius:var(--r-xl);
+}
+.modal{
+  max-width:1080px;margin:0 auto;
+  background:var(--s1);
+  border:1px solid var(--line-2);
+  border-radius:var(--r-xl);
+  box-shadow:0 32px 72px -20px rgba(0,0,0,.85), 0 0 0 1px rgba(0,0,0,.4);
+  overflow:hidden;
+}
+.modal .mhead{
+  display:flex;align-items:center;gap:12px;
+  padding:13px 16px;border-bottom:1px solid var(--line);background:var(--s2);
+}
+.modal .mhead .t{font-size:13px;font-weight:510;letter-spacing:-.01em}
+.modal .mhead .spacer{flex:1}
+.modal .mhead .status{
+  display:inline-flex;align-items:center;gap:7px;
+  font-size:11.5px;color:var(--ink-4);letter-spacing:-.005em;
+}
+.mgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr)}
+.mleft{border-right:1px solid var(--line);padding:16px;display:flex;flex-direction:column;gap:10px}
+.mleft .eyebrow{display:flex;justify-content:space-between;align-items:center}
+.mleft .editor{flex:1;display:flex;flex-direction:column}
+.mleft .editor .code{flex:1;min-height:230px;font-size:12px;line-height:1.7}
+
+.mright{display:flex;flex-direction:column;background:var(--canvas)}
+.feed{padding:16px;display:flex;flex-direction:column;gap:14px;flex:1;min-height:260px}
+.msg{max-width:88%}
+.msg .who{font-size:10.5px;letter-spacing:.4px;text-transform:uppercase;color:var(--ink-4);margin-bottom:5px}
+.msg .bub{
+  border:1px solid var(--line);border-radius:var(--r-lg);
+  padding:10px 12px;font-size:13px;line-height:1.55;color:var(--ink-2);letter-spacing:-.008em;
+  background:var(--s2);
+}
+.msg.me{align-self:flex-end}
+.msg.me .who{text-align:right}
+.msg.me .bub{background:var(--s4);border-color:var(--line-2);color:var(--ink)}
+.msg .bub .snippet{
+  margin-top:9px;padding:9px 10px;border-radius:var(--r-sm);
+  background:var(--canvas);border:1px solid var(--line);
+  font-family:var(--mono);font-size:11px;line-height:1.65;color:var(--ink-3);letter-spacing:0;
+  white-space:pre-wrap;word-break:break-word;
+}
+.msg .bub .snippet .k{color:var(--key)}
+.msg .bub .snippet .el{color:var(--ink-4)}
+
+.thinking{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink-4);letter-spacing:-.005em}
+.thinking .dots{display:inline-flex;gap:3px}
+.thinking .dots i{width:3px;height:3px;border-radius:50%;background:var(--ink-3);display:block;animation:th 1.25s ease-in-out infinite}
+.thinking .dots i:nth-child(2){animation-delay:.16s}
+.thinking .dots i:nth-child(3){animation-delay:.32s}
+@keyframes th{0%,60%,100%{opacity:.22;transform:translateY(0)}30%{opacity:1;transform:translateY(-2px)}}
+
+.composer{border-top:1px solid var(--line);padding:12px 16px;background:var(--s1)}
+.composer .box{
+  border:1px solid var(--line-2);border-radius:var(--r-lg);background:var(--s2);
+  padding:10px 12px;
+}
+.composer .box .ph{font-size:13px;color:var(--ink-4);letter-spacing:-.008em;min-height:38px}
+.composer .box .ph .caret{background:var(--ink-3)}
+.composer .box .bottom{
+  display:flex;align-items:center;gap:8px;margin-top:8px;
+  padding-top:9px;border-top:1px solid var(--line);
+}
+.composer .box .bottom .spacer{flex:1}
+.iconbtn{
+  width:28px;height:28px;border-radius:var(--r-sm);
+  border:1px solid var(--line);background:var(--s3);
+  display:grid;place-items:center;cursor:pointer;color:var(--ink-3);flex:none;
+}
+.iconbtn:hover{color:var(--ink);border-color:var(--line-2);background:var(--s4)}
+.dndhint{
+  margin-top:8px;
+  border:1px dashed var(--line);border-radius:var(--r-sm);
+  padding:7px 10px;font-size:11.5px;color:var(--ink-4);letter-spacing:-.005em;
+  display:flex;align-items:center;gap:8px;
+}
+.dur-inline{
+  display:inline-flex;align-items:center;gap:7px;
+  font-size:12px;color:var(--ink-3);letter-spacing:-.005em;
+}
+.dur-inline .inp{width:56px;padding:4px 8px;font-size:12px;text-align:center}
+
+.mfoot{
+  display:flex;align-items:center;gap:8px;
+  padding:12px 16px;border-top:1px solid var(--line);background:var(--s2);
+}
+.mfoot .spacer{flex:1}
+
+/* ─────────────────────────── адаптив ─────────────────────────── */
+@media (max-width:1180px){
+  .grid-main{grid-template-columns:minmax(0,1fr)}
+  .results{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media (max-width:860px){
+  .mgrid{grid-template-columns:minmax(0,1fr)}
+  .mleft{border-right:none;border-bottom:1px solid var(--line)}
+}
+@media (max-width:760px){
+  .shell,.screen-div{padding:16px}
+  .stage{padding:16px 12px;margin-top:16px}
+  .params,.adv-body{grid-template-columns:minmax(0,1fr)}
+  .results{gap:12px;padding:12px}
+  .chrome{padding:0 14px;gap:10px;height:52px}
+  .chrome .host{display:none}
+  .readout .stat:nth-child(n+3){display:none}
+  .qstate .row{flex-wrap:wrap}
+  .qstate .spacer{display:none}
+  .cta-row{flex-wrap:wrap}
+  .qitem{flex-wrap:wrap}
+  .qitem .acts-inline{width:100%;justify-content:flex-start;margin-left:26px}
+}
+@media (max-width:560px){
+  .results{grid-template-columns:minmax(0,1fr)}
+  .estimate,.editor-bar{gap:8px}
+}
+</style>
+</head>
+<body>
+
+<!-- ══════════════════ ЧРОМА ══════════════════ -->
+<div class="chrome">
+  <div class="mark">
+    <div class="glyph">H3</div>
+    <div class="name">MiniMax H3 <span>· локальная станция</span></div>
+  </div>
+  <div class="host">127.0.0.1:8765</div>
+  <div class="spacer"></div>
+  <div class="readout">
+    <div class="stat"><span class="dot idle"></span><span class="k">очередь</span><span class="v">пауза</span></div>
+    <div class="stat"><span class="k">vram</span><span class="v hot">21,4 / 24 ГБ</span></div>
+    <div class="stat"><span class="k">gpu</span><span class="v">4 %</span></div>
+    <div class="stat"><span class="k">за сессию</span><span class="v">3 ролика · 2 ч 41 м</span></div>
+  </div>
+</div>
+
+<div class="shell">
+<div class="grid-main">
+
+  <!-- ══════════════════ 1. СОЧИНЕНИЕ ══════════════════ -->
+  <section class="panel">
+    <div class="panel-head">
+      <div class="num">1</div>
+      <h2>Сочинение</h2>
+      <div class="spacer"></div>
+      <span class="eyebrow">формат MiniMax H3</span>
+    </div>
+    <div class="panel-body">
+
+      <div class="editor-bar">
+        <button class="btn">Новый через диалог</button>
+        <div class="sel">
+          <select aria-label="Библиотека промптов">
+            <option>Библиотека промптов — 24</option>
+            <option>кот-италия-полдень</option>
+            <option>баллада-финал-30с</option>
+            <option>танго-арка</option>
+            <option>рыбак-на-рассвете</option>
+            <option>пустой шаблон t2va</option>
+          </select>
+        </div>
+        <div class="spacer"></div>
+        <button class="btn ghost">Проверить формат</button>
+      </div>
+
+      <div class="editor">
+        <div class="code"><p><span class="k">integrated_multimodal_description:</span> <span class="sh">[Shot 1]</span> Live-action, cinematic, a wide shot captures a sun-drenched Italian cobblestone street at high noon. Terracotta-colored buildings line both sides<span class="el">…</span> <span class="sh">[Shot 2]</span> At <span class="ts">00:05.000</span>, the camera cuts to a ground-level close-up as the cat weaves past café tables<span class="el">…</span></p><p><span class="k">overall_soundscape:</span> <span class="el">…</span>the crisp, rhythmic clicking of the cat's paws on sun-baked cobblestones<span class="el">…</span></p><p><span class="k">non_diegetic_music:</span> A light acoustic guitar plays a steady, moderate tempo rhythm<span class="el">…</span><span class="caret"></span></p></div>
+        <div class="foot">
+          <span>4 поля</span>
+          <span>1 284 симв.</span>
+          <span>2 шота</span>
+          <span class="valid"><span class="dot ok"></span>формат распознан</span>
+        </div>
+      </div>
+
+      <div class="params">
+        <div class="field">
+          <label for="res">Разрешение</label>
+          <div class="sel">
+            <select id="res">
+              <option>черновик 448×288</option>
+              <option>малое 896×576</option>
+              <option>большое 1344×768</option>
+              <option>черновик верт. 288×448</option>
+              <option>малое верт. 576×896</option>
+              <option>своё…</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="dur">Длительность</label>
+          <div class="inp-unit">
+            <input class="inp" id="dur" type="text" value="10">
+            <span class="u">с</span>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Режим</label>
+          <div class="seg">
+            <input type="radio" name="mode" id="m-t2va" checked><label for="m-t2va">t2va</label>
+            <input type="radio" name="mode" id="m-i2v"><label for="m-i2v">i2v</label>
+            <input type="radio" name="mode" id="m-flf"><label for="m-flf">flf</label>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="seed-top">Сид</label>
+          <div class="inp-unit">
+            <input class="inp" id="seed-top" type="text" value="184 209 771">
+          </div>
+        </div>
+
+        <div class="drop dim">
+          <div class="thumb"></div>
+          <div class="txt">
+            <b>Перетащи картинку или выбери файл</b>
+            <small>кадр не нужен в режиме t2va · png, jpg, webp</small>
+          </div>
+          <div class="spacer"></div>
+          <button class="btn">Выбрать файл</button>
+        </div>
+
+        <details class="adv">
+          <summary>Настройки модели <span class="hint">h3-dit-8bit · 7 проходов · 3 LoRA</span></summary>
+          <div class="adv-body">
+            <div class="field full">
+              <label for="ckpt">Чекпойнт</label>
+              <div class="sel">
+                <select id="ckpt">
+                  <option>minimax-h3-dit-q8_0.safetensors</option>
+                  <option>minimax-h3-dit-fp16.safetensors</option>
+                  <option>minimax-h3-dit-q6_k.safetensors</option>
+                </select>
+              </div>
+            </div>
+            <div class="field">
+              <label for="lora">LoRA</label>
+              <div class="sel">
+                <select id="lora">
+                  <option>cinematic-grain v3 · 0,65</option>
+                  <option>street-motion v1 · 0,40</option>
+                  <option>без LoRA</option>
+                </select>
+              </div>
+            </div>
+            <div class="field">
+              <label for="adaln">Таблица AdaLN</label>
+              <div class="sel">
+                <select id="adaln">
+                  <option>adaln_h3_v2.bin</option>
+                  <option>adaln_h3_v1_legacy.bin</option>
+                  <option>вычислять на лету</option>
+                </select>
+              </div>
+            </div>
+            <div class="field">
+              <label for="steps">Шаги</label>
+              <input class="inp" id="steps" type="text" value="28">
+            </div>
+            <div class="field">
+              <label for="seed">Сид прохода</label>
+              <input class="inp" id="seed" type="text" value="184 209 771">
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <div class="estimate">
+        <span class="big">≈13 мин</span>
+        <span class="sep">·</span>
+        <span class="m">7 проходов</span>
+        <span class="sep">·</span>
+        <span class="m">DiT 8 бит</span>
+        <div class="spacer"></div>
+        <span class="m">старт после 2 задач в очереди</span>
+      </div>
+
+      <div class="cta-row">
+        <button class="btn inverse lg">Поставить в очередь <span class="kbd">⌘↵</span></button>
+        <button class="btn lg">Сохранить в библиотеку</button>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ══════════════════ 2. ОЧЕРЕДЬ ══════════════════ -->
+  <section class="panel">
+    <div class="panel-head">
+      <div class="num">2</div>
+      <h2>Очередь</h2>
+      <div class="spacer"></div>
+      <span class="eyebrow">3 задачи · ≈2 ч 39 м</span>
+    </div>
+
+    <div class="qstate">
+      <div class="row">
+        <div>
+          <div class="title">Очередь приостановлена</div>
+          <div class="sub">пауза 6 мин · текущая задача заморожена на проходе 4</div>
+        </div>
+        <div class="spacer"></div>
+        <button class="btn inverse lg"><span class="tri"></span> Начать расчёт</button>
+      </div>
+    </div>
+
+    <div class="now">
+      <div class="head">
+        <span class="dot run"></span>
+        <span class="name">kot-italy2</span>
+        <span class="meta">448×288</span>
+        <div class="spacer"></div>
+        <span class="meta">проход <em>4/7</em> · осталось ≈5 мин</span>
+      </div>
+      <div class="steps">
+        <i class="done"></i><i class="done"></i><i class="done"></i><i class="cur"></i><i></i><i></i><i></i>
+      </div>
+      <div class="steps-legend">
+        <span>шаг 17 / 28</span>
+        <span>8,1 мин прошло</span>
+      </div>
+    </div>
+
+    <div class="warnbar">
+      <div class="t">
+        <span class="dot"></span>
+        <div><b>Модель в памяти держит GPU</b> — 21,4 ГБ занято процессом Qwen. Выгрузить и начать генерацию?</div>
+      </div>
+      <div class="acts">
+        <button class="btn">Выгрузить и начать</button>
+        <button class="btn ghost">Пусть ждёт</button>
+      </div>
+    </div>
+
+    <div class="waiting">
+      <div class="eyebrow"><span>Ждут</span><span>2</span></div>
+
+      <div class="qitem">
+        <div class="idx">1</div>
+        <div class="body">
+          <div class="n">fisherman-dawn</div>
+          <div class="m">малое 896×576 · ≈77 мин</div>
+        </div>
+        <div class="acts-inline">
+          <a>вверх</a><s>·</s><a>обсудить</a><s>·</s><a>копия</a><s>·</s><a class="del">удалить</a>
+        </div>
+      </div>
+
+      <div class="qitem">
+        <div class="idx">2</div>
+        <div class="body">
+          <div class="n">tango-vertical</div>
+          <div class="m">576×896 верт. · ≈77 мин</div>
+        </div>
+        <div class="acts-inline">
+          <a>вверх</a><s>·</s><a>обсудить</a><s>·</s><a>копия</a><s>·</s><a class="del">удалить</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<!-- ══════════════════ 3. ГОТОВО ══════════════════ -->
+<section class="panel section-gap">
+  <div class="panel-head">
+    <div class="num">3</div>
+    <h2>Готово</h2>
+    <div class="spacer"></div>
+    <span class="eyebrow">сегодня · 3 ролика</span>
+  </div>
+
+  <div class="results">
+
+    <article class="rcard">
+      <div class="frame">
+        <span class="tc">кадр 00:04</span>
+        <span class="dur">10 с</span>
+      </div>
+      <div class="info">
+        <div class="n">кот-италия-полдень</div>
+        <div class="m">13,4 мин · 448×288</div>
+        <div class="acts-inline">
+          <a>открыть папку</a><s>·</s><a>копия</a><s>·</s><a>обсудить</a>
+        </div>
+      </div>
+    </article>
+
+    <article class="rcard">
+      <div class="frame splice">
+        <u>00:00</u><u>00:10</u><u>00:20</u>
+        <span class="dur">30 с</span>
+      </div>
+      <div class="info">
+        <div class="n">баллада-финал-30с</div>
+        <div class="m">склейка 3×10 с</div>
+        <div class="acts-inline">
+          <a>открыть папку</a><s>·</s><a>копия</a><s>·</s><a>обсудить</a>
+        </div>
+      </div>
+    </article>
+
+    <article class="rcard">
+      <div class="frame">
+        <span class="tc">кадр 00:04</span>
+        <span class="dur">10 с</span>
+      </div>
+      <div class="info">
+        <div class="n">танго-арка</div>
+        <div class="m">72,6 мин · 896×576</div>
+        <div class="acts-inline">
+          <a>открыть папку</a><s>·</s><a>копия</a><s>·</s><a>обсудить</a>
+        </div>
+      </div>
+    </article>
+
+  </div>
+</section>
+
+</div>
+
+<!-- ══════════════════ ЭКРАН 2 ══════════════════ -->
+<div class="screen-div">
+  <div class="l"></div>
+  <h2>Экран 2: модалка диалога</h2>
+  <div class="l"></div>
+</div>
+
+<div class="stage">
+  <div class="modal">
+
+    <div class="mhead">
+      <div class="t">Новый промпт через диалог</div>
+      <div class="spacer"></div>
+      <div class="status"><span class="dot idle"></span>Qwen выгружена — поднимется при первом сообщении</div>
+    </div>
+
+    <div class="mgrid">
+
+      <!-- левое окно промпта -->
+      <div class="mleft">
+        <div class="eyebrow"><span>Промпт</span><span>черновик · не сохранён</span></div>
+        <div class="editor">
+          <div class="code"><p><span class="k">integrated_multimodal_description:</span> <span class="sh">[Shot 1]</span> Live-action, cinematic, a wide shot captures a sun-drenched Italian cobblestone street at high noon. Terracotta-colored buildings line both sides<span class="el">…</span> <span class="sh">[Shot 2]</span> At <span class="ts">00:05.000</span>, the camera cuts to a ground-level close-up as the cat weaves past café tables<span class="el">…</span></p><p><span class="k">overall_soundscape:</span> <span class="el">…</span>the crisp, rhythmic clicking of the cat's paws on sun-baked cobblestones<span class="el">…</span></p><p><span class="k">non_diegetic_music:</span> A light acoustic guitar plays a steady, moderate tempo rhythm<span class="el">…</span></p></div>
+          <div class="foot">
+            <span>4 поля</span>
+            <span>1 284 симв.</span>
+            <span class="valid"><span class="dot ok"></span>формат распознан</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- лента диалога -->
+      <div class="mright">
+        <div class="feed">
+
+          <div class="msg me">
+            <div class="who">я</div>
+            <div class="bub">Кот бежит по итальянской улице…</div>
+          </div>
+
+          <div class="msg">
+            <div class="who">Qwen 2.5 · локально</div>
+            <div class="bub">
+              Вот полный промпт в формате MiniMax H3 — развернул в два шота, добавил звуковую дорожку и недиегетическую музыку.
+              <div class="snippet"><span class="k">integrated_multimodal_description:</span> [Shot 1] Live-action, cinematic, a wide shot<span class="el">…</span>
+<span class="k">overall_soundscape:</span> <span class="el">…</span>clicking of the cat's paws<span class="el">…</span>
+<span class="k">non_diegetic_music:</span> A light acoustic guitar<span class="el">…</span></div>
+            </div>
+          </div>
+
+          <div class="msg me">
+            <div class="who">я</div>
+            <div class="bub">Полдень, жарче. И убери людей из кадра.</div>
+          </div>
+
+          <div class="thinking">
+            <span class="dots"><i></i><i></i><i></i></span>
+            модель думает…
+          </div>
+
+        </div>
+
+        <div class="composer">
+          <div class="box">
+            <div class="ph">Опиши сцену своими словами<span class="caret"></span></div>
+            <div class="bottom">
+              <button class="iconbtn" aria-label="Прикрепить файл">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21.4 11.05 12.25 20.2a5.5 5.5 0 0 1-7.78-7.78l9.19-9.19a3.67 3.67 0 0 1 5.19 5.19l-9.2 9.19a1.83 1.83 0 0 1-2.59-2.6l8.49-8.48"/></svg>
+              </button>
+              <span class="dur-inline">Длительность <input class="inp" type="text" value="10"> с</span>
+              <div class="spacer"></div>
+              <button class="btn">Отправить <span class="kbd">↵</span></button>
+            </div>
+            <div class="dndhint">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="m3 16 5-5 4 4 3-3 6 6"/></svg>
+              Перетащи картинку сюда — станет опорным кадром для i2v
+            </div>
+          </div>
+        </div>
+
+        <div class="mfoot">
+          <button class="btn inverse">В Редактор</button>
+          <button class="btn ghost">Очистить</button>
+          <div class="spacer"></div>
+          <button class="btn ghost">Закрыть <span class="kbd" style="color:var(--ink-4)">esc</span></button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<!--
+  РУЛЕТКА ВЫДАЛА: веб-стиль №2 — «Нео-брутализм: цветовые столкновения» (The Verge 2022, 还原 95%).
+  ДНК стиля: жирные обводки 2-3px, жёсткие смещённые тени без размытия (6px 6px 0), нулевые скругления,
+    геометрический гротеск в заголовках против серифа в акцентах, плоские высоконасыщенные блоки-столкновения.
+  АДАПТАЦИЯ ПОД СПЕКУ (честно, без имитации): оригинал светлый с чёрными обводками — здесь инверсия для тёмной
+    комнаты: обводка костяная #EDEAE3 только у важных блоков, у второстепенных приглушённая #34343E; тень всегда
+    жёсткая #000 без blur. Фирменные пурпур/маджента ДНК выброшены целиком (анти-слоп) — вместо них сигнальные
+    плоские заливки пульта: жёлтый #F5DE00 (действие/расчёт), кирпичный #FF4A26 (тревога), терминальный #29E37F (готово).
+  СНИЖЕНО ДО ПЛОСКИХ ЦВЕТОВ: hover-переворот карточек и «незаконченный» коллаж не воспроизводятся статикой —
+    вместо них статичные состояния и плоская сетка; плейсхолдер кадра — градиент + штриховка, без рисованных объектов.
+-->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniMax H3 · пульт</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@600;800&family=Manrope:wght@400;500;700;800&family=JetBrains+Mono:wght@400;700&family=Playfair+Display:ital,wght@0,700;1,700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0F0F13;
+  --panel:#191920;
+  --panel-2:#212129;
+  --sunk:#0A0A0D;
+  --bone:#EDEAE3;
+  --bone-dim:#A5A29A;
+  --bone-mute:#6E6C66;
+  --edge:#34343E;
+  --edge-2:#4A4A56;
+  --yellow:#F5DE00;
+  --brick:#FF4A26;
+  --green:#29E37F;
+  --blue:#4D7CFF;
+  --shadow:#000;
+  --f-disp:'Unbounded',system-ui,sans-serif;
+  --f-ui:'Manrope',system-ui,-apple-system,sans-serif;
+  --f-mono:'JetBrains Mono',ui-monospace,Menlo,monospace;
+  --f-ser:'Playfair Display',Georgia,serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{
+  background:var(--bg);color:var(--bone);
+  font-family:var(--f-ui);font-size:14px;line-height:1.45;
+  padding:0 0 96px;
+}
+/* ─── примитивы нео-брутализма ─────────────────────────── */
+.blk{background:var(--panel);border:2px solid var(--edge);box-shadow:6px 6px 0 var(--shadow)}
+.blk--key{border-color:var(--bone)}
+.mono{font-family:var(--f-mono);font-variant-ligatures:none}
+.up{text-transform:uppercase;letter-spacing:.08em}
+.tag{
+  display:inline-block;font-family:var(--f-mono);font-size:10px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.1em;padding:3px 7px;background:var(--bone);color:#000;
+}
+.tag--y{background:var(--yellow)}
+.tag--r{background:var(--brick);color:#0F0F13}
+.tag--g{background:var(--green);color:#04180E}
+.tag--ghost{background:transparent;color:var(--bone-dim);border:1px solid var(--edge-2)}
+
+.btn{
+  font-family:var(--f-ui);font-weight:800;font-size:12px;letter-spacing:.06em;text-transform:uppercase;
+  background:transparent;color:var(--bone);border:2px solid var(--edge-2);
+  padding:9px 14px;cursor:pointer;box-shadow:3px 3px 0 var(--shadow);
+}
+.btn--key{border-color:var(--bone)}
+.btn--y{background:var(--yellow);color:#12100A;border-color:var(--yellow)}
+.btn--r{background:var(--brick);color:#170702;border-color:var(--brick)}
+.btn--dark{background:#0F0F13;color:var(--bone);border-color:#0F0F13}
+.btn--xl{font-size:16px;padding:17px 22px;box-shadow:6px 6px 0 var(--shadow);width:100%;font-family:var(--f-disp);font-weight:800;letter-spacing:.02em}
+.btn--lg{font-size:14px;padding:13px 18px;box-shadow:5px 5px 0 var(--shadow)}
+
+/* мини-действия строкой: подчёркнутая ссылка-«верж» */
+.acts{display:flex;flex-wrap:wrap;gap:0;align-items:center}
+.act{
+  font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+  color:var(--bone-dim);background:none;border:0;padding:4px 9px;cursor:pointer;
+  border-bottom:2px solid transparent;
+}
+.act:hover{color:var(--bone);border-bottom-color:var(--yellow)}
+.act--danger:hover{color:var(--brick);border-bottom-color:var(--brick)}
+.act-sep{width:1px;height:12px;background:var(--edge-2)}
+
+/* ─── каркас ────────────────────────────────────────────── */
+.wrap{max-width:1400px;margin:0 auto;padding:0 26px}
+
+header.top{
+  border-bottom:2px solid var(--bone);
+  background:var(--sunk);
+  position:sticky;top:0;z-index:5;
+}
+.top-in{display:flex;align-items:stretch;gap:0;max-width:1400px;margin:0 auto;padding:0 26px}
+.brand{
+  background:var(--yellow);color:#12100A;font-family:var(--f-disp);font-weight:800;
+  font-size:17px;letter-spacing:-.01em;padding:14px 16px;display:flex;align-items:center;gap:10px;
+}
+.brand span{font-family:var(--f-mono);font-size:10px;font-weight:700;letter-spacing:.1em;background:#12100A;color:var(--yellow);padding:2px 5px}
+.addr{display:flex;align-items:center;padding:0 16px;border-right:1px solid var(--edge);border-left:2px solid var(--bone)}
+.addr .mono{font-size:12px;color:var(--bone-dim)}
+.rig{display:flex;align-items:center;gap:18px;margin-left:auto;padding-left:16px}
+.rig div{font-family:var(--f-mono);font-size:11px;color:var(--bone-mute);letter-spacing:.02em}
+.rig b{color:var(--bone);font-weight:700}
+.dot{display:inline-block;width:8px;height:8px;background:var(--yellow);margin-right:6px;vertical-align:1px}
+.dot--off{background:var(--edge-2)}
+
+/* заголовок зоны: номер плашкой + правило на всю ширину */
+.zone-h{display:flex;align-items:center;gap:12px;margin:0 0 14px}
+.zone-n{
+  font-family:var(--f-mono);font-weight:700;font-size:12px;background:var(--bone);color:#000;padding:4px 8px;
+}
+.zone-n--y{background:var(--yellow)}
+.zone-n--g{background:var(--green);color:#04180E}
+.zone-t{font-family:var(--f-disp);font-weight:800;font-size:15px;letter-spacing:.06em;text-transform:uppercase}
+.zone-r{flex:1;height:2px;background:var(--edge)}
+.zone-note{font-family:var(--f-mono);font-size:11px;color:var(--bone-mute)}
+
+.grid{display:grid;grid-template-columns:minmax(0,1.22fr) minmax(0,1fr);gap:26px;align-items:start;margin-top:26px}
+section.zone{min-width:0}
+
+/* ─── ЗОНА 1: сочинение ─────────────────────────────────── */
+.compose{padding:0}
+.compose-bar{display:flex;flex-wrap:wrap;gap:10px;padding:14px;border-bottom:2px solid var(--edge)}
+.sel{
+  position:relative;display:inline-flex;align-items:center;
+  border:2px solid var(--edge-2);background:var(--panel-2);
+}
+.sel select{
+  appearance:none;-webkit-appearance:none;background:none;border:0;color:var(--bone);
+  font-family:var(--f-ui);font-weight:700;font-size:12px;letter-spacing:.03em;
+  padding:9px 30px 9px 12px;cursor:pointer;outline:none;
+}
+.sel::after{content:"▾";position:absolute;right:10px;color:var(--bone-dim);pointer-events:none;font-size:11px}
+.sel--wide select{min-width:210px}
+.sel-lab{
+  font-family:var(--f-mono);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+  color:#000;background:var(--bone-dim);padding:0 7px;align-self:stretch;display:flex;align-items:center;
+}
+
+/* редактор промпта */
+.editor{background:var(--sunk);border-bottom:2px solid var(--edge);position:relative}
+.editor-rail{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:8px 14px;border-bottom:1px solid var(--edge);background:#121216;
+}
+.editor-rail .mono{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--bone-mute)}
+.code{
+  font-family:var(--f-mono);font-size:12.5px;line-height:1.72;padding:16px 16px 18px;
+  white-space:pre-wrap;word-break:break-word;color:#BFBCB4;min-height:214px;
+}
+.k{color:var(--yellow);font-weight:700}
+.shot{color:var(--blue);font-weight:700}
+.tm{color:var(--green)}
+.ell{color:var(--bone-mute)}
+.caret{display:inline-block;width:8px;height:15px;background:var(--yellow);vertical-align:-3px;animation:blink 1.1s steps(1,end) infinite}
+@keyframes blink{50%{opacity:0}}
+
+/* параметры */
+.params{display:grid;grid-template-columns:1fr 1fr;gap:0;border-bottom:2px solid var(--edge)}
+.pcell{padding:14px;border-right:1px solid var(--edge);border-bottom:1px solid var(--edge)}
+.pcell:nth-child(2n){border-right:0}
+.plab{font-family:var(--f-mono);font-size:10px;font-weight:700;letter-spacing:.11em;text-transform:uppercase;color:var(--bone-mute);margin-bottom:8px}
+.dur{display:flex;border:2px solid var(--edge-2);background:var(--panel-2);align-items:stretch}
+.dur input{
+  background:none;border:0;color:var(--bone);font-family:var(--f-mono);font-weight:700;font-size:15px;
+  padding:8px 12px;width:100%;outline:none;
+}
+.dur .unit{font-family:var(--f-mono);font-size:11px;color:#000;background:var(--bone-dim);padding:0 9px;display:flex;align-items:center;font-weight:700}
+.seg{display:flex;border:2px solid var(--edge-2)}
+.seg button{
+  flex:1;background:var(--panel-2);border:0;border-right:2px solid var(--edge-2);color:var(--bone-dim);
+  font-family:var(--f-mono);font-weight:700;font-size:12px;padding:9px 4px;cursor:pointer;letter-spacing:.04em;
+}
+.seg button:last-child{border-right:0}
+.seg button[aria-pressed="true"]{background:var(--yellow);color:#12100A}
+.dnd{
+  grid-column:1 / -1;border-bottom:1px solid var(--edge);padding:14px;
+}
+.dnd-in{
+  border:2px dashed var(--edge-2);background:#131318;padding:18px 16px;
+  display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;
+}
+.dnd-in strong{font-size:13px;font-weight:800;display:block}
+.dnd-in p{font-family:var(--f-mono);font-size:11px;color:var(--bone-mute);margin-top:4px}
+.disclose{
+  grid-column:1 / -1;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  padding:13px 14px;background:#131318;cursor:pointer;
+}
+.disclose b{font-family:var(--f-disp);font-weight:600;font-size:13px;letter-spacing:.02em}
+.disclose .mono{font-size:11px;color:var(--bone-mute)}
+.compose-foot{display:flex;gap:14px;align-items:center;padding:16px 14px;flex-wrap:wrap}
+.est{
+  flex:1;min-width:200px;font-family:var(--f-mono);font-size:12.5px;color:var(--bone);
+  border-left:4px solid var(--yellow);padding:4px 0 4px 10px;
+}
+.est span{color:var(--bone-mute)}
+.compose-foot .btn--xl{width:auto;flex:0 0 auto;min-width:280px}
+
+/* ─── ЗОНА 2: очередь ───────────────────────────────────── */
+.qstate{padding:0;margin-bottom:18px}
+.qstate-top{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:16px 16px 14px;flex-wrap:wrap}
+.qstate h2{font-family:var(--f-ser);font-style:italic;font-weight:700;font-size:27px;line-height:1.05;letter-spacing:-.01em}
+.qstate .sub{font-family:var(--f-mono);font-size:11px;color:var(--bone-mute);margin-top:5px}
+.stripe{height:12px;background:repeating-linear-gradient(45deg,var(--yellow) 0 10px,#0F0F13 10px 20px);border-top:2px solid var(--edge)}
+
+.task{padding:0;margin-bottom:14px}
+.task-h{display:flex;align-items:baseline;gap:10px;padding:12px 14px 10px;flex-wrap:wrap}
+.task-h .name{font-family:var(--f-mono);font-weight:700;font-size:14px}
+.task-h .meta{font-family:var(--f-mono);font-size:11.5px;color:var(--bone-mute)}
+.task-h .meta b{color:var(--bone-dim);font-weight:700}
+.steps{display:flex;gap:3px;padding:0 14px 12px}
+.steps i{flex:1;height:14px;background:#101015;border:1px solid var(--edge-2)}
+.steps i.on{background:var(--yellow);border-color:var(--yellow)}
+.steps i.now{background:var(--yellow);border-color:var(--yellow);animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.42}}
+.task-f{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 14px;border-top:1px solid var(--edge);background:#131318;flex-wrap:wrap}
+.task-f .mono{font-size:11px;color:var(--bone-mute)}
+
+.qrow{display:flex;align-items:center;gap:12px;padding:11px 14px;border:2px solid var(--edge);background:var(--panel);box-shadow:4px 4px 0 var(--shadow);margin-bottom:12px;flex-wrap:wrap}
+.qrow .num{font-family:var(--f-mono);font-size:11px;font-weight:700;color:#000;background:var(--bone-mute);padding:2px 6px}
+.qrow .name{font-family:var(--f-mono);font-weight:700;font-size:13px}
+.qrow .meta{font-family:var(--f-mono);font-size:11.5px;color:var(--bone-mute)}
+.qrow .acts{margin-left:auto}
+
+.warn{background:var(--brick);color:#180702;border:2px solid var(--brick);box-shadow:6px 6px 0 var(--shadow);margin-top:16px}
+.warn-in{padding:14px}
+.warn .hd{font-family:var(--f-mono);font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;opacity:.75}
+.warn p{font-family:var(--f-ui);font-weight:800;font-size:14.5px;line-height:1.3;margin:6px 0 12px;max-width:44ch}
+.warn .btn{box-shadow:3px 3px 0 rgba(0,0,0,.55)}
+
+/* ─── ЗОНА 3: готово ────────────────────────────────────── */
+.done{margin-top:34px}
+.done-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px}
+.card{padding:0}
+.frame{
+  position:relative;aspect-ratio:16/9;
+  background:
+    repeating-linear-gradient(135deg,rgba(255,255,255,.028) 0 2px,transparent 2px 9px),
+    linear-gradient(158deg,#2C2C36 0%,#191921 46%,#0B0B0E 100%);
+  border-bottom:2px solid var(--edge);
+}
+.frame .cap{position:absolute;left:0;bottom:0;background:#000;color:var(--bone);font-family:var(--f-mono);font-size:10.5px;letter-spacing:.06em;padding:4px 8px}
+.frame .res{position:absolute;right:0;top:0;background:var(--bone);color:#000;font-family:var(--f-mono);font-size:10px;font-weight:700;padding:3px 7px}
+.card-b{padding:12px 13px}
+.card-b .name{font-family:var(--f-ui);font-weight:800;font-size:14px;letter-spacing:-.005em}
+.card-b .meta{font-family:var(--f-mono);font-size:11.5px;color:var(--bone-mute);margin-top:4px}
+.card-f{border-top:1px solid var(--edge);background:#131318;padding:6px 6px}
+
+/* ─── разделитель экрана 2 ──────────────────────────────── */
+.screen-sep{margin:64px 0 26px;border-top:2px solid var(--bone);padding-top:16px;display:flex;align-items:flex-end;gap:14px;flex-wrap:wrap}
+.screen-sep h2{font-family:var(--f-disp);font-weight:800;font-size:26px;letter-spacing:-.015em}
+.screen-sep .mono{font-size:11px;color:var(--bone-mute);padding-bottom:6px}
+
+/* ─── МОДАЛКА ───────────────────────────────────────────── */
+.scrim{background:#08080B;border:2px solid var(--edge);padding:26px}
+.modal{background:var(--panel);border:2px solid var(--bone);box-shadow:10px 10px 0 var(--shadow)}
+.modal-h{display:flex;align-items:center;gap:12px;padding:12px 14px;border-bottom:2px solid var(--bone);background:var(--sunk);flex-wrap:wrap}
+.modal-h .ttl{font-family:var(--f-disp);font-weight:800;font-size:14px;letter-spacing:.04em;text-transform:uppercase}
+.modal-h .right{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.modal-b{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.06fr)}
+.mpane{min-width:0}
+.mpane--l{border-right:2px solid var(--edge);background:var(--sunk);display:flex;flex-direction:column}
+.mpane--l .mcode{flex:1;max-height:none}
+.pane-h{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 13px;border-bottom:1px solid var(--edge);background:#121216}
+.pane-h .mono{font-size:10px;font-weight:700;letter-spacing:.11em;text-transform:uppercase;color:var(--bone-mute)}
+.mcode{font-family:var(--f-mono);font-size:12px;line-height:1.7;padding:14px;white-space:pre-wrap;word-break:break-word;color:#BFBCB4;max-height:330px;overflow:hidden}
+.pane-foot{border-top:1px solid var(--edge);padding:10px 13px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:#121216}
+
+.feed{padding:14px 13px;display:flex;flex-direction:column;gap:12px;max-height:330px;overflow:hidden}
+.msg{max-width:92%}
+.msg .who{font-family:var(--f-mono);font-size:9.5px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;margin-bottom:5px;color:var(--bone-mute)}
+.bub{border:2px solid var(--edge-2);padding:10px 12px;font-size:13.5px;line-height:1.5;box-shadow:3px 3px 0 var(--shadow)}
+.msg--me{align-self:flex-end}
+.msg--me .who{text-align:right}
+.msg--me .bub{background:var(--yellow);color:#12100A;border-color:var(--yellow);font-weight:700}
+.msg--ai .bub{background:var(--panel-2)}
+.bub .mono{font-size:11.5px;color:var(--bone-dim);display:block;margin-top:7px;padding-top:7px;border-top:1px solid var(--edge-2)}
+.think{display:flex;align-items:center;gap:9px;font-family:var(--f-mono);font-size:11px;color:var(--bone-mute);letter-spacing:.05em}
+.think i{width:7px;height:7px;background:var(--yellow);display:block;animation:tk 1.05s steps(1,end) infinite}
+.think i:nth-child(3){animation-delay:.2s}
+.think i:nth-child(4){animation-delay:.4s}
+@keyframes tk{0%,49%{opacity:1}50%,100%{opacity:.18}}
+
+.composer{border-top:2px solid var(--edge)}
+.composer-in{display:flex;align-items:stretch;border-bottom:1px solid var(--edge)}
+.clip{background:var(--panel-2);border:0;border-right:2px solid var(--edge);width:46px;display:flex;align-items:center;justify-content:center;cursor:pointer}
+.clip svg{width:17px;height:17px;stroke:var(--bone-dim);fill:none;stroke-width:2;stroke-linecap:square}
+.clip:hover svg{stroke:var(--yellow)}
+.composer-in input{
+  flex:1;min-width:0;background:#121216;border:0;color:var(--bone);font-family:var(--f-ui);font-size:13.5px;
+  padding:13px;outline:none;
+}
+.composer-in input::placeholder{color:var(--bone-mute)}
+.send{background:var(--yellow);color:#12100A;border:0;padding:0 18px;font-family:var(--f-ui);font-weight:800;font-size:12px;letter-spacing:.06em;text-transform:uppercase;cursor:pointer}
+.drop{margin:0;padding:9px 13px;border-bottom:1px solid var(--edge);border-top:0;background:#101014;font-family:var(--f-mono);font-size:11px;color:var(--bone-mute);display:flex;gap:8px;align-items:center}
+.drop .dash{flex:1;border:2px dashed var(--edge);padding:6px 9px;color:var(--bone-mute)}
+.composer-foot{display:flex;align-items:center;gap:12px;padding:10px 13px;flex-wrap:wrap;background:var(--sunk)}
+.composer-foot .mono{font-size:11px;color:var(--bone-mute)}
+.mini-dur{display:flex;border:2px solid var(--edge-2);align-items:stretch}
+.mini-dur span{font-family:var(--f-mono);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#000;background:var(--bone-dim);padding:0 7px;display:flex;align-items:center}
+.mini-dur b{font-family:var(--f-mono);font-size:12px;padding:5px 10px;background:var(--panel-2)}
+
+footer.legend{margin-top:44px;border-top:2px solid var(--edge);padding-top:14px;display:flex;gap:22px;flex-wrap:wrap}
+footer.legend div{font-family:var(--f-mono);font-size:11px;color:var(--bone-mute)}
+footer.legend b{color:var(--bone-dim);font-weight:700}
+
+/* ─── адаптив: 1440 → ~700 ──────────────────────────────── */
+@media (max-width:1180px){
+  .done-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media (max-width:1000px){
+  .grid{grid-template-columns:minmax(0,1fr);gap:34px}
+  .modal-b{grid-template-columns:minmax(0,1fr)}
+  .mpane--l{border-right:0;border-bottom:2px solid var(--edge)}
+  .mcode{max-height:220px}
+}
+@media (max-width:760px){
+  .wrap,.top-in{padding:0 14px}
+  .top-in{flex-wrap:wrap}
+  .addr{border-left:0;border-top:1px solid var(--edge);width:100%;padding:8px 0}
+  .rig{margin-left:0;padding:8px 0 10px;gap:14px;flex-wrap:wrap;width:100%}
+  .params{grid-template-columns:minmax(0,1fr)}
+  .pcell{border-right:0}
+  .done-grid{grid-template-columns:minmax(0,1fr)}
+  .compose-foot .btn--xl{min-width:100%}
+  .qstate h2{font-size:22px}
+  .scrim{padding:12px}
+  .screen-sep h2{font-size:20px}
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="top-in">
+    <div class="brand">MINIMAX&nbsp;H3 <span>ЛОКАЛЬНО</span></div>
+    <div class="addr"><span class="mono">http://127.0.0.1:8765</span></div>
+    <div class="rig">
+      <div><span class="dot"></span>GPU <b>62,4 / 96 ГБ</b></div>
+      <div><span class="dot dot--off"></span>Qwen <b>выгружена</b></div>
+      <div>DiT <b>8 бит</b> · 7 проходов</div>
+      <div class="mono">23:41</div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="grid">
+
+    <!-- ══ ЗОНА 1 ══════════════════════════════════════════ -->
+    <section class="zone">
+      <div class="zone-h">
+        <div class="zone-n zone-n--y">01</div>
+        <div class="zone-t">Сочинение</div>
+        <div class="zone-r"></div>
+        <div class="zone-note">черновик не сохранён</div>
+      </div>
+
+      <div class="blk blk--key compose">
+        <div class="compose-bar">
+          <button class="btn btn--key">Новый через диалог</button>
+          <label class="sel sel--wide">
+            <span class="sel-lab">Библиотека</span>
+            <select>
+              <option>кот-италия · базовый</option>
+              <option>баллада · вертикаль</option>
+              <option>танго-арка · 3 шота</option>
+              <option>рыбак-рассвет · драфт</option>
+              <option>пустой шаблон H3</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="editor">
+          <div class="editor-rail">
+            <span class="mono">промпт · формат MiniMax H3</span>
+            <span class="mono">1 284 симв. · 3 поля</span>
+          </div>
+          <div class="code"><span class="k">integrated_multimodal_description:</span> <span class="shot">[Shot 1]</span> Live-action, cinematic, a wide shot captures a sun-drenched Italian cobblestone street at high noon. Terracotta-colored buildings line both sides<span class="ell">…</span> <span class="shot">[Shot 2]</span> At <span class="tm">00:05.000</span>, the camera cuts to a ground-level close-up as the cat weaves past café tables<span class="ell">…</span>
+
+<span class="k">overall_soundscape:</span> <span class="ell">…</span>the crisp, rhythmic clicking of the cat's paws on sun-baked cobblestones<span class="ell">…</span>
+
+<span class="k">non_diegetic_music:</span> A light acoustic guitar plays a steady, moderate tempo rhythm<span class="ell">…</span><span class="caret"></span></div>
+        </div>
+
+        <div class="params">
+          <div class="pcell">
+            <div class="plab">Разрешение</div>
+            <label class="sel" style="width:100%">
+              <select style="width:100%">
+                <option>черновик 448×288</option>
+                <option>малое 896×576</option>
+                <option>большое 1344×768</option>
+                <option>черновик верт. 288×448</option>
+                <option>малое верт. 576×896</option>
+                <option>своё…</option>
+              </select>
+            </label>
+          </div>
+          <div class="pcell">
+            <div class="plab">Длительность, с</div>
+            <div class="dur"><input value="10"><span class="unit">СЕК</span></div>
+          </div>
+          <div class="pcell">
+            <div class="plab">Режим</div>
+            <div class="seg">
+              <button aria-pressed="true">t2va</button>
+              <button aria-pressed="false">i2v</button>
+              <button aria-pressed="false">flf</button>
+            </div>
+          </div>
+          <div class="pcell">
+            <div class="plab">Опорный кадр</div>
+            <div class="mono" style="font-size:11.5px;color:var(--bone-mute);padding-top:7px">не требуется для t2va</div>
+          </div>
+
+          <div class="dnd">
+            <div class="dnd-in">
+              <div>
+                <strong>Перетащи картинку или выбери файл</strong>
+                <p>png · jpg · webp — станет первым кадром в i2v / flf</p>
+              </div>
+              <button class="btn">Выбрать файл</button>
+            </div>
+          </div>
+
+          <div class="disclose">
+            <b>▸ Настройки модели</b>
+            <span class="mono">чекпойнт · LoRA · таблица AdaLN · шаги · сид</span>
+            <span class="tag tag--ghost">свёрнуто</span>
+          </div>
+        </div>
+
+        <div class="compose-foot">
+          <div class="est">≈13 мин · 7 проходов · DiT 8 бит<br><span>448×288 · 10 с · сид 4417</span></div>
+          <button class="btn btn--y btn--xl">Поставить в очередь</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══ ЗОНА 2 ══════════════════════════════════════════ -->
+    <section class="zone">
+      <div class="zone-h">
+        <div class="zone-n">02</div>
+        <div class="zone-t">Очередь</div>
+        <div class="zone-r"></div>
+        <div class="zone-note">3 задачи · ≈159 мин</div>
+      </div>
+
+      <div class="blk blk--key qstate">
+        <div class="qstate-top">
+          <div>
+            <h2>Очередь приостановлена</h2>
+            <div class="sub">расчёт не идёт · GPU занят выгрузкой модели</div>
+          </div>
+          <button class="btn btn--y btn--lg">▶ Начать расчёт</button>
+        </div>
+        <div class="stripe"></div>
+      </div>
+
+      <div class="blk blk--key task">
+        <div class="task-h">
+          <span class="tag tag--y">Сейчас</span>
+          <span class="name">kot-italy2</span>
+          <span class="meta">448×288 · проход <b>4/7</b> · осталось <b>≈5 мин</b></span>
+        </div>
+        <div class="steps">
+          <i class="on"></i><i class="on"></i><i class="on"></i><i class="now"></i><i></i><i></i><i></i>
+        </div>
+        <div class="task-f">
+          <span class="mono">старт 23:28 · шаг 512/896 · 2,41 с/шаг</span>
+          <div class="acts">
+            <button class="act">Обсудить</button><span class="act-sep"></span>
+            <button class="act act--danger">Снять</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="qrow">
+        <span class="num">2</span>
+        <span class="name">fisherman-dawn</span>
+        <span class="meta">малое 896×576 · ≈77 мин</span>
+        <div class="acts">
+          <button class="act">Вверх</button><span class="act-sep"></span>
+          <button class="act">Обсудить</button><span class="act-sep"></span>
+          <button class="act">Копия</button><span class="act-sep"></span>
+          <button class="act act--danger">Удалить</button>
+        </div>
+      </div>
+
+      <div class="qrow">
+        <span class="num">3</span>
+        <span class="name">tango-vertical</span>
+        <span class="meta">576×896 верт. · ≈77 мин</span>
+        <div class="acts">
+          <button class="act">Вверх</button><span class="act-sep"></span>
+          <button class="act">Обсудить</button><span class="act-sep"></span>
+          <button class="act">Копия</button><span class="act-sep"></span>
+          <button class="act act--danger">Удалить</button>
+        </div>
+      </div>
+
+      <div class="warn">
+        <div class="warn-in">
+          <div class="hd">Требуется решение</div>
+          <p>Модель в памяти держит GPU — выгрузить и начать генерацию?</p>
+          <button class="btn btn--dark">Выгрузить и начать</button>
+          <button class="btn" style="border-color:#180702;color:#180702">Пусть ждёт</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ══ ЗОНА 3 ════════════════════════════════════════════ -->
+  <section class="zone done">
+    <div class="zone-h">
+      <div class="zone-n zone-n--g">03</div>
+      <div class="zone-t">Готово</div>
+      <div class="zone-r"></div>
+      <div class="zone-note">~/Movies/h3-out/</div>
+    </div>
+
+    <div class="done-grid">
+      <article class="blk card">
+        <div class="frame"><span class="res">448×288</span><span class="cap">кадр 00:04</span></div>
+        <div class="card-b">
+          <div class="name">кот-италия-полдень</div>
+          <div class="meta">13,4 мин · 448×288 · t2va</div>
+        </div>
+        <div class="card-f acts">
+          <button class="act">Открыть папку</button><span class="act-sep"></span>
+          <button class="act">Копия</button><span class="act-sep"></span>
+          <button class="act">Обсудить</button>
+        </div>
+      </article>
+
+      <article class="blk card">
+        <div class="frame"><span class="res">склейка</span><span class="cap">кадр 00:04</span></div>
+        <div class="card-b">
+          <div class="name">баллада-финал-30с</div>
+          <div class="meta">склейка 3×10 с · 896×576</div>
+        </div>
+        <div class="card-f acts">
+          <button class="act">Открыть папку</button><span class="act-sep"></span>
+          <button class="act">Копия</button><span class="act-sep"></span>
+          <button class="act">Обсудить</button>
+        </div>
+      </article>
+
+      <article class="blk card">
+        <div class="frame"><span class="res">896×576</span><span class="cap">кадр 00:04</span></div>
+        <div class="card-b">
+          <div class="name">танго-арка</div>
+          <div class="meta">72,6 мин · 896×576 · flf</div>
+        </div>
+        <div class="card-f acts">
+          <button class="act">Открыть папку</button><span class="act-sep"></span>
+          <button class="act">Копия</button><span class="act-sep"></span>
+          <button class="act">Обсудить</button>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ══ ЭКРАН 2 ═══════════════════════════════════════════ -->
+  <div class="screen-sep">
+    <span class="tag">Экран 2</span>
+    <h2>Модалка диалога</h2>
+    <span class="mono">поверх основного экрана · Esc — закрыть</span>
+  </div>
+
+  <div class="scrim">
+    <div class="modal">
+      <div class="modal-h">
+        <span class="tag tag--y">Диалог</span>
+        <span class="ttl">Сочинить промпт</span>
+        <div class="right">
+          <span class="mono" style="font-size:11px;color:var(--bone-mute)"><span class="dot dot--off"></span>Qwen выгружена — поднимется при первом сообщении</span>
+        </div>
+      </div>
+
+      <div class="modal-b">
+        <!-- левая половина: окно промпта -->
+        <div class="mpane mpane--l">
+          <div class="pane-h">
+            <span class="mono">Черновик промпта</span>
+            <span class="mono">обновлён 23:39</span>
+          </div>
+          <div class="mcode"><span class="k">integrated_multimodal_description:</span> <span class="shot">[Shot 1]</span> Live-action, cinematic, a wide shot captures a sun-drenched Italian cobblestone street at high noon. Terracotta-colored buildings line both sides<span class="ell">…</span> <span class="shot">[Shot 2]</span> At <span class="tm">00:05.000</span>, the camera cuts to a ground-level close-up as the cat weaves past café tables<span class="ell">…</span>
+
+<span class="k">overall_soundscape:</span> <span class="ell">…</span>the crisp, rhythmic clicking of the cat's paws on sun-baked cobblestones<span class="ell">…</span>
+
+<span class="k">non_diegetic_music:</span> A light acoustic guitar plays a steady, moderate tempo rhythm<span class="ell">…</span></div>
+          <div class="pane-foot">
+            <button class="btn btn--y">В редактор</button>
+            <button class="btn">Очистить</button>
+            <span class="mono" style="font-size:11px;color:var(--bone-mute);margin-left:auto">3 поля · 1 284 симв.</span>
+          </div>
+        </div>
+
+        <!-- правая половина: лента диалога -->
+        <div class="mpane">
+          <div class="pane-h">
+            <span class="mono">Лента · Qwen2.5-32B локально</span>
+            <button class="act" style="padding:0">Закрыть ✕</button>
+          </div>
+
+          <div class="feed">
+            <div class="msg msg--me">
+              <div class="who">Я · 23:37</div>
+              <div class="bub">Кот бежит по итальянской улице…</div>
+            </div>
+
+            <div class="msg msg--ai">
+              <div class="who">Qwen · 23:38</div>
+              <div class="bub">Вот полный промпт в формате MiniMax H3 — три поля, два шота, склейка по времени на 00:05.
+                <span class="mono">integrated_multimodal_description · overall_soundscape · non_diegetic_music → перенесён в черновик слева</span>
+              </div>
+            </div>
+
+            <div class="msg msg--me">
+              <div class="who">Я · 23:39</div>
+              <div class="bub">Добавь звук шагов по брусчатке и убери людей из кадра</div>
+            </div>
+
+            <div class="think"><span>модель думает</span><i></i><i></i><i></i></div>
+          </div>
+
+          <div class="composer">
+            <div class="composer-in">
+              <button class="clip" title="Прикрепить кадр">
+                <svg viewBox="0 0 24 24"><path d="M20 11.5 11 20.5a5 5 0 0 1-7-7l9-9a3.4 3.4 0 0 1 4.8 4.8l-9 9a1.8 1.8 0 0 1-2.5-2.5l8.2-8.2"/></svg>
+              </button>
+              <input placeholder="Написать модели… или перетащить кадр сюда">
+              <button class="send">Отправить</button>
+            </div>
+            <div class="drop">
+              <span class="dash">Зона перетаскивания: брось png/jpg — уйдёт в диалог как опорный кадр</span>
+            </div>
+            <div class="composer-foot">
+              <div class="mini-dur"><span>Длительность</span><b>10 с</b></div>
+              <span class="mono">контекст 4 сообщения · 1,2 k токенов</span>
+              <button class="btn" style="margin-left:auto">Закрыть</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="legend">
+    <div>Стиль: <b>нео-брутализм</b>, инверсия под тёмную комнату</div>
+    <div>Жёлтый <b>= действие и расчёт</b> · кирпичный <b>= решение и снос</b> · зелёный <b>= готово</b></div>
+    <div>Моноширинный — только промпт, пути и числа</div>
+  </footer>
+</div>
+
+</body>
+</html>
