@@ -23,5 +23,4 @@ upstream/
 # Process artifacts from the planning/review workflow used to build this repo — not project
 # files, and not meant for a public clone.
 .superpowers/
-docs/superpowers/
 .gstack/
