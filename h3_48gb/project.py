@@ -109,6 +109,12 @@ _DEFAULT_AUDIO_MODE = {"video": "clips", "clip": "song", "song": "clips"}
 PROJECT_FILENAME = "project.json"
 PROJECT_LOCK_NAME = "project.lock"
 
+#: `set_scene_status`'s own "omitted" sentinel for `job_id` -- distinct from `None`, which that
+#: parameter now treats as an explicit clear (C1, fix round 1, 2026-08-18 review; see the method's
+#: own docstring). A private module-level singleton rather than an inline `object()` default so
+#: the identity check inside the method reads the same sentinel every call.
+_UNSET_JOB_ID = object()
+
 #: Every top-level key `create_project` writes and `_read_data` requires. A file missing one of
 #: these -- truncated mid-write despite the durable-write protocol (e.g. hand-edited, or written by
 #: some future, buggier version of this module) -- is treated as corrupt, the same as unparseable
@@ -493,15 +499,26 @@ class Project:
             self._apply(data)
         return self
 
-    def set_scene_status(self, idx: int, status: str, *, job_id: str | None = None,
+    def set_scene_status(self, idx: int, status: str, *, job_id=_UNSET_JOB_ID,
                           clip_path: str | None = None, keyframe_path: str | None = None
                           ) -> "Project":
         """Set scene `idx`'s status, and any of `job_id`/`clip_path`/`keyframe_path` that are
-        given. A field left as `None` is left exactly as it already was on disk -- this is a
-        partial update, matching how the worker actually learns these facts one at a time (a
-        `job_id` the moment it submits, a `clip_path` only once the job is `done`); it is not how
-        a scene gets its fields *cleared* -- that is `invalidate_scene_chain`'s job, which sets
-        them to `None` explicitly rather than by omission.
+        given. `clip_path`/`keyframe_path` left as `None` are left exactly as they already were on
+        disk -- this is a partial update, matching how the worker actually learns these facts one
+        at a time (a `clip_path` only once the job is `done`); neither is how a scene gets these
+        two fields *cleared* -- that is `invalidate_scene_chain`'s job, which sets them to `None`
+        explicitly rather than by omission.
+
+        **`job_id` follows a different convention (C1, fix round 1, 2026-08-18 review): omitting
+        it leaves it unchanged, but passing `job_id=None` explicitly *clears* it.** Every call
+        before this fix either omitted `job_id` or passed a real job id string -- never `None` --
+        so this is not a behaviour change for any existing caller; it exists for `assemble.
+        _submit_next_scene`'s own rollback, which must be able to actually clear a scene's `job_id`
+        back to `None` after `claim_next_scene` already wrote a placeholder and the following
+        `submit()` then raised, not merely leave the placeholder sitting there under a `"pending"`
+        status. `clip_path`/`keyframe_path` keep the plain "`None` means unchanged" convention --
+        no caller has ever needed to clear either of them outside `invalidate_scene_chain`'s own
+        bulk reset.
         """
         if status not in SCENE_STATUSES:
             raise ProjectError(f"unknown scene status {status!r}, expected one of {SCENE_STATUSES}")
@@ -509,7 +526,7 @@ class Project:
             data = _read_data(self.path)
             scene = _find_scene(data["scenes"], idx)
             scene["status"] = status
-            if job_id is not None:
+            if job_id is not _UNSET_JOB_ID:
                 scene["job_id"] = job_id
             if clip_path is not None:
                 scene["clip_path"] = clip_path
@@ -545,7 +562,7 @@ class Project:
         scene = _next_ready_scene(data["scenes"])
         return dict(scene) if scene is not None else None
 
-    def claim_next_scene(self, job_id: str) -> dict | None:
+    def claim_next_scene(self, job_id: str, *, expected_idx: int | None = None) -> dict | None:
         """Atomically find *and claim* the next ready scene (`_next_ready_scene`'s walk, the same
         one `next_pending_scene` previews) for `job_id`, in a single exclusive lock hold: read,
         pick, set `status="running"` and `job_id`, write, all before the lock is released.
@@ -560,14 +577,29 @@ class Project:
         re-read (after it finally gets the lock) sees `running`, not `pending`, and moves on to
         whatever scene (if any) is ready after that -- or gets `None`.
 
-        Returns a copy of the claimed scene, or `None` if nothing is ready. The lock is still taken
-        and released even when nothing is claimed (a `None` result is not free of I/O), matching
-        every other locked mutator here.
+        **`expected_idx` (C1, fix round 1, 2026-08-18 review).** A caller that already built a
+        job (prompt, keyframe, `--tag`) for a *specific* scene index must be able to say so, and
+        have the claim refuse -- inside this same lock hold, before writing anything -- if the
+        scene that is actually next-ready by the time the lock is acquired is a *different* one.
+        Without this, a caller racing an `invalidate_scene_chain` that landed between its own
+        preview (`next_pending_scene()`) and this call would have the *wrong* scene silently
+        claimed under a job id that was never built for it -- e.g. scene 0, freshly reset to
+        `pending` by the invalidation, claimed under a job whose `args`/`note` actually describe
+        scene 1; nothing then ever revisits scene 0 again, since the worker's own post-job hook
+        only ever looks at the scene index a job's `note` names (`h3_48gb.assemble.parse_scene_
+        note`), so it is stuck `running` forever. Checking and refusing *before* the write is what
+        `assemble._submit_next_scene` needs to claim first, then submit -- see its own docstring.
+        `expected_idx=None` (every call before this parameter existed) keeps the old, unchecked
+        behaviour exactly.
+
+        Returns a copy of the claimed scene, or `None` if nothing is ready *or* `expected_idx` was
+        given and does not match. The lock is still taken and released even when nothing is
+        claimed (a `None` result is not free of I/O), matching every other locked mutator here.
         """
         with _project_lock(self.path.parent, exclusive=True):
             data = _read_data(self.path)
             scene = _next_ready_scene(data["scenes"])
-            if scene is None:
+            if scene is None or (expected_idx is not None and scene["idx"] != expected_idx):
                 self._apply(data)
                 return None
             scene["status"] = "running"

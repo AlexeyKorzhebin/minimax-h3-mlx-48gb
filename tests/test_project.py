@@ -215,6 +215,23 @@ def test_set_scene_status_updates_status_and_optional_fields(tmp_path):
     assert reloaded.scenes[0]["status"] == "done"
 
 
+def test_set_scene_status_job_id_none_explicitly_clears_it(tmp_path):
+    """C1 (fix round 1, 2026-08-18 review): unlike `clip_path`/`keyframe_path`, `job_id` treats an
+    *explicit* `None` as "clear it", not "leave it as it was" -- `assemble._submit_next_scene`'s
+    own rollback needs this to actually undo a claim's placeholder job id when `submit()` fails.
+    Omitting the keyword entirely (the previous test, above) must still mean "unchanged".
+    """
+    project = _project_with_scenes(tmp_path)
+    project.set_scene_status(0, "running", job_id="job-1")
+
+    project.set_scene_status(0, "pending", job_id=None)
+
+    assert project.scenes[0]["status"] == "pending"
+    assert project.scenes[0]["job_id"] is None
+    reloaded = p.load_project(project.path)
+    assert reloaded.scenes[0]["job_id"] is None
+
+
 def test_set_scene_status_rejects_an_unknown_idx(tmp_path):
     project = _project_with_scenes(tmp_path, n=2)
     with pytest.raises(p.ProjectError):
@@ -650,6 +667,51 @@ def test_claim_next_scene_is_atomic_under_a_race(tmp_path):
     assert reloaded.scenes[0]["status"] == "running"
     assert reloaded.scenes[0]["job_id"] in ("job-a", "job-b")
     assert reloaded.scenes[0]["job_id"] == claimed[0]["job_id"]
+
+
+# -- C1 (fix round 1, 2026-08-18 review): claim_next_scene(expected_idx=...) ---------------------
+
+
+def test_claim_next_scene_refuses_and_writes_nothing_when_expected_idx_does_not_match(tmp_path):
+    """The exact check C1 needed: a caller that built a job for scene 1 must be able to refuse the
+    claim, inside the lock, before writing anything, if the scene that is actually next-ready by
+    the time the lock is acquired is scene 0 instead (an invalidation raced in between). Before
+    this parameter existed, `claim_next_scene` would claim scene 0 under whatever `job_id` the
+    caller passed (a job that was actually built for scene 1) and only let the caller notice
+    afterward -- by which point scene 0 was already corrupted.
+    """
+    project = _project_with_scenes(tmp_path, n=2)
+
+    result = project.claim_next_scene("job-for-scene-1", expected_idx=1)
+
+    assert result is None
+    reloaded = p.load_project(project.path)
+    assert reloaded.scenes[0]["status"] == "pending", "must not have been claimed under the wrong id"
+    assert reloaded.scenes[0]["job_id"] is None
+
+
+def test_claim_next_scene_still_claims_when_expected_idx_matches(tmp_path):
+    project = _project_with_scenes(tmp_path, n=2)
+
+    result = project.claim_next_scene("job-1", expected_idx=0)
+
+    assert result["idx"] == 0
+    assert result["status"] == "running"
+    reloaded = p.load_project(project.path)
+    assert reloaded.scenes[0]["status"] == "running"
+    assert reloaded.scenes[0]["job_id"] == "job-1"
+
+
+def test_claim_next_scene_without_expected_idx_keeps_the_old_unchecked_behaviour(tmp_path):
+    """Every caller before this parameter existed passes no `expected_idx` at all -- must keep
+    claiming whatever is next-ready, exactly as before.
+    """
+    project = _project_with_scenes(tmp_path, n=2)
+
+    result = project.claim_next_scene("job-1")
+
+    assert result["idx"] == 0
+    assert result["status"] == "running"
 
 
 def test_next_pending_scene_has_no_side_effect_on_self(tmp_path):

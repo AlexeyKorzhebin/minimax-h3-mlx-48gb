@@ -55,6 +55,8 @@ the package (see `h3_48gb.queue`'s module docstring).
 from __future__ import annotations
 
 import re
+import secrets
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -137,6 +139,22 @@ def _ffprobe_duration(path, *, run) -> float:
     except ValueError as exc:
         raise AssembleError(f"ffprobe produced an unparseable duration for {path}: {raw!r}") \
             from exc
+
+
+_FFPROBE_AUDIO_STREAMS_CMD = ("ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+                               "stream=index", "-of", "csv=p=0")
+
+
+def _has_audio_stream(path, *, run) -> bool:
+    """Whether `path` has at least one audio stream -- a readable-error preflight for `"mix"`
+    mode's clip-audio concat (module docstring's minor fix, review round 1): without it, a clip
+    missing its own audio track (a silent generation, a hand-edited project) makes the concat
+    demuxer or `amix` fail with an opaque ffmpeg stderr blob a human has to decode by hand, instead
+    of the readable `AssembleError` `run` raises when this comes back `False`.
+    """
+    result = _run_ffmpeg([*_FFPROBE_AUDIO_STREAMS_CMD, str(path)], run,
+                          f"ffprobe audio-stream probe ({path})")
+    return bool((result.stdout or "").strip())
 
 
 # -- ffmpeg concat / mux building blocks ----------------------------------------------------------
@@ -287,6 +305,12 @@ def run(project_path, *, run=subprocess.run) -> Path:
     render whose picture and song do not line up. `audio_mode == "clips"` skips all of this: there
     is no track to measure against, so the concatenated clips' own combined length is the answer.
 
+    **I4 (fix round 1, 2026-08-18 review): the same tolerance check is repeated against
+    `final.mp4` itself**, after the mux step, not only against the pre-mux, video-only concat --
+    the mux (`amix`'s own `duration=longest`, an unexpected container quirk) is a second place a
+    drift could sneak in between "the video-only track measured right" and "the file a human
+    actually opens is right".
+
     On success, records `assembly.final_path` and `stages.assembly = "done"` on the project through
     its own locked mutators (`update_assembly`/`set_stage_status`) -- mirroring
     `worker._run_song_job`'s own "only locked mutators, never `save()`" discipline, even though
@@ -342,15 +366,60 @@ def run(project_path, *, run=subprocess.run) -> Path:
         if audio_mode == "song":
             _mux_song_audio(video_only, mastered_mp3, final_path, run=run)
         else:
+            missing_audio = [p for p in clip_paths if not _has_audio_stream(p, run=run)]
+            if missing_audio:
+                raise AssembleError(
+                    f"audio_mode='mix' needs every clip to carry its own audio track to mix "
+                    f"underneath the song -- missing an audio stream: {missing_audio}")
             clip_audio = _concat(clip_paths, assembly_dir / "concat_audio.m4a", run=run,
                                   video=False, audio=True)
             _mux_mixed_audio(video_only, clip_audio, mastered_mp3, final_path, run=run)
+
+        # I4 (fix round 1, 2026-08-18 review): the duration check above only ever measured the
+        # video-only concat, *before* the mux step attached the track -- catching a padding
+        # shortfall, but never anything the mux itself could introduce (a filter's own `duration=`
+        # policy, a container quirk). `final.mp4` is what a human actually opens, so it is the one
+        # ffprobe reading that must land within tolerance before this is ever marked `done`.
+        final_duration = _ffprobe_duration(final_path, run=run)
+        if abs(final_duration - track_duration) > DURATION_TOLERANCE_SECONDS:
+            raise AssembleError(
+                f"final.mp4 is {final_duration:.2f}s, track is {track_duration:.2f}s -- outside "
+                f"the {DURATION_TOLERANCE_SECONDS}s tolerance after muxing the audio in")
     else:
         _concat(clip_paths, final_path, run=run, video=True, audio=True)
 
     proj.update_assembly(final_path=str(final_path))
     proj.set_stage_status("assembly", "done")
+    # Minor fix (review round 1): every intermediate file `run` wrote on the way to `final.mp4` is
+    # only useful for diagnosing a *failed* assembly -- once the run above has actually succeeded
+    # (every check has already passed and the project is already marked `done`), keep only
+    # `final.mp4` itself. A failure anywhere above this point returns/raises before reaching here,
+    # so the intermediates from a failed attempt are always left in place for a human to inspect.
+    _cleanup_intermediate_assembly_files(assembly_dir)
     return final_path
+
+
+def _cleanup_intermediate_assembly_files(assembly_dir: Path) -> None:
+    """Remove the video-only concat, the `"mix"`-mode clip-audio-only concat, every concat-demuxer
+    list file `_concat` leaves next to them, and the freeze-frame pad workdir -- everything `run`
+    may have written under `assembly_dir` on its way to `final.mp4` besides `final.mp4` itself.
+    Best-effort: a stray permission error here must not turn an otherwise-successful assembly into
+    a failed job over disk cleanup, so this never raises.
+    """
+    for name in ("concat_video.mp4", "concat_video.concat.txt",
+                 "concat_audio.m4a", "concat_audio.concat.txt"):
+        path = assembly_dir / name
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError:
+            pass
+    pad_dir = assembly_dir / "pad"
+    try:
+        if pad_dir.is_dir():
+            shutil.rmtree(pad_dir, ignore_errors=True)
+    except OSError:
+        pass
 
 
 # -- Scene note: how a project scene's ordinary `kind="generate"` job is tagged ------------------
@@ -429,7 +498,16 @@ def _scene_generate_args(scene: dict, keyframe, scenes_dir: Path) -> tuple[list[
     """
     idx = scene["idx"]
     width, height = DEFAULT_SCENE_CANVAS
-    tag = f"scene-{idx}"
+    # Minor fix (review round 1): a retry of this same scene within the same wall-clock minute as
+    # its previous attempt (a human's "пересчитать сцену" after `invalidate_scene_chain`) would
+    # otherwise compute the exact same `--tag` -- and therefore, through `_relocate_to_job_subdir`'s
+    # own minute-precision subdirectory naming and `RunSpec.output_stem`'s tag-derived filename, the
+    # exact same `output_stem` -- as the attempt it is replacing. `queue.submit`'s own `_stem_taken`
+    # check would then reject the retry as a conflict with a job that may not even be pending any
+    # more. A short random suffix (four hex characters -- not `queue._suffix`'s own alphabet, kept
+    # local rather than importing a queue-private helper) makes every attempt's own tag unique
+    # regardless of timing, without needing an attempt counter on the scene's own schema.
+    tag = f"scene-{idx}-{secrets.token_hex(2)}"
     args = ["generate", scene["prompt"],
             "--width", str(width), "--height", str(height),
             "--duration", str(scene["duration"]),
@@ -457,25 +535,58 @@ def _extract_keyframe(clip_path, dest_dir: Path, source_idx: int, *, run) -> Pat
     return out_path
 
 
+#: A placeholder `job_id` for `_submit_next_scene`'s own pre-claim (see its docstring, C1) --
+#: `claim_next_scene` requires a `job_id` as part of one atomic write (`status="running"` +
+#: `job_id=...`), but the *real* job id does not exist until `submit()` returns, and claiming must
+#: happen *before* `submit()` runs (that ordering is the fix). Overwritten with the real job id
+#: once `submit()` succeeds, or with `None` (scene reset to `"pending"`) if it raises -- never left
+#: on disk either way once `_submit_next_scene` returns.
+_SCENE_CLAIM_PLACEHOLDER_JOB_ID = "claiming"
+
+
 def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
-    """Submit scene `scene["idx"]`'s `kind="generate"` job and claim it on the project, atomically,
-    through `Project.claim_next_scene` (task 1/3's own locked mutator -- see its docstring for why
-    this, and not `next_pending_scene` + `set_scene_status`, is the race-safe way to claim a scene).
+    """Claim scene `scene["idx"]` on the project *first*, then submit its `kind="generate"` job --
+    task brief C1 (fix round 1, 2026-08-18 review).
 
-    The `submit` -> `claim_next_scene(job.id)` order is unavoidable (`claim_next_scene` needs the
-    job's own id, which only exists once `submit` has claimed one), which leaves a real, narrow
-    window: a crash between the two lines would leave a queued job with no scene pointing at it.
-    Not solved here -- see the module's own report's "сомнения" for why this is an accepted,
-    documented gap rather than a race this task closes.
+    **Claim before submit, not after (C1).** The previous order -- `submit()`, then
+    `claim_next_scene(job.id)` -- left a window between the two calls: if something else (an
+    `invalidate_scene_chain`, in practice a human's "пересчитать сцену") mutated the project in
+    that window, `claim_next_scene` would claim *whatever* scene was next-ready by then, under a
+    job id that was built for a *different* one, and only notice the mismatch after the write had
+    already happened -- by which point the wrong scene was already corrupted (`"running"` forever
+    under a job whose own `note` names some other scene index, so the worker's post-job hook would
+    never revisit it). Claiming first, with `expected_idx=idx` (`Project.claim_next_scene`'s own
+    C1 fix), moves the check *inside* the same lock hold the write happens under, and *before* it:
+    a race is detected with nothing written at all, and this function returns `nothing_to_do`
+    without ever calling `submit` for a scene that has already moved on. `_SCENE_CLAIM_PLACEHOLDER_
+    JOB_ID` stands in for the not-yet-known real job id for the length of that claim; the real one
+    (or a rollback to `"pending"`) is written right after `submit()` resolves, below.
 
-    If `claim_next_scene` claims a *different* scene than the one this call built a prompt/args for
-    (only possible if something else mutated the project between this call's own `next_pending_
-    scene()` preview and here -- never happens in this codebase's single-worker design, but nothing
-    prevents a future caller from violating that), raises `AssembleError` rather than silently
-    recording the wrong scene's `job_id`/`keyframe_path` against a job that was actually built for
-    a different one.
+    **A `submit()` that raises rolls the claim back to `"pending"`** (`set_scene_status(idx,
+    "pending", job_id=None)`) rather than leaving the scene stuck `"running"` under the
+    placeholder -- a transient queue error must not need a human's manual "пересчитать" to recover
+    from. The reverse case -- a crash between `submit()` returning and the follow-up `set_scene_
+    status` call recording the real job id -- is not solved here (a job would exist with no scene
+    pointing at it): see the module's own report for why this narrower, pre-existing gap is
+    accepted rather than closed in this round.
     """
     idx = scene["idx"]
+
+    claimed = proj.claim_next_scene(_SCENE_CLAIM_PLACEHOLDER_JOB_ID, expected_idx=idx)
+    if claimed is None:
+        # Raced away: some other advance_project call (or an invalidation) already moved the chain
+        # past the scene this call was asked to submit. Nothing to do -- the next real advance_
+        # project call re-derives the correct next step from scratch.
+        return {"action": "nothing_to_do"}
+
+    # I2 (fix round 1, 2026-08-18 review): "живой лайфсайкл" -- stages.scenes moves to "running"
+    # the moment the *first* scene is actually claimed, from whichever of "draft"/"approved" it
+    # was resting in. Idempotent by construction: a scene is only ever claimed once, but the guard
+    # also keeps a repeat call (there is none here, given the claim above, but future callers are
+    # not this function's business to assume) from writing over "done"/"failed".
+    if proj.stages.get("scenes") in ("draft", "approved"):
+        proj.set_stage_status("scenes", "running")
+
     keyframe = None
     if idx > 0:
         prev = _scene_by_idx(proj.scenes, idx - 1)
@@ -500,16 +611,15 @@ def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
     width, height = DEFAULT_SCENE_CANVAS
     estimate = {"seconds": _scene_wallclock_estimate_seconds(width, height, scene["duration"])}
 
-    job = submit(queue_root, args, note, {"output_stem": output_stem}, estimate,
-                 kind=q.KIND_GENERATE)
+    try:
+        job = submit(queue_root, args, note, {"output_stem": output_stem}, estimate,
+                     kind=q.KIND_GENERATE)
+    except Exception:
+        proj.set_scene_status(idx, "pending", job_id=None)
+        raise
 
-    claimed = proj.claim_next_scene(job.id)
-    if claimed is None or claimed["idx"] != idx:
-        raise AssembleError(
-            f"scene chain raced while submitting job {job.id}: expected to claim scene {idx}, "
-            f"claim_next_scene returned {claimed!r}")
-    if keyframe is not None:
-        proj.set_scene_status(idx, "running", keyframe_path=str(keyframe))
+    proj.set_scene_status(idx, "running", job_id=job.id,
+                           keyframe_path=str(keyframe) if keyframe is not None else None)
 
     return {"action": "submitted_scene", "idx": idx, "job_id": job.id,
             "keyframe": str(keyframe) if keyframe is not None else None}
@@ -598,6 +708,12 @@ def advance_project(project, queue_root, outdir, *, submit=q.submit, run=subproc
         return _submit_next_scene(proj, next_scene, queue_root, submit=submit, run=run)
 
     if proj.scenes and all(scene.get("status") == "done" for scene in proj.scenes):
+        # I2 (fix round 1, 2026-08-18 review): "живой лайфсайкл" -- stages.scenes moves to "done"
+        # once every scene actually is, and it does so *before* the assembly job is submitted (not
+        # after), so a caller reading the project while the assemble job is in flight never sees
+        # scenes still "running" next to an assembly already underway.
+        if proj.stages.get("scenes") != "done":
+            proj.set_stage_status("scenes", "done")
         return _submit_assembly(proj, queue_root, submit=submit)
 
     return {"action": "nothing_to_do"}

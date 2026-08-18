@@ -38,6 +38,13 @@ class _FakeRun:
     answers are queued per-call (`ffprobe_durations`), in the order `_ffprobe_duration` is expected
     to call them, so a test can script "video came up short, then padded video matches" without
     needing a real ffmpeg to measure anything.
+
+    The audio-stream preflight probe (`_has_audio_stream`, `-select_streams a`) is answered
+    separately from that queue -- "every clip has audio" by default -- rather than treated as one
+    more duration call: it asks a different question, and making it share the same queue would
+    force every `"mix"`-mode test to insert an extra, semantically irrelevant value just to keep
+    the real duration answers lined up. `_NoClipAudioFakeRun` below overrides this one answer for
+    the tests that actually want a clip found missing its audio track.
     """
 
     def __init__(self, ffprobe_durations=None):
@@ -46,6 +53,8 @@ class _FakeRun:
 
     def __call__(self, cmd, capture_output=True, text=True):
         self.calls.append(list(cmd))
+        if cmd[0] == "ffprobe" and "-select_streams" in cmd:
+            return _FakeResult(0, stdout="0\n")  # "has an audio stream", by default
         if cmd[0] == "ffprobe":
             duration = self._ffprobe_durations.pop(0) if self._ffprobe_durations else 0.0
             return _FakeResult(0, stdout=f"{duration}\n")
@@ -139,8 +148,9 @@ def test_run_song_mode_pads_a_short_video_with_a_freeze_frame(tmp_path):
                           track={"mastered_mp3": str(tmp_path / "song.mastered.mp3"),
                                  "duration": 10.0},
                           scenes=[_make_scene(0, clip_path=str(tmp_path / "a.mp4"))])
-    # First ffprobe: the raw concat's own duration (short); second: after padding, matches track.
-    fake = _FakeRun(ffprobe_durations=[8.0, 10.0])
+    # First ffprobe: the raw concat's own duration (short); second: after padding, matches track;
+    # third: final.mp4 itself, post-mux (I4) -- also matches, the mux introduces no drift here.
+    fake = _FakeRun(ffprobe_durations=[8.0, 10.0, 10.0])
 
     final = assemble.run(proj.path, run=fake)
 
@@ -160,7 +170,8 @@ def test_run_song_mode_skips_padding_when_video_already_covers_the_track(tmp_pat
                           track={"mastered_mp3": str(tmp_path / "song.mastered.mp3"),
                                  "duration": 10.0},
                           scenes=[_make_scene(0, clip_path=str(tmp_path / "a.mp4"))])
-    fake = _FakeRun(ffprobe_durations=[10.1])
+    # First ffprobe: the raw concat, already within tolerance; second: final.mp4 itself (I4).
+    fake = _FakeRun(ffprobe_durations=[10.1, 10.1])
 
     assemble.run(proj.path, run=fake)
 
@@ -204,12 +215,32 @@ def test_run_never_passes_shortest_to_any_ffmpeg_call(tmp_path):
                           track={"mastered_mp3": str(tmp_path / "song.mastered.mp3"),
                                  "duration": 10.0},
                           scenes=[_make_scene(0, clip_path=str(tmp_path / "a.mp4"))])
-    fake = _FakeRun(ffprobe_durations=[8.0, 10.0])
+    fake = _FakeRun(ffprobe_durations=[8.0, 10.0, 10.0])
 
     assemble.run(proj.path, run=fake)
 
     for cmd in fake.calls:
         assert "-shortest" not in cmd
+
+
+# -- run(): I4 (fix round 1, 2026-08-18 review) -- final.mp4 itself is checked too ----------------
+
+
+def test_run_song_mode_raises_when_final_mp4_itself_drifts_from_the_track(tmp_path):
+    """The pre-mux, video-only concat can measure exactly on target and still not guarantee
+    `final.mp4` itself lands within tolerance -- the mux step is a second place a drift could sneak
+    in (module docstring, I4). This scripts exactly that: the video-only concat matches the track
+    perfectly (no padding), but `final.mp4` itself -- the next `ffprobe` call, after the mux --
+    measures off by more than `DURATION_TOLERANCE_SECONDS`.
+    """
+    proj = _make_project(tmp_path, "clip", audio_mode="song",
+                          track={"mastered_mp3": str(tmp_path / "song.mastered.mp3"),
+                                 "duration": 10.0},
+                          scenes=[_make_scene(0, clip_path=str(tmp_path / "a.mp4"))])
+    fake = _FakeRun(ffprobe_durations=[10.0, 12.0])
+
+    with pytest.raises(assemble.AssembleError, match="final.mp4"):
+        assemble.run(proj.path, run=fake)
 
 
 # -- run(): "mix" audio mode -----------------------------------------------------------------------
@@ -220,7 +251,8 @@ def test_run_mix_mode_mixes_clip_audio_at_minus_18db_with_the_track(tmp_path):
                           track={"mastered_mp3": str(tmp_path / "song.mastered.mp3"),
                                  "duration": 10.0},
                           scenes=[_make_scene(0, clip_path=str(tmp_path / "a.mp4"))])
-    fake = _FakeRun(ffprobe_durations=[10.0])
+    # First ffprobe: the raw concat, exactly on target; second: final.mp4 itself (I4).
+    fake = _FakeRun(ffprobe_durations=[10.0, 10.0])
 
     assemble.run(proj.path, run=fake)
 
@@ -229,6 +261,39 @@ def test_run_mix_mode_mixes_clip_audio_at_minus_18db_with_the_track(tmp_path):
     filter_complex = mix_calls[0][mix_calls[0].index("-filter_complex") + 1]
     assert "volume=-18dB" in filter_complex
     assert "amix=inputs=2:duration=longest" in filter_complex
+
+
+class _NoClipAudioFakeRun(_FakeRun):
+    """`_FakeRun` plus an override for the audio-stream preflight probe (`-select_streams a`):
+    every clip path in `no_audio_clips` answers "no audio stream" (empty stdout) instead of the
+    base class's default "has one" -- everything else (durations, ffmpeg calls) is unchanged.
+    """
+
+    def __init__(self, *, no_audio_clips, ffprobe_durations=None):
+        super().__init__(ffprobe_durations=ffprobe_durations)
+        self._no_audio_clips = {str(p) for p in no_audio_clips}
+
+    def __call__(self, cmd, capture_output=True, text=True):
+        if cmd[0] == "ffprobe" and "-select_streams" in cmd and cmd[-1] in self._no_audio_clips:
+            self.calls.append(list(cmd))
+            return _FakeResult(0, stdout="")
+        return super().__call__(cmd, capture_output=capture_output, text=text)
+
+
+def test_run_mix_mode_raises_a_readable_error_when_a_clip_has_no_audio_stream(tmp_path):
+    """Minor fix (review round 1): a clip missing its own audio track must fail `run` with a
+    message a human can read (which clip, and why), not an opaque ffmpeg stderr blob from `amix`
+    choking on a stream that was never there.
+    """
+    clip_no_audio = tmp_path / "a.mp4"
+    proj = _make_project(tmp_path, "clip", audio_mode="mix",
+                          track={"mastered_mp3": str(tmp_path / "song.mastered.mp3"),
+                                 "duration": 10.0},
+                          scenes=[_make_scene(0, clip_path=str(clip_no_audio))])
+    fake = _NoClipAudioFakeRun(no_audio_clips=[clip_no_audio], ffprobe_durations=[10.0])
+
+    with pytest.raises(assemble.AssembleError, match="audio track"):
+        assemble.run(proj.path, run=fake)
 
 
 # -- run(): direct-cut concat only -- no scene-transition filters anywhere -----------------------
@@ -252,6 +317,14 @@ def test_run_never_uses_a_crossfade_or_transition_filter(tmp_path):
 # -- scene_note / parse_scene_note -----------------------------------------------------------------
 
 
+def test_scene_note_format_is_frozen():
+    """Minor fix (review round 1): the exact string, not just a round trip -- `h3_48gb.worker`'s
+    post-job hook and a future task 6 both depend on this literal shape, so a refactor that changes
+    it (even one that still round-trips through `parse_scene_note` fine) must fail a test loudly.
+    """
+    assert assemble.scene_note("p", 3) == "project scene p #3"
+
+
 def test_scene_note_round_trips_through_parse_scene_note(tmp_path):
     proj = _make_project(tmp_path, "video", scenes=[])
     note = assemble.scene_note(proj, 3)
@@ -266,6 +339,26 @@ def test_scene_note_accepts_a_bare_id_string():
 @pytest.mark.parametrize("note", [None, "", "just a note", "project scene", "project scene abc"])
 def test_parse_scene_note_returns_none_for_anything_else(note):
     assert assemble.parse_scene_note(note) is None
+
+
+# -- _scene_generate_args: retry-safe output_stem (minor fix, review round 1) --------------------
+
+
+def test_scene_generate_args_produces_a_different_output_stem_on_each_call(tmp_path):
+    """A retry within the same wall-clock minute as a scene's previous attempt must not compute
+    the same `output_stem`/`--tag` as the attempt it replaces -- `queue.submit`'s own `_stem_taken`
+    conflict check would otherwise reject the retry outright, since `_relocate_to_job_subdir`'s own
+    subdirectory naming only has minute precision. `_scene_generate_args` is called fresh for every
+    `_submit_next_scene` attempt, with no attempt-count field on the scene's own schema to key off,
+    so it must vary its own output on its own, run to run.
+    """
+    scene = _make_scene(0, status="pending")
+
+    args1, stem1 = assemble._scene_generate_args(scene, None, tmp_path / "scenes")
+    args2, stem2 = assemble._scene_generate_args(scene, None, tmp_path / "scenes")
+
+    assert stem1 != stem2
+    assert args1[args1.index("--tag") + 1] != args2[args2.index("--tag") + 1]
 
 
 # -- advance_project(): the scene chain -------------------------------------------------------------
@@ -407,6 +500,96 @@ def test_advance_project_does_not_resubmit_once_a_scene_is_already_running(tmp_p
     assert len(submit.calls) == 1
 
 
+# -- C1 (fix round 1, 2026-08-18 review): claim before submit -----------------------------------
+
+
+def test_advance_project_does_not_corrupt_a_scene_when_invalidated_between_decision_and_claim(
+        tmp_path, monkeypatch):
+    """The exact race the review reproduced: an invalidation (a human's "пересчитать сцену") lands
+    between `advance_project`'s own `next_pending_scene()` preview (which already saw scene 1 as
+    next) and the moment `_submit_next_scene` actually claims it. Before the fix, `submit()` ran
+    first and `claim_next_scene` (no `expected_idx`) claimed *whatever* scene was next-ready by
+    then -- scene 0, freshly reset `pending` by the injected invalidation -- under the *wrong*
+    job's id (one built for scene 1, note "#1"), and only found out afterward: scene 0 was already
+    stuck `"running"` forever, since the worker only ever revisits the scene index a job's own
+    `note` names. After the fix, the claim happens first, `expected_idx=1` refuses inside the lock
+    before any write, and `submit` is never even called for the race this call lost.
+    """
+    proj = _make_project(tmp_path, "video", scenes=[
+        _make_scene(0, status="done", clip_path=str(tmp_path / "a.mp4")),
+        _make_scene(1, status="pending"),
+    ])
+    real_claim = project_module.Project.claim_next_scene
+
+    def racy_claim(self, job_id, *, expected_idx=None):
+        # Simulate a concurrent invalidation landing exactly between advance_project's own
+        # next_pending_scene() preview (already stale by the time this runs) and this claim.
+        self.invalidate_scene_chain(0)
+        return real_claim(self, job_id, expected_idx=expected_idx)
+
+    monkeypatch.setattr(project_module.Project, "claim_next_scene", racy_claim)
+    submit = _RecordingSubmit()
+
+    result = assemble.advance_project(proj, tmp_path / "queue", tmp_path / "out", submit=submit,
+                                       run=_FakeRun(ffprobe_durations=[6.0]))
+
+    assert submit.calls == [], "the race must be caught before any job is ever submitted"
+    assert result["action"] == "nothing_to_do"
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.scenes[0]["status"] == "pending", "scene 0 must not be left corrupted"
+    assert reloaded.scenes[0]["job_id"] is None
+
+
+def test_advance_project_rolls_a_scene_back_to_pending_when_submit_itself_raises(tmp_path):
+    """A `submit()` that raises (a queue-side failure, `OutputStemConflict`, ...) must not leave
+    the scene stuck `"running"` under the claim's own placeholder job id -- it must be rolled back
+    to `"pending"` so a later retry (or a human's "пересчитать") is not required to recover from a
+    transient queue error.
+    """
+    proj = _make_project(tmp_path, "video", scenes=[_make_scene(0, status="pending")])
+
+    def failing_submit(*a, **kw):
+        raise RuntimeError("queue is on fire")
+
+    with pytest.raises(RuntimeError, match="queue is on fire"):
+        assemble.advance_project(proj, tmp_path / "queue", tmp_path / "out", submit=failing_submit,
+                                  run=_FakeRun())
+
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.scenes[0]["status"] == "pending"
+    assert reloaded.scenes[0]["job_id"] is None
+
+
+# -- I2 (fix round 1, 2026-08-18 review): stages.scenes' own live lifecycle ----------------------
+
+
+def test_advance_project_marks_scenes_stage_running_on_the_first_scene_submit(tmp_path):
+    proj = _make_project(tmp_path, "video", scenes=[_make_scene(0, status="pending")])
+    assert proj.stages["scenes"] == "draft"
+    submit = _RecordingSubmit()
+
+    assemble.advance_project(proj, tmp_path / "queue", tmp_path / "out", submit=submit,
+                              run=_FakeRun())
+
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.stages["scenes"] == "running"
+
+
+def test_advance_project_marks_scenes_stage_done_before_submitting_assembly(tmp_path):
+    proj = _make_project(tmp_path, "video", audio_mode="clips", scenes=[
+        _make_scene(0, status="done", clip_path=str(tmp_path / "a.mp4")),
+    ])
+    proj.set_stage_status("scenes", "running")
+    submit = _RecordingSubmit()
+
+    result = assemble.advance_project(proj, tmp_path / "queue", tmp_path / "out", submit=submit,
+                                       run=_FakeRun())
+
+    assert result["action"] == "submitted_assembly"
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.stages["scenes"] == "done"
+
+
 def test_advance_project_submits_assembly_once_every_scene_is_done(tmp_path):
     proj = _make_project(tmp_path, "video", audio_mode="clips", scenes=[
         _make_scene(0, status="done", clip_path=str(tmp_path / "a.mp4")),
@@ -527,6 +710,40 @@ def test_run_concats_pads_and_replaces_audio_on_a_real_ffmpeg_synthesis(tmp_path
     reloaded = project_module.load_project(proj.path)
     assert reloaded.assembly["final_path"] == str(final)
     assert reloaded.stages["assembly"] == "done"
+    # Minor fix (review round 1): a successful assembly cleans up its own intermediates -- the
+    # video-only concat, its concat-list file, and the freeze-frame pad workdir -- keeping only
+    # final.mp4 itself.
+    assembly_dir = proj.path.parent / "assembly"
+    assert not (assembly_dir / "concat_video.mp4").exists()
+    assert not (assembly_dir / "concat_video.concat.txt").exists()
+    assert not (assembly_dir / "pad").exists()
+
+
+def test_run_leaves_intermediate_files_in_place_when_assembly_fails(tmp_path):
+    """Minor fix (review round 1): the flip side of the cleanup above -- a *failed* assembly must
+    leave every intermediate it managed to write on disk, for a human to inspect. A track far
+    shorter than the video (no amount of freeze-frame padding could ever close a *negative* gap --
+    padding never trims) fails the duration check right after the video-only concat is written,
+    which is exactly the file this asserts survives.
+    """
+    clip0 = tmp_path / "clip0.mp4"
+    _make_lavfi_clip(clip0, 2.0, "green")
+    track_mp3 = tmp_path / "short_track.mp3"
+    _make_sine_mp3(track_mp3, 0.3)
+
+    proj = _make_project(tmp_path, "clip", audio_mode="song",
+                          track={"mastered_mp3": str(track_mp3),
+                                 "duration": _real_ffprobe_duration(track_mp3)},
+                          scenes=[_make_scene(0, clip_path=str(clip0))])
+
+    with pytest.raises(assemble.AssembleError, match="tolerance"):
+        assemble.run(proj.path, run=subprocess.run)
+
+    assembly_dir = proj.path.parent / "assembly"
+    assert (assembly_dir / "concat_video.mp4").is_file(), (
+        "the video-only concat must survive a failed assembly for diagnosis")
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.stages["assembly"] != "done"
 
 
 # -- no-mlx discipline --------------------------------------------------------------------------

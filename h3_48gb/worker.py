@@ -374,6 +374,26 @@ def _run_song_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
         return 1, "\n".join(log_lines) + "\n"
 
 
+def _mark_assembly_failed(project_path) -> None:
+    """Best-effort: record `stages.assembly = "failed"` on the project a `kind="assemble"` job
+    named (I1a, fix round 1, 2026-08-18 review) -- called from `_run_assemble_job`'s own failure
+    paths so a crashed (or import-broken) assembly job does not leave the stage stuck `"running"`
+    forever: nothing else in this codebase ever revisits an `assembly` stage that is not
+    `"draft"` (`advance_project._submit_assembly`'s own idempotency gate), so without this a
+    failed assembly job looked, permanently, like one that was still in flight. Never raises --
+    this runs from inside an already-failing job's own except block, and a second failure here (a
+    moved project, a corrupt `project.json`) must not replace the job's own honest failure message
+    with an unrelated traceback. A retry needs a human resetting the stage back to `"draft"`
+    first -- task 6's "пересчёт" button, out of this task's own scope (see the module's report).
+    """
+    try:
+        from h3_48gb import project as project_module
+        proj = project_module.load_project(project_path)
+        proj.set_stage_status("assembly", "failed")
+    except Exception:  # noqa: BLE001 -- see docstring.
+        pass
+
+
 def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
     """The `kind="assemble"` job body (task 3 dispatches; the implementation is task 4's). A lazy
     `import h3_48gb.assemble` -- not a module-level one -- so this module keeps working, and every
@@ -391,8 +411,22 @@ def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
     exact same seam `songrun.run_song`/`align_track` already accept -- so a second `SIGTERM`
     arriving mid-assembly now reaches ffmpeg/ffprobe through `_terminate_child_group`'s `os.killpg`
     exactly as it already reaches a song job's own subprocess.
+
+    **I1a (fix round 1, 2026-08-18 review): every failure path here also calls `_mark_assembly_
+    failed`** -- the import failing, `assemble.run` itself raising, anything -- so `stages.assembly`
+    never sits stuck `"running"` after a job that is actually dead. `project_path` is resolved
+    once, ahead of both `try` blocks, specifically so it is available to the `ImportError` branch
+    too; if `_project_arg` itself cannot parse `job.args` (malformed beyond what `queue.submit`'s
+    own `_validate_args_shape_for_kind` already guards against at submission time), there is no
+    project to mark and this just fails the job honestly, as before.
     """
     log_lines: list[str] = []
+    try:
+        project_path = _project_arg(job.args)
+    except Exception as exc:  # noqa: BLE001 -- malformed args, nothing to mark; fail the job.
+        log_lines.append(f"assemble job failed: {type(exc).__name__}: {exc}")
+        return 1, "\n".join(log_lines) + "\n"
+
     try:
         try:
             from h3_48gb import assemble
@@ -400,9 +434,9 @@ def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
             log_lines.append(
                 f"assemble job failed: h3_48gb.assemble ещё не реализован (появится в Task 4): "
                 f"{exc}")
+            _mark_assembly_failed(project_path)
             return 1, "\n".join(log_lines) + "\n"
 
-        project_path = _project_arg(job.args)
         run = _tracked_child_run(spawn)
         with _caffeinate_block(spawn=spawn):
             assemble.run(project_path, run=run)
@@ -410,6 +444,7 @@ def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
         return 0, "\n".join(log_lines) + "\n"
     except Exception as exc:  # noqa: BLE001 -- same reasoning as `_run_song_job`.
         log_lines.append(f"assemble job failed: {type(exc).__name__}: {exc}")
+        _mark_assembly_failed(project_path)
         return 1, "\n".join(log_lines) + "\n"
 
 
@@ -446,9 +481,34 @@ def _handle_project_scene_result(root, outdir, job, exit_code: int, *, run) -> N
     -- the queue's own record of this job is already correct and final by the time this runs; only
     what happens *next* for its project is at stake. One line to stderr, matching `_llm_holds_gpu`'s
     own "never let this kill the loop" discipline.
+
+    **I3 (fix round 1, 2026-08-18 review): the `h3_48gb.assemble`/`h3_48gb.project` imports
+    themselves are inside the `try`, not above it.** They used to sit ahead of this function's own
+    `try` block, so an `ImportError` here (the exact checkout-predates-task-4 shape `_run_assemble_
+    job`'s own lazy import is deliberately protected against) would propagate straight out of
+    `run_job`, contradicting this module's own docstring ("must not take the whole worker process
+    down") for every `KIND_GENERATE` job, not only project-scene ones. A broken import is now just
+    another reason to return without touching either module, exactly like `parse_scene_note`
+    finding nothing.
+
+    **C2 (fix round 1, 2026-08-18 review): a scene's `job_id` on disk must match `job.id` before
+    this writes `done`/`failed`.** Without this, a *stale* job -- one whose scene was reset by an
+    `invalidate_scene_chain` (a human's "пересчитать сцену") after this job was already queued
+    against the old attempt, or one that simply lost a race to a newer submission for the same
+    index -- would overwrite the *current* attempt's outcome with its own: a scene correctly
+    `running` under a fresh job silently flipped to `done` with a clip from a keyframe that no
+    longer exists in the chain, or to `failed` for a job nobody is waiting on any more. The check
+    reads the project fresh (`project_module.load_project`, the same call this function already
+    makes) and compares `scenes[idx]["job_id"]` to `job.id` *before* writing anything -- a mismatch
+    means this job's own outcome no longer speaks for scene `idx`, and the right move is to leave
+    the project exactly as the newer attempt already has it and say nothing further (one line to
+    stderr, not a raise -- this is an expected, not exceptional, shape once retries exist).
     """
-    from h3_48gb import assemble
-    from h3_48gb import project as project_module
+    try:
+        from h3_48gb import assemble
+        from h3_48gb import project as project_module
+    except ImportError:
+        return
 
     parsed = assemble.parse_scene_note(job.note)
     if parsed is None:
@@ -456,6 +516,12 @@ def _handle_project_scene_result(root, outdir, job, exit_code: int, *, run) -> N
     project_id, idx = parsed
     try:
         proj = project_module.load_project(Path(outdir) / "projects" / project_id)
+        scene = next((s for s in proj.scenes if s.get("idx") == idx), None)
+        if scene is None or scene.get("job_id") != job.id:
+            print(f"h3 worker: stale project scene job {job.id} for project {project_id!r} "
+                  f"scene {idx} (scene's own job_id is {scene.get('job_id') if scene else None!r})"
+                  f" -- ignoring, a newer attempt already owns this scene", file=sys.stderr)
+            return
         clip_path = f"{job.output_stem}.mp4"
         if exit_code == 0 and Path(clip_path).is_file():
             proj.set_scene_status(idx, "done", clip_path=clip_path)
@@ -510,6 +576,12 @@ def run_job(root, job, spawn=subprocess.Popen, outdir=None) -> int:
     воркером после каждого done/failed задания проекта". See that function's own docstring for why
     this never lets a broken project take the worker down, and `outdir`'s docstring below for where
     it looks for the project.
+
+    **I1b (fix round 1, 2026-08-18 review): after a `KIND_SONG`/`KIND_ASSEMBLE` job is filed,
+    `_advance_project_after_job` calls `advance_project` too** -- the task brief's own "после
+    каждого done/failed задания проекта", taken literally, is not scoped to scene jobs alone. See
+    that function's own docstring for why this is a safe no-op in every shape this codebase
+    currently reaches.
 
     **`_current_child` is set by `KIND_GENERATE` directly, and by `KIND_SONG`/`KIND_ASSEMBLE`
     through `_run_song_job`/`_run_assemble_job`'s own `run=_tracked_child_run(spawn)`** (fix round
@@ -571,8 +643,50 @@ def run_job(root, job, spawn=subprocess.Popen, outdir=None) -> int:
 
     if job.kind == q.KIND_GENERATE:
         _handle_project_scene_result(root, outdir, job, exit_code, run=_tracked_child_run(spawn))
+    elif job.kind in (q.KIND_SONG, q.KIND_ASSEMBLE):
+        _advance_project_after_job(root, outdir, job, run=_tracked_child_run(spawn))
 
     return exit_code
+
+
+def _advance_project_after_job(root, outdir, job, *, run) -> None:
+    """I1b (fix round 1, 2026-08-18 review): continue `job`'s own project's scene chain after a
+    `KIND_SONG`/`KIND_ASSEMBLE` job is filed done/failed -- the task brief, read literally:
+    "advance_project ... вызывается воркером после каждого done/failed задания проекта", not only
+    a scene's own `KIND_GENERATE` job (`_handle_project_scene_result`'s own long-standing job).
+
+    **A no-op in every shape this codebase currently reaches, and that is the point, not a bug.**
+    A `KIND_SONG` job finishes before its project has any `scenes` populated at all (task 6, not
+    built yet, is what turns an approved script into a `scenes` list) -- `advance_project` sees an
+    empty `proj.scenes` and returns `"nothing_to_do"` by construction (its own docstring). A
+    `KIND_ASSEMBLE` job's own completion (`assemble.run` itself already sets `stages.assembly` to
+    `"done"`, and `_run_assemble_job`'s own I1a fix sets it to `"failed"` on any crash) is the
+    terminal state for its project either way -- calling `advance_project` again afterward re-reads
+    `stages.assembly != "draft"` and, again, does nothing. This hook exists anyway, symmetrically
+    with `_handle_project_scene_result`, so a *future* gate change that lets a track and a scene
+    chain coexist mid-flight (or a retried assembly) does not silently need this wiring added back.
+
+    `job.args` is `["song"/"assemble", "--project", <path>]` either way (`queue._validate_args_
+    shape_for_kind`'s own guarantee at submission time), so `_project_arg` -- the same helper
+    `_run_song_job`/`_run_assemble_job` already use to find their project -- is what this reads.
+
+    **Never lets an exception escape**, the same discipline as `_handle_project_scene_result`'s own
+    (a missing project, a corrupt `project.json`): this runs after the job's own result is already
+    filed and final, so a failure here must only be logged, never propagated into `run_job`.
+    """
+    try:
+        from h3_48gb import assemble
+        from h3_48gb import project as project_module
+    except ImportError:
+        return
+    try:
+        project_path = _project_arg(job.args)
+        proj = project_module.load_project(project_path)
+        assemble.advance_project(proj, root, outdir, run=run)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: bookkeeping for an already-filed job
+        # must never take the worker down.
+        print(f"h3 worker: project advance failed after job {job.id} (kind={job.kind!r}): "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def _terminate_child_group(signum: int) -> None:

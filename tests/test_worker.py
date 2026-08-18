@@ -1210,6 +1210,123 @@ def test_run_job_dispatches_an_assemble_kind_to_h3_48gb_assemble_run(tmp_path, m
     assert caffeinate_calls == [["caffeinate", "-dimsu", "-w", str(os.getpid())]]
 
 
+# -- I1a (fix round 1, 2026-08-18 review): a failed assemble job marks stages.assembly failed -----
+
+
+def test_i1a_a_failed_assemble_job_marks_stages_assembly_failed(tmp_path, monkeypatch):
+    """Before this, a crashing `assemble.run` left `stages.assembly` stuck wherever `_submit_
+    assembly` last set it (`"running"`) forever -- nothing else in this codebase ever revisits an
+    assembly stage that is not `"draft"`, so the project looked permanently in-flight with no job
+    actually working on it.
+    """
+    def boom(project_path, *, run):
+        raise RuntimeError("ffmpeg exploded")
+
+    monkeypatch.setattr(assemble, "run", boom)
+
+    root = tmp_path / "queue"
+    proj = project_module.create_project(tmp_path / "out", "video", "Мой ролик")
+    proj.set_stage_status("assembly", "running")
+    job = q.submit(root, ["assemble", "--project", str(proj.path)], "",
+                   {"output_stem": str(proj.path.parent / "final")}, {}, kind=q.KIND_ASSEMBLE)
+    claimed = q.claim(root)
+
+    code = worker.run_job(root, claimed, spawn=_caffeinate_spy([]))
+
+    assert code == 1
+    assert q.job_path(root, job.id, "failed").exists()
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.stages["assembly"] == "failed"
+
+
+def test_i1a_an_import_broken_assemble_job_also_marks_stages_assembly_failed(tmp_path, monkeypatch):
+    """The other failure path `_run_assemble_job` has -- the lazy import itself failing -- must
+    mark the stage the same way a crash inside `assemble.run` does.
+    """
+    import h3_48gb as h3_48gb_pkg
+    monkeypatch.delattr(h3_48gb_pkg, "assemble", raising=False)
+    monkeypatch.setitem(sys.modules, "h3_48gb.assemble", None)
+
+    root = tmp_path / "queue"
+    proj = project_module.create_project(tmp_path / "out", "video", "Мой ролик")
+    proj.set_stage_status("assembly", "running")
+    job = q.submit(root, ["assemble", "--project", str(proj.path)], "",
+                   {"output_stem": str(proj.path.parent / "final")}, {}, kind=q.KIND_ASSEMBLE)
+    claimed = q.claim(root)
+
+    code = worker.run_job(root, claimed, spawn=_caffeinate_spy([]))
+
+    assert code == 1
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.stages["assembly"] == "failed"
+
+
+# -- I1b (fix round 1, 2026-08-18 review): advance_project also runs after song/assemble jobs -----
+
+
+def test_i1b_a_finished_song_job_also_calls_advance_project(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_advance(project, queue_root, outdir, **kwargs):
+        calls.append(project.id)
+        return {"action": "nothing_to_do"}
+
+    monkeypatch.setattr(assemble, "advance_project", fake_advance)
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = _song_job(root, proj, tmp_path)
+    fake_result = _fake_song_result(proj.path.parent / "track")
+    monkeypatch.setattr(sr, "run_song", lambda *a, **kw: fake_result)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]), outdir=tmp_path / "out")
+
+    assert code == 0
+    assert calls == [proj.id]
+
+
+def test_i1b_a_finished_song_job_with_no_scenes_yet_advances_as_a_safe_no_op(tmp_path, monkeypatch):
+    """The no-op case, exercised for real (no `advance_project` mock): a `kind="song"` project has
+    no `scenes` at all yet (task 6 populates them, later, from an approved script) --
+    `advance_project` must return `"nothing_to_do"` quietly, not raise or submit anything.
+    """
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = _song_job(root, proj, tmp_path)
+    fake_result = _fake_song_result(proj.path.parent / "track")
+    monkeypatch.setattr(sr, "run_song", lambda *a, **kw: fake_result)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]), outdir=tmp_path / "out")
+
+    assert code == 0
+    pending_jobs = [j for j in q.scan(root)[0] if j.state == "pending"]
+    assert pending_jobs == [], "a song-only project has no scenes to advance -- nothing submitted"
+
+
+def test_i1b_a_finished_assemble_job_also_calls_advance_project(tmp_path, monkeypatch):
+    advance_calls = []
+
+    def fake_advance(project, queue_root, outdir, **kwargs):
+        advance_calls.append(project.id)
+        return {"action": "nothing_to_do"}
+
+    def fake_run(project_path, *, run):
+        return Path(project_path).parent / "final.mp4"
+
+    monkeypatch.setattr(assemble, "run", fake_run)
+    monkeypatch.setattr(assemble, "advance_project", fake_advance)
+
+    root = tmp_path / "queue"
+    proj = project_module.create_project(tmp_path / "out", "video", "Мой ролик")
+    job = q.submit(root, ["assemble", "--project", str(proj.path)], "",
+                   {"output_stem": str(proj.path.parent / "final")}, {}, kind=q.KIND_ASSEMBLE)
+    claimed = q.claim(root)
+
+    code = worker.run_job(root, claimed, spawn=_caffeinate_spy([]), outdir=tmp_path / "out")
+
+    assert code == 0
+    assert advance_calls == [proj.id]
+
+
 def test_song_job_wallclock_estimate_seconds_is_estimate_duration_times_13():
     """Task 3's brief, verbatim: "Оценка song-задачи = estimate_duration × 13" -- the queue-facing
     wall-clock estimate (Music3's own realtime factor), not the song's own duration estimate.
@@ -1533,13 +1650,20 @@ def _video_project_with_scenes(tmp_path, *, n=2, title="Мой ролик"):
 def _scene_zero_job(root, proj):
     """Queue and claim scene 0's own `kind="generate"` job, tagged exactly as `advance_project`
     would have tagged it (`h3_48gb.assemble.scene_note`) -- standing in for task 6, which is not
-    built yet, submitting the real first scene.
+    built yet, submitting the real first scene. Also claims scene 0 on the project itself
+    (`Project.claim_next_scene`), exactly as `advance_project`'s own `_submit_next_scene` would --
+    C2 (fix round 1, 2026-08-18 review) requires `scenes[0]["job_id"]` to already match the job
+    that is about to finish, so this stand-in must leave the project in the same shape a real
+    `advance_project(project, ...)`-driven scene 0 submission would, not the bare `q.submit` this
+    helper used to do on its own before that check existed.
     """
     scenes_dir = proj.path.parent / "scenes"
     args = ["generate", "scene 0", "--width", "896", "--height", "512", "--duration", "5.0",
             "--tag", "scene-0", "--outdir", str(scenes_dir)]
-    q.submit(root, args, assemble.scene_note(proj, 0),
-             {"output_stem": str(scenes_dir / "h3-scene-0-896x512")}, {}, kind=q.KIND_GENERATE)
+    submitted = q.submit(root, args, assemble.scene_note(proj, 0),
+                          {"output_stem": str(scenes_dir / "h3-scene-0-896x512")}, {},
+                          kind=q.KIND_GENERATE)
+    proj.claim_next_scene(submitted.id)
     return q.claim(root)
 
 
@@ -1641,6 +1765,76 @@ def test_project_scene_bookkeeping_never_crashes_the_worker_on_a_missing_project
     assert code == 0
     assert q.job_path(root, job.id, "done").exists()
     assert "project scene bookkeeping failed" in capsys.readouterr().err
+
+
+# -- C2 (fix round 1, 2026-08-18 review): a stale scene job must not overwrite a fresher attempt --
+
+
+def test_c2_a_stale_scene_job_does_not_overwrite_a_fresher_attempts_status(tmp_path, capsys):
+    """A job whose own note names scene 1, but whose id no longer matches `scenes[1]["job_id"]` on
+    the project (a delayed retry of an old attempt racing a re-submission the human already
+    triggered, e.g. via "пересчитать сцену") must not be allowed to record its own outcome over the
+    fresher attempt's -- before this fix, an old job's `done`/`failed` blindly overwrote whatever
+    the current attempt already had, including clobbering a `done` scene with a stale clip.
+    """
+    root = tmp_path / "queue"
+    proj = _video_project_with_scenes(tmp_path, n=2)
+    proj.set_scene_status(0, "done", clip_path=str(tmp_path / "scene0.mp4"), job_id="job-scene-0")
+    # Scene 1 is currently owned by a *fresh* job -- not the one about to finish below.
+    proj.set_scene_status(1, "running", job_id="fresh-job")
+
+    scenes_dir = proj.path.parent / "scenes"
+    args = ["generate", "scene 1", "--width", "896", "--height", "512", "--duration", "5.0",
+            "--tag", "scene-1-stale", "--outdir", str(scenes_dir)]
+    q.submit(root, args, assemble.scene_note(proj, 1),
+             {"output_stem": str(scenes_dir / "h3-scene-1-stale-896x512")}, {},
+             kind=q.KIND_GENERATE)
+    stale_job = q.claim(root)
+    Path(f"{stale_job.output_stem}.mp4").parent.mkdir(parents=True, exist_ok=True)
+    Path(f"{stale_job.output_stem}.mp4").write_bytes(b"stale clip bytes")
+    assert stale_job.id != "fresh-job"
+
+    code = worker.run_job(root, stale_job, spawn=_scene_hook_spawn(), outdir=tmp_path / "out")
+
+    assert code == 0, "the job's own exit code is untouched by this bookkeeping"
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.scenes[1]["status"] == "running", (
+        "the stale job must not overwrite the fresher attempt's status")
+    assert reloaded.scenes[1]["job_id"] == "fresh-job"
+    assert reloaded.scenes[1]["clip_path"] is None
+    assert "stale project scene job" in capsys.readouterr().err
+
+
+# -- I3 (fix round 1, 2026-08-18 review): a broken assemble import must not crash a scene job -----
+
+
+def test_i3_a_broken_assemble_import_does_not_crash_run_job_for_a_generate_scene_job(tmp_path,
+                                                                                      monkeypatch):
+    """Before this fix, `_handle_project_scene_result`'s own `from h3_48gb import assemble`/
+    `project` imports sat ahead of its `try` block -- an `ImportError` here propagated straight out
+    of `run_job`, contradicting this module's own docstring ("must not take the whole worker
+    process down") for every `KIND_GENERATE` job whose note happens to parse as a project scene's,
+    not just the ones this function otherwise protects.
+    """
+    import h3_48gb as h3_48gb_pkg
+    monkeypatch.delattr(h3_48gb_pkg, "assemble", raising=False)
+    monkeypatch.setitem(sys.modules, "h3_48gb.assemble", None)
+
+    root = tmp_path / "queue"
+    scenes_dir = tmp_path / "out" / "projects" / "some-project" / "scenes"
+    args = ["generate", "scene 0", "--width", "896", "--height", "512", "--duration", "5.0",
+            "--tag", "scene-0", "--outdir", str(scenes_dir)]
+    job = q.submit(root, args, "project scene some-project #0",
+                   {"output_stem": str(scenes_dir / "h3-scene-0-896x512")}, {},
+                   kind=q.KIND_GENERATE)
+    claimed = q.claim(root)
+    Path(f"{claimed.output_stem}.mp4").parent.mkdir(parents=True, exist_ok=True)
+    Path(f"{claimed.output_stem}.mp4").write_bytes(b"fake mp4 bytes")
+
+    code = worker.run_job(root, claimed, spawn=_scene_hook_spawn(), outdir=tmp_path / "out")
+
+    assert code == 0, "the job's own exit code must not be affected by the broken import"
+    assert q.job_path(root, job.id, "done").exists()
 
 
 # -- M1 (fix round 1, 2026-08-18 review): the bare caffeinate is bound to the worker's own pid ----
