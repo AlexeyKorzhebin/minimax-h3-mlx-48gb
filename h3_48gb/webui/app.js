@@ -2310,7 +2310,7 @@ function startPage() {
     const outdir = state && state.outdir;
     $("project-body").innerHTML = projectScriptStageHtml(proj)
       + projectTrackStageHtml(proj, project.active_job, outdir)
-      + projectScenesStageHtml(proj)
+      + projectScenesStageHtml(proj, outdir)
       + projectAssemblyStageHtml(proj, outdir);
   }
 
