@@ -786,6 +786,152 @@ def test_approve_track_for_a_clip_project_with_an_unmeasured_track_is_refused_ho
     assert (status, payload["error"]["code"]) == (400, "project_scene_build_failed"), payload
 
 
+# == Retry: track (task 7's own small addition to the server, "Пересчитать трек") ================
+
+
+def _run_fake_song_job(srv, monkeypatch, *, duration=15.0):
+    """Claims and runs the one pending `kind="song"` job with a fake `songrun.run_song`, landing
+    the project's track at `stages.track == "awaiting_approval"` -- the shared setup every retry
+    test below starts from.
+    """
+    fake_result = sr.SongResult(
+        wav=Path("song.wav"), mastered_wav=Path("song.mastered.wav"), mp3=Path("song.mp3"),
+        mastered_mp3=Path("song.mastered.mp3"), duration=duration, transcript="ла ла ла",
+        sections=_FAKE_SONG_SECTIONS, undersung=False)
+    monkeypatch.setattr(sr, "run_song", lambda *a, **kw: fake_result)
+    job = q.claim(srv.queue_root)
+    assert job.kind == q.KIND_SONG
+    code = worker.run_job(srv.queue_root, job, spawn=_caffeinate_spy([]), outdir=srv.root)
+    assert code == 0
+
+
+def test_retry_track_before_script_approval_is_refused(_serve):
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="song", scenes=None, lyrics=_TWO_SECTION_LYRICS))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/track/retry", {})
+    assert (status, payload["error"]["code"]) == (409, "project_stage_not_ready")
+
+
+def test_retry_track_for_a_video_project_is_refused(_serve):
+    srv = _serve()
+    sid = _new_session_with_project(srv, _project_body(kind="video", scenes=_VIDEO_SCENES))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})  # scene 0 running, script approved
+
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/track/retry", {})
+    assert (status, payload["error"]["code"]) == (409, "project_stage_not_ready")
+
+
+def test_retry_track_while_the_first_song_job_is_still_queued_is_refused(_serve):
+    """M6's own point, exercised for this route too: `stages.track` alone stays `"draft"` while
+    the first song job is queued, so this route must join against the queue, not trust the
+    stage."""
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="song", scenes=None, lyrics=_TWO_SECTION_LYRICS))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})  # song job now pending
+
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/track/retry", {})
+    assert (status, payload["error"]["code"]) == (409, "project_running")
+
+
+def test_retry_track_after_approval_is_refused(_serve, monkeypatch):
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="song", scenes=None, lyrics=_TWO_SECTION_LYRICS))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+    _run_fake_song_job(srv, monkeypatch)
+    srv.post_json(f"/api/projects/{pid}/approve/track", {})
+
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/track/retry", {})
+    assert (status, payload["error"]["code"]) == (409, "project_stage_not_ready")
+
+
+def test_retry_track_resubmits_a_song_job_and_marks_the_stage_running(_serve, monkeypatch):
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="song", scenes=None, lyrics=_TWO_SECTION_LYRICS))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+    _run_fake_song_job(srv, monkeypatch)
+
+    awaiting = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert awaiting["stages"]["track"] == "awaiting_approval"
+
+    retried = srv.post_json(f"/api/projects/{pid}/track/retry", {})
+    assert "job_id" in retried["submit"]
+    assert retried["project"]["stages"]["track"] == "running"
+
+    jobs, _broken = q.scan(srv.queue_root)
+    pending = [j for j in jobs if j.state == "pending"]
+    assert len(pending) == 1
+    assert pending[0].kind == q.KIND_SONG
+
+    # A stale approve of the take being replaced must not slip through while the retry job is
+    # still in flight: `stages.track` is "running", not the "awaiting_approval" it was a moment
+    # ago, so the ordinary gate check refuses it on its own.
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/approve/track", {})
+    assert (status, payload["error"]["code"]) == (409, "project_stage_not_ready")
+
+
+def test_retry_track_with_a_seed_writes_it_before_resubmitting(_serve, monkeypatch):
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="song", scenes=None, lyrics=_TWO_SECTION_LYRICS))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+    _run_fake_song_job(srv, monkeypatch)
+
+    retried = srv.post_json(f"/api/projects/{pid}/track/retry", {"seed": 4242})
+    assert retried["project"]["track"]["seed"] == 4242
+
+
+def test_retry_track_seed_must_be_a_number(_serve, monkeypatch):
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="song", scenes=None, lyrics=_TWO_SECTION_LYRICS))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+    _run_fake_song_job(srv, monkeypatch)
+
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/track/retry", {"seed": "loud"})
+    assert (status, payload["error"]["code"]) == (400, "args_invalid")
+
+
+def test_retry_track_seed_is_refused_for_an_imported_track(_serve, monkeypatch):
+    srv = _serve()
+    upload = srv.upload_raw(_MP3_BYTES, "song.mp3")[1]
+    sid = _new_session_with_project(
+        srv, _project_body(kind="clip", scenes=None, lyrics=_TWO_SECTION_LYRICS))
+    pid = srv.post_json(
+        "/api/projects",
+        {"session_id": sid, "track_source": "import", "track_path": upload["path"]})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+    imported_mp3 = Path(upload["path"])
+    fake_result = sr.SongResult(
+        wav=imported_mp3, mastered_wav=imported_mp3, mp3=imported_mp3, mastered_mp3=imported_mp3,
+        duration=16.0, transcript="hello there my friend sing along with me",
+        sections=[{"name": "verse", "start": 0.0, "end": 8.0},
+                 {"name": "chorus", "start": 8.0, "end": None}],
+        undersung=False)
+    monkeypatch.setattr(sr, "align_track", lambda *a, **kw: fake_result)
+    job = q.claim(srv.queue_root)
+    code = worker.run_job(srv.queue_root, job, spawn=_caffeinate_spy([]), outdir=srv.root)
+    assert code == 0
+
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/track/retry", {"seed": 1})
+    assert (status, payload["error"]["code"]) == (400, "args_invalid")
+
+    # Without a seed, the retry itself is allowed for an imported track too -- it just re-runs the
+    # Whisper alignment pass rather than a fresh generation.
+    retried = srv.post_json(f"/api/projects/{pid}/track/retry", {})
+    assert "job_id" in retried["submit"]
+
+
 # == Retry: scenes, assembly =======================================================================
 
 

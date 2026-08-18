@@ -2382,15 +2382,18 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/projects":
             return self._create_project()
         if path.startswith("/api/projects/"):
-            # Task 6 ("Проекты"): three nested action routes under one project id, told apart by
-            # shape rather than three separate `startswith`/`endswith` pairs -- `/approve/<stage>`
-            # (3 segments, second is "approve"), `/assembly/retry` (3 segments, "assembly"/"retry"),
+            # Task 6 ("Проекты"), extended by task 7's own `/track/retry`: nested action routes
+            # under one project id, told apart by shape rather than one `startswith`/`endswith`
+            # pair each -- `/approve/<stage>` (3 segments, second is "approve"), `/assembly/retry`
+            # and `/track/retry` (3 segments, second is "assembly"/"track", third "retry"),
             # `/scenes/<idx>/retry` (4 segments, "scenes"/.../"retry").
             parts = path[len("/api/projects/"):].split("/")
             if len(parts) == 3 and parts[1] == "approve":
                 return self._approve_project_stage(parts[0], parts[2])
             if len(parts) == 3 and parts[1] == "assembly" and parts[2] == "retry":
                 return self._retry_project_assembly(parts[0])
+            if len(parts) == 3 and parts[1] == "track" and parts[2] == "retry":
+                return self._retry_project_track(parts[0])
             if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "retry":
                 return self._retry_project_scene(parts[0], parts[2])
         return 404, "application/json", _error_bytes(
@@ -3294,6 +3297,96 @@ class _Handler(BaseHTTPRequestHandler):
                 f"вне v1)", {"id": raw_id, "stage": stage, "kind": proj.kind})
 
         proj.approve_stage(stage)
+
+        reloaded = project_module.load_project(proj.path)
+        return 200, "application/json", _json_bytes(
+            {"ok": True, **result, "project": reloaded.as_dict()})
+
+    def _retry_project_track(self, raw_id: str) -> tuple[int, str, bytes]:
+        """`POST /api/projects/<id>/track/retry`: task 7's own small addition to the server ("
+        мелочь можно, с тестом" -- task 6 shipped no route for this) -- "Пересчитать трек" (design
+        spec, "Трек": "Гейт: прослушать, «Утвердить трек» (или пересчитать с другими seed/
+        caption)"). Resubmits the same `kind="song"` job `_approve_project_stage`'s own `script`
+        gate submits, before the track has been approved.
+
+        **`kind` must be `"clip"` or `"song"`.** A `kind="video"` project's `stages.track` sits at
+        `"draft"` forever too (M3, task 6 fix round 1) -- without this check it would read exactly
+        like a `clip`/`song` project that has not started its track yet, and this route would
+        submit a song job for a project that never asked for one.
+
+        **`script` must already be `"approved"`.** `stages.track` starts at `"draft"` for every
+        fresh project, including one whose script gate nobody has passed -- `_approve_project_
+        stage`'s own script gate never has to check this explicitly (`track` cannot reach
+        `"awaiting_approval"` before a song job that only `script`'s approval submits), but this
+        route can be reached at `"draft"` before that job ever ran, so it checks what the approve
+        route gets for free.
+
+        **Allowed only from `"draft"` (never started, or a previous attempt's job never even
+        reached the worker) or `"awaiting_approval"` (a finished take nobody has approved yet, and
+        a different seed is wanted)** -- `"approved"`/`"done"` are refused: a clip's own scenes may
+        already be built on top of that take (`build_clip_scenes`), and redoing the track out from
+        under them is not this route's job. Not reachable at all in practice, but refused the same
+        way rather than left to `_submit_project_song_job`'s own `output_stem_conflict`, is
+        `"running"` -- see the next check.
+
+        **Refused with `project_running` while a song job for this project is already pending or
+        running** -- `stages.track` alone cannot say that (task 6's own M6: it stays `"draft"`
+        while the very first song job is still queued), so this reuses `project_is_active`, the
+        same queue join `DELETE /api/projects/<id>` already trusts for the identical question.
+
+        **`seed`, optional.** Applied via `proj.update_track(seed=...)` *before* the resubmit, so
+        the worker's own `track.get("seed")` read (`worker._run_song_job`) picks it up -- the same
+        mechanism a `"Копия"` on a `done` song job already relies on to reproduce a take (task 6
+        report, I1). Refused for `track.source == "import"`: an imported track has no generation
+        step to seed, only the same Whisper alignment pass every retry of it would repeat
+        identically.
+
+        **`stages.track` is moved to `"running"` only after `_submit_project_song_job` actually
+        succeeds, not before** -- flipping it first and having the submit itself fail would strand
+        the stage at `"running"` with nothing running, the exact failure mode C1 (task 6 fix round
+        1) already fixed once for `approve_stage` itself. Moving it at all (rather than leaving it
+        at `"awaiting_approval"`) is what stops a stale approve of the *previous* take from landing
+        while the new one is still in flight: `_approve_project_stage`'s own gate only ever accepts
+        `"awaiting_approval"`. The worker's own completion (`_run_song_job`) sets it back to
+        `"awaiting_approval"` unconditionally once the new take is ready, exactly as it already
+        does for a project's very first attempt. The gap between a successful submit and this
+        write is the same kind of narrowed-not-closed race `_cancel_project_scene_tail_jobs`'s own
+        docstring already accepts as best effort by construction.
+        """
+        proj = self._load_project(raw_id)
+        if proj.kind not in ("clip", "song"):
+            raise CliError(
+                "project_stage_not_ready",
+                f"проект {raw_id}: 'track' не пересчитывается для kind={proj.kind!r}",
+                {"id": raw_id, "kind": proj.kind})
+        if proj.stages.get("script") != "approved":
+            raise CliError(
+                "project_stage_not_ready",
+                f"проект {raw_id}: сценарий ещё не утверждён, пересчитывать трек рано",
+                {"id": raw_id, "stage": "script", "status": proj.stages.get("script")})
+        current = proj.stages.get("track")
+        if current not in ("draft", "awaiting_approval"):
+            raise CliError(
+                "project_stage_not_ready",
+                f"трек проекта {raw_id} нельзя пересчитать сейчас (статус {current!r})",
+                {"id": raw_id, "stage": "track", "status": current})
+        if project_is_active(proj, self.server.queue_root):
+            raise CliError("project_running", f"проект {raw_id} ещё выполняется", {"id": raw_id})
+
+        payload = self._json_request(allowed=("seed",))
+        if "seed" in payload:
+            seed = payload["seed"]
+            if not isinstance(seed, (int, float)) or isinstance(seed, bool):
+                raise CliError("args_invalid", "`seed` must be a number",
+                               {"type": type(seed).__name__})
+            if proj.track.get("source") == "import":
+                raise CliError(
+                    "args_invalid",
+                    "`seed` has no effect on an imported track (track.source == 'import')", {})
+            proj.update_track(seed=int(seed))
+
+        result = {"submit": self._submit_project_song_job(proj)}
+        proj.set_stage_status("track", "running")
 
         reloaded = project_module.load_project(proj.path)
         return 200, "application/json", _json_bytes(
