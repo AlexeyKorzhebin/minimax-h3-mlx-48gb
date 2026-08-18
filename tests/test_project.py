@@ -500,6 +500,32 @@ def test_update_track_accepts_source_and_undersung(tmp_path):
     assert reloaded.track["undersung"] is True
 
 
+def test_a_fresh_track_defaults_seed_and_duration_to_none(tmp_path):
+    """Fix round 1, I1/I4 (2026-08-18 review): `seed` is `None` until a song job actually rolls one
+    (the worker fills it in, see `h3_48gb.worker._run_song_job`) and `duration` is `None` until a
+    song job actually produces one -- neither is a fact a fresh, never-run track has.
+    """
+    project = p.create_project(tmp_path, "song", "song")
+    assert project.track["seed"] is None
+    assert project.track["duration"] is None
+
+
+def test_update_track_accepts_seed_and_duration(tmp_path):
+    """`_TRACK_FIELDS` grew `seed`/`duration` for the worker's song-job dispatch
+    (`h3_48gb.worker._run_song_job`), which records the seed it actually used (I1, so a duplicate
+    take is reproducible) and the track's actual length (I4, from `songrun.SongResult.duration`)
+    through the same locked `update_track` call as everything else a song job produces.
+    """
+    project = p.create_project(tmp_path, "song", "song")
+    project.update_track(seed=12345, duration=87.5)
+    assert project.track["seed"] == 12345
+    assert project.track["duration"] == pytest.approx(87.5)
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.track["seed"] == 12345
+    assert reloaded.track["duration"] == pytest.approx(87.5)
+
+
 def test_update_assembly_partially_updates_and_leaves_other_fields_alone(tmp_path):
     project = p.create_project(tmp_path, "video", "x")
     project.update_assembly(final_path="/x/final.mp4")

@@ -192,6 +192,23 @@ def _empty_track() -> dict:
         # to a track that is otherwise a complete success (mp3s exist, the job is `done`) -- an
         # `undersung` take is a warning on an approved-looking result, not a failure.
         "undersung": False,
+        # Fix round 1, I1 (2026-08-18 review): the seed a `kind="song"` generation used. `None`
+        # until a song job actually runs one -- the worker (`h3_48gb.worker._run_song_job`) reads
+        # this before generating, and if it is still `None` picks a random one itself
+        # (`random.randrange(2**31)`) and writes the value it actually used straight back here,
+        # in the same `update_track` call as the rest of the job's results. This is what makes a
+        # duplicate ("Копия" on a `done` song job) reproducible: without recording the seed that
+        # was actually rolled, a retry of an unset seed would roll a *different* random one and
+        # never be able to recreate a take a human liked. Never touched for `track.source ==
+        # "import"` -- there is no generation, so no seed to record.
+        "seed": None,
+        # Fix round 1, I4 (2026-08-18 review): how long the track actually plays, in seconds --
+        # `songrun.SongResult.duration` copied straight onto the track once a song job finishes,
+        # for `run_song` (Music3's own actual generated length) exactly as for `align_track` (an
+        # imported mp3's real length, via `ffprobe`, not a Whisper segment's own end timestamp --
+        # see `align_track`'s docstring for why the earlier version of that function undercounted
+        # a track with a wordless tail). `None` until a song job has actually produced one.
+        "duration": None,
     }
 
 
@@ -594,11 +611,11 @@ class Project:
 
     def update_track(self, **fields) -> "Project":
         """Partial update of `self.track`'s own fields (`_TRACK_FIELDS`:
-        `lyrics`/`caption`/`wav`/`mp3`/`mastered_mp3`/`sections`/`status`) -- the `track`-scoped
-        sibling of `set_scene_status`, for a caller (task 3's chat integration, the mastering step)
-        that has learned one or two of these facts and must not clobber the rest via a blind
-        `save()` (see `save`'s own docstring for why that stops being safe once other writers
-        exist).
+        `lyrics`/`caption`/`wav`/`mp3`/`mastered_mp3`/`sections`/`status`/`source`/`undersung`/
+        `seed`/`duration`) -- the `track`-scoped sibling of `set_scene_status`, for a caller
+        (task 3's chat integration, the mastering step, the worker's song-job dispatch) that has
+        learned one or two of these facts and must not clobber the rest via a blind `save()` (see
+        `save`'s own docstring for why that stops being safe once other writers exist).
 
         Unlike `set_scene_status`'s `None`-means-unchanged convention, `**fields` already tells
         "not passed" and "passed as `None`" apart for free: a keyword simply absent from `fields`

@@ -1012,8 +1012,10 @@ def test_run_job_dispatches_a_song_kind_to_songrun_run_song_and_gates_the_track(
     assert seen["lyrics"] == proj.track["lyrics"]
     assert seen["caption"] == proj.track["caption"]
     assert seen["duration"] == sr.estimate_duration(proj.track["lyrics"])
-    assert caffeinate_calls == [["caffeinate", "-dimsu"]], (
-        "a song job must be caffeinated the same way a generate job is (task 3 brief)")
+    assert caffeinate_calls == [["caffeinate", "-dimsu", "-w", str(os.getpid())]], (
+        "a song job must be caffeinated the same way a generate job is (task 3 brief); M1 (fix "
+        "round 1) additionally binds it to the worker's own pid so it cannot outlive a killed "
+        "worker")
     assert caffeinate_calls  # sanity, redundant with the assert above
 
     reloaded = project_module.load_project(proj.path)
@@ -1182,7 +1184,7 @@ def test_run_job_dispatches_an_assemble_kind_to_h3_48gb_assemble_run(tmp_path, m
     assert code == 0
     assert q.job_path(root, job.id, "done").exists()
     assert calls == [proj.path]
-    assert caffeinate_calls == [["caffeinate", "-dimsu"]]
+    assert caffeinate_calls == [["caffeinate", "-dimsu", "-w", str(os.getpid())]]
 
 
 def test_song_job_wallclock_estimate_seconds_is_estimate_duration_times_13():
@@ -1192,6 +1194,325 @@ def test_song_job_wallclock_estimate_seconds_is_estimate_duration_times_13():
     lyrics = "[verse]\nа б в\n[chorus]\nг д е\n"
     assert worker.song_job_wallclock_estimate_seconds(lyrics) == pytest.approx(
         sr.estimate_duration(lyrics) * 13.0)
+
+
+# -- C1 (fix round 1, 2026-08-18 review): a song job's own subprocess is a tracked child ---------
+
+
+class _FakeTrackedChild:
+    """Stands in for the `Popen` `worker._tracked_child_run`'s own `spawn` starts: no `.wait()`,
+    just `.communicate()` (the way that seam actually uses it) and a `.returncode`.
+    """
+
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+        self.pid = 4242
+
+    def communicate(self):
+        return self._stdout, self._stderr
+
+
+def test_c1_song_job_registers_current_child_while_its_own_subprocess_runs_and_clears_it_after(
+        tmp_path, monkeypatch):
+    """C1, the round's main fix: before it, only `KIND_GENERATE` ever set `_current_child`, so a
+    second `SIGTERM` arriving while a song job was mid-flight found `_current_child is None` and
+    took the *worker* down (`_stop_signals`' handler falls through to `SIG_DFL` + re-signalling
+    itself) instead of the song job's own Music3/ffmpeg/mlx_whisper subprocess -- orphaning it on
+    the GPU with no worker, no lease and nothing left to reap it. This proves the fix at the exact
+    seam `songrun.run_song`/`align_track` already call (`run(cmd, capture_output=True, text=True)`,
+    task 2's own contract) -- a mocked `run_song` stands in and calls that `run` argument itself,
+    exactly as the real one does for each of its four subprocess steps.
+    """
+    assert worker._current_child is None, "sanity: no state left over from an earlier test"
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = _fake_song_result(track_dir)
+    seen = {}
+
+    def fake_spawn(cmd, **kw):
+        if cmd[0] == "caffeinate":
+            return _FakeCaffeinate()
+        seen["child_spawn_kwargs"] = kw
+        return _FakeTrackedChild(returncode=0, stdout="ok", stderr="")
+
+    def fake_run_song(track_dir_arg, lyrics, caption, duration, *, seed, run, **kw):
+        result = run(["fake-music3-generate.py"], capture_output=True, text=True)
+        seen["result_returncode"] = result.returncode
+        seen["result_stdout"] = result.stdout
+        return fake_result
+
+    # Observe `_current_child` from *inside* `communicate()`, the only moment it is guaranteed to
+    # be set -- checking it from `fake_run_song` after `run(...)` returns would only prove it was
+    # cleared, not that it was ever set while the call was actually in flight.
+    real_communicate = _FakeTrackedChild.communicate
+
+    def spying_communicate(self):
+        seen["current_child_during_communicate"] = worker._current_child
+        return real_communicate(self)
+
+    monkeypatch.setattr(_FakeTrackedChild, "communicate", spying_communicate)
+    monkeypatch.setattr(sr, "run_song", fake_run_song)
+
+    code = worker.run_job(root, job, spawn=fake_spawn)
+
+    assert code == 0
+    assert seen["current_child_during_communicate"] is not None, (
+        "the song job's own subprocess must be visible to _terminate_child_group (the second "
+        "SIGTERM's kill target) while it is actually running")
+    assert seen["child_spawn_kwargs"]["start_new_session"] is True, (
+        "the song job's own subprocess must run in its own process group -- otherwise "
+        "_terminate_child_group's os.killpg has nothing of its own to reach")
+    assert seen["result_returncode"] == 0
+    assert seen["result_stdout"] == "ok", "run() must hand songrun a real CompletedProcess back"
+    assert worker._current_child is None, (
+        "must be cleared once the song job's subprocess call returns, exactly like KIND_GENERATE's")
+
+
+def test_c1_tracked_child_run_clears_current_child_even_if_the_subprocess_call_raises(tmp_path):
+    """`_current_child` must not leak past a failing subprocess call either -- a `finally`, not a
+    bare assignment after `communicate()` returns, is what the implementation must use.
+    """
+    class _BoomChild:
+        pid = 1
+
+        def communicate(self):
+            raise OSError("boom")
+
+    def spawn(cmd, **kw):
+        return _BoomChild()
+
+    run = worker._tracked_child_run(spawn=spawn)
+    with pytest.raises(OSError, match="boom"):
+        run(["anything"], capture_output=True, text=True)
+    assert worker._current_child is None
+
+
+# -- I1/I4 (fix round 1, 2026-08-18 review): seed and duration round-trip through the project -----
+
+
+def test_i1_song_job_respects_an_explicit_seed_from_project_json(tmp_path, monkeypatch):
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    proj.track = {**proj.track, "seed": 999999}
+    proj.save()
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = _fake_song_result(track_dir)
+    seen = {}
+
+    def fake_run_song(track_dir_arg, lyrics, caption, duration, *, seed, **kw):
+        seen["seed"] = seed
+        return fake_result
+
+    monkeypatch.setattr(sr, "run_song", fake_run_song)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    assert seen["seed"] == 999999, "an explicit project.json seed must be passed through unchanged"
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["seed"] == 999999, "an already-set seed must still be recorded (no-op)"
+
+
+def test_i1_song_job_rolls_a_random_seed_when_none_is_set_and_records_it(tmp_path, monkeypatch):
+    """`_empty_track()` defaults `seed` to `None` -- the common case, a fresh track. The worker must
+    roll one itself and, critically, write the *actual* value it rolled back onto the project, so a
+    duplicate of this job (task 6) can reproduce the exact take instead of rolling a different
+    random seed on every retry.
+    """
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    assert proj.track["seed"] is None, "sanity: the fixture must start with the real default"
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = _fake_song_result(track_dir)
+    seen = {}
+
+    def fake_run_song(track_dir_arg, lyrics, caption, duration, *, seed, **kw):
+        seen["seed"] = seed
+        return fake_result
+
+    monkeypatch.setattr(sr, "run_song", fake_run_song)
+    monkeypatch.setattr(worker.random, "randrange", lambda n: 424242)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    assert seen["seed"] == 424242, "a rolled seed must actually be used for generation"
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["seed"] == 424242, (
+        "the seed actually used must be written back, not left None -- otherwise a duplicate "
+        "cannot reproduce this take")
+
+
+def test_i1_song_job_never_writes_a_seed_for_an_imported_track(tmp_path, monkeypatch):
+    """`track.source == "import"` never generates anything, so there is no seed to roll or record
+    -- `update_track` must not be called with `seed=...` at all for this path (as opposed to, say,
+    silently writing `seed=None` over a value a human may have typed in by hand for their own
+    reference).
+    """
+    root = tmp_path / "queue"
+    imported_mp3 = tmp_path / "uploaded" / "suno-song.mp3"
+    imported_mp3.parent.mkdir(parents=True)
+    imported_mp3.write_bytes(b"fake mp3 bytes")
+    proj = _song_project(tmp_path, source="import", mp3=imported_mp3)
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = sr.SongResult(
+        wav=imported_mp3, mastered_wav=imported_mp3, mp3=imported_mp3, mastered_mp3=imported_mp3,
+        duration=42.0, transcript="ла ла ла", sections=_FAKE_SECTIONS, undersung=False,
+    )
+    monkeypatch.setattr(sr, "align_track", lambda *a, **kw: fake_result)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["seed"] is None, "an import must never have a seed written for it"
+
+
+def test_i4_song_job_records_the_tracks_duration_from_run_song(tmp_path, monkeypatch):
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = _fake_song_result(track_dir)
+    assert fake_result.duration == pytest.approx(30.0)
+    monkeypatch.setattr(sr, "run_song", lambda *a, **kw: fake_result)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["duration"] == pytest.approx(30.0)
+
+
+def test_i4_song_job_records_the_tracks_duration_from_align_track(tmp_path, monkeypatch):
+    root = tmp_path / "queue"
+    imported_mp3 = tmp_path / "uploaded" / "suno-song.mp3"
+    imported_mp3.parent.mkdir(parents=True)
+    imported_mp3.write_bytes(b"fake mp3 bytes")
+    proj = _song_project(tmp_path, source="import", mp3=imported_mp3)
+    job = _song_job(root, proj, tmp_path)
+    fake_result = sr.SongResult(
+        wav=imported_mp3, mastered_wav=imported_mp3, mp3=imported_mp3, mastered_mp3=imported_mp3,
+        duration=123.4, transcript="ла ла ла", sections=_FAKE_SECTIONS, undersung=False,
+    )
+    monkeypatch.setattr(sr, "align_track", lambda *a, **kw: fake_result)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["duration"] == pytest.approx(123.4)
+
+
+# -- M1 (fix round 1, 2026-08-18 review): the bare caffeinate is bound to the worker's own pid ----
+
+
+def test_m1_caffeinate_block_binds_to_the_workers_own_pid(tmp_path):
+    """A `finally: proc.terminate()` never runs if the worker itself is taken down by `kill -9`
+    (or the second-SIGTERM path, which sets `SIG_DFL` and re-signals itself -- indistinguishable
+    from `kill -9` as far as Python's own cleanup is concerned): the bare `caffeinate` `
+    _caffeinate_block` starts would then run forever, with no target and nothing left to stop it.
+    `-w <this process's own pid>` makes `caffeinate` itself watch the worker and exit the moment it
+    is gone, whichever way it goes.
+    """
+    calls = []
+    with worker._caffeinate_block(spawn=_caffeinate_spy(calls)):
+        pass
+    assert calls == [["caffeinate", "-dimsu", "-w", str(os.getpid())]]
+
+
+# -- I5 (fix round 1, 2026-08-18 review): a worker killed mid-song-job recovers cleanly -----------
+
+
+_CRASH_SONG_WORKER = """
+import os, sys
+sys.path.insert(0, {project!r})
+from h3_48gb import queue as q
+from h3_48gb import songrun as sr
+from h3_48gb import worker
+
+root = sys.argv[1]
+worker._now = lambda: "2020-01-01T00:00:00"
+
+
+def dying_run_song(*a, **kw):
+    os._exit(1)
+
+
+sr.run_song = dying_run_song
+
+job = q.claim(root)
+
+
+class _FakeCaffeinate:
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def spawn(cmd, **kw):
+    return _FakeCaffeinate()
+
+
+worker.run_job(root, job, spawn=spawn)
+os._exit(0)
+"""
+
+
+def test_i5_a_crash_during_a_song_job_returns_it_to_pending_and_leaves_the_project_untouched(
+        tmp_path, monkeypatch):
+    """By the same shape as `test_a_crash_before_any_result_returns_the_job_to_pending`
+    (`point="during_child"`), but for `KIND_SONG`: a worker killed while `songrun.run_song` is
+    running leaves no result marker and no gated project -- `reconcile` must return the job to
+    `pending/` and `project.json` must show no intermediate status at all, only the `"draft"` it
+    started with. A subsequent, successful run must then finish normally (`run_song`'s own I4
+    cleans `song.*`/`whisper.json` before generating, so a retry against the *same* `track_dir`
+    is already safe -- this only has to prove the queue side of that story).
+    """
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = q.submit(root, ["song", "--project", str(proj.path)], "",
+                   {"output_stem": str(proj.path.parent / "track" / "song")}, {}, kind=q.KIND_SONG)
+
+    script = _CRASH_SONG_WORKER.format(project=str(PROJECT_ROOT))
+    result = subprocess.run([sys.executable, "-c", script, str(root)],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1, f"the crash script did not die as expected: {result.stderr}"
+
+    assert q.job_path(root, job.id, "running").exists(), (
+        "nothing survived the crash -- the job must still look like it is running")
+    assert q.lease_is_free(root, job.id) is True, "the lease must not outlive its dead holder"
+
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["status"] == "draft", (
+        "a mid-job crash must leave no intermediate status on the project -- update_track is only "
+        "ever called after the song job has actually finished")
+    assert reloaded.stages["track"] == "draft"
+
+    recon = q.reconcile(root)
+    assert [j.state for j in recon.changed] == ["pending"]
+    assert q.job_path(root, job.id, "pending").exists()
+
+    # And the retry -- a fresh worker claiming the same job -- finishes normally.
+    track_dir = proj.path.parent / "track"
+    fake_result = _fake_song_result(track_dir)
+    monkeypatch.setattr(sr, "run_song", lambda *a, **kw: fake_result)
+    retried = q.claim(root)
+    code = worker.run_job(root, retried, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    assert q.job_path(root, job.id, "done").exists()
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["status"] == "awaiting_approval"
 
 
 # -- Global constraint: the worker must stay importable without MLX ------------------------------

@@ -698,11 +698,18 @@ def test_run_song_result_fields_match_update_track_field_names():
     the worker's song-job dispatch (`h3_48gb.worker._run_song_job`) could pass
     `SongResult.undersung` straight through to `update_track(undersung=...)` the same way it already
     does for `wav`/`mp3`/`mastered_mp3`/`sections` -- see the task 3 report.
+
+    `duration` joined this set in fix round 1 (I4, 2026-08-18 review): `_TRACK_FIELDS` grew a
+    `duration` field so the same dispatch could pass `SongResult.duration` through too -- the
+    track's actual length, from `run_song`'s own generated-audio measurement or `align_track`'s
+    `ffprobe` read, not the `estimate_duration` guess `track.status` moved past long before either
+    of those ever ran.
     """
     from h3_48gb import project as p
     result_fields = set(sr.SongResult.__dataclass_fields__)
     track_fields = set(p._TRACK_FIELDS)
-    assert result_fields & track_fields == {"wav", "mp3", "mastered_mp3", "sections", "undersung"}
+    assert result_fields & track_fields == {
+        "wav", "mp3", "mastered_mp3", "sections", "undersung", "duration"}
 
 
 def test_run_song_propagates_a_generation_failure_as_song_run_error(tmp_path):
@@ -802,6 +809,102 @@ def test_i4_run_song_propagates_a_whisper_failure_and_leaves_no_mastered_mp3(tmp
         sr.run_song(track_dir, lyrics="[intro]\nx", caption="c", duration=10.0, seed=1,
                     music3_python="p", model_dir="m", run=fake)
     assert not (track_dir / "song.mastered.mp3").exists()
+
+
+# -- align_track: the import-only path ------------------------------------------------------------
+
+
+def _is_ffprobe_call(cmd):
+    return cmd[0] == "ffprobe"
+
+
+def test_align_track_transcribes_the_mp3_as_given_and_uses_ffprobe_for_duration(tmp_path):
+    """Fix round 1, I4 (2026-08-18 review): `duration` must come from `ffprobe`'s own read of the
+    file's container-level length, not from the last Whisper segment's own end timestamp -- pinned
+    here with an `ffprobe` duration that deliberately disagrees with (is longer than) the last
+    segment's `end`, the exact shape a real imported mp3 with an unrecognized instrumental tail
+    would have. The old, wrong implementation would have returned 3.0 (the last segment's `end`)
+    here instead of 9.4.
+    """
+    track_dir = tmp_path / "track"
+    mp3_path = tmp_path / "uploaded" / "suno-song.mp3"
+    mp3_path.parent.mkdir(parents=True)
+    mp3_path.write_bytes(b"fake mp3 bytes")
+
+    fake = _FakeRun()
+    segments = [{"start": 0.0, "end": 3.0, "text": "spi moy malenkiy"}]
+
+    def handle_whisper(cmd):
+        out_dir = Path(cmd[cmd.index("--output-dir") + 1])
+        name = cmd[cmd.index("--output-name") + 1]
+        payload = {"text": "spi moy malenkiy", "segments": segments}
+        (out_dir / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
+        return _Result()
+
+    def handle_ffprobe(cmd):
+        assert cmd[-1] == str(mp3_path)
+        return _Result(stdout="9.4\n")
+
+    fake.add(_is_mlx_whisper_call, handle_whisper)
+    fake.add(_is_ffprobe_call, handle_ffprobe)
+
+    result = sr.align_track(track_dir, mp3_path, "[intro]\nspi moy malenkiy",
+                            music3_python="fake-python3", run=fake)
+
+    assert isinstance(result, sr.SongResult)
+    assert result.duration == pytest.approx(9.4), (
+        "duration must come from ffprobe, not the last Whisper segment's own end")
+    assert result.wav == mp3_path
+    assert result.mastered_wav == mp3_path
+    assert result.mp3 == mp3_path
+    assert result.mastered_mp3 == mp3_path
+    assert result.transcript == "spi moy malenkiy"
+    assert result.sections == [{"name": "intro", "start": 0.0, "end": 9.4}]
+
+    ffprobe_call = next(c for c in fake.calls if c[0] == "ffprobe")
+    assert ffprobe_call == [*sr._FFPROBE_DURATION_CMD, str(mp3_path)]
+
+
+def test_align_track_raises_song_run_error_if_ffprobe_fails(tmp_path):
+    track_dir = tmp_path / "track"
+    mp3_path = tmp_path / "song.mp3"
+    mp3_path.write_bytes(b"fake mp3 bytes")
+
+    fake = _FakeRun()
+
+    def handle_whisper(cmd):
+        out_dir = Path(cmd[cmd.index("--output-dir") + 1])
+        name = cmd[cmd.index("--output-name") + 1]
+        (out_dir / f"{name}.json").write_text(
+            json.dumps({"text": "", "segments": []}), encoding="utf-8")
+        return _Result()
+
+    fake.add(_is_mlx_whisper_call, handle_whisper)
+    fake.add(_is_ffprobe_call, lambda cmd: _Result(returncode=1, stderr="no such file"))
+
+    with pytest.raises(sr.SongRunError, match="no such file"):
+        sr.align_track(track_dir, mp3_path, "[intro]\nx", music3_python="p", run=fake)
+
+
+def test_align_track_raises_song_run_error_on_unparseable_ffprobe_output(tmp_path):
+    track_dir = tmp_path / "track"
+    mp3_path = tmp_path / "song.mp3"
+    mp3_path.write_bytes(b"fake mp3 bytes")
+
+    fake = _FakeRun()
+
+    def handle_whisper(cmd):
+        out_dir = Path(cmd[cmd.index("--output-dir") + 1])
+        name = cmd[cmd.index("--output-name") + 1]
+        (out_dir / f"{name}.json").write_text(
+            json.dumps({"text": "", "segments": []}), encoding="utf-8")
+        return _Result()
+
+    fake.add(_is_mlx_whisper_call, handle_whisper)
+    fake.add(_is_ffprobe_call, lambda cmd: _Result(stdout="not-a-number\n"))
+
+    with pytest.raises(sr.SongRunError, match="unparseable"):
+        sr.align_track(track_dir, mp3_path, "[intro]\nx", music3_python="p", run=fake)
 
 
 # -- no-mlx discipline --------------------------------------------------------------------------

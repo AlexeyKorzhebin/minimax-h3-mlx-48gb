@@ -1853,6 +1853,50 @@ def test_an_old_job_file_with_no_kind_field_reads_as_generate(tmp_path):
     assert claimed.kind == q.KIND_GENERATE
 
 
+# -- M4 (fix round 1, 2026-08-18 review): submit validates args shape against kind ---------------
+
+
+def test_submit_refuses_a_song_kind_job_whose_args_dont_start_with_song(tmp_path):
+    root = tmp_path / "queue"
+    project_path = tmp_path / "projects" / "x" / "project.json"
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["generate", "--project", str(project_path)], "",
+                 {"output_stem": str(project_path.parent / "track" / "song")}, {}, kind=q.KIND_SONG)
+
+
+def test_submit_refuses_a_song_kind_job_missing_the_project_flag(tmp_path):
+    root = tmp_path / "queue"
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["song", "--tag", "x"], "",
+                 {"output_stem": str(tmp_path / "track" / "song")}, {}, kind=q.KIND_SONG)
+
+
+def test_submit_refuses_an_assemble_kind_job_whose_args_dont_start_with_assemble(tmp_path):
+    root = tmp_path / "queue"
+    project_path = tmp_path / "projects" / "x" / "project.json"
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["--project", str(project_path)], "",
+                 {"output_stem": str(project_path.parent / "final")}, {}, kind=q.KIND_ASSEMBLE)
+
+
+def test_submit_refuses_a_generate_kind_job_whose_args_start_with_song(tmp_path):
+    """The mirror mistake M4 also catches: song/assemble-shaped `args` submitted without also
+    setting `kind` -- these would otherwise be handed to `h3 generate` as its own subprocess argv
+    and fail deep inside the CLI, an hour later, instead of at submission.
+    """
+    root = tmp_path / "queue"
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["song", "--project", "/x/project.json"], "",
+                 _stem(_DRY, str(tmp_path / "h3-a-1x1")), {})
+
+
+def test_submit_refuses_a_generate_kind_job_whose_args_start_with_assemble(tmp_path):
+    root = tmp_path / "queue"
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["assemble", "--project", "/x/project.json"], "",
+                 _stem(_DRY, str(tmp_path / "h3-a-1x1")), {})
+
+
 # -- Global constraint: queue.py must stay importable without MLX -------------------------------
 
 

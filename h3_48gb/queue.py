@@ -599,6 +599,35 @@ def _stem_taken(root: Path, output_stem: str, exclude_id: str | None = None) -> 
     return False
 
 
+def _validate_args_shape_for_kind(kind: str, args: list[str]) -> None:
+    """M4 (fix round 1, 2026-08-18 review): refuse a `kind`/`args` mismatch honestly, at `submit`
+    time, rather than letting it sit in `pending/` and fail only once the worker actually claims it
+    -- `_project_arg` (`worker.py`) raising `ValueError` for a `kind="song"` job with no `--project`
+    token, or a `kind="generate"` job whose `args` happen to start with `"song"`/`"assemble"` being
+    handed to `h3 generate` as nonsense positional arguments, are both mistakes a human made at
+    submission time and should be told about right then, not an hour later when the queue finally
+    reaches the job.
+
+    `kind="song"`/`"assemble"`: `args[0]` must equal `kind` and `"--project"` must appear somewhere
+    in `args` -- the exact shape task 3's brief requires (`["song", "--project", <path>]`/
+    `["assemble", "--project", <path>]`) and the only shape `_project_arg` can parse. `kind=
+    "generate"` (the default -- every caller before this validation existed): `args[0]` must *not*
+    be `"song"`/`"assemble"`, catching the mirror mistake -- song/assemble-shaped args submitted
+    without also setting `kind`, which would otherwise be handed to `h3 generate` as its own
+    subprocess argv and fail inside the CLI instead of at submission.
+    """
+    if kind in (KIND_SONG, KIND_ASSEMBLE):
+        if not args or args[0] != kind or "--project" not in args:
+            raise QueueError(
+                f"kind={kind!r} job args must look like [{kind!r}, '--project', <path>, ...], "
+                f"got {args!r}")
+    elif kind == KIND_GENERATE:
+        if args and args[0] in (KIND_SONG, KIND_ASSEMBLE):
+            raise QueueError(
+                f"kind=\"generate\" job args must not start with {args[0]!r} -- pass "
+                f"kind={args[0]!r} to submit() instead, got {args!r}")
+
+
 def submit(root, args: list[str], note: str, dry_run_report: dict, estimate: dict,
            prompt_source: str | None = None, prompt_text: str | None = None, now=None,
            kind: str = KIND_GENERATE) -> Job:
@@ -648,6 +677,7 @@ def submit(root, args: list[str], note: str, dry_run_report: dict, estimate: dic
     """
     if kind not in JOB_KINDS:
         raise QueueError(f"unknown job kind {kind!r}, expected one of {JOB_KINDS}")
+    _validate_args_shape_for_kind(kind, args)
 
     root = Path(root)
     layout(root)

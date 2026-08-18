@@ -2215,6 +2215,25 @@ class _Handler(BaseHTTPRequestHandler):
             return 404, "application/json", _error_bytes(
                 "not_found", f"нет такой задачи: {raw_id}", {"id": raw_id})
 
+        # I3 (fix round 1, 2026-08-18 review): a `kind="song"`/`"assemble"` job's `args` names a
+        # *project* (`["song", "--project", <path>]`), not a canvas/prompt the way `generate`'s do
+        # -- resubmitting it as a fresh pending job the way this route does for `generate` would
+        # start a second song/assemble run racing the original against the same project, or (worse)
+        # succeed only because `_duplicate_tag_candidates`' `--tag` rewrite happens to be a no-op on
+        # args that were never `--tag`-shaped to begin with. What "duplicate a song/assemble job"
+        # should actually mean (a new track dir? the same one?) is a decision for task 6, not a
+        # guess made here -- so this refuses honestly instead. This must also be the reason `submit`
+        # below is given `kind=job.kind` rather than defaulting to `KIND_GENERATE`: without either
+        # the refusal here or the correct `kind`, a duplicated song job would have silently become a
+        # `generate` job under `queue.submit`'s new M4 args-shape validation and failed there
+        # instead, an equally honest but far more confusing refusal.
+        if job.kind != q.KIND_GENERATE:
+            return 409, "application/json", _error_bytes(
+                "duplicate_unsupported_kind",
+                f"дублирование задач kind={job.kind!r} пока не поддержано (появится в Task 6): "
+                f"{raw_id}",
+                {"id": raw_id, "kind": job.kind})
+
         prompt_text = None
         if "--prompt-file" in job.args and job.args.index("--prompt-file") + 1 < len(job.args):
             snapshot = Path(job.args[job.args.index("--prompt-file") + 1])
@@ -2237,7 +2256,8 @@ class _Handler(BaseHTTPRequestHandler):
                 with queue_write_errors(self.server.queue_root, what="the job id"):
                     new_job = q.submit(self.server.queue_root, args, job.note,
                                        {"output_stem": output_stem}, dict(job.estimate),
-                                       prompt_source=job.prompt_source, prompt_text=prompt_text)
+                                       prompt_source=job.prompt_source, prompt_text=prompt_text,
+                                       kind=job.kind)
             except CliError as exc:
                 if exc.code != "output_stem_conflict":
                     raise

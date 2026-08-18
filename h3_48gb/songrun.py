@@ -293,6 +293,33 @@ def master(wav_path, mastered_path, *, run=subprocess.run) -> Path:
     return Path(mastered_path)
 
 
+_FFPROBE_DURATION_CMD = ("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
+                          "csv=p=0")
+
+
+def _ffprobe_duration(mp3_path, *, run) -> float:
+    """`ffprobe -v error -show_entries format=duration -of csv=p=0 <mp3_path>`, through the same
+    injectable `run` seam every other subprocess call in this module goes through. Fix round 1, I4
+    (2026-08-18 review): `align_track` used to take its `duration` from the *last Whisper segment's
+    own end timestamp* -- cheap, but wrong for a real imported mp3 with any audible tail after the
+    last recognized word (a fade, an instrumental outro, applause): that tail would be silently cut
+    from `duration` and therefore from the last section's `end` (`check_lyrics_sung`'s
+    `_section_ends`), understating both. `ffprobe`'s own container-level duration has no such blind
+    spot -- it reads the file's actual length, not a guess derived from what Whisper happened to
+    transcribe.
+
+    Raises `SongRunError` (never a bare `ValueError`) if `ffprobe` fails or its stdout is not a
+    parseable number -- matching every other subprocess call in this module.
+    """
+    result = _run([*_FFPROBE_DURATION_CMD, str(mp3_path)], run, "ffprobe duration")
+    raw = (result.stdout or "").strip()
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise SongRunError(f"ffprobe produced an unparseable duration for {mp3_path}: {raw!r}") \
+            from exc
+
+
 def to_mp3(src_wav, dst_mp3, *, run=subprocess.run) -> Path:
     """`src_wav` encoded to `dst_mp3` (`libmp3lame -q:a 1` -- the task brief's exact codec/quality
     choice). Called twice per song (design spec, "Трек": "оба файла сохраняются") -- once for the
@@ -569,16 +596,16 @@ def align_track(track_dir, mp3_path, lyrics: str, *,
     to know which path produced it before calling `project.Project.update_track(**fields)`:
     `wav`/`mastered_wav`/`mp3`/`mastered_mp3` all point at `mp3_path` itself (there is no separate
     wav, mastering pass or mp3 encode step for an import -- the file the human uploaded *is* all
-    four of those roles at once). `duration` is the timestamp of the last Whisper segment (there is
-    no `[audio] ... dur=` line to parse the way `_generate_wav` gets one, since nothing was
-    generated) -- `0.0` if `mlx_whisper` found no segments at all, which `check_lyrics_sung` already
-    treats as "nothing matched" rather than a crash.
+    four of those roles at once). `duration` is `mp3_path`'s own container-level length, read via
+    `ffprobe` (`_ffprobe_duration`) -- **not** the last Whisper segment's own end timestamp (fix
+    round 1, I4, 2026-08-18 review: that undercounts whenever the file has any audible tail past the
+    last recognized word -- a fade, an instrumental outro, applause).
 
     `track_dir` is created if missing, matching `run_song`; only `whisper.json` lands inside it
     (there is no `song.*` to write -- the caller already has the audio at `mp3_path`).
 
-    Raises `SongRunError` if `mlx_whisper` fails, exactly as `run_song`'s own `_transcribe` does --
-    never a bare subprocess/JSON exception.
+    Raises `SongRunError` if `mlx_whisper` or `ffprobe` fails, exactly as `run_song`'s own
+    `_transcribe` does -- never a bare subprocess/JSON exception.
     """
     track_dir = Path(track_dir)
     track_dir.mkdir(parents=True, exist_ok=True)
@@ -586,7 +613,7 @@ def align_track(track_dir, mp3_path, lyrics: str, *,
 
     whisper_data = _transcribe(music3_python, mp3_path, track_dir, run=run)
     segments = whisper_data.get("segments", [])
-    duration = segments[-1]["end"] if segments else 0.0
+    duration = _ffprobe_duration(mp3_path, run=run)
     sections, undersung = check_lyrics_sung(lyrics, segments, duration=duration)
 
     return SongResult(

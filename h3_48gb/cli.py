@@ -189,6 +189,10 @@ ERROR_CODES = {
     "command_not_allowed": "only `h3 generate` may be queued, and never with --no-checkpoint",
     "output_stem_conflict": "another pending or running job, or a file already on disk, claims that output name",
     "job_not_pending": "the job is no longer in pending/: the worker claimed it, or it was already removed",
+    # Fix round 1 (I3, 2026-08-18 review): `/api/jobs/<id>/duplicate` refuses a `kind="song"`/
+    # `"assemble"` source honestly rather than silently resubmitting its args as `generate` --
+    # what duplicating a song/assemble job should even mean is a task 6 decision, not this route's.
+    "duplicate_unsupported_kind": "duplicating a song/assemble job is not supported yet (task 6); `detail.kind` names the source job's own kind",
     "path_outside_root": "a path names something outside every root the server may touch, or writes into the read-only models root",
     "prompt_name_invalid": "a prompt name is not a bare `[A-Za-z0-9_-]+.txt` -- it names a directory or another suffix",
     "queue_unwritable": "the queue directory could not be read or written; see `detail.path`",

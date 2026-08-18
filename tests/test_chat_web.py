@@ -1310,6 +1310,30 @@ def test_duplicating_an_unknown_job_is_a_named_404(_serve):
     assert answer["error"]["code"] == "not_found", answer
 
 
+def test_duplicating_a_song_kind_job_is_refused_honestly(_serve):
+    """I3 (fix round 1, 2026-08-18 review): `_duplicate_job` used to call `q.submit` without
+    `kind=job.kind` at all, silently resubmitting a song/assemble job's `args`
+    (`["song", "--project", <path>]`) as an ordinary `generate` job -- nonsense the CLI would only
+    discover an hour later, inside the worker. What duplicating a song/assemble job *should* mean
+    (a fresh track dir? racing the same project?) is a decision task 6 has not made yet, so this
+    route refuses honestly instead of guessing, and leaves the source job exactly as it was.
+    """
+    srv = _serve()
+    project_path = srv.root / "projects" / "20260818-1200-my-song" / "project.json"
+    job = q.submit(srv.queue_root, ["song", "--project", str(project_path)], "заметка",
+                   {"output_stem": str(project_path.parent / "track" / "song")}, {},
+                   kind=q.KIND_SONG)
+
+    status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/duplicate", None)
+    assert status == 409, answer
+    assert answer["error"]["code"] == "duplicate_unsupported_kind", answer
+
+    jobs, broken = q.scan(srv.queue_root)
+    assert broken == []
+    assert [row.state for row in jobs] == ["pending"], "the refusal must not touch the source job"
+    assert jobs[0].id == job.id
+
+
 def test_duplicating_a_job_with_a_prompt_file_gets_its_own_snapshot_not_the_sources(_serve):
     """Fix round 1. `queue.submit` only re-snapshots the prompt when `prompt_text` is given;
     without it, `args` pass through untouched, and untouched here means `--prompt-file` still

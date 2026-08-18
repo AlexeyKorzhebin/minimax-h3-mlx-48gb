@@ -33,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -184,13 +185,78 @@ def _caffeinate_block(spawn=subprocess.Popen):
 
     `spawn` is the same injection point `run_job` already takes for its `KIND_GENERATE` child, so a
     test substitutes one fake for both rather than needing a second seam.
+
+    **`-w <this worker's own pid>`** (fix round 1, M1, 2026-08-18 review): binds the bare
+    `caffeinate`'s own lifetime to the worker process's, on top of the `terminate()`/`wait()` this
+    function already does in its `finally`. The `finally` alone only fires on an orderly exit or an
+    exception -- a worker taken down by `kill -9` (the exact scenario C1 of this same review round
+    is about: a second `SIGTERM` reaching a worker mid-song-job used to set `SIG_DFL` and re-deliver
+    the signal to *itself*, which is indistinguishable from `kill -9` as far as Python's own
+    `finally` blocks are concerned) skips it entirely, and the bare `caffeinate` this function
+    started is left running with no target and nothing left to stop it -- forever, per `man
+    caffeinate`'s own "-w: waits for the process ... to exit" contract read backwards: without `-w`,
+    nothing waits for anything, so nothing exits. `-w <pid>` makes `caffeinate` itself watch the
+    worker's pid and exit the moment it is gone, whichever way it goes -- this is not a replacement
+    for the `finally` (a `caffeinate` that already believes the "normal" case's `terminate()` reached
+    it will simply see its watched process gone one instruction later and exit anyway), it is what
+    closes the gap the `finally` cannot.
     """
-    proc = spawn(["caffeinate", "-dimsu"])
+    proc = spawn(["caffeinate", "-dimsu", "-w", str(os.getpid())])
     try:
         yield
     finally:
         proc.terminate()
         proc.wait()
+
+
+def _tracked_child_run(spawn=subprocess.Popen):
+    """Build a `run` callable for `songrun.run_song`/`align_track` (and, eventually, task 4's
+    `assemble.run`) that registers each subprocess it starts as `_current_child` for the exact
+    duration of the call -- the seam task 2 left for this (every subprocess call in `songrun.py`
+    goes through one injected `run(cmd, capture_output=True, text=True) -> CompletedProcess`, see
+    `songrun._run_or_raise`'s own docstring), closing C1 (fix round 1, 2026-08-18 review):
+
+    Before this, `KIND_SONG`/`KIND_ASSEMBLE` never set `_current_child` at all (only
+    `KIND_GENERATE`'s own top-level `Popen` did) -- so a *second* `SIGTERM` arriving while a song job
+    was mid-flight (a human running `web-stop.sh` twice, say) hit `_terminate_child_group`'s
+    `if proc is None: return` and signalled nothing: `_stop_signals`' handler still set `SIG_DFL` and
+    re-delivered the signal to the worker itself, taking the *worker* process down immediately, with
+    its currently-running Music3/`ffmpeg`/`mlx_whisper` child (and the bare `caffeinate`
+    `_caffeinate_block` started, see that function's own M1 note) left running with no worker, no
+    lease and nothing left to reap them -- ~30 GB stuck on the GPU until a human noticed, and
+    `reconcile` would meanwhile see the lease gone and hand the same track straight back to
+    `pending/`, so the *next* worker starts a second Music3 run right next to the orphaned first one.
+
+    The returned `run` does exactly what `KIND_GENERATE`'s own dispatch already does for its
+    top-level child (`run_job`'s `KIND_GENERATE` branch): `start_new_session=True` so
+    `_terminate_child_group`'s `os.killpg` reaches the whole tree, `_current_child` set before the
+    blocking wait and cleared in a `finally` right after -- the exact mechanism `_terminate_child_group`
+    already knows how to use, reused rather than duplicated. `songrun.py` itself needed **no
+    changes** for this: it already always calls `run(cmd, capture_output=True, text=True)` and
+    expects a `subprocess.CompletedProcess` back, which is exactly what a real `Popen` +
+    `communicate()` produces once assembled by hand.
+
+    `spawn` is the same seam `_caffeinate_block` and `run_job`'s `KIND_GENERATE` branch already take
+    -- one fake `spawn` in a test covers the bare `caffeinate` companion process and every one of a
+    song job's own Music3/`ffmpeg`/`mlx_whisper` calls.
+    """
+    def run(cmd, *, capture_output=True, text=True):
+        global _current_child
+        kwargs: dict = {"start_new_session": True}
+        if capture_output:
+            kwargs["stdout"] = subprocess.PIPE
+            kwargs["stderr"] = subprocess.PIPE
+        if text:
+            kwargs["text"] = True
+        proc = spawn(cmd, **kwargs)
+        _current_child = proc
+        try:
+            stdout, stderr = proc.communicate()
+        finally:
+            _current_child = None
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+    return run
 
 
 #: Music3 runs roughly 11-13x slower than the song it produces (design spec, "Трек": "~11-13x
@@ -230,6 +296,26 @@ def _run_song_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
     actually raises (a subprocess failed to start, the project file will not load, `track.source`
     is `"import"` with no `mp3` set) is the only case this returns non-zero for.
 
+    **C1 (fix round 1, 2026-08-18 review): `run=_tracked_child_run(spawn)` is passed into
+    `songrun.run_song`/`align_track`.** Both already accept a `run` keyword -- the seam task 2 built
+    for testing without a real subprocess -- so no change to `songrun.py` was needed: the worker
+    supplies the *same* mechanism `KIND_GENERATE` uses (`_current_child` + `start_new_session=True`)
+    through that existing seam instead of a bare `subprocess.run`, and `_terminate_child_group`
+    (already written for `KIND_GENERATE`) then reaches a song job's own Music3/`ffmpeg`/
+    `mlx_whisper` child for free. See `_tracked_child_run`'s own docstring for the orphan this
+    closes.
+
+    **I1 (fix round 1): a song generation's seed is resolved and recorded, not silently defaulted
+    to `0`.** `track.get("seed")` -- if `None` (a fresh track, `_empty_track`'s own default) --
+    is replaced with a fresh `random.randrange(2**31)` roll, and the value actually used is written
+    back onto the project through the same `update_track` call as everything else the job produced,
+    so a duplicate ("Копия" on a `done` song job, task 6) can reproduce the exact take rather than
+    rolling a different random seed on every retry. Only the generation branch touches `seed` --
+    `track.source == "import"` has no seed to resolve or record.
+
+    **I4 (fix round 1): `track.duration` is recorded too** -- `result.duration`, from either path
+    (`run_song`'s actual generated length, `align_track`'s `ffprobe`-read one).
+
     Never lets a bare exception escape: whatever `h3_48gb.project`/`h3_48gb.songrun` raise is
     caught and turned into `(1, <message>)`, because a job whose body raises must still let
     `run_job` write a result marker and move the file out of `running/` -- an uncaught exception
@@ -246,6 +332,8 @@ def _run_song_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
         lyrics = track.get("lyrics") or ""
         caption = track.get("caption") or ""
         track_dir = proj.path.parent / "track"
+        run = _tracked_child_run(spawn)
+        seed_used = None  # only the generation branch below has one to record (I1)
 
         with _caffeinate_block(spawn=spawn):
             if track.get("source") == "import":
@@ -254,18 +342,25 @@ def _run_song_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
                     raise songrun.SongRunError(
                         "track.source is 'import' but track.mp3 is not set")
                 log_lines.append(f"align-only (imported track): {mp3_path}")
-                result = songrun.align_track(track_dir, mp3_path, lyrics)
+                result = songrun.align_track(track_dir, mp3_path, lyrics, run=run)
             else:
                 duration = songrun.estimate_duration(lyrics)
-                seed = track.get("seed") or 0
+                seed_used = track.get("seed")
+                if seed_used is None:
+                    seed_used = random.randrange(2**31)
                 log_lines.append(
-                    f"generating: estimated duration={duration}s seed={seed}")
-                result = songrun.run_song(track_dir, lyrics, caption, duration, seed=seed)
+                    f"generating: estimated duration={duration}s seed={seed_used}")
+                result = songrun.run_song(track_dir, lyrics, caption, duration, seed=seed_used,
+                                           run=run)
 
-        proj.update_track(
+        update_fields = dict(
             wav=str(result.wav), mp3=str(result.mp3), mastered_mp3=str(result.mastered_mp3),
             sections=result.sections, status="awaiting_approval", undersung=result.undersung,
+            duration=result.duration,
         )
+        if seed_used is not None:
+            update_fields["seed"] = seed_used
+        proj.update_track(**update_fields)
         proj.set_stage_status("track", "awaiting_approval")
         log_lines.append(
             f"song job done: undersung={result.undersung}, duration={result.duration}s")
@@ -338,17 +433,22 @@ def run_job(root, job, spawn=subprocess.Popen) -> int:
       4; not implemented yet, see that function's docstring for the honest failure this dispatches
       to until it is).
 
-    Only the `KIND_GENERATE` branch sets `_current_child` -- the song/assemble branches run their
-    own subprocesses (Music3, ffmpeg, `mlx_whisper`) as blocking `subprocess.run` calls with no
-    `Popen` handle this module ever sees, so the two-stage stop signal's "kill the child's process
-    group" has nothing of theirs to reach; a `SIGTERM` still stops the worker from taking the
-    *next* job (see `_stop_signals`), it just cannot interrupt one of these already in flight. Known
-    gap, not solved by this task -- see the task 3 report.
+    **`_current_child` is set by `KIND_GENERATE` directly, and by `KIND_SONG` through
+    `_run_song_job`'s own `run=_tracked_child_run(spawn)`** (fix round 1, C1, 2026-08-18 review --
+    see `_tracked_child_run`'s own docstring for the orphaned-GPU-process gap this closes): both
+    ultimately go through the same `_current_child` + `start_new_session=True` mechanism, so
+    `_terminate_child_group`'s "kill the child's process group" reaches a song job's own Music3/
+    `ffmpeg`/`mlx_whisper` subprocess exactly as it already reached `KIND_GENERATE`'s. `KIND_ASSEMBLE`
+    is the one branch that still does not: `h3_48gb.assemble.run(project_path)`'s own signature
+    (task 4) takes no `run` keyword to inject one through, so a second `SIGTERM` mid-assemble still
+    cannot interrupt whatever `assemble.run` is doing -- a `SIGTERM` still stops the worker from
+    taking the *next* job either way (see `_stop_signals`). Known gap for `KIND_ASSEMBLE` only, not
+    solved by this task -- see the task 3 report.
 
     `spawn` is injectable because every test of this function must not start a real generation: a
     second MLX process on this machine is 36 GB against a 48 GB budget. The same `spawn` is reused
-    by `_caffeinate_block` for the song/assemble branches' `caffeinate` companion process, so one
-    fake covers both.
+    by `_caffeinate_block` for the song/assemble branches' `caffeinate` companion process, and by
+    `_tracked_child_run` for a song job's own subprocess calls, so one fake covers all three.
     """
     global _current_child
     root = Path(root)
