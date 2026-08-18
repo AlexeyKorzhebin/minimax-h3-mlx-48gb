@@ -368,7 +368,7 @@ def _transcribe(music3_python, audio_path: Path, track_dir: Path, *, run) -> dic
         raise SongRunError(f"{json_path} is not valid JSON: {exc}") from exc
 
 
-def _parse_lyrics(lyrics: str) -> tuple[list[str], list[tuple[int, str]]]:
+def parse_lyrics(lyrics: str) -> tuple[list[str], list[tuple[int, str]]]:
     """`lyrics` split into `(section_names, lines)`: `section_names` is the ordered list of
     `[tag]` names, one entry per *occurrence* (a lyric with `[chorus]` twice gets two entries,
     both named `"chorus"`); `lines` is every non-empty, non-tag line, as `(section_index, text)`,
@@ -379,6 +379,12 @@ def _parse_lyrics(lyrics: str) -> tuple[list[str], list[tuple[int, str]]]:
     index 0, rather than dropped, so a hand-typed lyric that forgot its opening tag still gets
     every line counted (`count_sections`/`estimate_duration`) and matched
     (`check_lyrics_sung`) -- just under an unnamed section instead of a real one.
+
+    **Public since fix round 1 (I's own minor, 2026-08-19 review, reviewer's verdict on task 6):**
+    was `_parse_lyrics` -- `h3_48gb.web.build_clip_scenes` already called it directly from outside
+    this module (the same positional convention that builds `track.sections`, not a parser worth
+    duplicating), which made it a de facto public function with a private name. `_parse_lyrics`
+    stays as a plain alias below for anything that still spells it the old way.
     """
     section_names: list[str] = []
     lines: list[tuple[int, str]] = []
@@ -399,12 +405,17 @@ def _parse_lyrics(lyrics: str) -> tuple[list[str], list[tuple[int, str]]]:
     return section_names, lines
 
 
+#: Fix round 1 (2026-08-19 review): compatibility alias for `parse_lyrics`'s old private name --
+#: see that function's own docstring.
+_parse_lyrics = parse_lyrics
+
+
 def count_sections(lyrics: str) -> int:
     """The number of section *occurrences* in `lyrics` -- every `[tag]` line, repeats included
     (`[chorus]` appearing three times counts as three) -- what `estimate_duration` multiplies
     `SECONDS_PER_SECTION` by, and what `check_lyrics_sung`'s `sections` list has one entry per.
     """
-    section_names, _ = _parse_lyrics(lyrics)
+    section_names, _ = parse_lyrics(lyrics)
     return len(section_names)
 
 
@@ -534,7 +545,7 @@ def check_lyrics_sung(lyrics: str, segments: list[dict], *,
     (`[{"start": float, "end": float, "text": str}, ...]`, the shape `mlx_whisper`'s JSON output
     already uses) and return `(sections, undersung)`.
 
-    `sections` has one entry per section *occurrence* in `lyrics` (`_parse_lyrics`), each
+    `sections` has one entry per section *occurrence* in `lyrics` (`parse_lyrics`), each
     `{"name": str, "start": float | None, "end": float | None}`: `start` is the timestamp of the
     *first* Whisper segment that matched any line belonging to that section (task brief: "первый
     сегмент, совпавший со строкой секции, задаёт start"), `None` if no line in the section matched
@@ -557,7 +568,7 @@ def check_lyrics_sung(lyrics: str, segments: list[dict], *,
     `LINE_MATCH_THRESHOLD`, *and* an absolute floor, `MIN_SHARED_WORDS`) rather than requiring a
     verbatim match.
     """
-    section_names, lines = _parse_lyrics(lyrics)
+    section_names, lines = parse_lyrics(lyrics)
     line_word_sets = [_word_set(text) for _, text in lines]
     segment_word_sets = [_word_set(seg.get("text", "")) for seg in segments]
     segment_starts = [seg.get("start") for seg in segments]

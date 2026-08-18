@@ -778,7 +778,10 @@ def build_state(queue_root, outdir) -> dict:
         "queue": {**grouped,
                   "broken": [{"path": item.path, "error": item.error} for item in broken]},
         "runs": [run.as_dict() for run in runs_module.scan(Path(outdir))],
-        "projects": [project_summary(proj, queue_root) for proj in project_module.list_projects(outdir)],
+        # I2 (fix round 1, 2026-08-19 review): reuse the one `q.scan` already done above for the
+        # queue's own state, rather than `project_summary` scanning again per project (P+1 scans
+        # per `/api/state` poll, every 20s from the page).
+        "projects": [project_summary(proj, jobs) for proj in project_module.list_projects(outdir)],
     }
 
 
@@ -804,6 +807,24 @@ SCENE_MAX_SECONDS = 10.0
 #: Task brief ("Проекты", task 6): an instrumental gap under this many seconds is not worth its own
 #: scene -- folded into whichever sung scene borders it. At or above, it becomes its own
 #: instrumental scene with a fallback prompt (`_GAP_SCENE_PROMPT`), no second LLM call.
+#:
+#: **Honest correction (I3, fix round 1, 2026-08-19 review): this constant's own number is not the
+#: threshold a caller actually observes.** `build_clip_scenes` runs *two* fold passes in sequence --
+#: this one first (`eligible=lambda seg: not seg["sung"]`, gap segments only), then an unconditional
+#: second pass at `SCENE_MIN_SECONDS` (5.0) over *every* segment, sung or not. A gap between 1.5s
+#: and `SCENE_MIN_SECONDS` survives the first pass as its own segment (with `_GAP_SCENE_PROMPT`) only
+#: to be folded straight into a neighbour by the second pass moments later, discarding that prompt
+#: same as a sub-1.5s gap would have been -- there is no code path a caller outside this module can
+#: observe where a 1.5-5s gap actually keeps `_GAP_SCENE_PROMPT`. The number that actually decides
+#: "does an intro gap survive as its own scene" is `SCENE_MIN_SECONDS`, not this constant. This is
+#: correct behaviour, not a bug (H3 itself refuses a scene shorter than `SCENE_MIN_SECONDS`, so a
+#: 1.5-5s gap could never have become a real job either way) -- but the number on this line is
+#: misleading on its own, and is kept at 1.5 (rather than deleted or raised to match
+#: `SCENE_MIN_SECONDS`) only because the task brief names 1.5 verbatim and a future change to
+#: `SCENE_MIN_SECONDS` alone (say, if H3 ever learns to render shorter clips) would make this
+#: constant meaningful again without any other code changing. See the task report ("Fix round 1")
+#: for the full reasoning, and `test_build_clip_scenes_*` for the direct (non-tautological) proof of
+#: what the *effective* threshold is.
 GAP_SCENE_THRESHOLD_SECONDS = 1.5
 
 #: Task brief, verbatim: the fallback prompt an instrumental gap scene gets, built from whichever
@@ -884,11 +905,15 @@ def _fold_short_segments(segments: list[dict], min_seconds: float, *,
             continue
         result.append({**seg, "start": start})
     if carry_start is not None:
-        # Every segment was short -- the whole timeline collapses into whatever is left.
-        if result:
-            result[0] = {**result[0], "start": carry_start}
-        else:
-            result.append({**segments[-1], "start": carry_start})
+        # Every segment was short and eligible -- the whole timeline collapses into whatever is
+        # left of it. M1 (fix round 1, 2026-08-19 review): `result` is *provably* still empty here,
+        # not merely usually empty -- `carry_start` only survives past the loop if the very last
+        # segment took the "carry forward" branch above, and that branch is only reachable while
+        # `result` is empty (the moment a first segment is appended, every later short/eligible
+        # segment merges backward into `result[-1]` instead, never setting `carry_start` again). A
+        # dead `if result: ...` branch used to sit here for the case that can never happen;
+        # removed rather than covered, since there is no input that reaches it to cover.
+        result.append({**segments[-1], "start": carry_start})
     return result
 
 
@@ -912,7 +937,28 @@ def _split_long_segment(seg: dict) -> list[dict]:
             for i in range(n)]
 
 
-def _clip_section_prompt(tag: str, lines: list[str], caption: str) -> str:
+def _clip_style_block(caption: str) -> str:
+    """The literal sentence `build_clip_scenes` glues, word-for-word, onto every scene's own
+    prompt -- a cheap, deliberate application of `docs/h3-prompt-system.md`'s own "same words" rule
+    ("Describe every character, the visual style, and the palette in *exactly the same words* in
+    every single scene's prompt ... the only thing carrying identity across the cut from one clip
+    into the next is ... whatever text each scene's own prompt repeats") to a `kind="clip"` project,
+    which has no visual bible to draw character/palette text from at all (task report, sомнение 1).
+
+    `caption`'s own Global Metadata section (`docs/h3-prompt-system.md`, "Song mode": "genre,
+    tempo/BPM feel, key/mood, instrumentation at a glance") is the only style description this
+    project has by the time scenes are built -- its own first sentence, taken literally, not
+    reworded. Not a real visual bible (no character, no camera, no palette) -- see the task report
+    for what Task 7 would need to do better; this is cheap insurance against scene-to-scene drift,
+    not a substitute for one.
+    """
+    first_paragraph = next((p.strip() for p in (caption or "").split("\n\n") if p.strip()), "")
+    first_line = next((line.strip() for line in first_paragraph.splitlines() if line.strip()), "")
+    sentence = first_line.split(". ", 1)[0].rstrip(".").strip()
+    return sentence
+
+
+def _clip_section_prompt(tag: str, lines: list[str], caption: str, style_block: str) -> str:
     """A minimal, templated H3 prompt for one sung song section -- task 6's own stopgap, not a
     creative decision: see the task report for why (`docs/h3-prompt-system.md`, "Song mode":
     "`scenes` stays null [for `kind=clip`/`song`] ... a clip's scenes are built later, from the
@@ -921,25 +967,27 @@ def _clip_section_prompt(tag: str, lines: list[str], caption: str) -> str:
 
     Assembled, without any LLM call, from what *does* exist by the time a track is approved: this
     section's own sung lines (`lines`, matched by position out of `lyrics` -- see
-    `songrun._parse_lyrics`) and the track's own `caption` (written for Music3, but the only
-    description of mood/genre/instrumentation this project has). Not a "visual bible" in the design
-    spec's own sense -- no character, no camera vocabulary, no shot list -- see the task report for
-    what a better v2 would need.
+    `songrun.parse_lyrics`), the track's own `caption` (written for Music3, but the only
+    description of mood/genre/instrumentation this project has), and `style_block` (see
+    `_clip_style_block`'s own docstring), repeated identically in every call `build_clip_scenes`
+    makes for the same track. Not a "visual bible" in the design spec's own sense -- no character,
+    no camera vocabulary, no shot list -- see the task report for what a better v2 would need.
     """
     mood = next((line.strip() for line in (caption or "").splitlines() if line.strip()),
                 "a music video")
     sung_text = " ".join(lines) if lines else (tag or "instrumental section")
+    style_clause = f" Visual style, identical in every scene: {style_block}." if style_block else ""
     return (
         f"integrated_multimodal_description: [Shot 1] A music video visual for the "
-        f"{tag or 'song'} section. {mood}. The scene visually interprets what is being sung: "
-        f"\"{sung_text}\".\n\n"
+        f"{tag or 'song'} section. {mood}.{style_clause} The scene visually interprets what is "
+        f"being sung: \"{sung_text}\".\n\n"
         "overall_soundscape: the song's own vocals and instrumentation continue, no separate "
         "diegetic sound.\n\n"
         f"non_diegetic_music: {mood}, continuing the song's own performance."
     )
 
 
-def build_clip_scenes(track: dict) -> list[dict]:
+def build_clip_scenes(track: dict, *, style_block: str | None = None) -> list[dict]:
     """The coverage-complete scene list for a `kind="clip"` project, once its track is measured
     (design spec, "Клипы": "клип на песню ... сцены привязываются к секциям песни ПОСЛЕ этапа
     трека"; lyric-video-director principle: "таймлайн покрывает 0 -> длительность трека без дыр").
@@ -954,11 +1002,30 @@ def build_clip_scenes(track: dict) -> list[dict]:
     folded into that neighbour when it is shorter. Every resulting scene is then folded (too short)
     or split (too long) to H3's own `[SCENE_MIN_SECONDS, SCENE_MAX_SECONDS]` range.
 
+    **The effective gap threshold is `SCENE_MIN_SECONDS` (5s), not `GAP_SCENE_THRESHOLD_SECONDS`
+    (1.5s) (I3, fix round 1, 2026-08-19 review).** See `GAP_SCENE_THRESHOLD_SECONDS`'s own docstring
+    for why: the unconditional second fold pass (`SCENE_MIN_SECONDS`) runs *after* the gap-specific
+    one and swallows any gap segment shorter than 5s regardless of whether it cleared 1.5s, so no
+    gap under 5s ever survives as its own instrumental scene in practice.
+
+    `style_block` (fix round 1, 2026-08-19 review -- reviewer's verdict, "дешёвая правка против
+    дрейфа"): a literal sentence glued onto *every* scene's own prompt, sung and gap-fallback alike
+    (`_clip_section_prompt`), the same words each time -- `docs/h3-prompt-system.md`'s "same words"
+    rule for keeping a visual style from drifting scene to scene, applied here with the only
+    material this project has to draw one from (see `_clip_style_block`). Defaults to
+    `_clip_style_block(track["caption"])` when not given explicitly -- a caller (Task 7) that later
+    grows a real visual-bible field can pass it here directly instead.
+
     Validates the total against `track["duration"]` (Task 3's `ffprobe` reading, **never**
     `sections[-1]["end"]` -- a lyric boundary that routinely stops short of the track's actual
-    audio) within `_COVERAGE_TOLERANCE_SECONDS`, and raises `ProjectSceneBuildError` if a track has
-    no measured duration yet, or if it has sung sections but `lyrics` yields no lines for any of
-    them (nothing to build a prompt from).
+    audio) within `_COVERAGE_TOLERANCE_SECONDS`, **and, since fix round 1 (M5, 2026-08-19 review),
+    the shape of the timeline itself** -- the first scene must start at `0.0` and every consecutive
+    pair of scenes must share an exact boundary (`prev["end"] == next["start"]`), not only the sum
+    of their durations: a bug that shifts every scene by the same offset, or that overlaps one pair
+    while leaving a gap in another, could sum correctly while still leaving the timeline broken, and
+    the total-only check would never see it. Raises `ProjectSceneBuildError` if a track has no
+    measured duration yet, or if it has sung sections but `lyrics` yields no lines for any of them
+    (nothing to build a prompt from), or if either shape check above fails.
 
     Returns `Project.scenes`-shaped dicts (`idx`/`prompt`/`duration`/`status="pending"`/
     `job_id=None`/`clip_path=None`/`keyframe_path=None`), ready to assign to `project.scenes`.
@@ -971,7 +1038,9 @@ def build_clip_scenes(track: dict) -> list[dict]:
     sections = track.get("sections") or []
     lyrics = track.get("lyrics") or ""
     caption = track.get("caption") or ""
-    section_names, lines = songrun._parse_lyrics(lyrics)
+    if style_block is None:
+        style_block = _clip_style_block(caption)
+    _, lines = songrun.parse_lyrics(lyrics)
     lines_by_section: dict[int, list[str]] = {}
     for section_index, text in lines:
         lines_by_section.setdefault(section_index, []).append(text)
@@ -982,18 +1051,24 @@ def build_clip_scenes(track: dict) -> list[dict]:
         # whole thing, built the same way a real section would be, not routed through the
         # gap-fallback template (there is no "neighbouring scene" to reference).
         segments = [{**segments[0],
-                    "prompt": _clip_section_prompt("instrumental", [], caption)}]
+                    "prompt": _clip_section_prompt("instrumental", [], caption, style_block)}]
     else:
         for seg in segments:
             if seg["sung"]:
-                tag = (section_names[seg["section_index"]]
-                       if seg["section_index"] < len(section_names) else "")
+                # M4 (fix round 1, 2026-08-19 review): the section's own name comes from
+                # `track["sections"]` itself (`Project`'s own schema, task 1/2) -- `sections` is
+                # already positionally aligned with `songrun.parse_lyrics`'s own `lines` (both
+                # index by tag *occurrence*, task 2's convention), so re-deriving the name a second
+                # time out of `parse_lyrics`'s own `section_names` return was reparsing the same
+                # fact `sections[i]["name"]` already states, not a second independent source.
+                tag = sections[seg["section_index"]].get("name", "") \
+                    if seg["section_index"] < len(sections) else ""
                 section_lines = lines_by_section.get(seg["section_index"], [])
                 if not section_lines:
                     raise ProjectSceneBuildError(
                         f"section {seg['section_index']} ({tag!r}) is sung (start is known) but "
                         f"has no lyric lines to build a prompt from")
-                seg["prompt"] = _clip_section_prompt(tag, section_lines, caption)
+                seg["prompt"] = _clip_section_prompt(tag, section_lines, caption, style_block)
             else:
                 seg["prompt"] = None  # resolved below, once the gap-threshold fold has run
 
@@ -1012,6 +1087,18 @@ def build_clip_scenes(track: dict) -> list[dict]:
         pieces = (_split_long_segment(seg) if seg["end"] - seg["start"] > SCENE_MAX_SECONDS
                  else [seg])
         expanded.extend(pieces)
+
+    # M5 (fix round 1, 2026-08-19 review): the timeline's own shape, not only its total -- see the
+    # function's own docstring for why a shape bug can sum correctly and still be broken.
+    if expanded and abs(expanded[0]["start"] - 0.0) > _COVERAGE_TOLERANCE_SECONDS:
+        raise ProjectSceneBuildError(
+            f"built scenes start at {expanded[0]['start']:.3f}s, not 0.0s -- coverage is not "
+            f"complete")
+    for prev, nxt in zip(expanded, expanded[1:]):
+        if abs(prev["end"] - nxt["start"]) > _COVERAGE_TOLERANCE_SECONDS:
+            raise ProjectSceneBuildError(
+                f"built scenes have a seam at {prev['end']:.3f}s/{nxt['start']:.3f}s -- coverage "
+                f"is not complete")
 
     total = sum(seg["end"] - seg["start"] for seg in expanded)
     if abs(total - duration) > _COVERAGE_TOLERANCE_SECONDS:
@@ -1051,12 +1138,29 @@ def _project_active_job(proj, jobs) -> dict | None:
     cannot be trusted to say "running" on its own, but at most one of the three can ever be true at
     once (script/track/scenes/assembly are sequential), so there is never a real ambiguity to break
     a tie on.
+
+    **A fourth check, added for I1 (fix round 1, 2026-08-19 review): a project-scene job the queue
+    still has pending/running that no scene in `proj.scenes` points to any more.** `_retry_project_
+    scene` cancels a tail scene's own pending job before it invalidates the chain (see that route's
+    own docstring), but that cancellation is best-effort -- a job the worker already claimed between
+    the scan and the cancel attempt cannot be un-claimed, and `invalidate_scene_chain` still clears
+    that scene's own `job_id` regardless. Once cleared, the first loop above can never find that job
+    again by any scene's own bookkeeping, yet the job is still real and still writes into this
+    project's own directory once it finishes -- exactly what the delete gate below exists to catch.
+    Found by `assemble.parse_scene_note` alone (the job's own `note`, not anything on `proj`), the
+    same way `_retry_project_scene`'s own cancellation finds its targets.
     """
     by_id = {job.id: job for job in jobs if job.state in ("pending", "running")}
     for scene in sorted(proj.scenes, key=lambda scene: scene.get("idx", 0)):
         if scene.get("status") == "running" and scene.get("job_id") in by_id:
             job = by_id[scene["job_id"]]
             return {"kind": "scene", "idx": scene["idx"], "job": job.as_dict()}
+    for job in jobs:
+        if job.state not in ("pending", "running"):
+            continue
+        parsed = assemble_module.parse_scene_note(job.note)
+        if parsed is not None and parsed[0] == proj.id:
+            return {"kind": "scene", "idx": parsed[1], "job": job.as_dict()}
     song_job = _project_job_by_args(jobs, proj.path, q.KIND_SONG)
     if song_job is not None:
         return {"kind": "track", "job": song_job.as_dict()}
@@ -1066,13 +1170,19 @@ def _project_active_job(proj, jobs) -> dict | None:
     return None
 
 
-def project_summary(proj, queue_root) -> dict:
+def project_summary(proj, jobs) -> dict:
     """One row of the project list (`GET /api/projects`, and `/api/state`'s own `"projects"` --
     design spec, "Веб": "список: название, kind, этап, прогресс сцен") -- everything the list page
     needs without loading each project's full `project.json` a second time on the detail page.
+
+    **`jobs` is a caller-supplied, already-scanned list, not a `queue_root` this function scans
+    itself (I2, fix round 1, 2026-08-19 review).** Before this fix, every call scanned the queue on
+    its own -- fine for `GET /api/projects/<id>` (one project, one scan), but `/api/state` and `GET
+    /api/projects` each call this once per project while listing *every* project, which turned into
+    P+1 full queue scans per request (every 20s, from `/api/state`'s own poll) for what is really
+    one scan's worth of information. The caller (`build_state`/`_list_projects`) now scans once and
+    passes the same `jobs` list to every `project_summary` call.
     """
-    with queue_errors(queue_root):
-        jobs, _broken = q.scan(queue_root)
     scenes = proj.scenes
     return {
         "id": proj.id, "kind": proj.kind, "title": proj.title, "created_at": proj.created_at,
@@ -2873,11 +2983,16 @@ class _Handler(BaseHTTPRequestHandler):
     def _list_projects(self) -> tuple[int, str, bytes]:
         """`GET /api/projects`: every project under `<outdir>/projects/`, summarised -- design
         spec, "Веб": "список: название, kind, этап, прогресс сцен".
+
+        I2 (fix round 1, 2026-08-19 review): the queue is scanned once, here, and the same `jobs`
+        list is handed to every `project_summary` call -- not one `q.scan` per project, which is
+        what this route (and `build_state`'s own "projects" key) used to do.
         """
         projects = project_module.list_projects(self.server.outdir)
+        with queue_errors(self.server.queue_root):
+            jobs, _broken = q.scan(self.server.queue_root)
         return 200, "application/json", _json_bytes(
-            {"ok": True,
-             "projects": [project_summary(proj, self.server.queue_root) for proj in projects]})
+            {"ok": True, "projects": [project_summary(proj, jobs) for proj in projects]})
 
     def _read_project(self, raw_id: str) -> tuple[int, str, bytes]:
         """`GET /api/projects/<id>`: the full `project.json`, plus the one queue job (if any) that
@@ -3006,7 +3121,13 @@ class _Handler(BaseHTTPRequestHandler):
             if not raw_track_path:
                 raise CliError("args_invalid",
                                "`track_path` is required when track_source='import'", {})
-            resolved = resolve_within(raw_track_path, self.server.roots, write=False)
+            # M6 (fix round 1, 2026-08-19 review): scoped to `outdir` alone, not the server's
+            # whole `roots` (which also includes `repo`/`models`) -- an imported track can only
+            # ever be a file this same server already accepted through `/api/uploads`
+            # (`<outdir>/uploads/...`), same narrowing `resolve_prompt_name`/`_project_dir` already
+            # use for their own single-root path checks.
+            resolved = resolve_within(
+                raw_track_path, {"outdir": Path(self.server.outdir)}, write=False)
             if resolved.suffix.lower() not in UPLOAD_AUDIO_SUFFIXES:
                 raise CliError(
                     "args_invalid",
@@ -3085,6 +3206,23 @@ class _Handler(BaseHTTPRequestHandler):
         because `track` genuinely never reaches `"awaiting_approval"` until a song job -- itself
         only submitted once `script` is approved -- has actually run.
 
+        **`proj.approve_stage(stage)` runs *last*, only once every side effect below has actually
+        succeeded (C1, fix round 1, 2026-08-19 review).** The previous order -- `approve_stage`
+        first, side effect after -- committed `"approved"` to `project.json` before
+        `build_clip_scenes`/`_submit_project_song_job` had a chance to fail; a failure left the
+        stage stuck `"approved"` forever with nothing actually submitted or built: a repeat
+        `POST .../approve/<stage>` answers `409 project_stage_not_ready` (the stage is not
+        `"awaiting_approval"` any more), and neither `scenes/<idx>/retry` nor `assembly/retry`
+        exist to fix a stage that never produced anything to retry in the first place -- the
+        project was dead with no way back in short of hand-editing `project.json`. Doing the side
+        effect first and the approval last needs no rollback on failure: nothing here has to check
+        whether `advance_project` (video's `script` gate) needs `stages.script` already
+        `"approved"` to do its job, because it does not -- `advance_project` re-derives everything
+        it needs from `proj.scenes`/`proj.stages.scenes`, never from `stages.script`/`stages.track`
+        (see its own docstring's "three outcomes" -- none of them reads either). If a side effect
+        *does* raise, the stage is simply left exactly where it was (`"awaiting_approval"`), and the
+        same `POST .../approve/<stage>` call is the retry -- no separate recovery endpoint needed.
+
         **What each gate starts, once passed:**
 
         * `script`, `kind="video"` -- `assemble.advance_project` (the same call `Task 4`'s own
@@ -3096,13 +3234,27 @@ class _Handler(BaseHTTPRequestHandler):
           for this project before this moment, so a blind bulk write is safe, same reasoning as
           `_create_project`'s own), then `assemble.advance_project` submits scene 0, exactly like a
           video project's script gate does.
-        * `track`, `kind="song"` -- nothing further: the mp3 already is the product (design spec:
-          "для kind=song проект на этом завершён").
-        * `track`, `kind="video"` -- an optional song on a video project (design spec, "Суть":
-          "звук ... опционально песня") is out of this task's v1 scope: nothing here ever moves a
-          video project's `stages.track` to `"awaiting_approval"` in the first place (script
-          approval for `kind="video"` never submits a song job), so this combination's gate is
-          unreachable in practice, not specially refused.
+        * `track`, `kind="song"` -- nothing to submit: the mp3 already is the product (design spec:
+          "для kind=song проект на этом завершён"). **M2 (fix round 1, 2026-08-19 review):**
+          `stages.scenes`/`stages.assembly` are explicitly set to `"done"` here rather than left at
+          whatever they were created with (`"draft"`, forever) -- a `kind="song"` project has no
+          scenes and no assembly step at all, and leaving those two stages at `"draft"` reads, on
+          the project list (`scenes_total: 0`, `stages.assembly: "draft"`), as "not started yet"
+          rather than "this project is finished" -- indistinguishable from a project nobody has
+          touched. `"done"` is the terminal `STAGE_STATUSES` value every other stage's own pipeline
+          already lands on for "nothing more to do here"; documented here for Task 7's own list/
+          detail rendering: a `kind="song"` project is complete exactly when `stages.track ==
+          "approved"` (equivalently, once `stages.scenes`/`stages.assembly` read `"done"`).
+        * `track`, `kind="video"` -- **M3 (fix round 1, 2026-08-19 review): refused explicitly**
+          (`409 project_stage_not_ready`), not silently accepted. An optional song on a video
+          project (design spec, "Суть": "звук ... опционально песня") is out of this task's v1
+          scope: nothing here ever moves a video project's `stages.track` to `"awaiting_approval"`
+          in the first place (script approval for `kind="video"` never submits a song job), so this
+          combination is unreachable through the ordinary routes -- but the gate check above only
+          looks at `stages.track`'s own value, not `proj.kind`, so a project coaxed into this shape
+          by hand (or by a future bug) used to fall through every `if`/`elif` below with no side
+          effect *and* no refusal, silently answering `ok: true` having approved a stage that meant
+          nothing. Refusing it by name is honest about "this is not supported", not "it worked".
         """
         if stage not in ("script", "track"):
             raise CliError(
@@ -3115,7 +3267,6 @@ class _Handler(BaseHTTPRequestHandler):
                 "project_stage_not_ready",
                 f"стадия {stage!r} проекта {raw_id} не ждёт утверждения (сейчас {current!r})",
                 {"id": raw_id, "stage": stage, "status": current})
-        proj.approve_stage(stage)
 
         result: dict = {"stage": stage}
         if stage == "script":
@@ -3133,10 +3284,60 @@ class _Handler(BaseHTTPRequestHandler):
             proj.save()
             result["advance"] = assemble_module.advance_project(
                 proj, self.server.queue_root, self.server.outdir)
+        elif stage == "track" and proj.kind == "song":
+            proj.set_stage_status("scenes", "done")
+            proj.set_stage_status("assembly", "done")
+        elif stage == "track" and proj.kind == "video":
+            raise CliError(
+                "project_stage_not_ready",
+                f"проект {raw_id}: 'track' не гейтуется для kind='video' (опциональная песня "
+                f"вне v1)", {"id": raw_id, "stage": stage, "kind": proj.kind})
+
+        proj.approve_stage(stage)
 
         reloaded = project_module.load_project(proj.path)
         return 200, "application/json", _json_bytes(
             {"ok": True, **result, "project": reloaded.as_dict()})
+
+    def _cancel_project_scene_tail_jobs(self, proj, idx: int) -> list[str]:
+        """Cancel every still-*pending* queue job that is a project-scene job for `proj`, index
+        `idx` or later -- I1 (fix round 1, 2026-08-19 review), called by `_retry_project_scene`
+        right before it invalidates the chain.
+
+        `invalidate_scene_chain` only ever touches `project.json` -- it has no idea the queue even
+        exists, so a scene job already sitting in `pending/` for a scene about to be invalidated
+        would otherwise survive completely untouched: the worker could claim it *before* the fresh
+        resubmit `advance_project` makes right after, burning GPU minutes on a clip built from a
+        keyframe that is about to be replaced (or, for `idx` itself, on the exact attempt being
+        retried away). Until the worker actually claims it, that orphaned job is also invisible to
+        `_project_active_job`'s own first check (its scene's `job_id` was just cleared), which is
+        the DELETE gate's own protection -- see that function's own I1 fix for the other half of
+        this.
+
+        Found by `assemble.parse_scene_note(job.note)`, not by any scene's own `job_id` on `proj`
+        (about to be cleared by the invalidation this precedes) -- the same source `_project_active_
+        job`'s own fallback reads. `q.cancel` only ever removes a job still in `pending/`; a job the
+        worker already claimed (now `running/`) cannot be cancelled here or anywhere else in this
+        server, and is left alone deliberately -- racing an already-running job further is not this
+        route's job, and `q.cancel` would just raise `JobNotPending` for it, caught and ignored
+        below like any other "already claimed by the time we got here" race.
+        """
+        with queue_errors(self.server.queue_root):
+            jobs, _broken = q.scan(self.server.queue_root)
+        cancelled = []
+        for job in jobs:
+            if job.state != "pending":
+                continue
+            parsed = assemble_module.parse_scene_note(job.note)
+            if parsed is None or parsed[0] != proj.id or parsed[1] < idx:
+                continue
+            try:
+                q.cancel(self.server.queue_root, job.id)
+            except q.JobNotPending:
+                # Claimed between the scan above and this call -- nothing left to cancel.
+                continue
+            cancelled.append(job.id)
+        return cancelled
 
     def _retry_project_scene(self, raw_id: str, raw_idx: str) -> tuple[int, str, bytes]:
         """`POST /api/projects/<id>/scenes/<idx>/retry`: "пересчёт отдельной сцены" (design spec,
@@ -3144,6 +3345,16 @@ class _Handler(BaseHTTPRequestHandler):
         (`Project.invalidate_scene_chain`, "честное предупреждение": every later scene's automatic
         keyframe was derived, transitively, from this one's own clip), then resubmits from there
         (`assemble.advance_project`, the same call the script/track gates use to start the chain).
+
+        **Cancels the tail's own pending queue jobs first (I1, fix round 1, 2026-08-19 review),
+        before invalidating anything on `project.json`** -- see `_cancel_project_scene_tail_jobs`'s
+        own docstring for why this must happen at all. Cancelling first, invalidating second (rather
+        than the reverse) narrows the race: `invalidate_scene_chain` clears a scene's own `job_id`
+        immediately, so doing it *before* the cancellation scan would make an orphaned job
+        unreachable, by `job_id`, one write earlier than necessary. Not airtight either way -- a job
+        can still be claimed in the gap between this method's own scan and its `q.cancel` call, best
+        effort by construction (see that method's own docstring) -- but this ordering is strictly
+        better than the reverse, at zero extra cost.
         """
         try:
             idx = int(raw_idx)
@@ -3152,6 +3363,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "args_invalid", f"a scene index must be an integer, and {raw_idx!r} is not",
                 {"idx": raw_idx})
         proj = self._load_project(raw_id)
+        self._cancel_project_scene_tail_jobs(proj, idx)
         try:
             proj.invalidate_scene_chain(idx)
         except project_module.UnknownScene as exc:

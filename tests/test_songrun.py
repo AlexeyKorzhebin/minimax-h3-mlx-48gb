@@ -315,7 +315,7 @@ def test_c1_fixture_repro_real_kolybelnaya_chorus_repeated_second_occurrence_uns
     whisper_text = (DATA_DIR / "kolybelnaya-whisper.txt").read_text(encoding="utf-8")
     assert "песка" in whisper_text, "fixture must contain the real в висках -> песка mishearing"
 
-    section_names, lines = sr._parse_lyrics(lyrics_text)
+    section_names, lines = sr.parse_lyrics(lyrics_text)
     chorus_lines = [text for idx, text in lines if section_names[idx] == "chorus"][:8]
     assert len(chorus_lines) == 8
     lyrics = "[chorus]\n" + "\n".join(chorus_lines) + "\n[chorus]\n" + "\n".join(chorus_lines)

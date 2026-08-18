@@ -63,9 +63,12 @@ def test_build_clip_scenes_covers_the_full_track_with_an_intro_gap():
     assert sum(s["duration"] for s in scenes) == pytest.approx(20.0, abs=0.01)
     assert all(web.SCENE_MIN_SECONDS - 0.01 <= s["duration"] <= web.SCENE_MAX_SECONDS + 0.01
               for s in scenes)
-    # An intro of 4s clears GAP_SCENE_THRESHOLD_SECONDS (1.5) but not SCENE_MIN_SECONDS (5) -- it
-    # is folded into the first sung scene by the second (H3 length) fold pass, not kept bare.
-    assert "инструментальная интерлюдия" not in scenes[0]["prompt"] or len(scenes) == 3
+    # I3 (fix round 1, 2026-08-19 review): the *effective* gap threshold is SCENE_MIN_SECONDS
+    # (5s), not GAP_SCENE_THRESHOLD_SECONDS (1.5s) -- an intro of 4s clears 1.5s but not 5s, so
+    # the unconditional second (H3-length) fold pass swallows it straight back into a neighbour,
+    # discarding the gap-fallback prompt entirely. Stated directly, not as a tautological "A or
+    # len(scenes) == 3" that was true regardless of which branch actually ran.
+    assert not any("инструментальная интерлюдия" in s["prompt"] for s in scenes)
     assert [s["idx"] for s in scenes] == list(range(len(scenes)))
     for s in scenes:
         assert s["status"] == "pending"
@@ -73,6 +76,8 @@ def test_build_clip_scenes_covers_the_full_track_with_an_intro_gap():
 
 
 def test_build_clip_scenes_keeps_a_long_enough_intro_as_its_own_instrumental_scene():
+    """The other side of I3's own point: an intro of 8s clears *both* thresholds (1.5s and the
+    effective 5s), so it survives the second fold pass and keeps its own gap-fallback prompt."""
     sections = [{"name": "intro", "start": None, "end": None},
                 {"name": "verse", "start": 8.0, "end": 16.0},
                 {"name": "chorus", "start": 16.0, "end": None}]
@@ -148,6 +153,83 @@ def test_build_clip_scenes_refuses_a_sung_section_with_no_lyric_lines():
     """
     with pytest.raises(web.ProjectSceneBuildError, match="no lyric lines"):
         web.build_clip_scenes(_track([{"start": 0.0, "end": None}], 10.0, ""))
+
+
+def test_build_clip_scenes_glues_a_literal_style_block_onto_every_scene(monkeypatch):
+    """The drift-fix minor (fix round 1, 2026-08-19 review): `style_block` -- by default, the
+    first sentence of `caption`'s own Global Metadata section -- is glued verbatim onto every
+    scene's own prompt, sung and gap-fallback alike (`docs/h3-prompt-system.md`'s "same words"
+    rule for keeping a visual style from drifting scene to scene)."""
+    sections = [{"name": "intro", "start": None, "end": None},
+                {"name": "verse", "start": 8.0, "end": 16.0},
+                {"name": "chorus", "start": 16.0, "end": None}]
+    track = _track(sections, 24.0, _THREE_SECTION_LYRICS,
+                   caption="Wistful synthwave ballad.\n\nVocal Details: breathy alto.")
+    scenes = web.build_clip_scenes(track)
+    assert len(scenes) >= 2
+    for s in scenes:
+        assert "Wistful synthwave ballad" in s["prompt"]
+
+    # An explicit `style_block` overrides the caption-derived default, verbatim -- checked against
+    # the style clause specifically, since `caption`'s first line also independently drives the
+    # unrelated "mood" text `_clip_section_prompt` always includes (a coincidental overlap when
+    # `style_block` is left at its caption-derived default, not true once it is overridden).
+    scenes2 = web.build_clip_scenes(track, style_block="A hand-drawn watercolor music video")
+    for s in scenes2:
+        assert "Visual style, identical in every scene: A hand-drawn watercolor music video" \
+            in s["prompt"]
+        assert "Visual style, identical in every scene: Wistful synthwave ballad" \
+            not in s["prompt"]
+
+
+def test_build_clip_scenes_refuses_when_coverage_does_not_start_at_zero(monkeypatch):
+    """M5 (fix round 1, 2026-08-19 review): the built timeline's own shape is validated, not only
+    its total duration -- a hypothetical bug that shifts every scene's own boundaries by the same
+    offset would leave the summed duration untouched while the timeline itself no longer starts at
+    0. `_clip_raw_segments`'s own convention makes this unreachable through real track data (see
+    its docstring), so this proves the new guard fires by patching the internal fold helper the
+    same way a latent bug would corrupt its output.
+    """
+    real_fold = web._fold_short_segments
+    calls = []
+
+    def spied_fold(segments, *a, **kw):
+        result = real_fold(segments, *a, **kw)
+        calls.append(result)
+        if len(calls) == 2:  # the SCENE_MIN_SECONDS pass -- the last one before split/expand
+            shifted = [{**result[0], "start": result[0]["start"] + 1.0}] + list(result[1:])
+            shifted[-1] = {**shifted[-1], "end": shifted[-1]["end"] + 1.0}
+            return shifted
+        return result
+
+    monkeypatch.setattr(web, "_fold_short_segments", spied_fold)
+    sections = [{"name": "verse", "start": 0.0, "end": None}]
+    with pytest.raises(web.ProjectSceneBuildError, match="not 0.0s"):
+        web.build_clip_scenes(_track(sections, 10.0, "[verse]\nHello there\n"))
+
+
+def test_build_clip_scenes_refuses_a_seam_gap_between_scenes(monkeypatch):
+    """M5's other half: a gap (or overlap) *between* two scenes that leaves the summed duration
+    unchanged (the shift on one boundary is exactly cancelled by an equal shift on its own other
+    boundary) must still be refused -- the total-only check alone cannot see it."""
+    real_fold = web._fold_short_segments
+    calls = []
+
+    def spied_fold(segments, *a, **kw):
+        result = real_fold(segments, *a, **kw)
+        calls.append(result)
+        if len(calls) == 2 and len(result) >= 2:
+            shifted = [result[0],
+                      {**result[1], "start": result[1]["start"] + 0.5,
+                       "end": result[1]["end"] + 0.5}] + list(result[2:])
+            return shifted
+        return result
+
+    monkeypatch.setattr(web, "_fold_short_segments", spied_fold)
+    sections = [{"name": "verse", "start": 0.0, "end": None},
+               {"name": "chorus", "start": 6.0, "end": None}]
+    with pytest.raises(web.ProjectSceneBuildError, match="seam"):
+        web.build_clip_scenes(_track(sections, 12.0, _TWO_SECTION_LYRICS))
 
 
 # == Server fixtures ===============================================================================
@@ -444,6 +526,100 @@ def test_approve_script_for_a_clip_project_submits_a_song_job(_serve):
     assert detail["active_job"]["kind"] == "track"
 
 
+def test_approve_track_for_a_video_project_is_refused_explicitly(_serve):
+    """M3 (fix round 1, 2026-08-19 review): `stage='track'` never legitimately applies to
+    `kind='video'` -- script approval for a video project never submits a song job, so
+    `stages.track` should never reach `awaiting_approval` in the first place. If it is coaxed
+    there anyway (by hand, or by a future bug), the route must refuse it explicitly (409), not
+    silently answer `ok: true` having done nothing -- the old behaviour before this fix."""
+    srv = _serve()
+    pid = srv.post_json("/api/projects", {"kind": "video"})["id"]
+    proj = project_module.load_project(Path(srv.root) / "projects" / pid / "project.json")
+    proj.set_stage_status("track", "awaiting_approval")
+
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/approve/track", {})
+    assert (status, payload["error"]["code"]) == (409, "project_stage_not_ready"), payload
+
+    # And the stage must not have been quietly approved before the refusal.
+    stuck = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert stuck["stages"]["track"] == "awaiting_approval"
+
+
+# == C1: a failed side effect must not leave a stage stuck "approved" =============================
+
+
+def test_approve_track_survives_a_failed_scene_build_and_can_be_retried(_serve):
+    """C1 (fix round 1, 2026-08-19 review): `approve_stage` must run *after* `build_clip_scenes`
+    actually succeeds, not before it. Before this fix, a failed build left `stages.track` stuck
+    `"approved"` forever with no scenes ever built and no way back in -- a repeat `approve/track`
+    answered 409 (the stage was no longer `awaiting_approval`), and there is no separate "retry the
+    track build" endpoint, only `scenes/<idx>/retry`, which needs a scene to already exist.
+    """
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="clip", scenes=None, lyrics=_TWO_SECTION_LYRICS,
+                           caption="Warm pop."))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    project_path = Path(srv.root) / "projects" / pid / "project.json"
+    proj = project_module.load_project(project_path)
+    # No `duration` set yet -- `build_clip_scenes` must refuse (the worker normally sets it,
+    # Task 3's I4; forcing the gate open by hand is the only way to reach this state through the
+    # routes, same technique `test_approve_track_for_a_clip_project_with_an_unmeasured_track_is_
+    # refused_honestly` already uses).
+    proj.set_stage_status("track", "awaiting_approval")
+
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/approve/track", {})
+    assert (status, payload["error"]["code"]) == (400, "project_scene_build_failed"), payload
+
+    stuck = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert stuck["stages"]["track"] == "awaiting_approval", (
+        "a failed build must not leave the project stuck 'approved' with no scenes and no retry "
+        "path -- the same gate must still be open")
+    assert stuck["scenes"] == []
+
+    # Fix the track (the worker's own I4 write, done by hand here) and retry the *same* gate.
+    proj2 = project_module.load_project(project_path)
+    proj2.update_track(duration=8.0, sections=[{"name": "verse", "start": 0.0, "end": None}])
+    retried = srv.post_json(f"/api/projects/{pid}/approve/track", {})
+    assert retried["project"]["stages"]["track"] == "approved"
+    assert retried["advance"]["action"] == "submitted_scene"
+    assert len(retried["project"]["scenes"]) >= 1
+
+
+def test_approve_script_survives_a_failed_song_submit_and_can_be_retried(_serve):
+    """C1's other half: a failed *submit* (not a failed build) must leave the same gate retryable
+    too. `output_stem_conflict` is a real, deterministic way to make `q.submit` fail without
+    monkeypatching internals -- a leftover artifact already claims the exact `output_stem`
+    `_submit_project_song_job` always uses for this project's song job.
+    """
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="song", scenes=None, lyrics=_TWO_SECTION_LYRICS,
+                           caption="Warm pop."))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+
+    project_path = Path(srv.root) / "projects" / pid / "project.json"
+    track_dir = project_path.parent / "track"
+    track_dir.mkdir(parents=True, exist_ok=True)
+    (track_dir / "job-song.json").write_bytes(b"{}")  # claims the song job's own output_stem
+
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/approve/script", {})
+    assert (status, payload["error"]["code"]) == (400, "output_stem_conflict"), payload
+
+    stuck = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert stuck["stages"]["script"] == "awaiting_approval", (
+        "a failed submit must not leave the project stuck 'approved' with nothing queued")
+
+    jobs, _broken = q.scan(srv.queue_root)
+    assert not any(j.state in ("pending", "running") for j in jobs), (
+        "nothing should have been queued by the failed attempt")
+
+    (track_dir / "job-song.json").unlink()
+    retried = srv.post_json(f"/api/projects/{pid}/approve/script", {})
+    assert "job_id" in retried["submit"]
+    assert retried["project"]["stages"]["script"] == "approved"
+
+
 # == Full lifecycle: song project (mock queue + worker) ===========================================
 
 
@@ -484,8 +660,11 @@ def test_song_project_full_lifecycle(_serve, monkeypatch, tmp_path):
 
     approved_track = srv.post_json(f"/api/projects/{pid}/approve/track", {})
     assert approved_track["project"]["stages"]["track"] == "approved"
-    assert approved_track["project"]["stages"]["assembly"] == "draft", (
-        "kind=song never reaches assembly -- the mp3 already is the product")
+    # M2 (fix round 1, 2026-08-19 review): kind=song has no scenes/assembly of its own -- both
+    # stages are set explicitly to the terminal "done" (not left at "draft" forever, which would
+    # read as "not started" rather than "this project is finished").
+    assert approved_track["project"]["stages"]["scenes"] == "done"
+    assert approved_track["project"]["stages"]["assembly"] == "done"
     assert "advance" not in approved_track  # nothing further to submit for kind=song
 
     jobs, _broken = q.scan(srv.queue_root)
@@ -633,6 +812,44 @@ def test_retry_scene_invalidates_the_chain_and_resubmits(_serve):
         "invalidate_scene_chain must reset every scene from idx onward")
 
 
+def test_retry_scene_cancels_an_orphaned_pending_tail_job(_serve):
+    """I1 (fix round 1, 2026-08-19 review): retrying scene 0 while scene 1's own job is still
+    sitting in `pending/` (submitted, not yet claimed by a worker) must cancel that job, not leave
+    it in the queue -- otherwise a worker could claim the orphaned scene-1 job *before* the fresh
+    scene-0 resubmit even runs, burning GPU minutes on a clip built from a keyframe that is about
+    to be replaced.
+    """
+    srv = _serve()
+    sid = _new_session_with_project(srv, _project_body(kind="video", scenes=_VIDEO_SCENES))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+
+    job0 = q.claim(srv.queue_root)
+    _write_fake_clip(job0)
+    worker.run_job(srv.queue_root, job0, spawn=_scene_hook_spawn(), outdir=srv.root)
+
+    before = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert before["scenes"][0]["status"] == "done"
+    assert before["scenes"][1]["status"] == "running"
+    orphan_job_id = before["scenes"][1]["job_id"]
+
+    jobs, _broken = q.scan(srv.queue_root)
+    assert any(j.id == orphan_job_id and j.state == "pending" for j in jobs), (
+        "scene 1's own job must still be queued, not yet claimed by a worker")
+
+    retried = srv.post_json(f"/api/projects/{pid}/scenes/0/retry", {})
+    assert retried["advance"]["action"] == "submitted_scene"
+    assert retried["advance"]["idx"] == 0
+
+    jobs, _broken = q.scan(srv.queue_root)
+    ids = {j.id for j in jobs}
+    assert orphan_job_id not in ids, (
+        "retrying scene 0 must cancel scene 1's now-orphaned pending job")
+    pending = [j for j in jobs if j.state == "pending"]
+    assert len(pending) == 1, "only the fresh scene 0 resubmit should be left in the queue"
+    assert pending[0].note == assemble_module.scene_note(pid, 0)
+
+
 def test_retry_an_unknown_scene_index_is_404(_serve):
     srv = _serve()
     pid = srv.post_json("/api/projects", {"kind": "video"})["id"]
@@ -708,6 +925,39 @@ def test_delete_a_project_with_a_song_job_queued_is_refused(_serve):
 
     status, payload = srv.delete_json_raw(f"/api/projects/{pid}")
     assert (status, payload["error"]["code"]) == (409, "project_running")
+
+
+def test_delete_is_refused_while_an_orphaned_pending_scene_job_still_exists(_serve):
+    """I1 (fix round 1, 2026-08-19 review), other half: `_project_active_job` must find a pending
+    project-scene job even once nothing on `project.json` points at it any more
+    (`invalidate_scene_chain` clears `scenes[i].job_id`) -- otherwise DELETE would remove the
+    project's own directory while a job is still about to write a clip into it.
+
+    Bypasses `_retry_project_scene`'s own new cancellation (I1's other half) on purpose, calling
+    `invalidate_scene_chain` directly through `project_module` -- this isolates the race window
+    that cancellation narrows but cannot close outright (a job already claimed by the time the
+    route's own cancel attempt runs), by constructing the exact state that window can leave
+    behind: a queued job with no scene pointing at it any more.
+    """
+    srv = _serve()
+    sid = _new_session_with_project(srv, _project_body(kind="video", scenes=_VIDEO_SCENES))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+
+    job0 = q.claim(srv.queue_root)
+    _write_fake_clip(job0)
+    worker.run_job(srv.queue_root, job0, spawn=_scene_hook_spawn(), outdir=srv.root)
+    # Scene 1's own job is now pending, not yet claimed by a worker.
+
+    project_path = Path(srv.root) / "projects" / pid / "project.json"
+    proj = project_module.load_project(project_path)
+    proj.invalidate_scene_chain(0)
+
+    jobs, _broken = q.scan(srv.queue_root)
+    assert any(j.state == "pending" for j in jobs), "the orphaned job must still be sitting there"
+
+    status, payload = srv.delete_json_raw(f"/api/projects/{pid}")
+    assert (status, payload["error"]["code"]) == (409, "project_running"), payload
 
 
 # == q.update / duplicate refuse a project scene's own job ========================================
