@@ -271,6 +271,71 @@ saved under `<outdir>/uploads/`), `DELETE /api/chat/<id>` (drop a chat session's
 The page itself is three files in `h3_48gb/webui/` — `index.html`, `style.css`, `app.js` — with no
 build step, no dependency and no address off this machine in any of them.
 
+## Проекты
+
+A single clip is one job; three kinds of finished long-form content are not, so **Проекты** —
+a section in `h3 web`, between the queue and "Закончилось" — builds one of those on top of the
+same queue instead of a second execution mechanism: a *project* is nothing more than ordinary
+`generate` jobs plus a `project.json` that threads them together by job id, written atomically
+(tmp+rename, `flock`-locked) next to the rest of `<outdir>/projects/<YYYYMMDD-HHMM>-<slug>/`.
+
+Three kinds share one on-disk shape: **`video`** (a multi-scene clip), **`clip`** (a music video
+built on a generated or imported song), **`song`** (just the mastered mp3, nothing else). Every
+project moves through the same four stages — `script`, `track`, `scenes`, `assembly` — gated
+where a human has to look at the result before GPU time is spent on the next one; which stages
+actually do anything depends on `kind` (a `song` project never touches `scenes`/`assembly`, a
+`video` project without an optional song never touches `track`).
+
+A scenario comes from the chat model that already writes single-shot prompts: for `video`, a
+list of 5-10 s scenes, each a self-contained H3 prompt with character/style descriptions
+repeated verbatim in every one (a keyframe carries composition, not identity — text is the only
+thing holding a character together across cuts); for `clip`/`song`, lyrics (structural tags
+only — `[verse]`/`[chorus]`/etc, never an English stage direction inside a tag, it breaks the
+model) plus a caption carrying all the direction. Approving the **script** gate does the first
+real work: a `video` submits scene 0 (t2v, or i2v if the project carries a start image); a
+`clip`/`song` submits a `kind=song` queue job.
+
+That job runs Music3 in its own venv (`h3_48gb/songrun.py`), masters the output (highpass, a
+7-point EQ, loudnorm) to `mastered.mp3`, and Whisper-checks it against the lyrics for
+undersinging and section timing — or, for an **imported track** (`track.source="import"`, an
+existing mp3 uploaded through the now-audio-aware `/api/uploads` together with its own lyrics),
+skips generation and mastering entirely and only runs the Whisper alignment. Either path ends at
+the **track** gate. Approving it is where a `clip` gets its scenes: the song's own sung sections
+are cut into a coverage-complete timeline — 0 to the track's full duration, no gaps — folding
+short instrumental gaps (<1.5 s) into a neighboring scene and giving longer ones their own
+fallback "instrumental interlude" scene, then splitting/merging everything to H3's 5-10 s scene
+length before the first one is submitted.
+
+From there scenes chain themselves, no separate mechanism: every `generate` job tagged as a
+project scene (in its `note`, not its `kind` — a scene is an ordinary `kind=generate` job like
+any other), on completion, pulls a keyframe from the second-to-last second of its own clip and
+submits the next scene i2v against it (with the mandatory instruction line H3 requires for
+image-conditioned modes); a failed scene stops the chain instead of pressing on; the last scene
+done submits the assembly job. Assembly (`h3_48gb/assemble.py`) concatenates by direct cuts only
+(no crossfades — scene boundaries already sit on the song's musical boundaries), and wherever
+the final audio is a song, that song is sacrosanct: no `-shortest`, no time-stretch, the output's
+duration must match the track's within 0.5 s, and any shortfall is padded with a freeze-frame of
+the last cut rather than by touching the audio.
+
+The API, all under `h3_48gb/web.py`: `GET /api/projects` (summary list — kind, stage, scene
+progress — joined against the live queue for whatever is running right now, since `project.json`
+itself never records "in flight"; the same summaries ride along in `/api/state`),
+`GET /api/projects/<id>` (the full `project.json`), `POST /api/projects` (create one from a chat
+session's `project` field, or from an imported mp3 for a `clip`), `POST /api/projects/<id>/approve/<stage>`
+(`stage` is `script` or `track` — the only two gated by a human; `scenes`/`assembly` advance
+themselves, and a gate can't be jumped: it refuses `409` unless the stage it names is actually
+`awaiting_approval`), `POST /api/projects/<id>/scenes/<idx>/retry` (invalidates that scene and
+every scene after it — a keyframe chain can't rerun scene 3 without redoing 4 onward — cancels
+any orphaned queued jobs for the tail, then resubmits), `POST /api/projects/<id>/track/retry` and
+`POST /api/projects/<id>/assembly/retry` (recompute either, refused while one is already running
+or, for assembly, until its failed status is there to reset), and `DELETE /api/projects/<id>`
+(refused while any scene/track/assembly job for it is still in flight). The queue itself grew two
+job kinds dispatched by `h3_48gb/worker.py` beside the existing `generate` (still the default old
+job files with no `kind` field read as): `kind=song` (`args=["song","--project",<path>]`) runs a
+project's track job in-process; `kind=assemble` (`["assemble","--project",<path>]`) runs its
+final concat. Both share the same GPU lease/lock as generation — nothing about queueing or the
+worker's crash-safety changed to add them.
+
 ## Measured results
 
 All runs at the one schedule the baked AdaLN table supports: 31 grid points (30 forwards), sigma
