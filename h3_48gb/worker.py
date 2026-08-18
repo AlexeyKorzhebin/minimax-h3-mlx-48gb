@@ -210,11 +210,14 @@ def _caffeinate_block(spawn=subprocess.Popen):
 
 
 def _tracked_child_run(spawn=subprocess.Popen):
-    """Build a `run` callable for `songrun.run_song`/`align_track` (and, eventually, task 4's
-    `assemble.run`) that registers each subprocess it starts as `_current_child` for the exact
-    duration of the call -- the seam task 2 left for this (every subprocess call in `songrun.py`
-    goes through one injected `run(cmd, capture_output=True, text=True) -> CompletedProcess`, see
-    `songrun._run_or_raise`'s own docstring), closing C1 (fix round 1, 2026-08-18 review):
+    """Build a `run` callable for `songrun.run_song`/`align_track` and (task 4) `assemble.run`
+    that registers each subprocess it starts as `_current_child` for the exact duration of the
+    call -- the seam task 2 left for this (every subprocess call in `songrun.py` goes through one
+    injected `run(cmd, capture_output=True, text=True) -> CompletedProcess`, see
+    `songrun._run_or_raise`'s own docstring, and `assemble.py` matches it exactly), closing C1
+    (fix round 1, 2026-08-18 review), extended to a `KIND_ASSEMBLE` job's own `ffmpeg`/`ffprobe`
+    subprocess in task 4 (the same class of gap, per the controller's decision recorded in the
+    task 3 report: "assemble.run получит run= ... тот же класс дыры, что C1"):
 
     Before this, `KIND_SONG`/`KIND_ASSEMBLE` never set `_current_child` at all (only
     `KIND_GENERATE`'s own top-level `Popen` did) -- so a *second* `SIGTERM` arriving while a song job
@@ -379,6 +382,15 @@ def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
     4"), not an `ImportError` that takes the worker process down. A test substitutes a fake
     `h3_48gb.assemble` module (`sys.modules["h3_48gb.assemble"]`) to exercise the dispatch without
     the real module existing.
+
+    **`run=_tracked_child_run(spawn)` is passed into `assemble.run`** (task 4, closing the one gap
+    task 3's own C1 fix left open -- see that fix's own note in `run_job`'s docstring and in the
+    task 3 report: "`KIND_ASSEMBLE` is the one branch [C1] does not [cover]"). `assemble.run`'s
+    signature (task 4, controller's correction over the task 3 report's original
+    `assemble.run(project_path)`) is `run(project_path, *, run=subprocess.run) -> Path`, taking the
+    exact same seam `songrun.run_song`/`align_track` already accept -- so a second `SIGTERM`
+    arriving mid-assembly now reaches ffmpeg/ffprobe through `_terminate_child_group`'s `os.killpg`
+    exactly as it already reaches a song job's own subprocess.
     """
     log_lines: list[str] = []
     try:
@@ -391,8 +403,9 @@ def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
             return 1, "\n".join(log_lines) + "\n"
 
         project_path = _project_arg(job.args)
+        run = _tracked_child_run(spawn)
         with _caffeinate_block(spawn=spawn):
-            assemble.run(project_path)
+            assemble.run(project_path, run=run)
         log_lines.append("assemble job done")
         return 0, "\n".join(log_lines) + "\n"
     except Exception as exc:  # noqa: BLE001 -- same reasoning as `_run_song_job`.
@@ -400,7 +413,63 @@ def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
         return 1, "\n".join(log_lines) + "\n"
 
 
-def run_job(root, job, spawn=subprocess.Popen) -> int:
+def _handle_project_scene_result(root, outdir, job, exit_code: int, *, run) -> None:
+    """After a `KIND_GENERATE` job is filed done/failed, if its `note` marks it as a project
+    scene's own job (`h3_48gb.assemble.scene_note`'s format -- design spec: "Клипы -- обычные
+    generate-задачи с пометкой project/scene в note"), record the scene's outcome on its project
+    and continue the scene chain (`h3_48gb.assemble.advance_project`) -- task 4's brief, verbatim:
+    "advance_project ... вызывается воркером после каждого done/failed задания проекта".
+
+    An ordinary generate job (no project scene note, which is every job before task 4 and most
+    jobs after it -- the web form's own submissions) is a no-op here: `parse_scene_note` returns
+    `None` for anything that does not look exactly like this module's own `scene_note` format, and
+    this function returns immediately without touching `h3_48gb.project`/`h3_48gb.assemble` at all.
+
+    `clip_path` is read off the job's own `output_stem` (`f"{job.output_stem}.mp4"`) -- the same
+    convention `queue._stem_taken`'s `ARTIFACT_SUFFIXES` check already assumes for every
+    `KIND_GENERATE` job, and the only place this function can learn where the run actually wrote
+    without re-deriving `RunSpec.output_stem()`'s own canvas-dependent logic (which needs `mlx` for
+    an `--image` run -- exactly what this module must never import, see its own docstring). A
+    `done` job whose `.mp4` does not actually exist at that path (an unexpected shape a future bug
+    could produce) is treated the same as `failed` -- a scene without a real clip on disk is not
+    something the next scene's automatic keyframe or the final assembly can use either way.
+
+    A lazy `import h3_48gb.assemble`/`import h3_48gb.project` -- not module-level ones -- for the
+    same reason `_run_assemble_job`'s is lazy: an ordinary generate job (the overwhelming majority
+    of `KIND_GENERATE` jobs) must keep working on a checkout where `assemble.py` does not exist,
+    and importing it unconditionally at module scope would break that for no reason, since this
+    function returns before touching either module whenever `parse_scene_note` finds nothing.
+
+    **Never lets an exception escape.** A missing/corrupt `project.json`, a project directory that
+    moved, or a scene-chain step failing (a keyframe extraction, a submission) must not take the
+    whole worker process down over bookkeeping for a job that has *already* been filed done/failed
+    -- the queue's own record of this job is already correct and final by the time this runs; only
+    what happens *next* for its project is at stake. One line to stderr, matching `_llm_holds_gpu`'s
+    own "never let this kill the loop" discipline.
+    """
+    from h3_48gb import assemble
+    from h3_48gb import project as project_module
+
+    parsed = assemble.parse_scene_note(job.note)
+    if parsed is None:
+        return
+    project_id, idx = parsed
+    try:
+        proj = project_module.load_project(Path(outdir) / "projects" / project_id)
+        clip_path = f"{job.output_stem}.mp4"
+        if exit_code == 0 and Path(clip_path).is_file():
+            proj.set_scene_status(idx, "done", clip_path=clip_path)
+        else:
+            proj.set_scene_status(idx, "failed")
+        assemble.advance_project(proj, root, outdir, run=run)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: bookkeeping for an already-filed job
+        # must never take the worker down.
+        print(f"h3 worker: project scene bookkeeping failed for job {job.id} "
+              f"(project {project_id!r} scene {idx}): {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+
+def run_job(root, job, spawn=subprocess.Popen, outdir=None) -> int:
     """Run one claimed job to completion and file its result. Returns the job's exit code.
 
     The order is the contract, and every step of it is load-bearing:
@@ -430,28 +499,43 @@ def run_job(root, job, spawn=subprocess.Popen) -> int:
       own locked mutators. See `_run_song_job`'s docstring for why an undersung take is still
       success.
     * `KIND_ASSEMBLE` -- `_run_assemble_job`, in this process: a lazy `h3_48gb.assemble.run` (task
-      4; not implemented yet, see that function's docstring for the honest failure this dispatches
-      to until it is).
+      4; on a checkout that predates task 4, the lazy import itself fails the job honestly instead
+      of taking the worker down -- see that function's own docstring).
 
-    **`_current_child` is set by `KIND_GENERATE` directly, and by `KIND_SONG` through
-    `_run_song_job`'s own `run=_tracked_child_run(spawn)`** (fix round 1, C1, 2026-08-18 review --
-    see `_tracked_child_run`'s own docstring for the orphaned-GPU-process gap this closes): both
-    ultimately go through the same `_current_child` + `start_new_session=True` mechanism, so
-    `_terminate_child_group`'s "kill the child's process group" reaches a song job's own Music3/
-    `ffmpeg`/`mlx_whisper` subprocess exactly as it already reached `KIND_GENERATE`'s. `KIND_ASSEMBLE`
-    is the one branch that still does not: `h3_48gb.assemble.run(project_path)`'s own signature
-    (task 4) takes no `run` keyword to inject one through, so a second `SIGTERM` mid-assemble still
-    cannot interrupt whatever `assemble.run` is doing -- a `SIGTERM` still stops the worker from
-    taking the *next* job either way (see `_stop_signals`). Known gap for `KIND_ASSEMBLE` only, not
-    solved by this task -- see the task 3 report.
+    **After a `KIND_GENERATE` job is filed, `_handle_project_scene_result` checks whether it was a
+    project scene's own job** (task 4's `h3_48gb.assemble.scene_note` tagging its `note` --
+    design spec, "Клипы: обычные generate-задачи с пометкой project/scene в note") and, if so,
+    records the scene's outcome on its project and continues the scene chain
+    (`h3_48gb.assemble.advance_project`) -- task 4's brief: "advance_project ... вызывается
+    воркером после каждого done/failed задания проекта". See that function's own docstring for why
+    this never lets a broken project take the worker down, and `outdir`'s docstring below for where
+    it looks for the project.
+
+    **`_current_child` is set by `KIND_GENERATE` directly, and by `KIND_SONG`/`KIND_ASSEMBLE`
+    through `_run_song_job`/`_run_assemble_job`'s own `run=_tracked_child_run(spawn)`** (fix round
+    1, C1, 2026-08-18 review, extended to `KIND_ASSEMBLE` in task 4 -- see `_tracked_child_run`'s
+    own docstring for the orphaned-GPU-process gap this closes): all three ultimately go through
+    the same `_current_child` + `start_new_session=True` mechanism, so `_terminate_child_group`'s
+    "kill the child's process group" reaches a song job's own Music3/`ffmpeg`/`mlx_whisper`
+    subprocess, and an assemble job's own `ffmpeg`/`ffprobe` subprocess, exactly as it already
+    reached `KIND_GENERATE`'s. No known gap remains here for any of the three kinds.
 
     `spawn` is injectable because every test of this function must not start a real generation: a
     second MLX process on this machine is 36 GB against a 48 GB budget. The same `spawn` is reused
     by `_caffeinate_block` for the song/assemble branches' `caffeinate` companion process, and by
     `_tracked_child_run` for a song job's own subprocess calls, so one fake covers all three.
+
+    `outdir` is where a project scene's own job would be found under `<outdir>/projects/<id>/` --
+    the same value `main_loop` already resolves for `_llm_holds_gpu` (`root`'s parent whenever
+    `root` is `cli.queue_root(outdir)`, the only shape `root` actually takes), defaulted here the
+    identical way so a direct caller of `run_job` (every existing test) does not have to start
+    passing it. It is read only by `_handle_project_scene_result`, and only for a `KIND_GENERATE`
+    job whose `note` actually parses as a project scene's -- an ordinary generate job never reads
+    it at all.
     """
     global _current_child
     root = Path(root)
+    outdir = Path(outdir) if outdir is not None else root.parent
     lease = _acquire_lease(root, job.id)
     try:
         if job.kind == q.KIND_GENERATE:
@@ -484,6 +568,10 @@ def run_job(root, job, spawn=subprocess.Popen) -> int:
         _release_lease(lease)
 
     q.finish(root, job.id, exit_code, log_tail, finished_at=finished_at)
+
+    if job.kind == q.KIND_GENERATE:
+        _handle_project_scene_result(root, outdir, job, exit_code, run=_tracked_child_run(spawn))
+
     return exit_code
 
 
@@ -677,7 +765,7 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir
                 if stop.wait(poll):
                     break
                 continue
-            run_job(root, job, spawn=spawn)
+            run_job(root, job, spawn=spawn, outdir=outdir)
             ran += 1
             q.pause_if_drained(root)
 
