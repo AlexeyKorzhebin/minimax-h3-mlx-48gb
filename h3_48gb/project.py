@@ -33,13 +33,17 @@ per-*project*, not a single lock for every project under `<outdir>/projects/`: t
 projects being edited at once (a human on one project's page, a worker advancing another's scenes)
 must not serialize on each other, the way `queue.py`'s single `queue.lock` correctly does serialize
 unrelated *jobs* (they share one pending/running/done/failed state machine; two projects share
-nothing but a parent directory). Every one of the four documented mutators
-(`approve_stage`/`set_scene_status`/`next_pending_scene`/`invalidate_scene_chain`) re-reads
-`project.json` from disk *inside* the lock before touching it, exactly like `queue.py`'s `update`
-re-reads a pending job under the queue lock: a `Project` object held by one caller (the web server,
-say) must not silently clobber a change the worker wrote through a different `Project` object
-between the caller's last read and this write. `Project.save()` is the one exception -- see its own
-docstring for why a blind overwrite is the right contract there.
+nothing but a parent directory). Every locked mutator this module documents
+(`approve_stage`/`set_stage_status`/`set_scene_status`/`claim_next_scene`/`invalidate_scene_chain`/
+`update_track`/`update_assembly`) re-reads `project.json` from disk *inside* the lock before
+touching it, exactly like `queue.py`'s `update` re-reads a pending job under the queue lock: a
+`Project` object held by one caller (the web server, say) must not silently clobber a change the
+worker wrote through a different `Project` object between the caller's last read and this write.
+`next_pending_scene` is a deliberate exception -- a read-only preview, not a claim, so it neither
+takes the exclusive lock nor re-applies its re-read back onto `self`; see its own docstring, and
+`claim_next_scene`'s, for the atomic claim `next_pending_scene` itself cannot safely be used for.
+`Project.save()` is the other exception -- see its own docstring for why a blind overwrite is the
+right contract there.
 
 Messages a human reads are Russian; comments and docstrings are English -- same split as the rest
 of the package (see `queue.py`'s module docstring).
@@ -87,6 +91,11 @@ SCENE_STATUSES = ("pending", "running", "done", "failed")
 #: song (`song`), the clips' own diegetic sound with the song mixed in low underneath (`mix`), or
 #: just the clips' own sound with no song at all (`clips`).
 ASSEMBLY_AUDIO_MODES = ("song", "mix", "clips")
+
+#: The fields `update_assembly(**fields)` accepts -- exactly `assembly`'s own two keys, see
+#: `create_project`. Kept as an explicit tuple, not derived from a live `assembly` dict, since
+#: there is no `_empty_assembly()` the way there is an `_empty_track()`.
+_ASSEMBLY_FIELDS = ("audio_mode", "final_path")
 
 #: `create_project`'s default `assembly.audio_mode` per `kind`. `clip` defaults to `"song"` --
 #: the design spec is explicit that a clip-on-a-song's default is "только песня" (song only,
@@ -141,12 +150,16 @@ def _dir_stamp(created_at: str) -> str:
 
 def _slug(title: str | None) -> str:
     """`title` reduced to `[a-z0-9-]`, with whitespace/underscores folded to a single `-` first so
-    a human-typed title like "My First Video" reads as `my-first-video`, not `myfirstvideo`.
-    `"project"` if there is no title or nothing survives the filter.
+    a human-typed title like "My First Video" reads as `my-first-video`, not `myfirstvideo`, and
+    Cyrillic transliterated (`_transliterate`) before the filter so "Мой ролик" reads as
+    `moy-rolik`, not the empty string every one of its characters would otherwise strip down to.
+    `"project"` if there is no title or nothing survives the filter (e.g. a title in a script
+    `_CYRILLIC_TO_LATIN` does not cover either).
     """
     if not title:
         return "project"
     lowered = re.sub(r"[\s_]+", "-", title.strip().lower())
+    lowered = _transliterate(lowered)
     lowered = re.sub(r"[^a-z0-9-]", "", lowered)
     lowered = re.sub(r"-+", "-", lowered).strip("-")
     return lowered or "project"
@@ -160,8 +173,47 @@ def _empty_track() -> dict:
         "mp3": None,
         "mastered_mp3": None,
         "sections": [],
+        # `status` deliberately reuses no fixed enum today (unlike `stages`/`scenes`) -- task 3's
+        # Whisper gate ("трек короче лирики, увеличь длительность") may need a value outside
+        # `STAGE_STATUSES`'s six words. If that turns out false, fold this into a real
+        # `TRACK_STATUSES` tuple and validate it the same way `set_stage_status` validates
+        # `STAGE_STATUSES` -- do not invent the enum speculatively here before task 3 knows what
+        # it needs.
         "status": "draft",
     }
+
+
+#: The fields `update_track(**fields)` accepts -- exactly `_empty_track()`'s own keys, derived
+#: from it rather than duplicated so the two can never silently drift apart.
+_TRACK_FIELDS = tuple(_empty_track())
+
+
+#: `_slug`'s Russian-to-Latin table, applied before the `[a-z0-9-]` filter so a Cyrillic title
+#: (a human is not required to type an English one) does not collapse to the `"project"` fallback
+#: -- every Cyrillic codepoint the filter would otherwise strip is spelled out in Latin letters
+#: first. Deliberately a hand-written dict, not a dependency (`unidecode`/`transliterate`/etc):
+#: this is the one, fixed alphabet the filter needs covered, and pulling in a library for a
+#: 33-entry table would be the tail wagging the dog -- see the module docstring's "no mlx"
+#: discipline extended to "no needless dependencies at all" for this small a need. Common
+#: practical-transcription scheme (е/э→e, й→y, ц→ts, ч→ch, ш→sh, щ→shch, ъ/ь→dropped, ю→yu, я→ya)
+#: -- the same shape most Russian URL slugs on the web already use, so a generated slug reads as
+#: familiar rather than invented.
+_CYRILLIC_TO_LATIN = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def _transliterate(text: str) -> str:
+    """`text` (already lowercased) with every Cyrillic character in `_CYRILLIC_TO_LATIN` replaced
+    by its Latin spelling; anything not in the table (already-Latin letters, digits, the `-`
+    `_slug` folded whitespace into) passes through untouched, for the `[^a-z0-9-]` filter after
+    this to strip.
+    """
+    return "".join(_CYRILLIC_TO_LATIN.get(ch, ch) for ch in text)
 
 
 @contextlib.contextmanager
@@ -187,12 +239,40 @@ def _project_lock(project_dir, exclusive: bool):
 
 
 def _validate_shape(data, path) -> dict:
-    """`data` if it looks like a project (a dict with every field `_REQUIRED_FIELDS` names),
-    otherwise `ProjectNotFound` -- the same refusal `_read_data` raises for unparseable JSON, so a
-    caller (`list_projects`) can treat "not JSON" and "JSON but not a project" identically.
+    """`data` if it looks like a project -- a dict with every field `_REQUIRED_FIELDS` names, AND
+    the four container fields holding the type the rest of this module assumes without checking
+    again -- otherwise `ProjectNotFound`, the same refusal `_read_data` raises for unparseable
+    JSON, so a caller (`list_projects`) can treat "not JSON", "JSON but not a project" and "JSON,
+    shaped like a project, but with a field of the wrong type" identically.
+
+    The type checks exist because presence alone is not shape: `{"scenes": "notalist", ...}` has
+    every required key, but `Project._apply`'s `[dict(scene) for scene in data["scenes"]]` would
+    iterate the *string* `"notalist"` character by character and blow up on `dict("n")` with a
+    bare, uncaught `TypeError` -- a corrupt file crashing `list_projects` for every other, healthy
+    project in the same `outdir`, not the "skip with a warning" contract promises. Checking
+    `stages`/`track`/`assembly` are objects and `scenes` is an array of objects (not, e.g., a list
+    of bare strings or numbers) here turns that crash into one `ProjectNotFound`, caught by
+    `list_projects` like any other corrupt file. Deeper still -- a scene missing its own `idx` key,
+    say -- is not re-validated field by field here; `_find_scene`/`_next_ready_scene` catch that
+    layer with their own `try/except (KeyError, TypeError)`, converting it to a `ProjectError`
+    rather than letting a bare `KeyError` escape a mutator call, see there.
     """
     if not isinstance(data, dict) or any(field not in data for field in _REQUIRED_FIELDS):
         raise ProjectNotFound(f"{path} does not have the shape of a project.json")
+    if not isinstance(data["stages"], dict):
+        raise ProjectNotFound(
+            f"{path}: 'stages' must be an object, got {type(data['stages']).__name__}")
+    if not isinstance(data["scenes"], list):
+        raise ProjectNotFound(
+            f"{path}: 'scenes' must be an array, got {type(data['scenes']).__name__}")
+    if not all(isinstance(scene, dict) for scene in data["scenes"]):
+        raise ProjectNotFound(f"{path}: every element of 'scenes' must be an object")
+    if not isinstance(data["track"], dict):
+        raise ProjectNotFound(
+            f"{path}: 'track' must be an object, got {type(data['track']).__name__}")
+    if not isinstance(data["assembly"], dict):
+        raise ProjectNotFound(
+            f"{path}: 'assembly' must be an object, got {type(data['assembly']).__name__}")
     return data
 
 
@@ -214,10 +294,53 @@ def _read_data(path: Path) -> dict:
 
 
 def _find_scene(scenes: list[dict], idx: int) -> dict:
+    """The scene dict with `idx == idx` inside `scenes`, or `UnknownScene`. A scene missing its own
+    `idx` key entirely (on-disk corruption `_validate_shape` does not check this deep, see its own
+    docstring) raises `ProjectError`, not a bare `KeyError` -- a caller catching this module's own
+    exception family (the web layer, task 6) must not also have to catch built-in exceptions to be
+    safe against a hand-edited or half-written file.
+    """
     for scene in scenes:
-        if scene["idx"] == idx:
+        try:
+            scene_idx = scene["idx"]
+        except KeyError as exc:
+            raise ProjectError(f"malformed scene entry (missing 'idx'): {scene!r}") from exc
+        if scene_idx == idx:
             return scene
     raise UnknownScene(f"no scene with idx={idx}")
+
+
+def _next_ready_scene(scenes: list[dict]) -> dict | None:
+    """The scene `next_pending_scene`/`claim_next_scene` agree is next, or `None` -- the shared
+    sequential-dependency walk both need (see `next_pending_scene`'s own docstring for the policy:
+    a `done` scene lets the walk continue, the first `pending` scene found is the answer, anything
+    else -- `running`/`failed` -- means the chain is not caught up and every scene from there on is
+    `None`, including a `pending` one sitting behind a `failed` one).
+
+    Returns the actual dict living inside `scenes` (not a copy), so a caller that wants to mutate
+    it in place under its own lock hold (`claim_next_scene`) can, while a caller that only wants a
+    snapshot (`next_pending_scene`) copies it itself before returning.
+
+    Raises `ProjectError`, not a bare `KeyError`/`TypeError`, for a scene missing `idx`/`status` or
+    an `idx` that cannot be compared -- the same discipline `_find_scene` follows, for the same
+    reason: this is on-disk corruption `_validate_shape` does not check this deep, see its own
+    docstring.
+    """
+    try:
+        ordered = sorted(scenes, key=lambda scene: scene["idx"])
+    except (KeyError, TypeError) as exc:
+        raise ProjectError(f"malformed scene entry: {exc}") from exc
+    for scene in ordered:
+        try:
+            status = scene["status"]
+        except KeyError as exc:
+            raise ProjectError(f"malformed scene entry (missing 'status'): {scene!r}") from exc
+        if status == "done":
+            continue
+        if status == "pending":
+            return scene
+        return None
+    return None
 
 
 class Project:
@@ -240,6 +363,11 @@ class Project:
         self._apply(data)
 
     def _apply(self, data: dict) -> None:
+        # Every top-level key `data` carries beyond `_REQUIRED_FIELDS` (a field a later task, or a
+        # hand-edit, added that this module does not itself know about) is kept verbatim in
+        # `_extra` rather than dropped, so `as_dict` -- and therefore `save`/every locked mutator's
+        # write-back -- round-trips it instead of silently deleting it. See `as_dict`.
+        self._extra = {key: value for key, value in data.items() if key not in _REQUIRED_FIELDS}
         self.id = data["id"]
         self.kind = data["kind"]
         self.title = data["title"]
@@ -250,7 +378,21 @@ class Project:
         self.assembly = dict(data["assembly"])
 
     def as_dict(self) -> dict:
-        return {
+        """This project as a plain dict, ready for `json.dumps` -- every field this module
+        documents, plus, verbatim, any top-level field it does not (`self._extra`, populated by
+        `_apply` from whatever `data` last carried beyond `_REQUIRED_FIELDS`).
+
+        Starts from a **copy of `self._extra`**, with the documented fields written on top, rather
+        than the other way around: a documented field always wins over a same-named stray one (it
+        cannot happen today since `_REQUIRED_FIELDS` and `_extra`'s keys are disjoint by
+        construction, but "known fields are authoritative" is the right rule to state regardless).
+        This is what lets an unrecognized top-level key -- one a future task's version of this
+        module wrote, or a human hand-added while inspecting a file -- survive a `Project` object
+        loading it, mutating something else entirely, and writing the whole file back out, instead
+        of that field being quietly dropped on the next `save()`/locked mutator write.
+        """
+        result = dict(self._extra)
+        result.update({
             "id": self.id,
             "kind": self.kind,
             "title": self.title,
@@ -259,20 +401,25 @@ class Project:
             "scenes": [dict(scene) for scene in self.scenes],
             "track": dict(self.track),
             "assembly": dict(self.assembly),
-        }
+        })
+        return result
 
     def save(self) -> None:
         """Durably overwrite `project.json` with this object's current in-memory state --
         `tmp` write, `fsync`, `os.replace`, `fsync` the directory (`write_json_durably`), under an
         exclusive hold of this project's own lock.
 
-        **Deliberately a blind overwrite, not a read-modify-write.** `save` exists for a caller
+        **Deliberately a blind overwrite, not a read-modify-write -- scope this narrowly: use it
+        only for the primary population of a freshly created project.** `save` exists for a caller
         that already knows it is the sole writer of a whole batch of fields at once -- most
         notably the script gate (task 3) populating a freshly created project's `scenes`/`track`
-        for the first time, where there is nothing on disk yet to race against. The four
-        documented mutators below are the ones built for the read-modify-write shape, because
-        *they* are the ones a concurrent second writer (the worker, mid-project) is realistically
-        racing.
+        for the first time, where there is nothing on disk yet to race against, and
+        `create_project` populating the initial skeleton. It is *not* the right way to update a
+        project that may already be in use: once other writers exist, updating `stages`, `track`
+        or `assembly` piecemeal belongs to `set_stage_status`/`update_track`/`update_assembly`
+        (and a single scene to `set_scene_status`/`claim_next_scene`/`invalidate_scene_chain`) --
+        those re-read `project.json` from disk under the lock before writing, so they cannot
+        clobber a concurrent writer's change the way a blind `save()` can.
         """
         with _project_lock(self.path.parent, exclusive=True):
             write_json_durably(self.path, self.as_dict())
@@ -283,12 +430,36 @@ class Project:
         which transitions are legal (e.g. only from `awaiting_approval`) is a decision for the web
         layer that renders the gate buttons (task 6), not for the storage layer -- enforcing it
         here would freeze that policy into this module before any caller of it exists.
+
+        A thin, fixed-destination convenience over `set_stage_status(name, "approved")` -- see
+        that method for a stage transition to anything else (`awaiting_approval`/`running`/`done`/
+        `failed`), which the worker (task 3) needs and this narrower method deliberately does not
+        offer.
         """
         if name not in STAGE_NAMES:
             raise UnknownStage(f"unknown stage {name!r}, expected one of {STAGE_NAMES}")
         with _project_lock(self.path.parent, exclusive=True):
             data = _read_data(self.path)
             data["stages"][name] = "approved"
+            write_json_durably(self.path, data)
+            self._apply(data)
+        return self
+
+    def set_stage_status(self, name: str, status: str) -> "Project":
+        """Set stage `name`'s status to any `STAGE_STATUSES` value -- the general form of
+        `approve_stage`, which only ever writes `"approved"`. Exists for the worker (task 3): as it
+        actually produces the script/track/scenes/assembly it needs to move a stage through
+        `awaiting_approval`/`running`/`done`/`failed`, not only the one transition the human gate
+        button (`approve_stage`) covers. Same lock -> re-read -> write -> `_apply` shape as every
+        other locked mutator here.
+        """
+        if name not in STAGE_NAMES:
+            raise UnknownStage(f"unknown stage {name!r}, expected one of {STAGE_NAMES}")
+        if status not in STAGE_STATUSES:
+            raise ProjectError(f"unknown stage status {status!r}, expected one of {STAGE_STATUSES}")
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            data["stages"][name] = status
             write_json_durably(self.path, data)
             self._apply(data)
         return self
@@ -320,31 +491,61 @@ class Project:
         return self
 
     def next_pending_scene(self) -> dict | None:
-        """The one scene the worker should submit next, or `None` if nothing is ready.
+        """The one scene the worker should submit next, or `None` if nothing is ready -- a
+        read-only *preview*, not a claim.
 
         Scenes are strictly sequential -- automatic keyframes need the *actual* last frame of the
-        previous clip, not a guess (design spec, "Клипы"). Walking scenes in `idx` order: a `done`
-        scene lets the walk continue past it; the first `pending` scene found is the answer;
-        anything else (`running` or `failed`) means the chain is not caught up yet, and `None` is
-        the answer for every scene from there on, including scenes after it that are themselves
-        `pending` -- a `pending` scene sitting behind a `failed` one is not next, it is blocked,
-        and stays blocked until a retry (or `invalidate_scene_chain`) clears the scene ahead of it.
+        previous clip, not a guess (design spec, "Клипы"). `_next_ready_scene` does the actual walk
+        (see its own docstring for the exact policy: a `done` scene lets the walk continue, the
+        first `pending` scene found is the answer, `running`/`failed` means `None` for every scene
+        from there on).
 
-        Read-only, but still re-reads under a *shared* lock rather than trusting this object's own
-        in-memory `scenes` -- the same reasoning `queue.scan` uses its shared lock for: a second
-        `Project` object (the worker's own, say) may have advanced a scene since this one was last
-        loaded.
+        Re-reads under a *shared* lock rather than trusting this object's own in-memory `scenes`
+        -- the same reasoning `queue.scan` uses its shared lock for: a second `Project` object (the
+        worker's own, say) may have advanced a scene since this one was last loaded. Deliberately
+        does **not** call `self._apply` after that re-read the way the locked mutators do -- calling
+        this must not have the side effect of silently refreshing `self.scenes`/`self.stages`/etc.
+        out from under a caller mid-edit, and more importantly: two callers racing to submit a
+        scene must not both be handed the same one, which this method alone cannot prevent (there
+        is a window between reading here and a caller's own later `set_scene_status` call). A
+        caller that intends to actually claim a scene for submission -- the worker, task 3 -- must
+        use `claim_next_scene` instead, which closes that window under one lock hold.
         """
         with _project_lock(self.path.parent, exclusive=False):
             data = _read_data(self.path)
-        self._apply(data)
-        for scene in sorted(data["scenes"], key=lambda s: s["idx"]):
-            if scene["status"] == "done":
-                continue
-            if scene["status"] == "pending":
-                return dict(scene)
-            return None
-        return None
+        scene = _next_ready_scene(data["scenes"])
+        return dict(scene) if scene is not None else None
+
+    def claim_next_scene(self, job_id: str) -> dict | None:
+        """Atomically find *and claim* the next ready scene (`_next_ready_scene`'s walk, the same
+        one `next_pending_scene` previews) for `job_id`, in a single exclusive lock hold: read,
+        pick, set `status="running"` and `job_id`, write, all before the lock is released.
+
+        This is what the worker (task 3) must call to submit a scene, not
+        `next_pending_scene()` followed by a separate `set_scene_status()` call -- those are two
+        lock acquisitions with a window in between where a second, concurrent caller's own
+        `next_pending_scene()` can read the same still-`pending` scene and both callers end up
+        submitting the same one. Folding "find" and "claim" into one lock hold is what closes that
+        window: whichever caller's `claim_next_scene` acquires the lock first sees the scene as
+        `pending` and flips it to `running` before releasing the lock, so the second caller's
+        re-read (after it finally gets the lock) sees `running`, not `pending`, and moves on to
+        whatever scene (if any) is ready after that -- or gets `None`.
+
+        Returns a copy of the claimed scene, or `None` if nothing is ready. The lock is still taken
+        and released even when nothing is claimed (a `None` result is not free of I/O), matching
+        every other locked mutator here.
+        """
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            scene = _next_ready_scene(data["scenes"])
+            if scene is None:
+                self._apply(data)
+                return None
+            scene["status"] = "running"
+            scene["job_id"] = job_id
+            write_json_durably(self.path, data)
+            self._apply(data)
+            return dict(scene)
 
     def invalidate_scene_chain(self, idx: int) -> "Project":
         """Reset scene `idx` and every scene after it to `pending`, clearing each one's `job_id`,
@@ -353,6 +554,15 @@ class Project:
         transitively, from scene `idx`'s own clip, so reusing any of them after scene `idx`
         changes would silently keep stale downstream clips -- clearing the whole tail is the
         "честное предупреждение" the design spec calls for, not a convenience.
+
+        Also resets the `scenes` and `assembly` stages back to `"draft"` (the pending-equivalent
+        for a stage -- `STAGE_STATUSES` has no separate `"pending"`) and clears
+        `assembly.final_path` to `None`. Both are downstream of the scene(s) just invalidated: the
+        `scenes` stage's gate no longer reflects reality once a scene it covered goes back to
+        `pending`, and any existing `assembly.final_path` was rendered from clips at least one of
+        which this call just invalidated, so leaving it in place would silently keep serving a
+        stale final video. `stages.script`/`stages.track` are untouched -- a scene invalidation has
+        nothing to say about either of those.
         """
         with _project_lock(self.path.parent, exclusive=True):
             data = _read_data(self.path)
@@ -363,6 +573,58 @@ class Project:
                     scene["job_id"] = None
                     scene["clip_path"] = None
                     scene["keyframe_path"] = None
+            data["stages"]["scenes"] = "draft"
+            data["stages"]["assembly"] = "draft"
+            data["assembly"]["final_path"] = None
+            write_json_durably(self.path, data)
+            self._apply(data)
+        return self
+
+    def update_track(self, **fields) -> "Project":
+        """Partial update of `self.track`'s own fields (`_TRACK_FIELDS`:
+        `lyrics`/`caption`/`wav`/`mp3`/`mastered_mp3`/`sections`/`status`) -- the `track`-scoped
+        sibling of `set_scene_status`, for a caller (task 3's chat integration, the mastering step)
+        that has learned one or two of these facts and must not clobber the rest via a blind
+        `save()` (see `save`'s own docstring for why that stops being safe once other writers
+        exist).
+
+        Unlike `set_scene_status`'s `None`-means-unchanged convention, `**fields` already tells
+        "not passed" and "passed as `None`" apart for free: a keyword simply absent from `fields`
+        leaves that field untouched on disk, while e.g. `update_track(lyrics=None)` genuinely
+        clears it -- no sentinel needed. An unrecognized keyword raises `ProjectError` rather than
+        silently writing a stray key into `track`. Same lock -> re-read -> merge -> write ->
+        `_apply` shape as the module's other locked mutators.
+        """
+        unknown = set(fields) - set(_TRACK_FIELDS)
+        if unknown:
+            raise ProjectError(
+                f"unknown track field(s) {sorted(unknown)}, expected one of {_TRACK_FIELDS}")
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            data["track"].update(fields)
+            write_json_durably(self.path, data)
+            self._apply(data)
+        return self
+
+    def update_assembly(self, **fields) -> "Project":
+        """Partial update of `self.assembly`'s own fields (`_ASSEMBLY_FIELDS`:
+        `audio_mode`/`final_path`) -- the `assembly`-scoped sibling of `update_track`. `audio_mode`,
+        if given, must be one of `ASSEMBLY_AUDIO_MODES`; `final_path` accepts any value including
+        `None` (clearing a stale render, e.g. by hand for the same reason
+        `invalidate_scene_chain` clears it automatically -- see that method's own docstring). An
+        unrecognized keyword raises `ProjectError`, exactly like `update_track`. Same lock ->
+        re-read -> merge -> write -> `_apply` shape as the module's other locked mutators.
+        """
+        unknown = set(fields) - set(_ASSEMBLY_FIELDS)
+        if unknown:
+            raise ProjectError(
+                f"unknown assembly field(s) {sorted(unknown)}, expected one of {_ASSEMBLY_FIELDS}")
+        if "audio_mode" in fields and fields["audio_mode"] not in ASSEMBLY_AUDIO_MODES:
+            raise ProjectError(f"unknown audio_mode {fields['audio_mode']!r}, expected one of "
+                                f"{ASSEMBLY_AUDIO_MODES}")
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            data["assembly"].update(fields)
             write_json_durably(self.path, data)
             self._apply(data)
         return self
@@ -425,10 +687,20 @@ def load_project(path) -> Project:
     Raises `ProjectNotFound` (a `ProjectError`) if there is nothing readable and well-shaped there
     -- never a bare `FileNotFoundError`/`json.JSONDecodeError`, matching this module's own
     exception family the way `queue.py`'s mutators match `QueueError`.
+
+    Checks `path.is_file()` **before** taking the project lock, deliberately: `_project_lock`
+    itself `mkdir(parents=True, exist_ok=True)`s the directory it locks, which is exactly right for
+    every locked mutator (their project directory already exists by construction) but wrong here --
+    a caller probing a project that was never created (a stale id, a typo'd path) must not have
+    that probe itself create the directory and a `project.lock` file inside it as a side effect of
+    failing. Bailing out first, before `_project_lock` ever runs, keeps a failed `load_project`
+    leaving no trace on disk.
     """
     path = Path(path)
     if path.is_dir():
         path = path / PROJECT_FILENAME
+    if not path.is_file():
+        raise ProjectNotFound(f"no project.json at {path}")
     with _project_lock(path.parent, exclusive=False):
         data = _read_data(path)
     return Project(path, data)
@@ -438,11 +710,20 @@ def list_projects(outdir) -> list[Project]:
     """Every project under `<outdir>/projects/`, sorted by directory name (which sorts by
     creation time first, since every name starts with `_dir_stamp`'s `YYYYmmdd-HHMM`).
 
-    A subdirectory that is not readable as a project -- corrupt JSON, or JSON missing a required
-    field -- is **skipped with a `warnings.warn`, not raised**: one broken project must not take
-    down a page meant to list every *other* one. A subdirectory with no `project.json` at all is
-    skipped silently, not warned about -- that is `create_project`'s own claimed-but-not-yet-
-    written directory, a normal (if narrow) window, not corruption.
+    A subdirectory that is not readable as a project -- corrupt JSON, JSON missing a required
+    field, or a required field present but holding the wrong *type* (`_validate_shape`'s type
+    checks: `"scenes"` not a list, `"stages"` not an object, a `scenes` element not an object, ...)
+    -- is **skipped with a `warnings.warn`, not raised**: one broken project must not take down a
+    page meant to list every *other* one. A subdirectory with no `project.json` at all is skipped
+    silently, not warned about -- that is `create_project`'s own claimed-but-not-yet-written
+    directory, a normal (if narrow) window, not corruption.
+
+    `Project(path, data)` construction is inside the same `try`/`except` as the read itself, not
+    just `_read_data` -- `data` has already passed `_validate_shape` by the time `Project()` sees
+    it here, so this is defense in depth rather than a case this module's own tests currently
+    exercise, but it keeps the promise ("one broken project cannot take the whole list down")
+    honest even if a future field gets added to `Project._apply` without a matching
+    `_validate_shape` check to go with it.
 
     `<outdir>/projects` not existing yet yields `[]`, matching `queue.scan`'s "a missing root is
     zero jobs, not an error" contract.
@@ -461,8 +742,9 @@ def list_projects(outdir) -> list[Project]:
         try:
             with _project_lock(entry, exclusive=False):
                 data = _read_data(path)
-        except ProjectNotFound as exc:
+            project = Project(path, data)
+        except ProjectError as exc:
             warnings.warn(f"skipping corrupt project at {path}: {exc}", stacklevel=2)
             continue
-        projects.append(Project(path, data))
+        projects.append(project)
     return projects

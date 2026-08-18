@@ -365,6 +365,315 @@ def test_list_projects_ignores_a_project_directory_that_has_no_project_json_yet(
 # -- no mlx dependency ------------------------------------------------------------------------
 
 
+# -- C1: list_projects/load_project on type-corrupt project.json (not just missing/unparseable) --
+
+
+_TYPE_CORRUPTIONS = [
+    pytest.param({"scenes": "notalist"}, id="scenes-not-a-list"),
+    pytest.param({"stages": ["a"]}, id="stages-not-an-object"),
+    pytest.param({"track": 5}, id="track-not-an-object"),
+    pytest.param({"assembly": None}, id="assembly-not-an-object"),
+    pytest.param({"scenes": [1, 2]}, id="scenes-elements-not-objects"),
+]
+
+
+def _corrupt(good: p.Project, overrides: dict) -> dict:
+    data = good.as_dict()
+    data.update(overrides)
+    return data
+
+
+@pytest.mark.parametrize("overrides", _TYPE_CORRUPTIONS)
+def test_list_projects_skips_a_project_json_with_a_wrong_field_type(tmp_path, overrides):
+    good = p.create_project(tmp_path, "video", "good")
+    broken_dir = tmp_path / "projects" / "20260101-0000-broken"
+    broken_dir.mkdir(parents=True)
+    (broken_dir / "project.json").write_text(json.dumps(_corrupt(good, overrides)),
+                                              encoding="utf-8")
+
+    with pytest.warns(UserWarning):
+        found = p.list_projects(tmp_path)
+
+    assert [proj.path for proj in found] == [good.path]
+
+
+@pytest.mark.parametrize("overrides", _TYPE_CORRUPTIONS)
+def test_load_project_raises_on_a_project_json_with_a_wrong_field_type(tmp_path, overrides):
+    good = p.create_project(tmp_path, "video", "good")
+    good.path.write_text(json.dumps(_corrupt(good, overrides)), encoding="utf-8")
+    with pytest.raises(p.ProjectError):
+        p.load_project(good.path)
+
+
+def test_load_project_does_not_create_a_directory_for_a_missing_project(tmp_path):
+    """A probe for a project that was never created (a stale id, a typo'd path) must not create
+    the directory or a `project.lock` file as a side effect of failing -- `_project_lock` itself
+    `mkdir`s its target, which is only safe once a mutator already knows the project directory
+    exists.
+    """
+    missing = tmp_path / "projects" / "nope"
+    with pytest.raises(p.ProjectError):
+        p.load_project(missing)
+    assert not missing.exists()
+    assert not (tmp_path / "projects").exists()
+
+
+# -- C2: set_stage_status / update_track / update_assembly ---------------------------------------
+
+
+def test_set_stage_status_sets_the_given_status(tmp_path):
+    project = p.create_project(tmp_path, "video", "x")
+    project.set_stage_status("track", "running")
+    assert project.stages["track"] == "running"
+    assert project.stages["script"] == "draft"  # untouched
+    reloaded = p.load_project(project.path)
+    assert reloaded.stages["track"] == "running"
+
+
+def test_set_stage_status_rejects_an_unknown_stage(tmp_path):
+    project = p.create_project(tmp_path, "video", "x")
+    with pytest.raises(p.ProjectError):
+        project.set_stage_status("nope", "running")
+
+
+def test_set_stage_status_rejects_an_unknown_status(tmp_path):
+    project = p.create_project(tmp_path, "video", "x")
+    with pytest.raises(p.ProjectError):
+        project.set_stage_status("track", "sleeping")
+
+
+def test_update_track_partially_updates_and_leaves_other_fields_alone(tmp_path):
+    project = p.create_project(tmp_path, "song", "song")
+    project.update_track(lyrics="la la la", status="awaiting_approval")
+    assert project.track["lyrics"] == "la la la"
+    assert project.track["status"] == "awaiting_approval"
+    assert project.track["caption"] is None  # untouched
+
+    project.update_track(caption="upbeat")
+    assert project.track["lyrics"] == "la la la"  # still there, not clobbered
+    assert project.track["caption"] == "upbeat"
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.track["lyrics"] == "la la la"
+    assert reloaded.track["caption"] == "upbeat"
+
+
+def test_update_track_can_explicitly_clear_a_field_to_none(tmp_path):
+    project = p.create_project(tmp_path, "song", "song")
+    project.update_track(lyrics="la la la")
+    project.update_track(lyrics=None)
+    assert project.track["lyrics"] is None
+
+
+def test_update_track_rejects_an_unknown_field(tmp_path):
+    project = p.create_project(tmp_path, "song", "song")
+    with pytest.raises(p.ProjectError):
+        project.update_track(not_a_real_field="x")
+
+
+def test_update_assembly_partially_updates_and_leaves_other_fields_alone(tmp_path):
+    project = p.create_project(tmp_path, "video", "x")
+    project.update_assembly(final_path="/x/final.mp4")
+    assert project.assembly["final_path"] == "/x/final.mp4"
+    assert project.assembly["audio_mode"] in p.ASSEMBLY_AUDIO_MODES  # untouched
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.assembly["final_path"] == "/x/final.mp4"
+
+
+def test_update_assembly_rejects_an_unknown_audio_mode(tmp_path):
+    project = p.create_project(tmp_path, "video", "x")
+    with pytest.raises(p.ProjectError):
+        project.update_assembly(audio_mode="nonsense")
+
+
+def test_update_assembly_rejects_an_unknown_field(tmp_path):
+    project = p.create_project(tmp_path, "video", "x")
+    with pytest.raises(p.ProjectError):
+        project.update_assembly(not_a_real_field="x")
+
+
+def test_two_project_objects_do_not_clobber_each_others_writes(tmp_path):
+    """The whole point of the locked mutators' re-read-under-lock: a caller holding a `Project`
+    object loaded before another caller's write must not overwrite that write with its own stale
+    in-memory copy of the rest of the file when it writes back. Two independently loaded `Project`
+    objects for the *same* project.json, each mutating a different part of the model
+    (`set_scene_status` vs `update_track`) -- both changes must be present on disk afterward.
+    """
+    created = _project_with_scenes(tmp_path, n=2)
+    a = p.load_project(created.path)
+    b = p.load_project(created.path)
+
+    a.set_scene_status(0, "done", clip_path="/x/0.mp4")
+    b.update_track(lyrics="la la la", status="approved")
+
+    reloaded = p.load_project(created.path)
+    assert reloaded.scenes[0]["status"] == "done"
+    assert reloaded.scenes[0]["clip_path"] == "/x/0.mp4"
+    assert reloaded.track["lyrics"] == "la la la"
+    assert reloaded.track["status"] == "approved"
+
+
+# -- I1: invalidate_scene_chain also resets the scenes/assembly stages and final_path ------------
+
+
+def test_invalidate_scene_chain_resets_scenes_and_assembly_stages_and_final_path(tmp_path):
+    project = _project_with_scenes(tmp_path, n=3)
+    for i in range(3):
+        project.set_scene_status(i, "done", clip_path=f"/x/{i}.mp4")
+    project.set_stage_status("scenes", "done")
+    project.set_stage_status("assembly", "done")
+    project.update_assembly(final_path="/x/final.mp4")
+
+    project.invalidate_scene_chain(1)
+
+    assert project.stages["scenes"] == "draft"
+    assert project.stages["assembly"] == "draft"
+    assert project.assembly["final_path"] is None
+    # untouched
+    assert project.stages["script"] == "draft"
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.stages["scenes"] == "draft"
+    assert reloaded.stages["assembly"] == "draft"
+    assert reloaded.assembly["final_path"] is None
+
+
+# -- I2: claim_next_scene -- atomic find-and-claim in one lock hold ------------------------------
+
+
+def test_claim_next_scene_claims_and_returns_the_next_ready_scene(tmp_path):
+    project = _project_with_scenes(tmp_path, n=2)
+    scene = project.claim_next_scene("job-1")
+    assert scene["idx"] == 0
+    assert scene["status"] == "running"
+    assert scene["job_id"] == "job-1"
+    assert project.scenes[0]["status"] == "running"
+    assert project.scenes[0]["job_id"] == "job-1"
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.scenes[0]["status"] == "running"
+    assert reloaded.scenes[0]["job_id"] == "job-1"
+
+
+def test_claim_next_scene_returns_none_when_nothing_is_ready(tmp_path):
+    project = _project_with_scenes(tmp_path, n=1)
+    project.set_scene_status(0, "running", job_id="job-1")
+    assert project.claim_next_scene("job-2") is None
+
+
+def test_claim_next_scene_is_atomic_under_a_race(tmp_path):
+    """A barrier forces both threads into `claim_next_scene` as close to simultaneously as
+    Python's scheduler allows, on a project with exactly one ready scene. `claim_next_scene`'s
+    single exclusive-lock hold (read -> pick -> claim -> write) is what guarantees exactly one of
+    the two threads is handed the scene and the other gets `None` -- calling `next_pending_scene`
+    then `set_scene_status` as two separate operations would leave a window where both threads
+    could read the scene as still `pending` before either claims it.
+    """
+    project = _project_with_scenes(tmp_path, n=1)
+    barrier = threading.Barrier(2)
+    results = [None, None]
+
+    def worker(slot, job_id):
+        barrier.wait()
+        results[slot] = project.claim_next_scene(job_id)
+
+    threads = [threading.Thread(target=worker, args=(0, "job-a")),
+               threading.Thread(target=worker, args=(1, "job-b"))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+        assert not t.is_alive()
+
+    claimed = [r for r in results if r is not None]
+    none_results = [r for r in results if r is None]
+    assert len(claimed) == 1, f"expected exactly one claim, got {results}"
+    assert len(none_results) == 1, f"expected exactly one None, got {results}"
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.scenes[0]["status"] == "running"
+    assert reloaded.scenes[0]["job_id"] in ("job-a", "job-b")
+    assert reloaded.scenes[0]["job_id"] == claimed[0]["job_id"]
+
+
+def test_next_pending_scene_has_no_side_effect_on_self(tmp_path):
+    """`next_pending_scene` is a read-only preview: calling it must not silently refresh `self`'s
+    own attributes from disk the way the locked mutators do.
+    """
+    project = _project_with_scenes(tmp_path, n=1)
+    other = p.load_project(project.path)
+    other.set_scene_status(0, "done")
+
+    project.next_pending_scene()  # must not pull in `other`'s write as a side effect
+    assert project.scenes[0]["status"] == "pending", (
+        "next_pending_scene must not mutate self.scenes as a side effect")
+
+
+# -- I3: as_dict / unknown top-level fields survive save() ----------------------------------------
+
+
+def test_unknown_top_level_fields_survive_a_save_round_trip(tmp_path):
+    project = p.create_project(tmp_path, "video", "x")
+    data = json.loads(project.path.read_text(encoding="utf-8"))
+    data["custom_field_from_a_future_task"] = {"whatever": True}
+    project.path.write_text(json.dumps(data), encoding="utf-8")
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.as_dict()["custom_field_from_a_future_task"] == {"whatever": True}
+
+    reloaded.approve_stage("script")  # any locked mutator's write-back
+
+    on_disk = json.loads(project.path.read_text(encoding="utf-8"))
+    assert on_disk["custom_field_from_a_future_task"] == {"whatever": True}
+    assert on_disk["stages"]["script"] == "approved"
+
+
+# -- I4: _slug transliterates Cyrillic titles ------------------------------------------------------
+
+
+def test_slug_transliterates_a_cyrillic_title():
+    assert p._slug("Мой ролик") == "moy-rolik"
+
+
+def test_create_project_with_a_cyrillic_title_gets_a_transliterated_slug(tmp_path):
+    project = p.create_project(tmp_path, "video", "Мой ролик")
+    assert "moy-rolik" in project.path.parent.name
+
+
+# -- I5: concurrent writes from separate OS processes lose nothing --------------------------------
+
+
+def test_concurrent_writes_from_separate_processes_lose_nothing(tmp_path):
+    """Real OS processes, not threads (see `_external_lock`'s own docstring on why a same-process
+    thread test is a much weaker proof of `flock` behaving correctly). `n` processes each claiming
+    a distinct scene at once must all land: every mutator re-reads the whole file under the lock
+    before writing the whole file back, so a genuinely enforced project lock is what keeps one
+    process's write from being silently overwritten by another's stale in-memory copy of the rest
+    of the file.
+    """
+    n = 6
+    project = _project_with_scenes(tmp_path, n=n)
+    script = (
+        "import sys\n"
+        "from h3_48gb import project as p\n"
+        "path, idx = sys.argv[1], int(sys.argv[2])\n"
+        "p.load_project(path).set_scene_status(idx, 'done', job_id=f'job-{idx}')\n"
+    )
+    procs = [
+        subprocess.Popen([sys.executable, "-c", script, str(project.path), str(i)],
+                          cwd=str(PROJECT_ROOT))
+        for i in range(n)
+    ]
+    for proc in procs:
+        assert proc.wait(timeout=30) == 0, f"worker process for scene {procs.index(proc)} failed"
+
+    reloaded = p.load_project(project.path)
+    for i in range(n):
+        assert reloaded.scenes[i]["status"] == "done", f"scene {i} lost its update"
+        assert reloaded.scenes[i]["job_id"] == f"job-{i}", f"scene {i} lost its job_id"
+
+
 def test_project_module_does_not_import_mlx():
     """`h3_48gb.project` will be imported by the worker and the web server on every project page
     load; loading it must never pull in the 33B-parameter transformer stack. Run in a subprocess
