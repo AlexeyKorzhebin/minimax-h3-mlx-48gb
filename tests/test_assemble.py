@@ -540,6 +540,37 @@ def test_advance_project_does_not_corrupt_a_scene_when_invalidated_between_decis
     assert reloaded.scenes[0]["job_id"] is None
 
 
+def test_advance_project_rolls_a_scene_back_to_pending_when_keyframe_extraction_raises(tmp_path):
+    """Round 2 (2026-08-18 re-review) regression: fix round 1's C1 moved the claim *before*
+    keyframe extraction and job-arg construction, but only wrapped `submit()` itself in the
+    rollback `try`/`except`. A failing `ffmpeg` call inside `_extract_keyframe` (a corrupt clip,
+    a full disk, ...) between that claim and `submit()` left the scene claimed -- `"running"`,
+    `job_id="claiming"` -- forever: `claim_next_scene` only ever looks at `"pending"` scenes, so
+    nothing would ever retry it and no human "пересчитать" button could reach it either (the scene
+    was never marked `"failed"`). This must roll back to `"pending"` exactly like a `submit()`
+    failure does.
+    """
+    clip = tmp_path / "scene0.mp4"
+    clip.write_bytes(b"fake mp4")
+    proj = _make_project(tmp_path, "video", scenes=[
+        _make_scene(0, status="done", clip_path=str(clip)),
+        _make_scene(1, status="pending"),
+    ])
+    submit = _RecordingSubmit()
+
+    def failing_run(cmd, capture_output=True, text=True):
+        return _FakeResult(1, stdout="", stderr="ffmpeg: no such file or directory")
+
+    with pytest.raises(assemble.AssembleError, match="ffprobe duration"):
+        assemble.advance_project(proj, tmp_path / "queue", tmp_path / "out", submit=submit,
+                                  run=failing_run)
+
+    assert submit.calls == [], "submit must never be reached once keyframe extraction fails"
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.scenes[1]["status"] == "pending"
+    assert reloaded.scenes[1]["job_id"] is None
+
+
 def test_advance_project_rolls_a_scene_back_to_pending_when_submit_itself_raises(tmp_path):
     """A `submit()` that raises (a queue-side failure, `OutputStemConflict`, ...) must not leave
     the scene stuck `"running"` under the claim's own placeholder job id -- it must be rolled back

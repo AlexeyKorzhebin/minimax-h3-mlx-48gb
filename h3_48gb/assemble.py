@@ -562,9 +562,15 @@ def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
     JOB_ID` stands in for the not-yet-known real job id for the length of that claim; the real one
     (or a rollback to `"pending"`) is written right after `submit()` resolves, below.
 
-    **A `submit()` that raises rolls the claim back to `"pending"`** (`set_scene_status(idx,
-    "pending", job_id=None)`) rather than leaving the scene stuck `"running"` under the
-    placeholder -- a transient queue error must not need a human's manual "пересчитать" to recover
+    **Anything fallible between a successful claim and a successful `submit()` rolls the claim
+    back to `"pending"`** (`set_scene_status(idx, "pending", job_id=None)`) rather than leaving the
+    scene stuck `"running"` under the placeholder. That `try` covers keyframe extraction
+    (`_extract_keyframe`, any `ffmpeg`/`ffprobe` failure -- a corrupt clip, a full disk), building
+    the job's args (`_scene_generate_args`), and `submit()` itself, not `submit()` alone: fix round
+    1 only wrapped `submit()`, which left a scene claimed but stranded forever (`"running"`,
+    `job_id="claiming"`, invisible to `claim_next_scene`'s `"pending"`-only scan) on any
+    keyframe-extraction failure in that gap -- caught by re-review and closed here (round 2,
+    2026-08-18). A transient error here must not need a human's manual "пересчитать" to recover
     from. The reverse case -- a crash between `submit()` returning and the follow-up `set_scene_
     status` call recording the real job id -- is not solved here (a job would exist with no scene
     pointing at it): see the module's own report for why this narrower, pre-existing gap is
@@ -587,31 +593,31 @@ def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
     if proj.stages.get("scenes") in ("draft", "approved"):
         proj.set_stage_status("scenes", "running")
 
-    keyframe = None
-    if idx > 0:
-        prev = _scene_by_idx(proj.scenes, idx - 1)
-        prev_clip = prev.get("clip_path") if prev else None
-        if prev_clip:
-            keyframe = _extract_keyframe(
-                prev_clip, proj.path.parent / "keyframes", idx - 1, run=run)
-    else:
-        # Design spec, "Клипы": "Первая сцена: t2v (или i2v, если у проекта загружен стартовый
-        # кадр)". Task 1's schema has no formal `start_image` field -- reading it off
-        # `as_dict()`'s pass-through for unknown top-level keys (`Project._apply`'s own
-        # `self._extra`, I3, 2026-08-18 review) lets a future writer (task 6) add
-        # `"start_image": "<path>"` to project.json without this module needing a schema change to
-        # notice it.
-        start_image = proj.as_dict().get("start_image")
-        if start_image:
-            keyframe = Path(start_image)
-
-    scenes_dir = proj.path.parent / "scenes"
-    args, output_stem = _scene_generate_args(scene, keyframe, scenes_dir)
-    note = scene_note(proj, idx)
-    width, height = DEFAULT_SCENE_CANVAS
-    estimate = {"seconds": _scene_wallclock_estimate_seconds(width, height, scene["duration"])}
-
     try:
+        keyframe = None
+        if idx > 0:
+            prev = _scene_by_idx(proj.scenes, idx - 1)
+            prev_clip = prev.get("clip_path") if prev else None
+            if prev_clip:
+                keyframe = _extract_keyframe(
+                    prev_clip, proj.path.parent / "keyframes", idx - 1, run=run)
+        else:
+            # Design spec, "Клипы": "Первая сцена: t2v (или i2v, если у проекта загружен стартовый
+            # кадр)". Task 1's schema has no formal `start_image` field -- reading it off
+            # `as_dict()`'s pass-through for unknown top-level keys (`Project._apply`'s own
+            # `self._extra`, I3, 2026-08-18 review) lets a future writer (task 6) add
+            # `"start_image": "<path>"` to project.json without this module needing a schema change
+            # to notice it.
+            start_image = proj.as_dict().get("start_image")
+            if start_image:
+                keyframe = Path(start_image)
+
+        scenes_dir = proj.path.parent / "scenes"
+        args, output_stem = _scene_generate_args(scene, keyframe, scenes_dir)
+        note = scene_note(proj, idx)
+        width, height = DEFAULT_SCENE_CANVAS
+        estimate = {"seconds": _scene_wallclock_estimate_seconds(width, height, scene["duration"])}
+
         job = submit(queue_root, args, note, {"output_stem": output_stem}, estimate,
                      kind=q.KIND_GENERATE)
     except Exception:
