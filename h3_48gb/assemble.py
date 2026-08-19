@@ -58,6 +58,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from h3_48gb import project as project_module
@@ -111,6 +112,28 @@ DURATION_TOLERANCE_SECONDS = 0.5
 #: Below this, an unpadded video is already inside `DURATION_TOLERANCE_SECONDS` on its own -- no
 #: freeze-frame ffmpeg call is worth spending on a shortfall this small.
 _FREEZE_PAD_EPSILON_SECONDS = 0.05
+
+#: P0-2 (боевые ворота 2026-08-19): a chaining scene's own frame 0 is *supposed* to duplicate the
+#: automatic keyframe the previous scene's clip already ended on (design spec, "Клипы": "кадр из
+#: предпоследней секунды предыдущего клипа") -- the repro (`20260819-0518-scene-1-e0a3`) landed an
+#: i2v run's own frame 0 corrupted (RGB banding/blocking) instead of a clean copy of the reference,
+#: right on the visible seam between two scenes, the single most noticeable place a defect like
+#: this could land. `_chaining_scene_indices` below is exactly "every scene idx>0" -- scene 0 has
+#: no keyframe behind it (design spec, "Первая сцена: t2v") and is never touched.
+
+#: P1-3 (боевые ворота 2026-08-19): ffmpeg's own `signalstats` filter has no direct standard-
+#: deviation output (`ffmpeg -h filter=signalstats` lists only MIN/LOW/AVG/HIGH/MAX per plane) --
+#: `_frame_luma_spread` uses `YHIGH-YLOW` (the 5%/95%-trimmed luma range) as the cheap stand-in
+#: instead. A flat, single-colour fill (the boевые ворота repro's own grey tail) collapses this to
+#: 0; any frame with real picture content spreads it out by orders of magnitude more than this
+#: threshold, so the substitution still separates the two cases the task brief's own "стандартное
+#: отклонение ... > ~4-6 из 255" was aimed at.
+_FREEZE_FRAME_LUMA_SPREAD_THRESHOLD = 6.0
+
+#: How far back into a clip's own tail `_extract_valid_last_frame` is willing to look for a frame
+#: that clears `_FREEZE_FRAME_LUMA_SPREAD_THRESHOLD` before giving up and falling back to the
+#: literal last frame anyway (task brief: "все 24 плоские -- берём последний как раньше").
+_FREEZE_FRAME_MAX_LOOKBACK_FRAMES = 24
 
 
 class AssembleError(RuntimeError):
@@ -170,6 +193,66 @@ def _has_audio_stream(path, *, run) -> bool:
     return bool((result.stdout or "").strip())
 
 
+# -- P0-2 (боевые ворота 2026-08-19): drop a chaining scene's own duplicate/corrupted frame 0 -----
+
+
+def _chaining_scene_indices(scenes) -> list[int]:
+    """Which of `scenes` need their own clip's frame 0 dropped before assembly -- every scene after
+    the first (design spec, "Клипы": "Первая сцена: t2v (или i2v, если ... загружен стартовый
+    кадр)" -- every scene *after* scene 0 is chained off the previous scene's own automatic
+    keyframe, scene 0 never is, regardless of whether it happens to be i2v off an uploaded
+    `start_image`). This is the "plan" half of the fix, kept as a pure function deliberately: a
+    test can assert exactly which indices it names without spinning up any `ffmpeg` call at all.
+    """
+    return sorted(scene["idx"] for scene in scenes if scene["idx"] > 0)
+
+
+def _drop_first_frame(clip_path, out_path: Path, *, run) -> Path:
+    """A copy of `clip_path` with its own frame 0 removed -- the fix for P0-2 (боевые ворота
+    2026-08-19): a chaining scene's frame 0 is *meant* to duplicate the automatic keyframe the
+    previous scene's own clip already ended on (`_extract_keyframe`'s own "кадр из предпоследней
+    секунды предыдущего клипа"), but the repro landed an i2v run's own frame 0 corrupted (RGB
+    banding/blocking) instead -- squarely on the one frame most likely to sit right on the visible
+    cut between two scenes. Dropping it does not reopen the seam: the cut becomes "scene i's own
+    last frame -> scene i+1's own *second* frame", which reads as the identical cut to a human,
+    since frame 0 and frame 1 of an i2v run are meant to look like the same reference picture held
+    for a beat.
+
+    Re-encoded to the same profile every other step in this module uses (crf 18/yuv420p/aac), so
+    the file this writes needs no further re-encode wherever `run` uses it downstream. Audio is
+    carried through unmodified via an *optional* map (`0:a:0?`) -- a scene clip may have no audio
+    track at all (`_has_audio_stream`'s own precondition, checked separately later in `run`), and
+    this step must not fail over a stream that was simply never there.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(clip_path),
+           "-vf", "trim=start_frame=1,setpts=PTS-STARTPTS",
+           "-map", "0:v:0", "-map", "0:a:0?",
+           "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "192k", str(out_path)]
+    _run_ffmpeg(cmd, run, f"ffmpeg first-frame drop ({clip_path})")
+    return out_path
+
+
+def _build_video_clip_paths(scenes, raw_clip_paths, workdir: Path, *, run) -> list[str]:
+    """The path list every video-bearing concat call in `run` uses in place of the scenes' own raw
+    `clip_path`s -- scene 0's own clip passed through untouched, every chaining scene's clip
+    (`_chaining_scene_indices`) replaced with `_drop_first_frame`'s own trimmed copy. Kept separate
+    from the raw `clip_paths` list `run` also keeps around: the audio-only concat/preflight
+    (`"mix"` mode) reads the clips' own *original* audio, never this trimmed copy, since P0-2 is a
+    picture-only fix -- nothing about a chaining scene's own audio track duplicates anything.
+    """
+    chaining = set(_chaining_scene_indices(scenes))
+    paths = []
+    for scene, raw_path in zip(scenes, raw_clip_paths):
+        if scene["idx"] not in chaining:
+            paths.append(raw_path)
+            continue
+        out_path = workdir / f"scene-{scene['idx']:03d}-trimmed.mp4"
+        paths.append(str(_drop_first_frame(raw_path, out_path, run=run)))
+    return paths
+
+
 # -- ffmpeg concat / mux building blocks ----------------------------------------------------------
 
 
@@ -211,17 +294,68 @@ def _concat(paths, out_path: Path, *, run, video: bool, audio: bool) -> Path:
     return out_path
 
 
-def _extract_last_frame(video_path, out_path: Path, *, run) -> Path:
-    """The still frame `_pad_with_freeze_frame` repeats to cover a shortfall against the track's
-    duration. `-sseof -0.1` (seek 0.1 s before end-of-file) rather than a duration read off
-    `_ffprobe_duration` and an explicit `-ss`: it needs no separate `ffprobe` call, and it is
-    robust to the concat step's own re-encode landing the container's reported duration a few
-    milliseconds off from the actual last decodable frame -- seeking from the end never overshoots
-    past it.
+def _extract_frame_at_lookback(video_path, out_path: Path, frames_back: int, *, run) -> Path:
+    """The frame `frames_back` frames from the end of `video_path` (1 = the literal last frame) --
+    `_extract_valid_last_frame`'s own building block for walking backward through a clip's tail
+    (task brief, P1-3: "извлекать кадры с хвоста по одному"). `reverse,select=eq(n\\,K)`
+    (`K = frames_back - 1`) rather than a `-sseof` timestamp: a `-sseof` pad small enough to target
+    a single specific frame a handful of frames before the end landed off by a frame or more
+    against a real encode (checked empirically against a real `ffmpeg` output while building this
+    fix -- see the module's own report) -- `reverse` decodes the whole clip and re-indexes it from
+    the end, so `select`'s own frame-index match is exact regardless of how short the gap to the
+    real end is.
     """
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-sseof", "-0.1", "-i", str(video_path),
-           "-frames:v", "1", str(out_path)]
-    _run_ffmpeg(cmd, run, "ffmpeg last-frame extraction")
+    k = frames_back - 1
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path),
+           "-vf", f"reverse,select=eq(n\\,{k})", "-frames:v", "1", str(out_path)]
+    _run_ffmpeg(cmd, run, f"ffmpeg tail-frame extraction (n={frames_back})")
+    return out_path
+
+
+def _frame_luma_spread(image_path, *, run) -> float:
+    """A cheap stand-in for the still frame `image_path`'s own luma standard deviation (module
+    constant `_FREEZE_FRAME_LUMA_SPREAD_THRESHOLD`'s own docstring explains the substitution:
+    ffmpeg's `signalstats` filter has no direct stddev output) -- `YHIGH-YLOW`, the 5%/95%-trimmed
+    luma range, read back off `metadata=print`'s own stdout. A flat, single-colour fill collapses
+    this to (near) 0; any frame with real picture content spreads it out far past the threshold.
+    """
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(image_path),
+           "-vf", "signalstats,metadata=print:file=-", "-f", "null", "-"]
+    result = _run_ffmpeg(cmd, run, f"ffmpeg signalstats ({image_path})")
+    stdout = result.stdout or ""
+    low_match = re.search(r"lavfi\.signalstats\.YLOW=([0-9.]+)", stdout)
+    high_match = re.search(r"lavfi\.signalstats\.YHIGH=([0-9.]+)", stdout)
+    if low_match is None or high_match is None:
+        raise AssembleError(
+            f"ffmpeg signalstats produced no YLOW/YHIGH reading for {image_path}: "
+            f"{stdout.strip()!r}")
+    return float(high_match.group(1)) - float(low_match.group(1))
+
+
+def _extract_valid_last_frame(video_path, out_path: Path, *, run) -> Path:
+    """P1-3 (боевые ворота 2026-08-19): the freeze-frame pad's own source frame, chosen for
+    *validity* instead of blindly grabbing the literal last frame -- the failing gate's own clip
+    ended on a run of flat grey frames, and the old unconditional `_extract_last_frame` froze that
+    mush across the entire padded tail.
+
+    Walks backward from the literal last frame, up to `_FREEZE_FRAME_MAX_LOOKBACK_FRAMES` frames,
+    extracting straight into `out_path` each try (a fresh `_extract_frame_at_lookback` call
+    overwrites whatever the previous try left there -- no separate candidate file or python-level
+    copy needed, since `out_path` already holds exactly the frame this returns the moment a try
+    clears `_FREEZE_FRAME_LUMA_SPREAD_THRESHOLD`). If every candidate in that window reads flat,
+    re-extracts the literal last frame (task brief: "все 24 плоские -- берём последний как раньше,
+    с warning в лог") -- padding with *something* the video already had beats refusing to assemble
+    at all, and this module's own caller (`run`) has no better fallback to reach for.
+    """
+    for n in range(1, _FREEZE_FRAME_MAX_LOOKBACK_FRAMES + 1):
+        _extract_frame_at_lookback(video_path, out_path, n, run=run)
+        if _frame_luma_spread(out_path, run=run) > _FREEZE_FRAME_LUMA_SPREAD_THRESHOLD:
+            return out_path
+    print(f"WARNING: freeze-frame source for {video_path} -- all "
+          f"{_FREEZE_FRAME_MAX_LOOKBACK_FRAMES} frames from the tail read as a flat fill (luma "
+          f"spread <= {_FREEZE_FRAME_LUMA_SPREAD_THRESHOLD}) -- falling back to the literal last "
+          f"frame", file=sys.stderr, flush=True)
+    _extract_frame_at_lookback(video_path, out_path, 1, run=run)
     return out_path
 
 
@@ -238,14 +372,19 @@ def _freeze_segment(image_path, seconds: float, out_path: Path, *, run) -> Path:
 
 
 def _pad_with_freeze_frame(video_path: Path, pad_seconds: float, workdir: Path, *, run) -> Path:
-    """`video_path` (video-only) with `pad_seconds` of its own last frame appended -- task brief:
-    "недостающий хвост видео добивается freeze-frame последнего кадра". Never touches audio: this
-    runs before `run()` ever attaches one, and the whole point of padding video instead of trimming
-    audio is that the audio is never the thing that moves (module docstring: "a song is sacred").
+    """`video_path` (video-only) with `pad_seconds` of its own last *valid* frame appended -- task
+    brief: "недостающий хвост видео добивается freeze-frame последнего кадра". Never touches audio:
+    this runs before `run()` ever attaches one, and the whole point of padding video instead of
+    trimming audio is that the audio is never the thing that moves (module docstring: "a song is
+    sacred").
+
+    P1-3 (боевые ворота 2026-08-19): "last frame" is `_extract_valid_last_frame`'s own validity-
+    checked pick, not the literal last frame -- the failing gate's own clip ended on a run of flat
+    grey frames, and the old unconditional last-frame grab froze that mush for the whole pad.
     """
     workdir.mkdir(parents=True, exist_ok=True)
     last_frame = workdir / "last_frame.png"
-    _extract_last_frame(video_path, last_frame, run=run)
+    _extract_valid_last_frame(video_path, last_frame, run=run)
     freeze_clip = workdir / "freeze_tail.mp4"
     _freeze_segment(last_frame, pad_seconds, freeze_clip, run=run)
     padded = workdir / "padded.mp4"
@@ -318,6 +457,13 @@ def run(project_path, *, run=subprocess.run) -> Path:
     render whose picture and song do not line up. `audio_mode == "clips"` skips all of this: there
     is no track to measure against, so the concatenated clips' own combined length is the answer.
 
+    **P0-2 (боевые ворота 2026-08-19): every measurement above already reflects the frame-0 drop.**
+    `video_clip_paths` (`_build_video_clip_paths`) replaces every chaining scene's raw clip with a
+    copy that has had its own frame 0 removed *before* the first `_concat`/`_ffprobe_duration` call
+    in this function ever runs -- the shortfall this measures, and the freeze-frame pad it computes
+    to close it, are both already sized against the *actual*, post-drop frame count, not the
+    pre-drop one. Nothing downstream needs a separate correction for the dropped frames.
+
     **I4 (fix round 1, 2026-08-18 review): the same tolerance check is repeated against
     `final.mp4` itself**, after the mux step, not only against the pre-mux, video-only concat --
     the mux (`amix`'s own `duration=longest`, an unexpected container quirk) is a second place a
@@ -353,6 +499,14 @@ def run(project_path, *, run=subprocess.run) -> Path:
     audio_mode = proj.assembly.get("audio_mode", "clips")
     final_path = assembly_dir / "final.mp4"
 
+    # P0-2 (боевые ворота 2026-08-19): every concat call below that touches the *picture* uses
+    # `video_clip_paths`, not the scenes' own raw `clip_paths` -- a chaining scene's own clip has
+    # had its frame 0 dropped (`_build_video_clip_paths`/`_drop_first_frame`). Audio-only work
+    # (`_has_audio_stream`'s preflight, the "mix"-mode clip-audio concat below) still reads the
+    # untouched `clip_paths` -- this fix is picture-only, nothing about a chaining scene's own
+    # audio track duplicates anything the way frame 0 does.
+    video_clip_paths = _build_video_clip_paths(scenes, clip_paths, assembly_dir / "trim", run=run)
+
     if audio_mode in ("song", "mix"):
         mastered_mp3 = proj.track.get("mastered_mp3")
         track_duration = proj.track.get("duration")
@@ -361,7 +515,7 @@ def run(project_path, *, run=subprocess.run) -> Path:
                 f"audio_mode={audio_mode!r} needs a mastered track with a known duration, "
                 f"project {proj.id!r} has mastered_mp3={mastered_mp3!r} duration={track_duration!r}")
 
-        video_only = _concat(clip_paths, assembly_dir / "concat_video.mp4", run=run,
+        video_only = _concat(video_clip_paths, assembly_dir / "concat_video.mp4", run=run,
                               video=True, audio=False)
         video_duration = _ffprobe_duration(video_only, run=run)
         shortfall = track_duration - video_duration
@@ -399,7 +553,7 @@ def run(project_path, *, run=subprocess.run) -> Path:
                 f"final.mp4 is {final_duration:.2f}s, track is {track_duration:.2f}s -- outside "
                 f"the {DURATION_TOLERANCE_SECONDS}s tolerance after muxing the audio in")
     else:
-        _concat(clip_paths, final_path, run=run, video=True, audio=True)
+        _concat(video_clip_paths, final_path, run=run, video=True, audio=True)
 
     proj.update_assembly(final_path=str(final_path))
     proj.set_stage_status("assembly", "done")
@@ -414,10 +568,11 @@ def run(project_path, *, run=subprocess.run) -> Path:
 
 def _cleanup_intermediate_assembly_files(assembly_dir: Path) -> None:
     """Remove the video-only concat, the `"mix"`-mode clip-audio-only concat, every concat-demuxer
-    list file `_concat` leaves next to them, and the freeze-frame pad workdir -- everything `run`
-    may have written under `assembly_dir` on its way to `final.mp4` besides `final.mp4` itself.
-    Best-effort: a stray permission error here must not turn an otherwise-successful assembly into
-    a failed job over disk cleanup, so this never raises.
+    list file `_concat` leaves next to them, the freeze-frame pad workdir, and the P0-2
+    frame-0-drop workdir -- everything `run` may have written under `assembly_dir` on its way to
+    `final.mp4` besides `final.mp4` itself. Best-effort: a stray permission error here must not
+    turn an otherwise-successful assembly into a failed job over disk cleanup, so this never
+    raises.
     """
     for name in ("concat_video.mp4", "concat_video.concat.txt",
                  "concat_audio.m4a", "concat_audio.concat.txt"):
@@ -427,12 +582,13 @@ def _cleanup_intermediate_assembly_files(assembly_dir: Path) -> None:
                 path.unlink()
         except OSError:
             pass
-    pad_dir = assembly_dir / "pad"
-    try:
-        if pad_dir.is_dir():
-            shutil.rmtree(pad_dir, ignore_errors=True)
-    except OSError:
-        pass
+    for dir_name in ("pad", "trim"):
+        dir_path = assembly_dir / dir_name
+        try:
+            if dir_path.is_dir():
+                shutil.rmtree(dir_path, ignore_errors=True)
+        except OSError:
+            pass
 
 
 # -- Scene note: how a project scene's ordinary `kind="generate"` job is tagged ------------------

@@ -45,6 +45,12 @@ class _FakeRun:
     force every `"mix"`-mode test to insert an extra, semantically irrelevant value just to keep
     the real duration answers lined up. `_NoClipAudioFakeRun` below overrides this one answer for
     the tests that actually want a clip found missing its audio track.
+
+    P1-3's own `_frame_luma_spread` (`signalstats,metadata=print`) is answered "not flat" by
+    default (`YLOW=10`/`YHIGH=200`, spread 190 -- comfortably past `_FREEZE_FRAME_LUMA_SPREAD_
+    THRESHOLD`) so `_extract_valid_last_frame` accepts the very first candidate it tries, matching
+    every pre-P1-3 test's own assumption of exactly one freeze-frame extraction per pad.
+    `_FlatTailFakeRun` below overrides this for the tests that actually want a flat/grey tail.
     """
 
     def __init__(self, ffprobe_durations=None):
@@ -58,6 +64,9 @@ class _FakeRun:
         if cmd[0] == "ffprobe":
             duration = self._ffprobe_durations.pop(0) if self._ffprobe_durations else 0.0
             return _FakeResult(0, stdout=f"{duration}\n")
+        if any("signalstats" in tok for tok in cmd):
+            return _FakeResult(0, stdout="lavfi.signalstats.YLOW=10\n"
+                                          "lavfi.signalstats.YHIGH=200\n")
         return _FakeResult(0, stdout="", stderr="")
 
 
@@ -115,6 +124,61 @@ def test_run_rejects_song_audio_mode_with_no_mastered_track(tmp_path):
                           scenes=[_make_scene(0, clip_path=str(tmp_path / "a.mp4"))])
     with pytest.raises(assemble.AssembleError, match="mastered track"):
         assemble.run(proj.path, run=_FakeRun())
+
+
+# -- P0-2 (боевые ворота 2026-08-19): drop a chaining scene's own duplicate/corrupted frame 0 -----
+
+
+def test_chaining_scene_indices_is_every_scene_after_scene_zero(tmp_path):
+    """The "plan" half of the fix, checked with no ffmpeg call at all: exactly the scenes with
+    idx>0 need their own frame 0 dropped -- scene 0 has no automatic keyframe behind it and must
+    never appear.
+    """
+    scenes = [
+        _make_scene(0, clip_path=str(tmp_path / "a.mp4")),
+        _make_scene(1, clip_path=str(tmp_path / "b.mp4")),
+        _make_scene(2, clip_path=str(tmp_path / "c.mp4")),
+    ]
+
+    assert assemble._chaining_scene_indices(scenes) == [1, 2]
+
+
+def test_chaining_scene_indices_is_empty_for_a_single_scene_zero_project(tmp_path):
+    scenes = [_make_scene(0, clip_path=str(tmp_path / "a.mp4"))]
+
+    assert assemble._chaining_scene_indices(scenes) == []
+
+
+def test_run_drops_frame_zero_of_a_chaining_scenes_clip_but_not_scene_zeros(tmp_path):
+    """`run()` must issue exactly one frame-0-drop ffmpeg call, and it must be for scene 1's own
+    clip -- scene 0's clip is passed straight through to the concat, untouched.
+    """
+    clip0 = str(tmp_path / "a.mp4")
+    clip1 = str(tmp_path / "b.mp4")
+    proj = _make_project(tmp_path, "video", audio_mode="clips", scenes=[
+        _make_scene(0, clip_path=clip0),
+        _make_scene(1, clip_path=clip1),
+    ])
+    fake = _FakeRun()
+
+    assemble.run(proj.path, run=fake)
+
+    trim_calls = [c for c in fake.calls if "trim=start_frame=1" in " ".join(c)]
+    assert len(trim_calls) == 1, "only scene 1 (idx>0) chains -- exactly one drop call"
+    assert trim_calls[0][trim_calls[0].index("-i") + 1] == clip1
+    assert not any(clip0 == c[c.index("-i") + 1] for c in trim_calls)
+
+
+def test_build_video_clip_paths_passes_scene_zeros_clip_through_untouched(tmp_path):
+    clip0 = str(tmp_path / "a.mp4")
+    clip1 = str(tmp_path / "b.mp4")
+    scenes = [_make_scene(0, clip_path=clip0), _make_scene(1, clip_path=clip1)]
+    fake = _FakeRun()
+
+    paths = assemble._build_video_clip_paths(scenes, [clip0, clip1], tmp_path / "trim", run=fake)
+
+    assert paths[0] == clip0, "scene 0's own clip is never touched"
+    assert paths[1] != clip1, "scene 1's own clip is replaced with a frame-0-dropped copy"
 
 
 # -- run(): "clips" audio mode -- no track needed, no duration validation ------------------------
@@ -294,6 +358,83 @@ def test_run_mix_mode_raises_a_readable_error_when_a_clip_has_no_audio_stream(tm
 
     with pytest.raises(assemble.AssembleError, match="audio track"):
         assemble.run(proj.path, run=fake)
+
+
+# -- P1-3 (боевые ворота 2026-08-19): freeze-frame source must be a *valid* frame -----------------
+
+
+class _FlatTailFakeRun(_FakeRun):
+    """`_FakeRun` plus scripted answers for the P1-3 `signalstats` probe (`_frame_luma_spread`):
+    each successive call pops the next `(low, high)` pair off `spreads`, in the order
+    `_extract_valid_last_frame`'s own walk-back loop asks them -- lets a test script "the last N
+    tail candidates are flat, the one after that is not" without needing a real ffmpeg clip.
+    """
+
+    def __init__(self, *, spreads, ffprobe_durations=None):
+        super().__init__(ffprobe_durations=ffprobe_durations)
+        self._spreads = list(spreads)
+
+    def __call__(self, cmd, capture_output=True, text=True):
+        self.calls.append(list(cmd))
+        if any("signalstats" in tok for tok in cmd):
+            low, high = self._spreads.pop(0)
+            return _FakeResult(0, stdout=f"lavfi.signalstats.YLOW={low}\n"
+                                          f"lavfi.signalstats.YHIGH={high}\n")
+        if cmd[0] == "ffprobe" and "-select_streams" in cmd:
+            return _FakeResult(0, stdout="0\n")
+        if cmd[0] == "ffprobe":
+            duration = self._ffprobe_durations.pop(0) if self._ffprobe_durations else 0.0
+            return _FakeResult(0, stdout=f"{duration}\n")
+        return _FakeResult(0, stdout="", stderr="")
+
+
+def test_extract_valid_last_frame_walks_back_past_a_flat_tail(tmp_path):
+    """Three flat candidates (the grey-fill tail), then a valid one -- must stop at the fourth
+    try, not the first.
+    """
+    fake = _FlatTailFakeRun(spreads=[(126, 126), (126, 126), (126, 126), (10, 200)])
+    out_path = tmp_path / "chosen.png"
+
+    assemble._extract_valid_last_frame(tmp_path / "clip.mp4", out_path, run=fake)
+
+    extraction_calls = [c for c in fake.calls if "reverse" in " ".join(c)]
+    assert len(extraction_calls) == 4, "must stop at the first valid candidate"
+    # n=4 frames back -> k=3 in the reverse-then-select-by-index filter.
+    assert "select=eq(n\\,3)" in " ".join(extraction_calls[-1])
+
+
+def test_extract_valid_last_frame_falls_back_to_the_last_frame_when_all_24_are_flat(
+        tmp_path, capsys):
+    """Task brief: "все 24 плоские -- берём последний как раньше, с warning в лог" -- every
+    candidate in the lookback window reads flat, so this must fall back to the literal last frame
+    (not just leave the 24th candidate in place) and log a warning a human can find.
+    """
+    fake = _FlatTailFakeRun(spreads=[(126, 126)] * 24)
+    out_path = tmp_path / "chosen.png"
+
+    assemble._extract_valid_last_frame(tmp_path / "clip.mp4", out_path, run=fake)
+
+    extraction_calls = [c for c in fake.calls if "reverse" in " ".join(c)]
+    # 24 trial extractions, then one more fallback re-extraction of the literal last frame (n=1).
+    assert len(extraction_calls) == 25
+    assert "select=eq(n\\,0)" in " ".join(extraction_calls[-1])
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "flat" in captured.err.lower()
+
+
+def test_extract_valid_last_frame_takes_the_literal_last_frame_when_it_is_already_valid(tmp_path):
+    """The common case -- no flat tail at all -- must cost exactly one extraction/probe pair, not
+    walk the whole lookback window.
+    """
+    fake = _FlatTailFakeRun(spreads=[(10, 200)])
+    out_path = tmp_path / "chosen.png"
+
+    assemble._extract_valid_last_frame(tmp_path / "clip.mp4", out_path, run=fake)
+
+    extraction_calls = [c for c in fake.calls if "reverse" in " ".join(c)]
+    assert len(extraction_calls) == 1
+    assert "select=eq(n\\,0)" in " ".join(extraction_calls[0])
 
 
 # -- run(): direct-cut concat only -- no scene-transition filters anywhere -----------------------
@@ -795,6 +936,9 @@ def test_run_concats_pads_and_replaces_audio_on_a_real_ffmpeg_synthesis(tmp_path
     video is short against a longer sine "track") get concatenated, freeze-frame padded to the
     track's duration, and muxed with the track audio -- verified end to end with real `ffmpeg`/
     `ffprobe`, no mocks.
+
+    This project already has a chaining scene (idx=1, `clip1`) -- P0-2's own frame-0 drop (`_build_
+    video_clip_paths`) runs for real here too, on the way to the same final assertions.
     """
     clip0 = tmp_path / "clip0.mp4"
     clip1 = tmp_path / "clip1.mp4"
@@ -828,6 +972,99 @@ def test_run_concats_pads_and_replaces_audio_on_a_real_ffmpeg_synthesis(tmp_path
     assert not (assembly_dir / "concat_video.mp4").exists()
     assert not (assembly_dir / "concat_video.concat.txt").exists()
     assert not (assembly_dir / "pad").exists()
+    assert not (assembly_dir / "trim").exists(), "P0-2's own frame-0-drop workdir is cleaned up too"
+
+
+def test_build_video_clip_paths_drops_frame_zero_of_chaining_scenes_on_real_ffmpeg(tmp_path):
+    """P0-2 (боевые ворота 2026-08-19), real-ffmpeg case: a 3-scene project where scenes 1 and 2
+    chain off the scene before them -- each of their own clips must come out one frame shorter,
+    scene 0's own clip must come out identical to what went in.
+    """
+    clip0 = tmp_path / "clip0.mp4"
+    clip1 = tmp_path / "clip1.mp4"
+    clip2 = tmp_path / "clip2.mp4"
+    _make_lavfi_clip(clip0, 1.0, "red")     # 24 frames @ 24fps
+    _make_lavfi_clip(clip1, 1.0, "blue")    # 24 frames -- idx=1, chains, must lose 1
+    _make_lavfi_clip(clip2, 1.0, "green")   # 24 frames -- idx=2, chains, must lose 1
+    scenes = [
+        _make_scene(0, clip_path=str(clip0)),
+        _make_scene(1, clip_path=str(clip1)),
+        _make_scene(2, clip_path=str(clip2)),
+    ]
+
+    def frame_count(path) -> int:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(path)],
+            check=True, capture_output=True, text=True)
+        return int(result.stdout.strip())
+
+    paths = assemble._build_video_clip_paths(
+        scenes, [str(clip0), str(clip1), str(clip2)], tmp_path / "trim", run=subprocess.run)
+
+    assert paths[0] == str(clip0), "scene 0's own clip is never touched"
+    assert frame_count(paths[0]) == 24
+    assert frame_count(paths[1]) == 23, "scene 1 chains off scene 0 -- frame 0 dropped"
+    assert frame_count(paths[2]) == 23, "scene 2 chains off scene 1 -- frame 0 dropped"
+
+
+def test_extract_valid_last_frame_skips_a_real_grey_tail(tmp_path):
+    """P1-3 (боевые ворота 2026-08-19), the task brief's own required synthetic case: a clip whose
+    last 3 frames are a flat grey fill -- `_extract_valid_last_frame` must land on an earlier frame
+    that still has real picture content, not the grey fill the failing gate's freeze pad grabbed.
+    """
+    clip = tmp_path / "grey_tail.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i", "testsrc=size=64x64:rate=24:duration=0.875",
+         "-f", "lavfi", "-i", "color=c=gray:size=64x64:rate=24:duration=0.125",
+         "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]", "-map", "[v]",
+         "-pix_fmt", "yuv420p", str(clip)],
+        check=True, capture_output=True)
+
+    # Sanity: the literal last frame really is flat, confirming this test's own premise.
+    literal_last = tmp_path / "literal_last.png"
+    assemble._extract_frame_at_lookback(clip, literal_last, 1, run=subprocess.run)
+    assert assemble._frame_luma_spread(literal_last, run=subprocess.run) <= \
+        assemble._FREEZE_FRAME_LUMA_SPREAD_THRESHOLD
+
+    chosen = tmp_path / "chosen.png"
+    assemble._extract_valid_last_frame(clip, chosen, run=subprocess.run)
+
+    assert assemble._frame_luma_spread(chosen, run=subprocess.run) > \
+        assemble._FREEZE_FRAME_LUMA_SPREAD_THRESHOLD
+
+
+def test_run_freeze_pads_with_a_valid_frame_when_the_clip_ends_on_a_grey_tail(tmp_path):
+    """End-to-end P1-3: a clip that needs freeze-frame padding (it is short against the track) but
+    ends on a flat grey tail -- the padded region must hold the earlier, valid frame, not the grey
+    fill stretched out (the exact defect the failing gate's own clip 0 landed on).
+    """
+    clip0 = tmp_path / "grey_tail.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i", "testsrc=size=64x64:rate=24:duration=0.875",
+         "-f", "lavfi", "-i", "color=c=gray:size=64x64:rate=24:duration=0.125",
+         "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]", "-map", "[v]",
+         "-pix_fmt", "yuv420p", str(clip0)],
+        check=True, capture_output=True)
+    track_mp3 = tmp_path / "track.mp3"
+    _make_sine_mp3(track_mp3, 2.0)  # clip is only 1.0s -- needs ~1.0s of freeze padding
+
+    proj = _make_project(tmp_path, "clip", audio_mode="song",
+                          track={"mastered_mp3": str(track_mp3),
+                                 "duration": _real_ffprobe_duration(track_mp3)},
+                          scenes=[_make_scene(0, clip_path=str(clip0))])
+
+    final = assemble.run(proj.path, run=subprocess.run)
+
+    # Sample a frame well inside the padded tail (past the original clip's own ~1.0s) and confirm
+    # it is not a flat fill.
+    padded_frame = tmp_path / "padded_frame.png"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "1.5", "-i", str(final),
+                    "-frames:v", "1", str(padded_frame)], check=True, capture_output=True)
+    assert assemble._frame_luma_spread(padded_frame, run=subprocess.run) > \
+        assemble._FREEZE_FRAME_LUMA_SPREAD_THRESHOLD
 
 
 def test_run_leaves_intermediate_files_in_place_when_assembly_fails(tmp_path):
