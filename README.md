@@ -295,10 +295,11 @@ same queue instead of a second execution mechanism: a *project* is nothing more 
 
 Three kinds share one on-disk shape: **`video`** (a multi-scene clip), **`clip`** (a music video
 built on a generated or imported song), **`song`** (just the mastered mp3, nothing else). Every
-project moves through the same four stages — `script`, `track`, `scenes`, `assembly` — gated
-where a human has to look at the result before GPU time is spent on the next one; which stages
-actually do anything depends on `kind` (a `song` project never touches `scenes`/`assembly`, a
-`video` project without an optional song never touches `track`).
+project moves through the same five stages — `script`, `track`, `scenario`, `scenes`, `assembly`
+— gated where a human has to look at the result before GPU time is spent on the next one; which
+stages actually do anything depends on `kind` (a `song` project never touches `scenes`/
+`assembly`; a `video` project without an optional song never touches `track`; only `clip` ever
+gates on `scenario` — `video`/`song` start it already `"approved"`, nothing to approve).
 
 A scenario comes from the chat model that already writes single-shot prompts: for `video`, a
 list of 5-10 s scenes, each a self-contained H3 prompt with character/style descriptions
@@ -312,13 +313,35 @@ real work: a `video` submits scene 0 (t2v, or i2v if the project carries a start
 That job runs Music3 in its own venv (`h3_48gb/songrun.py`), masters the output (highpass, a
 7-point EQ, loudnorm) to `mastered.mp3`, and Whisper-checks it against the lyrics for
 undersinging and section timing — or, for an **imported track** (`track.source="import"`, an
-existing mp3 uploaded through the now-audio-aware `/api/uploads` together with its own lyrics),
-skips generation and mastering entirely and only runs the Whisper alignment. Either path ends at
-the **track** gate. Approving it is where a `clip` gets its scenes: the song's own sung sections
-are cut into a coverage-complete timeline — 0 to the track's full duration, no gaps — folding
-short instrumental gaps (<1.5 s) into a neighboring scene and giving longer ones their own
-fallback "instrumental interlude" scene, then splitting/merging everything to H3's 5-10 s scene
-length before the first one is submitted.
+existing mp3 uploaded through the now-audio-aware `/api/uploads`), skips generation and mastering
+entirely and only runs the Whisper alignment (`songrun.align_track`). Lyrics are optional on
+import: given, they get the same fuzzy section-matching check a generated track's own
+undersinging check runs; without them, `align_track` still transcribes the file with Whisper, but
+has nothing to match it against, so `track.lyrics_auto` (the raw transcript) and
+`track.raw_segments` (Whisper's own timestamped segments) come back instead of matched sections —
+`sections` stays empty and `undersung` reads `False`, not a claim of completeness, just nothing to
+judge. Either path ends at the **track** gate.
+
+Approving **track** no longer builds a `clip`'s scenes directly — it opens the `scenario` stage
+instead (`video`/`song` skip it, created already `"approved"`). `POST
+/api/projects/<id>/scenario/generate` turns the track's lyrics — or, lacking those, its
+auto-transcript — plus its caption into a per-section scene list, either through an LLM turn
+(`provider.chat_scenario`, its own schema: one H3 prompt per song section plus a shared
+`style_block` glued verbatim onto each) or, given `{"procedural": true}`, the same LLM-free
+synthesis `clip` scenes used before this stage existed; `PUT /api/projects/<id>/scenario`
+hand-edits the result (prompts, durations, section bounds) before approval, refused `409` once
+`stages.scenario` is `"approved"`. Every write, generated or edited, is checked against the two
+things no schema enforces: the sections must tile `[0, duration)` with no gap or overlap, and no
+single section may run under 5 s (`400 scenario_invalid` otherwise). `POST
+/api/projects/<id>/approve/scenario` is what actually builds scenes from the approved sections:
+the same fold-short/split-long/snap-to-grid pass every clip's scenes get, run this time on
+sections a human already approved rather than straight off the track's own sung timing. That
+older, track-driven cut — an instrumental gap ahead of the first sung line becomes its own
+fallback "instrumental interlude" scene past 1.5 s, or folds into a neighbor short of that — is
+still what feeds the `{"procedural": true}` branch of `/scenario/generate` (the "no LLM" button),
+and, for a `project.json` written before this stage existed (migrated to a passed, empty
+`scenario` gate on load: "этап пройден"), the one thing `approve/track` itself still does, so
+such a project is not stuck with no route left that ever builds its scenes.
 
 From there scenes chain themselves, no separate mechanism: every `generate` job tagged as a
 project scene (in its `note`, not its `kind` — a scene is an ordinary `kind=generate` job like
@@ -336,9 +359,14 @@ progress — joined against the live queue for whatever is running right now, si
 itself never records "in flight"; the same summaries ride along in `/api/state`),
 `GET /api/projects/<id>` (the full `project.json`), `POST /api/projects` (create one from a chat
 session's `project` field, or from an imported mp3 for a `clip`), `POST /api/projects/<id>/approve/<stage>`
-(`stage` is `script` or `track` — the only two gated by a human; `scenes`/`assembly` advance
+(`stage` is `script`, `track`, or — `kind="clip"` only — `scenario`; `scenes`/`assembly` advance
 themselves, and a gate can't be jumped: it refuses `409` unless the stage it names is actually
-`awaiting_approval`), `POST /api/projects/<id>/scenes/<idx>/retry` (invalidates that scene and
+`awaiting_approval`), `POST /api/projects/<id>/scenario/generate` and
+`PUT /api/projects/<id>/scenario` (the scenario gate's own write routes, `kind="clip"` only, once
+`track` is approved — generate a fresh scene list, LLM or `{"procedural": true}`, or hand-edit one
+already written; refused once `scenario` itself is `"approved"`, `PUT` naming it `409
+scenario_already_approved`, `.../generate` the plain `project_stage_not_ready`),
+`POST /api/projects/<id>/scenes/<idx>/retry` (invalidates that scene and
 every scene after it — a keyframe chain can't rerun scene 3 without redoing 4 onward — cancels
 any orphaned queued jobs for the tail, then resubmits), `POST /api/projects/<id>/track/retry` and
 `POST /api/projects/<id>/assembly/retry` (recompute either, refused while one is already running

@@ -159,6 +159,43 @@
   клип не пройден по качеству генерации. Числа: сцена 896×512 ≈ 6 мин/сек выхода,
   песня 10.7× реалтайма, сборка 1-4 с.
 
+### Сюжет клипа (волна 2026-08-19, Task 1-6, коммиты 1da5dbee..425a1285)
+- Импорт mp3 для клипа больше не требует лирики: `align_track(..., lyrics=None)` делает
+  чистую Whisper-транскрипцию → `track.lyrics_auto` + `track.raw_segments`, `sections` не
+  строятся, `undersung=False` по построению (нечего судить — не «допето»). С лирикой
+  поведение не изменилось: тот же fuzzy-match, что и у сгенерированного трека.
+- Новый этап `stages.scenario` (draft → awaiting_approval → approved) между `track` и
+  `scenes`, только у kind=clip; `video`/`song` создаются сразу с `"approved"`. Старый
+  `project.json` без поля `scenario` читается как уже `"approved"` с пустым сценарием
+  (сознательная миграция «этап пройден», не «draft» — иначе гейт для проекта, у которого
+  этого этапа никогда не существовало, завис бы навсегда). `approve/track` для клипа
+  больше не строит сцены (кроме этого миграционного случая) — сцены строит только
+  `approve/scenario`.
+- LLM-сценарий: `SCENARIO_SCHEMA` (h3_48gb/provider.py) — отдельная от PROMPT_SCHEMA,
+  `{reply, scenario: {sections: [{tag, start, end, scene: {prompt, duration}}],
+  style_block}}`, `scene.duration` 5–10 с в самой схеме. `provider.chat_scenario` —
+  тот же `_chat_turn` (ensure_up/retry/ProviderError), что и обычный чат, только схема и
+  напоминание при ретрае свои.
+- Веб-маршруты (h3_48gb/web.py): `POST /api/projects/<id>/scenario/generate` (гейт:
+  kind=clip, track approved, scenario draft/awaiting_approval; тело `{}` → LLM,
+  `{"procedural": true}` → прежний процедурный синтез без LLM), `PUT
+  /api/projects/<id>/scenario` (правки scenario_scenes/style_block; открывает гейт даже из
+  draft — единственный путь для сценария, написанного руками с нуля без единого вызова
+  generate; 409 `scenario_already_approved` после утверждения), `POST
+  /api/projects/<id>/approve/scenario` (`build_clip_scenes(..., scenario_scenes=...)` →
+  submit сцены 0, `approve_stage` в конце — та же C1-дисциплина «побочный эффект до
+  статуса», что у остальных гейтов волны «Проекты»).
+- Валидация на каждом приёме (generate и PUT одинаково, `_validate_scenario_scenes`):
+  секции покрывают `[0, duration)` без гэпа и нахлёста, ни одна не короче 5 с, поле
+  `duration` в границах 5–10 — иначе `400 scenario_invalid`. Строже толерантного fold,
+  который `build_clip_scenes` даёт процедурным секциям: короткая секция человека/LLM не
+  должна молча пропасть в соседа без единого отказа.
+- `ALIGN_WALLCLOCK_FACTOR` (h3_48gb/worker.py, `3.0/45.0`) — грубая прикидка длительности
+  align-задачи импортированного трека для дисплея очереди, **не измерение**: в коде прямо
+  помечено, что более ранняя версия докстроки по ошибке назвала это «измеренным фактом»,
+  и ни один замер mlx_whisper на этой машине это число не подтверждает. Не цитировать как
+  измеренное, пока такой замер не появится.
+
 ## 5. Процесс и методология (чему научились)
 
 - **Мерить до того, как планировать часы**: «OOM» kot-1344 оказался демо-фикстурой UI;
