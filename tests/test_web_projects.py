@@ -492,6 +492,25 @@ def test_create_project_with_an_imported_track(_serve):
     assert proj["stages"]["script"] == "awaiting_approval"
 
 
+def test_create_project_with_an_imported_track_and_no_lyrics_is_valid(_serve):
+    """Task 1 ("Сюжет клипа" wave, "авто-лирика"): a clip project imported without a session (so
+    no lyrics were ever supplied) used to leave `stages.script` stuck at `"draft"` forever --
+    `POST /api/projects` itself never refused it (no `args_invalid`), but the project was
+    unapprovable, a dead end in every practical sense. `track_source="import"` on its own is now
+    enough for `stages.script` to reach `"awaiting_approval"`, matching `kind="clip"`/lyrics-given
+    imports (`test_create_project_with_an_imported_track` above).
+    """
+    srv = _serve()
+    upload = srv.upload_raw(_MP3_BYTES, "song.mp3")[1]
+    created = srv.post_json(
+        "/api/projects",
+        {"kind": "clip", "track_source": "import", "track_path": upload["path"]})
+    proj = created["project"]
+    assert proj["track"]["source"] == "import"
+    assert proj["track"]["lyrics"] is None
+    assert proj["stages"]["script"] == "awaiting_approval"
+
+
 def test_create_project_import_requires_an_mp3_suffix(_serve):
     srv = _serve()
     upload = srv.upload_raw(_PNG_BYTES, "frame.png")[1]
@@ -624,6 +643,27 @@ def test_approve_script_for_a_clip_project_submits_a_song_job(_serve):
 
     detail = srv.get_json(f"/api/projects/{pid}")
     assert detail["active_job"]["kind"] == "track"
+
+
+def test_approve_script_for_an_imported_clip_with_no_lyrics_submits_a_song_job(_serve):
+    """Task 1: the script gate for an imported clip with no lyrics behaves exactly like the
+    lyrics-given case (`test_approve_script_for_a_clip_project_submits_a_song_job`) -- a
+    `kind="song"` job is submitted either way; the worker (`h3_48gb.worker._run_song_job`, out of
+    this route's own concern) is what tells "matched against known lyrics" and "auto-transcribed"
+    apart once that job actually runs.
+    """
+    srv = _serve()
+    upload = srv.upload_raw(_MP3_BYTES, "song.mp3")[1]
+    pid = srv.post_json(
+        "/api/projects",
+        {"kind": "clip", "track_source": "import", "track_path": upload["path"]})["id"]
+    approved = srv.post_json(f"/api/projects/{pid}/approve/script", {})
+    assert "job_id" in approved["submit"]
+
+    jobs, _broken = q.scan(srv.queue_root)
+    pending = [j for j in jobs if j.state == "pending"]
+    assert len(pending) == 1
+    assert pending[0].kind == q.KIND_SONG
 
 
 def test_approve_track_for_a_video_project_is_refused_explicitly(_serve):

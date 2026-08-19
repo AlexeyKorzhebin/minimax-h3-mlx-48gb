@@ -543,6 +543,33 @@ def test_update_track_accepts_seed_and_duration(tmp_path):
     assert reloaded.track["duration"] == pytest.approx(87.5)
 
 
+def test_a_fresh_track_defaults_lyrics_auto_and_raw_segments_to_none(tmp_path):
+    """Task 1 ("Сюжет клипа" wave, "авто-лирика"): `lyrics_auto`/`raw_segments` only get a value
+    once an imported track with no reference lyrics has actually been transcribed
+    (`h3_48gb.worker._run_song_job`, when `songrun.align_track` ran with `lyrics=None`) -- a fresh
+    track, including one that was never imported at all, has neither.
+    """
+    project = p.create_project(tmp_path, "clip", "clip")
+    assert project.track["lyrics_auto"] is None
+    assert project.track["raw_segments"] is None
+
+
+def test_update_track_accepts_lyrics_auto_and_raw_segments(tmp_path):
+    """`_TRACK_FIELDS` grew these two fields for Task 1's worker glue
+    (`h3_48gb.worker._run_song_job`), which writes both through `update_track` once an auto-
+    transcribed (no reference lyrics) song job finishes.
+    """
+    project = p.create_project(tmp_path, "clip", "clip")
+    segments = [{"start": 0.0, "end": 2.5, "text": "spi moy malenkiy"}]
+    project.update_track(lyrics_auto="spi moy malenkiy", raw_segments=segments)
+    assert project.track["lyrics_auto"] == "spi moy malenkiy"
+    assert project.track["raw_segments"] == segments
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.track["lyrics_auto"] == "spi moy malenkiy"
+    assert reloaded.track["raw_segments"] == segments
+
+
 def test_update_assembly_partially_updates_and_leaves_other_fields_alone(tmp_path):
     project = p.create_project(tmp_path, "video", "x")
     project.update_assembly(final_path="/x/final.mp4")

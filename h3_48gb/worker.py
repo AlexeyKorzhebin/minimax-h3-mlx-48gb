@@ -332,7 +332,12 @@ def _run_song_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
         project_path = _project_arg(job.args)
         proj = project_module.load_project(project_path)
         track = proj.track
-        lyrics = track.get("lyrics") or ""
+        # Task 1 ("Сюжет клипа" wave, "авто-лирика"): kept as `None` here, *not* coerced to `""`
+        # the way the generation branch below needs -- `raw_lyrics is None` is exactly the signal
+        # `songrun.align_track` uses to switch into its no-reference transcription mode (its own
+        # docstring). Only the import branch ever sees this raw value; the generation branch still
+        # falls back to `""` immediately below, unchanged from before this task.
+        raw_lyrics = track.get("lyrics")
         caption = track.get("caption") or ""
         track_dir = proj.path.parent / "track"
         run = _tracked_child_run(spawn)
@@ -345,8 +350,9 @@ def _run_song_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
                     raise songrun.SongRunError(
                         "track.source is 'import' but track.mp3 is not set")
                 log_lines.append(f"align-only (imported track): {mp3_path}")
-                result = songrun.align_track(track_dir, mp3_path, lyrics, run=run)
+                result = songrun.align_track(track_dir, mp3_path, raw_lyrics, run=run)
             else:
+                lyrics = raw_lyrics or ""
                 duration = songrun.estimate_duration(lyrics)
                 seed_used = track.get("seed")
                 if seed_used is None:
@@ -363,6 +369,13 @@ def _run_song_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
         )
         if seed_used is not None:
             update_fields["seed"] = seed_used
+        if result.raw_segments is not None:
+            # Task 1: only `align_track(..., lyrics=None)` ever sets this (see `SongResult.
+            # raw_segments`'s own docstring) -- `lyrics_auto` is the same call's `transcript`,
+            # given a track-facing name so a human (or Task 2's scenario LLM) reads it as "the
+            # lyrics we don't actually have, guessed from the audio", not as a debug log field.
+            update_fields["lyrics_auto"] = result.transcript
+            update_fields["raw_segments"] = result.raw_segments
         proj.update_track(**update_fields)
         proj.set_stage_status("track", "awaiting_approval")
         log_lines.append(

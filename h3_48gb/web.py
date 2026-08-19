@@ -3207,10 +3207,13 @@ class _Handler(BaseHTTPRequestHandler):
         script gate ... populating a freshly created project's scenes/track for the first time")
         as `save()`'s intended use: nothing else has touched this project yet, so there is nothing
         for a blind write to clobber. `stages.script` becomes `"awaiting_approval"` only when there
-        is actually something to approve (a video project got at least one scene, or a clip/song
-        project got non-empty lyrics) -- an empty project (no session, or a session with no
-        `project` field) stays `"draft"`, not yet approvable, exactly as the design spec's "или
-        пустого" describes: a shell a person fills in later, not an empty gate.
+        is actually something to approve (a video project got at least one scene, a clip/song
+        project got non-empty lyrics, **or** -- Task 1, "Сюжет клипа" wave, "авто-лирика" -- a clip
+        project imported an mp3 with `track_source="import"` even with *no* lyrics at all: the
+        song job that follows transcribes the audio itself, so there is something to approve
+        whether or not a human supplied lyrics up front) -- an empty project (no session, or a
+        session with no `project` field) stays `"draft"`, not yet approvable, exactly as the design
+        spec's "или пустого" describes: a shell a person fills in later, not an empty gate.
         """
         payload = self._json_request(
             allowed=("session_id", "kind", "title", "track_source", "track_path"))
@@ -3346,7 +3349,15 @@ class _Handler(BaseHTTPRequestHandler):
             if track_source == "import":
                 proj.track["source"] = "import"
                 proj.track["mp3"] = str(track_path)
-            if proj.track.get("lyrics"):
+            # Task 1 ("Сюжет клипа" wave, "авто-лирика"): `track_source == "import"` alone is
+            # enough to approve the script gate, lyrics or not -- an imported clip with no lyrics
+            # is a fully legitimate project (design spec: "clip-проект ... принимает mp3 БЕЗ
+            # лирики"), whose song job runs `songrun.align_track(..., lyrics=None)` and comes back
+            # with a transcript instead of matched sections. `track_source == "generate"` still
+            # requires actual lyrics (`proj.track.get("lyrics")`), unchanged from before this task
+            # -- there is no audio yet for Music3 to derive anything from, so an empty lyric there
+            # would submit a generation job with nothing to sing.
+            if proj.track.get("lyrics") or track_source == "import":
                 proj.stages["script"] = "awaiting_approval"
         proj.save()
 

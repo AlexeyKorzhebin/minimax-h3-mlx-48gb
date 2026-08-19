@@ -728,7 +728,7 @@ def test_run_song_result_fields_match_update_track_field_names():
     result_fields = set(sr.SongResult.__dataclass_fields__)
     track_fields = set(p._TRACK_FIELDS)
     assert result_fields & track_fields == {
-        "wav", "mp3", "mastered_mp3", "sections", "undersung", "duration"}
+        "wav", "mp3", "mastered_mp3", "sections", "undersung", "duration", "raw_segments"}
 
 
 def test_run_song_propagates_a_generation_failure_as_song_run_error(tmp_path):
@@ -924,6 +924,83 @@ def test_align_track_raises_song_run_error_on_unparseable_ffprobe_output(tmp_pat
 
     with pytest.raises(sr.SongRunError, match="unparseable"):
         sr.align_track(track_dir, mp3_path, "[intro]\nx", music3_python="p", run=fake)
+
+
+# -- align_track(lyrics=None): auto-lyrics (Task 1, "Сюжет клипа" wave) --------------------------
+
+
+def test_align_track_with_no_reference_lyrics_returns_raw_segments_and_no_sections(tmp_path):
+    """Design spec, "авто-лирика": a clip project may import an mp3 with no reference lyrics at
+    all. `lyrics=None` must still run Whisper (the same transcription every other `align_track`
+    call does) but skip the fuzzy-match against a reference that does not exist: `sections` comes
+    back empty, `undersung` is always `False` (nothing to judge as unsung), and `raw_segments`
+    carries Whisper's own segments -- trimmed to just `start`/`end`/`text`, not the full
+    `mlx_whisper` segment dict.
+    """
+    track_dir = tmp_path / "track"
+    mp3_path = tmp_path / "uploaded" / "no-lyrics-song.mp3"
+    mp3_path.parent.mkdir(parents=True)
+    mp3_path.write_bytes(b"fake mp3 bytes")
+
+    fake = _FakeRun()
+    segments = [
+        {"start": 0.0, "end": 2.5, "text": "spi moy malenkiy",
+         "id": 0, "seek": 0, "tokens": [1, 2], "avg_logprob": -0.1},
+        {"start": 2.5, "end": 5.0, "text": "moy yasny svet",
+         "id": 1, "seek": 0, "tokens": [3, 4], "avg_logprob": -0.2},
+    ]
+
+    def handle_whisper(cmd):
+        out_dir = Path(cmd[cmd.index("--output-dir") + 1])
+        name = cmd[cmd.index("--output-name") + 1]
+        payload = {"text": "spi moy malenkiy moy yasny svet", "segments": segments}
+        (out_dir / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
+        return _Result()
+
+    fake.add(_is_mlx_whisper_call, handle_whisper)
+    fake.add(_is_ffprobe_call, lambda cmd: _Result(stdout="5.0\n"))
+
+    result = sr.align_track(track_dir, mp3_path, None, music3_python="fake-python3", run=fake)
+
+    assert isinstance(result, sr.SongResult)
+    assert result.duration == pytest.approx(5.0)
+    assert result.transcript == "spi moy malenkiy moy yasny svet"
+    assert result.sections == []
+    assert result.undersung is False
+    assert result.raw_segments == [
+        {"start": 0.0, "end": 2.5, "text": "spi moy malenkiy"},
+        {"start": 2.5, "end": 5.0, "text": "moy yasny svet"},
+    ]
+
+
+def test_align_track_with_reference_lyrics_still_leaves_raw_segments_none(tmp_path):
+    """The pre-existing, reference-lyrics path (`lyrics` a real string) is unchanged by Task 1:
+    `sections`/`undersung` still come from `check_lyrics_sung`, and `raw_segments` -- the new field
+    -- stays `None`, the same as every other field this function did not touch before.
+    """
+    track_dir = tmp_path / "track"
+    mp3_path = tmp_path / "uploaded" / "suno-song.mp3"
+    mp3_path.parent.mkdir(parents=True)
+    mp3_path.write_bytes(b"fake mp3 bytes")
+
+    fake = _FakeRun()
+    segments = [{"start": 0.0, "end": 3.0, "text": "spi moy malenkiy"}]
+
+    def handle_whisper(cmd):
+        out_dir = Path(cmd[cmd.index("--output-dir") + 1])
+        name = cmd[cmd.index("--output-name") + 1]
+        payload = {"text": "spi moy malenkiy", "segments": segments}
+        (out_dir / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
+        return _Result()
+
+    fake.add(_is_mlx_whisper_call, handle_whisper)
+    fake.add(_is_ffprobe_call, lambda cmd: _Result(stdout="9.4\n"))
+
+    result = sr.align_track(track_dir, mp3_path, "[intro]\nspi moy malenkiy",
+                            music3_python="fake-python3", run=fake)
+
+    assert result.raw_segments is None
+    assert result.sections == [{"name": "intro", "start": 0.0, "end": 9.4}]
 
 
 # -- no-mlx discipline --------------------------------------------------------------------------

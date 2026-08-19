@@ -1092,6 +1092,53 @@ def test_a_song_job_with_an_imported_track_runs_the_align_only_path(tmp_path, mo
     assert reloaded.track["mp3"] == str(imported_mp3)
 
 
+def test_a_song_job_with_an_imported_track_and_no_lyrics_runs_the_auto_lyrics_path(
+        tmp_path, monkeypatch):
+    """Task 1 ("Сюжет клипа" wave, "авто-лирика"): a `track.source == "import"` project with no
+    reference lyrics at all (`track.lyrics is None`) passes that `None` straight through to
+    `songrun.align_track` -- **not** coerced to `""` the way the generation branch's own `lyrics`
+    local is -- so `align_track` can tell "no reference" apart from "an empty reference" the same
+    way its own docstring describes. Once the job finishes, `lyrics_auto`/`raw_segments` (only
+    ever set when `SongResult.raw_segments is not None`) land on the track through the same
+    `update_track` call as everything else the job produces.
+    """
+    root = tmp_path / "queue"
+    imported_mp3 = tmp_path / "uploaded" / "no-lyrics-song.mp3"
+    imported_mp3.parent.mkdir(parents=True)
+    imported_mp3.write_bytes(b"fake mp3 bytes")
+    proj = _song_project(tmp_path, source="import", mp3=imported_mp3, lyrics=None)
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    raw_segments = [{"start": 0.0, "end": 2.5, "text": "spi moy malenkiy"}]
+    fake_result = sr.SongResult(
+        wav=imported_mp3, mastered_wav=imported_mp3, mp3=imported_mp3, mastered_mp3=imported_mp3,
+        duration=42.0, transcript="spi moy malenkiy", sections=[], undersung=False,
+        raw_segments=raw_segments,
+    )
+
+    seen = {}
+
+    def fake_align_track(track_dir_arg, mp3_path, lyrics, **kw):
+        seen["lyrics"] = lyrics
+        return fake_result
+
+    monkeypatch.setattr(sr, "run_song",
+                         lambda *a, **kw: (_ for _ in ()).throw(
+                             AssertionError("run_song must not be called for an imported track")))
+    monkeypatch.setattr(sr, "align_track", fake_align_track)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    assert seen["lyrics"] is None, "align_track must see the real None, not an empty string"
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["status"] == "awaiting_approval"
+    assert reloaded.track["sections"] == []
+    assert reloaded.track["undersung"] is False
+    assert reloaded.track["lyrics_auto"] == "spi moy malenkiy"
+    assert reloaded.track["raw_segments"] == raw_segments
+
+
 def test_a_song_job_with_an_imported_track_but_no_mp3_fails_honestly(tmp_path):
     """`track.source == "import"` with no `track.mp3` set is a malformed project, not something to
     crash the worker over -- the job fails (`failed/`), the project is left untouched.

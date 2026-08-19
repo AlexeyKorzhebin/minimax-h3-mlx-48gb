@@ -197,6 +197,17 @@ class SongResult:
     #: *tail* was -- see `check_lyrics_sung`'s own docstring for exactly what this does and does
     #: not promise.
     undersung: bool = False
+    #: Task 1 ("Сюжет клипа" wave, "авто-лирика"): `align_track`'s raw Whisper segments,
+    #: `[{"start": float | None, "end": float | None, "text": str}, ...]`, one entry per segment
+    #: `mlx_whisper` produced -- set **only** when `align_track` was called with `lyrics=None` (no
+    #: reference lyrics to match against at all). `None` in every other case (`run_song`'s own
+    #: generated take always has real lyrics; `align_track` given real lyrics builds `sections`
+    #: instead, the same as `run_song` does) -- a caller (the worker) tells "auto-transcribed" and
+    #: "matched against known lyrics" apart by checking this field for `None`, not by re-deriving it
+    #: from whether `track.lyrics` happens to be empty. Task 2 (LLM scenario generation) is the
+    #: intended reader: it needs each segment's own timestamp to group them into sections itself,
+    #: something `sections` (built only when reference lyrics exist) cannot offer here.
+    raw_segments: list[dict] | None = None
 
 
 def _run_or_raise(cmd: list[str], run, what: str) -> subprocess.CompletedProcess:
@@ -601,13 +612,30 @@ def check_lyrics_sung(lyrics: str, segments: list[dict], *,
     return sections, undersung
 
 
-def align_track(track_dir, mp3_path, lyrics: str, *,
+def align_track(track_dir, mp3_path, lyrics: str | None, *,
                  music3_python=DEFAULT_MUSIC3_PYTHON, run=subprocess.run) -> SongResult:
     """The `track.source == "import"` path (design spec addendum, "импортированный трек"): no
     Music3 generation, no mastering -- an imported mp3 is already the finished product -- just
-    `mlx_whisper` transcription and the same section-alignment `run_song` uses, so a clip-on-a-song
-    project built from an imported track gets scene boundaries the identical way a generated one
-    does.
+    `mlx_whisper` transcription and, when reference lyrics are given, the same section-alignment
+    `run_song` uses, so a clip-on-a-song project built from an imported track gets scene boundaries
+    the identical way a generated one does.
+
+    **`lyrics=None` (Task 1, "Сюжет клипа" wave, "авто-лирика"): a legitimate mode, not an error.**
+    A clip project may import an mp3 with *no* reference lyrics at all (design spec: "clip-проект
+    с track.source=import принимает mp3 БЕЗ лирики") -- Whisper still runs exactly the same
+    (`_transcribe` does not know or care whether a reference exists), but there is nothing to fuzzy-
+    match its segments against, so `check_lyrics_sung` is skipped entirely: `sections` comes back
+    empty (design spec: "sections тогда НЕ строятся"), `undersung` is always `False` (there is no
+    lyric tail to judge as unsung), and `raw_segments` -- `None` in every other call to this
+    function -- carries Whisper's own segments instead, trimmed to just `{"start", "end", "text"}`
+    (not the full `mlx_whisper` segment dict, which also has `id`/`seek`/`tokens`/`temperature`/
+    `avg_logprob`/`compression_ratio`/`no_speech_prob` -- noise no caller here needs). Whisper
+    mishearings are fine as-is in this mode (design spec: "ослышки Whisper допустимы -- сценарий
+    пишется по смыслу, не для караоке") -- nothing downstream fuzzy-matches this text against
+    anything, so there is no threshold for a mishearing to fail.
+
+    `lyrics` given as a non-empty string is the pre-existing behavior, unchanged: `sections`/
+    `undersung` come from `check_lyrics_sung` exactly as before, and `raw_segments` stays `None`.
 
     Returns a `SongResult` shaped exactly like `run_song`'s, so task 3's worker glue does not need
     to know which path produced it before calling `project.Project.update_track(**fields)`:
@@ -631,7 +659,19 @@ def align_track(track_dir, mp3_path, lyrics: str, *,
     whisper_data = _transcribe(music3_python, mp3_path, track_dir, run=run)
     segments = whisper_data.get("segments", [])
     duration = _ffprobe_duration(mp3_path, run=run)
-    sections, undersung = check_lyrics_sung(lyrics, segments, duration=duration)
+    transcript = (whisper_data.get("text") or "").strip()
+
+    if lyrics is None:
+        sections: list[dict] = []
+        undersung = False
+        raw_segments: list[dict] | None = [
+            {"start": seg.get("start"), "end": seg.get("end"),
+             "text": (seg.get("text") or "").strip()}
+            for seg in segments
+        ]
+    else:
+        sections, undersung = check_lyrics_sung(lyrics, segments, duration=duration)
+        raw_segments = None
 
     return SongResult(
         wav=mp3_path,
@@ -639,9 +679,10 @@ def align_track(track_dir, mp3_path, lyrics: str, *,
         mp3=mp3_path,
         mastered_mp3=mp3_path,
         duration=duration,
-        transcript=(whisper_data.get("text") or "").strip(),
+        transcript=transcript,
         sections=sections,
         undersung=undersung,
+        raw_segments=raw_segments,
     )
 
 

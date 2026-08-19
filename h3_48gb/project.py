@@ -215,6 +215,25 @@ def _empty_track() -> dict:
         # see `align_track`'s docstring for why the earlier version of that function undercounted
         # a track with a wordless tail). `None` until a song job has actually produced one.
         "duration": None,
+        # Task 1 ("Сюжет клипа" wave, "авто-лирика"): a `track.source == "import"` project may
+        # import an mp3 with no reference lyrics at all -- the worker's song-job dispatch then
+        # calls `songrun.align_track(..., lyrics=None)`, which cannot build `sections` (nothing to
+        # fuzzy-match against) but still transcribes the audio. `lyrics_auto` is that raw
+        # transcript (`songrun.SongResult.transcript`, the same full-text field a lyrics-matched
+        # run also produces but never had anywhere to land before this) -- a human-readable stand-
+        # in for lyrics a clip's future scenario step (Task 2) reads by *meaning*, not for karaoke
+        # accuracy (design spec: "ослышки Whisper допустимы"). `None` until an auto-transcribed
+        # song job has actually produced one; stays `None` forever for a track whose lyrics were
+        # already known (matched sections exist instead) or that was never imported at all.
+        "lyrics_auto": None,
+        # Task 1: `songrun.SongResult.raw_segments` copied straight onto the track in the same
+        # `lyrics=None` case as `lyrics_auto` above -- `[{"start", "end", "text"}, ...]`, one entry
+        # per Whisper segment, timestamps and all. This is what a future scenario LLM call (Task 2)
+        # groups into sections itself, since `sections` (built from *known* lyrics) does not exist
+        # for this track. Can run to hundreds of entries on a long song; `project.json` already
+        # tolerates large scene lists the same way (module docstring), so no special handling here.
+        # `None` for every track that is not this specific auto-transcribed-import case.
+        "raw_segments": None,
     }
 
 
@@ -644,7 +663,8 @@ class Project:
     def update_track(self, **fields) -> "Project":
         """Partial update of `self.track`'s own fields (`_TRACK_FIELDS`:
         `lyrics`/`caption`/`wav`/`mp3`/`mastered_mp3`/`sections`/`status`/`source`/`undersung`/
-        `seed`/`duration`) -- the `track`-scoped sibling of `set_scene_status`, for a caller
+        `seed`/`duration`/`lyrics_auto`/`raw_segments`) -- the `track`-scoped sibling of
+        `set_scene_status`, for a caller
         (task 3's chat integration, the mastering step, the worker's song-job dispatch) that has
         learned one or two of these facts and must not clobber the rest via a blind `save()` (see
         `save`'s own docstring for why that stops being safe once other writers exist).
