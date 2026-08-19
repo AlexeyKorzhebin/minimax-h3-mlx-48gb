@@ -1732,6 +1732,73 @@ def test_edit_scenario_rejects_a_malformed_entry_as_args_invalid(_serve, monkeyp
     assert (status, payload["error"]["code"]) == (400, "args_invalid"), payload
 
 
+def test_edit_scenario_from_draft_opens_the_gate(_serve, monkeypatch):
+    """Ревью, фикс-раунд 1, I1: a scenario written entirely by hand, with no `/scenario/generate`
+    call at all (`stages.scenario` still `"draft"` -- the instrumental-track path the design spec
+    names), must not be a dead end. Before this fix the only route that ever flipped `stages.
+    scenario` to `"awaiting_approval"` was `/scenario/generate`, so a hand-written scenario could
+    never reach `approve/scenario` without first calling `/scenario/generate` and overwriting it.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    project_before = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert project_before["stages"]["scenario"] == "draft"
+    assert project_before["scenario_scenes"] == []
+
+    status, edited = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "hand-written from scratch",
+             "duration": 6.0},
+            {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "hand-written second half",
+             "duration": 7.0},
+        ],
+        "style_block": "Hand-written style, no LLM involved.",
+    })
+    assert status == 200, edited
+    assert edited["project"]["stages"]["scenario"] == "awaiting_approval"
+    assert edited["project"]["scenario_scenes"][0]["prompt"] == "hand-written from scratch"
+
+    approved_scenario = srv.post_json(f"/api/projects/{pid}/approve/scenario", {})
+    assert approved_scenario["advance"]["action"] == "submitted_scene"
+    scenes = approved_scenario["project"]["scenes"]
+    assert len(scenes) >= 1
+    assert approved_scenario["project"]["stages"]["scenario"] == "approved"
+
+
+def test_edit_scenario_while_awaiting_approval_stays_awaiting_approval(_serve, monkeypatch):
+    """A `PUT` on a scenario that already opened the gate (via a prior `/scenario/generate` or
+    `PUT`) is a no-op re-write of the same status, not a new transition -- editing before approval
+    must not do anything surprising to `stages.scenario` beyond leaving it exactly where it already
+    was (ревью, фикс-раунд 1, I1: "PUT в статусе awaiting_approval ведёт себя как раньше").
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    generated = srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+    assert generated["project"]["stages"]["scenario"] == "awaiting_approval"
+
+    status, edited = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 16.0, "prompt": "edited once more",
+             "duration": 8.0},
+        ],
+    })
+    assert status == 200, edited
+    assert edited["project"]["stages"]["scenario"] == "awaiting_approval"
+
+    # a second PUT still leaves it at awaiting_approval, and approve/scenario still works
+    status, edited_again = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 16.0, "prompt": "edited twice",
+             "duration": 8.0},
+        ],
+    })
+    assert status == 200, edited_again
+    assert edited_again["project"]["stages"]["scenario"] == "awaiting_approval"
+
+    approved_scenario = srv.post_json(f"/api/projects/{pid}/approve/scenario", {})
+    assert approved_scenario["project"]["stages"]["scenario"] == "approved"
+
+
 # -- migration: a project.json written before the scenario stage existed -------------------------
 
 

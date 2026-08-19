@@ -4079,6 +4079,16 @@ class _Handler(BaseHTTPRequestHandler):
         `style_block`, optional: omitted leaves `Project.scenario_style_block` exactly as it was;
         given, `null` clears it and a string replaces it -- the same "absent vs. `null`" contract
         `Project.update_track`'s own docstring already promises `update_scenario` shares.
+
+        **Opens the gate (ревью, фикс-раунд 1, I1): a successful `PUT` always leaves `stages.
+        scenario` at `"awaiting_approval"`, content written first.** Before this fix a scenario
+        written by hand from `"draft"` (no `/scenario/generate` call at all -- the instrumental-
+        track path the design spec names) could never reach `approve/scenario` at all, because
+        only `/scenario/generate` ever flipped the stage status; the only way out of that dead end
+        was calling `/scenario/generate`, which overwrites whatever the human had just written.
+        From `"draft"` this `PUT` is now the transition into `"awaiting_approval"` in its own
+        right, same as `/scenario/generate`; from `"awaiting_approval"` it is a no-op re-write of
+        the same value, not a new behaviour.
         """
         proj = self._scenario_gate_project(raw_id)
         current = proj.stages.get("scenario")
@@ -4119,6 +4129,13 @@ class _Handler(BaseHTTPRequestHandler):
                                {"type": type(style_block).__name__})
             fields["scenario_style_block"] = style_block
         proj.update_scenario(**fields)
+
+        # Гейт: контент ДО статуса (C1-дисциплина). Из `"draft"` этот `PUT` -- единственный путь,
+        # который может открыть гейт (ревью, фикс-раунд 1, I1): написанный руками с нуля сценарий
+        # был утверждаем только через `/scenario/generate`, который его тут же перетирал бы. Из
+        # `"awaiting_approval"` это ровно тот же статус на выходе, что и на входе -- не поведенческое
+        # изменение, просто одна и та же запись `set_stage_status` в обоих случаях, без ветвления.
+        proj.set_stage_status("scenario", "awaiting_approval")
 
         reloaded = project_module.load_project(proj.path)
         return 200, "application/json", _json_bytes(

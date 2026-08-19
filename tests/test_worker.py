@@ -1472,13 +1472,16 @@ def test_song_job_wallclock_estimate_seconds_is_estimate_duration_times_13():
         sr.estimate_duration(lyrics) * 13.0)
 
 
-def test_align_job_wallclock_estimate_seconds_matches_the_measured_calibration():
-    """Task 4 ("Сюжет клипа" wave) brief, verbatim: "транскрипция 45-с трека ~3 c" -- an align-only
-    job (`track.source == "import"`) is priced off the file's own duration, not lyric section
-    count (`song_job_wallclock_estimate_seconds`, which has nothing to do with this job at all: it
-    never generates anything). 45s of audio should land close to the measured 3s of Whisper work
-    plus the fixed pad.
+def test_align_job_wallclock_estimate_seconds_pins_the_current_rough_guess():
+    """`ALIGN_WALLCLOCK_FACTOR`/`ALIGN_WALLCLOCK_PAD_SECONDS` are a rough order-of-magnitude guess,
+    not a measured calibration (ревью, фикс-раунд 1, I2 -- an earlier version of this test and
+    `ALIGN_WALLCLOCK_FACTOR`'s own docstring called it "measured" and attributed it to the task 4
+    brief, which names no such number). This pins today's constants and their arithmetic so a
+    future change to either is a deliberate, visible diff -- not a claim that `3.0 / 45.0` is
+    accurate.
     """
+    assert worker.ALIGN_WALLCLOCK_FACTOR == pytest.approx(3.0 / 45.0)
+    assert worker.ALIGN_WALLCLOCK_PAD_SECONDS == pytest.approx(5.0)
     assert worker.align_job_wallclock_estimate_seconds(45.0) == pytest.approx(
         45.0 * worker.ALIGN_WALLCLOCK_FACTOR + worker.ALIGN_WALLCLOCK_PAD_SECONDS)
     assert worker.align_job_wallclock_estimate_seconds(45.0) == pytest.approx(3.0 + 5.0)

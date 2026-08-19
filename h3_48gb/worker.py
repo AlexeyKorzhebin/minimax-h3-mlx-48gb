@@ -280,13 +280,16 @@ def song_job_wallclock_estimate_seconds(lyrics: str) -> float:
     return songrun.estimate_duration(lyrics) * SONG_WALLCLOCK_FACTOR
 
 
-#: Measured fact ("Сюжет клипа" wave, task 4 brief): `mlx_whisper` transcribed a 45s track in
-#: roughly 3s wall clock on this machine -- an align-only `kind="song"` job (`track.source ==
-#: "import"`, `h3_48gb.songrun.align_track`) is dominated by that one step, not by anything
-#: proportional to a lyric section count the way a *generated* take is (`SONG_WALLCLOCK_FACTOR`
-#: above prices that job, and only that job -- Music3 generation never runs for an import at all).
-#: ~1/15th of the file's own length, not `SONG_WALLCLOCK_FACTOR`'s ~13x: the two numbers describe
-#: two different jobs, not two measurements of the same one.
+#: Rough order-of-magnitude guess, NOT a measurement (ревью, фикс-раунд 1, I2: an earlier version
+#: of this docstring called `3.0 / 45.0` a "measured fact" attributed to the task 4 brief -- the
+#: brief names no such number, and no measurement backs this ratio anywhere in the repo; fix
+#: whenever an actual `mlx_whisper` timing is taken on this machine). An align-only `kind="song"`
+#: job (`track.source == "import"`, `h3_48gb.songrun.align_track`) is dominated by Whisper
+#: transcription, not by anything proportional to a lyric section count the way a *generated* take
+#: is (`SONG_WALLCLOCK_FACTOR` above prices that job, and only that job -- Music3 generation never
+#: runs for an import at all). This guesses transcription runs much faster than realtime -- nowhere
+#: near `SONG_WALLCLOCK_FACTOR`'s ~13x -- so the display-only estimate below errs toward "fast",
+#: not toward the accuracy either constant would need to actually gate anything.
 ALIGN_WALLCLOCK_FACTOR = 3.0 / 45.0
 
 #: Flat pad on top of `ALIGN_WALLCLOCK_FACTOR * <track duration>` -- `ffprobe`, process spawn, disk
