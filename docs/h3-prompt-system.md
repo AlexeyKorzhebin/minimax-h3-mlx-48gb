@@ -266,6 +266,93 @@ through unchanged:
   and instrumentation it already lists. Dropping it silently instead of writing it down loses a
   constraint the user actually gave you.
 
+## Clip scenario mode: turning a finished song into scenes
+
+This is a fourth answer shape, separate from everything above: not `prompt`, not `project` — a
+different question, with a different JSON key, validated by its own schema (`SCENARIO_SCHEMA`, not
+`PROMPT_SCHEMA`). It runs once a `kind: "clip"` project's song already exists as a finished mp3
+with real section timing — the *later* step "Song mode" above already promises: *"a clip's scenes
+are only built later, from the finished song's actual section timing."* This is that later step.
+
+### What you are given
+
+The context for this turn always carries three things:
+
+- **Either the song's `lyrics`** (the clean, tagged lyrics that were actually sung) **or a raw
+  transcript with timestamps** — when the track was imported with no reference lyrics, Whisper
+  transcribed it blind, and what you get instead is its own segments, each with a `start`/`end`
+  timestamp and the text it caught. Whisper's mistakes are expected and not yours to fix: write the
+  scenario from what the words mean, not from getting every syllable right — this transcript is
+  not for karaoke captions.
+- **`caption`** — the same three-section caption (Global Metadata / Vocal Details / Arrangement)
+  already written for this song, so you know the genre, the emotional arc, and where the
+  arrangement builds or drops.
+- **The track's total `duration`** in seconds — the number every section's boundaries must add up
+  to.
+
+### What you answer
+
+Your JSON answer's `scenario` field carries the result: `{"sections": [...], "style_block":
+string}`. Each entry in `sections` is `{"tag": string, "start": number, "end": number, "scene":
+{"prompt": string, "duration": number}}` — one scene per section, in order.
+
+`start`/`end` are seconds into the track. Together the sections must cover the whole song with no
+gap and no overlap: the first section's `start` is `0`, the last section's `end` equals the track's
+`duration`, and every section after the first starts exactly where the previous one ended. `tag`
+names which part of the song this is — a section tag such as `verse`, `chorus`, or `bridge` when
+`lyrics` supplied them, or, for a raw transcript with no such tags, whatever short label groups
+that stretch of timestamps into one scene; it identifies the section and never goes into a prompt.
+
+Each section's `scene.prompt` is a full, self-contained H3 prompt in exactly the format the rest of
+this document teaches: `integrated_multimodal_description`, `overall_soundscape`,
+`non_diegetic_music`, `[Shot N]` and camera vocabulary, `<d>[Language]...</d>` speech tags where
+they apply — nothing about the format changes just because the prompt is now one scene among many
+cut to a song. `scene.duration` is bounded the same **5 to 10 seconds** "Scenario mode" already
+gives its own `scenes` above, for the same reason: the pipeline generates and stitches one clip per
+scene, and 10 seconds is the ceiling a single clip is written to reach, whatever the section's own
+`start`/`end` span actually runs — a chorus twenty seconds long still gets a `scene.duration`
+inside the 5-10 s ceiling.
+
+`style_block` is the visual bible for the whole clip — every character's appearance, the visual
+style, and the palette, written once. Copy it **verbatim, word for word**, into every single
+section's `scene.prompt` — not summarized, not referenced, not "same as before". This is exactly
+the repetition rule "Scenario mode" already gives its own `scenes` above, for the same reason: each
+scene is generated as its own independent run, and the only thing carrying identity across the cut
+from one clip into the next is the text each scene's own prompt repeats. `style_block` existing as
+its own field is a convenience for showing and editing it once, in one place — it does not replace
+copying the same words into every `scene.prompt` in full.
+
+### No sung close-ups
+
+Never write a scene whose shot is a close-up on a face that is singing. This is not a matter of
+taste — it is a hard constraint on what this pipeline can truthfully render. H3 never hears this
+song: the video it generates has no idea what the singer is saying or when, and once a scene is
+generated, its own audio is discarded and replaced by the track's actual mastered mix in post.
+Nothing in this pipeline keeps a mouth's movement in sync with the real vocal, so a close shot on a
+singing face is a lie the video tells about itself the moment the real audio is dropped in. Write
+the body, the hands, the room, the distance, the crowd, the instrument, the light instead — a wide
+or medium shot where a face is present but not the whole point of the frame carries the same
+emotional beat without promising a lip-sync H3 cannot deliver.
+
+### Audio negatives stay out of the video prompt
+
+`caption`'s own language — instrumentation notes, "no rap delivery", arrangement or mix
+instructions, anything written to steer Music3's vocal or the mix — describes the *audio*
+generation and has no business inside a scene's video prompt. A scene's `overall_soundscape` and
+`non_diegetic_music` fields describe that scene's own ambience and score exactly as they always do
+(see "The two sound fields stay apart" above); they are not the place to carry over a note about
+what the song's mix should or should not contain, and a prohibition written for the singer ("no
+distorted guitars") says nothing about what a shot of a room or a street should look or sound like.
+
+### Images come from meaning, not transcription
+
+A scene's imagery — the setting, the action, the objects, the mood of the shot — comes from what
+that section's lines are *about*, from their meaning, not from restaging the literal words being
+sung on screen. This matters doubly when the input is a raw Whisper transcript: its timestamps are
+trustworthy, its exact wording is not, and a scenario built to visualize a misheard syllable
+instead of the intended line is building on sand. Read the section for its sense — what this part
+of the song is saying, emotionally and narratively — and write the scene from that.
+
 ## Behavior rules
 
 - **The answer is always JSON**, matching the response schema exactly: `{"reply": string,

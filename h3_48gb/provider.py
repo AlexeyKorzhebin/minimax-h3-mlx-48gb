@@ -103,6 +103,83 @@ PROMPT_SCHEMA = {
 }
 
 
+# Task 2 ("Сюжет клипа"): the *later* step "Song mode" (in docs/h3-prompt-system.md, and in
+# `PROMPT_SCHEMA["schema"]["properties"]["project"]` above) already promises -- "a clip's scenes
+# are only built later, from the finished song's actual section timing." This is that step's own
+# answer shape, and it is a *separate* top-level schema rather than a fourth key bolted onto
+# `PROMPT_SCHEMA`: that schema already carries `prompt` (one clip) and `project` (a video script,
+# or a song's lyrics+caption before it is even rendered) and does not need a third, unrelated
+# shape mixed into the same object every ordinary chat turn is validated against.
+SCENARIO_SCHEMA = {
+    "name": "h3_clip_scenario",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "reply": {"type": "string"},
+            # Nullable-but-required, the same convention `prompt`/`project` use above in
+            # `PROMPT_SCHEMA`: `null` while there is nothing to answer with yet (a clarifying
+            # question), but the key itself always present in a valid turn.
+            "scenario": {
+                "type": ["object", "null"],
+                "properties": {
+                    "sections": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                # Names which part of the song this is (`verse`, `chorus`, ... or,
+                                # for a raw Whisper transcript with no such tags, a short label of
+                                # the modeler's own choosing) -- identifies the section, never
+                                # itself part of a prompt.
+                                "tag": {"type": "string"},
+                                # Seconds into the track. Sections must cover the whole song with
+                                # no gap and no overlap (docs/h3-prompt-system.md, "Clip scenario
+                                # mode") -- enforced by the caller (coverage against the track's
+                                # own `duration`), not by this schema, the same way `PROMPT_SCHEMA`
+                                # leaves cross-field coverage checks to its own caller.
+                                "start": {"type": "number"},
+                                "end": {"type": "number"},
+                                "scene": {
+                                    "type": "object",
+                                    "properties": {
+                                        # A full, self-contained H3 prompt -- the same three-field
+                                        # format `PROMPT_SCHEMA`'s own `project.scenes[].prompt`
+                                        # uses for "Scenario mode", flattened to text.
+                                        "prompt": {"type": "string"},
+                                        # Same 5-10 s pipeline ceiling as `PROMPT_SCHEMA`'s own
+                                        # `project.scenes[].duration` (review I1's reasoning
+                                        # applies unchanged here): a clip is generated and
+                                        # stitched per scene, and 10 s is the ceiling a single
+                                        # clip is written to reach, independent of how long the
+                                        # section's own `start`/`end` span actually runs.
+                                        "duration": {"type": "number", "minimum": 5,
+                                                    "maximum": 10},
+                                    },
+                                    "required": ["prompt", "duration"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "required": ["tag", "start", "end", "scene"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    # The visual bible for the whole clip, written once -- every `scene.prompt`
+                    # above must still repeat it verbatim (docs/h3-prompt-system.md), the same
+                    # "Scenario mode" identity-across-cuts rule `PROMPT_SCHEMA`'s own scenario
+                    # already lives by; this field exists so the gate UI can show and edit it once,
+                    # in one place, not to replace the copy inside every scene.
+                    "style_block": {"type": "string"},
+                },
+                "required": ["sections", "style_block"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["reply", "scenario"],
+        "additionalProperties": False,
+    },
+}
+
+
 _SYSTEM_PROMPT_CACHE: str | None = None
 
 
@@ -240,8 +317,14 @@ def _base_url(cfg: dict) -> str:
     return f"http://127.0.0.1:{cfg['port']}"
 
 
-def chat(cfg: dict, env: dict, messages: list[dict]) -> dict:
-    """One turn of the OpenAI chat protocol, response shaped by PROMPT_SCHEMA.
+def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
+               retry_reminder: str) -> dict:
+    """One turn of the OpenAI chat protocol, response shaped by `schema`.
+
+    The mechanics shared by every schema this module knows how to ask for -- `chat` (PROMPT_SCHEMA)
+    and `chat_scenario` (SCENARIO_SCHEMA, Task 2, "Сюжет клипа") are both a thin wrapper around
+    this: only the schema and the retry reminder's own wording (naming that schema's own top-level
+    keys back to the model) differ between them.
 
     Both provider kinds speak the same wire format; only the base URL and
     the optional bearer token differ. A model that fails to hold the JSON
@@ -258,7 +341,7 @@ def chat(cfg: dict, env: dict, messages: list[dict]) -> dict:
     body = {"model": cfg.get("model", cfg.get("preset", "default")),
             "messages": messages,
             "temperature": cfg.get("temperature", 0.7),
-            "response_format": {"type": "json_schema", "json_schema": PROMPT_SCHEMA}}
+            "response_format": {"type": "json_schema", "json_schema": schema}}
     headers = {"Content-Type": "application/json"}
     key_env = cfg.get("api_key_env")
     if cfg.get("type") == "openai" and key_env:
@@ -295,11 +378,35 @@ def chat(cfg: dict, env: dict, messages: list[dict]) -> dict:
     try:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        reminder = {"role": "system",
-                    "content": "Ответ строго одним JSON-объектом по схеме "
-                               "{reply: string, prompt: object|null}. Без другого текста."}
+        reminder = {"role": "system", "content": retry_reminder}
         raw2 = ask([reminder, *messages])
         try:
             return json.loads(raw2)
         except (json.JSONDecodeError, TypeError):
             raise ProviderError("bad_model_json", f"модель не удержала формат: {raw2[:400]}")
+
+
+def chat(cfg: dict, env: dict, messages: list[dict]) -> dict:
+    """One turn of the OpenAI chat protocol, response shaped by PROMPT_SCHEMA.
+
+    See `_chat_turn` for the shared mechanics (retry, the three named failures) this and
+    `chat_scenario` both build on.
+    """
+    return _chat_turn(cfg, env, messages, PROMPT_SCHEMA,
+                      "Ответ строго одним JSON-объектом по схеме "
+                      "{reply: string, prompt: object|null}. Без другого текста.")
+
+
+def chat_scenario(cfg: dict, env: dict, messages: list[dict]) -> dict:
+    """One turn of the OpenAI chat protocol, response shaped by SCENARIO_SCHEMA -- the "Clip
+    scenario mode" call (Task 2, "Сюжет клипа"): turning a finished song's real section timing (or
+    a raw Whisper transcript, when there was no reference lyrics) into per-section H3 video
+    prompts. Same wire protocol, same provider roster, same `ensure_up`/error/retry mechanics as
+    `chat` -- shared through `_chat_turn` rather than duplicated -- only the schema and the retry
+    reminder's own wording differ. Callers build `messages` themselves (`system_prompt()` plus the
+    scenario's own context: lyrics or raw_segments, caption, duration), the same way the chat route
+    already builds `chat`'s own messages.
+    """
+    return _chat_turn(cfg, env, messages, SCENARIO_SCHEMA,
+                      "Ответ строго одним JSON-объектом по схеме "
+                      "{reply: string, scenario: object|null}. Без другого текста.")

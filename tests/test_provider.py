@@ -423,3 +423,169 @@ def test_system_prompt_carries_the_scenario_and_song_rules():
             # the schema line itself, extended with `project`
             '"project": object | null'):
         assert anchor in text, anchor
+
+
+# -- Task 2 ("Сюжет клипа"): SCENARIO_SCHEMA and chat_scenario ----------------------------------
+#
+# A fourth, separate answer shape -- not `prompt` (one clip), not `project` (a whole video script,
+# or lyrics+caption for a song that has not been rendered yet), but `scenario`: the *later* step
+# `docs/h3-prompt-system.md`'s own "Song mode" section already promises ("a clip's scenes are only
+# built later, from the finished song's actual section timing") -- turning a song that has already
+# been rendered, with real section timing (or, for an imported mp3 with no reference lyrics, a raw
+# Whisper transcript with per-segment timestamps -- Task 1), into per-section H3 video prompts.
+# `SCENARIO_SCHEMA` is deliberately its own top-level schema object, not a fourth key bolted onto
+# `PROMPT_SCHEMA` -- the brief is explicit that this must not bloat that schema further.
+
+
+def _scenario_fields() -> dict:
+    return provider.SCENARIO_SCHEMA["schema"]["properties"]["scenario"]["properties"]
+
+
+def test_scenario_schema_requires_reply_and_a_nullable_scenario_object():
+    """The same nullable-but-required shape `PROMPT_SCHEMA`'s own `prompt`/`project` already use:
+    `scenario` is `null` while there is nothing to answer with yet (mid-conversation, or a
+    clarifying question), but the key itself is always present in a valid answer.
+    """
+    schema = provider.SCENARIO_SCHEMA["schema"]
+    assert schema["required"] == ["reply", "scenario"]
+    assert schema["properties"]["reply"]["type"] == "string"
+    assert schema["properties"]["scenario"]["type"] == ["object", "null"]
+    assert schema["additionalProperties"] is False
+
+
+def test_scenario_schema_sections_carry_tag_start_end_and_a_scene():
+    scenario = provider.SCENARIO_SCHEMA["schema"]["properties"]["scenario"]
+    assert sorted(scenario["required"]) == ["sections", "style_block"]
+    assert scenario["properties"]["style_block"]["type"] == "string"
+    section = _scenario_fields()["sections"]["items"]
+    assert sorted(section["required"]) == ["end", "scene", "start", "tag"]
+    assert section["properties"]["tag"]["type"] == "string"
+    assert section["properties"]["start"]["type"] == "number"
+    assert section["properties"]["end"]["type"] == "number"
+    scene = section["properties"]["scene"]
+    assert scene["required"] == ["prompt", "duration"]
+    assert scene["properties"]["prompt"]["type"] == "string"
+    assert scene["properties"]["duration"]["type"] == "number"
+
+
+def test_scenario_schema_accepts_a_well_formed_turn_and_rejects_bad_ones():
+    """The brief's own three checks, all against `jsonschema` itself rather than dict inspection,
+    so this would actually catch a completion a real `response_format` rejection would too (review
+    I1's own reasoning for `PROMPT_SCHEMA`'s scene `duration`, applied here): a valid scenario
+    round-trips; a scene `duration` of 3 or 12 (outside the 5-10 s pipeline ceiling) is rejected;
+    a section missing `start` or `end` is rejected.
+    """
+    import jsonschema
+
+    good = {"reply": "вот сюжет из двух сцен", "scenario": {
+        "sections": [
+            {"tag": "verse", "start": 0, "end": 8,
+             "scene": {"prompt": "[Shot 1] Cinematic, a lantern-lit nursery…", "duration": 8}},
+            {"tag": "chorus", "start": 8, "end": 16,
+             "scene": {"prompt": "[Shot 1] Cinematic, the same nursery, moonlight…",
+                       "duration": 8}},
+        ],
+        "style_block": "A tired mother in a pale blue nightgown, a wooden crib, warm lamplight.",
+    }}
+    jsonschema.validate(good, provider.SCENARIO_SCHEMA["schema"])
+
+    for bad_duration in (3, 12):
+        turn = json.loads(json.dumps(good))
+        turn["scenario"]["sections"][0]["scene"]["duration"] = bad_duration
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(turn, provider.SCENARIO_SCHEMA["schema"])
+
+    for good_duration in (5, 7.5, 10):
+        turn = json.loads(json.dumps(good))
+        turn["scenario"]["sections"][0]["scene"]["duration"] = good_duration
+        jsonschema.validate(turn, provider.SCENARIO_SCHEMA["schema"])
+
+    for missing_key in ("start", "end"):
+        turn = json.loads(json.dumps(good))
+        del turn["scenario"]["sections"][0][missing_key]
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(turn, provider.SCENARIO_SCHEMA["schema"])
+
+
+def _scenario_payload() -> dict:
+    scenario = {
+        "sections": [
+            {"tag": "verse", "start": 0, "end": 8,
+             "scene": {"prompt": "[Shot 1] Cinematic, a lantern-lit nursery…", "duration": 8}},
+            {"tag": "chorus", "start": 8, "end": 16,
+             "scene": {"prompt": "[Shot 1] Cinematic, the same nursery, moonlight…",
+                       "duration": 8}},
+        ],
+        "style_block": "A tired mother in a pale blue nightgown, a wooden crib, warm lamplight.",
+    }
+    return {"choices": [{"message": {"content": json.dumps(
+        {"reply": "вот сюжет из двух сцен", "scenario": scenario})}}]}
+
+
+def test_chat_scenario_sends_its_own_schema_and_returns_a_parsed_scenario(tmp_path):
+    fake = _FakeLlama(chat_payload=_scenario_payload())
+    try:
+        turn = provider.chat_scenario(_llama_cfg(fake.port), {},
+                                      [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn["reply"] == "вот сюжет из двух сцен"
+    assert len(turn["scenario"]["sections"]) == 2
+    assert turn["scenario"]["sections"][0]["tag"] == "verse"
+    assert turn["scenario"]["sections"][0]["scene"]["duration"] == 8
+    assert turn["scenario"]["style_block"].startswith("A tired mother")
+    (req,) = fake.requests
+    assert req["body"]["response_format"]["json_schema"] == provider.SCENARIO_SCHEMA
+    assert req["body"]["response_format"]["json_schema"] != provider.PROMPT_SCHEMA
+
+
+def test_chat_scenario_invalid_model_json_gets_one_retry_then_a_named_error(tmp_path):
+    """The same retry-once-then-named-error mechanics `chat` already has (`bad_model_json`, one
+    retry, not more) -- shared rather than reimplemented, so this exercises the same code path
+    `test_invalid_model_json_gets_one_retry_then_a_named_error` does for `chat`.
+    """
+    fake = _FakeLlama(chat_payload={"choices": [{"message": {"content": "не json"}}]})
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat_scenario(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_model_json"
+        assert len(fake.requests) == 2, "должен быть ровно один повтор"
+    finally:
+        fake.close()
+
+
+def test_chat_scenario_with_no_provider_listening_raises_the_same_named_error_as_chat(tmp_path):
+    fake = _FakeLlama()
+    port = fake.port
+    fake.close()  # никто больше не слушает этот порт -> connection refused
+    with pytest.raises(provider.ProviderError) as err:
+        provider.chat_scenario(_llama_cfg(port), {}, [{"role": "user", "content": "x"}])
+    assert err.value.code == "chat_unreachable"
+
+
+def test_system_prompt_carries_the_clip_scenario_section():
+    """Task 2's own anchors: the new "Clip scenario mode" section teaches the model the fourth
+    answer shape (`scenario`, validated by `SCENARIO_SCHEMA`) -- its input (lyrics or a raw
+    timestamped transcript, the song's `caption`, the track's `duration`), its output (sections
+    covering the whole track, one scene per section), and the rules a real generation needs: no
+    sung close-ups (with the actual reason -- H3 never hears the song and the real mix replaces
+    its audio in post, so lip-sync cannot exist), the visual bible copied verbatim into every
+    scene, audio negatives staying out of the video prompt, and imagery drawn from a section's
+    meaning rather than its exact, possibly misheard, words.
+    """
+    text = provider.system_prompt()
+    for anchor in (
+            "Clip scenario mode",
+            "SCENARIO_SCHEMA",
+            "a raw transcript with no such tags",
+            "Whisper",
+            "not for karaoke",
+            "the first section's `start` is `0`",
+            "close-up on a face that is singing",
+            "H3 never hears this",
+            "replaced by the track's actual mastered mix",
+            "verbatim, word for word",
+            "Audio negatives",
+            "meaning, not from restaging",
+    ):
+        assert anchor in text, anchor
