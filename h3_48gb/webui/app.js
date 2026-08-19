@@ -1061,8 +1061,15 @@ export function projectStageWord(project) {
     if (stages.assembly === "failed") return "сборка упала";
     if (stages.assembly === "running") return "сборка";
     if (stages.scenes === "running") return "сцены";
+    // Task 5 ("Сюжет клипа" wave): `approve/track` больше не строит сцены для клипа само по
+    // себе (task 4) — между «трек утверждён» и «идут сцены» появился новый этап «Сюжет», и без
+    // этой ветки строка списка молча возвращалась бы к «трек» на всё время, пока клип сидит в
+    // этом гейте (следующая проверка ниже, `stages.track === "approved"`, читалась бы как
+    // «трек ещё не готов», хотя он готов — просто следующий этап ещё не пройден).
+    if (stages.scenario === "awaiting_approval") return "сюжет: ждёт утверждения";
     if (stages.track === "running") return "трек пересчитывается";
     if (stages.track === "awaiting_approval") return "трек: ждёт прослушивания";
+    if (stages.track === "approved") return "сюжет";
     if (stages.script === "approved") return "трек";
     if (stages.script === "awaiting_approval") return "сценарий: ждёт утверждения";
     return "сценарий";
@@ -2352,6 +2359,7 @@ function startPage() {
     const outdir = state && state.outdir;
     $("project-body").innerHTML = projectScriptStageHtml(proj)
       + projectTrackStageHtml(proj, project.active_job, outdir)
+      + projectScenarioStageHtml(proj)
       + projectScenesStageHtml(proj, outdir)
       + projectAssemblyStageHtml(proj, outdir);
   }
@@ -2430,6 +2438,135 @@ function startPage() {
       + `<div class="spacer"></div>${gate}</div>`
       + `<div class="proj-stage-body">${player}${undersung}${doneNote}${activeNote}${seedRow}</div>`
       + `</div>`;
+  }
+
+  /** «м:сс» — подпись тайминга сцены сюжета на таймлайне трека (`scene.start`/`scene.end`), не
+   *  оценка расчёта (та — `formatFine`, «3 мин 20 с»): здесь секунда, а не округлённая минута,
+   *  главное число, потому что сцены сюжета обычно короче минуты. */
+  function formatTimestamp(seconds) {
+    const s = Math.max(0, Math.round(Number(seconds) || 0));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m}:${String(r).padStart(2, "0")}`;
+  }
+
+  /** Одна секция сюжета: тег + тайминг участка трека — подпись, не поле (task 5 brief: правкам
+   *  подлежат только промпт и длительность сцены, границы секции — нет), затем сам промпт
+   *  (`<textarea>`, до утверждения) и длительность будущей H3-сцены (`5`–`10`с,
+   *  `web.SCENE_MIN_SECONDS`/`SCENE_MAX_SECONDS`). `data-idx` — позиция в `scenario_scenes`,
+   *  то, чем `collectScenarioScenes`/фокус-аут ниже находят поле обратно в массиве. */
+  function projectScenarioSceneHtml(scene, idx, editable) {
+    const timing = `${formatTimestamp(scene.start)}–${formatTimestamp(scene.end)}`;
+    const promptField = editable
+      ? `<textarea class="inp scenario-prompt" data-idx="${idx}" rows="3">`
+        + `${escapeHtml(scene.prompt)}</textarea>`
+      : `<div class="scenario-prompt-ro">${escapeHtml(scene.prompt)}</div>`;
+    const durField = editable
+      ? `<span class="dur-inline" `
+        + `title="Длительность одной H3-сцены (5–10с) — не длина всего участка трека">`
+        + `<label>сцена</label>`
+        + `<input class="inp num scenario-duration" type="number" step="0.5" min="5" max="10" `
+        + `data-idx="${idx}" value="${escapeHtml(String(scene.duration))}">`
+        + `<span class="u">с</span></span>`
+      : `<span class="scenario-duration-ro mono">${formatFine(scene.duration)}</span>`;
+    return `<div class="scenario-scene" data-idx="${idx}">`
+      + `<div class="scenario-scene-head">`
+      + `<span class="tag mono">${escapeHtml(scene.tag)}</span>`
+      + `<span class="timing mono">${timing}</span>`
+      + `<div class="spacer"></div>${durField}`
+      + `</div>${promptField}</div>`;
+  }
+
+  function projectScenarioScenesHtml(scenes, editable) {
+    return `<div class="scenario-list">`
+      + scenes.map((scene, idx) => projectScenarioSceneHtml(scene, idx, editable)).join("")
+      + `</div>`;
+  }
+
+  /** Этап «Сюжет» (task 5, "Сюжет клипа" wave) — между треком и сценами, только `kind="clip"` и
+   *  только когда `stages.track === "approved"` (`web._scenario_gate_project`: писать сюжет не
+   *  из чего раньше — нет измеренной длительности трека). Кнопки «Сгенерировать сюжет»/«Сюжет
+   *  без LLM» бьют один и тот же маршрут (`POST .../scenario/generate`, `{}` или
+   *  `{"procedural": true}`) и остаются доступны и на `"draft"`, и на `"awaiting_approval"` —
+   *  design spec называет второй случай «Перегенерировать сюжет», это не отдельная кнопка, а тот
+   *  же вызов поверх уже написанного сюжета, поэтому подтверждение (`confirm`) просят только
+   *  когда сцены уже есть — тот же приём, что у «Пересчитать трек» (`retry-track` выше):
+   *  «текущий результат будет заменён».
+   *
+   *  Правка (`PUT`) — блюром поля или кнопкой «Сохранить» (см. делегированный `focusout`
+   *  ниже и `data-act="scenario-save"`); после утверждения (`stages.scenario === "approved"`)
+   *  список остаётся видимым, но `editable=false` убирает и поля ввода, и кнопки — сюжет
+   *  зафиксирован, сцены строятся из него (`approve/scenario`), редактировать больше нечего.
+   */
+  function projectScenarioStageHtml(proj) {
+    if (proj.kind !== "clip" || proj.stages.track !== "approved") return "";
+    const status = proj.stages.scenario;
+    const statusWord = { draft: "не начат", awaiting_approval: "ждёт утверждения",
+                         approved: "утверждён" }[status] || status;
+    const scenes = proj.scenario_scenes || [];
+    const editable = status !== "approved";
+    const gate = status === "awaiting_approval"
+      ? `<button class="inverse" type="button" data-act="approve-scenario" `
+        + `data-id="${escapeHtml(proj.id)}">Утвердить сюжет</button>` : "";
+    const genRow = editable
+      ? `<div class="proj-scenario-gen">`
+        + `<button class="ghost" type="button" data-act="scenario-generate" `
+        + `data-id="${escapeHtml(proj.id)}">Сгенерировать сюжет</button>`
+        + `<button class="ghost" type="button" data-act="scenario-procedural" `
+        + `data-id="${escapeHtml(proj.id)}">Сюжет без LLM</button>`
+        + (scenes.length ? `<button class="ghost" type="button" data-act="scenario-save" `
+            + `data-id="${escapeHtml(proj.id)}">Сохранить</button>` : "")
+        + `</div>`
+        + `<p class="proj-stage-note">Генерация может поднять модель — как в диалоге; если `
+        + `сейчас идёт прогон, кнопка честно откажет и ничего не тронет.</p>` : "";
+    const list = scenes.length
+      ? projectScenarioScenesHtml(scenes, editable)
+      : (status === "draft" ? `<p class="proj-stage-note">Сюжет ещё не написан.</p>` : "");
+    // `.proj-lyrics` — тот же приём, что у `track.lyrics` в этапе «Сценарий» (bounded, свой
+    // скролл): visual bible, которую LLM-путь кладёт в `style_block`, может быть длиннее одной
+    // короткой строки, а неограниченная `.proj-stage-note` растянула бы панель под неё целиком.
+    const styleNote = proj.scenario_style_block
+      ? `<p class="proj-stage-note"><b>Стиль (клеится в конец каждого промпта):</b></p>`
+        + `<div class="proj-lyrics">${escapeHtml(proj.scenario_style_block)}</div>`
+      : "";
+    return `<div class="proj-stage">`
+      + `<div class="proj-stage-head">`
+      + `<span class="t">Сюжет</span>`
+      + `<span class="proj-stage-status">${escapeHtml(statusWord)}</span>`
+      + `<div class="spacer"></div>${gate}</div>`
+      + `<div class="proj-stage-body">${genRow}${list}${styleNote}</div></div>`;
+  }
+
+  /** `scenario_scenes` целиком, собранный с полей редактора для `PUT` (тот заменяет список
+   *  целиком, не поэлементно — `web._edit_project_scenario`'s own docstring). `tag`/`start`/
+   *  `end` берутся из уже загруженного проекта, не из DOM: в редакторе это подпись, не поле
+   *  (см. `projectScenarioSceneHtml`) — только `prompt`/`duration` могут разойтись с тем, что
+   *  на диске. Поле, которого в DOM почему-то нет (не должно случаться — то же число сцен,
+   *  что и в `proj.scenario_scenes`), молча берёт значение с диска, а не бросает исключение:
+   *  этой функции не с кем спорить о том, что пошло не так, только сервер вправе отказать.
+   */
+  function collectScenarioScenes() {
+    const base = (project && project.project && project.project.scenario_scenes) || [];
+    const prompts = {};
+    document.querySelectorAll("#project-body .scenario-prompt").forEach((el) => {
+      prompts[el.dataset.idx] = el.value;
+    });
+    const durations = {};
+    document.querySelectorAll("#project-body .scenario-duration").forEach((el) => {
+      durations[el.dataset.idx] = Number(el.value);
+    });
+    return base.map((scene, idx) => ({
+      tag: scene.tag, start: scene.start, end: scene.end,
+      prompt: idx in prompts ? prompts[idx] : scene.prompt,
+      duration: (idx in durations && Number.isFinite(durations[idx]))
+        ? durations[idx] : scene.duration,
+    }));
+  }
+
+  function saveScenario(id) {
+    const scenes = collectScenarioScenes();
+    withProject(() => api("PUT", `/api/projects/${encodeURIComponent(id)}/scenario`,
+      { scenario_scenes: scenes }));
   }
 
   function projectSceneCardHtml(scene, projId, outdir) {
@@ -3872,6 +4009,28 @@ function startPage() {
       withProject(() => api("POST", `/api/projects/${encodeURIComponent(id)}/approve/track`, {}));
       return;
     }
+    // -- сюжет (Task 5, "Сюжет клипа" wave) — свои три `data-act`, тот же `withProject`. -----
+    if (button.dataset.act === "scenario-generate" || button.dataset.act === "scenario-procedural") {
+      // Сюжет уже есть (правки могли быть не сохранены — блюр их уже отправил, но перекрыть
+      // написанное заново молча всё равно нельзя) — то же предупреждение, что у «Пересчитать
+      // трек» выше: назвать именно то, что произойдёт, а не «вы уверены?».
+      const already = project && project.project
+        && (project.project.scenario_scenes || []).length > 0;
+      if (already && !window.confirm(
+        "Перегенерировать сюжет? Написанные сцены будут заменены.")) return;
+      const procedural = button.dataset.act === "scenario-procedural";
+      withProject(() => api("POST", `/api/projects/${encodeURIComponent(id)}/scenario/generate`,
+        procedural ? { procedural: true } : {}));
+      return;
+    }
+    if (button.dataset.act === "scenario-save") { saveScenario(id); return; }
+    if (button.dataset.act === "approve-scenario") {
+      if (!window.confirm(
+        "Утвердить сюжет? Дальше начнётся генерация сцен — сюжет больше нельзя будет "
+        + "поправить.")) return;
+      withProject(() => api("POST", `/api/projects/${encodeURIComponent(id)}/approve/scenario`, {}));
+      return;
+    }
     if (button.dataset.act === "retry-track") {
       // «Пересчитать трек» заменяет ещё неутверждённый дубль — честное предупреждение, тем же
       // приёмом, что и у пересчёта сцены ниже (design spec: "или пересчитать с другими seed/
@@ -3903,6 +4062,23 @@ function startPage() {
     if (button.dataset.act === "retry-assembly") {
       withProject(() => api("POST", `/api/projects/${encodeURIComponent(id)}/assembly/retry`, {}));
     }
+  });
+
+  // Правка сюжета сохраняется на блюре поля (task 5 brief: "PUT при blur/кнопке «Сохранить»")
+  // -- `focusout`, не `blur`: `blur` не всплывает, а поля создаются заново при каждой перерисовке
+  // панели (делегировать некому кроме документа). Сохраняет, только если значение действительно
+  // разошлось с тем, что уже на диске (`project.project.scenario_scenes`) -- переход табом между
+  // полями без правки не должен гонять `PUT` вхолостую.
+  document.addEventListener("focusout", (event) => {
+    const field = event.target.closest(".scenario-prompt, .scenario-duration");
+    if (!field || !project || !project.project) return;
+    const idx = Number(field.dataset.idx);
+    const original = (project.project.scenario_scenes || [])[idx];
+    if (!original) return;
+    const changed = field.classList.contains("scenario-prompt")
+      ? field.value !== original.prompt
+      : Number(field.value) !== original.duration;
+    if (changed) saveScenario(project.id);
   });
 
   $("submit").addEventListener("click", submit);
