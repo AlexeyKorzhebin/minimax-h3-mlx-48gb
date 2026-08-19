@@ -339,8 +339,14 @@ def _mlx_whisper_binary(music3_python) -> Path:
     installed console script instead of `-m`, resolved relative to the interpreter path
     `run_song`'s caller already supplied for generation rather than adding a second path a caller
     would have to configure separately -- one venv, one thing to point at.
+
+    Deliberately NOT `.resolve()`d: a venv's `bin/python` is a symlink chain out to the base
+    interpreter (`bin/python -> python3 -> ~/.pyenv/versions/.../bin/python3`), so resolving the
+    *file* walks out of the venv entirely and lands in a `bin/` that has no `mlx_whisper` --
+    exactly the failure the 2026-08-19 integration gate hit on the first live song job. The
+    console script lives next to the symlink, not next to its target.
     """
-    return Path(music3_python).resolve().with_name("mlx_whisper")
+    return Path(music3_python).with_name("mlx_whisper")
 
 
 def _transcribe(music3_python, audio_path: Path, track_dir: Path, *, run) -> dict:

@@ -486,6 +486,25 @@ def test_mlx_whisper_binary_is_the_console_script_next_to_the_python_interpreter
     assert sr._mlx_whisper_binary(python) == venv_bin / "mlx_whisper"
 
 
+def test_mlx_whisper_binary_does_not_follow_the_venv_python_symlink_out_of_the_venv(tmp_path):
+    """P0 первого живого song-job'а (ворота 2026-08-19): `bin/python` в venv — симлинк-цепочка
+    на базовый интерпретатор pyenv, и `.resolve()` уводил поиск console-script'а из venv в
+    pyenv-`bin/`, где `mlx_whisper` не существует. Скрипт лежит рядом с симлинком, не рядом
+    с его целью."""
+    base_bin = tmp_path / "pyenv" / "bin"
+    base_bin.mkdir(parents=True)
+    real_python = base_bin / "python3"
+    real_python.touch()
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python = venv_bin / "python"
+    python.symlink_to(real_python)
+    (venv_bin / "mlx_whisper").touch()
+    found = sr._mlx_whisper_binary(python)
+    assert found == venv_bin / "mlx_whisper"
+    assert found.exists()
+
+
 # -- fake subprocess plumbing: _generate_wav / _transcribe / run_song -------------------------
 
 
