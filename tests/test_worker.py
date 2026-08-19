@@ -1139,6 +1139,41 @@ def test_a_song_job_with_an_imported_track_and_no_lyrics_runs_the_auto_lyrics_pa
     assert reloaded.track["raw_segments"] == raw_segments
 
 
+def test_an_imported_track_with_an_empty_string_for_lyrics_still_takes_the_auto_path(
+        tmp_path, monkeypatch):
+    """Task 1 review I1: `PROMPT_SCHEMA` types `lyrics` as string-or-null, so a chat model may
+    answer `""` instead of `null` for "no lyrics". That empty string must fold into the same
+    no-reference signal as `None` -- landing it in the reference-matching branch would silently
+    throw away the transcript Whisper just computed and never write `lyrics_auto`."""
+    root = tmp_path / "queue"
+    imported_mp3 = tmp_path / "uploaded" / "empty-lyrics-song.mp3"
+    imported_mp3.parent.mkdir(parents=True)
+    imported_mp3.write_bytes(b"fake mp3 bytes")
+    proj = _song_project(tmp_path, source="import", mp3=imported_mp3, lyrics="")
+    job = _song_job(root, proj, tmp_path)
+    raw_segments = [{"start": 0.0, "end": 2.0, "text": "gori ono"}]
+    fake_result = sr.SongResult(
+        wav=imported_mp3, mastered_wav=imported_mp3, mp3=imported_mp3, mastered_mp3=imported_mp3,
+        duration=30.0, transcript="gori ono", sections=[], undersung=False,
+        raw_segments=raw_segments,
+    )
+    seen = {}
+
+    def fake_align_track(track_dir_arg, mp3_path, lyrics, **kw):
+        seen["lyrics"] = lyrics
+        return fake_result
+
+    monkeypatch.setattr(sr, "align_track", fake_align_track)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    assert seen["lyrics"] is None, "an empty-string reference must fold into the None signal"
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["lyrics_auto"] == "gori ono"
+    assert reloaded.track["raw_segments"] == raw_segments
+
+
 def test_a_song_job_with_an_imported_track_but_no_mp3_fails_honestly(tmp_path):
     """`track.source == "import"` with no `track.mp3` set is a malformed project, not something to
     crash the worker over -- the job fails (`failed/`), the project is left untouched.

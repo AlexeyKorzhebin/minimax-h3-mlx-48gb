@@ -332,12 +332,16 @@ def _run_song_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
         project_path = _project_arg(job.args)
         proj = project_module.load_project(project_path)
         track = proj.track
-        # Task 1 ("Сюжет клипа" wave, "авто-лирика"): kept as `None` here, *not* coerced to `""`
+        # Task 1 ("Сюжет клипа" wave, "авто-лирика"): kept nullable here, *not* coerced to `""`
         # the way the generation branch below needs -- `raw_lyrics is None` is exactly the signal
         # `songrun.align_track` uses to switch into its no-reference transcription mode (its own
-        # docstring). Only the import branch ever sees this raw value; the generation branch still
-        # falls back to `""` immediately below, unchanged from before this task.
-        raw_lyrics = track.get("lyrics")
+        # docstring). `or None` folds an *empty* string into that same signal (Task 1 review I1):
+        # PROMPT_SCHEMA types `lyrics` as string-or-null, so a chat model answering `""` for "no
+        # lyrics" must not silently land in the reference-matching branch, where the transcript
+        # Whisper just computed would be thrown away and `lyrics_auto` never written. Only the
+        # import branch ever sees this raw value; the generation branch still falls back to `""`
+        # immediately below, unchanged from before this task.
+        raw_lyrics = track.get("lyrics") or None
         caption = track.get("caption") or ""
         track_dir = proj.path.parent / "track"
         run = _tracked_child_run(spawn)
