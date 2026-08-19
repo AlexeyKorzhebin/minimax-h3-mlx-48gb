@@ -189,6 +189,20 @@ ERROR_CODES = {
     "command_not_allowed": "only `h3 generate` may be queued, and never with --no-checkpoint",
     "output_stem_conflict": "another pending or running job, or a file already on disk, claims that output name",
     "job_not_pending": "the job is no longer in pending/: the worker claimed it, or it was already removed",
+    # Fix round 1 (I3, 2026-08-18 review): `/api/jobs/<id>/duplicate` refuses a `kind="song"`/
+    # `"assemble"` source honestly rather than silently resubmitting its args as `generate` --
+    # what duplicating a song/assemble job should even mean is a task 6 decision, not this route's.
+    "duplicate_unsupported_kind": "duplicating a song/assemble job is not supported yet (task 6); `detail.kind` names the source job's own kind",
+    # Task 6 ("Проекты"): editing or duplicating a project scene's own `generate` job by hand would
+    # desynchronise `note` (which scene it is) from `scenes[idx].job_id` (which job speaks for that
+    # scene) -- see `h3_48gb.assemble.parse_scene_note` and the worker's C1/C2 fixes this contract
+    # protects. `detail.project`/`detail.idx` name the scene the job belongs to.
+    "project_scene_locked": "a project scene's own generate job cannot be edited or duplicated by hand; retry the scene from its project page instead",
+    "project_not_found": "there is no project with that id under `<outdir>/projects/`",
+    "project_scene_not_found": "the project has no scene with that index",
+    "project_stage_not_ready": "this stage is not waiting on its gate (already approved, not produced yet, or a later stage was asked for before an earlier one) -- see `detail` for the stage and its current status",
+    "project_running": "the project has a scene, a track or an assembly job in flight; wait for it to finish or fail before deleting the project",
+    "project_scene_build_failed": "the clip's coverage-complete scene list could not be built from the track's own timing -- see the message for why",
     "path_outside_root": "a path names something outside every root the server may touch, or writes into the read-only models root",
     "prompt_name_invalid": "a prompt name is not a bare `[A-Za-z0-9_-]+.txt` -- it names a directory or another suffix",
     "queue_unwritable": "the queue directory could not be read or written; see `detail.path`",

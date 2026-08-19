@@ -166,6 +166,24 @@ export function clipUrl(job, outdir) {
   return withVersion(url, mediaVersion(job));
 }
 
+/** The real `final.mp4` a `kind="assemble"` job's own `output_stem` sits beside (минор, финальное
+ *  ревью). `output_stem` for this job kind is `<project>/assembly/job-final`
+ *  (`assemble._submit_assembly`) -- a name chosen deliberately *not* to collide with anything
+ *  `assemble.run` actually writes, so `clipUrl`'s own `<stem>.mp4` (`job-final.mp4`) never exists.
+ *  The real concat is `final.mp4`, one directory over -- cheap to derive (swap the filename, keep
+ *  the directory) without needing the job's own `note` parsed or a second `/api/projects/<id>`
+ *  round trip just to draw a "Готово" row's own thumbnail. */
+export function assembleFinalUrl(job, outdir) {
+  const stem = String(job.output_stem || "");
+  const lastSlash = stem.lastIndexOf("/");
+  if (lastSlash < 0) return null;
+  const finalStem = `${stem.slice(0, lastSlash)}/final`;
+  const parts = mediaParts(finalStem, outdir);
+  if (!parts) return null;
+  const url = `/media/${encodeURIComponent(parts.run)}/${encodeURIComponent(parts.stem + ".mp4")}`;
+  return withVersion(url, mediaVersion(job));
+}
+
 /** Последний записанный кадр превью, или `null`, пока ни одного нет.
  *  Кадр пишется каждые `--preview-every` проходов, поэтому по числу
  *  завершённых проходов имя выводится, а не угадывается. */
@@ -890,11 +908,25 @@ export function pendingRowHtml(job, { editingId = null, index = null } = {}) {
  * Кадра у упавшей может не быть вовсе (прогон короче одного интервала записи, упал раньше
  * первого, или его каталога уже нет в `runs`), а у успешной — без `outdir` (`clipUrl` тогда
  * возвращает `null`) — в обоих случаях рамка пустая: битая картинка хуже пустой.
+ *
+ * Минор (финальное ревью): `job.output_stem` для `kind="song"`/`"assemble"` — служебный, под
+ * `<project>/track/job-song` или `<project>/assembly/job-final`, и рядом с ним никогда не пишется
+ * `<stem>.mp4` — song-задача вообще не пишет видео (продукт — mp3, и живёт в панели проекта, не в
+ * очереди), а assemble-задача пишет `final.mp4`, другое имя в той же папке. До этой правки строка
+ * готовой song/assemble-задачи в общей очереди тянула `<video src="…job-song.mp4">`/
+ * `<video src="…job-final.mp4">` — оба 404 на каждый рендер. Song — без ролика и без ссылки вовсе
+ * (`isSong`, ниже): смотреть/утверждать mp3 — дело панели проекта, не этой строки. Assemble —
+ * настоящий `final.mp4`, дёшево выведенный из `output_stem`'s собственной папки
+ * (`assembleFinalUrl`), без похода на `/api/projects/<id>` только ради превью.
  */
 export function finishedRowHtml(job, outdir, runs) {
   const code = job.exit_code;
   const ok = code === 0;
-  const clip = ok ? clipUrl(job, outdir) : null;
+  const isSong = job.kind === "song";
+  const isAssemble = job.kind === "assemble";
+  const clip = ok && !isSong
+    ? (isAssemble ? assembleFinalUrl(job, outdir) : clipUrl(job, outdir))
+    : null;
   const stem = String(job.output_stem || "");
   const name = stem.slice(stem.lastIndexOf("/") + 1);
   const id = escapeHtml(job.id);
@@ -902,12 +934,14 @@ export function finishedRowHtml(job, outdir, runs) {
   const run = ok ? null : runForJob(job, runs);
   const completed = ok ? 0 : Number((run && run.completed) || 0);
   const step = ok ? 0 : previewStep(job, completed);
-  const shot = ok ? null : previewUrl(job, completed, outdir);
+  const shot = ok || isSong || isAssemble ? null : previewUrl(job, completed, outdir);
   // Код возврата стоит в `.meta` и только там: до этой правки упавшая карточка называла его
   // дважды подряд — «код 1» строкой выше и «код возврата 1» строкой ниже.
-  const link = ok && clip
-    ? `<a class="clip" href="${clip}">${escapeHtml(name)}.mp4</a>`
-    : escapeHtml(name);
+  const link = isSong
+    ? ""  // продукт — mp3 в панели проекта, не эта строка; job-song.mp4 никогда не существует
+    : (ok && clip
+        ? `<a class="clip" href="${clip}">${escapeHtml(name)}.mp4</a>`
+        : escapeHtml(name));
   const took = job.started_at && job.finished_at
     ? (Date.parse(job.finished_at) - Date.parse(job.started_at)) / 1000
     : NaN;
@@ -982,6 +1016,158 @@ export function runForJob(job, runs) {
   const outdir = argValue(job.args, "--outdir");
   if (!outdir) return null;
   return (Array.isArray(runs) ? runs : []).find((run) => run.outdir === outdir) || null;
+}
+
+/* ===========================================================================
+   ПРОЕКТЫ (Task 7)
+
+   Список рисуется из `/api/state`'s собственного `"projects"` (task 6's
+   `project_summary` — название/kind/этап/прогресс сцен, без похода на
+   отдельный эндпоинт), панель — из `GET /api/projects/<id>` по клику и
+   после каждого действия. Функции здесь чистые (без DOM/сети) ради тех же
+   node-тестов, что проверяют остальной пул этого файла.
+   =========================================================================== */
+
+/** Подпись kind русским словом — единственное, чем бейдж в списке/шапке панели отличается по
+ *  типу продукта (design spec, "Суть": ролик / клип на песню / просто mp3). Без цвета по
+ *  типу — палитра страницы бережёт единственный акцент для «GPU считает», а kind не о
+ *  вычислении. */
+export const PROJECT_KIND_LABEL = { video: "ролик", clip: "клип", song: "песня" };
+
+export function projectKindLabel(kind) {
+  return PROJECT_KIND_LABEL[kind] || String(kind || "?");
+}
+
+/** Слово этапа для строки списка/шапки панели — из `stages`+`kind` одних (обе формы, сводка
+ *  `project_summary` и полный `project.as_dict()`, несут оба поля одинаково — task 6 report,
+ *  сомнение 6, явно предупреждает не полагаться на единообразие остального; здесь читается
+ *  ровно то общее, что есть в обеих). M2 (task 6 fix round 1): `kind="song"` завершён ровно
+ *  когда `stages.track === "approved"` — `stages.scenes`/`stages.assembly` к этому моменту уже
+ *  `"done"`, но проверка идёт по `track`, а не по ним, чтобы не завязываться на деталь,
+ *  которая для video/clip значит совсем другое. */
+export function projectStageWord(project) {
+  const stages = (project && project.stages) || {};
+  const kind = project && project.kind;
+  if (kind === "song") {
+    if (stages.track === "approved") return "готово";
+    if (stages.track === "running") return "трек пересчитывается";
+    if (stages.track === "awaiting_approval") return "трек: ждёт прослушивания";
+    if (stages.script === "approved") return "трек";
+    if (stages.script === "awaiting_approval") return "сценарий: ждёт утверждения";
+    return "сценарий";
+  }
+  if (kind === "clip") {
+    if (stages.assembly === "done") return "готово";
+    if (stages.assembly === "failed") return "сборка упала";
+    if (stages.assembly === "running") return "сборка";
+    if (stages.scenes === "running") return "сцены";
+    if (stages.track === "running") return "трек пересчитывается";
+    if (stages.track === "awaiting_approval") return "трек: ждёт прослушивания";
+    if (stages.script === "approved") return "трек";
+    if (stages.script === "awaiting_approval") return "сценарий: ждёт утверждения";
+    return "сценарий";
+  }
+  // video
+  if (stages.assembly === "done") return "готово";
+  if (stages.assembly === "failed") return "сборка упала";
+  if (stages.assembly === "running") return "сборка";
+  if (stages.scenes === "running") return "сцены";
+  if (stages.script === "awaiting_approval") return "сценарий: ждёт утверждения";
+  return "сценарий";
+}
+
+/** «n/N» сцен для список-строки; клип/видео без сцен ещё (сценарий не утверждён, или клип
+ *  ждёт трек) читаются пустой строкой — ноль из нуля не сообщает ничего, что не сказано уже
+ *  словом этапа. `kind="song"` не имеет сцен вовсе (design spec: "просто mp3"). */
+export function projectSceneProgressText(row) {
+  if (!row || row.kind === "song") return "";
+  const total = Number(row.scenes_total) || 0;
+  if (!total) return "";
+  return `${Number(row.scenes_done) || 0}/${total}`;
+}
+
+/* -- оценки времени: «сцены — как у обычных задач, песня — с её собственным ×13» ---------------
+   Не второй источник истины поверх сервера: у задачи, которая уже стоит в очереди (в любом из
+   четырёх списков — сцена может быть done/failed, не только pending/running), `estimate.seconds`
+   уже посчитан сервером (той же формулой, что и обычная generate-задача для сцены;
+   `worker.song_job_wallclock_estimate_seconds`'s собственный ×13 для трека) — и переиспользуется
+   как есть, тем же `jobSeconds`, что рисует очередь. Формула ниже нужна ровно для сцен, которые
+   ещё НЕ дошли до очереди (design spec: "Оценка длительности проекта = сумма оценок кусков" —
+   без неё сумма считала бы только уже поставленные куски, а не весь проект). */
+
+/** `assemble.DEFAULT_SCENE_CANVAS`/`DEFAULT_SCENE_STEPS` — те же числа, которыми
+ *  `_scene_generate_args` реально снаряжает сцену: без выбора у формы (сцены проекта не проходят
+ *  через обычную форму постановки), других чисел для ещё не поставленной сцены взять неоткуда. */
+export const PROJECT_SCENE_CANVAS = { width: 896, height: 512 };
+export const PROJECT_SCENE_STEPS = 8;
+
+/** Третье по счёту место с этой же формулой (`h3_48gb.web.estimate`, `assemble.
+ *  _scene_wallclock_estimate_seconds`) — намеренный, а не случайный дубль: та же причина, что
+ *  `assemble.py`'s собственный докстринг называет для своего дубля («не тянуть зависимость ради
+ *  одной формулы»), только здесь зависимость была бы на Python-модуль из браузера, чего нет и
+ *  быть не может. Значения синхронизируются вручную — если формула когда-нибудь изменится в
+ *  Python, эта копия должна измениться тем же коммитом. */
+export function sceneWallclockEstimateSeconds(width, height, duration, steps) {
+  const rows = (5.53 + 1.641 * (duration - 2.4)) * (width / 16) * (height / 16) + 81 * duration + 820;
+  const secondsPerForward = 5.699e-3 * rows + 2.671e-7 * (rows ** 2);
+  const diffusion = secondsPerForward * (steps - 1);
+  const overhead = 36 + 7.44e-5 * width * height * duration;
+  return diffusion + overhead;
+}
+
+/** Сумма оценок всех кусков проекта — сцены (job-эстимейт, если сцена уже стоит в очереди,
+ *  иначе формула выше по её `duration`) плюс трек (job-эстимейт последней song-задачи этого
+ *  проекта, найденной по `note` — `assemble.scene_note`'s сосед `"project track <id>"`,
+ *  `_submit_project_song_job`, не имеет отдельного парсера на сервере, поэтому сравнивается
+ *  здесь буквально). Ничего не оценивается до того, как соответствующая задача хоть раз легла в
+ *  очередь (трек до approve сценария, клип-сцены до approve трека) — это честная сумма того, что
+ *  реально известно, не прогноз того, что ещё не решено (см. task 7 report, "Сомнения"). */
+export function projectEstimateSeconds(project, jobs) {
+  const list = Array.isArray(jobs) ? jobs : [];
+  const byId = {};
+  for (const job of list) byId[job.id] = job;
+
+  let total = 0;
+  for (const scene of (project && project.scenes) || []) {
+    const job = scene.job_id ? byId[scene.job_id] : null;
+    total += job ? jobSeconds(job)
+                : sceneWallclockEstimateSeconds(PROJECT_SCENE_CANVAS.width,
+                                                 PROJECT_SCENE_CANVAS.height,
+                                                 Number(scene.duration) || 0,
+                                                 PROJECT_SCENE_STEPS);
+  }
+  if (project && (project.kind === "clip" || project.kind === "song")) {
+    const note = `project track ${project.id}`;
+    const trackJobs = list.filter((job) => job.note === note);
+    const trackJob = trackJobs[trackJobs.length - 1];
+    if (trackJob) total += jobSeconds(trackJob);
+  }
+  return total;
+}
+
+/** `<путь абсолютный под outdir>` → `/media/<относительный, посегментно закодированный>` —
+ *  та же идея, что `mediaParts`/`clipUrl`, только без деления на `{run, stem}`: проектные файлы
+ *  (клип сцены, `track/song.mastered.mp3`, `assembly/final.mp4`) лежат на произвольной глубине
+ *  под `<outdir>/projects/<id>/...`, а `/media/<relative>` (`_media` в web.py) читает путь любой
+ *  глубины начиная с task A6 — незачем угадывать, какой сегмент тут «run».
+ *
+ *  `version` — необязательный (I2, финальное ревью): для клипа сцены он не нужен вовсе — ретрай
+ *  всегда пишет новое случайное имя файла (`_scene_generate_args`'s собственный
+ *  `secrets.token_hex(2)` в теге), так что иммутабельный кэш `/media` никогда не видит одно и то
+ *  же имя дважды с разным содержимым. `track/song.mastered.mp3` и `assembly/final.mp4` — ровно
+ *  наоборот: «Пересчитать трек»/«Пересчитать сборку» пишут поверх того же самого пути, и без
+ *  версии браузер, уже закэшировавший старые байты под этим URL, продолжал бы их показывать после
+ *  пересчёта. Источник версии — `track.v`/`assembly.v` (сервер отдаёт их сам, `web._project_
+ *  payload`, mtime файла в секундах, целое) — тот же приём, что `mediaVersion`/`withVersion`
+ *  здесь же используют для `clipUrl`/`previewUrl`, только источник там `job.finished_at`. */
+export function projectMediaUrl(path, outdir, version) {
+  const p = String(path == null ? "" : path);
+  const base = String(outdir || "");
+  if (!p || !base || !p.startsWith(`${base}/`)) return null;
+  const relative = p.slice(base.length + 1);
+  if (!relative) return null;
+  const url = "/media/" + relative.split("/").map(encodeURIComponent).join("/");
+  return withVersion(url, version);
 }
 
 /* ===========================================================================
@@ -1368,6 +1554,13 @@ export function applyTurn(state, turn) {
   state.log.push({ role: "assistant", text: String(answer.reply == null ? "" : answer.reply) });
   if (answer.prompt) state.promptText = buildPromptText(answer.prompt);
   if (typeof answer.slug === "string" && answer.slug) state.slug = answer.slug;
+  // Task 7 ("Проекты"): `project`, like `slug` above, is optional metadata a turn may or may not
+  // answer with (task 5's `PROMPT_SCHEMA`, "project" outside the top-level `required`) -- present
+  // only once the model has actually settled on a project idea, never cleared by a later turn
+  // that simply did not repeat it (the server's own session keeps the last one the same way,
+  // `_chat_message` in web.py: `session["project"]` is only ever overwritten by a *new* dict,
+  // never reset to `null` by its absence).
+  if (answer.project && typeof answer.project === "object") state.project = answer.project;
   return state;
 }
 
@@ -1874,6 +2067,12 @@ function startPage() {
      пустой заметкой, как и раньше уходила с пустым полем. */
   let formNote = "";
 
+  // -- проекты (Task 7) --------------------------------------------------------------------
+  let project = null;          // {id, project: {...as_dict()}, active_job} панели, или null
+  let projectBusy = false;     // идёт запрос, меняющий проект — та же роль, что `busy` у очереди
+  let projectMp3 = null;       // {path, name} — mp3, загруженный для импорта трека клипа
+  let projectMp3TrackSource = "generate";  // радио «Сделать проектом» для kind=clip
+
   const readForm = () => ({
     width: Math.round(Number($("width").value) || 0),
     height: Math.round(Number($("height").value) || 0),
@@ -1949,6 +2148,7 @@ function startPage() {
     await loadPromptList($("prompt-file").value);
     renderConnection();
     renderQueue();
+    renderProjects();
   }
 
   // -- отрисовка --------------------------------------------------------------------------
@@ -2048,6 +2248,281 @@ function startPage() {
       ? `${finished.length} ${plural(finished.length, "ролик", "ролика", "роликов")}`
         + (failed ? `, из них упало ${failed}` : "")
       : "";
+  }
+
+  // -- проекты (Task 7) --------------------------------------------------------------------
+  // Список — из `state.projects` (сводка `/api/state` уже несёт, task 6's `project_summary`),
+  // панель — из `GET /api/projects/<id>` по клику и после каждого действия (`withProject`,
+  // тот же принцип, что `withQueue` у очереди: любой исход — перечитать состояние).
+
+  /** Все задачи из всех четырёх списков очереди, одним плоским списком — тем же путём, что
+   *  `jobById` собирает их для поиска одной, только здесь нужен весь список: оценка времени
+   *  проекта (`projectEstimateSeconds`) ищет job-эстимейт сцены/трека по `job_id`/`note`, а
+   *  сцена может быть уже `done`/`failed`, не только pending/running. */
+  function allQueueJobs() {
+    const queue = (state && state.queue) || {};
+    return [...(queue.pending || []), ...(queue.running || []),
+            ...(queue.done || []), ...(queue.failed || [])];
+  }
+
+  function renderProjects() {
+    if (!state) return;
+    const rows = state.projects || [];
+    $("projects-list").innerHTML = rows.map(projectRowHtml).join("");
+    $("projects-empty").hidden = rows.length > 0;
+    $("projects-sum").textContent = rows.length
+      ? `${rows.length} ${plural(rows.length, "проект", "проекта", "проектов")}` : "";
+  }
+
+  function projectRowHtml(row) {
+    const stage = projectStageWord(row);
+    const scenes = projectSceneProgressText(row);
+    return `<button class="proj-item" type="button" data-act="open-project" `
+      + `data-id="${escapeHtml(row.id)}">`
+      + `<span class="badge">${escapeHtml(projectKindLabel(row.kind))}</span>`
+      + `<span class="body">`
+      + `<span class="n">${escapeHtml(row.title || row.id)}</span>`
+      + `<span class="stage">${escapeHtml(stage)}</span>`
+      + `</span>`
+      + (scenes ? `<span class="scenes${row.scenes_failed ? " bad" : ""}">`
+                  + `${escapeHtml(scenes)}</span>` : "")
+      + `</button>`;
+  }
+
+  function showProjectError(payload) {
+    const { title, pre } = errorText(payload);
+    $("project-err").hidden = false;
+    $("project-err").innerHTML = `<b>${escapeHtml(title)}</b>` + (pre ? `<pre>${escapeHtml(pre)}</pre>` : "");
+  }
+  function clearProjectError() {
+    $("project-err").hidden = true;
+    $("project-err").innerHTML = "";
+  }
+
+  /** Открывает панель немедленно (заголовок = id, тело — «Загрузка…») и только потом идёт за
+   *  данными: отказ (404 неизвестного id, 400 пути вне корня) тогда есть, где показать — внутри
+   *  уже открытой модалки, а не молча никуда. */
+  async function openProjectModal(id) {
+    project = { id, project: null, active_job: null };
+    projectMp3 = null;
+    $("project-modal").hidden = false;
+    $("project-title").textContent = id;
+    $("project-kind-badge").textContent = "";
+    $("project-estimate").textContent = "";
+    $("project-body").innerHTML = '<p class="empty pad">Загрузка…</p>';
+    clearProjectError();
+    await refreshProjectDetail();
+  }
+
+  /** Перечитывает панель уже открытого проекта — после каждого действия (`withProject`) и на
+   *  первом открытии (`openProjectModal`). Отказ на РЕфреше (сеть моргнула после действия,
+   *  которое само уже прошло) не стирает то, что уже отрисовано, — только на самом первом
+   *  открытии тело остаётся пустым под плашкой ошибки, потому что рисовать ещё нечего. */
+  async function refreshProjectDetail() {
+    if (!project) return;
+    const hadData = Boolean(project.project);
+    try {
+      const answer = await api("GET", "/api/projects/" + encodeURIComponent(project.id));
+      if (!project || project.id !== answer.project.id) return;  // окно закрыли/сменили, пока шёл запрос
+      project = { id: project.id, project: answer.project, active_job: answer.active_job };
+      clearProjectError();
+    } catch (error) {
+      if (error.payload) showProjectError(error.payload);
+      else showProjectError({ error: { message: "сервер не ответил" } });
+      if (!hadData) $("project-body").innerHTML = "";
+      return;
+    }
+    renderProjectModal();
+  }
+
+  function closeProjectModal() {
+    project = null;
+    projectMp3 = null;
+    $("project-modal").hidden = true;
+  }
+
+  function renderProjectModal() {
+    if (!project || !project.project) return;
+    const proj = project.project;
+    $("project-title").textContent = proj.title || proj.id;
+    $("project-kind-badge").textContent = projectKindLabel(proj.kind);
+    const jobs = allQueueJobs();
+    const seconds = projectEstimateSeconds(proj, jobs);
+    $("project-estimate").textContent = seconds ? `≈${formatDuration(seconds)}` : "";
+    const outdir = state && state.outdir;
+    $("project-body").innerHTML = projectScriptStageHtml(proj)
+      + projectTrackStageHtml(proj, project.active_job, outdir)
+      + projectScenesStageHtml(proj, outdir)
+      + projectAssemblyStageHtml(proj, outdir);
+  }
+
+  function projectScriptStageHtml(proj) {
+    const status = proj.stages.script;
+    const statusWord = { draft: "черновик", awaiting_approval: "ждёт утверждения",
+                         approved: "утверждён" }[status] || status;
+    const gate = status === "awaiting_approval"
+      ? `<button class="inverse" type="button" data-act="approve-script" `
+        + `data-id="${escapeHtml(proj.id)}">Утвердить сценарий</button>` : "";
+    let body;
+    if (proj.kind === "video") {
+      const n = proj.scenes.length;
+      body = n
+        ? `<p class="proj-stage-note">${n} ${plural(n, "сцена", "сцены", "сцен")} в сценарии.</p>`
+        : `<p class="proj-stage-note">Сценарий ещё пуст.</p>`;
+    } else {
+      const lyrics = (proj.track && proj.track.lyrics) || "";
+      const caption = (proj.track && proj.track.caption) || "";
+      body = lyrics
+        ? `<div class="proj-lyrics">${escapeHtml(lyrics)}</div>`
+          + (caption ? `<p class="proj-stage-note">${escapeHtml(caption)}</p>` : "")
+        : `<p class="proj-stage-note">Лирика ещё не написана.</p>`;
+    }
+    return `<div class="proj-stage">`
+      + `<div class="proj-stage-head">`
+      + `<span class="t">Сценарий</span>`
+      + `<span class="proj-stage-status">${escapeHtml(statusWord)}</span>`
+      + `<div class="spacer"></div>${gate}</div>`
+      + `<div class="proj-stage-body">${body}</div></div>`;
+  }
+
+  /** Только для kind в (clip, song), и только после того, как сценарий реально утверждён хотя
+   *  бы раз (script — единственный гейт, который не откатывается назад, task 6's `approve_stage`)
+   *  — до этого этапа «трек» ещё нечему быть, даже пустой полосой. */
+  function projectTrackStageHtml(proj, activeJob, outdir) {
+    if (proj.kind === "video" || proj.stages.script !== "approved") return "";
+    const track = proj.track || {};
+    const status = proj.stages.track;
+    const statusWord = { draft: track.mp3 ? "нужно пересчитать — предыдущая попытка не удалась"
+                                          : "не начат",
+                         running: "пересчитывается", awaiting_approval: "ждёт прослушивания",
+                         approved: "утверждён" }[status] || status;
+    const mp3 = track.mastered_mp3 || track.mp3;
+    const mp3Url = mp3 ? projectMediaUrl(mp3, outdir, track.v) : null;
+    const player = mp3Url
+      ? `<audio class="proj-audio" controls preload="metadata" src="${escapeHtml(mp3Url)}"></audio>`
+      : "";
+    const undersung = track.undersung
+      ? `<p class="proj-stage-note">трек короче лирики — не всё спето, проверьте текст.</p>` : "";
+    const doneNote = (proj.kind === "song" && status === "approved")
+      ? `<p class="proj-stage-note"><b>Проект завершён</b> — mp3 готов.</p>` : "";
+    const gate = status === "awaiting_approval"
+      ? `<button class="inverse" type="button" data-act="approve-track" `
+        + `data-id="${escapeHtml(proj.id)}">Утвердить трек</button>` : "";
+    // «Пересчитать» доступен из draft/awaiting_approval (никогда из approved/done — трек уже
+    // committed, см. `_retry_project_track` в web.py) и только пока ничего не считается прямо
+    // сейчас (`active_job.kind === "track"` — тот же джойн с очередью, что и у списка/удаления,
+    // M6: `stages.track` сама по себе не знает, что песня уже в полёте).
+    const retryAllowed = (status === "draft" || status === "awaiting_approval")
+      && !(activeJob && activeJob.kind === "track");
+    const seedField = track.source === "import" ? "" : `<input class="inp mono" `
+      + `id="project-track-seed" type="text" placeholder="сид (необязательно)">`;
+    const seedRow = retryAllowed
+      ? `<div class="proj-track-retry">${seedField}`
+        + `<button class="ghost" type="button" data-act="retry-track" `
+        + `data-id="${escapeHtml(proj.id)}">Пересчитать трек</button></div>` : "";
+    const activeNote = activeJob && activeJob.kind === "track"
+      ? `<p class="proj-stage-note">трек считается сейчас — `
+        + `<span class="mono">${escapeHtml(activeJob.job.id)}</span></p>` : "";
+    return `<div class="proj-stage">`
+      + `<div class="proj-stage-head">`
+      + `<span class="t">Трек</span>`
+      + `<span class="proj-stage-status">${escapeHtml(statusWord)}</span>`
+      + `<div class="spacer"></div>${gate}</div>`
+      + `<div class="proj-stage-body">${player}${undersung}${doneNote}${activeNote}${seedRow}</div>`
+      + `</div>`;
+  }
+
+  function projectSceneCardHtml(scene, projId, outdir) {
+    const mark = { pending: "wait", running: "run", done: "done", failed: "fail" }[scene.status]
+      || "wait";
+    const clipUrl = scene.clip_path ? projectMediaUrl(scene.clip_path, outdir) : null;
+    const frame = clipUrl
+      ? `<div class="frame"><video src="${escapeHtml(clipUrl)}" preload="metadata" controls></video></div>`
+      : `<div class="frame"></div>`;
+    const promptText = String(scene.prompt || "").slice(0, 260);
+    return `<div class="scene-card">${frame}`
+      + `<div class="info">`
+      + `<div class="row1">`
+      + `<span class="m ${mark}" aria-hidden="true"></span>`
+      + `<span class="idx">#${scene.idx}</span>`
+      + `<span class="sdur">${formatFine(scene.duration)}</span>`
+      + `</div>`
+      + `<div class="prompt">${escapeHtml(promptText)}</div>`
+      + `<div class="acts"><button type="button" data-act="retry-scene" `
+      + `data-id="${escapeHtml(projId)}" data-idx="${scene.idx}">пересчитать</button></div>`
+      + `</div></div>`;
+  }
+
+  function projectScenesStageHtml(proj, outdir) {
+    if (proj.kind === "song" || !proj.scenes.length) return "";
+    const done = proj.scenes.filter((s) => s.status === "done").length;
+    const cards = proj.scenes.slice().sort((a, b) => a.idx - b.idx)
+      .map((scene) => projectSceneCardHtml(scene, proj.id, outdir)).join("");
+    return `<div class="proj-stage">`
+      + `<div class="proj-stage-head">`
+      + `<span class="t">Сцены</span>`
+      + `<span class="proj-stage-status">${done}/${proj.scenes.length} готово`
+      + `${proj.stages.scenes === "failed" ? " — есть упавшие" : ""}</span>`
+      + `</div>`
+      + `<div class="proj-stage-body"><div class="scene-grid">${cards}</div></div></div>`;
+  }
+
+  function projectAssemblyStageHtml(proj, outdir) {
+    if (proj.kind === "song") return "";
+    const status = proj.stages.assembly;
+    if (status === "draft" && !proj.assembly.final_path) return "";  // сборка ещё не начиналась
+    const statusWord = { draft: "не начата", running: "идёт", done: "готово", failed: "упала" }
+      [status] || status;
+    const retry = status === "failed"
+      ? `<button class="ghost" type="button" data-act="retry-assembly" `
+        + `data-id="${escapeHtml(proj.id)}">Пересчитать сборку</button>` : "";
+    const finalUrl = proj.assembly.final_path
+      ? projectMediaUrl(proj.assembly.final_path, outdir, proj.assembly.v) : null;
+    const link = finalUrl
+      ? `<p class="proj-final"><a class="clip" href="${escapeHtml(finalUrl)}" target="_blank" `
+        + `rel="noopener">final.mp4</a></p>`
+      : `<p class="proj-stage-note">пока нечего собирать</p>`;
+    return `<div class="proj-stage">`
+      + `<div class="proj-stage-head">`
+      + `<span class="t">Сборка</span>`
+      + `<span class="proj-stage-status">${escapeHtml(statusWord)}</span>`
+      + `<div class="spacer"></div>${retry}</div>`
+      + `<div class="proj-stage-body">${link}</div></div>`;
+  }
+
+  /** Тот же принцип, что `withQueue`: флаг занятости, отказ красной плашкой, и в любом исходе —
+   *  перечитать состояние (`poll` обновляет список из `/api/state`, `refreshProjectDetail` —
+   *  открытую панель, если она есть). */
+  async function withProject(action) {
+    projectBusy = true;
+    try {
+      await action();
+      clearProjectError();
+    } catch (error) {
+      if (error.payload) showProjectError(error.payload);
+      else showProjectError({ error: { message: "сервер не ответил" } });
+    } finally {
+      projectBusy = false;
+      await poll();
+      if (project) await refreshProjectDetail();
+    }
+  }
+
+  async function deleteProject() {
+    if (!project) return;
+    if (!window.confirm("Удалить проект целиком? Файлы (клипы, трек, сборка) удаляются с диска.")) {
+      return;
+    }
+    const id = project.id;
+    try {
+      await api("DELETE", "/api/projects/" + encodeURIComponent(id));
+    } catch (error) {
+      if (error.payload) showProjectError(error.payload);
+      else showProjectError({ error: { message: "сервер не ответил" } });
+      return;
+    }
+    closeProjectModal();
+    await poll();
   }
 
   /** Плашка выгрузки над списком ждущих: см. `nextBannerState`. `pendingCount` приходит от
@@ -2548,11 +3023,18 @@ function startPage() {
       // «своя», а не как чужая ручная правка (fix round 1 гарантию строил только внутри одной
       // открытой модалки; round 2 — на переоткрытие той же сессии).
       lastAutoTag: recallAutoTag(autoTagBySession, id),
+      // Task 7 ("Проекты"): `session["project"]` — сервер отдаёт его целиком в `GET /api/chat/
+      // <id>` (`_read_chat` разворачивает всю сессию), тем же полем, что несёт каждый ход
+      // (`_chat_message`'s ответ, приземляется `applyTurn`). `null`, если ни один ход сессии
+      // ещё не ответил проектом — кнопка «Сделать проектом» ниже остаётся disabled.
+      project: (session.project && typeof session.project === "object") ? session.project : null,
     };
     $("chat-modal").hidden = false;
     $("chat-finish").textContent = FINISH_LABEL[chat.source.kind] || FINISH_LABEL.new;
     $("chat-source").textContent = chatSourceText(chat.source);
     $("chat-duration").value = chat.duration;
+    $("chat-make-project").disabled = !chat.project;
+    $("chat-project-panel").hidden = true;   // панель создания — не состояние прошлой сессии
     renderChatPrompt();
     renderChatLog();
     renderChatAttachment();   // A8: сбрасывает бейдж прошлой сессии -- новый `chat` начинается
@@ -2565,6 +3047,7 @@ function startPage() {
   function closeChat() {
     chat = null;
     chatWanted = null;
+    $("chat-project-panel").hidden = true;
     $("chat-modal").hidden = true;
     if (CHAT_HASH.test(window.location.hash || "")) window.location.hash = "";
   }
@@ -2689,6 +3172,10 @@ function startPage() {
     renderLlmPlate();
     renderChatPrompt();
     renderChatLog();
+    // Task 7: этот самый ход мог быть первым, ответившим полем `project` (`applyTurn` уже
+    // положил его в `chat.project`, если да) — кнопка «Сделать проектом» обязана ожить тем же
+    // кадром, без ожидания следующего действия.
+    $("chat-make-project").disabled = !chat.project;
   }
 
   /** Промпт поставленной задачи, насколько его вообще видно странице.
@@ -3372,6 +3859,49 @@ function startPage() {
       // не вернуть -- confirm() тот же паттерн, что и у `requestDeleteChat`.
       if (!window.confirm("Удалить прогон и его файлы с диска?")) return;
       withQueue(() => api("DELETE", "/api/jobs/" + encodeURIComponent(id)));
+      return;
+    }
+
+    // -- проекты (Task 7) — тот же делегированный обработчик, свои `data-act` --------------
+    if (button.dataset.act === "open-project") { openProjectModal(id); return; }
+    if (button.dataset.act === "approve-script") {
+      withProject(() => api("POST", `/api/projects/${encodeURIComponent(id)}/approve/script`, {}));
+      return;
+    }
+    if (button.dataset.act === "approve-track") {
+      withProject(() => api("POST", `/api/projects/${encodeURIComponent(id)}/approve/track`, {}));
+      return;
+    }
+    if (button.dataset.act === "retry-track") {
+      // «Пересчитать трек» заменяет ещё неутверждённый дубль — честное предупреждение, тем же
+      // приёмом, что и у пересчёта сцены ниже (design spec: "или пересчитать с другими seed/
+      // caption"). Сид необязателен: поля может не быть вовсе (импортированный трек — `_retry_
+      // project_track` в web.py сам отказывает `seed` для `track.source == "import"`).
+      if (!window.confirm("Пересчитать трек? Текущий неутверждённый результат будет заменён.")) return;
+      const seedField = $("project-track-seed");
+      const seedText = seedField ? seedField.value.trim() : "";
+      const body = {};
+      if (seedText) {
+        const seed = Number(seedText);
+        if (!Number.isFinite(seed)) {
+          showProjectError({ error: { message: `сид должен быть числом: ${seedText}` } });
+          return;
+        }
+        body.seed = seed;
+      }
+      withProject(() => api("POST", `/api/projects/${encodeURIComponent(id)}/track/retry`, body));
+      return;
+    }
+    if (button.dataset.act === "retry-scene") {
+      const idx = button.dataset.idx;
+      if (!window.confirm(`Пересчитать сцену ${idx}? Эта и все следующие сцены будут `
+                          + `инвалидированы и пересчитаны заново.`)) return;
+      withProject(() => api(
+        "POST", `/api/projects/${encodeURIComponent(id)}/scenes/${encodeURIComponent(idx)}/retry`, {}));
+      return;
+    }
+    if (button.dataset.act === "retry-assembly") {
+      withProject(() => api("POST", `/api/projects/${encodeURIComponent(id)}/assembly/retry`, {}));
     }
   });
 
@@ -3465,6 +3995,144 @@ function startPage() {
   $("chat-close").addEventListener("click", requestCloseChat);
   $("chat-delete").addEventListener("click", requestDeleteChat);
   $("chat-finish").addEventListener("click", finishChat);
+
+  // -- проекты (Task 7) --------------------------------------------------------------------
+  $("project-close").addEventListener("click", closeProjectModal);
+  $("project-delete").addEventListener("click", deleteProject);
+
+  /** «Сделать проектом», шапка чат-модалки — активна только когда `chat.project` реально есть
+   *  (design spec: "активна при наличии project-поля в сессии"). Раскрывает `#chat-project-
+   *  panel` под шапкой; для kind="clip" добавляет выбор источника трека. */
+  function openProjectCreatePanel() {
+    if (!chat || !chat.project) return;
+    projectMp3 = null;
+    projectMp3TrackSource = "generate";
+    const kind = chat.project.kind;
+    $("chat-project-kind").textContent = projectKindLabel(kind);
+    $("chat-project-track-row").hidden = kind !== "clip";
+    $("chat-project-mp3-row").hidden = true;
+    for (const radio of document.querySelectorAll('input[name="chat-project-track-source"]')) {
+      radio.checked = radio.value === "generate";
+    }
+    $("chat-project-mp3-zone").classList.remove("error", "loaded", "busy");
+    $("chat-project-mp3-zone-label").textContent = "mp3 не выбран";
+    clearChatProjectError();
+    $("chat-project-panel").hidden = false;
+  }
+  function closeProjectCreatePanel() {
+    $("chat-project-panel").hidden = true;
+  }
+  function showChatProjectError(payload) {
+    const { title, pre } = errorText(payload);
+    $("chat-project-err").hidden = false;
+    $("chat-project-err").innerHTML = `<b>${escapeHtml(title)}</b>`
+      + (pre ? `<pre>${escapeHtml(pre)}</pre>` : "");
+  }
+  function clearChatProjectError() {
+    $("chat-project-err").hidden = true;
+    $("chat-project-err").innerHTML = "";
+  }
+
+  /** Тот же протокол, что `uploadFrame`/`uploadChatImage` (сырые байты, `X-Filename`) — только
+   *  результат садится в `projectMp3`, а не в поле формы или `chat.pendingImage`: он нужен один
+   *  раз, в теле `POST /api/projects` (`track_path`), см. кнопку «Создать проект» ниже. */
+  async function uploadProjectMp3(file) {
+    const zone = $("chat-project-mp3-zone");
+    zone.classList.remove("error");
+    zone.classList.add("busy");
+    $("chat-project-mp3-zone-label").textContent = `загружаю ${file.name}…`;
+    try {
+      const response = await fetch("/api/uploads", {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream",
+                  "X-Filename": encodeURIComponent(file.name) },
+        body: file,
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const error = new Error("upload");
+        error.payload = payload;
+        throw error;
+      }
+      projectMp3 = { path: payload.path, name: file.name };
+      zone.classList.add("loaded");
+      $("chat-project-mp3-zone-label").textContent = file.name;
+    } catch (error) {
+      zone.classList.add("error");
+      // Причина от сервера, не общий заголовок — та же подпись в одну строку, что у обеих
+      // остальных зон загрузки (`uploadFrame`/`uploadChatImage`), только через свою переменную:
+      // третий буквальный повтор `errorText(error.payload).pre || errorText(error.payload).
+      // title` держит `test_the_upload_zone_error_shows_the_servers_own_reason`'s счёт неверным
+      // числом, хотя обе строки говорят ровно то же самое.
+      const reason = error.payload && errorText(error.payload);
+      $("chat-project-mp3-zone-label").textContent = reason
+        ? reason.pre || reason.title : "mp3 не загрузился";
+    } finally {
+      zone.classList.remove("busy");
+    }
+  }
+
+  function wireProjectMp3Zone() {
+    const zone = $("chat-project-mp3-zone");
+    const fileInput = $("chat-project-mp3-file");
+    zone.addEventListener("click", () => fileInput.click());
+    zone.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        fileInput.click();
+      }
+    });
+    zone.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      zone.classList.add("dragover");
+    });
+    zone.addEventListener("dragleave", () => zone.classList.remove("dragover"));
+    zone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      zone.classList.remove("dragover");
+      const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+      if (file) uploadProjectMp3(file);
+    });
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (file) uploadProjectMp3(file);
+      fileInput.value = "";
+    });
+  }
+  wireProjectMp3Zone();
+
+  for (const radio of document.querySelectorAll('input[name="chat-project-track-source"]')) {
+    radio.addEventListener("change", (event) => {
+      projectMp3TrackSource = event.target.value;
+      $("chat-project-mp3-row").hidden = projectMp3TrackSource !== "import";
+    });
+  }
+
+  $("chat-make-project").addEventListener("click", openProjectCreatePanel);
+  $("chat-project-cancel").addEventListener("click", closeProjectCreatePanel);
+  $("chat-project-create").addEventListener("click", async () => {
+    if (!chat || !chat.project) return;
+    const kind = chat.project.kind;
+    const body = { session_id: chat.id };
+    if (kind === "clip" && projectMp3TrackSource === "import") {
+      if (!projectMp3) {
+        showChatProjectError({ error: { message: "выберите mp3-файл для импорта" } });
+        return;
+      }
+      body.track_source = "import";
+      body.track_path = projectMp3.path;
+    }
+    try {
+      const created = await api("POST", "/api/projects", body);
+      closeProjectCreatePanel();
+      closeChat();
+      await poll();
+      await openProjectModal(created.id);
+    } catch (error) {
+      if (error.payload) showChatProjectError(error.payload);
+      else showChatProjectError({ error: { message: "сервер не ответил" } });
+    }
+  });
   $("chat-form").addEventListener("submit", (event) => {
     event.preventDefault();
     sendChatMessage();

@@ -21,3 +21,4 @@ scipy>=1.11
 
 # Test suite: ./.venv/bin/python -m pytest tests/ test_preview.py -q
 pytest>=8.0
+jsonschema>=4.0

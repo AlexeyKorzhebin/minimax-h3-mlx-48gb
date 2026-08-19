@@ -849,7 +849,7 @@ def test_media_refuses_a_forbidden_type_before_anyone_looks_for_it(server, name)
 
 
 @pytest.mark.parametrize("name", ["clip.mp4", "frame.jpg", "frame.jpeg", "frame.png", "sound.wav",
-                                  "CLIP.MP4", "Frame.JPG"])
+                                  "song.mp3", "CLIP.MP4", "Frame.JPG"])
 def test_media_still_serves_every_type_the_page_needs(server, name):
     """The other half: an allowlist that refused everything would pass the test above. The upper
     case spellings are here because the suffix check lowercases, and a run really can contain

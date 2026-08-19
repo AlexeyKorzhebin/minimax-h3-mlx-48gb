@@ -369,13 +369,31 @@
 </section>
 
 <!-- ===================================================================
-     ЗОНА 3. ГОТОВО. Карточками, а не строками таблицы: у законченного
+     ЗОНА 3. ПРОЕКТЫ (Task 7). Список — из сводки `/api/state`'s
+     `"projects"` (task 6's `project_summary`), без похода на отдельный
+     эндпоинт для главной страницы; клик по строке открывает панель
+     проекта (модалка `#project-modal`) — GET /api/projects/<id> по
+     клику и после каждого гейта/ретрая, см. app.js.
+     =================================================================== -->
+<section class="panel section-gap" id="projects">
+  <div class="panel-head">
+    <span class="num" aria-hidden="true">3</span>
+    <h2>Проекты</h2>
+    <div class="spacer"></div>
+    <span class="eyebrow" id="projects-sum"></span>
+  </div>
+  <div class="proj-list" id="projects-list"></div>
+  <p class="empty pad" id="projects-empty" hidden>Проектов пока нет — «Сделать проектом» в диалоге</p>
+</section>
+
+<!-- ===================================================================
+     ЗОНА 4. ГОТОВО. Карточками, а не строками таблицы: у законченного
      прогона главное — кадр, а не колонка чисел (превью-jpg задачи,
      тот же previewUrl, что рисует кадр идущей).
      =================================================================== -->
 <section class="panel section-gap" id="done">
   <div class="panel-head">
-    <span class="num" aria-hidden="true">3</span>
+    <span class="num" aria-hidden="true">4</span>
     <h2>Готово</h2>
     <div class="spacer"></div>
     <span class="eyebrow" id="done-sum"></span>
@@ -424,6 +442,12 @@
         <span id="chat-llm">модель не поднята</span></span>
 
       <span class="mhead-acts">
+        <!-- Task 7 ("Проекты"): активна только когда в сессии реально есть поле `project`
+             (последний ход модели ответил им, `chat.project`, см. `applyTurn`/`enterChat`) —
+             disabled, а не скрыта, чтобы её было видно заранее и понятно, чего не хватает. -->
+        <button class="ghost" id="chat-make-project" type="button" disabled
+                title="Появится, когда модель ответит полем project — опишите проект в диалоге">
+          Сделать проектом</button>
         <!-- Надпись зависит от источника: «в Редактор», «сохранить промпт»
              или «обновить задачу» — её ставит app.js при открытии. -->
         <button class="inverse" id="chat-finish" type="button">в Редактор</button>
@@ -432,6 +456,33 @@
              а надпись про клавишу, которая ничего не делает, — хуже отсутствия надписи. -->
         <button class="ghost" id="chat-close" type="button">закрыть</button>
       </span>
+    </div>
+
+    <!-- Task 7: панель создания проекта из сессии — раскрывается кнопкой «Сделать проектом»
+         выше. Для kind="clip" добавляется выбор источника трека (сгенерировать/импортировать);
+         для импорта — mp3 тем же механизмом аплоада, что и кадр (`.dropzone`), лирика уже несёт
+         сама сессия (`chat.project.lyrics`), второй раз её вводить незачем. -->
+    <div class="chat-project-panel" id="chat-project-panel" hidden>
+      <div class="cpp-row">
+        <span class="eyebrow">Новый проект · <span class="mono" id="chat-project-kind"></span></span>
+        <div class="spacer"></div>
+        <button class="ghost" id="chat-project-cancel" type="button">отмена</button>
+      </div>
+      <div class="cpp-track" id="chat-project-track-row" hidden>
+        <label><input type="radio" name="chat-project-track-source" value="generate" checked>
+          сгенерировать (Music3)</label>
+        <label><input type="radio" name="chat-project-track-source" value="import">
+          импортировать готовый mp3</label>
+      </div>
+      <div class="drop-row" id="chat-project-mp3-row" hidden>
+        <div class="dropzone" id="chat-project-mp3-zone" tabindex="0" role="button"
+             aria-label="mp3 трека — перетащи файл или нажми, чтобы выбрать">
+          <span class="dropzone-label" id="chat-project-mp3-zone-label">mp3 не выбран</span>
+        </div>
+        <input type="file" id="chat-project-mp3-file" accept="audio/mpeg,.mp3" hidden>
+      </div>
+      <p class="err" id="chat-project-err" hidden></p>
+      <button class="inverse" id="chat-project-create" type="button">Создать проект</button>
     </div>
 
     <div class="mgrid">
@@ -475,6 +526,30 @@
       </div>
 
     </div>
+  </div>
+</div>
+
+<!-- ===================================================================
+     ПАНЕЛЬ ПРОЕКТА (Task 7). Модалка, тем же макетом, что и диалог: своя
+     шапка (название, kind-бейдж, сумма оценок, закрыть/удалить), тело —
+     этапы с гейт-кнопками, сетка сцен, плеер трека, ссылка на final.mp4.
+     Тело рисуется целиком в app.js (`projectBodyHtml`) — слишком разное
+     по kind (video/clip/song), чтобы разметка стояла здесь заранее.
+     =================================================================== -->
+<div class="modal-back" id="project-modal" hidden>
+  <div class="modal project" role="dialog" aria-modal="true" aria-labelledby="project-title">
+    <div class="mhead">
+      <span class="t" id="project-title">Проект</span>
+      <span class="badge" id="project-kind-badge"></span>
+      <div class="spacer"></div>
+      <span class="eyebrow" id="project-estimate"></span>
+      <span class="mhead-acts">
+        <button class="ghost" id="project-delete" type="button">удалить</button>
+        <button class="ghost" id="project-close" type="button">закрыть</button>
+      </span>
+    </div>
+    <div class="proj-body" id="project-body"></div>
+    <p class="err" id="project-err" hidden></p>
   </div>
 </div>
 

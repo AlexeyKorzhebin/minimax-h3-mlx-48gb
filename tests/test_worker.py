@@ -33,7 +33,10 @@ from unittest import mock
 
 import pytest
 
+from h3_48gb import assemble
+from h3_48gb import project as project_module
 from h3_48gb import queue as q
+from h3_48gb import songrun as sr
 from h3_48gb import worker
 # `flock` is only honest when the holder is a separate process; `_external_lock` is the queue
 # suite's helper for exactly that, extended there with `name=` so it can hold `worker.lock` and
@@ -913,6 +916,1083 @@ def test_a_crash_between_the_marker_and_the_rename_finishes_from_the_marker(tmp_
     assert q.job_path(root, job.id, "done").exists()
     assert result.changed[0].finished_at == "2020-01-01T00:00:00", (
         "the finish time must come from the marker the dead worker wrote, not from now")
+
+
+# -- Step: dispatch by `job.kind` (task 3, "Проекты") --------------------------------------------
+
+
+class _FakeCaffeinate:
+    """Stands in for `subprocess.Popen(["caffeinate", "-dimsu"])`: never actually runs anything,
+    just records that it was asked to start and stop.
+    """
+
+    def __init__(self):
+        self.terminated = False
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def _caffeinate_spy(calls):
+    """A `spawn` that records every command it is asked to start (song/assemble dispatch's own
+    `caffeinate -dimsu` companion process, see `worker._caffeinate_block`) and hands back a fake
+    that never touches a real process.
+    """
+
+    def spawn(cmd, **kw):
+        calls.append(list(cmd))
+        return _FakeCaffeinate()
+
+    return spawn
+
+
+def _song_project(tmp_path, *, lyrics="[verse]\nстрока раз\nстрока два\n", caption="upbeat",
+                   source="generate", mp3=None, title="Моя песня"):
+    """A `kind="song"` project on disk with a track already populated -- the shape a completed
+    script/track-parameters gate (task 6, out of this task's scope) would have left behind before
+    a song job is ever queued against it.
+    """
+    proj = project_module.create_project(tmp_path / "out", "song", title)
+    proj.track = {**proj.track, "lyrics": lyrics, "caption": caption, "source": source}
+    if mp3 is not None:
+        proj.track["mp3"] = str(mp3)
+    proj.save()
+    return proj
+
+
+def _song_job(root, proj, tmp_path):
+    """One `kind="song"` job queued against `proj`, claimed and ready for `worker.run_job`."""
+    q.submit(root, ["song", "--project", str(proj.path)], "",
+            {"output_stem": str(proj.path.parent / "track" / "song")}, {}, kind=q.KIND_SONG)
+    return q.claim(root)
+
+
+_FAKE_SECTIONS = [{"name": "verse", "start": 0.0, "end": 30.0}]
+
+
+def _fake_song_result(track_dir: Path, *, undersung=False) -> sr.SongResult:
+    return sr.SongResult(
+        wav=track_dir / "song.wav", mastered_wav=track_dir / "song.mastered.wav",
+        mp3=track_dir / "song.mp3", mastered_mp3=track_dir / "song.mastered.mp3",
+        duration=30.0, transcript="ла ла ла", sections=_FAKE_SECTIONS, undersung=undersung,
+    )
+
+
+def test_run_job_dispatches_a_song_kind_to_songrun_run_song_and_gates_the_track(tmp_path,
+                                                                                 monkeypatch):
+    """`kind="song"` (design spec, "Трек"): the worker calls `songrun.run_song` in-process --
+    never spawns `h3 generate` -- and, once it succeeds, moves `track.status` to
+    `"awaiting_approval"` (the gate) through the *locked* mutators, not a blind `save()`.
+    """
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = _fake_song_result(track_dir)
+
+    seen = {}
+
+    def fake_run_song(track_dir_arg, lyrics, caption, duration, *, seed, **kw):
+        seen["track_dir"] = Path(track_dir_arg)
+        seen["lyrics"] = lyrics
+        seen["caption"] = caption
+        seen["duration"] = duration
+        return fake_result
+
+    monkeypatch.setattr(sr, "run_song", fake_run_song)
+    caffeinate_calls = []
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy(caffeinate_calls))
+
+    assert code == 0
+    assert q.job_path(root, job.id, "done").exists()
+    assert seen["track_dir"] == track_dir
+    assert seen["lyrics"] == proj.track["lyrics"]
+    assert seen["caption"] == proj.track["caption"]
+    assert seen["duration"] == sr.estimate_duration(proj.track["lyrics"])
+    assert caffeinate_calls == [["caffeinate", "-dimsu", "-w", str(os.getpid())]], (
+        "a song job must be caffeinated the same way a generate job is (task 3 brief); M1 (fix "
+        "round 1) additionally binds it to the worker's own pid so it cannot outlive a killed "
+        "worker")
+    assert caffeinate_calls  # sanity, redundant with the assert above
+
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["status"] == "awaiting_approval"
+    assert reloaded.track["mp3"] == str(fake_result.mp3)
+    assert reloaded.track["mastered_mp3"] == str(fake_result.mastered_mp3)
+    assert reloaded.track["wav"] == str(fake_result.wav)
+    assert reloaded.track["sections"] == _FAKE_SECTIONS
+    assert reloaded.track["undersung"] is False
+    assert reloaded.stages["track"] == "awaiting_approval"
+
+
+def test_an_undersung_song_job_still_gates_the_track_as_a_success_with_a_warning(tmp_path,
+                                                                                  monkeypatch):
+    """Task 3's review decision: `undersung=True` is a *warning on a success*, not a failure -- the
+    mp3s exist, the job is `done`, and the warning travels on `track.undersung` for the gate page
+    to show, not on the job's exit code.
+    """
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = _fake_song_result(track_dir, undersung=True)
+    monkeypatch.setattr(sr, "run_song", lambda *a, **kw: fake_result)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0, "undersung is a warning, not a job failure"
+    assert q.job_path(root, job.id, "done").exists()
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["status"] == "awaiting_approval"
+    assert reloaded.track["undersung"] is True
+
+
+def test_a_song_job_with_an_imported_track_runs_the_align_only_path(tmp_path, monkeypatch):
+    """`track.source == "import"` (design spec addendum, "импортированный трек"): generation and
+    mastering are skipped entirely -- `songrun.run_song` must not even be called -- only
+    `songrun.align_track` runs, against the already-uploaded mp3.
+    """
+    root = tmp_path / "queue"
+    imported_mp3 = tmp_path / "uploaded" / "suno-song.mp3"
+    imported_mp3.parent.mkdir(parents=True)
+    imported_mp3.write_bytes(b"fake mp3 bytes")
+    proj = _song_project(tmp_path, source="import", mp3=imported_mp3)
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = sr.SongResult(
+        wav=imported_mp3, mastered_wav=imported_mp3, mp3=imported_mp3, mastered_mp3=imported_mp3,
+        duration=42.0, transcript="ла ла ла", sections=_FAKE_SECTIONS, undersung=False,
+    )
+
+    def fail_run_song(*a, **kw):
+        raise AssertionError("run_song must not be called for an imported track")
+
+    seen = {}
+
+    def fake_align_track(track_dir_arg, mp3_path, lyrics, **kw):
+        seen["track_dir"] = Path(track_dir_arg)
+        seen["mp3_path"] = Path(mp3_path)
+        seen["lyrics"] = lyrics
+        return fake_result
+
+    monkeypatch.setattr(sr, "run_song", fail_run_song)
+    monkeypatch.setattr(sr, "align_track", fake_align_track)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    assert seen["track_dir"] == track_dir
+    assert seen["mp3_path"] == imported_mp3
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["status"] == "awaiting_approval"
+    assert reloaded.track["mp3"] == str(imported_mp3)
+
+
+def test_a_song_job_with_an_imported_track_but_no_mp3_fails_honestly(tmp_path):
+    """`track.source == "import"` with no `track.mp3` set is a malformed project, not something to
+    crash the worker over -- the job fails (`failed/`), the project is left untouched.
+    """
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path, source="import", mp3=None)
+    job = _song_job(root, proj, tmp_path)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 1
+    assert q.job_path(root, job.id, "failed").exists()
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["status"] == "draft", "an untouched project must not look gated"
+    # I1 (final review): `track.status` (the field checked above) is untouched, but `stages.track`
+    # -- the *gate*, what `web._retry_project_track` actually reads -- must now say "failed" rather
+    # than sitting at whatever it already was, or the project has no way back in. See the dedicated
+    # I1 tests below for the full before/after.
+    assert reloaded.stages["track"] == "failed"
+
+
+# -- I1 (final review): a failed song job marks stages.track failed, and can be retried -----------
+
+
+def test_i1_a_failed_song_job_marks_stages_track_failed(tmp_path, monkeypatch):
+    """Before this, a crashing `songrun.run_song` left `stages.track` stuck wherever it already was
+    (`"draft"` for a project's first-ever attempt) forever -- nothing else in this codebase ever
+    revisits a `track` stage that is not `"draft"`/`"awaiting_approval"`
+    (`web._retry_project_track`'s own gate, before this fix), so the project was stuck with no way
+    to try again short of hand-editing `project.json`. Mirrors `test_i1a_a_failed_assemble_job_
+    marks_stages_assembly_failed` exactly, one stage over.
+    """
+    def boom(*a, **kw):
+        raise RuntimeError("Music3 exploded")
+
+    monkeypatch.setattr(sr, "run_song", boom)
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = _song_job(root, proj, tmp_path)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 1
+    assert q.job_path(root, job.id, "failed").exists()
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.stages["track"] == "failed"
+
+
+def test_i1_a_failed_song_job_after_a_retry_also_marks_stages_track_failed(tmp_path, monkeypatch):
+    """The other state a real crash can be caught in (task brief, verbatim: "включая после
+    «Пересчитать трек» со stages.track=running"): `web._retry_project_track` moves `stages.track`
+    to `"running"` right after resubmitting, before the worker ever claims the job -- a crash from
+    there must still land on `"failed"`, not leave `"running"` standing with nothing running.
+    """
+    def boom(*a, **kw):
+        raise RuntimeError("Music3 exploded")
+
+    monkeypatch.setattr(sr, "run_song", boom)
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    proj.set_stage_status("track", "running")
+    job = _song_job(root, proj, tmp_path)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 1
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.stages["track"] == "failed"
+
+
+def test_run_job_treats_a_kind_less_job_as_generate(tmp_path):
+    """Backward compatibility end to end (task 3 brief, mandatory), not just at the dataclass level
+    (`test_queue.py` covers that half): a job claimed from a `pending/<id>.json` written before
+    `kind` existed must still dispatch through the subprocess branch.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    old_style = {
+        "id": "20260101-000000-old-abcd", "created_at": "2026-01-01T00:00:00",
+        "args": ["generate", "--tag", "old"], "note": "", "prompt_source": None,
+        "prompt_sha256": None, "output_stem": str(tmp_path / "h3-old-1x1"),
+        "estimate": {}, "priority": 0, "started_at": None, "finished_at": None,
+        "exit_code": None, "log_tail": None,
+    }
+    q.job_path(root, old_style["id"], "pending").write_text(json.dumps(old_style),
+                                                            encoding="utf-8")
+    job = q.claim(root)
+    assert job.kind == q.KIND_GENERATE
+
+    seen = {}
+
+    def spawn(cmd, **kw):
+        seen["cmd"] = list(cmd)
+        return _FakeProcess(0, "ok\n", kw)
+
+    code = worker.run_job(root, job, spawn=spawn)
+
+    assert code == 0
+    assert seen["cmd"][:2] == ["caffeinate", "-dimsu"], "must still go through job_command"
+    assert q.job_path(root, job.id, "done").exists()
+
+
+def test_run_job_dispatches_an_assemble_kind_with_an_honest_failure_before_task_4(tmp_path,
+                                                                                   monkeypatch):
+    """`kind="assemble"` when `h3_48gb.assemble` cannot be imported at all: the worker's lazy
+    import must fail the *job*, not the worker process -- the whole point of dispatching through a
+    lazy import instead of a module-level one. `h3_48gb.assemble` is a real module in this checkout
+    (task 4), so the only honest way left to exercise "the import itself fails" is to make the
+    import genuinely raise, not to hide an already-imported module from `sys.modules` -- once a
+    module has been imported for real anywhere in the process, Python binds it onto its parent
+    package's own namespace (`h3_48gb.assemble`), and `from h3_48gb import assemble` finds it there
+    directly, bypassing `sys.modules` entirely; deleting the `sys.modules` entry alone (task 3's
+    original test, written when this module did not exist yet) stopped being a reliable way to
+    simulate "not importable" the moment task 4 added the real file.
+    """
+    # `hasattr(h3_48gb, "assemble")` is what `from h3_48gb import assemble` actually consults first
+    # (CPython's `_handle_fromlist`) -- true the moment *any* test in this process has imported the
+    # real module (this file's own top-level `from h3_48gb import assemble` guarantees it), and
+    # true regardless of `sys.modules`. Clearing the package attribute *and* poisoning
+    # `sys.modules` with the standard "this import failed, do not retry" sentinel (`None`) is what
+    # actually forces a fresh `ImportError` again -- either alone is not enough.
+    import h3_48gb as h3_48gb_pkg
+    monkeypatch.delattr(h3_48gb_pkg, "assemble", raising=False)
+    monkeypatch.setitem(sys.modules, "h3_48gb.assemble", None)
+
+    root = tmp_path / "queue"
+    proj = project_module.create_project(tmp_path / "out", "video", "Мой ролик")
+    job = q.submit(root, ["assemble", "--project", str(proj.path)], "",
+                   {"output_stem": str(proj.path.parent / "final")}, {}, kind=q.KIND_ASSEMBLE)
+    claimed = q.claim(root)
+
+    code = worker.run_job(root, claimed, spawn=_caffeinate_spy([]))
+
+    assert code == 1
+    assert q.job_path(root, job.id, "failed").exists()
+    log = q.log_path(root, job.id).read_text(encoding="utf-8")
+    assert "Task 4" in log
+
+
+def test_run_job_dispatches_an_assemble_kind_to_h3_48gb_assemble_run(tmp_path, monkeypatch):
+    """The worker's lazy import finds the real `h3_48gb.assemble` and calls `.run(project_path,
+    run=...)` -- proven by monkeypatching `.run` directly on the real, already-imported module
+    (mirroring how `test_i1_song_job_...` monkeypatches `songrun.run_song` on the real `songrun`
+    module), which survives the package-attribute caching a `sys.modules` substitution does not
+    (see the previous test's own docstring).
+    """
+    calls = []
+
+    def fake_run(project_path, *, run):
+        calls.append((Path(project_path), run))
+        return Path(project_path).parent / "final.mp4"
+
+    monkeypatch.setattr(assemble, "run", fake_run)
+
+    root = tmp_path / "queue"
+    proj = project_module.create_project(tmp_path / "out", "video", "Мой ролик")
+    job = q.submit(root, ["assemble", "--project", str(proj.path)], "",
+                   {"output_stem": str(proj.path.parent / "final")}, {}, kind=q.KIND_ASSEMBLE)
+    claimed = q.claim(root)
+    caffeinate_calls = []
+
+    code = worker.run_job(root, claimed, spawn=_caffeinate_spy(caffeinate_calls))
+
+    assert code == 0
+    assert q.job_path(root, job.id, "done").exists()
+    assert len(calls) == 1
+    called_path, called_run = calls[0]
+    assert called_path == proj.path
+    assert callable(called_run), "assemble.run must receive an injectable run callable"
+    assert caffeinate_calls == [["caffeinate", "-dimsu", "-w", str(os.getpid())]]
+
+
+# -- I1a (fix round 1, 2026-08-18 review): a failed assemble job marks stages.assembly failed -----
+
+
+def test_i1a_a_failed_assemble_job_marks_stages_assembly_failed(tmp_path, monkeypatch):
+    """Before this, a crashing `assemble.run` left `stages.assembly` stuck wherever `_submit_
+    assembly` last set it (`"running"`) forever -- nothing else in this codebase ever revisits an
+    assembly stage that is not `"draft"`, so the project looked permanently in-flight with no job
+    actually working on it.
+    """
+    def boom(project_path, *, run):
+        raise RuntimeError("ffmpeg exploded")
+
+    monkeypatch.setattr(assemble, "run", boom)
+
+    root = tmp_path / "queue"
+    proj = project_module.create_project(tmp_path / "out", "video", "Мой ролик")
+    proj.set_stage_status("assembly", "running")
+    job = q.submit(root, ["assemble", "--project", str(proj.path)], "",
+                   {"output_stem": str(proj.path.parent / "final")}, {}, kind=q.KIND_ASSEMBLE)
+    claimed = q.claim(root)
+
+    code = worker.run_job(root, claimed, spawn=_caffeinate_spy([]))
+
+    assert code == 1
+    assert q.job_path(root, job.id, "failed").exists()
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.stages["assembly"] == "failed"
+
+
+def test_i1a_an_import_broken_assemble_job_also_marks_stages_assembly_failed(tmp_path, monkeypatch):
+    """The other failure path `_run_assemble_job` has -- the lazy import itself failing -- must
+    mark the stage the same way a crash inside `assemble.run` does.
+    """
+    import h3_48gb as h3_48gb_pkg
+    monkeypatch.delattr(h3_48gb_pkg, "assemble", raising=False)
+    monkeypatch.setitem(sys.modules, "h3_48gb.assemble", None)
+
+    root = tmp_path / "queue"
+    proj = project_module.create_project(tmp_path / "out", "video", "Мой ролик")
+    proj.set_stage_status("assembly", "running")
+    job = q.submit(root, ["assemble", "--project", str(proj.path)], "",
+                   {"output_stem": str(proj.path.parent / "final")}, {}, kind=q.KIND_ASSEMBLE)
+    claimed = q.claim(root)
+
+    code = worker.run_job(root, claimed, spawn=_caffeinate_spy([]))
+
+    assert code == 1
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.stages["assembly"] == "failed"
+
+
+# -- I1b (fix round 1, 2026-08-18 review): advance_project also runs after song/assemble jobs -----
+
+
+def test_i1b_a_finished_song_job_also_calls_advance_project(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_advance(project, queue_root, outdir, **kwargs):
+        calls.append(project.id)
+        return {"action": "nothing_to_do"}
+
+    monkeypatch.setattr(assemble, "advance_project", fake_advance)
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = _song_job(root, proj, tmp_path)
+    fake_result = _fake_song_result(proj.path.parent / "track")
+    monkeypatch.setattr(sr, "run_song", lambda *a, **kw: fake_result)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]), outdir=tmp_path / "out")
+
+    assert code == 0
+    assert calls == [proj.id]
+
+
+def test_i1b_a_finished_song_job_with_no_scenes_yet_advances_as_a_safe_no_op(tmp_path, monkeypatch):
+    """The no-op case, exercised for real (no `advance_project` mock): a `kind="song"` project has
+    no `scenes` at all yet (task 6 populates them, later, from an approved script) --
+    `advance_project` must return `"nothing_to_do"` quietly, not raise or submit anything.
+    """
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = _song_job(root, proj, tmp_path)
+    fake_result = _fake_song_result(proj.path.parent / "track")
+    monkeypatch.setattr(sr, "run_song", lambda *a, **kw: fake_result)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]), outdir=tmp_path / "out")
+
+    assert code == 0
+    pending_jobs = [j for j in q.scan(root)[0] if j.state == "pending"]
+    assert pending_jobs == [], "a song-only project has no scenes to advance -- nothing submitted"
+
+
+def test_i1b_a_finished_assemble_job_also_calls_advance_project(tmp_path, monkeypatch):
+    advance_calls = []
+
+    def fake_advance(project, queue_root, outdir, **kwargs):
+        advance_calls.append(project.id)
+        return {"action": "nothing_to_do"}
+
+    def fake_run(project_path, *, run):
+        return Path(project_path).parent / "final.mp4"
+
+    monkeypatch.setattr(assemble, "run", fake_run)
+    monkeypatch.setattr(assemble, "advance_project", fake_advance)
+
+    root = tmp_path / "queue"
+    proj = project_module.create_project(tmp_path / "out", "video", "Мой ролик")
+    job = q.submit(root, ["assemble", "--project", str(proj.path)], "",
+                   {"output_stem": str(proj.path.parent / "final")}, {}, kind=q.KIND_ASSEMBLE)
+    claimed = q.claim(root)
+
+    code = worker.run_job(root, claimed, spawn=_caffeinate_spy([]), outdir=tmp_path / "out")
+
+    assert code == 0
+    assert advance_calls == [proj.id]
+
+
+def test_song_job_wallclock_estimate_seconds_is_estimate_duration_times_13():
+    """Task 3's brief, verbatim: "Оценка song-задачи = estimate_duration × 13" -- the queue-facing
+    wall-clock estimate (Music3's own realtime factor), not the song's own duration estimate.
+    """
+    lyrics = "[verse]\nа б в\n[chorus]\nг д е\n"
+    assert worker.song_job_wallclock_estimate_seconds(lyrics) == pytest.approx(
+        sr.estimate_duration(lyrics) * 13.0)
+
+
+# -- C1 (fix round 1, 2026-08-18 review): a song job's own subprocess is a tracked child ---------
+
+
+class _FakeTrackedChild:
+    """Stands in for the `Popen` `worker._tracked_child_run`'s own `spawn` starts: no `.wait()`,
+    just `.communicate()` (the way that seam actually uses it) and a `.returncode`.
+    """
+
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+        self.pid = 4242
+
+    def communicate(self):
+        return self._stdout, self._stderr
+
+
+def test_c1_song_job_registers_current_child_while_its_own_subprocess_runs_and_clears_it_after(
+        tmp_path, monkeypatch):
+    """C1, the round's main fix: before it, only `KIND_GENERATE` ever set `_current_child`, so a
+    second `SIGTERM` arriving while a song job was mid-flight found `_current_child is None` and
+    took the *worker* down (`_stop_signals`' handler falls through to `SIG_DFL` + re-signalling
+    itself) instead of the song job's own Music3/ffmpeg/mlx_whisper subprocess -- orphaning it on
+    the GPU with no worker, no lease and nothing left to reap it. This proves the fix at the exact
+    seam `songrun.run_song`/`align_track` already call (`run(cmd, capture_output=True, text=True)`,
+    task 2's own contract) -- a mocked `run_song` stands in and calls that `run` argument itself,
+    exactly as the real one does for each of its four subprocess steps.
+    """
+    assert worker._current_child is None, "sanity: no state left over from an earlier test"
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = _fake_song_result(track_dir)
+    seen = {}
+
+    def fake_spawn(cmd, **kw):
+        if cmd[0] == "caffeinate":
+            return _FakeCaffeinate()
+        seen["child_spawn_kwargs"] = kw
+        return _FakeTrackedChild(returncode=0, stdout="ok", stderr="")
+
+    def fake_run_song(track_dir_arg, lyrics, caption, duration, *, seed, run, **kw):
+        result = run(["fake-music3-generate.py"], capture_output=True, text=True)
+        seen["result_returncode"] = result.returncode
+        seen["result_stdout"] = result.stdout
+        return fake_result
+
+    # Observe `_current_child` from *inside* `communicate()`, the only moment it is guaranteed to
+    # be set -- checking it from `fake_run_song` after `run(...)` returns would only prove it was
+    # cleared, not that it was ever set while the call was actually in flight.
+    real_communicate = _FakeTrackedChild.communicate
+
+    def spying_communicate(self):
+        seen["current_child_during_communicate"] = worker._current_child
+        return real_communicate(self)
+
+    monkeypatch.setattr(_FakeTrackedChild, "communicate", spying_communicate)
+    monkeypatch.setattr(sr, "run_song", fake_run_song)
+
+    code = worker.run_job(root, job, spawn=fake_spawn)
+
+    assert code == 0
+    assert seen["current_child_during_communicate"] is not None, (
+        "the song job's own subprocess must be visible to _terminate_child_group (the second "
+        "SIGTERM's kill target) while it is actually running")
+    assert seen["child_spawn_kwargs"]["start_new_session"] is True, (
+        "the song job's own subprocess must run in its own process group -- otherwise "
+        "_terminate_child_group's os.killpg has nothing of its own to reach")
+    assert seen["result_returncode"] == 0
+    assert seen["result_stdout"] == "ok", "run() must hand songrun a real CompletedProcess back"
+    assert worker._current_child is None, (
+        "must be cleared once the song job's subprocess call returns, exactly like KIND_GENERATE's")
+
+
+def test_c1_tracked_child_run_clears_current_child_even_if_the_subprocess_call_raises(tmp_path):
+    """`_current_child` must not leak past a failing subprocess call either -- a `finally`, not a
+    bare assignment after `communicate()` returns, is what the implementation must use.
+    """
+    class _BoomChild:
+        pid = 1
+
+        def communicate(self):
+            raise OSError("boom")
+
+    def spawn(cmd, **kw):
+        return _BoomChild()
+
+    run = worker._tracked_child_run(spawn=spawn)
+    with pytest.raises(OSError, match="boom"):
+        run(["anything"], capture_output=True, text=True)
+    assert worker._current_child is None
+
+
+# -- I1/I4 (fix round 1, 2026-08-18 review): seed and duration round-trip through the project -----
+
+
+def test_i1_song_job_respects_an_explicit_seed_from_project_json(tmp_path, monkeypatch):
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    proj.track = {**proj.track, "seed": 999999}
+    proj.save()
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = _fake_song_result(track_dir)
+    seen = {}
+
+    def fake_run_song(track_dir_arg, lyrics, caption, duration, *, seed, **kw):
+        seen["seed"] = seed
+        return fake_result
+
+    monkeypatch.setattr(sr, "run_song", fake_run_song)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    assert seen["seed"] == 999999, "an explicit project.json seed must be passed through unchanged"
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["seed"] == 999999, "an already-set seed must still be recorded (no-op)"
+
+
+def test_i1_song_job_rolls_a_random_seed_when_none_is_set_and_records_it(tmp_path, monkeypatch):
+    """`_empty_track()` defaults `seed` to `None` -- the common case, a fresh track. The worker must
+    roll one itself and, critically, write the *actual* value it rolled back onto the project, so a
+    duplicate of this job (task 6) can reproduce the exact take instead of rolling a different
+    random seed on every retry.
+    """
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    assert proj.track["seed"] is None, "sanity: the fixture must start with the real default"
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = _fake_song_result(track_dir)
+    seen = {}
+
+    def fake_run_song(track_dir_arg, lyrics, caption, duration, *, seed, **kw):
+        seen["seed"] = seed
+        return fake_result
+
+    monkeypatch.setattr(sr, "run_song", fake_run_song)
+    monkeypatch.setattr(worker.random, "randrange", lambda n: 424242)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    assert seen["seed"] == 424242, "a rolled seed must actually be used for generation"
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["seed"] == 424242, (
+        "the seed actually used must be written back, not left None -- otherwise a duplicate "
+        "cannot reproduce this take")
+
+
+def test_i1_song_job_never_writes_a_seed_for_an_imported_track(tmp_path, monkeypatch):
+    """`track.source == "import"` never generates anything, so there is no seed to roll or record
+    -- `update_track` must not be called with `seed=...` at all for this path (as opposed to, say,
+    silently writing `seed=None` over a value a human may have typed in by hand for their own
+    reference).
+    """
+    root = tmp_path / "queue"
+    imported_mp3 = tmp_path / "uploaded" / "suno-song.mp3"
+    imported_mp3.parent.mkdir(parents=True)
+    imported_mp3.write_bytes(b"fake mp3 bytes")
+    proj = _song_project(tmp_path, source="import", mp3=imported_mp3)
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = sr.SongResult(
+        wav=imported_mp3, mastered_wav=imported_mp3, mp3=imported_mp3, mastered_mp3=imported_mp3,
+        duration=42.0, transcript="ла ла ла", sections=_FAKE_SECTIONS, undersung=False,
+    )
+    monkeypatch.setattr(sr, "align_track", lambda *a, **kw: fake_result)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["seed"] is None, "an import must never have a seed written for it"
+
+
+def test_i4_song_job_records_the_tracks_duration_from_run_song(tmp_path, monkeypatch):
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = _song_job(root, proj, tmp_path)
+    track_dir = proj.path.parent / "track"
+    fake_result = _fake_song_result(track_dir)
+    assert fake_result.duration == pytest.approx(30.0)
+    monkeypatch.setattr(sr, "run_song", lambda *a, **kw: fake_result)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["duration"] == pytest.approx(30.0)
+
+
+def test_i4_song_job_records_the_tracks_duration_from_align_track(tmp_path, monkeypatch):
+    root = tmp_path / "queue"
+    imported_mp3 = tmp_path / "uploaded" / "suno-song.mp3"
+    imported_mp3.parent.mkdir(parents=True)
+    imported_mp3.write_bytes(b"fake mp3 bytes")
+    proj = _song_project(tmp_path, source="import", mp3=imported_mp3)
+    job = _song_job(root, proj, tmp_path)
+    fake_result = sr.SongResult(
+        wav=imported_mp3, mastered_wav=imported_mp3, mp3=imported_mp3, mastered_mp3=imported_mp3,
+        duration=123.4, transcript="ла ла ла", sections=_FAKE_SECTIONS, undersung=False,
+    )
+    monkeypatch.setattr(sr, "align_track", lambda *a, **kw: fake_result)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["duration"] == pytest.approx(123.4)
+
+
+# -- Task 4: assemble's own subprocess is a tracked child too (the C1 gap the task 3 report left
+# -- open for KIND_ASSEMBLE, closed here the same way it was closed for KIND_SONG) ---------------
+
+
+def test_task4_assemble_jobs_own_subprocess_is_a_tracked_child_while_it_runs(tmp_path, monkeypatch):
+    """The task 3 report's own known gap: `KIND_ASSEMBLE` never set `_current_child`, so a second
+    `SIGTERM` mid-assembly could not reach ffmpeg/ffprobe. Task 4 closes it by passing
+    `run=_tracked_child_run(spawn)` into `assemble.run`, exactly mirroring
+    `test_c1_song_job_registers_current_child_...` above -- a fake `assemble.run` calls the `run`
+    it was handed, and this test observes `_current_child` from *inside* the fake child's own
+    `communicate()`, the only moment it is guaranteed to be set.
+    """
+    assert worker._current_child is None, "sanity: no state left over from an earlier test"
+    root = tmp_path / "queue"
+    proj = project_module.create_project(tmp_path / "out", "video", "Мой ролик")
+    job = q.submit(root, ["assemble", "--project", str(proj.path)], "",
+                   {"output_stem": str(proj.path.parent / "assembly" / "job-final")}, {},
+                   kind=q.KIND_ASSEMBLE)
+    claimed = q.claim(root)
+    seen = {}
+
+    def fake_spawn(cmd, **kw):
+        if cmd[0] == "caffeinate":
+            return _FakeCaffeinate()
+        seen["child_spawn_kwargs"] = kw
+        return _FakeTrackedChild(returncode=0, stdout="10.0\n", stderr="")
+
+    real_communicate = _FakeTrackedChild.communicate
+
+    def spying_communicate(self):
+        seen["current_child_during_communicate"] = worker._current_child
+        return real_communicate(self)
+
+    monkeypatch.setattr(_FakeTrackedChild, "communicate", spying_communicate)
+
+    def fake_assemble_run(project_path, *, run):
+        result = run(["ffprobe", "fake"], capture_output=True, text=True)
+        seen["result_returncode"] = result.returncode
+        seen["result_stdout"] = result.stdout
+        return Path(project_path).parent / "assembly" / "final.mp4"
+
+    monkeypatch.setattr(assemble, "run", fake_assemble_run)
+
+    code = worker.run_job(root, claimed, spawn=fake_spawn)
+
+    assert code == 0
+    assert seen["current_child_during_communicate"] is not None, (
+        "an assemble job's own subprocess must be visible to _terminate_child_group while it is "
+        "actually running, exactly like a song job's")
+    assert seen["child_spawn_kwargs"]["start_new_session"] is True
+    assert seen["result_returncode"] == 0
+    assert seen["result_stdout"] == "10.0\n"
+    assert worker._current_child is None
+
+
+# -- Task 4: the post-job hook for a project scene's own kind="generate" job ---------------------
+
+
+class _FakeGenerateProcess:
+    """Stands in for the `Popen` `job_command`'s own `KIND_GENERATE` dispatch starts: no
+    `.communicate()`, just `.wait()` (the way `run_job`'s `KIND_GENERATE` branch actually uses it).
+    """
+
+    def __init__(self, returncode=0):
+        self.returncode = returncode
+        self.pid = os.getpid()
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _scene_hook_spawn(*, generate_returncode=0, ffprobe_duration=5.0):
+    """A `spawn` covering every shape this hook's own machinery needs: `job_command`'s top-level
+    generate subprocess (`.wait()`-based), and `_tracked_child_run`'s ffprobe/ffmpeg calls inside
+    `advance_project`'s own keyframe extraction (`.communicate()`-based) -- dispatched by `cmd[0]`.
+    """
+
+    def spawn(cmd, **kw):
+        if cmd[0] in ("ffprobe", "ffmpeg"):
+            return _FakeTrackedChild(returncode=0, stdout=f"{ffprobe_duration}\n", stderr="")
+        return _FakeGenerateProcess(returncode=generate_returncode)
+
+    return spawn
+
+
+def _video_project_with_scenes(tmp_path, *, n=2, title="Мой ролик"):
+    proj = project_module.create_project(tmp_path / "out", "video", title)
+    proj.scenes = [
+        {"idx": i, "prompt": f"scene {i}", "duration": 5.0, "status": "pending",
+         "job_id": None, "clip_path": None, "keyframe_path": None}
+        for i in range(n)
+    ]
+    proj.save()
+    return proj
+
+
+def _scene_zero_job(root, proj):
+    """Queue and claim scene 0's own `kind="generate"` job, tagged exactly as `advance_project`
+    would have tagged it (`h3_48gb.assemble.scene_note`) -- standing in for task 6, which is not
+    built yet, submitting the real first scene. Also claims scene 0 on the project itself
+    (`Project.claim_next_scene`), exactly as `advance_project`'s own `_submit_next_scene` would --
+    C2 (fix round 1, 2026-08-18 review) requires `scenes[0]["job_id"]` to already match the job
+    that is about to finish, so this stand-in must leave the project in the same shape a real
+    `advance_project(project, ...)`-driven scene 0 submission would, not the bare `q.submit` this
+    helper used to do on its own before that check existed.
+    """
+    scenes_dir = proj.path.parent / "scenes"
+    args = ["generate", "scene 0", "--width", "896", "--height", "512", "--duration", "5.0",
+            "--tag", "scene-0", "--outdir", str(scenes_dir)]
+    submitted = q.submit(root, args, assemble.scene_note(proj, 0),
+                          {"output_stem": str(scenes_dir / "h3-scene-0-896x512")}, {},
+                          kind=q.KIND_GENERATE)
+    proj.claim_next_scene(submitted.id)
+    return q.claim(root)
+
+
+def test_run_job_marks_a_project_scene_done_and_advances_to_the_next_scene(tmp_path):
+    root = tmp_path / "queue"
+    proj = _video_project_with_scenes(tmp_path, n=2)
+    job = _scene_zero_job(root, proj)
+    Path(f"{job.output_stem}.mp4").parent.mkdir(parents=True, exist_ok=True)
+    Path(f"{job.output_stem}.mp4").write_bytes(b"fake mp4 bytes")
+
+    code = worker.run_job(root, job, spawn=_scene_hook_spawn(), outdir=tmp_path / "out")
+
+    assert code == 0
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.scenes[0]["status"] == "done"
+    assert reloaded.scenes[0]["clip_path"] == f"{job.output_stem}.mp4"
+    assert reloaded.scenes[1]["status"] == "running", (
+        "advance_project must have claimed the next scene once the first was recorded done")
+    assert reloaded.scenes[1]["job_id"] is not None
+    assert reloaded.scenes[1]["keyframe_path"] is not None, (
+        "scene 1 follows a done scene with a clip -- it must get an automatic keyframe")
+    # A real pending job for scene 1 must now exist in the queue.
+    pending_notes = [j.note for j in q.scan(root)[0] if j.state == "pending"]
+    assert assemble.scene_note(proj, 1) in pending_notes
+
+
+def test_run_job_marks_a_project_scene_failed_and_stops_the_chain(tmp_path):
+    root = tmp_path / "queue"
+    proj = _video_project_with_scenes(tmp_path, n=2)
+    job = _scene_zero_job(root, proj)
+    # No .mp4 written -- the fake subprocess "failed" the run.
+
+    code = worker.run_job(root, job, spawn=_scene_hook_spawn(generate_returncode=1),
+                           outdir=tmp_path / "out")
+
+    assert code == 1
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.scenes[0]["status"] == "failed"
+    assert reloaded.scenes[1]["status"] == "pending", "the chain must not advance past a failure"
+    assert reloaded.stages["scenes"] == "failed"
+    pending_jobs = [j for j in q.scan(root)[0] if j.state == "pending"]
+    assert pending_jobs == [], "nothing further may be submitted once a scene has failed"
+
+
+def test_run_job_a_done_generate_job_with_no_mp4_on_disk_is_treated_as_a_failed_scene(tmp_path):
+    """`exit_code == 0` alone is not enough -- the hook also checks the clip actually exists at the
+    job's own `output_stem`, so a shape this codebase does not expect (a "successful" run that
+    somehow produced no file) still marks the scene failed rather than recording a `clip_path` that
+    points at nothing.
+    """
+    root = tmp_path / "queue"
+    proj = _video_project_with_scenes(tmp_path, n=1)
+    job = _scene_zero_job(root, proj)
+    # generate_returncode=0 (the default) but no .mp4 file is ever written.
+
+    code = worker.run_job(root, job, spawn=_scene_hook_spawn(), outdir=tmp_path / "out")
+
+    assert code == 0, "the job's own exit code is untouched by this bookkeeping"
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.scenes[0]["status"] == "failed"
+
+
+def test_run_job_ignores_an_ordinary_generate_job_with_no_project_note(tmp_path):
+    root = tmp_path / "queue"
+    seen = {}
+
+    def spawn(cmd, **kw):
+        seen["cmd"] = list(cmd)
+        return _FakeGenerateProcess(0)
+
+    job = q.submit(root, ["generate", "a prompt", "--tag", "plain"], "just a note",
+                   {"output_stem": str(tmp_path / "h3-plain-1x1")}, {}, kind=q.KIND_GENERATE)
+    claimed = q.claim(root)
+
+    code = worker.run_job(root, claimed, spawn=spawn, outdir=tmp_path / "out")
+
+    assert code == 0
+    assert q.job_path(root, job.id, "done").exists()
+
+
+def test_project_scene_bookkeeping_never_crashes_the_worker_on_a_missing_project(tmp_path,
+                                                                                  capsys):
+    """The note names a project id that does not exist under `<outdir>/projects/` (a deleted
+    project, a stale note) -- `_handle_project_scene_result` must swallow the failure and let
+    `run_job` return the job's own honest exit code, not propagate a `ProjectNotFound`.
+    """
+    root = tmp_path / "queue"
+    scenes_dir = tmp_path / "out" / "projects" / "does-not-exist" / "scenes"
+    args = ["generate", "scene 0", "--width", "896", "--height", "512", "--duration", "5.0",
+            "--tag", "scene-0", "--outdir", str(scenes_dir)]
+    job = q.submit(root, args, "project scene does-not-exist #0",
+                   {"output_stem": str(scenes_dir / "h3-scene-0-896x512")}, {}, kind=q.KIND_GENERATE)
+    claimed = q.claim(root)
+    Path(f"{claimed.output_stem}.mp4").parent.mkdir(parents=True, exist_ok=True)
+    Path(f"{claimed.output_stem}.mp4").write_bytes(b"fake mp4 bytes")
+
+    code = worker.run_job(root, claimed, spawn=_scene_hook_spawn(), outdir=tmp_path / "out")
+
+    assert code == 0
+    assert q.job_path(root, job.id, "done").exists()
+    assert "project scene bookkeeping failed" in capsys.readouterr().err
+
+
+# -- C2 (fix round 1, 2026-08-18 review): a stale scene job must not overwrite a fresher attempt --
+
+
+def test_c2_a_stale_scene_job_does_not_overwrite_a_fresher_attempts_status(tmp_path, capsys):
+    """A job whose own note names scene 1, but whose id no longer matches `scenes[1]["job_id"]` on
+    the project (a delayed retry of an old attempt racing a re-submission the human already
+    triggered, e.g. via "пересчитать сцену") must not be allowed to record its own outcome over the
+    fresher attempt's -- before this fix, an old job's `done`/`failed` blindly overwrote whatever
+    the current attempt already had, including clobbering a `done` scene with a stale clip.
+    """
+    root = tmp_path / "queue"
+    proj = _video_project_with_scenes(tmp_path, n=2)
+    proj.set_scene_status(0, "done", clip_path=str(tmp_path / "scene0.mp4"), job_id="job-scene-0")
+    # Scene 1 is currently owned by a *fresh* job -- not the one about to finish below.
+    proj.set_scene_status(1, "running", job_id="fresh-job")
+
+    scenes_dir = proj.path.parent / "scenes"
+    args = ["generate", "scene 1", "--width", "896", "--height", "512", "--duration", "5.0",
+            "--tag", "scene-1-stale", "--outdir", str(scenes_dir)]
+    q.submit(root, args, assemble.scene_note(proj, 1),
+             {"output_stem": str(scenes_dir / "h3-scene-1-stale-896x512")}, {},
+             kind=q.KIND_GENERATE)
+    stale_job = q.claim(root)
+    Path(f"{stale_job.output_stem}.mp4").parent.mkdir(parents=True, exist_ok=True)
+    Path(f"{stale_job.output_stem}.mp4").write_bytes(b"stale clip bytes")
+    assert stale_job.id != "fresh-job"
+
+    code = worker.run_job(root, stale_job, spawn=_scene_hook_spawn(), outdir=tmp_path / "out")
+
+    assert code == 0, "the job's own exit code is untouched by this bookkeeping"
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.scenes[1]["status"] == "running", (
+        "the stale job must not overwrite the fresher attempt's status")
+    assert reloaded.scenes[1]["job_id"] == "fresh-job"
+    assert reloaded.scenes[1]["clip_path"] is None
+    assert "stale project scene job" in capsys.readouterr().err
+
+
+# -- I3 (fix round 1, 2026-08-18 review): a broken assemble import must not crash a scene job -----
+
+
+def test_i3_a_broken_assemble_import_does_not_crash_run_job_for_a_generate_scene_job(tmp_path,
+                                                                                      monkeypatch):
+    """Before this fix, `_handle_project_scene_result`'s own `from h3_48gb import assemble`/
+    `project` imports sat ahead of its `try` block -- an `ImportError` here propagated straight out
+    of `run_job`, contradicting this module's own docstring ("must not take the whole worker
+    process down") for every `KIND_GENERATE` job whose note happens to parse as a project scene's,
+    not just the ones this function otherwise protects.
+    """
+    import h3_48gb as h3_48gb_pkg
+    monkeypatch.delattr(h3_48gb_pkg, "assemble", raising=False)
+    monkeypatch.setitem(sys.modules, "h3_48gb.assemble", None)
+
+    root = tmp_path / "queue"
+    scenes_dir = tmp_path / "out" / "projects" / "some-project" / "scenes"
+    args = ["generate", "scene 0", "--width", "896", "--height", "512", "--duration", "5.0",
+            "--tag", "scene-0", "--outdir", str(scenes_dir)]
+    job = q.submit(root, args, "project scene some-project #0",
+                   {"output_stem": str(scenes_dir / "h3-scene-0-896x512")}, {},
+                   kind=q.KIND_GENERATE)
+    claimed = q.claim(root)
+    Path(f"{claimed.output_stem}.mp4").parent.mkdir(parents=True, exist_ok=True)
+    Path(f"{claimed.output_stem}.mp4").write_bytes(b"fake mp4 bytes")
+
+    code = worker.run_job(root, claimed, spawn=_scene_hook_spawn(), outdir=tmp_path / "out")
+
+    assert code == 0, "the job's own exit code must not be affected by the broken import"
+    assert q.job_path(root, job.id, "done").exists()
+
+
+# -- M1 (fix round 1, 2026-08-18 review): the bare caffeinate is bound to the worker's own pid ----
+
+
+def test_m1_caffeinate_block_binds_to_the_workers_own_pid(tmp_path):
+    """A `finally: proc.terminate()` never runs if the worker itself is taken down by `kill -9`
+    (or the second-SIGTERM path, which sets `SIG_DFL` and re-signals itself -- indistinguishable
+    from `kill -9` as far as Python's own cleanup is concerned): the bare `caffeinate` `
+    _caffeinate_block` starts would then run forever, with no target and nothing left to stop it.
+    `-w <this process's own pid>` makes `caffeinate` itself watch the worker and exit the moment it
+    is gone, whichever way it goes.
+    """
+    calls = []
+    with worker._caffeinate_block(spawn=_caffeinate_spy(calls)):
+        pass
+    assert calls == [["caffeinate", "-dimsu", "-w", str(os.getpid())]]
+
+
+# -- I5 (fix round 1, 2026-08-18 review): a worker killed mid-song-job recovers cleanly -----------
+
+
+_CRASH_SONG_WORKER = """
+import os, sys
+sys.path.insert(0, {project!r})
+from h3_48gb import queue as q
+from h3_48gb import songrun as sr
+from h3_48gb import worker
+
+root = sys.argv[1]
+worker._now = lambda: "2020-01-01T00:00:00"
+
+
+def dying_run_song(*a, **kw):
+    os._exit(1)
+
+
+sr.run_song = dying_run_song
+
+job = q.claim(root)
+
+
+class _FakeCaffeinate:
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def spawn(cmd, **kw):
+    return _FakeCaffeinate()
+
+
+worker.run_job(root, job, spawn=spawn)
+os._exit(0)
+"""
+
+
+def test_i5_a_crash_during_a_song_job_returns_it_to_pending_and_leaves_the_project_untouched(
+        tmp_path, monkeypatch):
+    """By the same shape as `test_a_crash_before_any_result_returns_the_job_to_pending`
+    (`point="during_child"`), but for `KIND_SONG`: a worker killed while `songrun.run_song` is
+    running leaves no result marker and no gated project -- `reconcile` must return the job to
+    `pending/` and `project.json` must show no intermediate status at all, only the `"draft"` it
+    started with. A subsequent, successful run must then finish normally (`run_song`'s own I4
+    cleans `song.*`/`whisper.json` before generating, so a retry against the *same* `track_dir`
+    is already safe -- this only has to prove the queue side of that story).
+    """
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = q.submit(root, ["song", "--project", str(proj.path)], "",
+                   {"output_stem": str(proj.path.parent / "track" / "song")}, {}, kind=q.KIND_SONG)
+
+    script = _CRASH_SONG_WORKER.format(project=str(PROJECT_ROOT))
+    result = subprocess.run([sys.executable, "-c", script, str(root)],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1, f"the crash script did not die as expected: {result.stderr}"
+
+    assert q.job_path(root, job.id, "running").exists(), (
+        "nothing survived the crash -- the job must still look like it is running")
+    assert q.lease_is_free(root, job.id) is True, "the lease must not outlive its dead holder"
+
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["status"] == "draft", (
+        "a mid-job crash must leave no intermediate status on the project -- update_track is only "
+        "ever called after the song job has actually finished")
+    assert reloaded.stages["track"] == "draft"
+
+    recon = q.reconcile(root)
+    assert [j.state for j in recon.changed] == ["pending"]
+    assert q.job_path(root, job.id, "pending").exists()
+
+    # And the retry -- a fresh worker claiming the same job -- finishes normally.
+    track_dir = proj.path.parent / "track"
+    fake_result = _fake_song_result(track_dir)
+    monkeypatch.setattr(sr, "run_song", lambda *a, **kw: fake_result)
+    retried = q.claim(root)
+    code = worker.run_job(root, retried, spawn=_caffeinate_spy([]))
+
+    assert code == 0
+    assert q.job_path(root, job.id, "done").exists()
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.track["status"] == "awaiting_approval"
 
 
 # -- Global constraint: the worker must stay importable without MLX ------------------------------

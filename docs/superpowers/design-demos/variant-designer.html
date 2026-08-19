@@ -1,0 +1,933 @@
+<!--
+  MiniMax H3 · локальный пульт — вариант «Дизайнер»
+
+  ЧЬЯ ФИЛОСОФИЯ: школа Дитера Рамса / Braun — но не в её «белой бытовой» ипостаси,
+  а в той, что дала профессиональную студийную технику (пульты Studer, TG-серия EMI,
+  Braun TG 1000): графитовые панели, шелкографические подписи капителью, приборные
+  цифры и ровно одна сигнальная клавиша на всём аппарате. Продукт — ночной пульт
+  управления дорогими прогонами, значит форма должна быть формой прибора, а не
+  формой сайта.
+
+  ТРИ ПРИНЦИПА, КОТОРЫЕ Я ПРИМЕНИЛ:
+
+  1. «Weniger, aber besser». Ни одной декоративной рамки. Иерархию держат размер
+     кегля, воздух и волосяные линии — не карточки, не тени, не цвет. Всё, что не
+     несёт данных, снято с панели.
+
+  2. Один сигнал на весь прибор. Оранжевый Braun принадлежит только необратимому
+     действию — запуску расчёта — и следу уже потраченного GPU-времени в прогресс-
+     баре. «Поставить в очередь» намеренно светло-серая клавиша: безопасное
+     действие не имеет права выглядеть как опасное. Всё остальное — графит.
+     Сдержанность и есть то, что делает акцент 120-процентным.
+
+  3. Прибор объясняет себя молча. Подписи — капитель с разрядкой, как шелкография
+     на металле; все числа моноширинные и выровнены по правому краю, чтобы
+     считываться колонкой; свёрнутый блок настроек показывает свои значения не
+     раскрываясь. Состояние узла читается с расстояния, до чтения текста.
+-->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniMax H3 — локальный пульт</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:        #141517;
+  --bg-2:      #17181a;
+  --panel:     #1c1e20;
+  --panel-2:   #212327;
+  --raised:    #26282c;
+  --line:      #2e3134;
+  --line-soft: #26282a;
+  --ink:       #e9e7e2;
+  --ink-2:     #a5a39d;
+  --ink-3:     #78766f;
+  --ink-4:     #55534e;
+  --signal:    #e2561d;
+  --signal-lo: #8a3a17;
+  --key:       #d6d3cc;
+
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --sans: "IBM Plex Sans", -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:
+    radial-gradient(1200px 600px at 50% -10%, #1a1c1e 0%, transparent 70%),
+    var(--bg);
+  color:var(--ink);
+  font-family:var(--sans);
+  font-size:15px;
+  line-height:1.45;
+  -webkit-font-smoothing:antialiased;
+  padding-bottom:96px;
+}
+h1,h2,h3,h4,p{margin:0}
+button{font:inherit;color:inherit;background:none;border:none;padding:0;cursor:pointer}
+
+/* ── общие приборные примитивы ───────────────────────────── */
+.legend{
+  font-size:10px;
+  letter-spacing:.19em;
+  text-transform:uppercase;
+  color:var(--ink-4);
+  font-weight:500;
+}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+.hr{height:1px;background:var(--line-soft);border:0}
+
+.shell{max-width:1440px;margin:0 auto;padding:0 28px}
+
+/* ── передняя панель (шапка) ─────────────────────────────── */
+.faceplate{
+  border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg,#1b1d1f,#161719);
+  position:sticky;top:0;z-index:20;
+}
+.faceplate .shell{
+  display:flex;align-items:center;gap:28px;
+  height:60px;
+}
+.mark{display:flex;align-items:baseline;gap:10px;flex:0 0 auto}
+.mark .glyph{
+  font-family:var(--mono);font-weight:600;font-size:12px;letter-spacing:.06em;
+  color:var(--ink);
+  border:1px solid var(--ink-4);
+  padding:3px 6px 2px;
+  line-height:1;
+}
+.mark .name{font-size:13px;font-weight:500;letter-spacing:.02em;color:var(--ink-2)}
+.mark .sub{font-size:11px;color:var(--ink-4);letter-spacing:.04em}
+
+.telemetry{margin-left:auto;display:flex;align-items:stretch;gap:0}
+.tcell{
+  padding:0 18px;
+  border-left:1px solid var(--line-soft);
+  display:flex;flex-direction:column;justify-content:center;gap:3px;
+  min-width:96px;
+}
+.tcell:first-child{border-left:0}
+.tcell .val{font-family:var(--mono);font-size:12.5px;color:var(--ink-2);letter-spacing:.01em}
+.tcell .val b{color:var(--ink);font-weight:500}
+.dot{
+  width:6px;height:6px;border-radius:50%;
+  display:inline-block;vertical-align:1px;margin-right:6px;
+  background:#3a3d40;box-shadow:inset 0 0 0 1px rgba(0,0,0,.5);
+}
+.dot.on{background:var(--signal)}
+.dot.warm{background:var(--signal-lo)}
+
+/* ── сетка пульта ────────────────────────────────────────── */
+.desk{
+  display:grid;
+  grid-template-columns:minmax(0,3fr) minmax(0,2.15fr) minmax(0,1.6fr);
+  gap:0;
+  margin-top:26px;
+}
+.bay{padding:0 26px;border-left:1px solid var(--line-soft);min-width:0}
+.bay:first-child{padding-left:0;border-left:0}
+.bay:last-child{padding-right:0}
+
+.sechead{display:flex;align-items:baseline;gap:12px;margin-bottom:18px}
+.sechead .idx{font-family:var(--mono);font-size:11px;color:var(--ink-4);letter-spacing:.05em}
+.sechead h2{
+  font-size:12px;font-weight:600;letter-spacing:.2em;text-transform:uppercase;color:var(--ink-2);
+}
+.sechead .fill{flex:1;height:1px;background:var(--line-soft);transform:translateY(-3px)}
+.sechead .aux{font-family:var(--mono);font-size:11px;color:var(--ink-4)}
+
+/* ── кнопки ──────────────────────────────────────────────── */
+.btn{
+  border:1px solid var(--line);
+  background:linear-gradient(180deg,#232528,#1d1f21);
+  color:var(--ink-2);
+  padding:7px 13px;
+  font-size:12.5px;
+  letter-spacing:.01em;
+  border-radius:2px;
+  display:inline-flex;align-items:center;gap:8px;
+}
+.btn:hover{color:var(--ink);border-color:#3a3d41}
+.btn-key{
+  background:linear-gradient(180deg,#e0ddd6,#c9c6bf);
+  color:#191a1b;border:1px solid #b6b3ab;font-weight:600;
+}
+.btn-key:hover{color:#000;border-color:#cfccc4}
+.btn-ghost{background:none;border-color:transparent;color:var(--ink-3);padding:7px 10px}
+.btn-ghost:hover{color:var(--ink-2);background:rgba(255,255,255,.03)}
+.btn .kbd{
+  font-family:var(--mono);font-size:11px;opacity:.55;letter-spacing:0;
+}
+
+/* ── ЗОНА 1. Сочинение ───────────────────────────────────── */
+.toolrow{display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+
+.select{
+  position:relative;display:inline-flex;align-items:center;
+  border:1px solid var(--line);
+  background:linear-gradient(180deg,#1f2124,#1a1c1e);
+  border-radius:2px;padding:7px 30px 7px 12px;
+  font-size:12.5px;color:var(--ink);white-space:nowrap;
+}
+.select::after{
+  content:"▾";position:absolute;right:10px;top:50%;transform:translateY(-52%);
+  color:var(--ink-4);font-size:10px;
+}
+.select.wide{display:flex;width:100%}
+.select .ph{color:var(--ink-3)}
+
+/* редактор */
+.editor{
+  border:1px solid var(--line);
+  background:#131416;
+  border-radius:2px;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.025);
+}
+.editor .ehead{
+  display:flex;align-items:center;gap:10px;
+  padding:8px 12px;border-bottom:1px solid var(--line-soft);
+  background:linear-gradient(180deg,#1b1d1f,#171819);
+}
+.editor .ehead .fmt{font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+.editor .ehead .right{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--ink-4)}
+.code{
+  font-family:var(--mono);
+  font-size:12.5px;line-height:1.72;
+  padding:14px 14px 16px;
+  max-height:280px;overflow:hidden;position:relative;
+}
+.code .blk{display:grid;grid-template-columns:22px 1fr;gap:10px;margin-bottom:12px}
+.code .blk:last-child{margin-bottom:0}
+.code .gut{color:#3b3d40;text-align:right;user-select:none;font-size:11px;padding-top:1px}
+.code .field{color:#f0eee9;font-weight:500}
+.code .body{color:#8e8c86}
+.code .shot{color:#c9c6be;letter-spacing:.02em}
+.code .tc{color:#cfccc4}
+.code .cursor{
+  display:inline-block;width:7px;height:14px;vertical-align:-2px;
+  background:var(--ink-3);margin-left:2px;
+}
+.efoot{
+  display:flex;align-items:center;gap:14px;
+  padding:7px 12px;border-top:1px solid var(--line-soft);
+  font-family:var(--mono);font-size:11px;color:var(--ink-4);
+}
+.efoot .sep{width:1px;height:10px;background:var(--line)}
+.efoot .right{margin-left:auto}
+
+/* параметры */
+.params{
+  display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:16px 20px;margin-top:20px;
+}
+.param{display:flex;flex-direction:column;gap:7px;min-width:0}
+.param.full{grid-column:1 / -1}
+.field-in{
+  border:1px solid var(--line);
+  background:linear-gradient(180deg,#1f2124,#1a1c1e);
+  border-radius:2px;padding:7px 12px;
+  font-family:var(--mono);font-size:12.5px;color:var(--ink);
+  display:flex;align-items:center;
+}
+.field-in .unit{margin-left:auto;color:var(--ink-4);font-size:11px}
+
+/* сегментный переключатель режима */
+.seg{display:flex;border:1px solid var(--line);border-radius:2px;overflow:hidden;background:#191b1d}
+.seg span{
+  flex:1;text-align:center;padding:7px 4px;
+  font-family:var(--mono);font-size:12px;color:var(--ink-3);
+  border-left:1px solid var(--line-soft);letter-spacing:.02em;
+}
+.seg span:first-child{border-left:0}
+.seg span.on{
+  background:linear-gradient(180deg,#31343880,#26282c);
+  color:var(--ink);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06);
+}
+
+/* зона кадра */
+.drop{
+  border:1px dashed #34373b;border-radius:2px;
+  background:repeating-linear-gradient(-45deg,#1a1c1e 0 8px,#181a1c 8px 16px);
+  padding:16px 14px;
+  display:flex;align-items:center;gap:12px;
+  color:var(--ink-3);font-size:12.5px;
+}
+.drop .frame{
+  width:40px;height:26px;border:1px solid #3a3d41;flex:0 0 auto;
+  background:linear-gradient(150deg,#25272b,#191a1c);
+  position:relative;
+}
+.drop .frame::after{
+  content:"";position:absolute;left:6px;right:6px;top:50%;height:1px;background:#3a3d41;
+}
+.drop b{color:var(--ink-2);font-weight:500}
+.drop .pick{margin-left:auto;color:var(--ink-2);border-bottom:1px solid var(--line);font-size:12px}
+
+/* свёрнутые настройки */
+.foldrow{
+  margin-top:18px;
+  border-top:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);
+  padding:11px 2px;
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+}
+.foldrow .cap{font-size:12.5px;color:var(--ink-2)}
+.foldrow .car{color:var(--ink-4);font-size:10px}
+.foldrow .vals{
+  margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--ink-4);
+  display:flex;gap:0;flex-wrap:wrap;
+}
+.foldrow .vals span{padding:0 9px;border-left:1px solid var(--line-soft)}
+.foldrow .vals span:first-child{border-left:0;padding-left:0}
+.foldrow .vals i{font-style:normal;color:var(--ink-3)}
+
+/* строка выпуска */
+.emitrow{display:flex;align-items:center;gap:16px;margin-top:18px;flex-wrap:wrap}
+.estimate{font-family:var(--mono);font-size:12.5px;color:var(--ink-2);line-height:1.35}
+.estimate .lo{color:var(--ink-4)}
+.emitrow .btn-key{margin-left:auto;padding:11px 18px;font-size:13px}
+
+/* ── ЗОНА 2. Очередь ─────────────────────────────────────── */
+.transport{
+  border:1px solid var(--line);
+  border-radius:2px;
+  background:linear-gradient(180deg,#232528,#1b1d1f);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.045), 0 8px 22px -18px #000;
+  padding:16px 16px 15px;
+  display:flex;align-items:center;gap:18px;
+}
+.transport .state{min-width:0}
+.transport .state .legend{margin-bottom:6px;display:block}
+.transport .state h3{
+  font-size:20px;font-weight:500;letter-spacing:-.012em;color:var(--ink);line-height:1.2;
+}
+.transport .state p{font-size:12px;color:var(--ink-4);margin-top:5px}
+.startkey{
+  margin-left:auto;flex:0 0 auto;
+  background:linear-gradient(180deg,#ef6427,#d24d16);
+  color:#1a0c04;
+  font-weight:600;font-size:14px;letter-spacing:.01em;
+  padding:14px 20px;border-radius:2px;
+  border:1px solid #b8430f;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.28), 0 6px 16px -10px rgba(226,86,29,.55);
+  display:flex;align-items:center;gap:9px;
+}
+.startkey:hover{background:linear-gradient(180deg,#f56e30,#dd5419)}
+.startkey .tri{font-size:11px}
+
+/* текущая задача */
+.now{margin-top:20px}
+.now .row1{display:flex;align-items:baseline;gap:10px}
+.now .nm{font-family:var(--mono);font-size:13.5px;color:var(--ink);font-weight:500}
+.now .meta{font-family:var(--mono);font-size:11.5px;color:var(--ink-4)}
+.now .eta{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--ink-2)}
+.steps{display:flex;gap:3px;margin-top:11px}
+.steps i{
+  flex:1;height:7px;border-radius:1px;
+  background:rgba(255,255,255,.055);
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.035);
+}
+.steps i.done{background:var(--signal);box-shadow:none}
+.steps i.cur{background:transparent;box-shadow:inset 0 0 0 1px var(--signal-lo)}
+.now .undertext{
+  display:flex;margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--ink-4);
+}
+.now .undertext .r{margin-left:auto}
+
+/* ожидающие */
+.waitlist{margin-top:22px;border-top:1px solid var(--line-soft)}
+.item{
+  display:grid;grid-template-columns:16px 1fr auto;gap:12px;
+  padding:13px 0 12px;border-bottom:1px solid var(--line-soft);
+  align-items:start;
+}
+.item .ord{font-family:var(--mono);font-size:11px;color:var(--ink-4);padding-top:2px}
+.item .nm{font-family:var(--mono);font-size:13px;color:var(--ink-2)}
+.item .sp{font-family:var(--mono);font-size:11.5px;color:var(--ink-4);margin-top:3px}
+.item .est{font-family:var(--mono);font-size:12px;color:var(--ink-3);text-align:right;white-space:nowrap}
+.acts{grid-column:2 / -1;display:flex;gap:0;margin-top:8px;flex-wrap:wrap}
+.acts button{
+  font-size:11.5px;color:var(--ink-4);padding:0 10px;
+  border-left:1px solid var(--line-soft);line-height:1.1;
+}
+.acts button:first-child{padding-left:0;border-left:0}
+.acts button:hover{color:var(--ink-2)}
+.acts button.warn:hover{color:#c8704b}
+
+/* предупреждение */
+.notice{
+  margin-top:20px;
+  border:1px solid var(--line);
+  background:var(--panel);
+  border-radius:2px;
+  overflow:hidden;
+}
+.notice .hatch{
+  height:5px;
+  background:repeating-linear-gradient(-45deg,#3a3d41 0 5px,#212327 5px 10px);
+  opacity:.75;
+}
+.notice .in{padding:13px 14px 12px}
+.notice p{font-size:13px;color:var(--ink-2);line-height:1.5}
+.notice .btns{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.notice .btns .btn{padding:6px 12px;font-size:12px}
+
+/* ── ЗОНА 3. Готово ──────────────────────────────────────── */
+.result{margin-bottom:22px}
+.thumb{
+  aspect-ratio:16/9;width:100%;
+  border:1px solid var(--line);
+  position:relative;overflow:hidden;
+  background:
+    radial-gradient(120% 90% at 72% 18%, #34373c 0%, rgba(52,55,60,0) 58%),
+    linear-gradient(168deg,#2a2d31 0%,#1d1f22 46%,#161719 100%);
+}
+.result:nth-child(2) .thumb{
+  background:
+    radial-gradient(90% 110% at 24% 78%, #33363b 0%, rgba(51,54,59,0) 62%),
+    linear-gradient(196deg,#232629 0%,#1b1d20 52%,#141517 100%);
+}
+.result:nth-child(3) .thumb{
+  background:
+    radial-gradient(140% 70% at 50% 6%, #383b40 0%, rgba(56,59,64,0) 66%),
+    linear-gradient(180deg,#25282c 0%,#191a1c 70%,#151618 100%);
+}
+.thumb::after{
+  content:"";position:absolute;inset:0;
+  background:radial-gradient(110% 80% at 50% 55%, transparent 45%, rgba(0,0,0,.42) 100%);
+}
+.thumb .tag{
+  position:absolute;left:8px;bottom:7px;z-index:2;
+  font-family:var(--mono);font-size:10.5px;color:#cbc8c1;
+  background:rgba(10,11,12,.62);padding:2px 6px;letter-spacing:.03em;
+}
+.thumb .bar{
+  position:absolute;left:0;right:0;bottom:0;height:2px;z-index:2;
+  background:rgba(255,255,255,.09);
+}
+.thumb .bar i{display:block;height:100%;width:34%;background:rgba(255,255,255,.28)}
+.result h4{font-size:13.5px;font-weight:500;color:var(--ink);margin-top:10px;letter-spacing:-.005em}
+.result .rm{font-family:var(--mono);font-size:11.5px;color:var(--ink-4);margin-top:4px}
+.result .acts{grid-column:auto;margin-top:8px}
+.outpath{
+  font-family:var(--mono);font-size:11px;color:var(--ink-4);
+  padding-bottom:14px;margin-bottom:18px;border-bottom:1px solid var(--line-soft);
+}
+
+/* ── разделитель второго экрана ──────────────────────────── */
+.screenbreak{
+  margin:74px 0 26px;display:flex;align-items:center;gap:16px;
+}
+.screenbreak .lbl{
+  font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--ink-3);font-weight:600;
+  white-space:nowrap;
+}
+.screenbreak .fill{flex:1;height:1px;background:var(--line)}
+.screenbreak .n{font-family:var(--mono);font-size:11px;color:var(--ink-4)}
+
+/* ── ЭКРАН 2. Модалка диалога ────────────────────────────── */
+.scrim{
+  border:1px solid var(--line-soft);
+  background:
+    linear-gradient(rgba(9,10,11,.72),rgba(9,10,11,.72)),
+    repeating-linear-gradient(-45deg,#1a1c1e 0 3px,#181a1c 3px 6px);
+  padding:34px;
+}
+.modal{
+  max-width:1080px;margin:0 auto;
+  border:1px solid #34373b;border-radius:3px;
+  background:var(--panel);
+  box-shadow:0 30px 70px -30px #000, 0 0 0 1px rgba(255,255,255,.02) inset;
+  overflow:hidden;
+}
+.mhead{
+  display:flex;align-items:center;gap:12px;
+  padding:12px 16px;border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg,#242629,#1d1f21);
+}
+.mhead h3{font-size:13px;font-weight:600;letter-spacing:.02em}
+.mhead .sub{font-family:var(--mono);font-size:11px;color:var(--ink-4)}
+.mhead .x{margin-left:auto;color:var(--ink-3);font-size:15px;line-height:1;padding:4px 6px}
+.mhead .x:hover{color:var(--ink)}
+
+.mbody{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.12fr)}
+.mcol{padding:16px;min-width:0;display:flex;flex-direction:column}
+.mcol + .mcol{border-left:1px solid var(--line)}
+.mcol > .legend{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.mcol > .legend .r{margin-left:auto;font-family:var(--mono);letter-spacing:.02em}
+
+.mprompt{
+  border:1px solid var(--line);background:#131416;border-radius:2px;
+  flex:1;min-height:300px;overflow:hidden;position:relative;
+}
+.mprompt .code{max-height:none;padding:12px}
+
+/* лента диалога */
+.feed{display:flex;flex-direction:column;gap:16px;flex:1;min-height:250px;overflow:hidden;position:relative;padding-right:2px}
+.msg .who{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-4);margin-bottom:6px}
+.msg .txt{font-size:13.5px;line-height:1.55;color:var(--ink-2)}
+.msg.me .txt{
+  color:var(--ink);
+  border-left:1px solid var(--line);padding-left:12px;
+}
+.msg .quote{
+  margin-top:9px;border:1px solid var(--line);background:#131416;border-radius:2px;
+  padding:9px 11px;font-family:var(--mono);font-size:11.5px;line-height:1.65;color:#8e8c86;
+}
+.msg .quote b{color:#e6e4df;font-weight:500}
+.thinking{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--ink-3)}
+.thinking .dots i{
+  display:inline-block;width:3px;height:3px;border-radius:50%;background:var(--ink-3);
+  margin-right:3px;animation:blink 1.35s infinite;
+}
+.thinking .dots i:nth-child(2){animation-delay:.22s}
+.thinking .dots i:nth-child(3){animation-delay:.44s}
+@keyframes blink{0%,80%,100%{opacity:.2}40%{opacity:1}}
+
+.composer{
+  margin-top:14px;border:1px solid var(--line);border-radius:2px;
+  background:linear-gradient(180deg,#1f2124,#1a1c1e);
+}
+.composer .ta{
+  padding:11px 12px;font-size:13px;color:var(--ink-3);min-height:56px;
+}
+.composer .crow{
+  display:flex;align-items:center;gap:10px;
+  padding:8px 10px;border-top:1px solid var(--line-soft);
+}
+.clip{
+  width:26px;height:26px;border:1px solid var(--line);border-radius:2px;
+  display:flex;align-items:center;justify-content:center;color:var(--ink-3);
+}
+.clip:hover{color:var(--ink-2);border-color:#3a3d41}
+.composer .dnd{font-size:11.5px;color:var(--ink-4)}
+.composer .send{margin-left:auto}
+.composer .send .btn{padding:6px 12px;font-size:12px}
+
+.mstatus{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  margin-top:12px;font-size:11.5px;color:var(--ink-4);font-family:var(--mono);
+}
+.mstatus .dur{
+  margin-left:auto;display:inline-flex;align-items:center;gap:8px;
+  border:1px solid var(--line);border-radius:2px;padding:4px 9px;color:var(--ink-2);
+}
+.mstatus .dur em{font-style:normal;color:var(--ink-4)}
+
+.mfoot{
+  display:flex;align-items:center;gap:9px;
+  padding:12px 16px;border-top:1px solid var(--line);
+  background:linear-gradient(180deg,#1e2022,#1a1c1e);
+}
+.mfoot .btn-key{padding:8px 15px}
+.mfoot .right{margin-left:auto;display:flex;gap:6px}
+
+/* ── адаптив ─────────────────────────────────────────────── */
+@media (max-width:1180px){
+  .desk{grid-template-columns:minmax(0,1.35fr) minmax(0,1fr)}
+  .bay:nth-child(3){
+    grid-column:1 / -1;padding:24px 0 0;border-left:0;
+    border-top:1px solid var(--line-soft);margin-top:26px;
+  }
+  .bay:nth-child(3) .results{
+    display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:22px;
+  }
+  .bay:nth-child(3) .result{margin-bottom:0}
+}
+@media (max-width:860px){
+  .shell{padding:0 18px}
+  .faceplate .shell{height:auto;padding-top:12px;padding-bottom:12px;flex-wrap:wrap;gap:12px}
+  .telemetry{margin-left:0;width:100%;flex-wrap:wrap}
+  .tcell{padding:0 14px 0 0;border-left:0;min-width:auto;flex:1 1 auto}
+  .desk{grid-template-columns:minmax(0,1fr)}
+  .bay{padding:0;border-left:0}
+  .bay + .bay{border-top:1px solid var(--line-soft);margin-top:30px;padding-top:26px}
+  .bay:nth-child(3){margin-top:30px;padding-top:26px}
+  .bay:nth-child(3) .results{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .mbody{grid-template-columns:minmax(0,1fr)}
+  .mcol + .mcol{border-left:0;border-top:1px solid var(--line)}
+  .mprompt{min-height:220px}
+  .scrim{padding:16px}
+  .transport{flex-wrap:wrap}
+  .startkey{margin-left:0;width:100%;justify-content:center}
+}
+@media (max-width:620px){
+  .params{grid-template-columns:minmax(0,1fr)}
+  .bay:nth-child(3) .results{grid-template-columns:minmax(0,1fr)}
+  .emitrow .btn-key{margin-left:0;width:100%;justify-content:center}
+}
+</style>
+</head>
+<body>
+
+<!-- ══ ПЕРЕДНЯЯ ПАНЕЛЬ ══════════════════════════════════════ -->
+<header class="faceplate">
+  <div class="shell">
+    <div class="mark">
+      <span class="glyph">H3</span>
+      <span class="name">MiniMax&nbsp;H3</span>
+      <span class="sub">локальный пульт</span>
+    </div>
+    <div class="telemetry">
+      <div class="tcell">
+        <span class="legend">адрес</span>
+        <span class="val">127.0.0.1:8765</span>
+      </div>
+      <div class="tcell">
+        <span class="legend">видеопамять</span>
+        <span class="val"><b>41,8</b> / 48,0 ГБ</span>
+      </div>
+      <div class="tcell">
+        <span class="legend">точность</span>
+        <span class="val">DiT 8 бит</span>
+      </div>
+      <div class="tcell">
+        <span class="legend">расчёт</span>
+        <span class="val"><span class="dot"></span>стоит</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="shell">
+  <div class="desk">
+
+    <!-- ══ 01 · СОЧИНЕНИЕ ═════════════════════════════════ -->
+    <section class="bay">
+      <div class="sechead">
+        <span class="idx">01</span>
+        <h2>Сочинение</h2>
+        <span class="fill"></span>
+        <span class="aux">черновик · не сохранён</span>
+      </div>
+
+      <div class="toolrow">
+        <button class="btn">Новый через диалог</button>
+        <div class="select">Библиотека промптов<span style="color:var(--ink-4);margin-left:8px">24</span></div>
+      </div>
+
+      <div class="editor">
+        <div class="ehead">
+          <span class="fmt">формат MiniMax H3 · 3 поля</span>
+          <span class="right">2 плана · 00:10.000</span>
+        </div>
+        <div class="code">
+          <div class="blk">
+            <span class="gut">01</span>
+            <div>
+              <span class="field">integrated_multimodal_description:</span>
+              <span class="body">
+                <span class="shot">[Shot&nbsp;1]</span> Live-action, cinematic, a wide shot captures a sun-drenched Italian cobblestone street at high noon. Terracotta-colored buildings line both sides…
+                <span class="shot">[Shot&nbsp;2]</span> At <span class="tc">00:05.000</span>, the camera cuts to a ground-level close-up as the cat weaves past café tables…
+              </span>
+            </div>
+          </div>
+          <div class="blk">
+            <span class="gut">02</span>
+            <div>
+              <span class="field">overall_soundscape:</span>
+              <span class="body">…the crisp, rhythmic clicking of the cat's paws on sun-baked cobblestones…</span>
+            </div>
+          </div>
+          <div class="blk">
+            <span class="gut">03</span>
+            <div>
+              <span class="field">non_diegetic_music:</span>
+              <span class="body">A light acoustic guitar plays a steady, moderate tempo rhythm…<span class="cursor"></span></span>
+            </div>
+          </div>
+        </div>
+        <div class="efoot">
+          <span>1 284 знака</span>
+          <span class="sep"></span>
+          <span>переносов нет</span>
+          <span class="right">⌥⏎ — перенос строки</span>
+        </div>
+      </div>
+
+      <div class="params">
+        <div class="param">
+          <span class="legend">Разрешение</span>
+          <div class="select wide">малое 896×576</div>
+        </div>
+        <div class="param">
+          <span class="legend">Длительность</span>
+          <div class="field-in">10<span class="unit">секунд</span></div>
+        </div>
+        <div class="param full">
+          <span class="legend">Режим</span>
+          <div class="seg">
+            <span class="on">t2va</span><span>i2v</span><span>flf</span>
+          </div>
+        </div>
+        <div class="param full">
+          <span class="legend">Опорный кадр</span>
+          <div class="drop">
+            <span class="frame"></span>
+            <span>перетащи картинку или <b>выбери файл</b></span>
+            <span class="pick">обзор…</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="foldrow">
+        <span class="car">▸</span>
+        <span class="cap">Настройки модели</span>
+        <span class="vals">
+          <span>чекпойнт <i>h3-base-v2.safetensors</i></span>
+          <span>LoRA <i>нет</i></span>
+          <span>AdaLN <i>таблица A</i></span>
+          <span>шагов <i>7</i></span>
+          <span>сид <i>481203</i></span>
+        </span>
+      </div>
+
+      <div class="emitrow">
+        <div class="estimate">
+          ≈13 мин · 7 проходов<br>
+          <span class="lo">DiT 8 бит · 896×576 · 10 с</span>
+        </div>
+        <button class="btn btn-key">Поставить в очередь <span class="kbd">⌘⏎</span></button>
+      </div>
+    </section>
+
+    <!-- ══ 02 · ОЧЕРЕДЬ ═══════════════════════════════════ -->
+    <section class="bay">
+      <div class="sechead">
+        <span class="idx">02</span>
+        <h2>Очередь</h2>
+        <span class="fill"></span>
+        <span class="aux">3 задачи · ≈2 ч 39 мин</span>
+      </div>
+
+      <div class="transport">
+        <div class="state">
+          <span class="legend">Состояние</span>
+          <h3>Очередь приостановлена</h3>
+          <p>GPU свободен</p>
+        </div>
+        <button class="startkey"><span class="tri">▶</span> Начать расчёт</button>
+      </div>
+
+      <div class="now">
+        <span class="legend" style="display:block;margin-bottom:9px">Текущая задача</span>
+        <div class="row1">
+          <span class="nm">kot-italy2</span>
+          <span class="meta">448×288</span>
+          <span class="eta">осталось ≈5 мин</span>
+        </div>
+        <div class="steps">
+          <i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i>
+          <i class="cur"></i><i></i><i></i>
+        </div>
+        <div class="undertext">
+          <span>проход 4 / 7</span>
+          <span class="r">остановлена после четвёртого прохода</span>
+        </div>
+      </div>
+
+      <div class="waitlist">
+        <span class="legend" style="display:block;margin:16px 0 2px">Ждут</span>
+
+        <div class="item">
+          <span class="ord">2</span>
+          <div>
+            <div class="nm">fisherman-dawn</div>
+            <div class="sp">малое 896×576 · 10 с · 7 проходов</div>
+          </div>
+          <span class="est">≈77 мин</span>
+          <div class="acts">
+            <button>вверх</button><button>обсудить</button><button>копия</button><button class="warn">удалить</button>
+          </div>
+        </div>
+
+        <div class="item">
+          <span class="ord">3</span>
+          <div>
+            <div class="nm">tango-vertical</div>
+            <div class="sp">576×896 верт. · 10 с · 7 проходов</div>
+          </div>
+          <span class="est">≈77 мин</span>
+          <div class="acts">
+            <button>вверх</button><button>обсудить</button><button>копия</button><button class="warn">удалить</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="notice">
+        <div class="hatch"></div>
+        <div class="in">
+          <p>Модель в памяти держит GPU — выгрузить и начать генерацию?</p>
+          <div class="btns">
+            <button class="btn btn-key">выгрузить и начать</button>
+            <button class="btn btn-ghost">пусть ждёт</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══ 03 · ГОТОВО ════════════════════════════════════ -->
+    <section class="bay">
+      <div class="sechead">
+        <span class="idx">03</span>
+        <h2>Готово</h2>
+        <span class="fill"></span>
+      </div>
+
+      <div class="outpath">~/Movies/h3/out · 3 файла · 2,4 ГБ</div>
+
+      <div class="results">
+        <div class="result">
+          <div class="thumb">
+            <span class="tag">кадр 00:04</span>
+            <span class="bar"><i></i></span>
+          </div>
+          <h4>кот-италия-полдень</h4>
+          <div class="rm">13,4 мин · 448×288</div>
+          <div class="acts">
+            <button>открыть папку</button><button>копия</button><button>обсудить</button>
+          </div>
+        </div>
+
+        <div class="result">
+          <div class="thumb">
+            <span class="tag">кадр 00:04</span>
+            <span class="bar"><i style="width:58%"></i></span>
+          </div>
+          <h4>баллада-финал-30с</h4>
+          <div class="rm">склейка 3×10 с</div>
+          <div class="acts">
+            <button>открыть папку</button><button>копия</button><button>обсудить</button>
+          </div>
+        </div>
+
+        <div class="result">
+          <div class="thumb">
+            <span class="tag">кадр 00:04</span>
+            <span class="bar"><i style="width:21%"></i></span>
+          </div>
+          <h4>танго-арка</h4>
+          <div class="rm">72,6 мин · 896×576</div>
+          <div class="acts">
+            <button>открыть папку</button><button>копия</button><button>обсудить</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- ══ ЭКРАН 2 ═══════════════════════════════════════════ -->
+  <div class="screenbreak">
+    <span class="n">02</span>
+    <span class="lbl">Экран 2 · модалка диалога</span>
+    <span class="fill"></span>
+  </div>
+
+  <div class="scrim">
+    <div class="modal">
+      <div class="mhead">
+        <h3>Диалог о промпте</h3>
+        <span class="sub">локальная модель · ничего не уходит в сеть</span>
+        <button class="x">✕</button>
+      </div>
+
+      <div class="mbody">
+
+        <!-- левая колонка: промпт -->
+        <div class="mcol">
+          <div class="legend">Промпт <span class="r">1 284 знака · 3 поля</span></div>
+          <div class="mprompt">
+            <div class="code">
+              <div class="blk">
+                <span class="gut">01</span>
+                <div>
+                  <span class="field">integrated_multimodal_description:</span>
+                  <span class="body">
+                    <span class="shot">[Shot&nbsp;1]</span> Live-action, cinematic, a wide shot captures a sun-drenched Italian cobblestone street at high noon. Terracotta-colored buildings line both sides…
+                    <span class="shot">[Shot&nbsp;2]</span> At <span class="tc">00:05.000</span>, the camera cuts to a ground-level close-up as the cat weaves past café tables…
+                  </span>
+                </div>
+              </div>
+              <div class="blk">
+                <span class="gut">02</span>
+                <div>
+                  <span class="field">overall_soundscape:</span>
+                  <span class="body">…the crisp, rhythmic clicking of the cat's paws on sun-baked cobblestones…</span>
+                </div>
+              </div>
+              <div class="blk">
+                <span class="gut">03</span>
+                <div>
+                  <span class="field">non_diegetic_music:</span>
+                  <span class="body">A light acoustic guitar plays a steady, moderate tempo rhythm…<span class="cursor"></span></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- правая колонка: диалог -->
+        <div class="mcol">
+          <div class="legend">Диалог <span class="r">4 сообщения</span></div>
+
+          <div class="feed">
+            <div class="msg me">
+              <div class="who">вы</div>
+              <div class="txt">Кот бежит по итальянской улице…</div>
+            </div>
+
+            <div class="msg">
+              <div class="who">Qwen2.5 · локально</div>
+              <div class="txt">Вот полный промпт в формате MiniMax H3 — два плана, склейка на пятой секунде, звук отдельным полем.</div>
+              <div class="quote">
+                <b>integrated_multimodal_description:</b> [Shot 1] Live-action, cinematic, a wide shot captures a sun-drenched Italian cobblestone street…
+              </div>
+            </div>
+
+            <div class="thinking">
+              <span class="dots"><i></i><i></i><i></i></span>
+              модель думает…
+            </div>
+          </div>
+
+          <div class="composer">
+            <div class="ta">Добавь второй план — крупный кадр лап на брусчатке…</div>
+            <div class="crow">
+              <button class="clip" aria-label="прикрепить файл">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+                     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21.4 11.05 12.25 20.2a5.5 5.5 0 0 1-7.78-7.78l9.19-9.19a3.67 3.67 0 0 1 5.19 5.19l-9.2 9.19a1.83 1.83 0 0 1-2.59-2.59l8.49-8.48"/>
+                </svg>
+              </button>
+              <span class="dnd">или перетащи сюда картинку</span>
+              <span class="send"><button class="btn">Отправить <span class="kbd">⌘⏎</span></button></span>
+            </div>
+          </div>
+
+          <div class="mstatus">
+            <span><span class="dot warm"></span>Qwen выгружена — поднимется при первом сообщении</span>
+            <span class="dur"><em>Длительность</em> 10 с</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="mfoot">
+        <button class="btn btn-key">в Редактор</button>
+        <span class="mono" style="font-family:var(--mono);font-size:11px;color:var(--ink-4)">заменит текущий черновик</span>
+        <span class="right">
+          <button class="btn btn-ghost">очистить</button>
+          <button class="btn btn-ghost">закрыть</button>
+        </span>
+      </div>
+    </div>
+  </div>
+
+</main>
+</body>
+</html>

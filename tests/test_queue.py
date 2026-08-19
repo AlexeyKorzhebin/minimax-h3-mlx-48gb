@@ -1745,6 +1745,158 @@ def test_pause_if_drained_does_not_deadlock_against_the_queue_lock(tmp_path):
     assert _answer_within(5, lambda: q.pause_if_drained(root)) is True
 
 
+# -- Step: `Job.kind` (task 3, "Проекты") ---------------------------------------------------------
+
+
+def test_submit_defaults_kind_to_generate(tmp_path):
+    """A caller that never heard of `kind` (every caller before task 3) gets exactly the behavior
+    it always got: a `KIND_GENERATE` job.
+    """
+    root = tmp_path / "queue"
+    job = q.submit(root, ["generate", "--tag", "a"], "", _stem(_DRY, str(tmp_path / "h3-a-1x1")),
+                   {})
+    assert job.kind == q.KIND_GENERATE
+
+
+def test_submit_accepts_a_song_kind_and_leaves_its_args_untouched(tmp_path):
+    """A `kind="song"` job's `args` is `["song", "--project", <path>]` (task 3 brief, verbatim) --
+    `submit` must not graft an `--outdir` token onto it the way it does for `KIND_GENERATE`
+    (`_relocate_to_job_subdir`), because the worker's song dispatch parses exactly this shape and
+    nothing else.
+    """
+    root = tmp_path / "queue"
+    project_path = tmp_path / "projects" / "20260818-1200-my-song" / "project.json"
+    args = ["song", "--project", str(project_path)]
+    job = q.submit(root, args, "", {"output_stem": str(project_path.parent / "track" / "song")},
+                   {}, kind=q.KIND_SONG)
+
+    assert job.kind == q.KIND_SONG
+    assert job.args == args, "song args must pass through unrelocated"
+    assert job.output_stem == str(project_path.parent / "track" / "song")
+
+
+def test_submit_accepts_an_assemble_kind_and_leaves_its_args_untouched(tmp_path):
+    root = tmp_path / "queue"
+    project_path = tmp_path / "projects" / "20260818-1200-my-clip" / "project.json"
+    args = ["assemble", "--project", str(project_path)]
+    job = q.submit(root, args, "", {"output_stem": str(project_path.parent / "final")}, {},
+                   kind=q.KIND_ASSEMBLE)
+
+    assert job.kind == q.KIND_ASSEMBLE
+    assert job.args == args
+
+
+def test_submit_refuses_an_unknown_kind(tmp_path):
+    root = tmp_path / "queue"
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["frobnicate", "--project", "/x"], "", _DRY, {}, kind="frobnicate")
+
+
+def test_submitted_song_job_file_persists_kind_on_disk(tmp_path):
+    """`kind` is a real field of the job file, not just an in-memory attribute -- a human reading
+    `cat pending/<id>.json` (the module docstring's own promise for every field it writes) must see
+    it, and `claim`/`scan` must read it back.
+    """
+    root = tmp_path / "queue"
+    project_path = tmp_path / "projects" / "20260818-1200-my-song" / "project.json"
+    args = ["song", "--project", str(project_path)]
+    job = q.submit(root, args, "", {"output_stem": str(project_path.parent / "track" / "song")},
+                   {}, kind=q.KIND_SONG)
+
+    on_disk = json.loads(q.job_path(root, job.id, "pending").read_text())
+    assert on_disk["kind"] == "song"
+
+    claimed = q.claim(root)
+    assert claimed.kind == q.KIND_SONG
+
+
+def test_update_preserves_the_jobs_original_kind(tmp_path):
+    """`update` has no `kind` parameter -- editing a job's args/note/estimate must never silently
+    turn a song job back into a generate job (the dataclass default `update` would otherwise fall
+    through to if it forgot to carry `current.kind` forward).
+    """
+    root = tmp_path / "queue"
+    project_path = tmp_path / "projects" / "20260818-1200-my-song" / "project.json"
+    args = ["song", "--project", str(project_path)]
+    job = q.submit(root, args, "", {"output_stem": str(project_path.parent / "track" / "song")},
+                   {}, kind=q.KIND_SONG)
+
+    updated = q.update(root, job.id, args, "edited note",
+                       {"output_stem": str(project_path.parent / "track" / "song")}, {})
+
+    assert updated.kind == q.KIND_SONG
+
+
+def test_an_old_job_file_with_no_kind_field_reads_as_generate(tmp_path):
+    """Backward compatibility (task 3 brief, mandatory): a `pending/<id>.json` written before this
+    field existed has no `"kind"` key at all -- `Job(**data)` must fill in `KIND_GENERATE`, not
+    raise a `TypeError` for a missing required argument.
+    """
+    root = tmp_path / "queue"
+    q.layout(root)
+    old_style = {
+        "id": "20260101-000000-old-abcd", "created_at": "2026-01-01T00:00:00",
+        "args": ["generate", "--tag", "old"], "note": "", "prompt_source": None,
+        "prompt_sha256": None, "output_stem": str(tmp_path / "h3-old-1x1"),
+        "estimate": {}, "priority": 0, "started_at": None, "finished_at": None,
+        "exit_code": None, "log_tail": None,
+    }
+    path = q.job_path(root, old_style["id"], "pending")
+    path.write_text(json.dumps(old_style), encoding="utf-8")
+
+    jobs, broken = q.scan(root)
+    assert broken == []
+    assert len(jobs) == 1
+    assert jobs[0].kind == q.KIND_GENERATE
+
+    claimed = q.claim(root)
+    assert claimed.kind == q.KIND_GENERATE
+
+
+# -- M4 (fix round 1, 2026-08-18 review): submit validates args shape against kind ---------------
+
+
+def test_submit_refuses_a_song_kind_job_whose_args_dont_start_with_song(tmp_path):
+    root = tmp_path / "queue"
+    project_path = tmp_path / "projects" / "x" / "project.json"
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["generate", "--project", str(project_path)], "",
+                 {"output_stem": str(project_path.parent / "track" / "song")}, {}, kind=q.KIND_SONG)
+
+
+def test_submit_refuses_a_song_kind_job_missing_the_project_flag(tmp_path):
+    root = tmp_path / "queue"
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["song", "--tag", "x"], "",
+                 {"output_stem": str(tmp_path / "track" / "song")}, {}, kind=q.KIND_SONG)
+
+
+def test_submit_refuses_an_assemble_kind_job_whose_args_dont_start_with_assemble(tmp_path):
+    root = tmp_path / "queue"
+    project_path = tmp_path / "projects" / "x" / "project.json"
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["--project", str(project_path)], "",
+                 {"output_stem": str(project_path.parent / "final")}, {}, kind=q.KIND_ASSEMBLE)
+
+
+def test_submit_refuses_a_generate_kind_job_whose_args_start_with_song(tmp_path):
+    """The mirror mistake M4 also catches: song/assemble-shaped `args` submitted without also
+    setting `kind` -- these would otherwise be handed to `h3 generate` as its own subprocess argv
+    and fail deep inside the CLI, an hour later, instead of at submission.
+    """
+    root = tmp_path / "queue"
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["song", "--project", "/x/project.json"], "",
+                 _stem(_DRY, str(tmp_path / "h3-a-1x1")), {})
+
+
+def test_submit_refuses_a_generate_kind_job_whose_args_start_with_assemble(tmp_path):
+    root = tmp_path / "queue"
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["assemble", "--project", "/x/project.json"], "",
+                 _stem(_DRY, str(tmp_path / "h3-a-1x1")), {})
+
+
 # -- Global constraint: queue.py must stay importable without MLX -------------------------------
 
 

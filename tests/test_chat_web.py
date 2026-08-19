@@ -630,6 +630,215 @@ def test_a_non_string_or_empty_slug_is_ignored_quietly_not_a_502(_serve, slug):
         fake.close()
 
 
+# -- Task 5 ("Проекты"): `project` и `kind` -----------------------------------------------------
+
+
+def _turn_with_project(project, *, reply="ок"):
+    """A well-formed turn (the shape `_TURN` fixes) carrying `project` as given -- whatever shape."""
+    return {"choices": [{"message": {"content": json.dumps(
+        {"reply": reply, "prompt": None, "project": project})}}]}
+
+
+_VIDEO_PROJECT = {
+    "kind": "video",
+    "scenes": [{"prompt": "[Shot 1] Cinematic, a fox crosses a snowy field…", "duration": 8}],
+    "lyrics": None,
+    "caption": None,
+}
+
+_SONG_PROJECT = {
+    "kind": "song",
+    "scenes": None,
+    "lyrics": "[intro]\nТиши, тиши.\n[outro]\nСпи, мой князь.",
+    "caption": "Global Metadata: Wistful lullaby.",
+}
+
+
+def test_a_turn_with_a_project_is_saved_to_the_session_and_the_kind_follows_it(_serve):
+    fake = _FakeLlama(chat_payload=_turn_with_project(_VIDEO_PROJECT))
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "сделай ролик", "prompt": ""})
+        assert answer["project"] == _VIDEO_PROJECT
+        saved = srv.get_json(f"/api/chat/{sid}")
+        assert saved["project"] == _VIDEO_PROJECT
+        assert saved["kind"] == "video"
+    finally:
+        fake.close()
+
+
+def test_the_sessions_kind_rides_a_later_turns_context(_serve):
+    """Once one turn of a session has answered with a `project`, the session remembers its
+    `kind` -- and the *next* turn's system context carries it, the same way `mode`/`duration`
+    already do (`test_the_system_message_carries_the_format_doc_and_the_mode`), so the model does
+    not lose track of which kind of project this session already committed to.
+
+    One fake server mutated in place between turns, the same trick
+    `test_a_later_turn_with_no_slug_keeps_the_sessions_last_known_one` uses -- the second turn
+    answers with no `project` at all, and both the session's own `kind`/`project` and the *next*
+    turn's context are checked to have survived it, non-destructively, the same rule `slug` and
+    `prompt_struct` already follow.
+    """
+    payload = _turn_with_project(_SONG_PROJECT)
+    fake = _FakeLlama(chat_payload=payload)
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "песню", "prompt": ""})
+        assert srv.get_json(f"/api/chat/{sid}")["kind"] == "song"
+
+        payload.clear()
+        payload.update({"choices": [{"message": {"content": json.dumps(
+            {"reply": "ещё", "prompt": None})}}]})
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "ещё раз", "prompt": ""})
+        system = fake.requests[-1]["body"]["messages"][0]["content"]
+        assert "kind: song" in system
+        saved = srv.get_json(f"/api/chat/{sid}")
+        assert saved["kind"] == "song", "второй ход без project не должен был стереть kind первого"
+        assert saved["project"] == _SONG_PROJECT
+    finally:
+        fake.close()
+
+
+def test_a_later_turns_bad_kind_does_not_leave_the_sessions_kind_stale(_serve):
+    """Review M2: `session["kind"]` is a mirror of `session["project"]["kind"]`, but the first
+    turn's `## Context` fix (`test_the_sessions_kind_rides_a_later_turns_context`) only proved the
+    mirror survives a turn that says nothing about `project` at all. A *second* turn that answers
+    with a `project` again, this time with a `kind` this server does not recognise, must still move
+    `session["kind"]` off the stale `"video"` the first turn set -- otherwise it would go on
+    claiming `"video"` while `session["project"]["kind"]` says `"movie"`, a pair nothing downstream
+    (Task 6's project-creation route, the next turn's own `kind:` context line) could trust.
+
+    I4 (final review): the merge itself (`session["project"]` no longer overwritten wholesale, see
+    the I4 tests below) means `scenes` -- `null` in this turn's own `bad_project`, non-empty from
+    the first turn -- survives onto the merged result; only `kind` (a real, non-`None` value both
+    times) actually changes.
+    """
+    payload = _turn_with_project(_VIDEO_PROJECT)
+    fake = _FakeLlama(chat_payload=payload)
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "ролик", "prompt": ""})
+        assert srv.get_json(f"/api/chat/{sid}")["kind"] == "video"
+
+        bad_project = {"kind": "movie", "scenes": None, "lyrics": None, "caption": None}
+        payload.clear()
+        payload.update(_turn_with_project(bad_project))
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "ещё", "prompt": ""})
+
+        saved = srv.get_json(f"/api/chat/{sid}")
+        assert saved["project"] == {**_VIDEO_PROJECT, "kind": "movie"}
+        assert "kind" not in saved, "session['kind'] must not keep claiming a stale 'video'"
+    finally:
+        fake.close()
+
+
+@pytest.mark.parametrize("project", [
+    42, "video", ["video"],
+    {"kind": "movie", "scenes": None, "lyrics": None, "caption": None},  # `kind` вне списка
+])
+def test_a_malformed_or_unrecognised_project_is_handled_without_a_502(_serve, project):
+    """A provider outside `response_format`'s reach can send anything for `project`, the same
+    situation `slug`'s own malformed-value test covers. A `dict` is still saved verbatim (a
+    session on disk should keep whatever the model actually said, even a `kind` this server does
+    not recognise yet), but only a `kind` inside `h3_48gb.project.PROJECT_KINDS` ever becomes the
+    session's own top-level `kind` -- and anything that is not even a `dict` is treated as if the
+    turn had said nothing about a project at all.
+    """
+    fake = _FakeLlama(chat_payload=_turn_with_project(project))
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        status, answer = srv.post_json_raw(f"/api/chat/{sid}/message",
+                                           {"text": "х", "prompt": ""})
+        assert status == 200, answer
+        saved = srv.get_json(f"/api/chat/{sid}")
+        if isinstance(project, dict):
+            assert answer["project"] == project
+            assert saved["project"] == project
+            assert "kind" not in saved
+        else:
+            assert answer["project"] is None
+            assert "project" not in saved
+            assert "kind" not in saved
+    finally:
+        fake.close()
+
+
+# -- I4 (final review): a later turn's `project` merges, never clobbers -------------------------
+
+
+def test_a_later_turns_null_scenes_do_not_erase_the_first_turns_scenario(_serve):
+    """The bug directly: a `kind="video"` project's scenario is built on turn 1 (`_VIDEO_PROJECT`,
+    non-empty `scenes`); an unrelated later turn -- the model still remembering the project, but
+    with nothing new to say about the scenario itself -- answers with `project.scenes: null`
+    (`PROMPT_SCHEMA`'s own valid shape for "not decided yet", indistinguishable on the wire from
+    "nothing new"). Before this fix, `session["project"] = project`'s own blind overwrite read the
+    second turn's `null` as "the scenario is now empty" and discarded the scenes a person had
+    already asked for and could no longer create a project from.
+    """
+    payload = _turn_with_project(_VIDEO_PROJECT)
+    fake = _FakeLlama(chat_payload=payload)
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "ролик", "prompt": ""})
+        assert srv.get_json(f"/api/chat/{sid}")["project"]["scenes"] == _VIDEO_PROJECT["scenes"]
+
+        later_turn = {"kind": "video", "scenes": None, "lyrics": None, "caption": None}
+        payload.clear()
+        payload.update(_turn_with_project(later_turn, reply="было что-то ещё?"))
+        answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "а что там с погодой", "prompt": ""})
+
+        assert answer["project"]["scenes"] == _VIDEO_PROJECT["scenes"], (
+            "a later turn's null scenes must not erase the scenario the first turn already wrote")
+        saved = srv.get_json(f"/api/chat/{sid}")
+        assert saved["project"]["scenes"] == _VIDEO_PROJECT["scenes"]
+        assert saved["kind"] == "video"
+    finally:
+        fake.close()
+
+
+def test_a_later_turns_real_scenes_still_replace_the_first_turns(_serve):
+    """The other half: a field this turn *does* send a real value for still wins -- the merge only
+    ever protects a field the model said nothing new about, never freezes the scenario in place."""
+    payload = _turn_with_project(_VIDEO_PROJECT)
+    fake = _FakeLlama(chat_payload=payload)
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "ролик", "prompt": ""})
+
+        revised_scenes = [{"prompt": "[Shot 1] a totally different scene", "duration": 6}]
+        revised = {"kind": "video", "scenes": revised_scenes, "lyrics": None, "caption": None}
+        payload.clear()
+        payload.update(_turn_with_project(revised, reply="переписал сцену"))
+        answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "перепиши", "prompt": ""})
+
+        assert answer["project"]["scenes"] == revised_scenes
+        saved = srv.get_json(f"/api/chat/{sid}")
+        assert saved["project"]["scenes"] == revised_scenes
+    finally:
+        fake.close()
+
+
+def test_an_ordinary_session_never_carries_a_kind_line_in_its_context(_serve, fake_llama):
+    """`_TURN` (every other chat test's default answer) carries no `project` -- an everyday
+    single-clip editing session must never grow a `kind:` line in its context just from existing;
+    the line only appears once a real turn has actually named one (see the test above)."""
+    srv = _serve(providers_port=fake_llama.port)
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "опиши", "prompt": "п"})
+    system = fake_llama.requests[-1]["body"]["messages"][0]["content"]
+    # The format doc itself talks *about* `kind` (its own `### kind: "video"` heading) -- only
+    # the `## Context` block this route appends is under test here.
+    context = system.split("## Context", 1)[1]
+    assert "\nkind:" not in context
+    assert "kind" not in srv.get_json(f"/api/chat/{sid}")
+
+
 # -- кадр --------------------------------------------------------------------------------------
 
 
@@ -1308,6 +1517,30 @@ def test_duplicating_an_unknown_job_is_a_named_404(_serve):
     status, answer = srv.post_json_raw("/api/jobs/does-not-exist/duplicate", None)
     assert status == 404, answer
     assert answer["error"]["code"] == "not_found", answer
+
+
+def test_duplicating_a_song_kind_job_is_refused_honestly(_serve):
+    """I3 (fix round 1, 2026-08-18 review): `_duplicate_job` used to call `q.submit` without
+    `kind=job.kind` at all, silently resubmitting a song/assemble job's `args`
+    (`["song", "--project", <path>]`) as an ordinary `generate` job -- nonsense the CLI would only
+    discover an hour later, inside the worker. What duplicating a song/assemble job *should* mean
+    (a fresh track dir? racing the same project?) is a decision task 6 has not made yet, so this
+    route refuses honestly instead of guessing, and leaves the source job exactly as it was.
+    """
+    srv = _serve()
+    project_path = srv.root / "projects" / "20260818-1200-my-song" / "project.json"
+    job = q.submit(srv.queue_root, ["song", "--project", str(project_path)], "заметка",
+                   {"output_stem": str(project_path.parent / "track" / "song")}, {},
+                   kind=q.KIND_SONG)
+
+    status, answer = srv.post_json_raw(f"/api/jobs/{job.id}/duplicate", None)
+    assert status == 409, answer
+    assert answer["error"]["code"] == "duplicate_unsupported_kind", answer
+
+    jobs, broken = q.scan(srv.queue_root)
+    assert broken == []
+    assert [row.state for row in jobs] == ["pending"], "the refusal must not touch the source job"
+    assert jobs[0].id == job.id
 
 
 def test_duplicating_a_job_with_a_prompt_file_gets_its_own_snapshot_not_the_sources(_serve):

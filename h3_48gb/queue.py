@@ -46,6 +46,23 @@ from pathlib import Path
 #: which is also the order a human would want to see them listed in.
 QUEUE_STATES = ("pending", "running", "done", "failed")
 
+#: `Job.kind` -- what the worker actually does with a claimed job (task 3, "Проекты"):
+#: `KIND_GENERATE` spawns `h3 generate` as a subprocess, exactly as every job did before this field
+#: existed (see `Job.kind`'s own docstring for why that is also the default). `KIND_SONG` and
+#: `KIND_ASSEMBLE` are run in-process by `h3_48gb.worker` -- `h3_48gb.songrun.run_song`/
+#: `align_track` and `h3_48gb.assemble.run` (task 4) respectively -- never as a subprocess of this
+#: package's own CLI, because neither needs `generate`'s dry-run/canvas/output-stem machinery and
+#: both already isolate their own heavy lifting (Music3, ffmpeg, `mlx_whisper`) behind their own
+#: subprocess calls, in Music3's *separate* virtualenv.
+KIND_GENERATE = "generate"
+KIND_SONG = "song"
+KIND_ASSEMBLE = "assemble"
+
+#: Every `Job.kind` this module and the worker know about. `submit` refuses anything else -- a
+#: caller with a typo'd kind should see `QueueError` at submission time, not a job that sits in
+#: `pending/` forever because nothing claims to know how to run it.
+JOB_KINDS = (KIND_GENERATE, KIND_SONG, KIND_ASSEMBLE)
+
 #: Every suffix a finished (or half-finished) run can leave next to `output_stem`. A stale `.wav`
 #: or `.json` from a killed run claims the name just as surely as a `.mp4` does -- the next attempt
 #: at that name would overwrite it just the same -- so a stem check that only looked at `.mp4`
@@ -112,6 +129,15 @@ class Job:
     prompt_sha256: str | None
     output_stem: str
     estimate: dict
+    #: Task 3 ("Проекты"): which of `JOB_KINDS` this job is, defaulting to `KIND_GENERATE`. The
+    #: default is not a policy choice -- it is what makes reading an old job file written before
+    #: this field existed work at all: `Job(**data)` (`_job_from_file`/`_build_job`) fills in
+    #: `"generate"` for any `pending/`, `running/`, `done/` or `failed/` file on disk that predates
+    #: this field, exactly what every one of them in fact was. Every explicit `Job(...)`
+    #: construction elsewhere in this module (`submit`, `update`) passes `kind` itself rather than
+    #: relying on this default, so it is only ever *read* here, never silently reintroduced by a
+    #: caller editing a song/assemble job.
+    kind: str = KIND_GENERATE
     priority: int = 0
     started_at: str | None = None
     finished_at: str | None = None
@@ -573,14 +599,56 @@ def _stem_taken(root: Path, output_stem: str, exclude_id: str | None = None) -> 
     return False
 
 
+def _validate_args_shape_for_kind(kind: str, args: list[str]) -> None:
+    """M4 (fix round 1, 2026-08-18 review): refuse a `kind`/`args` mismatch honestly, at `submit`
+    time, rather than letting it sit in `pending/` and fail only once the worker actually claims it
+    -- `_project_arg` (`worker.py`) raising `ValueError` for a `kind="song"` job with no `--project`
+    token, or a `kind="generate"` job whose `args` happen to start with `"song"`/`"assemble"` being
+    handed to `h3 generate` as nonsense positional arguments, are both mistakes a human made at
+    submission time and should be told about right then, not an hour later when the queue finally
+    reaches the job.
+
+    `kind="song"`/`"assemble"`: `args[0]` must equal `kind` and `"--project"` must appear somewhere
+    in `args` -- the exact shape task 3's brief requires (`["song", "--project", <path>]`/
+    `["assemble", "--project", <path>]`) and the only shape `_project_arg` can parse. `kind=
+    "generate"` (the default -- every caller before this validation existed): `args[0]` must *not*
+    be `"song"`/`"assemble"`, catching the mirror mistake -- song/assemble-shaped args submitted
+    without also setting `kind`, which would otherwise be handed to `h3 generate` as its own
+    subprocess argv and fail inside the CLI instead of at submission.
+    """
+    if kind in (KIND_SONG, KIND_ASSEMBLE):
+        if not args or args[0] != kind or "--project" not in args:
+            raise QueueError(
+                f"kind={kind!r} job args must look like [{kind!r}, '--project', <path>, ...], "
+                f"got {args!r}")
+    elif kind == KIND_GENERATE:
+        if args and args[0] in (KIND_SONG, KIND_ASSEMBLE):
+            raise QueueError(
+                f"kind=\"generate\" job args must not start with {args[0]!r} -- pass "
+                f"kind={args[0]!r} to submit() instead, got {args!r}")
+
+
 def submit(root, args: list[str], note: str, dry_run_report: dict, estimate: dict,
-           prompt_source: str | None = None, prompt_text: str | None = None, now=None) -> Job:
+           prompt_source: str | None = None, prompt_text: str | None = None, now=None,
+           kind: str = KIND_GENERATE) -> Job:
     """Queue a new job in `pending/` and return it.
 
     `output_stem` comes **only** from `dry_run_report["output_stem"]`. The queue does not accept an
     output name from any other source: with `--image`, the canvas size that decides the name is
     computed by code that pulls in `mlx`, so `generate --dry-run` -- the CLI itself -- is the only
     thing that ever actually knows it.
+
+    `kind` (task 3, `JOB_KINDS`) defaults to `KIND_GENERATE`, matching every job queued before this
+    parameter existed. **Only a `KIND_GENERATE` job is relocated into its own output subdirectory**
+    (`_relocate_to_job_subdir`, below): that rewrite edits `--outdir` in `args`, a flag `generate`
+    alone understands -- a `KIND_SONG`/`KIND_ASSEMBLE` job's `args` is `["song", "--project",
+    <path>]`/`["assemble", "--project", <path>]` (task 3's brief, verbatim), no `--outdir` token to
+    rewrite and no canvas-shaped output file for one to name; relocating it anyway would silently
+    graft an `--outdir` flag onto an argument list the worker's in-process song/assemble dispatch
+    (`h3_48gb.worker`) never expects and does not parse. For those kinds `dry_run_report` still
+    supplies `output_stem` -- used only for `_stem_taken`'s conflict check, e.g. a caller naming a
+    project's own track directory so two song jobs for the same project cannot both be pending at
+    once -- but the caller's own `args` and `output_stem` otherwise pass straight through unchanged.
 
     If `prompt_text` is given, `submit` -- not the caller -- snapshots it to `queue/prompts/<id>.txt`
     and repoints `--prompt-file` in `args` at that copy, so a prompt file edited after queueing runs
@@ -607,6 +675,10 @@ def submit(root, args: list[str], note: str, dry_run_report: dict, estimate: dic
     `output_stem` conflict check, so what is actually checked -- and actually stored -- is the path
     the run will actually write, subdirectory included.
     """
+    if kind not in JOB_KINDS:
+        raise QueueError(f"unknown job kind {kind!r}, expected one of {JOB_KINDS}")
+    _validate_args_shape_for_kind(kind, args)
+
     root = Path(root)
     layout(root)
     output_stem = str(dry_run_report["output_stem"])
@@ -624,7 +696,8 @@ def submit(root, args: list[str], note: str, dry_run_report: dict, estimate: dic
                 )
 
         created_at = now() if now is not None else _now()
-        args, output_stem = _relocate_to_job_subdir(root, args, output_stem, created_at)
+        if kind == KIND_GENERATE:
+            args, output_stem = _relocate_to_job_subdir(root, args, output_stem, created_at)
 
         if _stem_taken(root, output_stem):
             raise OutputStemConflict(output_stem)
@@ -655,7 +728,7 @@ def submit(root, args: list[str], note: str, dry_run_report: dict, estimate: dic
             job = Job(
                 id=job_id, state="pending", created_at=created_at, args=args, note=note,
                 prompt_source=prompt_source, prompt_sha256=prompt_sha256,
-                output_stem=output_stem, estimate=dict(estimate), priority=0,
+                output_stem=output_stem, estimate=dict(estimate), kind=kind, priority=0,
                 started_at=None, finished_at=None, exit_code=None, log_tail=None,
             )
             write_json_durably(path, _job_file_payload(job))
@@ -1154,7 +1227,8 @@ def update(root, job_id: str, args: list[str], note: str, dry_run_report: dict, 
         job = Job(
             id=current.id, state="pending", created_at=current.created_at, args=args, note=note,
             prompt_source=new_prompt_source, prompt_sha256=new_prompt_sha256,
-            output_stem=output_stem, estimate=dict(estimate), priority=current.priority,
+            output_stem=output_stem, estimate=dict(estimate), kind=current.kind,
+            priority=current.priority,
             started_at=current.started_at, finished_at=current.finished_at,
             exit_code=current.exit_code, log_tail=current.log_tail,
         )
