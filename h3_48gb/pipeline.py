@@ -44,7 +44,7 @@ from minimax_h3_mlx.config import DiTConfig, PipelineConfig
 from minimax_h3_mlx.packing import PIXEL_MEAN, PIXEL_STD, unpatchify_video_tokens
 from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
 
-from . import memory
+from . import framecheck, memory
 from .adaln import AdaLNCacheFile, ScheduleMismatch
 from .checkpoint import CheckpointingPipeline, pop_checkpoint_kwargs, weights_fingerprint
 from .dit import load_dit_cached
@@ -208,6 +208,35 @@ class LazyTextEncoder(LazyComponent):
         if self._unload_after_encode:
             self.unload()
         return hidden_states, token_tags
+
+
+def _validate_decoded_frames(frames: np.ndarray) -> None:
+    """Raise `framecheck.CorruptFramesError` if any frame in `frames` (F, H, W, 3) uint8 trips
+    `framecheck`'s zero-fill/tile-seam corruption detectors.
+
+    P0 fix for боевые ворота 2026-08-19's root cause (see `framecheck`'s own module docstring):
+    `patches/0003-vae-decode-eval.patch` bounds `VideoVAE.decode`'s lazy graph, which should make
+    the corruption this catches unreachable in practice — but a decode is expensive (minutes) and
+    feeds a scene chain (`h3_48gb.assemble`) a silently-corrupt keyframe would poison, so this
+    stays as defense in depth rather than a redundant check to delete once the patch lands.
+    Costs ~2.3 s per clip (measured by the investigation), against a decode that runs minutes.
+
+    A caught failure here means the job goes to `failed/` (the existing job-failure path already
+    does this for any raised exception — see `h3_48gb.worker`), not a corrupt video written to
+    disk and fed silently into the next scene.
+    """
+    bad = framecheck.find_corrupt_frames(frames)
+    if not bad:
+        return
+    indices = ", ".join(str(b.index) for b in bad[:20])
+    more = "" if len(bad) <= 20 else f" (+{len(bad) - 20} more)"
+    kinds = sorted({("zero-fill" if b.zero_fill else "tile-seam") for b in bad})
+    raise framecheck.CorruptFramesError(
+        f"{len(bad)} of {frames.shape[0]} decoded frames failed corruption validation "
+        f"({'/'.join(kinds)}): frame indices {indices}{more}. This clip cannot be trusted for "
+        "output or for chaining the next scene off a keyframe -- failing the job rather than "
+        "emitting a corrupt video."
+    )
 
 
 # -- the pipeline ------------------------------------------------------------------------------
@@ -390,6 +419,15 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         std = mx.array(np.array(cfg.latents_std, np.float32)).reshape(1, -1, 1, 1, 1)
         latents = latents * std + mean
 
+        if not vae_decode_eval_patch_applied():
+            raise RuntimeError(
+                "`upstream/minimax_h3_mlx/video_vae.py` has no per-tile/per-chunk `mx.eval` in "
+                "`VideoVAE._decode_clip`/`decode`, so patches/0003-vae-decode-eval.patch is not "
+                "applied to this checkout. Apply it (`git -C upstream apply "
+                "../patches/0003-vae-decode-eval.patch`, see README) before decoding -- an "
+                "unbounded decode graph can non-deterministically leave a tile unwritten or "
+                "corrupt a tile seam under allocator pressure (боевые ворота 2026-08-19)."
+            )
         frames = self.video_vae.decode(latents.astype(mx.float32))
         # The VAE decodes into ImageNet-normalized RGB over a [0, 1] base range.
         pixel_mean = mx.array(np.array(PIXEL_MEAN, np.float32)).reshape(1, 3, 1, 1, 1)
@@ -400,7 +438,9 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         # both still lazy, both still on the MLX side of the `np.array()` barrier below.
         frames = (frames * 255.0 + 0.5).astype(mx.uint8)
         frames = frames[0].transpose(1, 2, 3, 0)  # -> (F, H, W, 3)
-        return np.array(frames)
+        frames = np.array(frames)
+        _validate_decoded_frames(frames)
+        return frames
 
     def _decode_audio(self, rows, *args, **kwargs):
         """Release the video VAE before the audio VAE loads — they are never needed together."""
@@ -639,6 +679,39 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
             dit, self, every, stem, n_cond_v, num_latent_frames, latent_height, latent_width,
             patch_size, verbose=bool(arguments.get("verbose", True)), decoder=decoder,
         )
+
+
+def vae_decode_eval_patch_applied(tile_source: str | None = None, chunk_source: str | None = None) -> bool:
+    """Whether the vendored `upstream/` carries `patches/0003-vae-decode-eval.patch`.
+
+    Same discipline as `h3_48gb.dit.attention_levers_patch_applied` /
+    `h3_48gb.text_encoder.keyframe_scatter_patch_applied`, but textual like the latter rather than
+    structural like the former: patch 0003 inserts `mx.eval` statements into two *existing*
+    methods (`VideoVAE._decode_clip`, `VideoVAE.decode`) instead of adding a new one, so there is
+    no new attribute for `hasattr` to find. Reads the live source of both methods, strips comment
+    lines first (the patch quotes the very lines it replaces, which would otherwise fool a naive
+    substring search — the same trap `keyframe_scatter_patch_applied`'s own docstring documents),
+    and requires each method to carry its own materialization call.
+
+    `tile_source`/`chunk_source` override the two methods' live source, the same seam
+    `keyframe_scatter_patch_applied`'s own `source` parameter provides — what lets a test assert
+    the detector's own behaviour against known patched/unpatched text without needing to flip
+    `upstream/`'s checkout back and forth.
+    """
+    import inspect
+
+    def has_marker(source: str, marker: str) -> bool:
+        code = [line for line in source.splitlines() if not line.lstrip().startswith("#")]
+        return any(marker in line for line in code)
+
+    if tile_source is None or chunk_source is None:
+        from minimax_h3_mlx.video_vae import VideoVAE
+
+        if tile_source is None:
+            tile_source = inspect.getsource(VideoVAE._decode_clip)
+        if chunk_source is None:
+            chunk_source = inspect.getsource(VideoVAE.decode)
+    return has_marker(tile_source, "mx.eval(decoded_tile)") and has_marker(chunk_source, "mx.eval(chunk)")
 
 
 def _load_video_vae(model_dir: Path):

@@ -21,6 +21,11 @@ from h3_48gb import queue as q
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+#: Captured before any test monkeypatches `assemble._frame_is_corrupt` (see the module-scoped
+#: `_frame_is_corrupt_default` autouse fixture below) -- the two tests that drive `run=subprocess.
+#: run` end to end restore this so they still exercise the real seam-check, not the default mock.
+_REAL_FRAME_IS_CORRUPT = assemble._frame_is_corrupt
+
 
 # -- fakes -----------------------------------------------------------------------------------------
 
@@ -59,8 +64,12 @@ class _FakeRun:
 
     def __call__(self, cmd, capture_output=True, text=True):
         self.calls.append(list(cmd))
-        if cmd[0] == "ffprobe" and "-select_streams" in cmd:
+        if cmd[0] == "ffprobe" and "stream=index" in cmd:
             return _FakeResult(0, stdout="0\n")  # "has an audio stream", by default
+        if cmd[0] == "ffprobe" and "stream=r_frame_rate" in cmd:
+            return _FakeResult(0, stdout="24/1\n")  # `_probe_frame_rate`'s own default answer
+        if cmd[0] == "ffprobe" and "stream=width,height" in cmd:
+            return _FakeResult(0, stdout="64x64\n")  # `_read_frame_rgb`'s own geometry probe
         if cmd[0] == "ffprobe":
             duration = self._ffprobe_durations.pop(0) if self._ffprobe_durations else 0.0
             return _FakeResult(0, stdout=f"{duration}\n")
@@ -68,6 +77,12 @@ class _FakeRun:
             return _FakeResult(0, stdout="lavfi.signalstats.YLOW=10\n"
                                           "lavfi.signalstats.YHIGH=200\n")
         return _FakeResult(0, stdout="", stderr="")
+
+
+#: `_frame_is_corrupt`'s "never corrupt" default (`tests/conftest.py`'s own autouse fixture) is
+#: project-wide, not local to this file -- `_extract_keyframe` is reachable through the worker and
+#: web layers too (`test_worker.py`, `test_web_projects.py`), which have their own scripted `spawn`
+#: fakes that need the same default.
 
 
 def _make_scene(idx, *, status="done", clip_path=None, prompt="a scene", duration=5.0,
@@ -380,8 +395,12 @@ class _FlatTailFakeRun(_FakeRun):
             low, high = self._spreads.pop(0)
             return _FakeResult(0, stdout=f"lavfi.signalstats.YLOW={low}\n"
                                           f"lavfi.signalstats.YHIGH={high}\n")
-        if cmd[0] == "ffprobe" and "-select_streams" in cmd:
+        if cmd[0] == "ffprobe" and "stream=index" in cmd:
             return _FakeResult(0, stdout="0\n")
+        if cmd[0] == "ffprobe" and "stream=r_frame_rate" in cmd:
+            return _FakeResult(0, stdout="24/1\n")
+        if cmd[0] == "ffprobe" and "stream=width,height" in cmd:
+            return _FakeResult(0, stdout="64x64\n")
         if cmd[0] == "ffprobe":
             duration = self._ffprobe_durations.pop(0) if self._ffprobe_durations else 0.0
             return _FakeResult(0, stdout=f"{duration}\n")
@@ -435,6 +454,48 @@ def test_extract_valid_last_frame_takes_the_literal_last_frame_when_it_is_alread
     extraction_calls = [c for c in fake.calls if "reverse" in " ".join(c)]
     assert len(extraction_calls) == 1
     assert "select=eq(n\\,0)" in " ".join(extraction_calls[0])
+
+
+# -- P0 (боевые ворота 2026-08-19): freeze-frame source must also clear the seam check -----------
+
+
+def test_extract_valid_last_frame_steps_past_a_seam_corrupt_candidate_with_fine_luma(
+        tmp_path, monkeypatch):
+    """The exact failure mode the investigation found in scene 4: a candidate with a perfectly
+    reasonable luma spread (166.6, nowhere near flat) that is still `framecheck`-corrupt (a
+    tile-seam artifact, not a blank frame). `_frame_luma_spread` alone would have accepted it on
+    the first try -- the seam check is a second, independent criterion, and both must pass.
+    """
+    seam_corrupt_then_clean = iter([True, False])
+    monkeypatch.setattr(assemble, "_frame_is_corrupt",
+                         lambda *a, **k: next(seam_corrupt_then_clean))
+    fake = _FlatTailFakeRun(spreads=[(10, 176.6), (10, 200)])  # both pass luma; only the 2nd is clean
+    out_path = tmp_path / "chosen.png"
+
+    assemble._extract_valid_last_frame(tmp_path / "clip.mp4", out_path, run=fake)
+
+    extraction_calls = [c for c in fake.calls if "reverse" in " ".join(c)]
+    assert len(extraction_calls) == 2, "must not stop at the luma-only-valid first candidate"
+    assert "select=eq(n\\,1)" in " ".join(extraction_calls[-1])  # n=2 frames back -> k=1
+
+
+def test_extract_valid_last_frame_falls_back_when_all_24_pass_luma_but_fail_the_seam_check(
+        tmp_path, monkeypatch, capsys):
+    """Every candidate in the lookback window has a fine luma spread but is seam-corrupt: the
+    fallback (literal last frame, warning logged) must still fire, matching the all-flat case's own
+    contract -- the caller has no better frame to reach for either way.
+    """
+    monkeypatch.setattr(assemble, "_frame_is_corrupt", lambda *a, **k: True)
+    fake = _FlatTailFakeRun(spreads=[(10, 200)] * 24)
+    out_path = tmp_path / "chosen.png"
+
+    assemble._extract_valid_last_frame(tmp_path / "clip.mp4", out_path, run=fake)
+
+    extraction_calls = [c for c in fake.calls if "reverse" in " ".join(c)]
+    assert len(extraction_calls) == 25
+    assert "select=eq(n\\,0)" in " ".join(extraction_calls[-1])
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
 
 
 # -- run(): direct-cut concat only -- no scene-transition filters anywhere -----------------------
@@ -686,6 +747,74 @@ def test_advance_project_keyframe_timestamp_floors_at_zero_for_a_short_clip(tmp_
     assert keyframe_calls[0][keyframe_calls[0].index("-ss") + 1] == "0.000"
 
 
+# -- P0 (боевые ворота 2026-08-19): automatic keyframe must be seam/zero-fill checked ------------
+
+
+def test_extract_keyframe_steps_back_past_corrupt_candidates(tmp_path, monkeypatch):
+    """The candidate at `dur - KEYFRAME_LEAD_SECONDS` reads corrupt (mocked): must step backward
+    one frame at a time (24 fps -> 1/24 s per step) until a clean candidate is found, and return
+    *that* frame -- not the first, damaged one.
+    """
+    corrupt_then_clean = iter([True, True, False])
+    monkeypatch.setattr(assemble, "_frame_is_corrupt",
+                         lambda *a, **k: next(corrupt_then_clean))
+    clip = tmp_path / "scene0.mp4"
+    clip.write_bytes(b"fake mp4")
+    fake_run = _FakeRun(ffprobe_durations=[6.0])  # keyframe target: max(0, 6-1.5) = 4.5
+
+    out_path = assemble._extract_keyframe(clip, tmp_path / "keyframes", 0, run=fake_run)
+
+    assert out_path.name == "keyframe-000.png"
+    seek_calls = [c for c in fake_run.calls if "-ss" in c]
+    assert len(seek_calls) == 3, "must try exactly 3 candidates: 2 corrupt, then the clean one"
+    timestamps = [c[c.index("-ss") + 1] for c in seek_calls]
+    assert timestamps[0] == "4.500"
+    assert timestamps[1] == f"{4.5 - 1 / 24:.3f}"
+    assert timestamps[2] == f"{4.5 - 2 / 24:.3f}"
+
+
+def test_extract_keyframe_raises_when_every_candidate_is_corrupt(tmp_path, monkeypatch):
+    """Task brief: all corrupt in the lookback window means the scene chain fails honestly rather
+    than chaining the next scene off a keyframe known to be damaged.
+    """
+    monkeypatch.setattr(assemble, "_frame_is_corrupt", lambda *a, **k: True)
+    clip = tmp_path / "scene0.mp4"
+    clip.write_bytes(b"fake mp4")
+    fake_run = _FakeRun(ffprobe_durations=[6.0])
+
+    with pytest.raises(assemble.AssembleError, match="corrupt"):
+        assemble._extract_keyframe(clip, tmp_path / "keyframes", 0, run=fake_run)
+
+    seek_calls = [c for c in fake_run.calls if "-ss" in c]
+    assert len(seek_calls) == assemble._KEYFRAME_SEAM_MAX_LOOKBACK_FRAMES
+
+
+def test_advance_project_fails_the_scene_when_the_keyframe_is_always_corrupt(tmp_path, monkeypatch):
+    """End to end through `advance_project`/`_submit_next_scene`: a keyframe that never clears
+    corruption validation must roll the scene claim back to `"pending"` (the existing `except
+    Exception` rollback in `_submit_next_scene`) rather than leaving it stuck `"running"` under a
+    placeholder job id, and must not call `submit` at all.
+    """
+    monkeypatch.setattr(assemble, "_frame_is_corrupt", lambda *a, **k: True)
+    clip = tmp_path / "scene0.mp4"
+    clip.write_bytes(b"fake mp4")
+    proj = _make_project(tmp_path, "video", scenes=[
+        _make_scene(0, status="done", clip_path=str(clip)),
+        _make_scene(1, status="pending"),
+    ])
+    submit = _RecordingSubmit()
+    fake_run = _FakeRun(ffprobe_durations=[6.0])
+
+    with pytest.raises(assemble.AssembleError, match="corrupt"):
+        assemble.advance_project(proj, tmp_path / "queue", tmp_path / "out", submit=submit,
+                                  run=fake_run)
+
+    assert submit.calls == []
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.scenes[1]["status"] == "pending"
+    assert reloaded.scenes[1]["job_id"] is None
+
+
 def test_advance_project_stops_and_marks_scenes_failed_without_submitting_anything(tmp_path):
     proj = _make_project(tmp_path, "video", scenes=[
         _make_scene(0, status="done", clip_path=str(tmp_path / "a.mp4")),
@@ -931,7 +1060,7 @@ def _real_ffprobe_duration(path: Path) -> float:
     return float(result.stdout.strip())
 
 
-def test_run_concats_pads_and_replaces_audio_on_a_real_ffmpeg_synthesis(tmp_path):
+def test_run_concats_pads_and_replaces_audio_on_a_real_ffmpeg_synthesis(tmp_path, monkeypatch):
     """The brief's own required real test: two tiny lavfi clips (1 s each, so the concatenated
     video is short against a longer sine "track") get concatenated, freeze-frame padded to the
     track's duration, and muxed with the track audio -- verified end to end with real `ffmpeg`/
@@ -940,6 +1069,7 @@ def test_run_concats_pads_and_replaces_audio_on_a_real_ffmpeg_synthesis(tmp_path
     This project already has a chaining scene (idx=1, `clip1`) -- P0-2's own frame-0 drop (`_build_
     video_clip_paths`) runs for real here too, on the way to the same final assertions.
     """
+    monkeypatch.setattr(assemble, "_frame_is_corrupt", _REAL_FRAME_IS_CORRUPT)
     clip0 = tmp_path / "clip0.mp4"
     clip1 = tmp_path / "clip1.mp4"
     _make_lavfi_clip(clip0, 1.0, "red")
@@ -1008,11 +1138,12 @@ def test_build_video_clip_paths_drops_frame_zero_of_chaining_scenes_on_real_ffmp
     assert frame_count(paths[2]) == 23, "scene 2 chains off scene 1 -- frame 0 dropped"
 
 
-def test_extract_valid_last_frame_skips_a_real_grey_tail(tmp_path):
+def test_extract_valid_last_frame_skips_a_real_grey_tail(tmp_path, monkeypatch):
     """P1-3 (боевые ворота 2026-08-19), the task brief's own required synthetic case: a clip whose
     last 3 frames are a flat grey fill -- `_extract_valid_last_frame` must land on an earlier frame
     that still has real picture content, not the grey fill the failing gate's freeze pad grabbed.
     """
+    monkeypatch.setattr(assemble, "_frame_is_corrupt", _REAL_FRAME_IS_CORRUPT)
     clip = tmp_path / "grey_tail.mp4"
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error",
@@ -1035,11 +1166,12 @@ def test_extract_valid_last_frame_skips_a_real_grey_tail(tmp_path):
         assemble._FREEZE_FRAME_LUMA_SPREAD_THRESHOLD
 
 
-def test_run_freeze_pads_with_a_valid_frame_when_the_clip_ends_on_a_grey_tail(tmp_path):
+def test_run_freeze_pads_with_a_valid_frame_when_the_clip_ends_on_a_grey_tail(tmp_path, monkeypatch):
     """End-to-end P1-3: a clip that needs freeze-frame padding (it is short against the track) but
     ends on a flat grey tail -- the padded region must hold the earlier, valid frame, not the grey
     fill stretched out (the exact defect the failing gate's own clip 0 landed on).
     """
+    monkeypatch.setattr(assemble, "_frame_is_corrupt", _REAL_FRAME_IS_CORRUPT)
     clip0 = tmp_path / "grey_tail.mp4"
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error",

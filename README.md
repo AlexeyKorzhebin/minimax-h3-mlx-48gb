@@ -32,17 +32,25 @@ different instruments, and the honest version of that is in
 [`docs/RESULTS.md`](docs/RESULTS.md)** — including the fact that the RSS trace never sampled the
 encoding phase at all, so the 28.2 GB and the 11.5 GB were never observed by the same tool.
 
-## The four modules, and the two source patches
+## The four modules, and the three source patches
 
 Everything this fork adds lives in `h3_48gb/`, applied to upstream from the outside — the four
 modules below. `upstream/` itself is a vendored clone, pinned to commit `fcd9e9b`, and carries
-exactly two source edits, both applied during setup below:
+exactly three source edits, all applied during setup below:
 
 * `patches/0001-keyframe-masked-scatter.patch`, without which keyframe runs die inside the text
   encoder. Text-only runs never reach it.
 * `patches/0002-attention-memory-levers.patch`, four bit-identical rewrites of the DiT's Q/K/V and
   MLP staging. Measured worth: 8.65 GB off the peak of a 15 s native forward, 4.92 GB at 10 s (see
   `docs/RESULTS.md`, "Attention memory levers"). Nothing about the outputs changes.
+* `patches/0003-vae-decode-eval.patch`, a bit-identical `mx.eval` after every VAE decode tile and
+  chunk. Without it, `VideoVAE.decode` chains up to 195 ViT-decoder forwards into a single lazy
+  graph and materializes all of it in one `np.array()` call at the very end — under allocator
+  pressure, a fraction of that graph's tiles could come back as an unwritten (zero) or garbled
+  buffer instead of what was actually computed, non-deterministically (боевые ворота 2026-08-19's
+  root cause: corrupted keyframes and tile-seam blocking in generated clips). `h3_48gb.framecheck`
+  is defense in depth on top of this — every decoded clip, automatic keyframe and freeze-frame pad
+  is still checked for the two symptoms before it is trusted.
 
 Patching from the outside keeps the two trees separable, but the pin is not optional: this fork
 rebinds `FinalLayer.__class__`, binds `inspect.signature(MiniMaxH3Pipeline.__call__)` in three
@@ -115,6 +123,12 @@ git -C upstream apply ../patches/0001-keyframe-masked-scatter.patch
 #    `load_dit_cached` splits the fused QKV by default and will refuse with a message naming this
 #    command, so an unpatched checkout must pass `split_qkv=False`.
 git -C upstream apply ../patches/0002-attention-memory-levers.patch
+
+#    The third patch bounds the video VAE decode's lazy graph with a bit-identical `mx.eval` per
+#    tile and per chunk (боевые ворота 2026-08-19: an unbounded ~195-forward graph could
+#    non-deterministically corrupt a tile under allocator pressure). `LazyMiniMaxH3Pipeline._decode_
+#    video` refuses to decode on an unpatched checkout with a message naming this command.
+git -C upstream apply ../patches/0003-vae-decode-eval.patch
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 ./.venv/bin/pip install -e .   # installs the `h3` console script

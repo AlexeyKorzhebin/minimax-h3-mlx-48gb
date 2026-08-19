@@ -1680,11 +1680,28 @@ def _scene_hook_spawn(*, generate_returncode=0, ffprobe_duration=5.0):
     """A `spawn` covering every shape this hook's own machinery needs: `job_command`'s top-level
     generate subprocess (`.wait()`-based), and `_tracked_child_run`'s ffprobe/ffmpeg calls inside
     `advance_project`'s own keyframe extraction (`.communicate()`-based) -- dispatched by `cmd[0]`.
+
+    P0 fix (боевые ворота 2026-08-19): `_extract_keyframe` now also probes the source clip's frame
+    rate (`stream=r_frame_rate`, for its own backward-stepping lookback) and, when the seam check
+    itself is not mocked away, the extracted frame's geometry (`stream=width,height`) -- every one
+    of those used to collapse onto the single `ffprobe_duration` answer this fake originally gave
+    every `ffprobe` call regardless of what it actually asked for, which made `_probe_frame_rate`
+    try to split `"5.0"` on `"/"` and fail. `tests/conftest.py`'s own autouse fixture defaults
+    `assemble._frame_is_corrupt` to "never corrupt" project-wide, so the geometry/raw-pixel probes
+    `_read_frame_rgb` would otherwise need are not reached from here.
     """
 
     def spawn(cmd, **kw):
-        if cmd[0] in ("ffprobe", "ffmpeg"):
+        if cmd[0] == "ffprobe":
+            if "stream=r_frame_rate" in cmd:
+                return _FakeTrackedChild(returncode=0, stdout="24/1\n", stderr="")
+            if "stream=width,height" in cmd:
+                return _FakeTrackedChild(returncode=0, stdout="64x64\n", stderr="")
+            if "stream=index" in cmd:
+                return _FakeTrackedChild(returncode=0, stdout="0\n", stderr="")
             return _FakeTrackedChild(returncode=0, stdout=f"{ffprobe_duration}\n", stderr="")
+        if cmd[0] == "ffmpeg":
+            return _FakeTrackedChild(returncode=0, stdout="", stderr="")
         return _FakeGenerateProcess(returncode=generate_returncode)
 
     return spawn

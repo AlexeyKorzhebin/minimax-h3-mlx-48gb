@@ -61,6 +61,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
+
+from h3_48gb import framecheck
 from h3_48gb import project as project_module
 from h3_48gb import queue as q
 
@@ -134,6 +137,15 @@ _FREEZE_FRAME_LUMA_SPREAD_THRESHOLD = 6.0
 #: that clears `_FREEZE_FRAME_LUMA_SPREAD_THRESHOLD` before giving up and falling back to the
 #: literal last frame anyway (task brief: "все 24 плоские -- берём последний как раньше").
 _FREEZE_FRAME_MAX_LOOKBACK_FRAMES = 24
+
+#: P0 fix (боевые ворота 2026-08-19, chunk-recon investigation): how many frames `_extract_keyframe`
+#: is willing to step backward from its target timestamp (`dur - KEYFRAME_LEAD_SECONDS`) looking
+#: for a frame that clears `framecheck.is_frame_corrupt` before giving up. Same budget as
+#: `_FREEZE_FRAME_MAX_LOOKBACK_FRAMES` -- both are "how much of a clip's tail is worth searching
+#: before admitting nothing usable is there" -- kept as a separate constant because the two loops
+#: walk different things (frame *index* from the literal end there; a *timestamp* offset here) and
+#: nothing ties their budgets together conceptually.
+_KEYFRAME_SEAM_MAX_LOOKBACK_FRAMES = 24
 
 
 class AssembleError(RuntimeError):
@@ -332,6 +344,82 @@ def _frame_luma_spread(image_path, *, run) -> float:
     return float(high_match.group(1)) - float(low_match.group(1))
 
 
+def _probe_frame_rate(video_path, *, run) -> float:
+    """`video_path`'s own frames-per-second, for `_extract_keyframe`'s backward-stepping lookback
+    (it needs to convert "N frames earlier" into a `-ss` timestamp offset). Reads `r_frame_rate`
+    the same way `cli.probe_video` does for face-refine, but through this module's own
+    `ffprobe`/`run` plumbing rather than importing `cli` for one field -- consistent with the
+    module docstring's "no `mlx` import, ever" (`cli.py` is safe to import, but this keeps the
+    dependency surface the same as every other helper here).
+    """
+    result = _run_ffmpeg(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=r_frame_rate", "-of", "csv=p=0", str(video_path)],
+        run, f"ffprobe frame-rate ({video_path})")
+    raw = (result.stdout or "").strip()
+    try:
+        num, den = raw.split("/")
+        fps = float(num) / float(den)
+    except (ValueError, ZeroDivisionError) as exc:
+        raise AssembleError(
+            f"ffprobe produced an unparseable frame rate for {video_path}: {raw!r}") from exc
+    if fps <= 0:
+        raise AssembleError(f"ffprobe reported a non-positive frame rate for {video_path}: {raw!r}")
+    return fps
+
+
+def _read_frame_rgb(image_path, *, run, workdir: Path) -> np.ndarray:
+    """Decode a single still image (`_extract_keyframe`/`_extract_valid_last_frame`'s own extracted
+    PNG) into an (H, W, 3) uint8 array for `framecheck`'s corruption detectors.
+
+    Goes through another `ffmpeg` subprocess rather than a PIL/cv2 dependency -- matching this
+    module's own "everything through ffmpeg/ffprobe" discipline (module docstring: "No `mlx`
+    import, ever"). Writes the raw pixels to a scratch file next to `image_path` instead of
+    capturing them off stdout: every `run` call in this module goes through `_run_ffmpeg`, which
+    always passes `text=True`, and text-mode stdout capture would corrupt binary pixel data.
+    """
+    probe = _run_ffmpeg(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=width,height", "-of", "csv=p=0:s=x", str(image_path)],
+        run, f"ffprobe frame geometry ({image_path})")
+    dims = (probe.stdout or "").strip()
+    try:
+        width, height = (int(x) for x in dims.split("x"))
+    except ValueError as exc:
+        raise AssembleError(
+            f"ffprobe produced an unparseable geometry for {image_path}: {dims!r}") from exc
+
+    raw_path = workdir / f"{Path(image_path).stem}.rgb24"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(image_path),
+           "-f", "rawvideo", "-pix_fmt", "rgb24", str(raw_path)]
+    try:
+        _run_ffmpeg(cmd, run, f"ffmpeg raw-pixel decode ({image_path})")
+        data = raw_path.read_bytes()
+    finally:
+        raw_path.unlink(missing_ok=True)
+
+    expected = width * height * 3
+    if len(data) != expected:
+        raise AssembleError(
+            f"ffmpeg raw-pixel decode for {image_path} produced {len(data)} bytes, expected "
+            f"{expected} ({width}x{height}x3)")
+    return np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3)
+
+
+def _frame_is_corrupt(image_path, *, run, workdir: Path) -> bool:
+    """`framecheck.is_frame_corrupt` on the still image at `image_path` -- `_extract_keyframe`'s
+    and `_extract_valid_last_frame`'s own seam/zero-fill check, factored out to its own function so
+    a test can monkeypatch corruption detection directly. `_read_frame_rgb` needs a real decodable
+    image on disk (it shells out to `ffmpeg` for the raw pixels), which none of this module's
+    scripted `run` fakes provide -- `test_assemble.py`'s fakes answer `run` calls out of a script,
+    they never touch the filesystem -- so every test that does not care about this specific check
+    monkeypatches this function to a fixed answer instead of trying to fake pixel bytes through
+    `run`.
+    """
+    frame = _read_frame_rgb(image_path, run=run, workdir=workdir)
+    return framecheck.is_frame_corrupt(frame)
+
+
 def _extract_valid_last_frame(video_path, out_path: Path, *, run) -> Path:
     """P1-3 (боевые ворота 2026-08-19): the freeze-frame pad's own source frame, chosen for
     *validity* instead of blindly grabbing the literal last frame -- the failing gate's own clip
@@ -342,19 +430,29 @@ def _extract_valid_last_frame(video_path, out_path: Path, *, run) -> Path:
     extracting straight into `out_path` each try (a fresh `_extract_frame_at_lookback` call
     overwrites whatever the previous try left there -- no separate candidate file or python-level
     copy needed, since `out_path` already holds exactly the frame this returns the moment a try
-    clears `_FREEZE_FRAME_LUMA_SPREAD_THRESHOLD`). If every candidate in that window reads flat,
-    re-extracts the literal last frame (task brief: "все 24 плоские -- берём последний как раньше,
-    с warning в лог") -- padding with *something* the video already had beats refusing to assemble
-    at all, and this module's own caller (`run`) has no better fallback to reach for.
+    clears both criteria below). If every candidate in that window fails, re-extracts the literal
+    last frame (task brief: "все 24 плоские -- берём последний как раньше, с warning в лог") --
+    padding with *something* the video already had beats refusing to assemble at all, and this
+    module's own caller (`run`) has no better fallback to reach for.
+
+    P0 fix (боевые ворота 2026-08-19, chunk-recon investigation): a candidate must clear *two*
+    independent criteria now, not one. `_frame_luma_spread` alone only ever caught a flat, single-
+    colour fill; the gate that motivated this fix froze scene 4's tail off frame 207, which read as
+    a perfectly reasonable luma spread of 166.6 (nowhere near flat) while still being a
+    `framecheck.is_frame_corrupt` tile-seam corruption -- picture content on either side of a
+    garbled tile boundary, not a blank frame. Both checks must pass; either one failing means this
+    candidate is not "the video's own last good frame" and the loop tries the next one back.
     """
     for n in range(1, _FREEZE_FRAME_MAX_LOOKBACK_FRAMES + 1):
         _extract_frame_at_lookback(video_path, out_path, n, run=run)
-        if _frame_luma_spread(out_path, run=run) > _FREEZE_FRAME_LUMA_SPREAD_THRESHOLD:
+        if _frame_luma_spread(out_path, run=run) <= _FREEZE_FRAME_LUMA_SPREAD_THRESHOLD:
+            continue
+        if not _frame_is_corrupt(out_path, run=run, workdir=out_path.parent):
             return out_path
     print(f"WARNING: freeze-frame source for {video_path} -- all "
-          f"{_FREEZE_FRAME_MAX_LOOKBACK_FRAMES} frames from the tail read as a flat fill (luma "
-          f"spread <= {_FREEZE_FRAME_LUMA_SPREAD_THRESHOLD}) -- falling back to the literal last "
-          f"frame", file=sys.stderr, flush=True)
+          f"{_FREEZE_FRAME_MAX_LOOKBACK_FRAMES} frames from the tail read as a flat fill or a "
+          "tile-seam corruption -- falling back to the literal last frame",
+          file=sys.stderr, flush=True)
     _extract_frame_at_lookback(video_path, out_path, 1, run=run)
     return out_path
 
@@ -716,15 +814,37 @@ def _extract_keyframe(clip_path, dest_dir: Path, source_idx: int, *, run) -> Pat
     предпоследней секунды предыдущего клипа"; task brief: "посмотри длительность клипа ffprobe,
     время = max(0, dur-1.5)". Named after the scene it was pulled *from* (`source_idx`), not the
     one it will feed, so the file on disk documents its own provenance.
+
+    P0 fix (боевые ворота 2026-08-19, chunk-recon investigation): the un-validated version of this
+    function is exactly what let a corrupt frame poison a scene chain in the failing gate -- the
+    automatic keyframe at scene 0's own `dur - KEYFRAME_LEAD_SECONDS` landed inside a VAE tile-seam
+    corrupted region, and every scene chained off it inherited the damage. The candidate at that
+    timestamp is now checked with `framecheck.is_frame_corrupt`; a corrupt candidate steps back one
+    frame at a time (`_probe_frame_rate`'s own fps converted to a `-ss` offset), up to
+    `_KEYFRAME_SEAM_MAX_LOOKBACK_FRAMES` frames, the same "walk backward from a bad candidate"
+    shape as `_extract_valid_last_frame`. If every candidate in that window is corrupt, this raises
+    rather than returning a keyframe known to be bad -- `_submit_next_scene`'s own caller lets that
+    exception fail the scene job honestly (`failed/`, existing job-failure path) instead of
+    chaining the next scene off damage this function could see and silently passed through.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     duration = _ffprobe_duration(clip_path, run=run)
-    timestamp = max(0.0, duration - KEYFRAME_LEAD_SECONDS)
+    fps = _probe_frame_rate(clip_path, run=run)
+    base_timestamp = max(0.0, duration - KEYFRAME_LEAD_SECONDS)
     out_path = dest_dir / f"keyframe-{source_idx:03d}.png"
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{timestamp:.3f}", "-i", str(clip_path),
-           "-frames:v", "1", str(out_path)]
-    _run_ffmpeg(cmd, run, "ffmpeg keyframe extraction")
-    return out_path
+    for step in range(_KEYFRAME_SEAM_MAX_LOOKBACK_FRAMES):
+        timestamp = max(0.0, base_timestamp - step / fps)
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{timestamp:.3f}", "-i", str(clip_path),
+               "-frames:v", "1", str(out_path)]
+        _run_ffmpeg(cmd, run, "ffmpeg keyframe extraction")
+        if not _frame_is_corrupt(out_path, run=run, workdir=dest_dir):
+            return out_path
+    raise AssembleError(
+        f"automatic keyframe for the scene after {source_idx} failed corruption validation "
+        f"(zero-fill/tile-seam) at every candidate from t={base_timestamp:.3f}s back "
+        f"{_KEYFRAME_SEAM_MAX_LOOKBACK_FRAMES} frames in {clip_path} -- refusing to chain the next "
+        "scene off a corrupt keyframe."
+    )
 
 
 #: A placeholder `job_id` for `_submit_next_scene`'s own pre-claim (see its docstring, C1) --
