@@ -179,6 +179,11 @@ document teaches: the same three labelled fields (`integrated_multimodal_descrip
 `<d>[Language]...</d>` speech tags. Nothing about scenes changes that format — the only thing that
 changes is that you are now writing several of these prompts in a row instead of one.
 
+Do not put the i2v instruction line ("The first line, for image-conditioned modes", above) into a
+scene's own `prompt` — a scene is written before its own mode is decided (scene 1 runs `t2v`; every
+scene after it runs `i2v` off an automatic keyframe), and the pipeline adds that line itself, once
+it actually knows which scenes need it.
+
 **The visual bible.** Describe every character, the visual style, and the palette in *exactly the
 same words* in every single scene's `prompt` — not summarized, not referenced, not "same as
 before": copy a character's appearance sentence verbatim from scene 1's prompt into scene 2's,

@@ -101,7 +101,13 @@ PATH_FLAGS = {
 #: spelled. It also closes a hole nobody was looking for: `<outdir>/checkpoints` is the default
 #: `--checkpoint-dir`, so `/media/checkpoints/h3-*.safetensors` was serving multi-gigabyte resume
 #: weights through `read_bytes()`, whole, into this process's memory.
-MEDIA_SUFFIXES = frozenset({".mp4", ".jpg", ".jpeg", ".png", ".wav"})
+#:
+#: `.mp3` (C2, final review): a project's own track (`track.mastered_mp3`/`track.mp3`,
+#: `h3_48gb.songrun.SongResult`) is always an mp3, never the `.wav`/`.mp4` this allowlist already
+#: covered -- without it, `projectTrackStageHtml`'s own `<audio>` player (`webui/app.js`) built a
+#: `/media` URL that this route refused with `media_type_not_allowed`, and there was no way to
+#: listen to a track before approving it at all.
+MEDIA_SUFFIXES = frozenset({".mp4", ".jpg", ".jpeg", ".png", ".wav", ".mp3"})
 
 #: How long a browser may keep a file it got from `/media`, in seconds. A year -- the conventional
 #: "forever" of `immutable`, and the reason it is safe here is a property of the run directory
@@ -836,8 +842,90 @@ _GAP_SCENE_PROMPT = "инструментальная интерлюдия: {pro
 #: `build_clip_scenes` refuses rather than silently shipping an incomplete timeline. Tight --
 #: unlike `assemble.DURATION_TOLERANCE_SECONDS` (ffmpeg's own real-world drift), every number this
 #: function works with is pure arithmetic over `track["sections"]`'s own timestamps, so a mismatch
-#: here means a bug, not measurement noise.
+#: here means a bug, not measurement noise. Checked against the *raw* (pre-grid-snap) timeline only
+#: -- see `_snap_scene_durations`' own docstring for the separate, wider tolerance the *returned*
+#: (grid-snapped) durations are checked against.
 _COVERAGE_TOLERANCE_SECONDS = 0.05
+
+#: MiniMax-H3's own video frame grid, duplicated from `upstream.minimax_h3_mlx.packing`
+#: (`FPS`/`FRAMES_PER_CHUNK`/`LATENTS_PER_CHUNK`) rather than imported (C1, final review): that
+#: module -- like `h3_48gb.pipeline`, which reads it through `align_num_frames` -- imports
+#: `mlx.core` at module scope, and this module's own docstring ("No `mlx` import, ever ... not at
+#: import time and not while serving a request") forbids that even as a lazy, function-local import,
+#: since `build_clip_scenes` runs on the `approve/track` request path, not in the worker process.
+#: Three constants that describe the video VAE's own chunking, not anything this codebase controls
+#: -- duplication risks drift only if H3's own chunk shape ever changes, and `pipeline.py`'s own
+#: `FRAMES_PER_CHUNK`/`LATENTS_PER_CHUNK`/`FPS` (re-exported from the same upstream module) would
+#: have to change with it.
+_H3_FPS = 24
+_H3_FRAMES_PER_CHUNK = 17
+_H3_LATENTS_PER_CHUNK = 5
+
+
+def _grid_frames_at_or_below(frames: int) -> int:
+    """The largest H3-valid frame count (`17n + 5`) at or below `frames`, floored at the grid's own
+    minimum (`n=0`, i.e. `_H3_LATENTS_PER_CHUNK`) if `frames` is smaller than that."""
+    remainder = (frames - _H3_LATENTS_PER_CHUNK) % _H3_FRAMES_PER_CHUNK
+    candidate = frames - remainder
+    return candidate if candidate >= _H3_LATENTS_PER_CHUNK else _H3_LATENTS_PER_CHUNK
+
+
+def _grid_frames_at_or_above(frames: int) -> int:
+    """The smallest H3-valid frame count (`17n + 5`) at or above `frames`."""
+    below = _grid_frames_at_or_below(frames)
+    return below if below >= frames else below + _H3_FRAMES_PER_CHUNK
+
+
+def _snap_scene_duration(seconds: float, carry: float) -> tuple[float, float]:
+    """One scene's own duration, snapped onto H3's frame grid (C1, final review), and the leftover
+    `carry` the caller should fold into the *next* scene's own target.
+
+    **Why this exists at all:** a real `generate` job's duration is rounded *up* to the next
+    `17n + 5` frame count before generation ever starts (`align_num_frames`, called from both
+    `upstream.minimax_h3_mlx.pipeline.MiniMaxH3Pipeline.__call__` and `h3_48gb.pipeline`'s own
+    preview seam) -- every `build_clip_scenes` duration that does not already sit on that grid makes
+    the *actual* rendered clip longer than this function promised. Summed across a whole clip's
+    scenes the drift reaches multiple seconds (final review, C1: "+1.6..3.5 с") against
+    `assemble.DURATION_TOLERANCE_SECONDS`'s 0.5s assembly budget, so the assembled clip's own length
+    check fails deterministically, and a `/assembly/retry` only repeats the same arithmetic.
+
+    **Snaps down**, not to the nearest grid point: `target = seconds + carry` rounded to the nearest
+    frame, then floored to the grid, so a real render is never longer than what this function
+    promised -- padding a short render with a freeze-frame (`assemble.run`'s own fallback) is cheap;
+    there is no equivalent way to trim one that ran long. The discarded remainder (`target -
+    snapped`) is returned as the new `carry`, so `build_clip_scenes` can fold it into the next
+    scene's own target instead of it just evaporating -- the aim is still the track's actual
+    duration, not `len(scenes)` frame-grid roundings short of it.
+
+    **Clamped into `[SCENE_MIN_SECONDS, SCENE_MAX_SECONDS]`** -- H3's own per-scene contract
+    (`docs/h3-prompt-system.md`, "Scenario mode": "5 to 10 seconds"). The grid step
+    (`_H3_FRAMES_PER_CHUNK / _H3_FPS ≈ 0.708s`) is wider than the gap between `SCENE_MIN_SECONDS`
+    and the lowest in-range grid point, so snapping a duration just above the floor straight down
+    can land *below* `SCENE_MIN_SECONDS` -- and, symmetrically, `carry` folded into a duration just
+    under the ceiling can snap *above* `SCENE_MAX_SECONDS`. Both edges are clamped to the nearest
+    grid point that is still in range rather than left to breach it; `carry`'s own return value
+    still reflects what this step actually spent either way, so the next scene sees the true
+    remainder regardless of which branch fired.
+    """
+    target = seconds + carry
+    frames = max(_H3_LATENTS_PER_CHUNK, round(target * _H3_FPS))
+    snapped = _grid_frames_at_or_below(frames) / _H3_FPS
+    if snapped < SCENE_MIN_SECONDS:
+        snapped = _grid_frames_at_or_above(round(SCENE_MIN_SECONDS * _H3_FPS)) / _H3_FPS
+    elif snapped > SCENE_MAX_SECONDS:
+        snapped = _grid_frames_at_or_below(round(SCENE_MAX_SECONDS * _H3_FPS)) / _H3_FPS
+    return snapped, target - snapped
+
+
+#: How far the *grid-snapped* scene durations `build_clip_scenes` actually returns may total below
+#: `track["duration"]` -- C1 (final review): unlike `_COVERAGE_TOLERANCE_SECONDS` (the raw timeline
+#: against itself, a pure-arithmetic check), snapping every scene down onto H3's frame grid always
+#: costs *some* real seconds against the track, and `assemble.run` can only close that gap with a
+#: freeze-frame pad, never trim an overshoot -- so the snapped total must land at or under the
+#: track's own duration, never over it. One second is generous headroom above the typical drift (at
+#: most one grid step, `~0.708s`, per the telescoping sum `_snap_scene_duration`'s own carry
+#: produces) for the rarer clamp case at the `SCENE_MIN_SECONDS`/`SCENE_MAX_SECONDS` edges.
+_SNAPPED_COVERAGE_SHORTFALL_SECONDS = 1.0
 
 
 class ProjectSceneBuildError(Exception):
@@ -1027,6 +1115,15 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None) -> list[di
     measured duration yet, or if it has sung sections but `lyrics` yields no lines for any of them
     (nothing to build a prompt from), or if either shape check above fails.
 
+    **Every returned `duration` is snapped onto H3's own frame grid (C1, final review)** --
+    `_snap_scene_duration`, applied scene by scene once the checks above pass, so it is the *raw*
+    (unsnapped) timeline that is checked for shape and total, and the *snapped* one that is
+    returned. Snapping only ever removes seconds (never adds), so the returned total can fall as
+    much as `_SNAPPED_COVERAGE_SHORTFALL_SECONDS` (1.0s) short of `track["duration"]` -- checked
+    directly, its own `ProjectSceneBuildError` if it falls short of even that -- and never over it:
+    `assemble.run`'s own freeze-frame pad can absorb a render that comes up short of the track, but
+    nothing in this codebase can trim one that runs long.
+
     Returns `Project.scenes`-shaped dicts (`idx`/`prompt`/`duration`/`status="pending"`/
     `job_id=None`/`clip_path=None`/`keyframe_path=None`), ready to assign to `project.scenes`.
     """
@@ -1106,9 +1203,31 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None) -> list[di
             f"built scenes cover {total:.3f}s, track is {duration:.3f}s -- coverage is not "
             f"complete")
 
-    return [{"idx": i, "prompt": seg["prompt"], "duration": seg["end"] - seg["start"],
-            "status": "pending", "job_id": None, "clip_path": None, "keyframe_path": None}
-            for i, seg in enumerate(expanded)]
+    # C1 (final review): every duration above this point is an exact float over `sections`' own
+    # timestamps -- correct for the coverage checks just run, but not a duration a real `generate`
+    # job can render exactly (`align_num_frames` rounds it up to H3's own frame grid before
+    # generation starts). Snapped down onto that grid here, scene by scene, with the discarded
+    # remainder carried into the next scene's own target -- see `_snap_scene_duration`'s own
+    # docstring for why down rather than nearest, and for the `SCENE_MIN_SECONDS`/
+    # `SCENE_MAX_SECONDS` clamp.
+    carry = 0.0
+    scenes = []
+    for i, seg in enumerate(expanded):
+        snapped, carry = _snap_scene_duration(seg["end"] - seg["start"], carry)
+        scenes.append({"idx": i, "prompt": seg["prompt"], "duration": snapped,
+                       "status": "pending", "job_id": None, "clip_path": None,
+                       "keyframe_path": None})
+
+    snapped_total = sum(s["duration"] for s in scenes)
+    if not (duration - _SNAPPED_COVERAGE_SHORTFALL_SECONDS - _COVERAGE_TOLERANCE_SECONDS
+            <= snapped_total <= duration + _COVERAGE_TOLERANCE_SECONDS):
+        raise ProjectSceneBuildError(
+            f"scene durations snapped to H3's frame grid cover {snapped_total:.3f}s, track is "
+            f"{duration:.3f}s -- outside the "
+            f"[{duration - _SNAPPED_COVERAGE_SHORTFALL_SECONDS:.3f}s, {duration:.3f}s] tolerance a "
+            f"freeze-frame pad can still absorb")
+
+    return scenes
 
 
 def _project_job_by_args(jobs, project_path: Path, kind: str):
@@ -1195,6 +1314,57 @@ def project_summary(proj, jobs) -> dict:
         "final_path": proj.assembly.get("final_path"),
         "active_job": _project_active_job(proj, jobs),
     }
+
+
+def _media_mtime(path) -> int | None:
+    """`int(mtime)` of `path`, or `None` if it does not exist or cannot be stat'd -- I2 (final
+    review): the cache-buster source `_project_payload` reads for `track`/`assembly`'s own `v`
+    field. `None` (never a fabricated `0` or the current time) so a caller can tell "no file yet"
+    from "a real version", the same "absent, not a guess" rule the rest of this module already
+    applies to optional fields.
+    """
+    if not path:
+        return None
+    try:
+        return int(Path(path).stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _project_payload(proj) -> dict:
+    """`proj.as_dict()`, with a cache-buster `v` field added to `track`/`assembly` when their own
+    media file exists on disk (I2, final review) -- every route that hands a project back to the
+    page goes through this instead of calling `proj.as_dict()` directly, so `webui/app.js`'s
+    `projectMediaUrl` always has a version to build `?v=` from.
+
+    **Why this was missing.** `MEDIA_MAX_AGE` (`_cache_control`) tells a browser it may keep a
+    `/media` response for a year, which is safe exactly because nothing under a run is ever
+    rewritten in place -- true for a scene's own clip (each retry writes a fresh, randomly-suffixed
+    file, `assemble._scene_generate_args`) but **not** true for a track's own mp3 or a clip's own
+    `final.mp4`: "Пересчитать трек"/"Пересчитать сборку" both write back onto the *same* path
+    (`track/song.mastered.mp3`, `assembly/final.mp4`). Before this fix a browser that had already
+    cached the old bytes under that exact URL kept showing them after a recompute -- a person could
+    approve a take they never actually heard.
+
+    **Computed fresh on every call, never stored on the project itself.** `int(mtime)` is not
+    project state -- it is a fact about the filesystem this server already has to touch to serve
+    `/media` at all, re-read here for the same reason `_media_mtime`'s own docstring gives: a value
+    computed once and cached would go stale exactly when it matters (right after a recompute
+    finishes). Missing file -> no `v` key at all (`_media_mtime` returning `None`), matching every
+    other "absent, not a guess" field this module already serves.
+    """
+    result = proj.as_dict()
+    track = dict(result.get("track") or {})
+    track_v = _media_mtime(track.get("mastered_mp3") or track.get("mp3"))
+    if track_v is not None:
+        track["v"] = track_v
+    result["track"] = track
+    assembly = dict(result.get("assembly") or {})
+    assembly_v = _media_mtime(assembly.get("final_path"))
+    if assembly_v is not None:
+        assembly["v"] = assembly_v
+    result["assembly"] = assembly
+    return result
 
 
 def project_is_active(proj, queue_root) -> bool:
@@ -3006,7 +3176,8 @@ class _Handler(BaseHTTPRequestHandler):
         with queue_errors(self.server.queue_root):
             jobs, _broken = q.scan(self.server.queue_root)
         return 200, "application/json", _json_bytes(
-            {"ok": True, "project": proj.as_dict(), "active_job": _project_active_job(proj, jobs)})
+            {"ok": True, "project": _project_payload(proj),
+             "active_job": _project_active_job(proj, jobs)})
 
     def _create_project(self) -> tuple[int, str, bytes]:
         """`POST /api/projects`: a new project, either from a chat session's last `project` field
@@ -3090,6 +3261,23 @@ class _Handler(BaseHTTPRequestHandler):
                             "args_invalid",
                             f"session `project.scenes[{i}].duration` must be a positive number",
                             {"index": i, "type": type(duration).__name__})
+                    # C3 (final review): `docs/h3-prompt-system.md`'s "5 to 10 seconds" (Scenario
+                    # mode) was, before this fix, only ever a hint in the system prompt handed to
+                    # the model that *writes* `scenes` -- nothing on the ingestion side actually
+                    # enforced it, so a model that ignored the hint (or a hand-crafted request past
+                    # the chat entirely) could hand this route a 60s "scene" that would sail
+                    # through creation and only fail later, deep in generation, against a limit the
+                    # person creating the project never saw named. Checked against the same
+                    # `SCENE_MIN_SECONDS`/`SCENE_MAX_SECONDS` `build_clip_scenes` itself enforces
+                    # for a `kind="clip"` project's own automatically-built scenes, so a
+                    # `kind="video"` project's hand-written ones answer to the identical contract.
+                    if not (SCENE_MIN_SECONDS <= duration <= SCENE_MAX_SECONDS):
+                        raise CliError(
+                            "args_invalid",
+                            f"session `project.scenes[{i}].duration` must be between "
+                            f"{SCENE_MIN_SECONDS} and {SCENE_MAX_SECONDS} seconds, got {duration}",
+                            {"index": i, "duration": duration, "min": SCENE_MIN_SECONDS,
+                             "max": SCENE_MAX_SECONDS})
                     scenes.append({"idx": i, "prompt": prompt, "duration": float(duration),
                                    "status": "pending", "job_id": None, "clip_path": None,
                                    "keyframe_path": None})
@@ -3163,7 +3351,7 @@ class _Handler(BaseHTTPRequestHandler):
         proj.save()
 
         return 200, "application/json", _json_bytes(
-            {"ok": True, "id": proj.id, "project": proj.as_dict()})
+            {"ok": True, "id": proj.id, "project": _project_payload(proj)})
 
     def _submit_project_song_job(self, proj) -> dict:
         """The `kind="song"` job a script-stage approval submits for a `kind="clip"`/`"song"`
@@ -3300,7 +3488,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         reloaded = project_module.load_project(proj.path)
         return 200, "application/json", _json_bytes(
-            {"ok": True, **result, "project": reloaded.as_dict()})
+            {"ok": True, **result, "project": _project_payload(reloaded)})
 
     def _retry_project_track(self, raw_id: str) -> tuple[int, str, bytes]:
         """`POST /api/projects/<id>/track/retry`: task 7's own small addition to the server ("
@@ -3322,12 +3510,21 @@ class _Handler(BaseHTTPRequestHandler):
         route gets for free.
 
         **Allowed only from `"draft"` (never started, or a previous attempt's job never even
-        reached the worker) or `"awaiting_approval"` (a finished take nobody has approved yet, and
-        a different seed is wanted)** -- `"approved"`/`"done"` are refused: a clip's own scenes may
-        already be built on top of that take (`build_clip_scenes`), and redoing the track out from
-        under them is not this route's job. Not reachable at all in practice, but refused the same
-        way rather than left to `_submit_project_song_job`'s own `output_stem_conflict`, is
-        `"running"` -- see the next check.
+        reached the worker), `"awaiting_approval"` (a finished take nobody has approved yet, and a
+        different seed is wanted), or `"failed"`** -- `"approved"`/`"done"` are refused: a clip's
+        own scenes may already be built on top of that take (`build_clip_scenes`), and redoing the
+        track out from under them is not this route's job. Not reachable at all in practice, but
+        refused the same way rather than left to `_submit_project_song_job`'s own `output_stem_
+        conflict`, is `"running"` -- see the next check.
+
+        **`"failed"` (I1, final review): a crashed song job (`worker._mark_track_failed`) used to be
+        a dead end.** Before that fix, an exception inside `_run_song_job` left `stages.track`
+        exactly where it already was -- `"draft"` for a first-ever attempt, `"running"` for a retry
+        of this same route -- and this check refused both states no differently from `"approved"`/
+        `"done"`, so the only way out was hand-editing `project.json`. `"failed"` is admitted here
+        the same way `"draft"`/`"awaiting_approval"` already are: nothing has been committed on top
+        of that attempt (no scenes built, no assembly running), so there is nothing a retry could
+        clobber.
 
         **Refused with `project_running` while a song job for this project is already pending or
         running** -- `stages.track` alone cannot say that (task 6's own M6: it stays `"draft"`
@@ -3365,7 +3562,7 @@ class _Handler(BaseHTTPRequestHandler):
                 f"проект {raw_id}: сценарий ещё не утверждён, пересчитывать трек рано",
                 {"id": raw_id, "stage": "script", "status": proj.stages.get("script")})
         current = proj.stages.get("track")
-        if current not in ("draft", "awaiting_approval"):
+        if current not in ("draft", "awaiting_approval", "failed"):
             raise CliError(
                 "project_stage_not_ready",
                 f"трек проекта {raw_id} нельзя пересчитать сейчас (статус {current!r})",
@@ -3390,7 +3587,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         reloaded = project_module.load_project(proj.path)
         return 200, "application/json", _json_bytes(
-            {"ok": True, **result, "project": reloaded.as_dict()})
+            {"ok": True, **result, "project": _project_payload(reloaded)})
 
     def _cancel_project_scene_tail_jobs(self, proj, idx: int) -> list[str]:
         """Cancel every still-*pending* queue job that is a project-scene job for `proj`, index
@@ -3466,7 +3663,7 @@ class _Handler(BaseHTTPRequestHandler):
         advance = assemble_module.advance_project(proj, self.server.queue_root, self.server.outdir)
         reloaded = project_module.load_project(proj.path)
         return 200, "application/json", _json_bytes(
-            {"ok": True, "advance": advance, "project": reloaded.as_dict()})
+            {"ok": True, "advance": advance, "project": _project_payload(reloaded)})
 
     def _retry_project_assembly(self, raw_id: str) -> tuple[int, str, bytes]:
         """`POST /api/projects/<id>/assembly/retry`: Task 4's own contract ("Требования к Task 6"):
@@ -3486,7 +3683,7 @@ class _Handler(BaseHTTPRequestHandler):
         advance = assemble_module.advance_project(proj, self.server.queue_root, self.server.outdir)
         reloaded = project_module.load_project(proj.path)
         return 200, "application/json", _json_bytes(
-            {"ok": True, "advance": advance, "project": reloaded.as_dict()})
+            {"ok": True, "advance": advance, "project": _project_payload(reloaded)})
 
     def _delete_project(self, raw_id: str) -> tuple[int, str, bytes]:
         """`DELETE /api/projects/<id>`: only a project with nothing in flight (design spec: "DELETE
@@ -4179,27 +4376,51 @@ class _Handler(BaseHTTPRequestHandler):
         # Task 5 ("Проекты"): `project` follows the same rule `slug` just did -- optional,
         # outside `PROMPT_SCHEMA`'s `required`, and a provider outside `response_format`'s reach
         # can send anything, so a malformed one is ignored quietly rather than earning a 502.
-        # Saved whole under `project` (mirrors `prompt_struct` holding the single-clip `prompt`),
-        # and `kind` besides it at the session's top level -- "по образцу", the same place
+        # Saved under `project` (mirrors `prompt_struct` holding the single-clip `prompt`), and
+        # `kind` besides it at the session's top level -- "по образцу", the same place
         # `mode`/`duration` already live -- so a later turn's `## Context` line above, and Task 6's
         # project-creation route, can both read the current kind without reaching into `project`.
         # Neither is set at session creation the way `mode` is (see `kind_line`'s own comment
         # above): the model decides a project's `kind` while talking to the person, this route
         # only ever records what it decided.
+        #
+        # I4 (final review): merged field by field, not overwritten wholesale. `PROMPT_SCHEMA`'s
+        # own `project.scenes` is valid as `null` -- the shape a turn that has not written the
+        # scenario yet sends, true on turn 1, but also the shape an unrelated *later* turn sends
+        # right back when it has nothing new to say about the scenario (the model answering a
+        # plain question, still remembering the project exists). Before this fix those two cases
+        # were indistinguishable to `session["project"] = project`'s own blind overwrite: the
+        # second one silently discarded a scenario the person had already asked for and approved
+        # nothing had actually changed about.
+        #
+        # A field is only ever left as this turn sent it (`None` included -- the ordinary shape of
+        # a *first* turn that has not decided the scenario yet, and no different from before this
+        # fix) unless the *previous* turn already had a real, non-`None` value for that exact key --
+        # only then does this turn's own `None` mean "nothing new to say", and only then is the
+        # older value kept instead. This is deliberately narrower than "any `None` means don't
+        # touch": a fresh project's very first turn must still be able to answer with explicit
+        # `null`s (`lyrics`/`caption`/`scenes`, whichever this `kind` does not use) and have them
+        # saved as given, not have this merge invent values that were never there.
         project = turn.get("project")
         if isinstance(project, dict):
-            session["project"] = project
-            kind = project.get("kind")
+            previous = session.get("project")
+            merged = dict(previous) if isinstance(previous, dict) else {}
+            for key, value in project.items():
+                if value is None and merged.get(key) is not None:
+                    continue
+                merged[key] = value
+            session["project"] = merged
+            kind = merged.get("kind")
             if isinstance(kind, str) and kind in PROJECT_KINDS:
                 session["kind"] = kind
             else:
-                # Review M2: `session["project"]` was just overwritten wholesale (above), so a
-                # `kind` a previous turn set must not go on claiming to describe *this* `project`
-                # -- leaving it in place would let `session["kind"]` and
+                # Review M2: a `kind` a previous turn set must not go on claiming to describe
+                # *this* `project` -- leaving it in place would let `session["kind"]` and
                 # `session["project"]["kind"]` disagree the moment this turn's own `kind` is
                 # missing or unrecognised, exactly the pair Task 6's project-creation route reads
                 # as if they always matched.
                 session.pop("kind", None)
+            project = merged
         else:
             project = None
         self._write_session(path, session)

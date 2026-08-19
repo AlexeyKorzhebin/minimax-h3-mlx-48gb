@@ -166,6 +166,24 @@ export function clipUrl(job, outdir) {
   return withVersion(url, mediaVersion(job));
 }
 
+/** The real `final.mp4` a `kind="assemble"` job's own `output_stem` sits beside (минор, финальное
+ *  ревью). `output_stem` for this job kind is `<project>/assembly/job-final`
+ *  (`assemble._submit_assembly`) -- a name chosen deliberately *not* to collide with anything
+ *  `assemble.run` actually writes, so `clipUrl`'s own `<stem>.mp4` (`job-final.mp4`) never exists.
+ *  The real concat is `final.mp4`, one directory over -- cheap to derive (swap the filename, keep
+ *  the directory) without needing the job's own `note` parsed or a second `/api/projects/<id>`
+ *  round trip just to draw a "Готово" row's own thumbnail. */
+export function assembleFinalUrl(job, outdir) {
+  const stem = String(job.output_stem || "");
+  const lastSlash = stem.lastIndexOf("/");
+  if (lastSlash < 0) return null;
+  const finalStem = `${stem.slice(0, lastSlash)}/final`;
+  const parts = mediaParts(finalStem, outdir);
+  if (!parts) return null;
+  const url = `/media/${encodeURIComponent(parts.run)}/${encodeURIComponent(parts.stem + ".mp4")}`;
+  return withVersion(url, mediaVersion(job));
+}
+
 /** Последний записанный кадр превью, или `null`, пока ни одного нет.
  *  Кадр пишется каждые `--preview-every` проходов, поэтому по числу
  *  завершённых проходов имя выводится, а не угадывается. */
@@ -890,11 +908,25 @@ export function pendingRowHtml(job, { editingId = null, index = null } = {}) {
  * Кадра у упавшей может не быть вовсе (прогон короче одного интервала записи, упал раньше
  * первого, или его каталога уже нет в `runs`), а у успешной — без `outdir` (`clipUrl` тогда
  * возвращает `null`) — в обоих случаях рамка пустая: битая картинка хуже пустой.
+ *
+ * Минор (финальное ревью): `job.output_stem` для `kind="song"`/`"assemble"` — служебный, под
+ * `<project>/track/job-song` или `<project>/assembly/job-final`, и рядом с ним никогда не пишется
+ * `<stem>.mp4` — song-задача вообще не пишет видео (продукт — mp3, и живёт в панели проекта, не в
+ * очереди), а assemble-задача пишет `final.mp4`, другое имя в той же папке. До этой правки строка
+ * готовой song/assemble-задачи в общей очереди тянула `<video src="…job-song.mp4">`/
+ * `<video src="…job-final.mp4">` — оба 404 на каждый рендер. Song — без ролика и без ссылки вовсе
+ * (`isSong`, ниже): смотреть/утверждать mp3 — дело панели проекта, не этой строки. Assemble —
+ * настоящий `final.mp4`, дёшево выведенный из `output_stem`'s собственной папки
+ * (`assembleFinalUrl`), без похода на `/api/projects/<id>` только ради превью.
  */
 export function finishedRowHtml(job, outdir, runs) {
   const code = job.exit_code;
   const ok = code === 0;
-  const clip = ok ? clipUrl(job, outdir) : null;
+  const isSong = job.kind === "song";
+  const isAssemble = job.kind === "assemble";
+  const clip = ok && !isSong
+    ? (isAssemble ? assembleFinalUrl(job, outdir) : clipUrl(job, outdir))
+    : null;
   const stem = String(job.output_stem || "");
   const name = stem.slice(stem.lastIndexOf("/") + 1);
   const id = escapeHtml(job.id);
@@ -902,12 +934,14 @@ export function finishedRowHtml(job, outdir, runs) {
   const run = ok ? null : runForJob(job, runs);
   const completed = ok ? 0 : Number((run && run.completed) || 0);
   const step = ok ? 0 : previewStep(job, completed);
-  const shot = ok ? null : previewUrl(job, completed, outdir);
+  const shot = ok || isSong || isAssemble ? null : previewUrl(job, completed, outdir);
   // Код возврата стоит в `.meta` и только там: до этой правки упавшая карточка называла его
   // дважды подряд — «код 1» строкой выше и «код возврата 1» строкой ниже.
-  const link = ok && clip
-    ? `<a class="clip" href="${clip}">${escapeHtml(name)}.mp4</a>`
-    : escapeHtml(name);
+  const link = isSong
+    ? ""  // продукт — mp3 в панели проекта, не эта строка; job-song.mp4 никогда не существует
+    : (ok && clip
+        ? `<a class="clip" href="${clip}">${escapeHtml(name)}.mp4</a>`
+        : escapeHtml(name));
   const took = job.started_at && job.finished_at
     ? (Date.parse(job.finished_at) - Date.parse(job.started_at)) / 1000
     : NaN;
@@ -1115,17 +1149,25 @@ export function projectEstimateSeconds(project, jobs) {
  *  та же идея, что `mediaParts`/`clipUrl`, только без деления на `{run, stem}`: проектные файлы
  *  (клип сцены, `track/song.mastered.mp3`, `assembly/final.mp4`) лежат на произвольной глубине
  *  под `<outdir>/projects/<id>/...`, а `/media/<relative>` (`_media` в web.py) читает путь любой
- *  глубины начиная с task A6 — незачем угадывать, какой сегмент тут «run». Версии (`?v=`) нет:
- *  сценa retry всегда пишет новое случайное имя файла (`_scene_generate_args`'s собственный
- *  `secrets.token_hex(2)` в теге), поэтому иммутабельный кэш `/media` никогда не видит одно и то
- *  же имя дважды с разным содержимым для сцен; `final.mp4`/трек — исключение, см. task 7 report. */
-export function projectMediaUrl(path, outdir) {
+ *  глубины начиная с task A6 — незачем угадывать, какой сегмент тут «run».
+ *
+ *  `version` — необязательный (I2, финальное ревью): для клипа сцены он не нужен вовсе — ретрай
+ *  всегда пишет новое случайное имя файла (`_scene_generate_args`'s собственный
+ *  `secrets.token_hex(2)` в теге), так что иммутабельный кэш `/media` никогда не видит одно и то
+ *  же имя дважды с разным содержимым. `track/song.mastered.mp3` и `assembly/final.mp4` — ровно
+ *  наоборот: «Пересчитать трек»/«Пересчитать сборку» пишут поверх того же самого пути, и без
+ *  версии браузер, уже закэшировавший старые байты под этим URL, продолжал бы их показывать после
+ *  пересчёта. Источник версии — `track.v`/`assembly.v` (сервер отдаёт их сам, `web._project_
+ *  payload`, mtime файла в секундах, целое) — тот же приём, что `mediaVersion`/`withVersion`
+ *  здесь же используют для `clipUrl`/`previewUrl`, только источник там `job.finished_at`. */
+export function projectMediaUrl(path, outdir, version) {
   const p = String(path == null ? "" : path);
   const base = String(outdir || "");
   if (!p || !base || !p.startsWith(`${base}/`)) return null;
   const relative = p.slice(base.length + 1);
   if (!relative) return null;
-  return "/media/" + relative.split("/").map(encodeURIComponent).join("/");
+  const url = "/media/" + relative.split("/").map(encodeURIComponent).join("/");
+  return withVersion(url, version);
 }
 
 /* ===========================================================================
@@ -2355,7 +2397,7 @@ function startPage() {
                          running: "пересчитывается", awaiting_approval: "ждёт прослушивания",
                          approved: "утверждён" }[status] || status;
     const mp3 = track.mastered_mp3 || track.mp3;
-    const mp3Url = mp3 ? projectMediaUrl(mp3, outdir) : null;
+    const mp3Url = mp3 ? projectMediaUrl(mp3, outdir, track.v) : null;
     const player = mp3Url
       ? `<audio class="proj-audio" controls preload="metadata" src="${escapeHtml(mp3Url)}"></audio>`
       : "";
@@ -2434,7 +2476,8 @@ function startPage() {
     const retry = status === "failed"
       ? `<button class="ghost" type="button" data-act="retry-assembly" `
         + `data-id="${escapeHtml(proj.id)}">Пересчитать сборку</button>` : "";
-    const finalUrl = proj.assembly.final_path ? projectMediaUrl(proj.assembly.final_path, outdir) : null;
+    const finalUrl = proj.assembly.final_path
+      ? projectMediaUrl(proj.assembly.final_path, outdir, proj.assembly.v) : null;
     const link = finalUrl
       ? `<p class="proj-final"><a class="clip" href="${escapeHtml(finalUrl)}" target="_blank" `
         + `rel="noopener">final.mp4</a></p>`

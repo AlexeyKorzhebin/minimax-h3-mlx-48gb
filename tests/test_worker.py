@@ -1106,6 +1106,60 @@ def test_a_song_job_with_an_imported_track_but_no_mp3_fails_honestly(tmp_path):
     assert q.job_path(root, job.id, "failed").exists()
     reloaded = project_module.load_project(proj.path)
     assert reloaded.track["status"] == "draft", "an untouched project must not look gated"
+    # I1 (final review): `track.status` (the field checked above) is untouched, but `stages.track`
+    # -- the *gate*, what `web._retry_project_track` actually reads -- must now say "failed" rather
+    # than sitting at whatever it already was, or the project has no way back in. See the dedicated
+    # I1 tests below for the full before/after.
+    assert reloaded.stages["track"] == "failed"
+
+
+# -- I1 (final review): a failed song job marks stages.track failed, and can be retried -----------
+
+
+def test_i1_a_failed_song_job_marks_stages_track_failed(tmp_path, monkeypatch):
+    """Before this, a crashing `songrun.run_song` left `stages.track` stuck wherever it already was
+    (`"draft"` for a project's first-ever attempt) forever -- nothing else in this codebase ever
+    revisits a `track` stage that is not `"draft"`/`"awaiting_approval"`
+    (`web._retry_project_track`'s own gate, before this fix), so the project was stuck with no way
+    to try again short of hand-editing `project.json`. Mirrors `test_i1a_a_failed_assemble_job_
+    marks_stages_assembly_failed` exactly, one stage over.
+    """
+    def boom(*a, **kw):
+        raise RuntimeError("Music3 exploded")
+
+    monkeypatch.setattr(sr, "run_song", boom)
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    job = _song_job(root, proj, tmp_path)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 1
+    assert q.job_path(root, job.id, "failed").exists()
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.stages["track"] == "failed"
+
+
+def test_i1_a_failed_song_job_after_a_retry_also_marks_stages_track_failed(tmp_path, monkeypatch):
+    """The other state a real crash can be caught in (task brief, verbatim: "включая после
+    «Пересчитать трек» со stages.track=running"): `web._retry_project_track` moves `stages.track`
+    to `"running"` right after resubmitting, before the worker ever claims the job -- a crash from
+    there must still land on `"failed"`, not leave `"running"` standing with nothing running.
+    """
+    def boom(*a, **kw):
+        raise RuntimeError("Music3 exploded")
+
+    monkeypatch.setattr(sr, "run_song", boom)
+    root = tmp_path / "queue"
+    proj = _song_project(tmp_path)
+    proj.set_stage_status("track", "running")
+    job = _song_job(root, proj, tmp_path)
+
+    code = worker.run_job(root, job, spawn=_caffeinate_spy([]))
+
+    assert code == 1
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.stages["track"] == "failed"
 
 
 def test_run_job_treats_a_kind_less_job_as_generate(tmp_path):

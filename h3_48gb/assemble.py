@@ -515,6 +515,19 @@ def _scene_generate_args(scene: dict, keyframe, scenes_dir: Path) -> tuple[list[
     fields by a blank line, the same joining rule `webui/app.js`'s `buildPromptText` already uses
     for an ordinary chat turn's `instruction` field. A `t2v` scene (no keyframe -- scene 0 with no
     uploaded start frame) gets no such line: `scene["prompt"]` is passed through untouched.
+
+    **I3 (final review): not prefixed if `scene["prompt"]` already opens with it.** The chat
+    system prompt (`docs/h3-prompt-system.md`, "The first line, for image-conditioned modes")
+    teaches the model to write this exact sentence itself whenever it believes a run is `mode:
+    i2v` -- but a scenario scene is written before its own mode is actually known (`t2v` for scene
+    0, `i2v` for every scene after it, decided here by whether an automatic keyframe exists), so a
+    model that follows that instruction literally for what it assumes will be an `i2v` scene, and
+    this function's own unconditional prefix, doubled the sentence at the top of the prompt. A
+    doubled instruction line is not merely redundant text -- H3 reads it as *two* keyframe
+    references at 0.00s, which is not what either the model or this function meant. Checked once,
+    against the prompt's own leading whitespace stripped (`lstrip()`), so a prompt the model wrote
+    with the sentence already in place is passed through unchanged instead of getting a second copy
+    glued on top of the first.
     """
     idx = scene["idx"]
     width, height = DEFAULT_SCENE_CANVAS
@@ -529,7 +542,7 @@ def _scene_generate_args(scene: dict, keyframe, scenes_dir: Path) -> tuple[list[
     # regardless of timing, without needing an attempt counter on the scene's own schema.
     tag = f"scene-{idx}-{secrets.token_hex(2)}"
     prompt = scene["prompt"]
-    if keyframe is not None:
+    if keyframe is not None and not prompt.lstrip().startswith(SCENE_I2V_INSTRUCTION):
         prompt = f"{SCENE_I2V_INSTRUCTION}\n\n{prompt}"
     args = ["generate", prompt,
             "--width", str(width), "--height", str(height),

@@ -371,7 +371,50 @@ def _run_song_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
     except Exception as exc:  # noqa: BLE001 -- a song job's own failure must route to failed/,
         # not crash the worker loop; see the docstring.
         log_lines.append(f"song job failed: {type(exc).__name__}: {exc}")
+        # I1 (final review): before this, a raising song job left `stages.track` exactly where it
+        # was -- "draft" for a project's first-ever attempt (script approval never moves it),
+        # "running" for a "Пересчитать трек" retry (`web._retry_project_track` moves it there right
+        # after resubmitting) -- with nothing actually running any more. Nothing else in this
+        # codebase ever revisits a `track` stage that is not `"draft"`/`"awaiting_approval"`
+        # (`_retry_project_track`'s own gate, before this fix), so the project was stuck: the retry
+        # route refused every further attempt with `project_stage_not_ready`, forever, and the only
+        # way out was hand-editing `project.json`. Mirrors `_mark_assembly_failed` exactly, one
+        # stage over -- see that function's own docstring for why this is best-effort and never
+        # raises.
+        project_path = _try_project_arg(job.args)
+        if project_path is not None:
+            _mark_track_failed(project_path)
         return 1, "\n".join(log_lines) + "\n"
+
+
+def _try_project_arg(args):
+    """`_project_arg(args)`, or `None` if `args` cannot even be parsed that far -- lets
+    `_run_song_job`'s own except block call `_mark_track_failed` only when there is a project path
+    to mark at all, the same guard `_run_assemble_job` gets from resolving `project_path` ahead of
+    its own `try` block. A song job's `args` is validated at submission time (`queue.submit`'s own
+    `_validate_args_shape_for_kind`), so this only ever matters for a malformed job that reached the
+    worker some other way.
+    """
+    try:
+        return _project_arg(args)
+    except Exception:  # noqa: BLE001 -- "no project to mark" is the only thing this needs to know.
+        return None
+
+
+def _mark_track_failed(project_path) -> None:
+    """Best-effort: record `stages.track = "failed"` on the project a `kind="song"` job named (I1,
+    final review) -- called from `_run_song_job`'s own failure path so a crashed (or malformed-
+    import) song job does not leave `stages.track` stuck `"draft"`/`"running"` forever with nothing
+    actually generating. Mirrors `_mark_assembly_failed` exactly (see its own docstring for why this
+    never raises): a second failure here (a moved project, a corrupt `project.json`) must not
+    replace the job's own honest failure message with an unrelated traceback.
+    """
+    try:
+        from h3_48gb import project as project_module
+        proj = project_module.load_project(project_path)
+        proj.set_stage_status("track", "failed")
+    except Exception:  # noqa: BLE001 -- see docstring.
+        pass
 
 
 def _mark_assembly_failed(project_path) -> None:

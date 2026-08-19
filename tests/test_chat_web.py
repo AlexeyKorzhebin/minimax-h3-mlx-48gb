@@ -705,11 +705,15 @@ def test_a_later_turns_bad_kind_does_not_leave_the_sessions_kind_stale(_serve):
     """Review M2: `session["kind"]` is a mirror of `session["project"]["kind"]`, but the first
     turn's `## Context` fix (`test_the_sessions_kind_rides_a_later_turns_context`) only proved the
     mirror survives a turn that says nothing about `project` at all. A *second* turn that answers
-    with a `project` again, this time with a `kind` this server does not recognise, overwrites
-    `session["project"]` wholesale (the same loyalty rule `prompt_struct` already follows) -- and
-    if `session["kind"]` from the *first* turn were left untouched, it would go on claiming
-    `"video"` while `session["project"]["kind"]` says `"movie"`, a pair nothing downstream (Task
-    6's project-creation route, the next turn's own `kind:` context line) could trust.
+    with a `project` again, this time with a `kind` this server does not recognise, must still move
+    `session["kind"]` off the stale `"video"` the first turn set -- otherwise it would go on
+    claiming `"video"` while `session["project"]["kind"]` says `"movie"`, a pair nothing downstream
+    (Task 6's project-creation route, the next turn's own `kind:` context line) could trust.
+
+    I4 (final review): the merge itself (`session["project"]` no longer overwritten wholesale, see
+    the I4 tests below) means `scenes` -- `null` in this turn's own `bad_project`, non-empty from
+    the first turn -- survives onto the merged result; only `kind` (a real, non-`None` value both
+    times) actually changes.
     """
     payload = _turn_with_project(_VIDEO_PROJECT)
     fake = _FakeLlama(chat_payload=payload)
@@ -725,7 +729,7 @@ def test_a_later_turns_bad_kind_does_not_leave_the_sessions_kind_stale(_serve):
         srv.post_json(f"/api/chat/{sid}/message", {"text": "ещё", "prompt": ""})
 
         saved = srv.get_json(f"/api/chat/{sid}")
-        assert saved["project"] == bad_project
+        assert saved["project"] == {**_VIDEO_PROJECT, "kind": "movie"}
         assert "kind" not in saved, "session['kind'] must not keep claiming a stale 'video'"
     finally:
         fake.close()
@@ -759,6 +763,63 @@ def test_a_malformed_or_unrecognised_project_is_handled_without_a_502(_serve, pr
             assert answer["project"] is None
             assert "project" not in saved
             assert "kind" not in saved
+    finally:
+        fake.close()
+
+
+# -- I4 (final review): a later turn's `project` merges, never clobbers -------------------------
+
+
+def test_a_later_turns_null_scenes_do_not_erase_the_first_turns_scenario(_serve):
+    """The bug directly: a `kind="video"` project's scenario is built on turn 1 (`_VIDEO_PROJECT`,
+    non-empty `scenes`); an unrelated later turn -- the model still remembering the project, but
+    with nothing new to say about the scenario itself -- answers with `project.scenes: null`
+    (`PROMPT_SCHEMA`'s own valid shape for "not decided yet", indistinguishable on the wire from
+    "nothing new"). Before this fix, `session["project"] = project`'s own blind overwrite read the
+    second turn's `null` as "the scenario is now empty" and discarded the scenes a person had
+    already asked for and could no longer create a project from.
+    """
+    payload = _turn_with_project(_VIDEO_PROJECT)
+    fake = _FakeLlama(chat_payload=payload)
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "ролик", "prompt": ""})
+        assert srv.get_json(f"/api/chat/{sid}")["project"]["scenes"] == _VIDEO_PROJECT["scenes"]
+
+        later_turn = {"kind": "video", "scenes": None, "lyrics": None, "caption": None}
+        payload.clear()
+        payload.update(_turn_with_project(later_turn, reply="было что-то ещё?"))
+        answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "а что там с погодой", "prompt": ""})
+
+        assert answer["project"]["scenes"] == _VIDEO_PROJECT["scenes"], (
+            "a later turn's null scenes must not erase the scenario the first turn already wrote")
+        saved = srv.get_json(f"/api/chat/{sid}")
+        assert saved["project"]["scenes"] == _VIDEO_PROJECT["scenes"]
+        assert saved["kind"] == "video"
+    finally:
+        fake.close()
+
+
+def test_a_later_turns_real_scenes_still_replace_the_first_turns(_serve):
+    """The other half: a field this turn *does* send a real value for still wins -- the merge only
+    ever protects a field the model said nothing new about, never freezes the scenario in place."""
+    payload = _turn_with_project(_VIDEO_PROJECT)
+    fake = _FakeLlama(chat_payload=payload)
+    try:
+        srv = _serve(providers_port=fake.port)
+        sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+        srv.post_json(f"/api/chat/{sid}/message", {"text": "ролик", "prompt": ""})
+
+        revised_scenes = [{"prompt": "[Shot 1] a totally different scene", "duration": 6}]
+        revised = {"kind": "video", "scenes": revised_scenes, "lyrics": None, "caption": None}
+        payload.clear()
+        payload.update(_turn_with_project(revised, reply="переписал сцену"))
+        answer = srv.post_json(f"/api/chat/{sid}/message", {"text": "перепиши", "prompt": ""})
+
+        assert answer["project"]["scenes"] == revised_scenes
+        saved = srv.get_json(f"/api/chat/{sid}")
+        assert saved["project"]["scenes"] == revised_scenes
     finally:
         fake.close()
 

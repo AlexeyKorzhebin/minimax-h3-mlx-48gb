@@ -401,6 +401,46 @@ def test_scene_generate_args_leaves_a_t2v_scenes_prompt_untouched():
     assert "is fully referenced" not in prompt_arg
 
 
+def test_scene_generate_args_does_not_double_the_i2v_instruction_the_model_already_wrote():
+    """I3 (final review): the chat system prompt teaches the model to write
+    `SCENE_I2V_INSTRUCTION` itself for what it believes will be an `i2v` run
+    (`docs/h3-prompt-system.md`, "The first line, for image-conditioned modes") -- but a scenario
+    scene is written before its own mode is actually decided (`t2v` for scene 0, `i2v` for every
+    scene after it, decided here by whether a keyframe exists), so a model that follows that
+    instruction for a scene this function later attaches a keyframe to collided with this
+    function's own unconditional prefix, doubling the sentence. H3 reads a doubled instruction as
+    two keyframe references at 0.00s, not one -- not merely redundant text, a different (and wrong)
+    claim about the run.
+    """
+    scene = _make_scene(
+        1, prompt="For the target video, at 0.00 seconds into the target video, "
+                  "<Picture 1> (from [Shot 1]) is fully referenced.\n\n"
+                  "integrated_multimodal_description: a fox runs\n\n"
+                  "overall_soundscape: wind\n\nnon_diegetic_music: N/A")
+
+    args, _ = assemble._scene_generate_args(scene, "/tmp/keyframe-000.png", Path("/tmp/scenes"))
+
+    prompt_arg = args[1]
+    assert prompt_arg == scene["prompt"]
+    assert prompt_arg.count("is fully referenced") == 1
+
+
+def test_scene_generate_args_dedup_check_ignores_leading_whitespace():
+    """The dedup check strips leading whitespace before comparing (`lstrip()`) -- a prompt that
+    happens to start with a blank line must still be recognised as already carrying the
+    instruction, not double it because of an incidental newline."""
+    scene = _make_scene(
+        1, prompt="\n\nFor the target video, at 0.00 seconds into the target video, "
+                  "<Picture 1> (from [Shot 1]) is fully referenced.\n\n"
+                  "integrated_multimodal_description: a fox runs")
+
+    args, _ = assemble._scene_generate_args(scene, "/tmp/keyframe-000.png", Path("/tmp/scenes"))
+
+    prompt_arg = args[1]
+    assert prompt_arg == scene["prompt"]
+    assert prompt_arg.count("is fully referenced") == 1
+
+
 # -- advance_project(): the scene chain -------------------------------------------------------------
 
 

@@ -32,6 +32,7 @@ from h3_48gb import songrun as sr
 from h3_48gb import web
 from h3_48gb import worker
 from test_chat_web import _serve  # noqa: F401 -- reused fixture, see its own module docstring
+from test_web import _request as _raw_request  # bytes-in/bytes-out, for /media -- see C2 tests
 from test_worker import _caffeinate_spy, _scene_hook_spawn
 
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"0" * 16
@@ -53,6 +54,25 @@ _TWO_SECTION_LYRICS = "[verse]\nHello there my friend\n[chorus]\nSing along with
 _THREE_SECTION_LYRICS = "[intro]\n" + _TWO_SECTION_LYRICS
 
 
+def _assert_scene_durations_on_h3_grid(scenes):
+    """Every scene's own `duration` already sits on H3's `17n + 5` frame grid (C1, final review) --
+    `round(duration * 24) % 17 == 5` is `align_num_frames`'s own fixed point, proving that the
+    pipeline's own upward rounding is a no-op against what `build_clip_scenes` promised, not a
+    silent stretch."""
+    for s in scenes:
+        frames = round(s["duration"] * 24)
+        assert frames % 17 == 5, f"scene {s['idx']} duration {s['duration']} is not on the H3 grid"
+
+
+def _assert_scene_total_within_snap_tolerance(scenes, duration):
+    """C1 (final review): the *grid-snapped* total may fall short of `track["duration"]` by up to
+    `web._SNAPPED_COVERAGE_SHORTFALL_SECONDS` (a freeze-frame pad closes the rest at assembly time)
+    but must never run over it -- nothing downstream can trim an overshoot."""
+    total = sum(s["duration"] for s in scenes)
+    lower = duration - web._SNAPPED_COVERAGE_SHORTFALL_SECONDS
+    assert lower - 1e-6 <= total <= duration + 1e-6, (total, duration)
+
+
 def test_build_clip_scenes_covers_the_full_track_with_an_intro_gap():
     """A typical shape: an unsung intro tag, then two sung sections whose `end`s already tile to
     `duration` (Task 2/3's own convention -- see `_clip_raw_segments`'s docstring)."""
@@ -60,7 +80,8 @@ def test_build_clip_scenes_covers_the_full_track_with_an_intro_gap():
                 {"name": "verse", "start": 4.0, "end": 12.0},
                 {"name": "chorus", "start": 12.0, "end": None}]
     scenes = web.build_clip_scenes(_track(sections, 20.0, _THREE_SECTION_LYRICS))
-    assert sum(s["duration"] for s in scenes) == pytest.approx(20.0, abs=0.01)
+    _assert_scene_total_within_snap_tolerance(scenes, 20.0)
+    _assert_scene_durations_on_h3_grid(scenes)
     assert all(web.SCENE_MIN_SECONDS - 0.01 <= s["duration"] <= web.SCENE_MAX_SECONDS + 0.01
               for s in scenes)
     # I3 (fix round 1, 2026-08-19 review): the *effective* gap threshold is SCENE_MIN_SECONDS
@@ -82,8 +103,9 @@ def test_build_clip_scenes_keeps_a_long_enough_intro_as_its_own_instrumental_sce
                 {"name": "verse", "start": 8.0, "end": 16.0},
                 {"name": "chorus", "start": 16.0, "end": None}]
     scenes = web.build_clip_scenes(_track(sections, 24.0, _THREE_SECTION_LYRICS))
-    assert sum(s["duration"] for s in scenes) == pytest.approx(24.0, abs=0.01)
-    assert scenes[0]["duration"] == pytest.approx(8.0, abs=0.01)
+    _assert_scene_total_within_snap_tolerance(scenes, 24.0)
+    _assert_scene_durations_on_h3_grid(scenes)
+    assert scenes[0]["duration"] == pytest.approx(8.0, abs=0.01)  # 8.0s is already grid-exact
     assert scenes[0]["prompt"].startswith("инструментальная интерлюдия:")
     assert "no vocals" in scenes[0]["prompt"]
 
@@ -93,16 +115,18 @@ def test_build_clip_scenes_folds_a_short_intro_into_the_first_sung_scene():
                 {"name": "verse", "start": 1.0, "end": 9.0},
                 {"name": "chorus", "start": 9.0, "end": None}]
     scenes = web.build_clip_scenes(_track(sections, 17.0, _THREE_SECTION_LYRICS))
-    assert sum(s["duration"] for s in scenes) == pytest.approx(17.0, abs=0.01)
+    _assert_scene_total_within_snap_tolerance(scenes, 17.0)
+    _assert_scene_durations_on_h3_grid(scenes)
     # The intro (1s, under the 1.5s gap threshold) never becomes its own scene.
     assert not any("инструментальная интерлюдия" in s["prompt"] for s in scenes)
-    assert scenes[0]["duration"] == pytest.approx(9.0, abs=0.01)  # 1s intro + 8s verse
+    assert scenes[0]["duration"] == pytest.approx(8.708, abs=0.01)  # 1s intro + 8s verse, snapped
 
 
 def test_build_clip_scenes_splits_a_section_longer_than_ten_seconds():
     sections = [{"name": "verse", "start": 0.0, "end": None}]
     scenes = web.build_clip_scenes(_track(sections, 23.0, "[verse]\nOne line to sing along to\n"))
-    assert sum(s["duration"] for s in scenes) == pytest.approx(23.0, abs=0.01)
+    _assert_scene_total_within_snap_tolerance(scenes, 23.0)
+    _assert_scene_durations_on_h3_grid(scenes)
     assert len(scenes) == 3  # ceil(23/10) == 3
     for s in scenes:
         assert web.SCENE_MIN_SECONDS <= s["duration"] <= web.SCENE_MAX_SECONDS
@@ -115,7 +139,8 @@ def test_build_clip_scenes_merges_a_short_trailing_section_into_its_neighbour():
     sections = [{"name": "verse", "start": 0.0, "end": None},
                 {"name": "chorus", "start": 10.0, "end": None}]
     scenes = web.build_clip_scenes(_track(sections, 12.0, _TWO_SECTION_LYRICS))
-    assert sum(s["duration"] for s in scenes) == pytest.approx(12.0, abs=0.01)
+    _assert_scene_total_within_snap_tolerance(scenes, 12.0)
+    _assert_scene_durations_on_h3_grid(scenes)
     # The 2s tail (chorus) is under SCENE_MIN_SECONDS -- merged backward into the verse, and the
     # merged 12s scene then re-splits (>10s) into two pieces sharing one prompt.
     assert len(scenes) == 2
@@ -125,7 +150,8 @@ def test_build_clip_scenes_merges_a_short_trailing_section_into_its_neighbour():
 def test_build_clip_scenes_handles_a_track_with_nothing_sung_at_all():
     sections = [{"name": "verse", "start": None, "end": None}]
     scenes = web.build_clip_scenes(_track(sections, 14.0, _TWO_SECTION_LYRICS))
-    assert sum(s["duration"] for s in scenes) == pytest.approx(14.0, abs=0.01)
+    _assert_scene_total_within_snap_tolerance(scenes, 14.0)
+    _assert_scene_durations_on_h3_grid(scenes)
     assert all("instrumental" in s["prompt"] for s in scenes)
 
 
@@ -230,6 +256,77 @@ def test_build_clip_scenes_refuses_a_seam_gap_between_scenes(monkeypatch):
                {"name": "chorus", "start": 6.0, "end": None}]
     with pytest.raises(web.ProjectSceneBuildError, match="seam"):
         web.build_clip_scenes(_track(sections, 12.0, _TWO_SECTION_LYRICS))
+
+
+# == C1 (final review): scene durations must land on H3's own 17n+5 frame grid ====================
+
+
+def _uniform_track(duration: float, *, section_seconds: float = 7.0) -> dict:
+    """A track whose `sections` are `n` equal-length sung sections tiling `[0, duration)`, each
+    close to `section_seconds` long (well inside `[SCENE_MIN_SECONDS, SCENE_MAX_SECONDS]`, so
+    `build_clip_scenes`' own fold/split passes are no-ops) -- realistic scene *counts* for a real
+    track (a 295s track gets ~40 scenes) without needing real Whisper-timed section data, which is
+    exactly the regime the drift in C1 (final review) was found in: the more scenes, the more a
+    per-scene rounding error compounds.
+    """
+    n = max(1, round(duration / section_seconds))
+    boundaries = [duration * i / n for i in range(n + 1)]
+    tags = (["verse", "chorus"] * ((n // 2) + 1))[:n]
+    sections = [{"name": tags[i], "start": boundaries[i], "end": boundaries[i + 1]}
+               for i in range(n)]
+    lyrics = "".join(f"[{tag}]\nline about {tag} number {i}\n" for i, tag in enumerate(tags))
+    return _track(sections, duration, lyrics)
+
+
+@pytest.mark.parametrize("duration", [295.0, 30.0, 60.0, 90.0])
+def test_build_clip_scenes_snaps_every_duration_onto_the_h3_frame_grid(duration):
+    """C1 (final review): the pipeline rounds a scene's own duration *up* to the next `17n + 5`
+    frame count before generation starts (`align_num_frames`) -- a `build_clip_scenes` duration that
+    is not already on that grid makes the real render longer than promised, and summed over a whole
+    clip's scenes the drift reached +1.6..3.5s against `assemble.DURATION_TOLERANCE_SECONDS`'s 0.5s
+    budget, so the assembled clip's own length check failed deterministically and `/assembly/retry`
+    only repeated the same arithmetic. Reproduced on the real 295s track from the review, plus three
+    synthetic ones spanning a realistic range of scene counts.
+    """
+    scenes = web.build_clip_scenes(_uniform_track(duration))
+    _assert_scene_durations_on_h3_grid(scenes)
+    _assert_scene_total_within_snap_tolerance(scenes, duration)
+    for s in scenes:
+        assert web.SCENE_MIN_SECONDS - 1e-6 <= s["duration"] <= web.SCENE_MAX_SECONDS + 1e-6
+
+
+def test_h3_grid_points_within_scene_bounds_are_exactly_these_seven():
+    """Pinned directly: the only durations `_snap_scene_duration` can ever return are H3's own
+    `17n + 5` frame counts that also fall inside `[SCENE_MIN_SECONDS, SCENE_MAX_SECONDS]` -- seven
+    of them (~5.17/5.88/6.58/7.29/8.0/8.71/9.42s). If H3's own frame grid or the scene bounds ever
+    change, this is the test that notices.
+    """
+    points = []
+    frames = web._grid_frames_at_or_above(round(web.SCENE_MIN_SECONDS * web._H3_FPS))
+    while frames / web._H3_FPS <= web.SCENE_MAX_SECONDS + 1e-9:
+        points.append(frames / web._H3_FPS)
+        frames += web._H3_FRAMES_PER_CHUNK
+    assert len(points) == 7
+    for p in points:
+        assert web.SCENE_MIN_SECONDS <= p <= web.SCENE_MAX_SECONDS
+
+
+def test_snap_scene_duration_never_drops_below_scene_min_seconds():
+    """The narrow trap zone (final review, C1): a raw duration just above `SCENE_MIN_SECONDS` whose
+    plain floor-to-grid would land *below* it (5.02s floors to 107/24 ≈ 4.458s) must clamp up to the
+    lowest in-range grid point instead of breaching the floor."""
+    snapped, _carry = web._snap_scene_duration(5.02, 0.0)
+    assert snapped >= web.SCENE_MIN_SECONDS
+    assert snapped == pytest.approx(124 / 24, abs=1e-6)
+
+
+def test_snap_scene_duration_never_exceeds_scene_max_seconds():
+    """The symmetric edge: a raw duration near `SCENE_MAX_SECONDS` with enough carried-in remainder
+    to push its target over 10s (9.9 + 0.7 = 10.6, which would floor to 243/24 ≈ 10.125s) must clamp
+    down to the highest in-range grid point instead."""
+    snapped, _carry = web._snap_scene_duration(9.9, 0.7)
+    assert snapped <= web.SCENE_MAX_SECONDS
+    assert snapped == pytest.approx(226 / 24, abs=1e-6)
 
 
 # == Server fixtures ===============================================================================
@@ -345,6 +442,9 @@ def test_create_project_from_an_unknown_session_is_refused(_serve):
     [{"prompt": "x", "duration": -1.0}],         # non-positive duration
     [{"prompt": "x", "duration": "6"}],          # duration is a string
     [42],                                        # not even an object
+    [{"prompt": "x", "duration": 4.99}],         # C3: below SCENE_MIN_SECONDS
+    [{"prompt": "x", "duration": 10.01}],        # C3: above SCENE_MAX_SECONDS
+    [{"prompt": "x", "duration": 60.0}],         # C3: a whole scene's worth of drift, unchecked
 ])
 def test_create_project_rejects_garbage_scenes_from_the_model_honestly(_serve, bad_scenes):
     """Task 5 report, "сомнение 3": `session["project"]` is stored without validating its shape --
@@ -672,6 +772,127 @@ def test_song_project_full_lifecycle(_serve, monkeypatch, tmp_path):
         "a song project is done once its track is approved -- nothing should still be queued")
 
 
+# == C2 (final review): /media must serve a project's own mp3 track ===============================
+
+
+def test_media_serves_a_projects_own_track_mp3(_serve, monkeypatch):
+    """C2 (final review): `MEDIA_SUFFIXES` did not include `.mp3` -- a track is always an mp3
+    (`songrun.SongResult`), so `projectTrackStageHtml`'s own `<audio>` player built a `/media` URL
+    that this route refused with `media_type_not_allowed`, and a track could never actually be
+    listened to before approving it.
+    """
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="song", scenes=None, lyrics=_TWO_SECTION_LYRICS,
+                           caption="Warm pop."))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+
+    project_path = Path(srv.root) / "projects" / pid / "project.json"
+    track_dir = project_path.parent / "track"
+    mastered_mp3 = track_dir / "song.mastered.mp3"
+    fake_result = sr.SongResult(
+        wav=track_dir / "song.wav", mastered_wav=track_dir / "song.mastered.wav",
+        mp3=track_dir / "song.mp3", mastered_mp3=mastered_mp3,
+        duration=15.0, transcript="ла ла ла", sections=_FAKE_SONG_SECTIONS, undersung=False)
+
+    def fake_run_song(track_dir_arg, lyrics, caption, duration, *, seed, **kw):
+        mastered_mp3.parent.mkdir(parents=True, exist_ok=True)
+        mastered_mp3.write_bytes(_MP3_BYTES)
+        return fake_result
+
+    monkeypatch.setattr(sr, "run_song", fake_run_song)
+    job = q.claim(srv.queue_root)
+    code = worker.run_job(srv.queue_root, job, spawn=_caffeinate_spy([]), outdir=srv.root)
+    assert code == 0
+
+    awaiting = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert awaiting["track"]["mastered_mp3"] == str(mastered_mp3)
+    relative = "/media/" + str(mastered_mp3.relative_to(Path(srv.root))).replace("\\", "/")
+    status, _, body = _raw_request(srv, relative)
+    assert status == 200, body
+    assert body == _MP3_BYTES
+
+
+# == I2 (final review): cache-buster -- track/assembly carry a `v` field off real file mtimes =====
+
+
+def test_project_track_carries_a_cache_buster_v_once_the_mp3_exists(_serve, monkeypatch):
+    """I2 (final review): before this, a recomputed track/final showed the *old* bytes if a
+    browser's own cache still had the previous run under that exact `/media` URL -- "Пересчитать
+    трек" writes back onto the same `track/song.mastered.mp3` path every time. `GET
+    /api/projects/<id>` (and every route that hands a project back) must carry a version the page
+    can turn into `?v=` -- present only once the file this measures actually exists on disk.
+    """
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="song", scenes=None, lyrics=_TWO_SECTION_LYRICS,
+                           caption="Warm pop."))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    detail = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert "v" not in detail["track"], "no mp3 exists yet -- no version to fabricate"
+
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+    project_path = Path(srv.root) / "projects" / pid / "project.json"
+    track_dir = project_path.parent / "track"
+    mastered_mp3 = track_dir / "song.mastered.mp3"
+    fake_result = sr.SongResult(
+        wav=track_dir / "song.wav", mastered_wav=track_dir / "song.mastered.wav",
+        mp3=track_dir / "song.mp3", mastered_mp3=mastered_mp3,
+        duration=15.0, transcript="ла ла ла", sections=_FAKE_SONG_SECTIONS, undersung=False)
+
+    def fake_run_song(track_dir_arg, lyrics, caption, duration, *, seed, **kw):
+        mastered_mp3.parent.mkdir(parents=True, exist_ok=True)
+        mastered_mp3.write_bytes(_MP3_BYTES)
+        return fake_result
+
+    monkeypatch.setattr(sr, "run_song", fake_run_song)
+    job = q.claim(srv.queue_root)
+    code = worker.run_job(srv.queue_root, job, spawn=_caffeinate_spy([]), outdir=srv.root)
+    assert code == 0
+
+    awaiting = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert isinstance(awaiting["track"]["v"], int)
+    assert awaiting["track"]["v"] == int(mastered_mp3.stat().st_mtime)
+
+
+def test_project_assembly_carries_a_cache_buster_v_once_final_exists(_serve, monkeypatch):
+    """The other half: `assembly.final_path` -- "Пересчитать сборку" writes back onto the same
+    `assembly/final.mp4` every time, the exact case `MEDIA_MAX_AGE`'s own year-long cache cannot
+    tell apart from a first render on its own.
+    """
+    srv = _serve()
+    sid = _new_session_with_project(srv, _project_body(kind="video", scenes=_VIDEO_SCENES))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+
+    spawn = _scene_hook_spawn()
+    for expected_idx in (0, 1):
+        job = q.claim(srv.queue_root)
+        _write_fake_clip(job)
+        code = worker.run_job(srv.queue_root, job, spawn=spawn, outdir=srv.root)
+        assert code == 0
+
+    def fake_assemble_run(project_path, *, run=None):
+        proj = project_module.load_project(project_path)
+        final = proj.path.parent / "assembly" / "final.mp4"
+        final.parent.mkdir(parents=True, exist_ok=True)
+        final.write_bytes(b"fake final mp4")
+        proj.update_assembly(final_path=str(final))
+        proj.set_stage_status("assembly", "done")
+        return final
+
+    monkeypatch.setattr(assemble_module, "run", fake_assemble_run)
+    assemble_job = q.claim(srv.queue_root)
+    code = worker.run_job(srv.queue_root, assemble_job, spawn=_caffeinate_spy([]), outdir=srv.root)
+    assert code == 0
+
+    done = srv.get_json(f"/api/projects/{pid}")["project"]
+    final_path = Path(done["assembly"]["final_path"])
+    assert isinstance(done["assembly"]["v"], int)
+    assert done["assembly"]["v"] == int(final_path.stat().st_mtime)
+
+
 # == Full lifecycle: video project (mock queue + worker) ==========================================
 
 
@@ -761,7 +982,8 @@ def test_clip_project_with_an_imported_track_builds_scenes_after_track_approval(
     assert approved_track["advance"]["action"] == "submitted_scene"
     scenes = approved_track["project"]["scenes"]
     assert len(scenes) >= 1
-    assert sum(s["duration"] for s in scenes) == pytest.approx(16.0, abs=0.05)
+    _assert_scene_total_within_snap_tolerance(scenes, 16.0)
+    _assert_scene_durations_on_h3_grid(scenes)
 
     jobs, _broken = q.scan(srv.queue_root)
     pending = [j for j in jobs if j.state == "pending"]
@@ -849,6 +1071,43 @@ def test_retry_track_after_approval_is_refused(_serve, monkeypatch):
 
     status, payload = srv.post_json_raw(f"/api/projects/{pid}/track/retry", {})
     assert (status, payload["error"]["code"]) == (409, "project_stage_not_ready")
+
+
+# -- I1 (final review): a failed song job can be retried, not stuck forever ----------------------
+
+
+def test_retry_track_after_a_failed_song_job_is_allowed(_serve, monkeypatch):
+    """Before I1's own worker fix, a crashing song job left `stages.track` at `"draft"` -- this
+    route already allowed a retry from there, so the bug was invisible from this side alone; what
+    proves the fix end to end is that `stages.track` genuinely reaches `"failed"` (not `"draft"`)
+    after the crash, *and* this route still accepts a retry from it.
+    """
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="song", scenes=None, lyrics=_TWO_SECTION_LYRICS))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+
+    def boom(*a, **kw):
+        raise sr.SongRunError("Music3 exploded")
+
+    monkeypatch.setattr(sr, "run_song", boom)
+    job = q.claim(srv.queue_root)
+    assert job.kind == q.KIND_SONG
+    code = worker.run_job(srv.queue_root, job, spawn=_caffeinate_spy([]), outdir=srv.root)
+    assert code == 1
+
+    failed = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert failed["stages"]["track"] == "failed"
+
+    retried = srv.post_json(f"/api/projects/{pid}/track/retry", {})
+    assert "job_id" in retried["submit"]
+    assert retried["project"]["stages"]["track"] == "running"
+
+    jobs, _broken = q.scan(srv.queue_root)
+    pending = [j for j in jobs if j.state == "pending"]
+    assert len(pending) == 1
+    assert pending[0].kind == q.KIND_SONG
 
 
 def test_retry_track_resubmits_a_song_job_and_marks_the_stage_running(_serve, monkeypatch):
