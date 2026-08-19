@@ -331,6 +331,18 @@ def _ffprobe_duration(mp3_path, *, run) -> float:
             from exc
 
 
+def probe_duration(mp3_path, *, run=subprocess.run) -> float:
+    """`_ffprobe_duration`, exported: Task 4 ("Сюжет клипа" wave)'s own `web._submit_project_song_
+    job` reads an *already-uploaded* import's own file length this way, before its song job ever
+    runs, to price that job's wall-clock estimate honestly (`h3_48gb.worker.align_job_wallclock_
+    estimate_seconds`) instead of `song_job_wallclock_estimate_seconds`'s lyric-section formula,
+    which has nothing to do with an align-only job's actual cost. A thin public wrapper rather than
+    a second implementation, so both callers -- `align_track` itself and this one -- read the exact
+    same number for the exact same file.
+    """
+    return _ffprobe_duration(mp3_path, run=run)
+
+
 def to_mp3(src_wav, dst_mp3, *, run=subprocess.run) -> Path:
     """`src_wav` encoded to `dst_mp3` (`libmp3lame -q:a 1` -- the task brief's exact codec/quality
     choice). Called twice per song (design spec, "Трек": "оба файла сохраняются") -- once for the

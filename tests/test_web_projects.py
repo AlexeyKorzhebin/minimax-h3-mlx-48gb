@@ -21,17 +21,20 @@ Three rules repeat from `tests/test_web.py`/`tests/test_chat_web.py`:
   3": stored without validating its shape).
 """
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from h3_48gb import assemble as assemble_module
 from h3_48gb import project as project_module
+from h3_48gb import provider
 from h3_48gb import queue as q
 from h3_48gb import songrun as sr
 from h3_48gb import web
 from h3_48gb import worker
-from test_chat_web import _serve  # noqa: F401 -- reused fixture, see its own module docstring
+from _fake_llama import _FakeLlama
+from test_chat_web import _external, _serve  # noqa: F401 -- reused, see test_chat_web's own docstring
 from test_web import _request as _raw_request  # bytes-in/bytes-out, for /media -- see C2 tests
 from test_worker import _caffeinate_spy, _scene_hook_spawn
 
@@ -495,6 +498,31 @@ def _new_session_with_project(srv, project: dict) -> str:
     return sid
 
 
+def _clip_project_with_approved_track(srv, monkeypatch, *, duration=16.0) -> str:
+    """A `kind="clip"` project (lyrics given, `track_source="generate"`) taken all the way through
+    `approve/script` and a faked `songrun.run_song` to `stages.track == "approved"` -- the shared
+    starting point every scenario-gate test below needs (task 4, "Сюжет клипа" wave): `stages.
+    scenario` sits at `"draft"`, `scenario_scenes` is `[]`, and `track.duration == duration`, ready
+    for `/scenario/generate`/`PUT /scenario`/`approve/scenario`.
+    """
+    sid = _new_session_with_project(
+        srv, _project_body(kind="clip", scenes=None, lyrics=_TWO_SECTION_LYRICS,
+                           caption="Warm pop."))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+    fake_result = sr.SongResult(
+        wav=Path("song.wav"), mastered_wav=Path("song.mastered.wav"), mp3=Path("song.mp3"),
+        mastered_mp3=Path("song.mastered.mp3"), duration=duration, transcript="ла ла ла",
+        sections=[{"name": "verse", "start": 0.0, "end": duration}], undersung=False)
+    monkeypatch.setattr(sr, "run_song", lambda *a, **kw: fake_result)
+    job = q.claim(srv.queue_root)
+    assert job.kind == q.KIND_SONG
+    code = worker.run_job(srv.queue_root, job, spawn=_caffeinate_spy([]), outdir=srv.root)
+    assert code == 0
+    srv.post_json(f"/api/projects/{pid}/approve/track", {})
+    return pid
+
+
 _VIDEO_SCENES = [
     {"prompt": "integrated_multimodal_description: [Shot 1] scene one\n\n"
               "overall_soundscape: quiet\n\nnon_diegetic_music: none",
@@ -805,6 +833,41 @@ def test_approve_script_for_an_imported_clip_with_no_lyrics_submits_a_song_job(_
     assert pending[0].kind == q.KIND_SONG
 
 
+def test_approve_script_for_an_imported_clip_estimates_the_song_job_from_the_files_own_duration(
+        _serve, tmp_path):
+    """Task 4 ("Сюжет клипа" wave): an imported track's own song job only ever runs Whisper
+    transcription (`songrun.align_track`), never Music3 generation -- pricing it with `song_job_
+    wallclock_estimate_seconds` (task 1 report, "сомнение 2": a flat 15s no matter how long the
+    file actually runs) was dishonest. `worker.align_job_wallclock_estimate_seconds` reads the
+    uploaded file's own real `ffprobe` duration instead -- a real ffmpeg-encoded mp3, not the
+    garbage `_MP3_BYTES` placeholder every other test here uploads, since a real duration is
+    exactly the thing under test.
+    """
+    srv = _serve()
+    wav = tmp_path / "sine.wav"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=45", str(wav)], check=True,
+                   capture_output=True)
+    mp3 = tmp_path / "sine.mp3"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(wav), str(mp3)], check=True,
+                   capture_output=True)
+    upload = srv.upload_raw(mp3.read_bytes(), "song.mp3")[1]
+    pid = srv.post_json(
+        "/api/projects",
+        {"kind": "clip", "track_source": "import", "track_path": upload["path"]})["id"]
+    approved = srv.post_json(f"/api/projects/{pid}/approve/script", {})
+    assert "job_id" in approved["submit"]
+
+    jobs, _broken = q.scan(srv.queue_root)
+    pending = [j for j in jobs if j.state == "pending"]
+    assert len(pending) == 1
+    seconds = pending[0].estimate["seconds"]
+    # ~45s * ALIGN_WALLCLOCK_FACTOR (~1/15) + a 5s pad = ~8s -- nowhere near the flat 15.0s the
+    # old lyrics-based formula gave an empty-lyric import, and nowhere near a *generated* take's
+    # own price either (song_job_wallclock_estimate_seconds("") alone would answer exactly 15.0).
+    assert 5.0 < seconds < 15.0
+
+
 def test_approve_track_for_a_video_project_is_refused_explicitly(_serve):
     """M3 (fix round 1, 2026-08-19 review): `stage='track'` never legitimately applies to
     `kind='video'` -- script approval for a video project never submits a song job, so
@@ -827,12 +890,18 @@ def test_approve_track_for_a_video_project_is_refused_explicitly(_serve):
 # == C1: a failed side effect must not leave a stage stuck "approved" =============================
 
 
-def test_approve_track_survives_a_failed_scene_build_and_can_be_retried(_serve):
-    """C1 (fix round 1, 2026-08-19 review): `approve_stage` must run *after* `build_clip_scenes`
-    actually succeeds, not before it. Before this fix, a failed build left `stages.track` stuck
-    `"approved"` forever with no scenes ever built and no way back in -- a repeat `approve/track`
-    answered 409 (the stage was no longer `awaiting_approval`), and there is no separate "retry the
-    track build" endpoint, only `scenes/<idx>/retry`, which needs a scene to already exist.
+def test_approve_track_for_a_migrated_project_survives_a_failed_scene_build_and_can_be_retried(
+        _serve):
+    """C1 (fix round 1, 2026-08-19 review), still exercised at `approve/track` **for the
+    migration case only** (task 4, "Сюжет клипа" wave): `approve_stage` must run *after*
+    `build_clip_scenes` actually succeeds, not before it, for the one clip project shape that
+    still builds scenes straight off `approve/track` -- a `project.json` written before the
+    scenario stage existed (`stages.scenario` migrated to `"approved"` on load, `scenario_scenes`
+    still empty; see `_approve_project_stage`'s own docstring). Before the original C1 fix, a
+    failed build left `stages.track` stuck `"approved"` forever with no scenes ever built and no
+    way back in -- a repeat `approve/track` answered 409 (the stage was no longer `awaiting_
+    approval`), and there is no separate "retry the track build" endpoint, only `scenes/<idx>/
+    retry`, which needs a scene to already exist.
     """
     srv = _serve()
     sid = _new_session_with_project(
@@ -841,10 +910,15 @@ def test_approve_track_survives_a_failed_scene_build_and_can_be_retried(_serve):
     pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
     project_path = Path(srv.root) / "projects" / pid / "project.json"
     proj = project_module.load_project(project_path)
+    # Force the migration shape by hand: a fresh project's own `stages.scenario` starts "draft",
+    # never "approved" this early -- only a `project.json` written before the scenario stage
+    # existed reaches `approve/track`'s old procedural branch, and there is no ordinary route that
+    # produces one in a fresh test project.
+    proj.set_stage_status("scenario", "approved")
     # No `duration` set yet -- `build_clip_scenes` must refuse (the worker normally sets it,
     # Task 3's I4; forcing the gate open by hand is the only way to reach this state through the
-    # routes, same technique `test_approve_track_for_a_clip_project_with_an_unmeasured_track_is_
-    # refused_honestly` already uses).
+    # routes, same technique `test_approve_scenario_for_a_clip_project_with_an_unmeasured_track_
+    # is_refused_honestly` already uses).
     proj.set_stage_status("track", "awaiting_approval")
 
     status, payload = srv.post_json_raw(f"/api/projects/{pid}/approve/track", {})
@@ -861,6 +935,68 @@ def test_approve_track_survives_a_failed_scene_build_and_can_be_retried(_serve):
     proj2.update_track(duration=8.0, sections=[{"name": "verse", "start": 0.0, "end": None}])
     retried = srv.post_json(f"/api/projects/{pid}/approve/track", {})
     assert retried["project"]["stages"]["track"] == "approved"
+    assert retried["advance"]["action"] == "submitted_scene"
+    assert len(retried["project"]["scenes"]) >= 1
+
+
+def test_approve_track_for_a_fresh_clip_project_never_builds_scenes(_serve):
+    """Task 4, "Сюжет клипа" wave: the *ordinary* (non-migrated) case, the mirror image of the
+    test above -- a fresh clip project's `stages.scenario` starts `"draft"`, so `approve/track`
+    takes the other branch entirely: no `build_clip_scenes` call at all, no `advance`, `scenes`
+    stays `[]`. Approving `track` succeeds even with **no measured `duration`**, because nothing
+    here reads it any more -- that check moved to the scenario gate (`_scenario_gate_project`,
+    `approve/scenario`).
+    """
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="clip", scenes=None, lyrics=_TWO_SECTION_LYRICS,
+                           caption="Warm pop."))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    proj = project_module.load_project(Path(srv.root) / "projects" / pid / "project.json")
+    proj.set_stage_status("track", "awaiting_approval")
+
+    approved = srv.post_json(f"/api/projects/{pid}/approve/track", {})
+    assert "advance" not in approved
+    assert approved["project"]["stages"]["track"] == "approved"
+    assert approved["project"]["stages"]["scenario"] == "draft"
+    assert approved["project"]["scenes"] == []
+
+
+def test_approve_scenario_survives_a_failed_scene_build_and_can_be_retried(_serve, monkeypatch):
+    """C1's own new home (task 4, "Сюжет клипа" wave): scene-building moved from `approve/track`
+    to `approve/scenario` for every ordinary (non-migrated) clip project, so the same "side effect
+    before `approve_stage`" discipline has to hold there now. A scenario whose sections do not
+    actually tile the track (forced by hand -- the only way to reach this state without a real
+    LLM reply that disagrees with its own gate's later validation) must leave `stages.scenario`
+    retryable, not stuck `"approved"` with no scenes and no way back in.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    project_path = Path(srv.root) / "projects" / pid / "project.json"
+    proj = project_module.load_project(project_path)
+    # A scenario that covers only half the track -- `_validate_scenario_scenes` (the honest
+    # routes) would refuse this outright, so reaching `approve/scenario` with it on file needs a
+    # direct write, bypassing `PUT /scenario`'s own validation entirely.
+    proj.update_scenario(scenario_scenes=[
+        {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "prompt A", "duration": 8.0}])
+    proj.set_stage_status("scenario", "awaiting_approval")
+
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/approve/scenario", {})
+    assert (status, payload["error"]["code"]) == (400, "project_scene_build_failed"), payload
+
+    stuck = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert stuck["stages"]["scenario"] == "awaiting_approval", (
+        "a failed build must not leave the project stuck 'approved' with no scenes and no retry "
+        "path -- the same gate must still be open")
+    assert stuck["scenes"] == []
+
+    # Fix the scenario (a full-coverage one this time) and retry the *same* gate.
+    proj2 = project_module.load_project(project_path)
+    proj2.update_scenario(scenario_scenes=[
+        {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "prompt A", "duration": 8.0},
+        {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "prompt B", "duration": 8.0}])
+    retried = srv.post_json(f"/api/projects/{pid}/approve/scenario", {})
+    assert retried["project"]["stages"]["scenario"] == "approved"
     assert retried["advance"]["action"] == "submitted_scene"
     assert len(retried["project"]["scenes"]) >= 1
 
@@ -1123,11 +1259,15 @@ def test_video_project_full_lifecycle(_serve, monkeypatch):
     assert done["assembly"]["final_path"] == str(assembled["path"])
 
 
-# == Full lifecycle: clip project with an imported track ==========================================
+# == Full lifecycle: clip project with an imported track, through the scenario gate ===============
 
 
-def test_clip_project_with_an_imported_track_builds_scenes_after_track_approval(_serve,
-                                                                                 monkeypatch):
+def test_clip_project_with_an_imported_track_goes_through_the_scenario_gate(_serve, monkeypatch):
+    """Task 4 ("Сюжет клипа" wave)'s own rewrite of this lifecycle test: `approve/track` no longer
+    builds scenes for an ordinary clip project -- it only unblocks the scenario gate. Scenes are
+    built at `approve/scenario` instead, once a scenario (here, the `{"procedural": true}`
+    fallback -- no LLM needed) has been generated and approved.
+    """
     srv = _serve()
     upload = srv.upload_raw(_MP3_BYTES, "song.mp3")[1]
     sid = _new_session_with_project(
@@ -1158,8 +1298,24 @@ def test_clip_project_with_an_imported_track_builds_scenes_after_track_approval(
     assert code == 0
 
     approved_track = srv.post_json(f"/api/projects/{pid}/approve/track", {})
-    assert approved_track["advance"]["action"] == "submitted_scene"
-    scenes = approved_track["project"]["scenes"]
+    assert "advance" not in approved_track, (
+        "task 4: approve/track for an ordinary clip project no longer builds scenes")
+    assert approved_track["project"]["scenes"] == []
+    assert approved_track["project"]["stages"]["scenario"] == "draft"
+
+    generated = srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+    assert generated["project"]["stages"]["scenario"] == "awaiting_approval"
+    scenario_scenes = generated["project"]["scenario_scenes"]
+    assert scenario_scenes
+    assert scenario_scenes[0]["start"] == pytest.approx(0.0)
+    assert scenario_scenes[-1]["end"] == pytest.approx(16.0)
+    assert generated["project"]["scenario_style_block"] is None, (
+        "the procedural fallback bakes its style clause into each prompt directly -- a separate "
+        "style_block here would glue the clause on a second time at approve/scenario")
+
+    approved_scenario = srv.post_json(f"/api/projects/{pid}/approve/scenario", {})
+    assert approved_scenario["advance"]["action"] == "submitted_scene"
+    scenes = approved_scenario["project"]["scenes"]
     assert len(scenes) >= 1
     _assert_scene_total_within_snap_tolerance(scenes, 16.0)
     _assert_scene_durations_on_h3_grid(scenes)
@@ -1170,21 +1326,468 @@ def test_clip_project_with_an_imported_track_builds_scenes_after_track_approval(
     assert pending[0].note == assemble_module.scene_note(pid, 0)
 
 
-def test_approve_track_for_a_clip_project_with_an_unmeasured_track_is_refused_honestly(_serve):
-    """Defensive: a track cannot reach `awaiting_approval` without `duration` being set (the
-    worker always writes it, Task 3's I4), but if it somehow did, `build_clip_scenes` refuses with
-    a named code rather than a 500 -- checked here directly against the project's own methods,
-    since there is no ordinary way to reach this state through the routes alone.
+def test_approve_scenario_for_a_clip_project_with_an_unmeasured_track_is_refused_honestly(_serve):
+    """Defensive: a track cannot reach `stages.track == "approved"` without `duration` being set
+    (the worker always writes it, Task 3's I4), but if it somehow did, `build_clip_scenes` refuses
+    with a named code rather than a 500 -- checked here directly against the project's own methods
+    (task 4 moved this check from `approve/track` to `approve/scenario`, along with scene
+    building itself), since there is no ordinary way to reach this state through the routes alone.
     """
     srv = _serve()
     sid = _new_session_with_project(
         srv, _project_body(kind="clip", scenes=None, lyrics=_TWO_SECTION_LYRICS))
     pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
     proj = project_module.load_project(Path(srv.root) / "projects" / pid / "project.json")
-    proj.set_stage_status("track", "awaiting_approval")
+    proj.update_scenario(scenario_scenes=[
+        {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "x", "duration": 8.0}])
+    proj.set_stage_status("scenario", "awaiting_approval")
 
-    status, payload = srv.post_json_raw(f"/api/projects/{pid}/approve/track", {})
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/approve/scenario", {})
     assert (status, payload["error"]["code"]) == (400, "project_scene_build_failed"), payload
+
+
+# == Task 4 ("Сюжет клипа" wave): the scenario gate itself =========================================
+#
+# `POST .../scenario/generate` (LLM or `{"procedural": true}`), `PUT .../scenario` (hand edits)
+# and `approve/scenario` (its full-lifecycle happy path already covered above, plus its own C1 and
+# "unmeasured track" tests) -- gates, validation, the LLM round trip through the same `_FakeLlama`
+# mock `tests/test_chat_web.py` already uses, and the migration path for a `project.json` written
+# before this stage existed.
+
+
+def _scenario_section(tag, start, end, prompt, duration=8):
+    return {"tag": tag, "start": start, "end": end, "scene": {"prompt": prompt, "duration": duration}}
+
+
+def _scenario_turn_payload(sections, style_block="A neon-lit stage, warm haze, handheld camera."):
+    scenario = {"sections": sections, "style_block": style_block}
+    return {"choices": [{"message": {"content": json.dumps(
+        {"reply": "вот сюжет", "scenario": scenario})}}]}
+
+
+# -- gates: kind, track approval, scenario's own current status ----------------------------------
+
+
+def test_generate_scenario_for_a_video_project_is_refused(_serve):
+    srv = _serve()
+    sid = _new_session_with_project(srv, _project_body(kind="video", scenes=_VIDEO_SCENES))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/scenario/generate", {})
+    assert (status, payload["error"]["code"]) == (409, "project_stage_not_ready")
+
+
+def test_generate_scenario_before_track_is_approved_is_refused(_serve):
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="clip", scenes=None, lyrics=_TWO_SECTION_LYRICS))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/scenario/generate", {})
+    assert (status, payload["error"]["code"]) == (409, "project_stage_not_ready")
+
+
+def test_generate_scenario_after_the_scenario_gate_is_approved_is_refused(_serve, monkeypatch):
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+    srv.post_json(f"/api/projects/{pid}/approve/scenario", {})
+
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/scenario/generate", {})
+    assert (status, payload["error"]["code"]) == (409, "project_stage_not_ready")
+
+
+def test_edit_scenario_for_a_video_project_is_refused(_serve):
+    srv = _serve()
+    sid = _new_session_with_project(srv, _project_body(kind="video", scenes=_VIDEO_SCENES))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    status, payload = srv._request("PUT", f"/api/projects/{pid}/scenario", {"scenario_scenes": []})
+    assert (status, payload["error"]["code"]) == (409, "project_stage_not_ready")
+
+
+def test_edit_scenario_after_approval_is_refused_with_its_own_code(_serve, monkeypatch):
+    """The one refusal `PUT /scenario` names differently from `/scenario/generate`'s own
+    `project_stage_not_ready` for the identical state -- task 4 brief, verbatim: "409
+    scenario_already_approved после утверждения"."""
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+    srv.post_json(f"/api/projects/{pid}/approve/scenario", {})
+
+    status, payload = srv._request(
+        "PUT", f"/api/projects/{pid}/scenario",
+        {"scenario_scenes": [{"tag": "verse", "start": 0.0, "end": 16.0, "prompt": "x",
+                              "duration": 8.0}]})
+    assert (status, payload["error"]["code"]) == (409, "scenario_already_approved"), payload
+
+
+# -- procedural fallback ("сюжет без LLM") --------------------------------------------------------
+
+
+def test_generate_scenario_procedural_needs_no_provider_at_all(_serve, monkeypatch):
+    """`{"procedural": true}` never touches `provider`/`ensure_up` -- an empty roster (no
+    `providers.json` at all) must not stand in its way, unlike the LLM path."""
+    srv = _serve(roster=False)
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    generated = srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+    assert generated["project"]["stages"]["scenario"] == "awaiting_approval"
+    scenes = generated["project"]["scenario_scenes"]
+    assert scenes[0]["start"] == pytest.approx(0.0)
+    assert scenes[-1]["end"] == pytest.approx(16.0)
+    for scene in scenes:
+        assert scene["end"] - scene["start"] >= web.SCENE_MIN_SECONDS - 0.01
+
+
+def test_generate_scenario_procedural_rejects_a_bad_procedural_type(_serve, monkeypatch):
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch)
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/scenario/generate",
+                                        {"procedural": "yes"})
+    assert (status, payload["error"]["code"]) == (400, "args_invalid")
+
+
+# -- the LLM round trip ----------------------------------------------------------------------------
+
+
+def test_generate_scenario_from_an_llm_reply_opens_the_gate(_serve, monkeypatch):
+    fake = _FakeLlama(chat_payload=_scenario_turn_payload([
+        _scenario_section("verse", 0.0, 8.0, "[Shot 1] wide shot, dusk street."),
+        _scenario_section("chorus", 8.0, 16.0, "[Shot 1] rooftop, fireworks."),
+    ]))
+    try:
+        srv = _serve(providers_port=fake.port)
+        pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+        generated = srv.post_json(f"/api/projects/{pid}/scenario/generate", {})
+    finally:
+        fake.close()
+
+    assert generated["project"]["stages"]["scenario"] == "awaiting_approval"
+    scenes = generated["project"]["scenario_scenes"]
+    assert len(scenes) == 2
+    assert scenes[0] == {"tag": "verse", "start": 0.0, "end": 8.0,
+                         "prompt": "[Shot 1] wide shot, dusk street.", "duration": 8.0}
+    assert generated["project"]["scenario_style_block"].startswith("A neon-lit stage")
+
+    (req,) = fake.requests
+    assert req["body"]["response_format"]["json_schema"] == provider.SCENARIO_SCHEMA
+
+
+def test_generate_scenario_sends_lyrics_when_they_are_non_empty(_serve, monkeypatch):
+    fake = _FakeLlama(chat_payload=_scenario_turn_payload([
+        _scenario_section("verse", 0.0, 16.0, "a"),
+    ]))
+    try:
+        srv = _serve(providers_port=fake.port)
+        pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+        srv.post_json(f"/api/projects/{pid}/scenario/generate", {})
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    user_message = req["body"]["messages"][-1]["content"]
+    assert "lyrics:" in user_message
+    assert _TWO_SECTION_LYRICS.strip() in user_message
+    assert "raw transcript" not in user_message
+
+
+def test_generate_scenario_sends_the_auto_transcript_when_there_are_no_lyrics(_serve, monkeypatch):
+    """Task 4 brief, verbatim: "lyrics непустая -> она; иначе lyrics_auto" -- an imported track
+    with no reference lyrics sends its raw Whisper segments instead."""
+    fake = _FakeLlama(chat_payload=_scenario_turn_payload([
+        _scenario_section("scene-0", 0.0, 10.0, "a"),
+    ]))
+    try:
+        srv = _serve(providers_port=fake.port)
+        upload = srv.upload_raw(_MP3_BYTES, "song.mp3")[1]
+        pid = srv.post_json(
+            "/api/projects",
+            {"kind": "clip", "track_source": "import", "track_path": upload["path"]})["id"]
+        srv.post_json(f"/api/projects/{pid}/approve/script", {})
+        imported_mp3 = Path(upload["path"])
+        fake_result = sr.SongResult(
+            wav=imported_mp3, mastered_wav=imported_mp3, mp3=imported_mp3,
+            mastered_mp3=imported_mp3, duration=10.0,
+            transcript="hello there my friend", sections=[], undersung=False,
+            raw_segments=[{"start": 0.0, "end": 4.0, "text": "hello there"},
+                         {"start": 4.0, "end": 10.0, "text": "my friend"}])
+        monkeypatch.setattr(sr, "align_track", lambda *a, **kw: fake_result)
+        job = q.claim(srv.queue_root)
+        worker.run_job(srv.queue_root, job, spawn=_caffeinate_spy([]), outdir=srv.root)
+        srv.post_json(f"/api/projects/{pid}/approve/track", {})
+
+        srv.post_json(f"/api/projects/{pid}/scenario/generate", {})
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    user_message = req["body"]["messages"][-1]["content"]
+    assert "raw transcript with timestamps" in user_message
+    assert "hello there" in user_message
+    assert "lyrics:" not in user_message
+
+
+def test_generate_scenario_with_nothing_to_write_from_is_refused(_serve, monkeypatch):
+    """An instrumental import: Whisper transcribed nothing, and there was never any reference
+    lyrics either -- `scenario_no_lyrics`, not a 502 from a provider that was never even called."""
+    srv = _serve()
+    upload = srv.upload_raw(_MP3_BYTES, "song.mp3")[1]
+    pid = srv.post_json(
+        "/api/projects",
+        {"kind": "clip", "track_source": "import", "track_path": upload["path"]})["id"]
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+    imported_mp3 = Path(upload["path"])
+    fake_result = sr.SongResult(
+        wav=imported_mp3, mastered_wav=imported_mp3, mp3=imported_mp3, mastered_mp3=imported_mp3,
+        duration=10.0, transcript="", sections=[], undersung=False, raw_segments=[])
+    monkeypatch.setattr(sr, "align_track", lambda *a, **kw: fake_result)
+    job = q.claim(srv.queue_root)
+    worker.run_job(srv.queue_root, job, spawn=_caffeinate_spy([]), outdir=srv.root)
+    srv.post_json(f"/api/projects/{pid}/approve/track", {})
+
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/scenario/generate", {})
+    assert (status, payload["error"]["code"]) == (400, "scenario_no_lyrics"), payload
+
+
+def test_generate_scenario_provider_unavailable(_serve, monkeypatch):
+    srv = _serve(roster=False)
+    pid = _clip_project_with_approved_track(srv, monkeypatch)
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/scenario/generate", {})
+    assert (status, payload["error"]["code"]) == (409, "provider_unavailable"), payload
+
+
+def test_generate_scenario_with_no_provider_listening_answers_chat_unreachable(_serve,
+                                                                                monkeypatch):
+    """An external (`type: "openai"`) provider on a closed port -- not a `llama-local` one, whose
+    `ensure_up` would spend up to 90s spawning and polling before giving up with a *different*
+    code (`llama_did_not_start`); this is `test_chat_web.py`'s own
+    `test_a_provider_that_does_not_answer_keeps_its_own_code_at_the_http_boundary` shape, reused
+    here for the same fast, deterministic `chat_unreachable`."""
+    srv = _serve(providers=_external(1), active="openrouter")  # port 1: nobody ever listens there
+    pid = _clip_project_with_approved_track(srv, monkeypatch)
+    status, payload = srv.post_json_raw(f"/api/projects/{pid}/scenario/generate", {})
+    assert (status, payload["error"]["code"]) == (502, "chat_unreachable"), payload
+
+
+def test_generate_scenario_refuses_a_malformed_llm_reply_as_bad_model_json(_serve, monkeypatch):
+    fake = _FakeLlama(chat_payload={"choices": [{"message": {"content": json.dumps(
+        {"reply": "не смог", "scenario": None})}}]})
+    try:
+        srv = _serve(providers_port=fake.port)
+        pid = _clip_project_with_approved_track(srv, monkeypatch)
+        status, payload = srv.post_json_raw(f"/api/projects/{pid}/scenario/generate", {})
+    finally:
+        fake.close()
+    assert (status, payload["error"]["code"]) == (502, "bad_model_json"), payload
+    detail = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert detail["stages"]["scenario"] == "draft", "a bad reply must not open the gate"
+
+
+# -- the python validation jsonschema/grammar-constrained decoding cannot express -----------------
+
+
+def test_generate_scenario_refuses_a_gap_in_coverage(_serve, monkeypatch):
+    fake = _FakeLlama(chat_payload=_scenario_turn_payload([
+        _scenario_section("verse", 0.0, 7.0, "a"),
+        _scenario_section("chorus", 8.0, 16.0, "b"),  # 1s gap between the two
+    ]))
+    try:
+        srv = _serve(providers_port=fake.port)
+        pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+        status, payload = srv.post_json_raw(f"/api/projects/{pid}/scenario/generate", {})
+    finally:
+        fake.close()
+    assert (status, payload["error"]["code"]) == (400, "scenario_invalid"), payload
+    assert payload["error"]["detail"]["reason"] == "gap_or_overlap"
+    detail = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert detail["stages"]["scenario"] == "draft", "invalid content must not open the gate"
+
+
+def test_generate_scenario_refuses_an_overlap_in_coverage(_serve, monkeypatch):
+    fake = _FakeLlama(chat_payload=_scenario_turn_payload([
+        _scenario_section("verse", 0.0, 9.0, "a"),
+        _scenario_section("chorus", 8.0, 16.0, "b"),  # overlaps the verse by 1s
+    ]))
+    try:
+        srv = _serve(providers_port=fake.port)
+        pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+        status, payload = srv.post_json_raw(f"/api/projects/{pid}/scenario/generate", {})
+    finally:
+        fake.close()
+    assert (status, payload["error"]["code"]) == (400, "scenario_invalid"), payload
+    assert payload["error"]["detail"]["reason"] == "gap_or_overlap"
+
+
+def test_generate_scenario_refuses_a_section_shorter_than_five_seconds(_serve, monkeypatch):
+    fake = _FakeLlama(chat_payload=_scenario_turn_payload([
+        _scenario_section("verse", 0.0, 3.0, "a"),
+        _scenario_section("chorus", 3.0, 16.0, "b"),
+    ]))
+    try:
+        srv = _serve(providers_port=fake.port)
+        pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+        status, payload = srv.post_json_raw(f"/api/projects/{pid}/scenario/generate", {})
+    finally:
+        fake.close()
+    assert (status, payload["error"]["code"]) == (400, "scenario_invalid"), payload
+    assert payload["error"]["detail"]["reason"] == "section_too_short"
+    assert payload["error"]["detail"]["index"] == 0
+
+
+# -- PUT /scenario: hand edits, the same validation on every call ---------------------------------
+
+
+def test_edit_scenario_updates_prompts_durations_and_the_style_block(_serve, monkeypatch):
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+
+    status, edited = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "hand-edited prompt A",
+             "duration": 6.0},
+            {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "hand-edited prompt B",
+             "duration": 7.0},
+        ],
+        "style_block": "A single lantern-lit room.",
+    })
+    assert status == 200, edited
+    scenes = edited["project"]["scenario_scenes"]
+    assert scenes[0]["prompt"] == "hand-edited prompt A"
+    assert scenes[0]["duration"] == 6.0
+    assert scenes[1]["prompt"] == "hand-edited prompt B"
+    assert edited["project"]["scenario_style_block"] == "A single lantern-lit room."
+    # editing does not itself approve anything
+    assert edited["project"]["stages"]["scenario"] == "awaiting_approval"
+
+
+def test_edit_scenario_null_style_block_clears_it(_serve, monkeypatch):
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+    srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [{"tag": "verse", "start": 0.0, "end": 16.0, "prompt": "a",
+                             "duration": 8.0}],
+        "style_block": "not empty",
+    })
+
+    status, edited = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [{"tag": "verse", "start": 0.0, "end": 16.0, "prompt": "a",
+                             "duration": 8.0}],
+        "style_block": None,
+    })
+    assert status == 200, edited
+    assert edited["project"]["scenario_style_block"] is None
+
+
+def test_edit_scenario_omitting_style_block_leaves_it_unchanged(_serve, monkeypatch):
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+    srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [{"tag": "verse", "start": 0.0, "end": 16.0, "prompt": "a",
+                             "duration": 8.0}],
+        "style_block": "keep me",
+    })
+
+    status, edited = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [{"tag": "verse", "start": 0.0, "end": 16.0, "prompt": "b",
+                             "duration": 8.0}],
+    })
+    assert status == 200, edited
+    assert edited["project"]["scenario_style_block"] == "keep me"
+
+
+def test_edit_scenario_refuses_a_gap_the_same_way_generate_does(_serve, monkeypatch):
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+
+    status, payload = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 7.0, "prompt": "a", "duration": 6.0},
+            {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "b", "duration": 7.0},
+        ],
+    })
+    assert (status, payload["error"]["code"]) == (400, "scenario_invalid"), payload
+
+
+def test_edit_scenario_refuses_a_duration_outside_five_to_ten_seconds(_serve, monkeypatch):
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+
+    status, payload = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 16.0, "prompt": "a", "duration": 30.0},
+        ],
+    })
+    assert (status, payload["error"]["code"]) == (400, "scenario_invalid"), payload
+    assert payload["error"]["detail"]["reason"] == "duration_out_of_range"
+
+
+def test_edit_scenario_rejects_a_malformed_entry_as_args_invalid(_serve, monkeypatch):
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+
+    status, payload = srv._request(
+        "PUT", f"/api/projects/{pid}/scenario",
+        {"scenario_scenes": [{"tag": "verse", "start": 0.0, "prompt": "a", "duration": 8.0}]})
+    assert (status, payload["error"]["code"]) == (400, "args_invalid"), payload
+
+
+# -- migration: a project.json written before the scenario stage existed -------------------------
+
+
+def test_a_project_json_without_a_scenario_stage_migrates_to_approved_on_load(_serve):
+    """Task 3's own migration (`Project._apply`), exercised through the web layer: a `project.json`
+    hand-truncated to look like it predates this feature reads `stages.scenario == "approved"` --
+    never `"draft"` -- the moment it is loaded, in memory, with nothing written back to disk."""
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="clip", scenes=None, lyrics=_TWO_SECTION_LYRICS))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    project_path = Path(srv.root) / "projects" / pid / "project.json"
+    data = json.loads(project_path.read_text(encoding="utf-8"))
+    del data["stages"]["scenario"]
+    on_disk_before = project_path.read_text(encoding="utf-8")
+    project_path.write_text(json.dumps(data), encoding="utf-8")
+
+    detail = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert detail["stages"]["scenario"] == "approved"
+    # nothing was written back just from loading it
+    assert json.loads(project_path.read_text(encoding="utf-8"))["stages"].get("scenario") is None
+
+
+def test_a_migrated_clip_project_still_builds_scenes_straight_off_approve_track(_serve,
+                                                                                monkeypatch):
+    """The compatibility path task 4's own brief asks for by name: an old clip project (`scenario`
+    migrated to `"approved"`, `scenario_scenes` still empty) must not get stuck forever with no
+    route left that ever builds its scenes -- `approve/track` keeps the old procedural behaviour
+    for exactly this shape.
+    """
+    srv = _serve()
+    sid = _new_session_with_project(
+        srv, _project_body(kind="clip", scenes=None, lyrics=_TWO_SECTION_LYRICS,
+                           caption="Warm pop."))
+    pid = srv.post_json("/api/projects", {"session_id": sid})["id"]
+    project_path = Path(srv.root) / "projects" / pid / "project.json"
+    data = json.loads(project_path.read_text(encoding="utf-8"))
+    del data["stages"]["scenario"]
+    project_path.write_text(json.dumps(data), encoding="utf-8")
+
+    srv.post_json(f"/api/projects/{pid}/approve/script", {})
+    fake_result = sr.SongResult(
+        wav=Path("song.wav"), mastered_wav=Path("song.mastered.wav"), mp3=Path("song.mp3"),
+        mastered_mp3=Path("song.mastered.mp3"), duration=16.0, transcript="ла ла ла",
+        sections=[{"name": "verse", "start": 0.0, "end": 16.0}], undersung=False)
+    monkeypatch.setattr(sr, "run_song", lambda *a, **kw: fake_result)
+    job = q.claim(srv.queue_root)
+    worker.run_job(srv.queue_root, job, spawn=_caffeinate_spy([]), outdir=srv.root)
+
+    approved_track = srv.post_json(f"/api/projects/{pid}/approve/track", {})
+    assert approved_track["advance"]["action"] == "submitted_scene"
+    scenes = approved_track["project"]["scenes"]
+    assert len(scenes) >= 1
+    _assert_scene_total_within_snap_tolerance(scenes, 16.0)
+    # the scenario gate stays "approved" (the migration) throughout -- no scenario route involved
+    assert approved_track["project"]["stages"]["scenario"] == "approved"
 
 
 # == Retry: track (task 7's own small addition to the server, "Пересчитать трек") ================

@@ -280,6 +280,36 @@ def song_job_wallclock_estimate_seconds(lyrics: str) -> float:
     return songrun.estimate_duration(lyrics) * SONG_WALLCLOCK_FACTOR
 
 
+#: Measured fact ("Сюжет клипа" wave, task 4 brief): `mlx_whisper` transcribed a 45s track in
+#: roughly 3s wall clock on this machine -- an align-only `kind="song"` job (`track.source ==
+#: "import"`, `h3_48gb.songrun.align_track`) is dominated by that one step, not by anything
+#: proportional to a lyric section count the way a *generated* take is (`SONG_WALLCLOCK_FACTOR`
+#: above prices that job, and only that job -- Music3 generation never runs for an import at all).
+#: ~1/15th of the file's own length, not `SONG_WALLCLOCK_FACTOR`'s ~13x: the two numbers describe
+#: two different jobs, not two measurements of the same one.
+ALIGN_WALLCLOCK_FACTOR = 3.0 / 45.0
+
+#: Flat pad on top of `ALIGN_WALLCLOCK_FACTOR * <track duration>` -- `ffprobe`, process spawn, disk
+#: I/O around the transcription itself, fixed cost independent of the file's own length.
+ALIGN_WALLCLOCK_PAD_SECONDS = 5.0
+
+
+def align_job_wallclock_estimate_seconds(track_duration_seconds: float) -> float:
+    """How long a `kind="song"` job is expected to take **to run** for `track.source == "import"`
+    -- the Whisper-only path (`h3_48gb.songrun.align_track`), as opposed to `song_job_wallclock_
+    estimate_seconds`, which prices a *generated* take and has no relationship to this one at all
+    (task 1 report, "сомнение 2": `song_job_wallclock_estimate_seconds("")` answered a flat 15s --
+    only `DURATION_PAD_SECONDS`, zero sections -- for an import with no lyrics, no matter how long
+    the actual mp3 ran; the real cost is Whisper transcribing the *whole file*, which this reads
+    directly off `track_duration_seconds` instead of guessing from lyric section count).
+
+    `track_duration_seconds` is the imported file's own `ffprobe` duration
+    (`h3_48gb.songrun.probe_duration`) -- the same number `align_track` itself will read once the
+    job actually runs, not an estimate of an estimate.
+    """
+    return ALIGN_WALLCLOCK_FACTOR * track_duration_seconds + ALIGN_WALLCLOCK_PAD_SECONDS
+
+
 def _run_song_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
     """The `kind="song"` job body (task 3): load the project `job.args` names, run
     `h3_48gb.songrun.run_song` (or, for an imported track, `align_track` -- the align-only path,

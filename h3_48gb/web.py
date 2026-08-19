@@ -54,7 +54,8 @@ from h3_48gb import runs as runs_module
 from h3_48gb import songrun
 from h3_48gb.cli import DEFAULT_CANVAS, ERROR_CODES, CliError, build_parser
 from h3_48gb.project import PROJECT_KINDS
-from h3_48gb.worker import WORKER_LOCK_NAME, song_job_wallclock_estimate_seconds
+from h3_48gb.worker import (WORKER_LOCK_NAME, align_job_wallclock_estimate_seconds,
+                            song_job_wallclock_estimate_seconds)
 
 #: The only address this server ever binds. Not a parameter, and deliberately not one: a flag that
 #: could hold `0.0.0.0` is a flag someone eventually sets, and this server has no authentication of
@@ -494,6 +495,9 @@ ERROR_STATUS = {
     "project_stage_not_ready": 409,
     "project_running": 409,
     "project_scene_locked": 409,
+    # Task 4 ("Сюжет клипа" wave): the same reasoning as `project_stage_not_ready` -- the request
+    # itself is fine, it is the scenario's own current state (already approved) that refuses it.
+    "scenario_already_approved": 409,
     "project_not_found": 404,
     "project_scene_not_found": 404,
     # Established elsewhere (`_read_chat`/`_delete_chat`) as a literal `(404, ...)` tuple, never
@@ -1317,6 +1321,251 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None,
             f"freeze-frame pad can still absorb")
 
     return scenes
+
+
+# == Task 4 ("Сюжет клипа" wave): the scenario gate's own web layer =================================
+#
+# `POST .../scenario/generate` (LLM or `{"procedural": true}`), `PUT .../scenario` (hand edits,
+# before approval) and `approve/scenario` (in `_approve_project_stage` below) all funnel through
+# the same on-disk shape `Project.scenario_scenes` already fixes (task 3 report): flat dicts,
+# `{"tag": str, "start": float, "end": float, "prompt": str, "duration": float}`. The functions
+# below are the shared plumbing every one of those three routes needs: turning a raw dict (from a
+# `PUT` body, or mapped out of a `chat_scenario` reply) into that exact shape with its fields typed
+# and coerced (`_typed_scenario_scene`), checking the *content* rule jsonschema cannot express --
+# coverage, no gap, no overlap, no section under `SCENE_MIN_SECONDS` (`_validate_scenario_scenes`)
+# -- and building the procedural fallback (`_procedural_scenario_scenes`) and the LLM prompt
+# (`_scenario_messages`) that feed a fresh scenario in the first place.
+
+
+def _typed_scenario_scene(raw, i: int) -> dict:
+    """One entry of a flat scenario-scenes list -- `{"tag", "start", "end", "prompt", "duration"}`
+    -- type-checked and coerced into `Project.scenario_scenes`'s own exact storage shape. `raw` may
+    come from a `PUT /scenario` body (a human's own hand edit) or from an already-unwrapped section
+    of a `chat_scenario` reply (`_scenario_turn_to_scenes`) -- both sources need the identical
+    checks, so this is the one place that makes them, shared rather than duplicated.
+
+    Raises a bare `ValueError` naming exactly what is wrong with entry `i` -- never `KeyError`/
+    `TypeError` -- so each caller can turn that into the error code that fits its own source
+    (`args_invalid` for a `PUT` body a human is responsible for, `bad_model_json` for a model reply
+    nobody but the model is responsible for): the same "one shared check, two different callers
+    decide what it is worth" split `_json_request`'s own docstring already uses elsewhere in this
+    module.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"entry {i} is not an object")
+    tag, start, end = raw.get("tag"), raw.get("start"), raw.get("end")
+    prompt, dur = raw.get("prompt"), raw.get("duration")
+    if not isinstance(tag, str):
+        raise ValueError(f"entry {i}: `tag` must be a string")
+    if not isinstance(start, (int, float)) or isinstance(start, bool):
+        raise ValueError(f"entry {i}: `start` must be a number")
+    if not isinstance(end, (int, float)) or isinstance(end, bool):
+        raise ValueError(f"entry {i}: `end` must be a number")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError(f"entry {i}: `prompt` must be a non-empty string")
+    if not isinstance(dur, (int, float)) or isinstance(dur, bool):
+        raise ValueError(f"entry {i}: `duration` must be a number")
+    return {"tag": tag, "start": float(start), "end": float(end), "prompt": prompt,
+            "duration": float(dur)}
+
+
+def _validate_scenario_scenes(scenes: list[dict], duration: float) -> None:
+    """`scenes` (already `_typed_scenario_scene`-shaped) checked against exactly the two rules
+    neither `SCENARIO_SCHEMA`'s own jsonschema (task 2) nor grammar-constrained decoding can
+    express or enforce -- both cross-field, both named directly in the task 4 brief: together the
+    sections must tile `[0, duration)` with no gap and no overlap (`docs/h3-prompt-system.md`'s own
+    "Clip scenario mode" rule), and no single section may itself be shorter than `SCENE_MIN_
+    SECONDS`.
+
+    **The minimum-length rule here is narrower than `build_clip_scenes`'s own tolerant fold for a
+    short *procedural* section** (task 3 report, "сомнение 2"): `build_clip_scenes(scenario_
+    scenes=...)` silently folds a short section into its neighbour, discarding that section's own
+    prompt -- fine for a procedural section (nobody wrote it by hand), not fine for a human- or
+    LLM-authored one, whose prompt disappearing without so much as a refusal is exactly the failure
+    mode a human gate exists to prevent. Refusing here, before either `/scenario/generate` or `PUT
+    /scenario` ever writes the scene to disk, is what keeps that fold from ever actually running
+    against an authored scenario in practice.
+
+    Raises `CliError("scenario_invalid", ...)`, `detail` naming the offending section's own index
+    and exactly what is wrong with it (`detail["reason"]`) -- the shared check both `/scenario/
+    generate` and `PUT /scenario` run on every write, task 4 brief: "coverage + ≥5 c + duration
+    5-10 на КАЖДЫЙ PUT".
+    """
+    if not scenes:
+        raise CliError("scenario_invalid", "a scenario needs at least one section",
+                       {"reason": "empty"})
+    for i, scene in enumerate(scenes):
+        if scene["end"] <= scene["start"]:
+            raise CliError(
+                "scenario_invalid",
+                f"section {i} ({scene['tag']!r}): `end` ({scene['end']}) must be after `start` "
+                f"({scene['start']})",
+                {"index": i, "reason": "end_before_start"})
+    ordered = sorted(range(len(scenes)), key=lambda i: scenes[i]["start"])
+    first = scenes[ordered[0]]
+    if abs(first["start"] - 0.0) > _COVERAGE_TOLERANCE_SECONDS:
+        raise CliError(
+            "scenario_invalid",
+            f"the sections start at {first['start']:.3f}s, not 0.0s -- coverage is not complete",
+            {"index": ordered[0], "reason": "does_not_start_at_zero"})
+    for a, b in zip(ordered, ordered[1:]):
+        if abs(scenes[a]["end"] - scenes[b]["start"]) > _COVERAGE_TOLERANCE_SECONDS:
+            raise CliError(
+                "scenario_invalid",
+                f"section {a} ends at {scenes[a]['end']:.3f}s but section {b} starts at "
+                f"{scenes[b]['start']:.3f}s -- a gap or an overlap, coverage is not complete",
+                {"index": b, "reason": "gap_or_overlap", "prev_end": scenes[a]["end"],
+                 "next_start": scenes[b]["start"]})
+    last = scenes[ordered[-1]]
+    if abs(last["end"] - duration) > _COVERAGE_TOLERANCE_SECONDS:
+        raise CliError(
+            "scenario_invalid",
+            f"the sections end at {last['end']:.3f}s, the track is {duration:.3f}s -- coverage "
+            f"is not complete",
+            {"index": ordered[-1], "reason": "does_not_end_at_track_duration"})
+    for i, scene in enumerate(scenes):
+        span = scene["end"] - scene["start"]
+        if span < SCENE_MIN_SECONDS - _COVERAGE_TOLERANCE_SECONDS:
+            raise CliError(
+                "scenario_invalid",
+                f"section {i} ({scene['tag']!r}) is {span:.3f}s, shorter than the "
+                f"{SCENE_MIN_SECONDS}s a scene can be",
+                {"index": i, "reason": "section_too_short", "span": span,
+                 "min": SCENE_MIN_SECONDS})
+        if not (SCENE_MIN_SECONDS - _COVERAGE_TOLERANCE_SECONDS
+                <= scene["duration"] <= SCENE_MAX_SECONDS + _COVERAGE_TOLERANCE_SECONDS):
+            raise CliError(
+                "scenario_invalid",
+                f"section {i} ({scene['tag']!r}): `duration` must be between {SCENE_MIN_SECONDS} "
+                f"and {SCENE_MAX_SECONDS}, got {scene['duration']}",
+                {"index": i, "reason": "duration_out_of_range", "duration": scene["duration"],
+                 "min": SCENE_MIN_SECONDS, "max": SCENE_MAX_SECONDS})
+
+
+def _procedural_scenario_scenes(track: dict) -> list[dict]:
+    """The `{"procedural": true}` branch of `POST /scenario/generate` (task 4 brief, "кнопка
+    «сюжет без LLM»"): the exact same scene list `build_clip_scenes(track)` already builds without
+    any scenario at all, reshaped into `Project.scenario_scenes`'s own flat form -- so the human
+    gate the scenario feature adds is the *only* gate a clip project goes through, whether or not
+    an LLM ever wrote anything: editing a procedurally synthesized scene and editing an LLM-written
+    one happen in the identical UI, through the identical routes (`PUT /scenario`, `approve/
+    scenario`), never two parallel code paths.
+
+    **Reconstructs `start`/`end` from the snapped durations `build_clip_scenes` returns**, because
+    that function's own return shape has none -- by the time it returns, the coverage-complete raw
+    timeline that produced those durations has already served its purpose and been discarded (only
+    the grid-snapped durations survive, see its own docstring). Walking them in order from `0.0` is
+    the same tiling `build_clip_scenes` itself already validated (`_check_coverage_shape`) before
+    ever snapping -- except the grid snap can itself land up to `_SNAPPED_COVERAGE_SHORTFALL_
+    SECONDS` (1.0s) short of `track["duration"]`, so the *last* section's own `end` is pinned to
+    `track["duration"]` exactly rather than left short: `_validate_scenario_scenes` (the route's
+    very next step) would otherwise refuse this function's own honest output.
+
+    **Never sets a style block.** Each scene's own `prompt` already carries `build_clip_scenes`'s
+    own style clause, glued in from `track["caption"]` (`_clip_style_block`) -- leaving `Project.
+    scenario_style_block` unset (`None`) is what keeps `approve/scenario`'s later `build_clip_
+    scenes(..., style_block=proj.scenario_style_block, scenario_scenes=...)` call from gluing that
+    same clause on a *second* time (`_style_clause(None)` glues nothing at all; see that function's
+    own docstring).
+
+    `tag` names nothing real here -- `build_clip_scenes`'s own return carries no section name to
+    give back -- just a positional `scene-<idx>` placeholder: nothing downstream reads `tag` for
+    anything but a label in the gate's own UI (`_scenario_segments`'s docstring).
+
+    Raises `ProjectSceneBuildError`, unchanged, exactly when `build_clip_scenes(track)` itself
+    would (most commonly: no measured `track["duration"]` yet).
+    """
+    scenes = build_clip_scenes(track)
+    duration = float(track["duration"])
+    result = []
+    cursor = 0.0
+    for i, scene in enumerate(scenes):
+        end = duration if i == len(scenes) - 1 else cursor + scene["duration"]
+        result.append({"tag": f"scene-{i}", "start": cursor, "end": end,
+                       "prompt": scene["prompt"], "duration": scene["duration"]})
+        cursor = end
+    return result
+
+
+def _scenario_context(lyrics: str, raw_segments: list[dict], caption: str, duration: float) -> str:
+    """The user turn `POST /scenario/generate` hands `provider.chat_scenario` -- lyrics **or** a
+    raw Whisper transcript with timestamps (never both), `caption`, and the track's own measured
+    `duration`: exactly the three things `docs/h3-prompt-system.md`'s "Clip scenario mode" section
+    promises the model it will always be given. `lyrics` wins whenever it is non-empty (the task 4
+    brief's own rule: "lyrics непустая -> она; иначе lyrics_auto") -- the caller decides which of
+    the two to pass here, this function only renders whichever one it was given.
+    """
+    if lyrics.strip():
+        source = f"lyrics:\n{lyrics}"
+    else:
+        lines = "\n".join(
+            f"[{seg.get('start')}-{seg.get('end')}] {seg.get('text', '')}" for seg in raw_segments)
+        source = f"raw transcript with timestamps (Whisper, seconds):\n{lines}"
+    return (f"## Context\nmode: clip_scenario\nduration: {duration:g} s\n\n"
+           f"caption:\n{caption}\n\n{source}\n\nWrite the clip's scenario now.")
+
+
+def _scenario_messages(lyrics: str, raw_segments: list[dict], caption: str,
+                       duration: float) -> list[dict]:
+    """The full `messages` list `provider.chat_scenario` needs for one, stateless, fire-and-forget
+    turn -- no session, no history, unlike `_locked_turn`'s own chat turns: `/scenario/generate` is
+    a single button press, not a conversation, so there is nothing to carry between calls."""
+    return [{"role": "system", "content": provider.system_prompt()},
+            {"role": "user", "content": _scenario_context(lyrics, raw_segments, caption, duration)}]
+
+
+class _BadScenarioReply(Exception):
+    """Raised by `_scenario_turn_to_scenes` for a `chat_scenario` reply whose *shape* -- not
+    whether the model was reachable at all -- is broken: valid JSON (already past `provider.
+    chat_scenario`'s own parse-retry) but missing or mistyped where `SCENARIO_SCHEMA` requires a
+    real value. Grammar-constrained decoding on a local model rarely triggers this (the whole point
+    of `response_format`), but nothing stops an external provider outside that reach from doing
+    exactly this -- caught once, at the route boundary, and turned into the same `bad_model_json`
+    502 `_locked_turn` already answers with for the analogous `chat()` shape failures.
+    """
+
+
+def _scenario_turn_to_scenes(turn) -> tuple[list[dict], str | None]:
+    """`turn` (`provider.chat_scenario`'s own return -- already-parsed JSON, shape unchecked
+    beyond that) turned into `(scenes, style_block)`, `scenes` already `_typed_scenario_scene`-
+    shaped. Raises `_BadScenarioReply` for anything `SCENARIO_SCHEMA` requires that is missing or
+    the wrong type -- the same defensive checks `_locked_turn` already makes on a plain `chat()`
+    reply (`isinstance(turn, dict)`, `reply` a string), extended one level in to `scenario`'s own
+    `sections`/`style_block`.
+    """
+    if not isinstance(turn, dict):
+        raise _BadScenarioReply(f"модель вернула не объект: {type(turn).__name__}")
+    reply = turn.get("reply")
+    if not isinstance(reply, str):
+        raise _BadScenarioReply(
+            f"модель ответила не текстом: `reply` пришёл как {type(reply).__name__}")
+    scenario = turn.get("scenario")
+    if not isinstance(scenario, dict):
+        raise _BadScenarioReply(
+            f"модель не написала сценарий (`scenario` пришёл как {type(scenario).__name__}): "
+            f"{reply}")
+    sections = scenario.get("sections")
+    if not isinstance(sections, list) or not sections:
+        raise _BadScenarioReply(
+            "`scenario.sections` должен быть непустым списком, пришёл как "
+            f"{'пустой список' if sections == [] else type(sections).__name__}")
+    style_block = scenario.get("style_block")
+    style_block = style_block if isinstance(style_block, str) else None
+    scenes = []
+    for i, section in enumerate(sections):
+        if not isinstance(section, dict):
+            raise _BadScenarioReply(f"scenario.sections[{i}] — не объект")
+        scene = section.get("scene")
+        if not isinstance(scene, dict):
+            raise _BadScenarioReply(f"scenario.sections[{i}].scene — не объект")
+        flat = {"tag": section.get("tag"), "start": section.get("start"),
+                "end": section.get("end"), "prompt": scene.get("prompt"),
+                "duration": scene.get("duration")}
+        try:
+            scenes.append(_typed_scenario_scene(flat, i))
+        except ValueError as exc:
+            raise _BadScenarioReply(str(exc)) from exc
+    return scenes, style_block
 
 
 def _project_job_by_args(jobs, project_path: Path, kind: str):
@@ -2641,11 +2890,13 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/projects":
             return self._create_project()
         if path.startswith("/api/projects/"):
-            # Task 6 ("Проекты"), extended by task 7's own `/track/retry`: nested action routes
-            # under one project id, told apart by shape rather than one `startswith`/`endswith`
-            # pair each -- `/approve/<stage>` (3 segments, second is "approve"), `/assembly/retry`
-            # and `/track/retry` (3 segments, second is "assembly"/"track", third "retry"),
-            # `/scenes/<idx>/retry` (4 segments, "scenes"/.../"retry").
+            # Task 6 ("Проекты"), extended by task 7's own `/track/retry` and task 4's own
+            # `/scenario/generate` ("Сюжет клипа" wave): nested action routes under one project
+            # id, told apart by shape rather than one `startswith`/`endswith` pair each --
+            # `/approve/<stage>` (3 segments, second is "approve"), `/assembly/retry`, `/track/
+            # retry` and `/scenario/generate` (3 segments, second is "assembly"/"track"/
+            # "scenario", third "retry"/"generate"), `/scenes/<idx>/retry` (4 segments,
+            # "scenes"/.../"retry").
             parts = path[len("/api/projects/"):].split("/")
             if len(parts) == 3 and parts[1] == "approve":
                 return self._approve_project_stage(parts[0], parts[2])
@@ -2653,6 +2904,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._retry_project_assembly(parts[0])
             if len(parts) == 3 and parts[1] == "track" and parts[2] == "retry":
                 return self._retry_project_track(parts[0])
+            if len(parts) == 3 and parts[1] == "scenario" and parts[2] == "generate":
+                return self._generate_project_scenario(parts[0])
             if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "retry":
                 return self._retry_project_scene(parts[0], parts[2])
         return 404, "application/json", _error_bytes(
@@ -2665,6 +2918,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._edit_job(path[len("/api/jobs/"):])
         if path.startswith("/api/prompts/"):
             return self._save_prompt(path[len("/api/prompts/"):])
+        if path.startswith("/api/projects/") and path.endswith("/scenario"):
+            # Task 4 ("Сюжет клипа" wave): `PUT /api/projects/<id>/scenario` -- the scenario
+            # gate's own edit route, the `PUT` sibling of `POST .../scenario/generate` above.
+            return self._edit_project_scenario(path[len("/api/projects/"):-len("/scenario")])
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for PUT {path}", {"path": path})
 
@@ -3471,13 +3728,26 @@ class _Handler(BaseHTTPRequestHandler):
         output_stem = str(track_dir / "job-song")
         args = ["song", "--project", str(proj.path)]
         note = f"project track {proj.id}"
-        # `song_job_wallclock_estimate_seconds` prices a *generated* take (Music3's own ~13x
-        # realtime) -- an imported track's own job only runs the much faster Whisper alignment
-        # pass (`songrun.align_track`), so this number over-estimates an import's own wall clock.
-        # Not fixed in this task: no validated formula for align-only timing exists yet, and the
-        # estimate is display-only (`queue.Job.estimate`'s own "whatever the caller put there"
-        # contract) -- see the task report.
-        estimate = {"seconds": song_job_wallclock_estimate_seconds(lyrics)}
+        # Task 4 ("Сюжет клипа" wave): `song_job_wallclock_estimate_seconds` prices a *generated*
+        # take (Music3's own ~13x realtime) -- an imported track's own job never generates
+        # anything at all, only the much faster Whisper alignment pass (`songrun.align_track`),
+        # so that formula was never the right one for `track.source == "import"` (task 1 report,
+        # "сомнение 2": a flat 15s no matter how long the file actually runs). The uploaded file
+        # already exists on disk by the time this runs (`_create_project` writes `track["mp3"]`
+        # before the script gate is even approvable), so its own `ffprobe` duration is read
+        # directly and priced with `align_job_wallclock_estimate_seconds` instead. Falls back to
+        # the old lyrics-based number if the file cannot be probed (corrupt upload, still an
+        # honest answer to give rather than raising out of an estimate that is display-only
+        # anyway -- `queue.Job.estimate`'s own "whatever the caller put there" contract).
+        seconds = song_job_wallclock_estimate_seconds(lyrics)
+        if proj.track.get("source") == "import" and proj.track.get("mp3"):
+            try:
+                track_seconds = songrun.probe_duration(Path(proj.track["mp3"]))
+            except songrun.SongRunError:
+                track_seconds = None
+            if track_seconds is not None:
+                seconds = align_job_wallclock_estimate_seconds(track_seconds)
+        estimate = {"seconds": seconds}
         with queue_write_errors(self.server.queue_root, what="the project track"):
             job = q.submit(self.server.queue_root, args, note, {"output_stem": output_stem},
                            estimate, kind=q.KIND_SONG)
@@ -3485,8 +3755,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _approve_project_stage(self, raw_id: str, stage: str) -> tuple[int, str, bytes]:
         """`POST /api/projects/<id>/approve/<stage>`: the human gate (design spec, "Этапы и
-        гейты") -- only `script` and `track` are gated at all (`scenes`/`assembly` are automatic,
-        design spec: "дальше автомат").
+        гейты") -- `script`, `track` and, for `kind="clip"` (task 4, "Сюжет клипа" wave),
+        `scenario` (`scenes`/`assembly` stay automatic, design spec: "дальше автомат").
 
         **Gates do not skip.** A stage is only approvable from `"awaiting_approval"` -- for
         `script`, that means `POST /api/projects` actually populated it (a truly empty project
@@ -3520,11 +3790,20 @@ class _Handler(BaseHTTPRequestHandler):
           contract requires: "approve сценария video-проекта = advance_project, он сам сабмитит
           сцену 0" -- scene 0's own submission is *not* reimplemented here).
         * `script`, `kind in ("clip", "song")` -- a `kind="song"` job (`_submit_project_song_job`).
-        * `track`, `kind="clip"` -- `build_clip_scenes` turns the now-measured track into a
-          coverage-complete scene list (`proj.scenes`, `proj.save()` -- nothing has written scenes
-          for this project before this moment, so a blind bulk write is safe, same reasoning as
-          `_create_project`'s own), then `assemble.advance_project` submits scene 0, exactly like a
-          video project's script gate does.
+        * `track`, `kind="clip"` -- **task 4, "Сюжет клипа" wave: no longer builds scenes.** Before
+          that task, this was the gate that ran `build_clip_scenes` and submitted scene 0; now the
+          track's own approval only unblocks the *scenario* gate (`POST .../scenario/generate`,
+          `PUT .../scenario`, `approve/scenario` below) -- a clip's scenes are built there instead,
+          once a human has approved the sequence of scenes an LLM (or the `{"procedural": true}`
+          fallback) proposed, never straight off the track's own timing any more. **Except for a
+          project whose `project.json` predates the scenario stage entirely**: `Project._apply`
+          migrates a missing `stages.scenario` key to `"approved"` on load (task 3), so such a
+          project's scenario gate reads as already passed with `scenario_scenes` still empty --
+          precisely the shape `approve/track`'s *old* procedural behaviour is kept for here (`proj.
+          stages.get("scenario") == "approved" and not proj.scenario_scenes`), so that a project
+          created before this task existed does not get stuck forever with no route left that ever
+          builds its scenes. A project created after this task exists always has `stages.scenario
+          == "draft"` at this point (never `"approved"` this early), so it never takes this branch.
         * `track`, `kind="song"` -- nothing to submit: the mp3 already is the product (design spec:
           "для kind=song проект на этом завершён"). **M2 (fix round 1, 2026-08-19 review):**
           `stages.scenes`/`stages.assembly` are explicitly set to `"done"` here rather than left at
@@ -3546,10 +3825,24 @@ class _Handler(BaseHTTPRequestHandler):
           by hand (or by a future bug) used to fall through every `if`/`elif` below with no side
           effect *and* no refusal, silently answering `ok: true` having approved a stage that meant
           nothing. Refusing it by name is honest about "this is not supported", not "it worked".
+        * `scenario`, `kind="clip"` -- **the scene-building step `track`'s own gate used to do**:
+          `build_clip_scenes(proj.track, style_block=proj.scenario_style_block, scenario_scenes=
+          proj.scenario_scenes)` (task 3's own contract for this exact call), then `assemble.
+          advance_project` submits scene 0, identically to every other gate that starts a chain. A
+          failed build (a bad hand edit through `PUT /scenario` that slipped past its own
+          validation somehow, or a track whose `duration` went missing between track approval and
+          now) leaves `stages.scenario` exactly where it was (`"awaiting_approval"`) -- the same
+          C1 discipline every other gate here already gets, and the same retry path: fix the
+          scenario (another `PUT`, or `POST .../scenario/generate` again) and call this route
+          again. `scenario` never reaches `"awaiting_approval"` for `kind in ("video", "song")` at
+          all (`create_project` starts it at `"approved"` for both, and nothing else ever touches
+          it) -- reachable only by hand-forcing the stage, refused explicitly below, same as
+          `track`'s own `kind="video"` case above.
         """
-        if stage not in ("script", "track"):
+        if stage not in ("script", "track", "scenario"):
             raise CliError(
-                "args_invalid", f"`stage` must be 'script' or 'track', and {stage!r} is not",
+                "args_invalid",
+                f"`stage` must be 'script', 'track' or 'scenario', and {stage!r} is not",
                 {"stage": stage})
         proj = self._load_project(raw_id)
         current = proj.stages.get(stage)
@@ -3567,14 +3860,22 @@ class _Handler(BaseHTTPRequestHandler):
             elif proj.kind in ("clip", "song"):
                 result["submit"] = self._submit_project_song_job(proj)
         elif stage == "track" and proj.kind == "clip":
-            try:
-                built = build_clip_scenes(proj.track)
-            except ProjectSceneBuildError as exc:
-                raise CliError("project_scene_build_failed", str(exc), {"id": raw_id}) from exc
-            proj.scenes = built
-            proj.save()
-            result["advance"] = assemble_module.advance_project(
-                proj, self.server.queue_root, self.server.outdir)
+            if proj.stages.get("scenario") == "approved" and not proj.scenario_scenes:
+                # Migration case: a `project.json` written before the scenario stage existed --
+                # `stages.scenario` was migrated to "approved" on load (`Project._apply`) and no
+                # scenario was ever gathered for it. Kept exactly as `approve/track` used to
+                # behave for every clip project, so such a project does not get stuck forever with
+                # no route left that ever builds its scenes. See this method's own docstring.
+                try:
+                    built = build_clip_scenes(proj.track)
+                except ProjectSceneBuildError as exc:
+                    raise CliError("project_scene_build_failed", str(exc), {"id": raw_id}) from exc
+                proj.scenes = built
+                proj.save()
+                result["advance"] = assemble_module.advance_project(
+                    proj, self.server.queue_root, self.server.outdir)
+            # else: a project going through the scenario gate -- nothing to build yet, scenes are
+            # built at `approve/scenario` instead, once a human has approved the scenario.
         elif stage == "track" and proj.kind == "song":
             proj.set_stage_status("scenes", "done")
             proj.set_stage_status("assembly", "done")
@@ -3583,12 +3884,245 @@ class _Handler(BaseHTTPRequestHandler):
                 "project_stage_not_ready",
                 f"проект {raw_id}: 'track' не гейтуется для kind='video' (опциональная песня "
                 f"вне v1)", {"id": raw_id, "stage": stage, "kind": proj.kind})
+        elif stage == "scenario" and proj.kind == "clip":
+            try:
+                built = build_clip_scenes(proj.track, style_block=proj.scenario_style_block,
+                                          scenario_scenes=proj.scenario_scenes)
+            except ProjectSceneBuildError as exc:
+                raise CliError("project_scene_build_failed", str(exc), {"id": raw_id}) from exc
+            proj.scenes = built
+            proj.save()
+            result["advance"] = assemble_module.advance_project(
+                proj, self.server.queue_root, self.server.outdir)
+        elif stage == "scenario":
+            raise CliError(
+                "project_stage_not_ready",
+                f"проект {raw_id}: 'scenario' не гейтуется для kind={proj.kind!r}",
+                {"id": raw_id, "stage": stage, "kind": proj.kind})
 
         proj.approve_stage(stage)
 
         reloaded = project_module.load_project(proj.path)
         return 200, "application/json", _json_bytes(
             {"ok": True, **result, "project": _project_payload(reloaded)})
+
+    def _scenario_gate_project(self, raw_id: str) -> "project_module.Project":
+        """`self._load_project(raw_id)`, refused (`project_stage_not_ready`, 409) unless this
+        project actually has a live scenario gate to write into right now -- the shared precondition
+        `POST .../scenario/generate` and `PUT .../scenario` both start from (task 4 brief:
+        "гейты (kind=clip, track approved, scenario in draft/awaiting_approval)").
+
+        Three checks, each named separately in the refusal so a page can say which one failed
+        rather than a single opaque "not ready": `kind` (only a clip project has a scenario stage
+        at all -- `video`/`song` sit at `"approved"` forever, `create_project`'s own doing),
+        `stages.track` (`"approved"` -- there is no measured track duration to build a scenario
+        against before then), and `stages.scenario` itself (`"draft"` or `"awaiting_approval"` --
+        writing into an already-`"approved"` scenario is `PUT`'s own separate `scenario_already_
+        approved` refusal, not this one, so that check is left to the one caller that needs the
+        more specific code).
+        """
+        proj = self._load_project(raw_id)
+        if proj.kind != "clip":
+            raise CliError(
+                "project_stage_not_ready",
+                f"проект {raw_id}: этапа 'сценарий' нет у kind={proj.kind!r} (он есть только у "
+                f"kind='clip')", {"id": raw_id, "stage": "scenario", "kind": proj.kind})
+        if proj.stages.get("track") != "approved":
+            raise CliError(
+                "project_stage_not_ready",
+                f"проект {raw_id}: трек ещё не утверждён, сценарий рано писать",
+                {"id": raw_id, "stage": "track", "status": proj.stages.get("track")})
+        return proj
+
+    def _generate_project_scenario(self, raw_id: str) -> tuple[int, str, bytes]:
+        """`POST /api/projects/<id>/scenario/generate`: writes a fresh `Project.scenario_scenes`/
+        `scenario_style_block` and opens the scenario gate (`stages.scenario = "awaiting_approval"`)
+        -- either from an LLM turn (`provider.chat_scenario`, the ordinary case) or, with
+        `{"procedural": true}` in the body, from the same procedural synthesis `build_clip_scenes`
+        already does without any scenario at all (task 4 brief, "кнопка «сюжет без LLM»") --
+        reshaped so both paths land the human at the identical gate (`_procedural_scenario_scenes`'s
+        own docstring).
+
+        **Gated by `_scenario_gate_project`** (kind, track approved) **and, here, additionally by
+        `stages.scenario` itself** being `"draft"` or `"awaiting_approval"` -- regenerating before
+        approval ("Перегенерировать сюжет", design spec) is allowed and simply overwrites whatever
+        was there; regenerating an *approved* scenario is not (`PUT`'s own `scenario_already_
+        approved` 409, not raised here since this route's own refusal for that state is the plain
+        `project_stage_not_ready` every other already-passed gate answers with elsewhere in this
+        module).
+
+        **Which lyrics source wins (task 4 brief, verbatim): `track.lyrics` if non-empty, otherwise
+        `track.lyrics_auto`/`track.raw_segments` (Task 1's auto-transcript pair), otherwise
+        `scenario_no_lyrics`** (400) -- an instrumental import Whisper found nothing to say about
+        has nothing for an LLM to write a scenario from either; the design spec's own answer for
+        that case is the scenario editor's `PUT` route by hand, not this one.
+
+        **The provider mechanics are `_locked_turn`'s own, copied rather than shared**: `ensure_up`
+        on a local model, `gpu_busy` while a generation is running, `provider_unavailable` for a
+        missing/unusable roster entry, a `provider.ProviderError` mapped straight to its own code
+        at 502. Copied and not factored out because `_locked_turn` also carries a chat session's
+        whole read-modify-write under a per-session lock, which a one-shot, unsessioned scenario
+        turn has no use for at all -- forcing this route through that shape would cost more than
+        the handful of duplicated lines saves.
+
+        **Validation, in order:** `_scenario_turn_to_scenes` (LLM path only) turns the reply into
+        `Project.scenario_scenes`'s own flat shape or raises `_BadScenarioReply` (-> `bad_model_
+        json`, 502) -- the *shape* jsonschema/grammar-constrained decoding already mostly enforces
+        for a well-behaved local model, checked again here because nothing enforces it for an
+        external one. `_validate_scenario_scenes` then checks the one thing no schema can
+        (coverage, minimum section length) for **both** paths alike, procedural included --
+        `scenario_invalid`, 400, if it fails.
+
+        **The side effect lands before the status flip** (task 4 brief, "побочный эффект до
+        статуса!"): `proj.update_scenario(...)` first, `proj.set_stage_status("scenario",
+        "awaiting_approval")` second -- so a crash between the two (there is essentially nothing
+        that could crash there, but the ordering is the same discipline `_approve_project_stage`'s
+        own C1 fix already established) never leaves the gate open on content that was never
+        actually written.
+        """
+        proj = self._scenario_gate_project(raw_id)
+        current = proj.stages.get("scenario")
+        if current not in ("draft", "awaiting_approval"):
+            raise CliError(
+                "project_stage_not_ready",
+                f"проект {raw_id}: сценарий уже утверждён (сейчас {current!r})",
+                {"id": raw_id, "stage": "scenario", "status": current})
+
+        payload = self._json_request(allowed=("procedural",))
+        raw_procedural = payload.get("procedural")
+        if raw_procedural is not None and not isinstance(raw_procedural, bool):
+            raise CliError("args_invalid", "`procedural` must be a boolean",
+                           {"type": type(raw_procedural).__name__})
+        procedural = bool(raw_procedural)
+
+        duration = proj.track.get("duration")
+        if not isinstance(duration, (int, float)) or duration <= 0:
+            raise CliError(
+                "project_scene_build_failed",
+                f"проект {raw_id}: у трека нет измеренной длительности", {"id": raw_id})
+
+        if procedural:
+            try:
+                scenes = _procedural_scenario_scenes(proj.track)
+            except ProjectSceneBuildError as exc:
+                raise CliError("project_scene_build_failed", str(exc), {"id": raw_id}) from exc
+            style_block = None
+        else:
+            lyrics = proj.track.get("lyrics") or ""
+            raw_segments = proj.track.get("raw_segments") or []
+            if not lyrics.strip() and not raw_segments:
+                raise CliError(
+                    "scenario_no_lyrics",
+                    f"проект {raw_id}: нет ни лирики, ни авто-транскрипта — писать сценарий не "
+                    f"из чего", {"id": raw_id})
+            name, cfg = self._active_provider()
+            if not cfg or not cfg.get("available"):
+                return 409, "application/json", _error_bytes(
+                    "provider_unavailable",
+                    (cfg or {}).get("reason")
+                    or (f"нет провайдера {name}" if name else "активный LLM-провайдер не выбран"),
+                    {"provider": name})
+            lam = self._llama_for(name, cfg)
+            if lam is not None:
+                running = _generation_running(self.server.queue_root)
+                if running:
+                    return 409, "application/json", _error_bytes(
+                        "gpu_busy", "идёт прогон — модель поднимется после него",
+                        {"running": _running_ids(running)})
+            messages = _scenario_messages(lyrics, raw_segments, proj.track.get("caption") or "",
+                                          float(duration))
+            try:
+                if lam is not None:
+                    lam.ensure_up()
+                turn = provider.chat_scenario(cfg, provider.load_env(self.server.outdir), messages)
+            except provider.ProviderError as exc:
+                return 502, "application/json", _error_bytes(exc.code, str(exc), {"provider": name})
+            try:
+                scenes, style_block = _scenario_turn_to_scenes(turn)
+            except _BadScenarioReply as exc:
+                return 502, "application/json", _error_bytes(
+                    "bad_model_json", str(exc), {"provider": name})
+
+        _validate_scenario_scenes(scenes, float(duration))
+
+        proj.update_scenario(scenario_scenes=scenes, scenario_style_block=style_block)
+        proj.set_stage_status("scenario", "awaiting_approval")
+
+        reloaded = project_module.load_project(proj.path)
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "project": _project_payload(reloaded)})
+
+    def _edit_project_scenario(self, raw_id: str) -> tuple[int, str, bytes]:
+        """`PUT /api/projects/<id>/scenario`: hand edits to `Project.scenario_scenes`/`scenario_
+        style_block` -- prompt, duration, section boundaries -- before the scenario gate is
+        approved (design spec: "PUT-правки разрешены только до утверждения").
+
+        **Gated by `_scenario_gate_project`, plus `scenario_already_approved` (409) once the gate
+        has actually passed** -- the one refusal this route names differently from `/scenario/
+        generate`'s own `project_stage_not_ready` for the identical state, because the task 4
+        brief names it explicitly: "409 scenario_already_approved после утверждения".
+
+        **Replaces the whole `scenario_scenes` list, not a single scene.** The gate's own editor
+        holds the full list client-side (it has to, to show every scene's timeline at once) and
+        `PUT`s the edited array back whole -- the same "the client owns the array, the server
+        replaces it" contract `PUT /api/prompts/<name>` already uses for a prompt's own text,
+        rather than a per-index `PATCH` this module has no other precedent for.
+
+        **The same python validation as `/scenario/generate`, on every single `PUT`** (task 4
+        brief: "coverage + ≥5 c + duration 5-10 на КАЖДЫЙ PUT") -- `_typed_scenario_scene` (per-
+        entry types, `args_invalid` for the first bad one) then `_validate_scenario_scenes`
+        (coverage + minimum section length + duration range, `scenario_invalid`) against the very
+        same track duration `build_clip_scenes` will eventually check against, so a scenario that
+        passes this route can never fail `approve/scenario`'s own build for a reason this route
+        could have caught first.
+
+        `style_block`, optional: omitted leaves `Project.scenario_style_block` exactly as it was;
+        given, `null` clears it and a string replaces it -- the same "absent vs. `null`" contract
+        `Project.update_track`'s own docstring already promises `update_scenario` shares.
+        """
+        proj = self._scenario_gate_project(raw_id)
+        current = proj.stages.get("scenario")
+        if current == "approved":
+            raise CliError(
+                "scenario_already_approved",
+                f"проект {raw_id}: сценарий уже утверждён, править поздно", {"id": raw_id})
+        if current not in ("draft", "awaiting_approval"):
+            raise CliError(
+                "project_stage_not_ready",
+                f"проект {raw_id}: сценарий сейчас в статусе {current!r}",
+                {"id": raw_id, "stage": "scenario", "status": current})
+
+        payload = self._json_request(allowed=("scenario_scenes", "style_block"))
+        raw_scenes = payload.get("scenario_scenes")
+        if not isinstance(raw_scenes, list) or not raw_scenes:
+            raise CliError("args_invalid", "`scenario_scenes` must be a non-empty list",
+                           {"type": type(raw_scenes).__name__})
+        scenes = []
+        for i, raw in enumerate(raw_scenes):
+            try:
+                scenes.append(_typed_scenario_scene(raw, i))
+            except ValueError as exc:
+                raise CliError("args_invalid", str(exc), {"index": i}) from exc
+
+        duration = proj.track.get("duration")
+        if not isinstance(duration, (int, float)) or duration <= 0:
+            raise CliError(
+                "project_scene_build_failed",
+                f"проект {raw_id}: у трека нет измеренной длительности", {"id": raw_id})
+        _validate_scenario_scenes(scenes, float(duration))
+
+        fields = {"scenario_scenes": scenes}
+        if "style_block" in payload:
+            style_block = payload["style_block"]
+            if style_block is not None and not isinstance(style_block, str):
+                raise CliError("args_invalid", "`style_block` must be a string or null",
+                               {"type": type(style_block).__name__})
+            fields["scenario_style_block"] = style_block
+        proj.update_scenario(**fields)
+
+        reloaded = project_module.load_project(proj.path)
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "project": _project_payload(reloaded)})
 
     def _retry_project_track(self, raw_id: str) -> tuple[int, str, bytes]:
         """`POST /api/projects/<id>/track/retry`: task 7's own small addition to the server ("

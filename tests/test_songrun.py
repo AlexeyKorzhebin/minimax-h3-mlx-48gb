@@ -450,6 +450,24 @@ def test_master_raises_song_run_error_on_a_missing_input_file(tmp_path):
         sr.master(tmp_path / "does-not-exist.wav", tmp_path / "out.wav")
 
 
+def test_probe_duration_reads_the_same_number_ffprobe_itself_would(tmp_path):
+    """Task 4 ("Сюжет клипа" wave): `probe_duration` is the public door onto `_ffprobe_duration` --
+    `h3_48gb.web._submit_project_song_job` reads an import's own uploaded file through it, before
+    its song job ever runs, to price that job honestly (`h3_48gb.worker.align_job_wallclock_
+    estimate_seconds`). A real `ffmpeg`/`ffprobe` round trip, not a mock, so a drift between the
+    two never goes unnoticed.
+    """
+    wav = tmp_path / "sine.wav"
+    _make_sine_wav(wav, duration=3.0)
+    mp3 = sr.to_mp3(wav, tmp_path / "sine.mp3")
+    assert sr.probe_duration(mp3) == pytest.approx(3.0, abs=0.3)
+
+
+def test_probe_duration_raises_song_run_error_on_a_missing_file(tmp_path):
+    with pytest.raises(sr.SongRunError):
+        sr.probe_duration(tmp_path / "does-not-exist.mp3")
+
+
 # -- I6: _run wraps a bare OSError/FileNotFoundError, never lets one escape ----------------------
 
 

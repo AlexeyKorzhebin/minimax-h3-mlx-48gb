@@ -203,6 +203,18 @@ ERROR_CODES = {
     "project_stage_not_ready": "this stage is not waiting on its gate (already approved, not produced yet, or a later stage was asked for before an earlier one) -- see `detail` for the stage and its current status",
     "project_running": "the project has a scene, a track or an assembly job in flight; wait for it to finish or fail before deleting the project",
     "project_scene_build_failed": "the clip's coverage-complete scene list could not be built from the track's own timing -- see the message for why",
+    # Task 4 ("Сюжет клипа" wave): the human gate a clip's scenario goes through before
+    # `build_clip_scenes` ever runs against it -- `POST .../scenario/generate` and `PUT
+    # .../scenario` both.
+    "scenario_no_lyrics": "the track has neither real lyrics nor an auto-transcript (an "
+                          "instrumental import Whisper found nothing to say) -- there is nothing "
+                          "to write a scenario from; write one by hand through `PUT .../scenario` "
+                          "instead",
+    "scenario_invalid": "a scenario's sections do not tile the track's own duration with no gap "
+                        "and no overlap, or one section is shorter than the minimum a scene can "
+                        "be -- `detail.index` names the offending section",
+    "scenario_already_approved": "the scenario gate is already approved; `PUT .../scenario` only "
+                                 "edits a scenario before that",
     "path_outside_root": "a path names something outside every root the server may touch, or writes into the read-only models root",
     "prompt_name_invalid": "a prompt name is not a bare `[A-Za-z0-9_-]+.txt` -- it names a directory or another suffix",
     "queue_unwritable": "the queue directory could not be read or written; see `detail.path`",

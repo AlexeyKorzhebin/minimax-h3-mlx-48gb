@@ -1472,6 +1472,27 @@ def test_song_job_wallclock_estimate_seconds_is_estimate_duration_times_13():
         sr.estimate_duration(lyrics) * 13.0)
 
 
+def test_align_job_wallclock_estimate_seconds_matches_the_measured_calibration():
+    """Task 4 ("Сюжет клипа" wave) brief, verbatim: "транскрипция 45-с трека ~3 c" -- an align-only
+    job (`track.source == "import"`) is priced off the file's own duration, not lyric section
+    count (`song_job_wallclock_estimate_seconds`, which has nothing to do with this job at all: it
+    never generates anything). 45s of audio should land close to the measured 3s of Whisper work
+    plus the fixed pad.
+    """
+    assert worker.align_job_wallclock_estimate_seconds(45.0) == pytest.approx(
+        45.0 * worker.ALIGN_WALLCLOCK_FACTOR + worker.ALIGN_WALLCLOCK_PAD_SECONDS)
+    assert worker.align_job_wallclock_estimate_seconds(45.0) == pytest.approx(3.0 + 5.0)
+
+
+def test_align_job_wallclock_estimate_seconds_grows_with_track_length():
+    """Unlike the flat 15s `song_job_wallclock_estimate_seconds("")` gave an import with no lyrics
+    (task 1 report, "сомнение 2") -- a 10-minute file must estimate for longer than a 10-second
+    one."""
+    short = worker.align_job_wallclock_estimate_seconds(10.0)
+    long = worker.align_job_wallclock_estimate_seconds(600.0)
+    assert long > short
+
+
 # -- C1 (fix round 1, 2026-08-18 review): a song job's own subprocess is a tracked child ---------
 
 
