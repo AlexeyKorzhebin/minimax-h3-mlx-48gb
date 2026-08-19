@@ -1095,7 +1095,20 @@ def _scenario_segments(scenario_scenes: list[dict], style_block: str | None) -> 
     gate) turned into the same raw `{"start", "end", "prompt"}` segment shape `_clip_raw_segments`
     builds for the procedural path -- sorted by `start`, `style_block` glued verbatim onto every
     `prompt` (`_style_clause`, the exact same clause the procedural path glues via
-    `_clip_section_prompt`).
+    `_clip_section_prompt`) **unless the prompt already carries it verbatim (I3, fix round 2,
+    2026-08-19 review).** `docs/h3-prompt-system.md`'s own scenario-mode instructions tell the LLM
+    to copy `style_block` "verbatim, word for word" into every `scene.prompt` itself; when it does
+    (the intended, documented behaviour, not a bug in the model's reply), gluing `_style_clause`
+    unconditionally on top used to paste the same paragraph into the prompt a second time -- on a
+    full song (~38 scenes) the visual bible is the single longest passage in every prompt, and
+    doubling it risks pushing real scene content out of the text encoder's window for no benefit:
+    the clause was only ever insurance against the model *forgetting* to copy it, not a second copy
+    to add on top of one it already wrote. `style_block not in prompt` is a plain substring check --
+    correct because "copy it verbatim" is exactly what the prompt promises the model did, not a
+    fuzzy or paraphrased inclusion this function would have no reliable way to detect anyway. The
+    procedural fallback (`_procedural_scenario_scenes`, `style_block` always `None` here) and a
+    scenario the model wrote without a `style_block` at all still get the clause glued on exactly as
+    before -- only an already-present, verbatim block is skipped.
 
     Deliberately drops `tag` and each scene's own `duration` -- neither has a consumer downstream.
     `duration` was the LLM's own *suggestion* (`h3_48gb.provider.SCENARIO_SCHEMA`'s
@@ -1118,7 +1131,8 @@ def _scenario_segments(scenario_scenes: list[dict], style_block: str | None) -> 
     style_clause = _style_clause(style_block)
     try:
         return [{"start": float(scene["start"]), "end": float(scene["end"]),
-                 "prompt": f"{scene['prompt']}{style_clause}"} for scene in ordered]
+                 "prompt": scene["prompt"] if (style_block and style_block in scene["prompt"])
+                 else f"{scene['prompt']}{style_clause}"} for scene in ordered]
     except (KeyError, TypeError) as exc:
         raise ProjectSceneBuildError(f"malformed scenario scene entry: {exc}") from exc
 
@@ -1222,12 +1236,13 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None,
     a violation here is a clear, early, attributable-to-the-scenario refusal, not one buried behind
     an unrelated fold/split step -- this is precisely "the python check jsonschema cannot express"
     the task brief calls for), and the grid-snap loop at the bottom. `style_block` is glued the same
-    way (`_style_clause`) but is **never** defaulted from `track["caption"]` in this mode -- that
-    default is specific to the procedural path's own caption-derived placeholder and has nothing to
-    do with a scenario's own `style_block` field; pass it explicitly (`Project.scenario_style_block`)
-    or leave it `None` for no clause at all. See `_scenario_segments`'s own docstring for exactly
-    what is read from each scenario scene (and what -- `tag`, each scene's own `duration` -- is
-    deliberately not).
+    way (`_style_clause`), **skipped when the scenario's own prompt already carries it verbatim
+    (I3, fix round 2, 2026-08-19 review -- see `_scenario_segments`'s own docstring)**, and is
+    **never** defaulted from `track["caption"]` in this mode -- that default is specific to the
+    procedural path's own caption-derived placeholder and has nothing to do with a scenario's own
+    `style_block` field; pass it explicitly (`Project.scenario_style_block`) or leave it `None` for
+    no clause at all. See `_scenario_segments`'s own docstring for exactly what is read from each
+    scenario scene (and what -- `tag`, each scene's own `duration` -- is deliberately not).
     """
     duration = track.get("duration")
     if not isinstance(duration, (int, float)) or duration <= 0:

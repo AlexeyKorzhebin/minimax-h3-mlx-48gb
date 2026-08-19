@@ -20,8 +20,11 @@ Three rules repeat from `tests/test_web.py`/`tests/test_chat_web.py`:
   own `project` field is never assumed to already match `PROMPT_SCHEMA` (task 5 report, "сомнение
   3": stored without validating its shape).
 """
+import base64
 import json
+import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -330,6 +333,40 @@ def test_build_clip_scenes_from_scenario_glues_style_block_verbatim_onto_every_s
     for s in scenes:
         assert ("Visual style, identical in every scene: A hand-drawn watercolor music video"
                in s["prompt"])
+
+
+def test_build_clip_scenes_from_scenario_does_not_double_glue_a_style_block_the_model_already_copied():
+    """I3, fix round 2 (2026-08-19 review): `docs/h3-prompt-system.md` tells the LLM to copy
+    `style_block` verbatim into every `scene.prompt` itself. When a scene's prompt already carries
+    it (the documented, intended shape of a real LLM reply), `_scenario_segments` must not glue
+    `_style_clause` on top a second time -- checked by *counting occurrences* of the style text in
+    the built prompt, not merely that the prompt is non-empty or "changed somehow", so a mutant that
+    always glues (or never checks) is caught either way.
+    """
+    block = "A hand-drawn watercolor music video"
+    scenario_scenes = [
+        _scenario_scene("verse", 0.0, 8.0,
+                         f"A lone figure walks a neon street. {block}."),
+        _scenario_scene("chorus", 8.0, 16.0,
+                         f"Fireworks bloom overhead. {block}."),
+    ]
+    scenes = web.build_clip_scenes(_scenario_track(16.0), scenario_scenes=scenario_scenes,
+                                    style_block=block)
+    for s in scenes:
+        assert s["prompt"].count(block) == 1, s["prompt"]
+
+
+def test_build_clip_scenes_from_scenario_still_glues_a_style_block_the_model_forgot():
+    """The other half of I3: a scenario whose prompt does *not* already carry `style_block`
+    verbatim (the model forgot, or this is the procedural fallback with a caller-supplied
+    `style_block`) must still get the clause glued on -- the fix narrows the glue to a duplicate
+    check, it does not remove the insurance `docs/h3-prompt-system.md`'s "same words" rule needs."""
+    block = "A hand-drawn watercolor music video"
+    scenario_scenes = [_scenario_scene("verse", 0.0, 8.0, "A lone figure walks a neon street.")]
+    scenes = web.build_clip_scenes(_scenario_track(8.0), scenario_scenes=scenario_scenes,
+                                    style_block=block)
+    assert scenes[0]["prompt"].count(block) == 1
+    assert f"Visual style, identical in every scene: {block}." in scenes[0]["prompt"]
 
 
 def test_build_clip_scenes_from_scenario_without_a_style_block_adds_no_clause():
@@ -1855,6 +1892,137 @@ def test_a_migrated_clip_project_still_builds_scenes_straight_off_approve_track(
     _assert_scene_total_within_snap_tolerance(scenes, 16.0)
     # the scenario gate stays "approved" (the migration) throughout -- no scenario route involved
     assert approved_track["project"]["stages"]["scenario"] == "approved"
+
+
+# == I1 (fix round 2, 2026-08-19 review): a scene's own `duration` is a hint, never a promise =====
+
+
+def test_edit_scenario_duration_does_not_change_the_built_scenes_own_length(_serve, monkeypatch):
+    """The controller's own decision (I1, fix round 2): `scenario_scenes[i]["duration"]` stays
+    editable and validated (the schema and `_validate_scenario_scenes` both require `5..10`), but a
+    hand edit to it must never change the *built* scene's own duration -- `_scenario_segments`
+    drops it entirely, and `end - start` (the section's own approved span) is what actually drives
+    the built scene's length. Reproduces exactly the live-gate finding this fix responds to: editing
+    `duration` `7.0 -> 6.0` still produced a built scene of `7.29s` -- the built length tracks the
+    section span, not the edited field, whatever it says.
+
+    Both sections here span exactly `8.0s`, which lands precisely on H3's own frame grid with zero
+    carry (`8.0 * 24 == 192 == 17*11 + 5`) -- so the built duration is an *exact* `8.0`, not merely
+    "close to 8, not 6/9", which is what makes this assertion pin the actual mechanism rather than a
+    tolerance band both the edited and the derived value could fall inside.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+
+    status, edited = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "prompt A", "duration": 6.0},
+            {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "prompt B", "duration": 9.0},
+        ],
+    })
+    assert status == 200, edited
+    assert edited["project"]["scenario_scenes"][0]["duration"] == 6.0, (
+        "the hand edit itself must be accepted and stored -- this route validates and keeps it")
+
+    approved = srv.post_json(f"/api/projects/{pid}/approve/scenario", {})
+    built = approved["project"]["scenes"]
+    assert len(built) == 2
+    assert built[0]["duration"] == pytest.approx(8.0), (
+        "built duration must come from the section span (8.0s), not the edited `duration` field "
+        f"(6.0s): got {built[0]['duration']}")
+    assert built[1]["duration"] == pytest.approx(8.0), (
+        "built duration must come from the section span (8.0s), not the edited `duration` field "
+        f"(9.0s): got {built[1]['duration']}")
+
+
+# == I2 (fix round 2, 2026-08-19 review): approve-scenario must wait for a pending blur-save =======
+
+
+_NODE = shutil.which("node")
+_needs_node_for_scenario_race = pytest.mark.skipif(
+    _NODE is None,
+    reason="`node` is not in PATH; the client-side scenario-save race (I2) is checked by actually "
+           "running `h3_48gb/webui/app.js`'s own event handlers, which needs node outside a "
+           "browser")
+
+_SCENARIO_RACE_SCRIPT = Path(__file__).resolve().parent / "_scenario_race_check.mjs"
+_APP_JS_URL = (Path(__file__).resolve().parent.parent / "h3_48gb" / "webui" / "app.js").as_uri()
+
+
+def _run_scenario_race_check(base_url: str, pid: str, edited_prompt: str, timeout=30) -> dict:
+    """Runs `_scenario_race_check.mjs` (see its own module docstring) against a real, already
+    running server -- drives the *real* `app.js`, not a reimplementation, through a `focusout`
+    immediately followed by a click on "Утвердить сюжет" (the exact order a browser delivers them
+    in when the button is clicked while the field it edited still has focus), and reports the two
+    requests' own timing plus the server's final state.
+    """
+    encoded = base64.b64encode(edited_prompt.encode("utf-8")).decode("ascii")
+    result = subprocess.run(
+        [_NODE, str(_SCENARIO_RACE_SCRIPT), _APP_JS_URL, base_url, pid, encoded],
+        capture_output=True, text=True, timeout=timeout)
+    assert result.returncode == 0, (
+        f"_scenario_race_check.mjs failed:\nstdout: {result.stdout}\nstderr: {result.stderr}")
+    return json.loads(result.stdout)
+
+
+@_needs_node_for_scenario_race
+def test_approving_the_scenario_right_after_a_blurred_edit_does_not_lose_it(_serve, monkeypatch):
+    """I2 (fix round 2, 2026-08-19 review): clicking "Утвердить сюжет" immediately after a
+    scenario field's own `focusout` used to race `PUT .../scenario` against `POST .../approve/
+    scenario` -- if the `PUT` landed after `approve/scenario`'s own `_load_project` but before its
+    own (unconditional, inherited-from-`approve/track`) `proj.save()`, the edit disappeared from
+    both the saved scenario *and* the scenes built from it, with no 409 and no error banner (the
+    review's own finding: `web.py:3893-3894`).
+
+    **The server-side race this reproduces is real and deliberately left alone** -- the controller's
+    own scope decision: `Project.save()`'s blind-overwrite pattern is inherited from `approve/
+    track` and out of this wave's scope (see the fix report). What closes it is `app.js` now
+    awaiting the pending save (`pendingScenarioSave`) before `approve-scenario` sends its own
+    request at all. This test forces the race window open from the *server* side
+    (`web.build_clip_scenes`, the call inside that window, delayed 300ms -- deterministic, and
+    monkeypatched only for this one test) so the outcome does not depend on true network-arrival
+    timing between two `fetch` calls a few microseconds apart: without the client fix, the delay
+    alone reliably reproduces the loss (see the mutation check in the fix report); with the fix,
+    `approve-scenario`'s own request is never even *sent* until the `PUT` has fully round-tripped,
+    so the delay changes nothing about the outcome.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=12.0)
+    status, put_first = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 12.0, "prompt": "prompt A", "duration": 8.0}],
+    })
+    assert status == 200, put_first
+
+    real_build_clip_scenes = web.build_clip_scenes
+
+    def _delayed_build_clip_scenes(*args, **kwargs):
+        time.sleep(0.3)
+        return real_build_clip_scenes(*args, **kwargs)
+
+    monkeypatch.setattr(web, "build_clip_scenes", _delayed_build_clip_scenes)
+
+    base_url = f"http://{web.LOOPBACK}:{srv.port}"
+    edited_prompt = "prompt A -- edited during the race"
+    result = _run_scenario_race_check(base_url, pid, edited_prompt)
+
+    assert result["putStatus"] == 200, result
+    assert result["postStatus"] == 200, result
+    # The sequencing the fix actually guarantees: the PUT fully finishes before the POST is even
+    # sent -- not merely "before it finishes", the stronger claim the fix's own `await` makes.
+    assert result["putFinishedAt"] <= result["postStartedAt"], (
+        "approve-scenario's own POST must not be sent before the pending PUT has finished -- "
+        f"PUT finished at {result['putFinishedAt']}, POST started at {result['postStartedAt']}")
+
+    final = result["finalProject"]
+    assert final["stages"]["scenario"] == "approved"
+    assert final["scenario_scenes"][0]["prompt"] == edited_prompt, (
+        "the edit must survive on disk, not revert to the stale pre-edit prompt -- got "
+        f"{final['scenario_scenes'][0]['prompt']!r}")
+    assert all(scene["prompt"] == edited_prompt for scene in final["scenes"]), (
+        "the built scene(s) must be built from the edited prompt, not a stale one -- got "
+        f"{[s['prompt'] for s in final['scenes']]!r}")
 
 
 # == Retry: track (task 7's own small addition to the server, "Пересчитать трек") ================

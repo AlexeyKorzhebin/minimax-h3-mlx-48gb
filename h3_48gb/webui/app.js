@@ -2077,6 +2077,17 @@ function startPage() {
   // -- проекты (Task 7) --------------------------------------------------------------------
   let project = null;          // {id, project: {...as_dict()}, active_job} панели, или null
   let projectBusy = false;     // идёт запрос, меняющий проект — та же роль, что `busy` у очереди
+  /** Промис последнего `saveScenario` (или `null`, если ни один ещё не запускался) -- I2, фикс-
+   *  раунд 2 (ревью 2026-08-19): «Утвердить сюжет»/«Сгенерировать сюжет» бьются кликом сразу после
+   *  блюра поля (см. делегированный `focusout` ниже), и блюр, и клик уходят в `withProject` не
+   *  дожидаясь друг друга -- без этой переменной `PUT` блюра мог прийти на сервер уже ПОСЛЕ того,
+   *  как approve/scenario прочитал проект, но ДО его собственного `proj.save()` (унаследованного у
+   *  approve/track паттерна, который эта волна намеренно не трогает -- см. отчёт), и тогда approve
+   *  тихо перезаписывал бы `scenario_scenes` устаревшей копией, без 409 и без баннера. Три
+   *  сценарных обработчика (`scenario-generate`/`scenario-procedural`/`approve-scenario`) ждут этот
+   *  промис первым делом, прежде чем бить свой собственный запрос -- тогда PUT блюра успевает
+   *  дойти до диска, и следующий запрос читает уже свежий `scenario_scenes`. */
+  let pendingScenarioSave = null;
   let projectMp3 = null;       // {path, name} — mp3, загруженный для импорта трека клипа
   let projectMp3TrackSource = "generate";  // радио «Сделать проектом» для kind=clip
 
@@ -2463,7 +2474,8 @@ function startPage() {
       : `<div class="scenario-prompt-ro">${escapeHtml(scene.prompt)}</div>`;
     const durField = editable
       ? `<span class="dur-inline" `
-        + `title="Длительность одной H3-сцены (5–10с) — не длина всего участка трека">`
+        + `title="Подсказка модели для длины сцены; финальная длина считается по границам `
+        + `секции">`
         + `<label>сцена</label>`
         + `<input class="inp num scenario-duration" type="number" step="0.5" min="5" max="10" `
         + `data-idx="${idx}" value="${escapeHtml(String(scene.duration))}">`
@@ -2563,10 +2575,14 @@ function startPage() {
     }));
   }
 
+  /** Возвращает (и держит в `pendingScenarioSave`) свой собственный промис -- три сценарных
+   *  обработчика клика ниже ждут именно его первым делом, см. `pendingScenarioSave`'s own
+   *  docstring above для того, какую гонку это закрывает. */
   function saveScenario(id) {
     const scenes = collectScenarioScenes();
-    withProject(() => api("PUT", `/api/projects/${encodeURIComponent(id)}/scenario`,
-      { scenario_scenes: scenes }));
+    pendingScenarioSave = withProject(() => api(
+      "PUT", `/api/projects/${encodeURIComponent(id)}/scenario`, { scenario_scenes: scenes }));
+    return pendingScenarioSave;
   }
 
   function projectSceneCardHtml(scene, projId, outdir) {
@@ -4019,8 +4035,14 @@ function startPage() {
       if (already && !window.confirm(
         "Перегенерировать сюжет? Написанные сцены будут заменены.")) return;
       const procedural = button.dataset.act === "scenario-procedural";
-      withProject(() => api("POST", `/api/projects/${encodeURIComponent(id)}/scenario/generate`,
-        procedural ? { procedural: true } : {}));
+      // I2 (фикс-раунд 2, ревью 2026-08-19): дождаться блюра, который мог уйти на PUT долей
+      // секунды раньше этого клика (см. `pendingScenarioSave`'s own docstring), прежде чем бить
+      // свой собственный запрос -- иначе оба запроса летят гонкой и один тихо теряет правку.
+      withProject(async () => {
+        if (pendingScenarioSave) await pendingScenarioSave;
+        return api("POST", `/api/projects/${encodeURIComponent(id)}/scenario/generate`,
+          procedural ? { procedural: true } : {});
+      });
       return;
     }
     if (button.dataset.act === "scenario-save") { saveScenario(id); return; }
@@ -4028,7 +4050,12 @@ function startPage() {
       if (!window.confirm(
         "Утвердить сюжет? Дальше начнётся генерация сцен — сюжет больше нельзя будет "
         + "поправить.")) return;
-      withProject(() => api("POST", `/api/projects/${encodeURIComponent(id)}/approve/scenario`, {}));
+      // I2 (фикс-раунд 2, ревью 2026-08-19): то же ожидание, что у `scenario-generate` выше --
+      // это как раз тот клик, что заводит блюр-плюс-approve гонку живого гейта.
+      withProject(async () => {
+        if (pendingScenarioSave) await pendingScenarioSave;
+        return api("POST", `/api/projects/${encodeURIComponent(id)}/approve/scenario`, {});
+      });
       return;
     }
     if (button.dataset.act === "retry-track") {
