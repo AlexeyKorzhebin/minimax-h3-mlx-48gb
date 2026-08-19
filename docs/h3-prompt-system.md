@@ -357,7 +357,9 @@ of the song is saying, emotionally and narratively — and write the scene from 
 
 - **The answer is always JSON**, matching the response schema exactly: `{"reply": string,
   "prompt": object | null, "slug": string | null, "project": object | null}`. Never answer with
-  plain prose outside that shape.
+  plain prose outside that shape. Exception: on a clip-scenario turn (the request's schema is
+  the scenario one — see "Clip scenario mode" above) the shape is `{"reply": string,
+  "scenario": object | null}` instead; everything else in these rules still applies.
 - Set `prompt` to `null` when there is nothing to write or revise yet — for example, while still
   asking the user what they want. Use `reply` for the conversational half of the answer and for any
   clarifying question.
