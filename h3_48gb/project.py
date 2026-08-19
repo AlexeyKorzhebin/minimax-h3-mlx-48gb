@@ -67,12 +67,24 @@ from h3_48gb.queue import write_json_durably  # noqa: F401 -- see "Durable write
 #: `_DEFAULT_AUDIO_MODE`.
 PROJECT_KINDS = ("video", "clip", "song")
 
-#: The four stages of the pipeline (design spec, "Этапы и гейты") every project's `stages` dict
+#: The five stages of the pipeline (design spec, "Этапы и гейты") every project's `stages` dict
 #: carries a status for, regardless of `kind`. Not every kind's flow visits every stage -- a `song`
 #: project never reaches `assembly`, and only `clip`/`song` ever populate `track` -- but a fixed,
 #: uniform key set means a caller (the web page, task 6) never has to special-case which keys exist
 #: for which `kind`; an unused stage simply stays `"draft"` forever.
-STAGE_NAMES = ("script", "track", "scenes", "assembly")
+#:
+#: **`"scenario"` (Task 3, "Сюжет клипа" wave) is the one exception to "stays draft forever".** It
+#: is meaningful *only* for `kind="clip"` -- the human gate between an approved track and the
+#: coverage nadrezka ("Утвердить сюжет", design spec "Гейт"). `create_project` defaults it straight
+#: to `"approved"` for `kind in ("video", "song")` instead of the uniform `"draft"` every other
+#: unused stage gets, because there is no scenario step at all for those kinds and leaving it
+#: `"draft"` would read as a gate nothing will ever pass. **Every `project.json` written before
+#: this stage existed lacks the key entirely** -- `Project._apply` migrates a missing
+#: `stages["scenario"]` to `"approved"` on every read, regardless of `kind`: "этап пройден", not
+#: "этап не начат" -- an old clip project's scenes were already built the procedural way with no
+#: scenario step to gate in the first place, so migrating to `"draft"` would incorrectly leave an
+#: already-finished project looking like it is stuck waiting on a gate it never had.
+STAGE_NAMES = ("script", "track", "scenario", "scenes", "assembly")
 
 #: What a stage's status can be. `draft` (nothing produced yet), `awaiting_approval` (produced,
 #: waiting on the gate -- "Утвердить сценарий" / "Утвердить трек"), `approved` (gate passed),
@@ -97,6 +109,11 @@ ASSEMBLY_AUDIO_MODES = ("song", "mix", "clips")
 #: there is no `_empty_assembly()` the way there is an `_empty_track()`.
 _ASSEMBLY_FIELDS = ("audio_mode", "final_path")
 
+#: The fields `update_scenario(**fields)` accepts -- both top-level `Project` attributes
+#: (`_OWNED_TOP_LEVEL_FIELDS`), unlike `_TRACK_FIELDS`/`_ASSEMBLY_FIELDS` (nested inside `track`/
+#: `assembly`). See `update_scenario`'s own docstring for why the merge shape differs.
+_SCENARIO_FIELDS = ("scenario_scenes", "scenario_style_block")
+
 #: `create_project`'s default `assembly.audio_mode` per `kind`. `clip` defaults to `"song"` --
 #: the design spec is explicit that a clip-on-a-song's default is "только песня" (song only,
 #: diegetic clip sound dropped). `video`'s main case has no song at all, so `"clips"` (its own
@@ -120,6 +137,16 @@ _UNSET_JOB_ID = object()
 #: some future, buggier version of this module) -- is treated as corrupt, the same as unparseable
 #: JSON: see `_read_data` and `list_projects`.
 _REQUIRED_FIELDS = ("id", "kind", "title", "created_at", "stages", "scenes", "track", "assembly")
+
+#: Every top-level key this module manages directly as its own `Project` attribute -- a superset of
+#: `_REQUIRED_FIELDS` (which `_validate_shape` treats as mandatory). Used only to keep `_apply`'s
+#: `_extra` catch-all from also holding a stale second copy of a field `Project` already exposes as
+#: its own attribute -- see `_apply`. Task 3's `scenario_scenes`/`scenario_style_block` are
+#: deliberately *not* in `_REQUIRED_FIELDS` (optional on disk: absent on every `project.json`
+#: written before this task existed, see `STAGE_NAMES`'s own docstring on the same backward-
+#: compatibility concern for `stages["scenario"]`) but are still first-class, always-present-once-
+#: loaded `Project` attributes, exactly like `scenes` itself.
+_OWNED_TOP_LEVEL_FIELDS = _REQUIRED_FIELDS + ("scenario_scenes", "scenario_style_block")
 
 
 class ProjectError(Exception):
@@ -327,6 +354,18 @@ def _validate_shape(data, path) -> dict:
     if not isinstance(data["assembly"], dict):
         raise ProjectNotFound(
             f"{path}: 'assembly' must be an object, got {type(data['assembly']).__name__}")
+    # Task 3: `scenario_scenes` is optional (see `_OWNED_TOP_LEVEL_FIELDS`'s own docstring), so its
+    # absence is not checked above with the required fields -- but if it *is* present, it gets the
+    # same type-corruption defence `scenes` gets, for the same reason (`_apply`'s `[dict(scene) for
+    # scene in data.get("scenario_scenes") or []]` would otherwise iterate a wrong-typed value
+    # character by character and blow up with a bare `TypeError`, not a clean `ProjectNotFound`).
+    if "scenario_scenes" in data:
+        if not isinstance(data["scenario_scenes"], list):
+            raise ProjectNotFound(
+                f"{path}: 'scenario_scenes' must be an array, got "
+                f"{type(data['scenario_scenes']).__name__}")
+        if not all(isinstance(scene, dict) for scene in data["scenario_scenes"]):
+            raise ProjectNotFound(f"{path}: every element of 'scenario_scenes' must be an object")
     return data
 
 
@@ -417,19 +456,31 @@ class Project:
         self._apply(data)
 
     def _apply(self, data: dict) -> None:
-        # Every top-level key `data` carries beyond `_REQUIRED_FIELDS` (a field a later task, or a
-        # hand-edit, added that this module does not itself know about) is kept verbatim in
-        # `_extra` rather than dropped, so `as_dict` -- and therefore `save`/every locked mutator's
-        # write-back -- round-trips it instead of silently deleting it. See `as_dict`.
-        self._extra = {key: value for key, value in data.items() if key not in _REQUIRED_FIELDS}
+        # Every top-level key `data` carries beyond `_OWNED_TOP_LEVEL_FIELDS` (a field a later
+        # task, or a hand-edit, added that this module does not itself know about) is kept verbatim
+        # in `_extra` rather than dropped, so `as_dict` -- and therefore `save`/every locked
+        # mutator's write-back -- round-trips it instead of silently deleting it. See `as_dict`.
+        self._extra = {key: value for key, value in data.items()
+                        if key not in _OWNED_TOP_LEVEL_FIELDS}
         self.id = data["id"]
         self.kind = data["kind"]
         self.title = data["title"]
         self.created_at = data["created_at"]
         self.stages = dict(data["stages"])
+        if "scenario" not in self.stages:
+            # Task 3: a project.json written before the scenario stage existed has no key for it
+            # at all -- migrate on read to "approved" ("этап пройден"), not "draft". See
+            # `STAGE_NAMES`'s own docstring for why "draft" would be the wrong migration target.
+            self.stages["scenario"] = "approved"
         self.scenes = [dict(scene) for scene in data["scenes"]]
         self.track = dict(data["track"])
         self.assembly = dict(data["assembly"])
+        # Task 3: optional on disk (absent on every project.json written before this task existed)
+        # -- `[]`/`None` is the same "nothing produced yet" default `_empty_track()`'s own fields
+        # use, not a signal this particular project predates the feature (a fresh project also
+        # starts here, see `create_project`).
+        self.scenario_scenes = [dict(scene) for scene in data.get("scenario_scenes") or []]
+        self.scenario_style_block = data.get("scenario_style_block")
 
     def as_dict(self) -> dict:
         """This project as a plain dict, ready for `json.dumps` -- every field this module
@@ -455,6 +506,8 @@ class Project:
             "scenes": [dict(scene) for scene in self.scenes],
             "track": dict(self.track),
             "assembly": dict(self.assembly),
+            "scenario_scenes": [dict(scene) for scene in self.scenario_scenes],
+            "scenario_style_block": self.scenario_style_block,
         })
         return result
 
@@ -710,6 +763,47 @@ class Project:
             self._apply(data)
         return self
 
+    def update_scenario(self, **fields) -> "Project":
+        """Partial update of `self.scenario_scenes`/`self.scenario_style_block` -- the locked
+        mutator Task 4's `/scenario/generate` route (writes both after a fresh LLM reply) and its
+        `PUT /scenario` route (edits `scenario_scenes` alone, before approval) need.
+
+        **Fields are flat top-level keys, not nested inside a subdict (`_SCENARIO_FIELDS`).** Unlike
+        `update_track`/`update_assembly`, whose fields live inside `self.track`/`self.assembly`,
+        `scenario_scenes` and `scenario_style_block` sit directly on `Project` -- mirroring `scenes`
+        itself (already a flat top-level list, not nested inside `track`) rather than `track`'s/
+        `assembly`'s own subdict convention. The merge is therefore `data.update(fields)` against
+        the whole project dict, not `data["scenario"].update(fields)` against a nested one.
+
+        Same lock -> re-read -> merge -> write -> `_apply` shape as every other locked mutator here.
+        An unrecognized keyword raises `ProjectError`, exactly like `update_track`/`update_assembly`.
+
+        **Does not touch `stages["scenario"]`.** The gate's own status is a separate concern this
+        method leaves to a plain `set_stage_status("scenario", ...)` call -- `STAGE_NAMES` now
+        includes `"scenario"`, so the existing generic setter already covers it; there is no need
+        for a second, narrower method duplicating what that one already does (task brief: "сеттер
+        статуса этапа через существующий set_stage_status"). A caller that generates a fresh
+        scenario and wants the gate to reflect it makes both calls itself, in whichever order its
+        own route needs.
+
+        **Does not validate `scenario_scenes`' own shape** (each entry's `tag`/`start`/`end`/
+        `prompt`/`duration`) -- exactly like `update_track` never validates `sections`' shape: that
+        is `h3_48gb.provider.SCENARIO_SCHEMA` (the LLM response)'s job, and, for coverage
+        specifically, `h3_48gb.web.build_clip_scenes`'s own `scenario_scenes=` mode (the python
+        check jsonschema cannot express: "0 -> track.duration, no gaps, no overlaps") -- both
+        outside this module's own concern, which is storage, not shape.
+        """
+        unknown = set(fields) - set(_SCENARIO_FIELDS)
+        if unknown:
+            raise ProjectError(
+                f"unknown scenario field(s) {sorted(unknown)}, expected one of {_SCENARIO_FIELDS}")
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            data.update(fields)
+            write_json_durably(self.path, data)
+            self._apply(data)
+        return self
+
 
 def create_project(outdir, kind: str, title: str, now=None) -> Project:
     """Claim `<outdir>/projects/<YYYYMMDD-HHMM>-<slug>/`, write a fresh `project.json` into it,
@@ -747,15 +841,24 @@ def create_project(outdir, kind: str, title: str, now=None) -> Project:
             attempt += 1
             continue
 
+    stages = {stage: "draft" for stage in STAGE_NAMES}
+    if kind != "clip":
+        # Task 3: no scenario step exists at all for these kinds -- default straight to "approved"
+        # rather than the uniform "draft" every other unused stage gets. See `STAGE_NAMES`'s own
+        # docstring.
+        stages["scenario"] = "approved"
+
     data = {
         "id": name,
         "kind": kind,
         "title": title,
         "created_at": created_at,
-        "stages": {stage: "draft" for stage in STAGE_NAMES},
+        "stages": stages,
         "scenes": [],
         "track": _empty_track(),
         "assembly": {"audio_mode": _DEFAULT_AUDIO_MODE[kind], "final_path": None},
+        "scenario_scenes": [],
+        "scenario_style_block": None,
     }
     project = Project(project_dir / PROJECT_FILENAME, data)
     project.save()

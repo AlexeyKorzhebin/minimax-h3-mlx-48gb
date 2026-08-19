@@ -1046,6 +1046,16 @@ def _clip_style_block(caption: str) -> str:
     return sentence
 
 
+def _style_clause(style_block: str | None) -> str:
+    """The literal clause both `build_clip_scenes` modes glue onto a scene's own prompt when a
+    `style_block` is given (empty string for no clause at all) -- factored out so
+    `_clip_section_prompt` (the procedural path) and `_scenario_segments` (the `scenario_scenes=`
+    path, Task 3, "Сюжет клипа" wave) glue *exactly* the same words onto a prompt, not two
+    independently-typed copies of the same sentence.
+    """
+    return f" Visual style, identical in every scene: {style_block}." if style_block else ""
+
+
 def _clip_section_prompt(tag: str, lines: list[str], caption: str, style_block: str) -> str:
     """A minimal, templated H3 prompt for one sung song section -- task 6's own stopgap, not a
     creative decision: see the task report for why (`docs/h3-prompt-system.md`, "Song mode":
@@ -1064,7 +1074,7 @@ def _clip_section_prompt(tag: str, lines: list[str], caption: str, style_block: 
     mood = next((line.strip() for line in (caption or "").splitlines() if line.strip()),
                 "a music video")
     sung_text = " ".join(lines) if lines else (tag or "instrumental section")
-    style_clause = f" Visual style, identical in every scene: {style_block}." if style_block else ""
+    style_clause = _style_clause(style_block)
     return (
         f"integrated_multimodal_description: [Shot 1] A music video visual for the "
         f"{tag or 'song'} section. {mood}.{style_clause} The scene visually interprets what is "
@@ -1075,7 +1085,74 @@ def _clip_section_prompt(tag: str, lines: list[str], caption: str, style_block: 
     )
 
 
-def build_clip_scenes(track: dict, *, style_block: str | None = None) -> list[dict]:
+def _scenario_segments(scenario_scenes: list[dict], style_block: str | None) -> list[dict]:
+    """`scenario_scenes` (`h3_48gb.project.Project.scenario_scenes`'s own on-disk shape: `{"tag",
+    "start", "end", "prompt", "duration"}`, approved and possibly hand-edited through the scenario
+    gate) turned into the same raw `{"start", "end", "prompt"}` segment shape `_clip_raw_segments`
+    builds for the procedural path -- sorted by `start`, `style_block` glued verbatim onto every
+    `prompt` (`_style_clause`, the exact same clause the procedural path glues via
+    `_clip_section_prompt`).
+
+    Deliberately drops `tag` and each scene's own `duration` -- neither has a consumer downstream.
+    `duration` was the LLM's own *suggestion* (`h3_48gb.provider.SCENARIO_SCHEMA`'s
+    `scene.duration`, clamped `[5, 10]`) for one representative H3 scene inside a song section that
+    can itself run much longer -- not a promise this function keeps. `end - start` (the section's
+    own approved span) is what actually drives `_split_long_segment`/`_fold_short_segments`/
+    `_snap_scene_duration` downstream, exactly as it already does for the procedural path's own sung
+    sections -- see `build_clip_scenes`'s own docstring for why the two modes share that whole tail
+    unchanged. `tag` has no consumer in the coverage nadrezka at all -- it exists for the gate UI
+    (Task 4) to label a scene by its song section, not for this module.
+
+    Raises `ProjectSceneBuildError`, not a bare `KeyError`/`TypeError`, for an entry missing
+    `start`/`end`/`prompt` or whose `start` cannot be compared -- the same discipline the procedural
+    path already uses turning missing lyric lines into a clear refusal rather than a 500.
+    """
+    try:
+        ordered = sorted(scenario_scenes, key=lambda scene: scene["start"])
+    except (KeyError, TypeError) as exc:
+        raise ProjectSceneBuildError(f"malformed scenario scene entry: {exc}") from exc
+    style_clause = _style_clause(style_block)
+    try:
+        return [{"start": float(scene["start"]), "end": float(scene["end"]),
+                 "prompt": f"{scene['prompt']}{style_clause}"} for scene in ordered]
+    except (KeyError, TypeError) as exc:
+        raise ProjectSceneBuildError(f"malformed scenario scene entry: {exc}") from exc
+
+
+def _check_coverage_shape(segments: list[dict], duration: float) -> None:
+    """`ProjectSceneBuildError` unless `segments` (each a `{"start", "end", ...}` dict, already
+    sorted by `start`) tiles `[0, duration)` exactly, within `_COVERAGE_TOLERANCE_SECONDS` --
+    checked by *shape* (the first segment starts at `0.0`, every consecutive pair shares an exact
+    boundary), not only by summed total (M5, fix round 1, 2026-08-19 review): a bug that shifts
+    every segment by the same offset, or that overlaps one pair while leaving a gap in another,
+    could sum correctly while the timeline itself is still broken, and a total-only check would
+    never see it.
+
+    Shared by both `build_clip_scenes` modes (Task 3, "Сюжет клипа" wave): the procedural path's own
+    `expanded` list (post fold/split) and the `scenario_scenes=` path's *raw* segments (checked
+    twice there -- once straight out of `_scenario_segments`, catching a malformed or gappy approved
+    scenario as early and as legibly as possible, and again after fold/split, same as the procedural
+    path -- `_fold_short_segments`/`_split_long_segment` both preserve coverage by construction, see
+    their own docstrings, so the second check is defence in depth, not a different rule).
+    """
+    if segments and abs(segments[0]["start"] - 0.0) > _COVERAGE_TOLERANCE_SECONDS:
+        raise ProjectSceneBuildError(
+            f"built scenes start at {segments[0]['start']:.3f}s, not 0.0s -- coverage is not "
+            f"complete")
+    for prev, nxt in zip(segments, segments[1:]):
+        if abs(prev["end"] - nxt["start"]) > _COVERAGE_TOLERANCE_SECONDS:
+            raise ProjectSceneBuildError(
+                f"built scenes have a seam at {prev['end']:.3f}s/{nxt['start']:.3f}s -- coverage "
+                f"is not complete")
+    total = sum(seg["end"] - seg["start"] for seg in segments)
+    if abs(total - duration) > _COVERAGE_TOLERANCE_SECONDS:
+        raise ProjectSceneBuildError(
+            f"built scenes cover {total:.3f}s, track is {duration:.3f}s -- coverage is not "
+            f"complete")
+
+
+def build_clip_scenes(track: dict, *, style_block: str | None = None,
+                       scenario_scenes: list[dict] | None = None) -> list[dict]:
     """The coverage-complete scene list for a `kind="clip"` project, once its track is measured
     (design spec, "Клипы": "клип на песню ... сцены привязываются к секциям песни ПОСЛЕ этапа
     трека"; lyric-video-director principle: "таймлайн покрывает 0 -> длительность трека без дыр").
@@ -1126,56 +1203,84 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None) -> list[di
 
     Returns `Project.scenes`-shaped dicts (`idx`/`prompt`/`duration`/`status="pending"`/
     `job_id=None`/`clip_path=None`/`keyframe_path=None`), ready to assign to `project.scenes`.
+
+    **`scenario_scenes=` (Task 3, "Сюжет клипа" wave): the human-approved scenario replaces this
+    whole procedural synthesis.** When given (`Project.scenario_scenes`'s own on-disk shape --
+    `[{"tag", "start", "end", "prompt", "duration"}, ...]`), `track["sections"]`/`track["lyrics"]`
+    are never read at all -- `_scenario_segments` turns the approved scenes directly into the same
+    raw `{"start", "end", "prompt"}` shape the procedural path above builds from sung sections, and
+    from there on **every remaining step is the identical code**: `_fold_short_segments(...,
+    SCENE_MIN_SECONDS)` (short pieces merge into a neighbour, taking on its prompt), `_split_long_
+    segment` (long pieces split into several sharing one prompt), the shape/total coverage check
+    (`_check_coverage_shape`, called once more here, up front, straight on `_scenario_segments`'s
+    raw output -- an approved scenario is expected to already tile `[0, duration)` with no gaps, the
+    same "0 -> duration, no gaps" rule `docs/h3-prompt-system.md`'s scenario-mode section states, so
+    a violation here is a clear, early, attributable-to-the-scenario refusal, not one buried behind
+    an unrelated fold/split step -- this is precisely "the python check jsonschema cannot express"
+    the task brief calls for), and the grid-snap loop at the bottom. `style_block` is glued the same
+    way (`_style_clause`) but is **never** defaulted from `track["caption"]` in this mode -- that
+    default is specific to the procedural path's own caption-derived placeholder and has nothing to
+    do with a scenario's own `style_block` field; pass it explicitly (`Project.scenario_style_block`)
+    or leave it `None` for no clause at all. See `_scenario_segments`'s own docstring for exactly
+    what is read from each scenario scene (and what -- `tag`, each scene's own `duration` -- is
+    deliberately not).
     """
     duration = track.get("duration")
     if not isinstance(duration, (int, float)) or duration <= 0:
         raise ProjectSceneBuildError(
             f"track has no measured duration to build scenes against: {duration!r}")
     duration = float(duration)
-    sections = track.get("sections") or []
-    lyrics = track.get("lyrics") or ""
-    caption = track.get("caption") or ""
-    if style_block is None:
-        style_block = _clip_style_block(caption)
-    _, lines = songrun.parse_lyrics(lyrics)
-    lines_by_section: dict[int, list[str]] = {}
-    for section_index, text in lines:
-        lines_by_section.setdefault(section_index, []).append(text)
 
-    segments = _clip_raw_segments(sections, duration)
-    if not any(seg["sung"] for seg in segments):
-        # Nothing was sung at all (an entirely undersung/instrumental track) -- one scene for the
-        # whole thing, built the same way a real section would be, not routed through the
-        # gap-fallback template (there is no "neighbouring scene" to reference).
-        segments = [{**segments[0],
-                    "prompt": _clip_section_prompt("instrumental", [], caption, style_block)}]
+    if scenario_scenes is not None:
+        segments = _scenario_segments(scenario_scenes, style_block)
+        _check_coverage_shape(segments, duration)
     else:
-        for seg in segments:
-            if seg["sung"]:
-                # M4 (fix round 1, 2026-08-19 review): the section's own name comes from
-                # `track["sections"]` itself (`Project`'s own schema, task 1/2) -- `sections` is
-                # already positionally aligned with `songrun.parse_lyrics`'s own `lines` (both
-                # index by tag *occurrence*, task 2's convention), so re-deriving the name a second
-                # time out of `parse_lyrics`'s own `section_names` return was reparsing the same
-                # fact `sections[i]["name"]` already states, not a second independent source.
-                tag = sections[seg["section_index"]].get("name", "") \
-                    if seg["section_index"] < len(sections) else ""
-                section_lines = lines_by_section.get(seg["section_index"], [])
-                if not section_lines:
-                    raise ProjectSceneBuildError(
-                        f"section {seg['section_index']} ({tag!r}) is sung (start is known) but "
-                        f"has no lyric lines to build a prompt from")
-                seg["prompt"] = _clip_section_prompt(tag, section_lines, caption, style_block)
-            else:
-                seg["prompt"] = None  # resolved below, once the gap-threshold fold has run
+        sections = track.get("sections") or []
+        lyrics = track.get("lyrics") or ""
+        caption = track.get("caption") or ""
+        if style_block is None:
+            style_block = _clip_style_block(caption)
+        _, lines = songrun.parse_lyrics(lyrics)
+        lines_by_section: dict[int, list[str]] = {}
+        for section_index, text in lines:
+            lines_by_section.setdefault(section_index, []).append(text)
 
-        segments = _fold_short_segments(segments, GAP_SCENE_THRESHOLD_SECONDS,
-                                        eligible=lambda seg: not seg["sung"])
-        for i, seg in enumerate(segments):
-            if not seg["sung"] and seg["prompt"] is None:
-                neighbour = (segments[i + 1]["prompt"] if i + 1 < len(segments)
-                            else segments[i - 1]["prompt"] if i > 0 else "")
-                segments[i] = {**seg, "prompt": _GAP_SCENE_PROMPT.format(prompt=neighbour or "")}
+        segments = _clip_raw_segments(sections, duration)
+        if not any(seg["sung"] for seg in segments):
+            # Nothing was sung at all (an entirely undersung/instrumental track) -- one scene for
+            # the whole thing, built the same way a real section would be, not routed through the
+            # gap-fallback template (there is no "neighbouring scene" to reference).
+            segments = [{**segments[0],
+                        "prompt": _clip_section_prompt("instrumental", [], caption, style_block)}]
+        else:
+            for seg in segments:
+                if seg["sung"]:
+                    # M4 (fix round 1, 2026-08-19 review): the section's own name comes from
+                    # `track["sections"]` itself (`Project`'s own schema, task 1/2) -- `sections`
+                    # is already positionally aligned with `songrun.parse_lyrics`'s own `lines`
+                    # (both index by tag *occurrence*, task 2's convention), so re-deriving the
+                    # name a second time out of `parse_lyrics`'s own `section_names` return was
+                    # reparsing the same fact `sections[i]["name"]` already states, not a second
+                    # independent source.
+                    tag = sections[seg["section_index"]].get("name", "") \
+                        if seg["section_index"] < len(sections) else ""
+                    section_lines = lines_by_section.get(seg["section_index"], [])
+                    if not section_lines:
+                        raise ProjectSceneBuildError(
+                            f"section {seg['section_index']} ({tag!r}) is sung (start is known) "
+                            f"but has no lyric lines to build a prompt from")
+                    seg["prompt"] = _clip_section_prompt(tag, section_lines, caption, style_block)
+                else:
+                    seg["prompt"] = None  # resolved below, once the gap-threshold fold has run
+
+            segments = _fold_short_segments(segments, GAP_SCENE_THRESHOLD_SECONDS,
+                                            eligible=lambda seg: not seg["sung"])
+            for i, seg in enumerate(segments):
+                if not seg["sung"] and seg["prompt"] is None:
+                    neighbour = (segments[i + 1]["prompt"] if i + 1 < len(segments)
+                                else segments[i - 1]["prompt"] if i > 0 else "")
+                    segments[i] = {**seg,
+                                   "prompt": _GAP_SCENE_PROMPT.format(prompt=neighbour or "")}
 
     segments = _fold_short_segments(segments, SCENE_MIN_SECONDS)
 
@@ -1185,23 +1290,7 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None) -> list[di
                  else [seg])
         expanded.extend(pieces)
 
-    # M5 (fix round 1, 2026-08-19 review): the timeline's own shape, not only its total -- see the
-    # function's own docstring for why a shape bug can sum correctly and still be broken.
-    if expanded and abs(expanded[0]["start"] - 0.0) > _COVERAGE_TOLERANCE_SECONDS:
-        raise ProjectSceneBuildError(
-            f"built scenes start at {expanded[0]['start']:.3f}s, not 0.0s -- coverage is not "
-            f"complete")
-    for prev, nxt in zip(expanded, expanded[1:]):
-        if abs(prev["end"] - nxt["start"]) > _COVERAGE_TOLERANCE_SECONDS:
-            raise ProjectSceneBuildError(
-                f"built scenes have a seam at {prev['end']:.3f}s/{nxt['start']:.3f}s -- coverage "
-                f"is not complete")
-
-    total = sum(seg["end"] - seg["start"] for seg in expanded)
-    if abs(total - duration) > _COVERAGE_TOLERANCE_SECONDS:
-        raise ProjectSceneBuildError(
-            f"built scenes cover {total:.3f}s, track is {duration:.3f}s -- coverage is not "
-            f"complete")
+    _check_coverage_shape(expanded, duration)
 
     # C1 (final review): every duration above this point is an exact float over `sections`' own
     # timestamps -- correct for the coverage checks just run, but not a duration a real `generate`

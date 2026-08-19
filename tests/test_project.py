@@ -46,12 +46,20 @@ def test_create_project_initializes_the_documented_model(tmp_path, kind):
     assert project.kind == kind
     assert project.title == "Title"
     assert project.scenes == []
-    assert set(project.stages) == {"script", "track", "scenes", "assembly"}
-    assert all(status == "draft" for status in project.stages.values())
+    assert set(project.stages) == {"script", "track", "scenario", "scenes", "assembly"}
+    # Task 3: "scenario" is the one stage that does not default to "draft" for every kind -- it is
+    # meaningful only for kind="clip" (see STAGE_NAMES's own docstring), so video/song start it
+    # straight at "approved" (nothing to gate) instead of a "draft" gate that would never resolve.
+    non_scenario_statuses = {name: status for name, status in project.stages.items()
+                             if name != "scenario"}
+    assert all(status == "draft" for status in non_scenario_statuses.values())
+    assert project.stages["scenario"] == ("draft" if kind == "clip" else "approved")
     assert project.track["sections"] == []
     assert project.track["status"] == "draft"
     assert project.assembly["audio_mode"] in p.ASSEMBLY_AUDIO_MODES
     assert project.assembly["final_path"] is None
+    assert project.scenario_scenes == []
+    assert project.scenario_style_block is None
 
 
 def test_create_project_disambiguates_a_colliding_directory_name(tmp_path):
@@ -179,6 +187,58 @@ def test_approve_stage_rejects_an_unknown_stage(tmp_path):
     project = p.create_project(tmp_path, "video", "x")
     with pytest.raises(p.ProjectError):
         project.approve_stage("nope")
+
+
+def test_approve_stage_accepts_scenario_now_that_it_exists(tmp_path):
+    project = p.create_project(tmp_path, "clip", "x")
+    assert project.stages["scenario"] == "draft"
+    project.approve_stage("scenario")
+    assert project.stages["scenario"] == "approved"
+    reloaded = p.load_project(project.path)
+    assert reloaded.stages["scenario"] == "approved"
+
+
+# -- Task 3, "Сюжет клипа" wave: stages.scenario migrates a missing key to "approved" -------------
+
+
+def test_loading_a_project_json_without_a_scenario_stage_field_migrates_it_to_approved(tmp_path):
+    """Every `project.json` written before this task existed has no `"scenario"` key in `stages`
+    at all -- `_apply` must migrate that to `"approved"` ("этап пройден"), not `"draft"`, on every
+    read, regardless of `kind` -- see `STAGE_NAMES`'s own docstring for why.
+    """
+    project = p.create_project(tmp_path, "clip", "old project")
+    data = json.loads(project.path.read_text(encoding="utf-8"))
+    del data["stages"]["scenario"]
+    project.path.write_text(json.dumps(data), encoding="utf-8")
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.stages["scenario"] == "approved"
+
+
+def test_a_project_missing_scenario_stage_migrates_in_memory_without_forcing_a_write(tmp_path):
+    """The migration is a read-time convenience, not an eager rewrite -- `load_project` on its own
+    must not touch the file on disk (it never even acquires an exclusive lock)."""
+    project = p.create_project(tmp_path, "clip", "old project")
+    data = json.loads(project.path.read_text(encoding="utf-8"))
+    del data["stages"]["scenario"]
+    before = json.dumps(data, sort_keys=True)
+    project.path.write_text(json.dumps(data), encoding="utf-8")
+
+    p.load_project(project.path)
+
+    after = json.dumps(json.loads(project.path.read_text(encoding="utf-8")), sort_keys=True)
+    assert after == before, "load_project must not write anything back"
+
+
+@pytest.mark.parametrize("kind", ["video", "song"])
+def test_a_project_missing_scenario_stage_migrates_to_approved_for_every_kind(tmp_path, kind):
+    project = p.create_project(tmp_path, kind, "old project")
+    data = json.loads(project.path.read_text(encoding="utf-8"))
+    del data["stages"]["scenario"]
+    project.path.write_text(json.dumps(data), encoding="utf-8")
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.stages["scenario"] == "approved"
 
 
 # -- set_scene_status -----------------------------------------------------------------------------
@@ -391,6 +451,10 @@ _TYPE_CORRUPTIONS = [
     pytest.param({"track": 5}, id="track-not-an-object"),
     pytest.param({"assembly": None}, id="assembly-not-an-object"),
     pytest.param({"scenes": [1, 2]}, id="scenes-elements-not-objects"),
+    # Task 3: scenario_scenes is optional (missing entirely on a pre-Task-3 file, see the migration
+    # tests above), but if present must still be an array of objects -- same defence `scenes` gets.
+    pytest.param({"scenario_scenes": "notalist"}, id="scenario-scenes-not-a-list"),
+    pytest.param({"scenario_scenes": [1, 2]}, id="scenario-scenes-elements-not-objects"),
 ]
 
 
@@ -590,6 +654,73 @@ def test_update_assembly_rejects_an_unknown_field(tmp_path):
     project = p.create_project(tmp_path, "video", "x")
     with pytest.raises(p.ProjectError):
         project.update_assembly(not_a_real_field="x")
+
+
+# -- Task 3, "Сюжет клипа" wave: update_scenario -----------------------------------------------
+
+
+_SCENARIO_SCENES = [
+    {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "a lone figure in the rain", "duration": 8.0},
+    {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "fireworks over the city", "duration": 8.0},
+]
+
+
+def test_update_scenario_sets_scenes_and_style_block(tmp_path):
+    project = p.create_project(tmp_path, "clip", "x")
+    project.update_scenario(scenario_scenes=_SCENARIO_SCENES, scenario_style_block="watercolor")
+    assert project.scenario_scenes == _SCENARIO_SCENES
+    assert project.scenario_style_block == "watercolor"
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.scenario_scenes == _SCENARIO_SCENES
+    assert reloaded.scenario_style_block == "watercolor"
+
+
+def test_update_scenario_partially_updates_and_leaves_other_fields_alone(tmp_path):
+    project = p.create_project(tmp_path, "clip", "x")
+    project.update_scenario(scenario_scenes=_SCENARIO_SCENES)
+    assert project.scenario_scenes == _SCENARIO_SCENES
+    assert project.scenario_style_block is None  # untouched
+
+    project.update_scenario(scenario_style_block="watercolor")
+    assert project.scenario_scenes == _SCENARIO_SCENES  # still there, not clobbered
+    assert project.scenario_style_block == "watercolor"
+
+
+def test_update_scenario_can_explicitly_clear_scenes_back_to_empty(tmp_path):
+    project = p.create_project(tmp_path, "clip", "x")
+    project.update_scenario(scenario_scenes=_SCENARIO_SCENES)
+    project.update_scenario(scenario_scenes=[])
+    assert project.scenario_scenes == []
+
+
+def test_update_scenario_rejects_an_unknown_field(tmp_path):
+    project = p.create_project(tmp_path, "clip", "x")
+    with pytest.raises(p.ProjectError):
+        project.update_scenario(not_a_real_field="x")
+
+
+def test_update_scenario_does_not_touch_the_scenario_stage_status(tmp_path):
+    """update_scenario is a storage-only mutator (task brief: the gate's own status goes through
+    the existing, generic set_stage_status instead) -- it must not silently flip stages["scenario"]
+    as a side effect."""
+    project = p.create_project(tmp_path, "clip", "x")
+    assert project.stages["scenario"] == "draft"
+    project.update_scenario(scenario_scenes=_SCENARIO_SCENES)
+    assert project.stages["scenario"] == "draft"
+
+
+def test_update_scenario_is_a_locked_mutator_that_does_not_clobber_a_concurrent_write(tmp_path):
+    project = p.create_project(tmp_path, "clip", "x")
+    a = p.load_project(project.path)
+    b = p.load_project(project.path)
+
+    a.update_scenario(scenario_scenes=_SCENARIO_SCENES)
+    b.set_stage_status("track", "approved")
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.scenario_scenes == _SCENARIO_SCENES
+    assert reloaded.stages["track"] == "approved"
 
 
 def test_two_project_objects_do_not_clobber_each_others_writes(tmp_path):

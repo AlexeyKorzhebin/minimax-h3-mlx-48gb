@@ -258,6 +258,145 @@ def test_build_clip_scenes_refuses_a_seam_gap_between_scenes(monkeypatch):
         web.build_clip_scenes(_track(sections, 12.0, _TWO_SECTION_LYRICS))
 
 
+# == Pure function: build_clip_scenes(scenario_scenes=...) (Task 3, "Сюжет клипа" wave) ===========
+
+
+def _scenario_track(duration, caption="Warm pop ballad.\nSteady beat.\n"):
+    """A track dict `scenario_scenes=` mode should never need to read `sections`/`lyrics` from --
+    only `duration` (`caption` is not read either in this mode, unlike the procedural path's own
+    caption-derived `style_block` default -- see
+    `test_build_clip_scenes_from_scenario_ignores_track_sections_lyrics_and_caption`)."""
+    return {"duration": duration, "caption": caption}
+
+
+def _scenario_scene(tag, start, end, prompt, duration=None):
+    return {"tag": tag, "start": start, "end": end, "prompt": prompt,
+            "duration": duration if duration is not None else min(10.0, max(5.0, end - start))}
+
+
+def test_build_clip_scenes_from_scenario_covers_the_full_track():
+    scenario_scenes = [
+        _scenario_scene("verse", 0.0, 8.0, "A lone figure walks a neon-lit city street."),
+        _scenario_scene("chorus", 8.0, 16.0, "The figure looks up as fireworks bloom overhead."),
+    ]
+    scenes = web.build_clip_scenes(_scenario_track(16.0), scenario_scenes=scenario_scenes)
+    _assert_scene_total_within_snap_tolerance(scenes, 16.0)
+    _assert_scene_durations_on_h3_grid(scenes)
+    assert [s["idx"] for s in scenes] == list(range(len(scenes)))
+    assert "neon-lit city street" in scenes[0]["prompt"]
+    assert "fireworks bloom" in scenes[1]["prompt"]
+    for s in scenes:
+        assert s["status"] == "pending"
+        assert s["job_id"] is None and s["clip_path"] is None and s["keyframe_path"] is None
+
+
+def test_build_clip_scenes_from_scenario_splits_a_section_longer_than_ten_seconds():
+    scenario_scenes = [_scenario_scene("verse", 0.0, 23.0, "a single continuous shot of rain")]
+    scenes = web.build_clip_scenes(_scenario_track(23.0), scenario_scenes=scenario_scenes)
+    _assert_scene_total_within_snap_tolerance(scenes, 23.0)
+    _assert_scene_durations_on_h3_grid(scenes)
+    assert len(scenes) == 3  # ceil(23/10) == 3, same rule as the procedural path's own split
+    for s in scenes:
+        assert web.SCENE_MIN_SECONDS <= s["duration"] <= web.SCENE_MAX_SECONDS
+    assert len({s["prompt"] for s in scenes}) == 1  # one section, one prompt, shared across pieces
+
+
+def test_build_clip_scenes_from_scenario_folds_a_short_trailing_section_into_its_neighbour():
+    """Mirrors `test_build_clip_scenes_merges_a_short_trailing_section_into_its_neighbour` (the
+    procedural path's own test) almost exactly -- proof this mode reuses the same
+    `_fold_short_segments(..., SCENE_MIN_SECONDS)` call, not a reimplementation."""
+    scenario_scenes = [
+        _scenario_scene("verse", 0.0, 10.0, "prompt A"),
+        _scenario_scene("outro", 10.0, 12.0, "prompt B"),
+    ]
+    scenes = web.build_clip_scenes(_scenario_track(12.0), scenario_scenes=scenario_scenes)
+    _assert_scene_total_within_snap_tolerance(scenes, 12.0)
+    _assert_scene_durations_on_h3_grid(scenes)
+    assert len(scenes) == 2  # the 2s outro folds into the verse, the merged 12s re-splits into two
+    assert len({s["prompt"] for s in scenes}) == 1
+    assert "prompt A" in scenes[0]["prompt"]
+
+
+def test_build_clip_scenes_from_scenario_glues_style_block_verbatim_onto_every_scene():
+    scenario_scenes = [
+        _scenario_scene("verse", 0.0, 8.0, "prompt A"),
+        _scenario_scene("chorus", 8.0, 16.0, "prompt B"),
+    ]
+    scenes = web.build_clip_scenes(_scenario_track(16.0), scenario_scenes=scenario_scenes,
+                                    style_block="A hand-drawn watercolor music video")
+    for s in scenes:
+        assert ("Visual style, identical in every scene: A hand-drawn watercolor music video"
+               in s["prompt"])
+
+
+def test_build_clip_scenes_from_scenario_without_a_style_block_adds_no_clause():
+    scenario_scenes = [_scenario_scene("verse", 0.0, 8.0, "prompt A")]
+    scenes = web.build_clip_scenes(_scenario_track(8.0), scenario_scenes=scenario_scenes)
+    assert scenes[0]["prompt"] == "prompt A"
+
+
+def test_build_clip_scenes_from_scenario_never_defaults_style_block_from_caption():
+    """The procedural path's own `style_block is None -> _clip_style_block(caption)` default is
+    specific to that path's caption-derived placeholder -- from_scenario mode must never silently
+    pull that unrelated text in just because `style_block` was left `None`."""
+    scenario_scenes = [_scenario_scene("verse", 0.0, 8.0, "prompt A")]
+    scenes = web.build_clip_scenes(
+        _scenario_track(8.0, caption="Wistful synthwave ballad."), scenario_scenes=scenario_scenes)
+    assert "Wistful synthwave ballad" not in scenes[0]["prompt"]
+    assert scenes[0]["prompt"] == "prompt A"
+
+
+def test_build_clip_scenes_from_scenario_ignores_track_sections_lyrics_and_caption():
+    """Proof this mode never reads `track["sections"]`/`track["lyrics"]` at all: garbage values
+    that would crash the procedural path do not affect from_scenario mode."""
+    track = {"duration": 8.0, "sections": "not even a list", "lyrics": 12345, "caption": None}
+    scenario_scenes = [_scenario_scene("verse", 0.0, 8.0, "prompt A")]
+    scenes = web.build_clip_scenes(track, scenario_scenes=scenario_scenes)
+    assert scenes[0]["prompt"] == "prompt A"
+
+
+def test_build_clip_scenes_from_scenario_refuses_a_track_with_no_measured_duration():
+    scenario_scenes = [_scenario_scene("verse", 0.0, 8.0, "prompt A")]
+    with pytest.raises(web.ProjectSceneBuildError, match="no measured duration"):
+        web.build_clip_scenes(_scenario_track(None), scenario_scenes=scenario_scenes)
+
+
+def test_build_clip_scenes_from_scenario_refuses_when_coverage_has_a_gap():
+    scenario_scenes = [
+        _scenario_scene("verse", 0.0, 8.0, "prompt A"),
+        _scenario_scene("chorus", 9.0, 16.0, "prompt B"),  # 1s gap between the two sections
+    ]
+    with pytest.raises(web.ProjectSceneBuildError, match="seam"):
+        web.build_clip_scenes(_scenario_track(16.0), scenario_scenes=scenario_scenes)
+
+
+def test_build_clip_scenes_from_scenario_refuses_an_overlap_between_sections():
+    scenario_scenes = [
+        _scenario_scene("verse", 0.0, 9.0, "prompt A"),
+        _scenario_scene("chorus", 8.0, 16.0, "prompt B"),  # overlaps the verse by 1s
+    ]
+    with pytest.raises(web.ProjectSceneBuildError, match="seam"):
+        web.build_clip_scenes(_scenario_track(16.0), scenario_scenes=scenario_scenes)
+
+
+def test_build_clip_scenes_from_scenario_refuses_when_coverage_does_not_start_at_zero():
+    scenario_scenes = [_scenario_scene("verse", 1.0, 16.0, "prompt A")]
+    with pytest.raises(web.ProjectSceneBuildError, match="not 0.0s"):
+        web.build_clip_scenes(_scenario_track(16.0), scenario_scenes=scenario_scenes)
+
+
+def test_build_clip_scenes_from_scenario_refuses_when_total_does_not_match_track_duration():
+    scenario_scenes = [_scenario_scene("verse", 0.0, 10.0, "prompt A")]
+    with pytest.raises(web.ProjectSceneBuildError, match=r"track is 16\.000s"):
+        web.build_clip_scenes(_scenario_track(16.0), scenario_scenes=scenario_scenes)
+
+
+def test_build_clip_scenes_from_scenario_refuses_a_malformed_scene_entry():
+    with pytest.raises(web.ProjectSceneBuildError, match="malformed"):
+        web.build_clip_scenes(_scenario_track(8.0),
+                              scenario_scenes=[{"tag": "verse", "prompt": "x"}])
+
+
 # == C1 (final review): scene durations must land on H3's own 17n+5 frame grid ====================
 
 
