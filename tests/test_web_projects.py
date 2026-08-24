@@ -2596,6 +2596,49 @@ def test_provider_test_route_reports_a_response_that_is_not_a_models_list(_serve
     assert payload["reachable"] is True
 
 
+def test_provider_test_route_never_echoes_the_raw_body_of_a_bad_models_reply(_serve):
+    """M3 (ревью): the "not a models list" branch used to put up to 200 chars of the raw
+    response body straight into `detail` -- honest, but a misconfigured proxy in front of a
+    real provider can echo request headers (the bearer token among them) back in an error body
+    it still answers 200 with, and that would have put the token one hop from the UI. Simulated
+    here by baking the token into the fake's own "bad" response body -- proves `detail` never
+    carries it, whatever the provider chose to send back."""
+    fake = _FakeLlama(models_payload={"upstream_echo":
+                                      "Authorization: Bearer sk-very-secret"})
+    try:
+        srv = _serve(providers={"ext": {"type": "openai",
+                                        "base_url": f"http://127.0.0.1:{fake.port}",
+                                        "model": "m", "api_key_env": "OPENROUTER_API_KEY"}},
+                     active="ext", env="OPENROUTER_API_KEY=sk-very-secret\n")
+        status, payload = srv.post_json_raw("/api/providers/ext/test", {})
+    finally:
+        fake.close()
+    assert status == 200, payload
+    assert payload["ok"] is False
+    assert "sk-very-secret" not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_provider_test_route_reports_a_response_that_is_not_json_at_all(_serve):
+    """`ok=False`, `reachable=True` -- same family as "answered, but not a models list" above,
+    but the response is not even parseable JSON (an HTML error page from a proxy in front of the
+    real provider, say). `json.loads` must be given a chance to fail on its own bytes, which is
+    why this needs `_FakeLlama`'s own `models_raw` (a `dict` passed through `models_payload`
+    always round-trips through `json.dumps`, so it can never produce this branch)."""
+    fake = _FakeLlama(models_raw="<html>502 Bad Gateway</html>")
+    try:
+        srv = _serve(providers={"ext": {"type": "openai",
+                                        "base_url": f"http://127.0.0.1:{fake.port}",
+                                        "model": "m"}},
+                     active="ext")
+        status, payload = srv.post_json_raw("/api/providers/ext/test", {})
+    finally:
+        fake.close()
+    assert status == 200, payload
+    assert payload["ok"] is False
+    assert payload["reachable"] is True
+    assert "JSON" in payload["detail"]
+
+
 def test_provider_test_route_for_a_local_port_that_is_not_up_is_not_shown_as_an_error(_serve):
     """A `llama-local` provider whose port nobody answers on is an ordinary state (the model
     raises itself, on `ensure_up`, at generation time) -- `ok` must stay `True`."""

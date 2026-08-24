@@ -428,9 +428,17 @@ def test_provider(cfg: dict, env: dict, timeout: float = 5.0) -> dict:
 
     `type: "openai"` -- `GET {base_url}/v1/models`, the same bearer header `_chat_turn` sends,
     `timeout` seconds (a handful, not `_chat_turn`'s own 600s: a probe is worth nothing if it can
-    itself hang for a minute). **Not `{base_url}/models`** -- `_base_url` already strips `/v1`,
-    the same way `_chat_turn` adds `/v1/chat/completions` itself; `/models` alone 404s on every
-    real provider. Success returns however many model ids the response named (`models`, capped at
+    itself hang for a minute). **Not `{base_url}/models`** -- `_base_url` (defined earlier in
+    this module) does not add or strip `/v1` at all, for either provider kind: for `type:
+    "openai"` it is only `cfg["base_url"].rstrip("/")`. `_chat_turn` is the one that appends
+    `/v1/chat/completions` itself, and this appends `/v1/models` the same way -- so **`base_url`
+    in `providers.json` must be given without a trailing `/v1`**. This matters beyond a typo:
+    OpenRouter's own docs quote a base URL that already ends in `/v1`, and copying that verbatim
+    here would silently double it into `/v1/v1/models` (and `/v1/v1/chat/completions` for
+    `chat`/`chat_scenario` too) -- a 404 on every provider that follows that convention, chat
+    included, not just this probe.
+
+    Success returns however many model ids the response named (`models`, capped at
     20 so a provider with hundreds does not bloat the response); failure -- no token, no answer,
     or a 200 that is not a models list -- is a plain, honest `detail`, never the raw exception
     (which can carry a URL with a query string) and never the token itself, which never leaves
@@ -472,9 +480,13 @@ def test_provider(cfg: dict, env: dict, timeout: float = 5.0) -> dict:
 
     models = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(models, list):
+        # The raw body never rides `detail` (M3, review round after the first landing): the
+        # one branch that gets this far already has a 200 from *something* at `base_url`, and
+        # that something is not necessarily the provider itself -- a misconfigured proxy in
+        # front of it can echo request headers (the bearer token among them) back in an error
+        # body, and this probe's whole point is to be safe to click without a second thought.
         return {"ok": False, "reachable": True,
-               "detail": f"провайдер ответил 200, но не списком моделей: "
-                        f"{json.dumps(payload, ensure_ascii=False)[:200]}"}
+               "detail": "провайдер ответил 200, но не списком моделей"}
     names = [m.get("id") for m in models if isinstance(m, dict) and m.get("id")]
     count = len(models)
     return {

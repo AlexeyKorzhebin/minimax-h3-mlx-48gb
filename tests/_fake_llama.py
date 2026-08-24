@@ -29,17 +29,24 @@ class _FakeLlama:
     old "anything but /health is 404" behaviour -- a test that never passes it sees no change at
     all. Passing a dict answers `models_status` (200 by default) with that dict as the JSON body,
     so a test can shape both the success case (`{"data": [...]}}`) and the "answered, but not a
-    models list" one (any other shape, still 200) without a second mock class. Recorded into
-    `seen`/`requests` the same way a POST chat turn is -- `/health` is polled every 0.2s by
+    models list" one (any other shape, still 200) without a second mock class.
+
+    `models_raw`: the one shape a JSON-encodable `dict` cannot make -- a 200 whose body is not
+    JSON at all (a provider or a proxy in front of one answering with an HTML error page, say).
+    Takes priority over `models_payload` when both are given; either raw `bytes` or `str`
+    (encoded utf-8 here for convenience).
+
+    Every `/v1/models` request is recorded into `seen`/`requests` the same way a POST chat turn
+    is -- `/health` is polled every 0.2s by
     `port_alive`/`ensure_up` and deliberately stays unlogged, or every existing `(req,) =
     fake.requests`/`fake.requests == []` assertion in the other provider/chat tests would break
     the moment this class started being used anywhere near a running local provider.
     """
 
     def __init__(self, chat_payload=None, health: int = 200, delay: float = 0.0,
-                 models_payload=None, models_status: int = 200):
+                 models_payload=None, models_status: int = 200, models_raw=None):
         handler_cls = self._make_handler(chat_payload, health, delay, models_payload,
-                                         models_status)
+                                         models_status, models_raw)
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
         self.port = self.httpd.server_address[1]
         self.requests: list[dict] = []
@@ -48,7 +55,7 @@ class _FakeLlama:
         self.thread.start()
 
     def _make_handler(self, chat_payload, health, delay=0.0, models_payload=None,
-                      models_status=200):
+                      models_status=200, models_raw=None):
         class Handler(http.server.BaseHTTPRequestHandler):
             seen: list = []
 
@@ -61,10 +68,13 @@ class _FakeLlama:
                     return
                 if self.path == "/v1/models":
                     type(self).seen.append({"path": self.path, "headers": dict(self.headers)})
-                    if models_payload is None:
+                    if models_raw is None and models_payload is None:
                         self.send_response(404); self.end_headers()
                         return
-                    out = json.dumps(models_payload).encode()
+                    if models_raw is not None:
+                        out = (models_raw.encode() if isinstance(models_raw, str) else models_raw)
+                    else:
+                        out = json.dumps(models_payload).encode()
                     self.send_response(models_status)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(out)))
