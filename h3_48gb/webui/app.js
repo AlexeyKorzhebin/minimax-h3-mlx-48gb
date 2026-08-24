@@ -773,6 +773,26 @@ export function pendingSummary(jobs, { now, runningSeconds = 0, workerState = "a
   };
 }
 
+/** Задача-часть чужого проекта — сцена, трек или сборка, — узнанная по `job.note`, а не по
+ *  `kind` (task 10, волна ux-фиксов 2026-08-24): сцена проекта — обычный `kind="generate"`,
+ *  неотличимый от одиночного прогона ничем, кроме `note`. Три формата, по одному на каждый
+ *  служебный шаг конвейера проекта, каждый — зеркало ровно одного места на сервере, которое
+ *  этот `note` пишет:
+ *   - `project scene <id> #<idx>` — `h3_48gb.assemble.scene_note`/`parse_scene_note`
+ *     (сцена клипа/видео, `kind="generate"`);
+ *   - `project track <id>` — `web._submit_project_song_job` (трек, `kind="song"`);
+ *   - `assemble project <id>` — `assemble._submit_assembly` (сборка, `kind="assemble"`).
+ *  Все три результата уже видны в своей карточке проекта (`projectTrackStageHtml`/
+ *  `projectScenesStageHtml`/`projectAssemblyStageHtml`) — держать их ещё и плиткой в общем
+ *  «Готово» удваивает одну и ту же новость и мешает её с одиночными прогонами, у которых
+ *  карточки проекта нет вовсе. Сцена принадлежит своей карточке проекта, не общей ленте. */
+export function isProjectPipelineNote(note) {
+  const s = String(note || "");
+  return /^project scene \S+ #\d+$/.test(s)
+    || /^project track \S+$/.test(s)
+    || /^assemble project \S+$/.test(s);
+}
+
 /** Все завершённые, свежие сверху.
  *
  *  Окна тут больше нет. Список смотрел на сутки назад из догадки, что список, который
@@ -2461,11 +2481,20 @@ function startPage() {
     $("pending-bad").hidden = broken === "";
     $("pending-bad").innerHTML = broken;
 
-    // -- закончилось: всё, что есть, свежее сверху
-    const finished = finishedSorted([...(queue.done || []), ...(queue.failed || [])]);
+    // -- закончилось: всё, что есть, свежее сверху -- КРОМЕ кусков чужого проекта
+    // (`isProjectPipelineNote`, task 10): сцены/трек/сборка проекта живут своей карточкой,
+    // здесь остаются только финальные ролики и одиночные прогоны.
+    const finishedAll = finishedSorted([...(queue.done || []), ...(queue.failed || [])]);
+    const finished = finishedAll.filter((job) => !isProjectPipelineNote(job.note));
     $("finished").innerHTML = finished
       .map((job) => finishedRowHtml(job, state.outdir, state.runs, deadMediaUrls)).join("");
     $("finished-empty").hidden = finished.length > 0;
+    // Пустой список после фильтрации проектных кусков — не то же самое, что пустой список
+    // вообще: если что-то посчиталось, но всё оно оказалось проектным, честная подпись — не
+    // «ещё ничего не закончилось» (неправда, посчиталось), а куда это делось.
+    $("finished-empty").textContent = (finished.length === 0 && finishedAll.length > 0)
+      ? "Всё посчитанное — части проектов; смотрите карточку нужного проекта"
+      : "Ещё ничего не закончилось";
     const failed = finished.filter((job) => job.exit_code !== 0).length;
     // Счётчик теперь общий, а не «за сутки», — и это единственное место, где видно, сколько
     // всего насчитано: числу в заголовке верят больше, чем длине прокрученного списка.
@@ -2972,18 +3001,38 @@ function startPage() {
       + `</div></div>`;
   }
 
+  /** «N/M готово» плюс, если что-то сейчас в работе, «, считается K-я» -- тот самый счётчик,
+   *  который должен читаться и без раскрытия блока (task 10): человека, заглянувшего в проект,
+   *  интересует прежде всего «где мы сейчас», а не готова ли сцена посмотреть карточками. */
+  function projectScenesStatusText(proj) {
+    const total = proj.scenes.length;
+    const done = proj.scenes.filter((s) => s.status === "done").length;
+    const running = proj.scenes.find((s) => s.status === "running");
+    return `${done}/${total} готово`
+      + (running ? `, считается ${running.idx + 1}-я` : "")
+      + (proj.stages.scenes === "failed" ? " — есть упавшие" : "");
+  }
+
+  /** Блок «Сцены» — свёрнут по умолчанию (`<details>`, без `open`, тот же приём, что общая
+   *  часть промптов сюжета выше, `projectScenarioScenesHtml`'s own docstring): раньше каждая
+   *  сцена проекта светилась дважды — карточкой здесь и второй раз плиткой в общем разделе
+   *  «Готово» (`isProjectPipelineNote` теперь прячет её оттуда, см. `renderQueue`), а сам блок
+   *  сцен был развёрнут всегда, то есть до девяти карточек занимали весь экран панели ещё до
+   *  того, как человек вообще спросил про сцены. Свёрнутый вид показывает ровно то, что решает
+   *  «нужно ли туда лезть»: счётчик и статус в `<summary>`, ничего больше. */
   function projectScenesStageHtml(proj, outdir) {
     if (proj.kind === "song" || !proj.scenes.length) return "";
-    const done = proj.scenes.filter((s) => s.status === "done").length;
+    const total = proj.scenes.length;
     const cards = proj.scenes.slice().sort((a, b) => a.idx - b.idx)
       .map((scene) => projectSceneCardHtml(scene, proj.id, outdir, deadMediaUrls)).join("");
     return `<div class="proj-stage">`
-      + `<div class="proj-stage-head">`
-      + `<span class="t">Сцены</span>`
-      + `<span class="proj-stage-status">${done}/${proj.scenes.length} готово`
-      + `${proj.stages.scenes === "failed" ? " — есть упавшие" : ""}</span>`
-      + `</div>`
-      + `<div class="proj-stage-body"><div class="scene-grid">${cards}</div></div></div>`;
+      + `<details class="adv proj-scenes-block">`
+      + `<summary class="proj-stage-head"><span class="t">Сцены (${total})</span>`
+      + `<span class="proj-stage-status">${escapeHtml(projectScenesStatusText(proj))}</span>`
+      + `</summary>`
+      + `<div class="adv-body proj-scenes-body">`
+      + `<div class="proj-stage-body"><div class="scene-grid">${cards}</div></div>`
+      + `</div></details></div>`;
   }
 
   function projectAssemblyStageHtml(proj, outdir) {

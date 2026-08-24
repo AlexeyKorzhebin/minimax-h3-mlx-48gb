@@ -1434,6 +1434,13 @@ audio.proj-audio { width: 100%; margin-top: 8px; display: block; }
 .scenario-common { margin-top: 10px; }
 .scenario-common .adv-body.scenario-common-body { display: block; }
 .scenario-common .scenario-common-body .proj-lyrics { margin-top: 0; }
+/* Task 10 (волна ux-фиксов 2026-08-24): блок «Сцены» проекта, тем же приёмом -- свёрнутая
+   карточка `details.adv`, тело в одну колонку (сетка карточек сцен сама решает свою раскладку,
+   спорить с `.adv-body`'s двухколоночной сеткой ей незачем). Счётчик/статус живут в `<summary>`
+   через уже существующие `.proj-stage-head .t`/`.proj-stage-status` -- сворачивается всё, кроме
+   них, поэтому свёрнутый вид остаётся осмысленным сам по себе. */
+.proj-scenes-block .adv-body.proj-scenes-body { display: block; }
+.proj-scenes-block .proj-scenes-body .proj-stage-body { margin-top: 0; }
 .scenario-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
 .scenario-scene {
   border: 1px solid var(--hairline); border-radius: var(--r-inner);
