@@ -773,24 +773,34 @@ export function pendingSummary(jobs, { now, runningSeconds = 0, workerState = "a
   };
 }
 
-/** Задача-часть чужого проекта — сцена, трек или сборка, — узнанная по `job.note`, а не по
- *  `kind` (task 10, волна ux-фиксов 2026-08-24): сцена проекта — обычный `kind="generate"`,
- *  неотличимый от одиночного прогона ничем, кроме `note`. Три формата, по одному на каждый
- *  служебный шаг конвейера проекта, каждый — зеркало ровно одного места на сервере, которое
- *  этот `note` пишет:
+/** Промежуточная задача-кусок проекта — сцена или трек, — узнанная по `job.note`, а не по
+ *  `kind` (task 10, живой проход 2026-08-24: изначальная правка прятала из «Готово» и сборку
+ *  тоже, но сборка (`kind="assemble"`) — это и есть финальный ролик проекта, ровно то, что
+ *  формулировка задачи называет «финальные ролики»; прятать её значило бы не оставить в ленте
+ *  вообще ни одного следа готового проекта). Скрыты только два формата, оба — зеркало ровно
+ *  одного места на сервере, которое этот `note` пишет:
  *   - `project scene <id> #<idx>` — `h3_48gb.assemble.scene_note`/`parse_scene_note`
  *     (сцена клипа/видео, `kind="generate"`);
- *   - `project track <id>` — `web._submit_project_song_job` (трек, `kind="song"`);
- *   - `assemble project <id>` — `assemble._submit_assembly` (сборка, `kind="assemble"`).
- *  Все три результата уже видны в своей карточке проекта (`projectTrackStageHtml`/
- *  `projectScenesStageHtml`/`projectAssemblyStageHtml`) — держать их ещё и плиткой в общем
- *  «Готово» удваивает одну и ту же новость и мешает её с одиночными прогонами, у которых
- *  карточки проекта нет вовсе. Сцена принадлежит своей карточке проекта, не общей ленте. */
+ *   - `project track <id>` — `web._submit_project_song_job` (трек, `kind="song"`).
+ *  Оба результата уже видны в своей карточке проекта (`projectTrackStageHtml`/
+ *  `projectScenesStageHtml`) — держать их ещё и плиткой в общем «Готово» удваивает одну и ту же
+ *  новость и мешает её с одиночными прогонами, у которых карточки проекта нет вовсе. Сборка
+ *  (`assembleProjectId` ниже) в этот список не входит — она остаётся в «Готово» как финал. */
 export function isProjectPipelineNote(note) {
   const s = String(note || "");
   return /^project scene \S+ #\d+$/.test(s)
-    || /^project track \S+$/.test(s)
-    || /^assemble project \S+$/.test(s);
+    || /^project track \S+$/.test(s);
+}
+
+/** `id` проекта, чью финальную сборку описывает `note`, или `null` -- зеркало `assemble.
+ *  _submit_assembly`'s собственного `note = f"assemble project {proj.id}"`. Единственный
+ *  потребитель -- `renderQueue` (task 10): плитка сборки в «Готово» узнаваема как итог именно
+ *  этого проекта (название проекта вместо `job-final`, имени файла, которое сборка сама себе
+ *  даёт и которое человеку ничего не говорит), а не только по совпадающему `kind="assemble"`. */
+export function assembleProjectId(note) {
+  const s = String(note || "");
+  const m = /^assemble project (\S+)$/.exec(s);
+  return m ? m[1] : null;
 }
 
 /** Все завершённые, свежие сверху.
@@ -954,7 +964,7 @@ export function deadMediaPlaceholderHtml(label) {
   return `<div class="media-gone">${escapeHtml(label)}</div>`;
 }
 
-export function finishedRowHtml(job, outdir, runs, deadMedia) {
+export function finishedRowHtml(job, outdir, runs, deadMedia, projectTitle) {
   const code = job.exit_code;
   const ok = code === 0;
   const isSong = job.kind === "song";
@@ -1003,7 +1013,16 @@ export function finishedRowHtml(job, outdir, runs, deadMedia) {
     + `</div>`
     + `<div class="info">`
     + `<div class="n"><span class="m ${ok ? "done" : "fail"}" aria-hidden="true"></span>`
-    + `${escapeHtml(jobTag(job))}</div>`
+    // Task 10 (живой проход 2026-08-24): сборка проекта (`kind="assemble"`) остаётся в «Готово»
+    // как финал -- но её собственное имя (`job-final`, `_submit_assembly`'s own `output_stem`)
+    // ничего не говорит о том, какой это проект. `projectTitle` (переданный из `renderQueue`,
+    // найденный по `assembleProjectId(job.note)` среди `state.projects`) заменяет его названием
+    // проекта, с тем же значком-плашкой, что уже есть у карточек проектов (`.badge`), чтобы
+    // плитка читалась как «финал проекта», а не как ещё один одиночный прогон.
+    + (projectTitle
+        ? `<span class="badge">проект</span>${escapeHtml(projectTitle)}`
+        : escapeHtml(jobTag(job)))
+    + `</div>`
     + `<div class="meta">${Number.isFinite(took) ? formatDuration(took) : "—"}`
     + ` · ${job.finished_at ? formatClock(new Date(job.finished_at)) : "—"}`
     + ` · код ${escapeHtml(code == null ? "?" : code)}</div>`
@@ -2481,19 +2500,27 @@ function startPage() {
     $("pending-bad").hidden = broken === "";
     $("pending-bad").innerHTML = broken;
 
-    // -- закончилось: всё, что есть, свежее сверху -- КРОМЕ кусков чужого проекта
-    // (`isProjectPipelineNote`, task 10): сцены/трек/сборка проекта живут своей карточкой,
-    // здесь остаются только финальные ролики и одиночные прогоны.
+    // -- закончилось: всё, что есть, свежее сверху -- КРОМЕ промежуточных кусков чужого
+    // проекта (`isProjectPipelineNote`, task 10, живой проход 2026-08-24): сцена/трек живут
+    // своей карточкой, здесь остаются только финальные ролики (в т.ч. сборка проекта,
+    // `kind="assemble"` -- она и есть финал) и одиночные прогоны.
     const finishedAll = finishedSorted([...(queue.done || []), ...(queue.failed || [])]);
     const finished = finishedAll.filter((job) => !isProjectPipelineNote(job.note));
+    // Сборка проекта узнаётся плиткой как ЕГО финал, не безымянный `job-final`, — см.
+    // `finishedRowHtml`'s own `projectTitle` docstring. `state.projects` уже несёт название
+    // каждого проекта (`project_summary`); отсутствующий здесь id (проект удалён, но задача в
+    // очереди осталась) — не повод падать, `finishedRowHtml` сама откатывается на `jobTag`.
+    const projectTitleById = {};
+    for (const row of (state.projects || [])) projectTitleById[row.id] = row.title || row.id;
     $("finished").innerHTML = finished
-      .map((job) => finishedRowHtml(job, state.outdir, state.runs, deadMediaUrls)).join("");
+      .map((job) => finishedRowHtml(job, state.outdir, state.runs, deadMediaUrls,
+        projectTitleById[assembleProjectId(job.note)])).join("");
     $("finished-empty").hidden = finished.length > 0;
-    // Пустой список после фильтрации проектных кусков — не то же самое, что пустой список
-    // вообще: если что-то посчиталось, но всё оно оказалось проектным, честная подпись — не
-    // «ещё ничего не закончилось» (неправда, посчиталось), а куда это делось.
+    // Пустой список после фильтрации кусков проекта — не то же самое, что пустой список
+    // вообще: если что-то посчиталось, но всё оно оказалось сценами/треком проекта, честная
+    // подпись — не «ещё ничего не закончилось» (неправда, посчиталось), а куда это делось.
     $("finished-empty").textContent = (finished.length === 0 && finishedAll.length > 0)
-      ? "Всё посчитанное — части проектов; смотрите карточку нужного проекта"
+      ? "Всё посчитанное — сцены/треки проектов; смотрите карточку нужного проекта"
       : "Ещё ничего не закончилось";
     const failed = finished.filter((job) => job.exit_code !== 0).length;
     // Счётчик теперь общий, а не «за сутки», — и это единственное место, где видно, сколько

@@ -1,17 +1,22 @@
-// Task 10 (волна ux-фиксов 2026-08-24): drives the REAL `h3_48gb/webui/app.js` -- not a
-// reimplementation -- through its own startup poll (`startPage()` -> `poll()` -> `GET /api/state`
-// -> `renderQueue()`) against a real, already-running server that has TWO finished jobs sitting in
-// its queue: one an ordinary standalone `kind="generate"` run, one a project scene job whose
-// `note` is shaped exactly like `assemble.scene_note` writes it (`project scene <id> #<idx>`).
+// Task 10 (волна ux-фиксов 2026-08-24, ПРАВКА "финалы проектов остаются"): drives the REAL
+// `h3_48gb/webui/app.js` -- not a reimplementation -- through its own startup poll
+// (`startPage()` -> `poll()` -> `GET /api/state` -> `renderQueue()`) against a real,
+// already-running server whose queue holds finished jobs of every shape `isProjectPipelineNote`/
+// `assembleProjectId` have to tell apart: an ordinary standalone `kind="generate"` run, a project
+// scene job (`note` shaped like `assemble.scene_note` writes it, `project scene <id> #<idx>`), a
+// project track/song job (`note = "project track <id>"`), and a project's own final assembly
+// (`kind="assemble"`, `note = "assemble project <id>"`).
 //
-// Before this fix, `renderQueue()` folded `queue.done`/`queue.failed` into one flat "закончилось"
-// list with no notion of "this job belongs to a project" at all -- a project's scenes appeared
-// twice: once as a card in the project's own modal, once more as an identical-looking tile in the
-// general "Готово" section, mixed in with genuinely standalone runs. The fix
-// (`isProjectPipelineNote`) filters the second copy out of `#finished`'s own `innerHTML` before it
-// is ever set -- this script proves that from OUTSIDE the module: it reads back the real
-// `document.getElementById("finished").innerHTML` a real click-free poll cycle produced, not a
-// value this script already assumes.
+// First round of this fix folded all three project-shaped notes out of "Готово" alike -- wrong:
+// the live review that followed found the assembly tile is the one thing in that trio a person
+// actually wants to see in the general feed (design decision, verbatim: "лента = одиночные
+// прогоны + финалы проектов") -- it has no separate "final video" card anywhere else the way a
+// scene has its own carousel in the project modal. So the contract this script now proves is
+// asymmetric: the scene and the track/song note must vanish from `#finished`'s own `innerHTML`,
+// the assembly note must NOT -- and (the recognisability half of the same fix) the assembly
+// tile's own title must read as the project's name, not `job-final` (`_submit_assembly`'s own
+// anonymous `output_stem`), which is what `finishedRowHtml`'s new `projectTitle` parameter and
+// `renderQueue`'s own `state.projects` lookup by `assembleProjectId(job.note)` are for.
 //
 // Same harness technique as `_scenario_busy_check.mjs`/`_scenario_prefix_check.mjs` (see either's
 // own module docstring for why this needs `node`, not a `_node_eval` snippet): a minimal
