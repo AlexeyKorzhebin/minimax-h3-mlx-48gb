@@ -17,13 +17,28 @@ on top of that, not a redundant check to delete once the patch lands — a decod
 every frame that reaches a caller is verified rather than trusted.
 
 Both thresholds and the seam-score formula come from the investigation's own scripts, merged: the
-five-column seam list is `check_mp4.py`'s (the investigation's "working detector for both modes");
-the fixed `2.5` threshold and the zero-fill fraction floor are `decode_after_unload.py`'s (the
-investigation's final, most-refined pass, run against the real allocator state a production decode
-sees) — see each constant's own docstring for its exact provenance.
+tile-seam geometry originally came from `check_mp4.py`'s hardcoded five-column list (calibrated by
+eye against one canvas, 896x512); the fixed `2.5` threshold and the zero-fill fraction floor are
+`decode_after_unload.py`'s (the investigation's final, most-refined pass, run against the real
+allocator state a production decode sees) — see each constant's own docstring for its exact
+provenance.
+
+**2026-08-24 fix (`.superpowers/fixes-2026-08-24/task-1-report.md`):** the hardcoded five-column /
+two-row list was `check_mp4.py`'s calibration for 896x512 alone. On any other canvas, part of it
+fell outside the frame and the surviving coordinates stopped being tile seams while still being
+scored as if they were one — this is what stalled боевые ворота 2026-08-20 (two scene chains, ~3h
+GPU, on clean 448x288 clips). `tile_seam_score` now computes seam positions from the frame's own
+size, using the same tiling arithmetic `video_vae.py::_split_tiles` uses (`_vae_tile_starts`
+below, ported to plain Python -- this module must stay `mlx`-free, see `video_vae.py:26-27`), and
+returns the clean value `1.0` outright on any canvas too small to give the ratio enough points to
+average over (`MIN_SEAM_POINTS`) rather than measuring noise. Measured: 448x288 never has enough
+points and is why `zero_fill_fraction` is now that canvas's *only* corruption signal; 896x512 and
+1344x768 both clear the floor and keep catching real corruption with wide margin. Full numbers in
+the report above.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -45,21 +60,99 @@ FILL_TOLERANCE = 2
 #: enough that no legitimate frame accidentally lands enough pixels on this one exact RGB triple.
 ZERO_FILL_FRACTION_THRESHOLD = 0.005
 
-#: Column x-positions where two decode tiles seam together horizontally, at the project's
-#: `DEFAULT_SCENE_CANVAS` (896x512, `h3_48gb.assemble`) — `check_mp4.py`'s own five columns, the
-#: investigation's most complete list of the VAE's tile boundaries at that canvas. A column outside
-#: a given frame's width is skipped, not clamped (see `tile_seam_score`), so this degrades to
-#: "no seam evidence at this column" rather than raising on a differently-sized frame.
-TILE_SEAM_COLUMNS = (160, 320, 480, 640, 736)
+#: The video VAE's own tiling geometry (`upstream/minimax_h3_mlx/video_vae.py`'s
+#: `VideoAutoencoder.__init__`, ~459-463): every decode tiles the frame into `VAE_TILE_SIZE`
+#: squares overlapping by at least `VAE_TILE_MIN_OVERLAP`. `framecheck` cannot import `video_vae`
+#: to read these off the real config (`video_vae.py:26-27` pulls `mlx` at module scope, and this
+#: module has to stay numpy-only so `h3_48gb.assemble`'s worker process can import it without a
+#: GPU) — these are this module's own copy, fixed for this project's one VAE.
+VAE_TILE_SIZE = 256
+VAE_TILE_MIN_OVERLAP = 64
 
-#: Row y-positions where two decode tiles seam together vertically, same canvas and source.
-TILE_SEAM_ROWS = (128, 256)
+#: The step tile-boundary slack is handed out in, so every tile boundary stays latent-aligned
+#: (`_split_tiles`'s `remaining // ratio` loop) — `VideoVAEConfig.spatial_compression_ratio`,
+#: product of `spatial_downsample_factors`. Same value in the dataclass default (`video_vae.py`'s
+#: `[2,2,2,2,1,1]`) and in the real weights' config (`~/models/h3-converted/video_vae/source/
+#: config.json`'s `space_down`): 16. Matters for the exact positions (measured different results
+#: at 8 vs 16 on 1344x768), so it is its own named constant, not folded into the arithmetic.
+VAE_SPATIAL_COMPRESSION_RATIO = 16
+
+
+def _vae_tile_starts(length: int) -> list[int]:
+    """Port of `VideoVAE._split_tiles`'s tile-start arithmetic (plain Python/no `mlx`, this
+    module's one allowed dependency is `numpy`) — the smallest number of `VAE_TILE_SIZE` tiles
+    that covers `length` while keeping every overlap at least `VAE_TILE_MIN_OVERLAP`, with the
+    leftover slack spread round-robin over the overlaps in `VAE_SPATIAL_COMPRESSION_RATIO` steps.
+
+    Returns `[0]` (one tile, no seam at all) when `length` doesn't need tiling.
+    """
+    tile = VAE_TILE_SIZE
+    if tile >= length:
+        return [0]
+    ratio = VAE_SPATIAL_COMPRESSION_RATIO
+    min_overlap = VAE_TILE_MIN_OVERLAP
+    num_tiles = math.ceil(length / tile)
+    while tile * num_tiles - min_overlap * (num_tiles - 1) - length < 0:
+        num_tiles += 1
+    overlaps = [min_overlap] * (num_tiles - 1)
+    remaining = tile * num_tiles - sum(overlaps) - length
+    for i in range(remaining // ratio):
+        overlaps[i % (num_tiles - 1)] += ratio
+    starts = [0]
+    for i in range(num_tiles - 1):
+        starts.append(starts[-1] + tile - overlaps[i])
+    return starts
+
+
+def _tile_seam_positions(length: int) -> tuple[int, ...]:
+    """Every coordinate along one axis (a frame's width or height) where two VAE decode tiles
+    meet — both edges of each overlap region: `_vae_tile_starts(length)[i + 1]` (where the next
+    tile starts) and `_vae_tile_starts(length)[i] + VAE_TILE_SIZE` (where the previous tile ends),
+    for every adjacent pair. Empty when `length` needs no tiling (`_vae_tile_starts` returns a
+    single start) — nothing to measure is not evidence of corruption, same contract as
+    `tile_seam_score`'s own "no configured seam fits" case.
+
+    For 896x512 (`h3_48gb.assemble.DEFAULT_SCENE_CANVAS`) this gives `(160, 256, 320, 416, 480,
+    576, 640, 736)` on the width axis and `(128, 256, 384)` on the height axis — a strict superset
+    of the tuples this replaced (`(160, 320, 480, 640, 736)` / `(128, 256)`, removed
+    2026-08-24): those were `check_mp4.py`'s by-eye reading of the same picture, and turned out
+    (measured, see the module docstring's fix note) to mix "overlap starts" for columns with
+    "overlap starts only, no ends" for rows — no single rule reproduced both, which is why this
+    computes every edge instead of guessing which subset someone meant.
+    """
+    starts = _vae_tile_starts(length)
+    if len(starts) < 2:
+        return ()
+    positions = set(starts[1:])
+    positions.update(s + VAE_TILE_SIZE for s in starts[:-1])
+    return tuple(sorted(positions))
+
+
+#: Below this many total measurement points (`_tile_seam_positions(width)` columns plus
+#: `_tile_seam_positions(height)` rows, combined), `tile_seam_score` returns the clean value
+#: outright instead of computing a ratio — too few points for an average to mean anything rather
+#: than just amplify whatever one of them happens to land on.
+#:
+#: Measured (`.superpowers/fixes-2026-08-24/task-1-report.md` has the full tables): 896x512 gets
+#: 11 points (8 columns + 3 rows) and 1344x768 gets 18 (12 + 6) — every clean frame across every
+#: available clip at those canvases (524 and 970 frames respectively, all clips on disk, not just
+#: a 60-frame sample) scored under 1.6, while the two reference corrupt frames still scored 19-32x
+#: over threshold. 448x288 gets only 4 (2 + 2) — and at 4 points, false positives were real and
+#: frequent: up to seam_score 3720+ across the 23 available clean 448x288 clips and the two
+#: gates-2026-08-20 `assembly/final.mp4` outputs, the same failure mode that stalled боевые
+#: ворота 2026-08-20 on clean footage. Below this floor, only `zero_fill_fraction` (canvas-size-
+#: independent, catches the same corruption `patches/0003` targets) still watches for corruption.
+MIN_SEAM_POINTS = 8
 
 #: Above this, `tile_seam_score`'s ratio of seam-adjacent pixel deltas to a same-tile baseline a
 #: few pixels over reads as a real discontinuity rather than picture detail. Chosen empirically by
 #: the investigation (`decode_after_unload.py`): clean frames scored <= 1.86, corrupted
 #: (tile-boundary garbage) frames scored >= 2.80 across its sample; `2.5` sits in the gap with
-#: margin on both sides and produced 0 false positives across 365 clean frames.
+#: margin on both sides. That sample was narrower than the docstring here used to claim — the
+#: full `corruption-map.csv` (1600 frames) has a real grey zone between 2.80 and 5.59 among frames
+#: `decode_after_unload.py` itself didn't call zero-filled — but the reference corrupt frames and
+#: every clean frame measured for this fix (see `MIN_SEAM_POINTS`) both sit with wide margin on
+#: their respective sides of `2.5`, so it stays unchanged rather than being retuned without cause.
 TILE_SEAM_SCORE_THRESHOLD = 2.5
 
 
@@ -78,17 +171,24 @@ def tile_seam_score(frame: np.ndarray) -> float:
     produces (legitimate picture content has no reason to break precisely on a VAE tile boundary).
     Ported from chunk-recon's `check_mp4.py` / `decode_after_unload.py` `seam_score`.
 
-    Returns ``1.0`` (the "clean" value) if `frame` is too small for any configured seam to fall
-    inside it — nothing to measure is not evidence of corruption.
+    Seam positions are computed from `frame`'s own size (`_tile_seam_positions`), not a fixed
+    table for one canvas — see the module docstring's 2026-08-24 fix note. Returns ``1.0`` (the
+    "clean" value) if `frame` is too small for any seam to fall inside it, or too small overall
+    for the ratio to mean anything (`MIN_SEAM_POINTS`) — nothing reliable to measure is not
+    evidence of corruption.
     """
     g = frame.astype(np.float32).mean(axis=-1)
     h, w = g.shape
+    columns = _tile_seam_positions(w)
+    rows = _tile_seam_positions(h)
+    if len(columns) + len(rows) < MIN_SEAM_POINTS:
+        return 1.0
     seam, base = [], []
-    for x in TILE_SEAM_COLUMNS:
+    for x in columns:
         if x - 4 >= 0 and x < w:
             seam.append(np.abs(g[:, x] - g[:, x - 1]).mean())
             base.append(np.abs(g[:, x - 3] - g[:, x - 4]).mean())
-    for y in TILE_SEAM_ROWS:
+    for y in rows:
         if y - 4 >= 0 and y < h:
             seam.append(np.abs(g[y] - g[y - 1]).mean())
             base.append(np.abs(g[y - 3] - g[y - 4]).mean())
