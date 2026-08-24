@@ -1204,6 +1204,34 @@ def test_stream_bad_provider_reply_redacts_an_echoed_bearer_token(tmp_path):
         fake.close()
 
 
+def test_bad_provider_reply_redaction_does_not_swallow_the_json_tail_after_the_token(tmp_path):
+    r"""Review round 3 (Minor, reproduced on real code, not a mock): the original
+    `_BEARER_TOKEN_RE` used `\S+` for the token itself -- "everything up to the next whitespace".
+    `Authorization` is often the *last* key in an echoed `headers` object (exactly the shape used
+    above, and the realistic one: JSON key order commonly puts it last), so the closing quote and
+    every closing brace after the token sit right next to it with no whitespace in between --
+    `\S+` swallowed all of that along with the token. The secret never leaked (a property the two
+    tests above already pin) -- but the message this left behind was not the diagnostic, still-
+    readable text `bad_provider_reply`'s own contract promises: it stopped mid-structure, with no
+    closing quote or brace at all, which is not what the docstring of `_redact_secrets` (and its
+    neighbour comment on `_BEARER_TOKEN_RE`) claims -- "the diagnostic value of the body remains."
+    This pins the actual tail, not just the absence of the secret: the redacted body must still be
+    valid, parseable JSON, closing exactly where the original did.
+    """
+    fake = _FakeLlama(chat_payload={
+        "echo": {"headers": {"Authorization": "Bearer sk-real-secret-abc123"}}})
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    message = str(err.value)
+    assert "sk-real-secret-abc123" not in message
+    body = message[message.index("{"):]
+    assert body.endswith('"}}}'), body
+    assert json.loads(body) == {"echo": {"headers": {"Authorization": "Bearer [скрыто]"}}}
+
+
 # -- review round 2: cheap -- `http.client.HTTPException` was an untested line -------------------
 
 

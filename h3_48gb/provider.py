@@ -357,7 +357,16 @@ _KNOWN_MAX_TOKENS_PARAMS = frozenset({"max_tokens", "max_completion_tokens"})
 #: message, rather than leaving that vector open for the sake of matching `cli.py:236`'s "first
 #: 400 characters" to the letter. `cli.py:236`'s contract still holds -- it was never a promise to
 #: echo *secrets*, only the provider's own explanation.
-_BEARER_TOKEN_RE = re.compile(r"(?i)(bearer\s+)\S+")
+#:
+#: The token class is deliberately narrower than "everything up to the next whitespace"
+#: (`\S+`, this pattern's own first version): `Authorization` is often the *last* key in a
+#: `headers` object a proxy echoes back, so `\S+` swallowed the JSON closing punctuation right
+#: after the token too -- `"Bearer sk-..."}}}` became `"Bearer [скрыто]` with the closing quote
+#: and every brace after it gone, leaving a message that is not the diagnostic, still-parseable
+#: text this whole redaction exists to preserve (only the secret itself is supposed to go).
+#: Excluding whitespace, quotes, comma, and the two JSON closing brackets from the match stops it
+#: at the token's own end instead of eating into whatever JSON structure follows.
+_BEARER_TOKEN_RE = re.compile(r"(?i)(bearer\s+)[^\s\"',}\]]+")
 
 
 def _redact_secrets(text: str) -> str:
