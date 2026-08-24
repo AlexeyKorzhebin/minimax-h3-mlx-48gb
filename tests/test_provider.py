@@ -7,6 +7,7 @@ http.server в потоке, отвечающий на /health и /v1/chat/compl
 """
 import http.client
 import json
+import re
 import textwrap
 from unittest.mock import patch
 
@@ -367,6 +368,32 @@ def test_system_prompt_carries_the_format_and_the_preservation_rule():
                    # full answer -- a description and a prompt, not a description and a stop.
                    "attaches an image and writes no words"):
         assert anchor in text, anchor
+
+
+def test_system_prompt_defaults_invented_speech_to_russian_without_touching_preservation():
+    """Speech the model makes up itself (the user never supplied a line) must default to
+    `[Russian]` -- otherwise it drifts to `[English]`, as it did on the live 2026-08-24 run where
+    all six invented lines came back `[English]` for a Russian-speaking user and project. That
+    default must not swallow the older preservation rule: a user-supplied line still keeps its own
+    language and is never translated, and the user can still ask for a different language and have
+    that request win over the Russian default.
+    """
+    raw = provider.system_prompt().split("## Speech", 1)[1].split("\n## ", 1)[0]
+    # collapse markdown line-wrap so a phrase split across two source lines still matches
+    section = re.sub(r"\s+", " ", raw)
+
+    # the default applies to speech the model invents, not to every line -- and it names Russian
+    assert re.search(r"invent\w*.*default.*\[Russian\]", section), \
+        "no rule tying invented speech to a [Russian] default"
+
+    # the preservation rule for a user-supplied line must still stand, untouched by the new default
+    assert "never translate or rewrite it" in section
+    assert re.search(r"applies only to a line the user actually gave you", section), \
+        "preservation rule no longer scoped to user-supplied lines"
+
+    # an explicit request from the user for a language still outranks the Russian default
+    assert re.search(r"user names a language.*outranks the default", section), \
+        "no rule letting an explicit user language request override the Russian default"
 
 
 # -- A4: slug -----------------------------------------------------------------------------------

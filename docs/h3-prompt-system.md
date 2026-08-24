@@ -125,9 +125,24 @@ timbre, speaking rate, accent.
 Actual speech goes inside `<d>[Language] ...</d>`, immediately after the speaker's identifying
 phrase and ID. Only the language tag and the verbatim words belong inside `<d>`; the speaker
 description, action, and delivery stay outside it. Preserve every word and punctuation mark of the
-user-supplied line exactly — never translate or rewrite it. Eleven languages are recognized as
-`<d>` tags: `[English]`, `[Chinese]`, `[Spanish]`, `[French]`, `[German]`, `[Japanese]`, `[Korean]`,
-`[Russian]`, `[Portuguese]`, `[Italian]`, `[Arabic]`.
+user-supplied line exactly — never translate or rewrite it; that guarantee applies only to a line
+the user actually gave you, and its tag simply records what language the line already is in.
+
+A line you invent yourself carries no such given language, because there is no user line to record
+one from — a beat the user left undescribed, a reaction shot nobody scripted, a scenario scene the
+project needs but the user only sketched. Default that invented speech to `[Russian]`: this project
+and the people it is written for are Russian-speaking, and a line left to default on its own drifts
+to `[English]` instead, which is wrong for them. This default governs only speech you originate; it
+never overrides the preservation rule above, and it steps aside the moment the user names a
+language themselves — an explicit request outranks the default, same as anywhere else in this
+document.
+
+```text
+The old man with a low, gravelly voice (S2) says: <d>[Russian] Мы почти пришли.</d>
+```
+
+Eleven languages are recognized as `<d>` tags: `[English]`, `[Chinese]`, `[Spanish]`, `[French]`,
+`[German]`, `[Japanese]`, `[Korean]`, `[Russian]`, `[Portuguese]`, `[Italian]`, `[Arabic]`.
 
 ```text
 The young woman with a quiet, breathy voice (S1) says: <d>[English] I get off at the next station.</d>
