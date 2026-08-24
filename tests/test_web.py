@@ -4056,6 +4056,59 @@ def test_a_failed_run_takes_its_frame_from_the_passes_it_actually_reached():
 
 
 @_needs_node
+def test_a_finished_run_already_known_dead_shows_a_placeholder_not_a_video():
+    """Находка 1 (живой проход 2026-08-24, `ux-syuzhet-report.md`'s own "Найдено живым
+    проходом"): a scene's file gone from disk used to mean `finishedRowHtml` kept drawing a
+    `<video src="...">`/`<img src="...">` pointing at it on every single redraw -- `renderQueue`
+    rebuilds `#finished`'s `innerHTML` from scratch every `POLL_MS`, so each redraw is a BRAND NEW
+    DOM node the browser has never seen fail before, and it dutifully requests the same dead URL
+    again. Live, that grew the console's own error count from 1 to 197 in a couple of minutes.
+
+    The fix is `deadMedia`, `finishedRowHtml`'s new fourth argument (a `Set` of URLs already known
+    to 404 in this tab, filled by `app.js`'s own delegated `error` listener as things actually
+    fail) -- once a URL is in it, the row must never emit an element pointing at that URL again,
+    for either the successful (`<video>`) or the failed (`<img>`) case. This is the structural half
+    of "no second request": a browser cannot re-fetch a URL that is not the `src` of anything on
+    the page, and this test proves that URL is gone from the markup entirely, not merely hidden by
+    CSS (which would still have let the initial request fire on every redraw).
+    """
+    video_live, video_dead, video_untouched, img_dead = _node_eval("""
+      const base = {id: "j", note: "", args: ["generate", "--tag", "кот"],
+                    estimate: {width: 896, height: 576, duration_seconds: 10, steps: 8,
+                               forwards: 7, seconds: 3600, peak_gb: 35},
+                    output_stem: "/o/night/h3-кот-896x576", exit_code: 0,
+                    started_at: "2026-08-12T01:00:00", finished_at: "2026-08-12T02:00:00"};
+      const clip = app.clipUrl(base, "/o");
+      const failedBase = {...base, exit_code: 1,
+                           args: [...base.args, "--preview-every", "5", "--outdir", "/o/night"]};
+      const runs = [{outdir: "/o/night", completed: 12}];
+      const shot = app.previewUrl(failedBase, 12, "/o");
+      console.log(JSON.stringify([
+        app.finishedRowHtml(base, "/o", [], new Set()),
+        app.finishedRowHtml(base, "/o", [], new Set([clip])),
+        app.finishedRowHtml(base, "/o", []),
+        app.finishedRowHtml(failedBase, "/o", runs, new Set([shot])),
+      ]));
+    """)
+    assert "<video" in video_live and "media-gone" not in video_live, (
+        "an unmarked URL must still render its real player:\n" + video_live)
+    assert "<video" not in video_dead, (
+        "a URL already known dead must not be re-emitted as a <video src> at all -- a browser "
+        f"can only re-request what is actually on the page:\n{video_dead}")
+    assert "media-gone" in video_dead, "the row must say something in the player's place"
+    # the exact dead URL string must not appear anywhere as a `src=`/`data-media-url=` value
+    clip_url_match = re.search(r'data-media-url="([^"]*)"', video_live)
+    assert clip_url_match, "the live row must carry the url it would fetch, for this test to mean anything"
+    dead_url = clip_url_match.group(1)
+    assert f'src="{dead_url}"' not in video_dead and f'data-media-url="{dead_url}"' not in video_dead, (
+        f"the dead URL {dead_url!r} must not appear as any element's src/data-media-url:\n{video_dead}")
+    assert "<video" in video_untouched, "omitting the 4th argument entirely must keep old behaviour"
+    assert "<img" not in img_dead and "media-gone" in img_dead, (
+        "a failed job's own preview shot gets the identical treatment once it is known dead:\n"
+        + img_dead)
+
+
+@_needs_node
 def test_the_waiting_summary_counts_the_jobs_the_hours_and_the_hour_it_ends():
     """Requirement 7 -- the answer to the question the night queue is assembled to ask."""
     text, seconds, count = _node_eval("""
@@ -5282,6 +5335,75 @@ def test_scenario_scene_client_error_catches_what_the_editor_can_actually_break(
     assert second is not None and second["detail"]["index"] == 1, (
         "the first (valid) scene must not be flagged -- only the actually broken second one: "
         f"{second}")
+
+
+@_needs_node
+def test_scenario_common_prefix_finds_the_shared_visual_bible_and_snaps_to_a_line_break():
+    """Находка 2 (живой проход 2026-08-24, `ux-syuzhet-report.md`): `docs/h3-prompt-system.md`
+    tells the model to copy the visual bible verbatim into every scene's own prompt -- on a real
+    scenario that duplicated block is the longest common PREFIX of every scene's prompt (the model
+    writes the bible before the scene-specific shot list), and `scenarioCommonPrefix` is what lets
+    the editor show only the unique tail without scrolling.
+
+    Three properties, each load-bearing for `collectScenarioScenes` never losing or duplicating
+    the common part on save:
+    1. the raw longest-common-prefix is snapped DOWN to the last full line break inside it, not
+       left mid-word -- a prefix ending mid-sentence would slice a tail that starts mid-sentence
+       too, in every single scene.
+    2. without a line break, it falls back to the last full word boundary (a space) instead.
+    3. a common part shorter than the "worth a separate block" floor collapses to "" -- a handful
+       of coincidentally shared characters is not a visual bible.
+    Every case below also checks the one property that actually protects data: `prefix +
+    prompt.slice(prefix.length) === prompt` for every input prompt -- the exact reconstruction
+    `collectScenarioScenes` relies on.
+    """
+    result = _node_eval("""
+      const withNewline = [
+        "BIBLE TEXT HERE, long enough to matter.\\nScene: alpha walks by the shore.",
+        "BIBLE TEXT HERE, long enough to matter.\\nScene: beta runs along the shore.",
+        "BIBLE TEXT HERE, long enough to matter.\\nScene: gamma sits by the shore.",
+      ];
+      const noNewline = [
+        "identical opening clause here diverges immediately for scene one",
+        "identical opening clause here divergently forever for scene two",
+      ];
+      const tooShort = [
+        "Hi Alice walks the dog today near the old red barn.",
+        "Hi Bob feeds the cat every morning by the same barn.",
+      ];
+      const noOverlapAtAll = ["abc scene one", "xyz scene two"];
+      const oneScene = ["only one scene here, nothing to compare against"];
+      const noScenes = [];
+      const reconstructs = (prompts, prefix) => prompts.every(
+        (p) => prefix + p.slice(prefix.length) === p);
+      const pWithNewline = app.scenarioCommonPrefix(withNewline);
+      const pNoNewline = app.scenarioCommonPrefix(noNewline);
+      console.log(JSON.stringify({
+        withNewline: pWithNewline,
+        withNewlineReconstructs: reconstructs(withNewline, pWithNewline),
+        noNewline: pNoNewline,
+        noNewlineReconstructs: reconstructs(noNewline, pNoNewline),
+        tooShort: app.scenarioCommonPrefix(tooShort),
+        noOverlapAtAll: app.scenarioCommonPrefix(noOverlapAtAll),
+        oneScene: app.scenarioCommonPrefix(oneScene),
+        noScenes: app.scenarioCommonPrefix(noScenes),
+      }));
+    """)
+    assert result["withNewline"] == "BIBLE TEXT HERE, long enough to matter.\n", (
+        "must snap down to the last line break inside the raw common prefix, not stop mid-word "
+        f"or keep the also-common \"Scene: \" that follows it: {result['withNewline']!r}")
+    assert result["withNewlineReconstructs"] is True
+
+    assert result["noNewline"] == "identical opening clause here ", (
+        "no line break in the raw common prefix -- must fall back to the last full word, not cut "
+        f"\"diverge\" in half: {result['noNewline']!r}")
+    assert result["noNewlineReconstructs"] is True
+
+    assert result["tooShort"] == "", (
+        f"a 3-character overlap (\"Hi \") is not a visual bible: {result['tooShort']!r}")
+    assert result["noOverlapAtAll"] == ""
+    assert result["oneScene"] == "", "one scene has nothing to share a prefix with"
+    assert result["noScenes"] == ""
 
 
 @_needs_node

@@ -919,7 +919,22 @@ export function pendingRowHtml(job, { editingId = null, index = null } = {}) {
  * настоящий `final.mp4`, дёшево выведенный из `output_stem`'s собственной папки
  * (`assembleFinalUrl`), без похода на `/api/projects/<id>` только ради превью.
  */
-export function finishedRowHtml(job, outdir, runs) {
+/** Заглушка вместо `<video>`/`<img>`, когда `url` уже отвечал 404 в этой открытой вкладке
+ *  (находка 1, живой проход 2026-08-24, `ux-syuzhet-report.md`: карточки проектов и раздел
+ *  «Готово» рендерили плеер для сцен, чьи файлы удалены с диска, и каждый опрос `/api/state`
+ *  пересобирал разметку заново — тот же `<video src>` бил тот же 404 по кругу, без остановки:
+ *  живьём счётчик ошибок консоли вырос с 1 до 197 за пару минут).
+ *
+ *  Решение — только на клиенте (см. `deadMediaUrls`, `startPage`'s own docstring рядом с её
+ *  объявлением, почему не на сервере). `label` — то, что уже написано у `alt`/`title` рядом
+ *  («снимок удалён» и т.п.), не жёстко «файл удалён»: разные вызывающие называют пропавшее
+ *  по-разному (клип vs снимок), и заглушка не должна врать точнее подписи, которая была бы у
+ *  живого элемента. */
+export function deadMediaPlaceholderHtml(label) {
+  return `<div class="media-gone">${escapeHtml(label)}</div>`;
+}
+
+export function finishedRowHtml(job, outdir, runs, deadMedia) {
   const code = job.exit_code;
   const ok = code === 0;
   const isSong = job.kind === "song";
@@ -945,14 +960,20 @@ export function finishedRowHtml(job, outdir, runs) {
   const took = job.started_at && job.finished_at
     ? (Date.parse(job.finished_at) - Date.parse(job.started_at)) / 1000
     : NaN;
+  const dead = deadMedia && typeof deadMedia.has === "function";
   const frame = ok
     ? (clip
-        ? `<video class="frame-video" preload="metadata" muted playsinline src="${clip}" `
-          + `title="Кадр ролика — щёлкните для показа/паузы"></video>`
+        ? (dead && deadMedia.has(clip)
+            ? deadMediaPlaceholderHtml("клип удалён")
+            : `<video class="frame-video" preload="metadata" muted playsinline src="${clip}" `
+              + `title="Кадр ролика — щёлкните для показа/паузы" `
+              + `data-media-url="${escapeHtml(clip)}"></video>`)
         : "")
     : (shot
-        ? `<img src="${shot}" alt="снимок с середины диффузии" `
-          + `title="снимок с шага ${step} — прогон упал" onerror="this.hidden = true">`
+        ? (dead && deadMedia.has(shot)
+            ? deadMediaPlaceholderHtml("снимок удалён")
+            : `<img src="${shot}" alt="снимок с середины диффузии" `
+              + `title="снимок с шага ${step} — прогон упал" data-media-url="${escapeHtml(shot)}">`)
         : "");
   return `<article class="rcard ${ok ? "done" : "fail"}">`
     + `<div class="frame">`
@@ -1360,6 +1381,56 @@ export function scenarioSceneClientError(scenes) {
     }
   }
   return null;
+}
+
+/** Общая часть промптов сцен, для этапа «Сюжет» (находка 2, живой проход 2026-08-24,
+ *  `ux-syuzhet-report.md`): `docs/h3-prompt-system.md`'s own инструкция модели — скопировать
+ *  «визуальную библию» (герои/стиль/палитра) *дословно* в каждую сцену — на 16-38 сценах даёт
+ *  поле, где три видимых без прокрутки строки одинаковы у всех карточек, а то единственное, что
+ *  меняется от сцены к сцене (что происходит в кадре), прячется под скролл. Самый длинный общий
+ *  префикс — ровно то, что просил task brief: если модель честно выполнила инструкцию и написала
+ *  библию раньше сцены-специфичного текста (обычный для неё порядок — сперва обстановка/герои,
+ *  потом список планов), префикс и есть эта библия.
+ *
+ *  Не идеально для процедурного пути (`web._clip_section_prompt`): там общий текст стоит и до, и
+ *  ПОСЛЕ переменного `{tag}`/секции, так что LCP ловит только шаблонный заголовок до тега, не всю
+ *  повторяющуюся часть. Это честное ограничение самого метода (LCP видит совпадение только с
+ *  начала строки, а не где угодно), не недосмотр — общий-ЛЮБОЙ-подстроки алгоритм сюда не входил
+ *  в задание, и его сложность не окупилась бы для этого экрана.
+ *
+ *  Подрезка на границу строки/слова (`lastIndexOf("\n")`, иначе `lastIndexOf(" ")`) — чтобы общий
+ *  блок не обрывался серединой слова, и то же самое не начинало хвост сцены с половины слова.
+ *  Это ЧИСТАЯ функция подрезки уже вычисленного LCP (сама подрезаемая строка не меняется, только
+ *  укорачивается), так что `prefix + prompt.slice(prefix.length)` остаётся точной реконструкцией
+ *  исходного промпта для ЛЮБОЙ длины отрезанного `prefix` — контракт, на котором держится
+ *  `collectScenarioScenes` (никогда не теряет и не дублирует общую часть при сохранении, см. её
+ *  собственный докстринг).
+ *
+ *  Меньше двух сцен или короче `MIN_LEN` символов общей части (после подрезки) — `""`: у одной
+ *  сцены «общее» не имеет смысла вовсе, а несколько случайно совпавших символов не стоят
+ *  отдельного сворачиваемого блока и подписи под ним. */
+const SCENARIO_COMMON_PREFIX_MIN_LEN = 20;
+
+export function scenarioCommonPrefix(prompts) {
+  const list = (Array.isArray(prompts) ? prompts : []).map((p) => String(p == null ? "" : p));
+  if (list.length < 2) return "";
+  let prefix = list[0];
+  for (let i = 1; i < list.length && prefix; i++) {
+    const other = list[i];
+    const max = Math.min(prefix.length, other.length);
+    let j = 0;
+    while (j < max && prefix[j] === other[j]) j++;
+    prefix = prefix.slice(0, j);
+  }
+  if (!prefix) return "";
+  const lastNl = prefix.lastIndexOf("\n");
+  if (lastNl !== -1) {
+    prefix = prefix.slice(0, lastNl + 1);
+  } else {
+    const lastSp = prefix.lastIndexOf(" ");
+    if (lastSp !== -1) prefix = prefix.slice(0, lastSp + 1);
+  }
+  return prefix.length >= SCENARIO_COMMON_PREFIX_MIN_LEN ? prefix : "";
 }
 
 /* ===========================================================================
@@ -2137,6 +2208,41 @@ function startPage() {
   let runningLeft = 0;         // сколько осталось идущему прогону — им объясняется gpu_busy
   let llmStatus = "";          // последний известный `/api/llm`'s `status` — своя переменная,
                                 // отдельная от `chat.llmStatus` модалки, чтобы не путать их опрос
+  /** URL'ы `/media/...`, уже ответившие 404 в этой открытой вкладке (находка 1, живой проход
+   *  2026-08-24) -- `finishedRowHtml`/`projectSceneCardHtml` рисуют заглушку вместо `<video>`/
+   *  `<img>` для всего, что здесь есть, а не только строят ссылку и ждут, пока браузер сам не
+   *  попробует её снова: без этого множества каждый опрос `/api/state` (раз в `POLL_MS`) и
+   *  каждый `refreshProjectDetail` пересобирают `innerHTML` с нуля, браузер видит СВЕЖИЙ `<video
+   *  src>` (новый узел DOM, а не старый с уже известным исходом) и обязан запросить его заново --
+   *  тот же файл, тот же 404, без остановки (живьём — 197 ошибок консоли за пару минут).
+   *
+   *  Только на клиенте, не на сервере. Очередь ("Готово", `finishedRowHtml`) не тронута этой
+   *  задачей (`queue.py`/`worker.py` — вне периметра волны), и без клиентского множества найденная
+   *  дыра осталась бы открытой хотя бы там; а раз клиентский путь обязателен для очереди, держать
+   *  для карточек сцен проекта ВТОРОЙ, серверный путь (проверка файла на диске в `_project_
+   *  payload`) значило бы два разных механизма для одного и того же симптома — лишняя связь между
+   *  web.py и app.js без выигрыша: клиентский путь и так закрывает гонку «файл исчез между тем,
+   *  как сервер собрал ответ, и тем, как браузер сходил за самим файлом», которую серверная
+   *  проверка не закрывает (проверка mtime — не lock, файл мог исчезнуть мгновением позже).
+   *
+   *  Наполняется одним делегированным `error`-обработчиком на `document` (capture-фаза — `error`
+   *  на `<video>`/`<img>` не всплывает, но захват идёт сверху вниз независимо от bubbles, см.
+   *  подписку ниже), а не через `onerror=` в разметке: так весь код заглушки живёт в одном месте,
+   *  а не размазан по каждому месту, что рисует медиа-элемент.
+   *
+   *  Чистится не автоматически при каждой перерисовке (иначе всё множество было бы бессмысленно —
+   *  следующий же опрос стёр бы саму защиту), а по двум явным сигналам, оба ниже: «retry-scene»
+   *  снимает пометку с URL этой сцены И всех следующих (сервер инвалидирует их все тем же
+   *  запросом — confirm() над кнопкой называет это прямо) — файл мог появиться заново под тем же
+   *  именем; на практике ретрай сцены всегда пишет новое случайное имя, см. `projectMediaUrl`'s
+   *  own docstring, но полагаться на этот факт здесь — рисковать тихой порчей, если он когда-нибудь
+   *  перестанет быть верным, а «open-project» снимает пометки со всех URL этого проекта разом
+   *  (`/media/projects/<id>/...` — см. `projectMediaUrl`'s own docstring про форму пути): открыть
+   *  карточку заново — тот самый явный жест «проверь ещё раз», которым человек обычно и узнаёт,
+   *  что файл вернули на место руками. Не очередь: `open-project` не трогает `/media/<run>/<файл>`
+   *  URL'ы очереди (другая форма пути) вовсе, так что чужие уже скрытые заглушки не мигают заново.
+   */
+  const deadMediaUrls = new Set();
   // Дисмисс плашки выгрузки — состояние `nextBannerState` переносит с опроса на опрос, а не
   // застывший ключ: без этого возврат к уже отклонённому `{pending, llm}` после промежуточного
   // изменения молча гасил бы предупреждение, которое в этот раз никто не отклонял.
@@ -2349,7 +2455,7 @@ function startPage() {
     // -- закончилось: всё, что есть, свежее сверху
     const finished = finishedSorted([...(queue.done || []), ...(queue.failed || [])]);
     $("finished").innerHTML = finished
-      .map((job) => finishedRowHtml(job, state.outdir, state.runs)).join("");
+      .map((job) => finishedRowHtml(job, state.outdir, state.runs, deadMediaUrls)).join("");
     $("finished-empty").hidden = finished.length > 0;
     const failed = finished.filter((job) => job.exit_code !== 0).length;
     // Счётчик теперь общий, а не «за сутки», — и это единственное место, где видно, сколько
@@ -2409,6 +2515,19 @@ function startPage() {
     $("project-err").innerHTML = "";
   }
 
+  /** Снимает пометку 404 со всех `/media/projects/<id>/...` URL'ов этого проекта разом —
+   *  `deadMediaUrls`'s own docstring выше объясняет, почему по `open-project`, а не по каждой
+   *  перерисовке. Строка-префикс, не `Set`-пересборка по каждому известному пути сцены: сцены
+   *  меняются от ретрая к ретраю, а URL проекта всегда лежит под одним и тем же `/media/
+   *  projects/<id>/` (`projectMediaUrl`'s own docstring) — фильтр по нему не должен знать заранее,
+   *  какие именно пути сейчас существуют. */
+  function clearDeadMediaForProject(id) {
+    const prefix = `/media/projects/${encodeURIComponent(id)}/`;
+    for (const url of deadMediaUrls) {
+      if (url.startsWith(prefix)) deadMediaUrls.delete(url);
+    }
+  }
+
   /** Открывает панель немедленно (заголовок = id, тело — «Загрузка…») и только потом идёт за
    *  данными: отказ (404 неизвестного id, 400 пути вне корня) тогда есть, где показать — внутри
    *  уже открытой модалки, а не молча никуда. */
@@ -2417,6 +2536,7 @@ function startPage() {
     projectMp3 = null;
     scenarioProviderChoice = null;
     scenarioProviderTest = null;
+    clearDeadMediaForProject(id);
     $("project-modal").hidden = false;
     $("project-title").textContent = id;
     $("project-kind-badge").textContent = "";
@@ -2580,13 +2700,26 @@ function startPage() {
    *  подлежат только промпт и длительность сцены, границы секции — нет), затем сам промпт
    *  (`<textarea>`, до утверждения) и длительность будущей H3-сцены (`5`–`10`с,
    *  `web.SCENE_MIN_SECONDS`/`SCENE_MAX_SECONDS`). `data-idx` — позиция в `scenario_scenes`,
-   *  то, чем `collectScenarioScenes`/фокус-аут ниже находят поле обратно в массиве. */
-  function projectScenarioSceneHtml(scene, idx, editable) {
+   *  то, чем `collectScenarioScenes`/фокус-аут ниже находят поле обратно в массиве.
+   *
+   *  `prefix` (находка 2, живой проход 2026-08-24) — общая часть всех промптов этого сюжета
+   *  (`scenarioCommonPrefix`, вызывается один раз для всего списка в `projectScenarioScenesHtml`,
+   *  не здесь — все карточки обязаны резать по ОДНОЙ и той же границе, иначе у разных сцен
+   *  "хвост" начинался бы в разных местах их же собственного текста без всякой причины). Поле
+   *  показывает и хранит только хвост (`scene.prompt.slice(prefix.length)`) — три строки без
+   *  прокрутки теперь показывают то единственное, что отличает сцену от соседних, а не
+   *  продублированную визуальную библию перед ним (см. `scenarioCommonPrefix`'s own докстринг
+   *  про то, откуда там взялась одинаковость). Полный промпт как строка нигде не хранится и не
+   *  идёт в `value` — `collectScenarioScenes` складывает `prefix + tail` заново перед `PUT`,
+   *  тем же `prefix`, вычисленным из тех же (ещё не сохранённых) исходных данных. */
+  function projectScenarioSceneHtml(scene, idx, editable, prefix) {
     const timing = `${formatTimestamp(scene.start)}–${formatTimestamp(scene.end)}`;
+    const full = String(scene.prompt == null ? "" : scene.prompt);
+    const tail = prefix && full.startsWith(prefix) ? full.slice(prefix.length) : full;
     const promptField = editable
       ? `<textarea class="inp scenario-prompt" data-idx="${idx}" rows="3">`
-        + `${escapeHtml(scene.prompt)}</textarea>`
-      : `<div class="scenario-prompt-ro">${escapeHtml(scene.prompt)}</div>`;
+        + `${escapeHtml(tail)}</textarea>`
+      : `<div class="scenario-prompt-ro">${escapeHtml(tail)}</div>`;
     const durField = editable
       ? `<span class="dur-inline" `
         + `title="Подсказка модели для длины сцены; финальная длина считается по границам `
@@ -2604,9 +2737,31 @@ function startPage() {
       + `</div>${promptField}</div>`;
   }
 
+  /** Список сцен сюжета, плюс (находка 2) один сворачиваемый блок над ним с общей частью всех
+   *  промптов — свёрнут по умолчанию (`<details>`, без `open`): между прочитать «что во всех
+   *  сценах одинаково» и «что отличает эту сцену» человек, листающий 16 карточек перед
+   *  утверждением, хочет второе, первое — по требованию. Блок только для чтения, с подписью
+   *  почему (см. его собственный текст ниже) — общий блок редактировать негде и незачем: правка
+   *  этой части значила бы «поменять все сцены разом и молча», а не правку одной сцены, и цена
+   *  такой путаницы выше пользы от лишнего поля ввода. Перегенерация («Сгенерировать сюжет»/
+   *  «Сюжет без LLM» выше) — единственный путь поменять эту часть; кнопки уже есть, второй способ
+   *  не нужен. */
   function projectScenarioScenesHtml(scenes, editable) {
-    return `<div class="scenario-list">`
-      + scenes.map((scene, idx) => projectScenarioSceneHtml(scene, idx, editable)).join("")
+    const prefix = scenarioCommonPrefix(scenes.map((scene) => scene.prompt));
+    const commonBlock = prefix
+      ? `<details class="adv scenario-common"><summary>Общая часть всех ${scenes.length} сцен `
+        + `(визуальная библия)<span class="hint">не редактируется здесь</span></summary>`
+        + `<div class="adv-body scenario-common-body">`
+        + `<div class="proj-lyrics">${escapeHtml(prefix)}</div>`
+        + `<p class="proj-stage-note">Одинаковый текст во всех сценах намеренно (см. `
+        + `docs/h3-prompt-system.md — модель обязана повторять героев/стиль/палитру дословно в `
+        + `каждой сцене, иначе персонаж «плывёт» от сцены к сцене). Править здесь нельзя: правка `
+        + `изменила бы все сцены разом и молча. Чтобы поменять — перегенерируйте сюжет кнопкой `
+        + `выше, либо впишите новый текст в хвост нужной сцены отдельно.</p></div></details>`
+      : "";
+    return commonBlock
+      + `<div class="scenario-list">`
+      + scenes.map((scene, idx) => projectScenarioSceneHtml(scene, idx, editable, prefix)).join("")
       + `</div>`;
   }
 
@@ -2727,12 +2882,22 @@ function startPage() {
    *  на диске. Поле, которого в DOM почему-то нет (не должно случаться — то же число сцен,
    *  что и в `proj.scenario_scenes`), молча берёт значение с диска, а не бросает исключение:
    *  этой функции не с кем спорить о том, что пошло не так, только сервер вправе отказать.
-   */
+   *
+   *  Находка 2 (живой проход 2026-08-24): `.scenario-prompt` теперь хранит только ХВОСТ промпта
+   *  (`projectScenarioSceneHtml`'s own докстринг) — `prompt: prefix + el.value`, не `el.value`
+   *  сам по себе, иначе на диск ушёл бы только хвост, и общая часть, ранее вычищенная из поля,
+   *  пропала бы навсегда с первым же автосохранением. `prefix` пересчитан здесь заново из `base`
+   *  той же функцией, что рисовала карточки (`scenarioCommonPrefix`), не пронесён извне и не
+   *  закэширован где-то между рендером и сохранением — `base` (то, что на диске) не меняется
+   *  между отрисовкой панели и этим вызовом (правка живёт только в DOM, пока не уйдёт `PUT`),
+   *  так что тот же вход даёт тот же `prefix`, что и был порезан на экране: конкатенация
+   *  восстанавливает исходный промпт точно, без потери и без задвоения общей части. */
   function collectScenarioScenes() {
     const base = (project && project.project && project.project.scenario_scenes) || [];
+    const prefix = scenarioCommonPrefix(base.map((scene) => scene.prompt));
     const prompts = {};
     document.querySelectorAll("#project-body .scenario-prompt").forEach((el) => {
-      prompts[el.dataset.idx] = el.value;
+      prompts[el.dataset.idx] = prefix + el.value;
     });
     const durations = {};
     document.querySelectorAll("#project-body .scenario-duration").forEach((el) => {
@@ -2770,12 +2935,19 @@ function startPage() {
     return pendingScenarioSave;
   }
 
-  function projectSceneCardHtml(scene, projId, outdir) {
+  function projectSceneCardHtml(scene, projId, outdir, deadMedia) {
     const mark = { pending: "wait", running: "run", done: "done", failed: "fail" }[scene.status]
       || "wait";
     const clipUrl = scene.clip_path ? projectMediaUrl(scene.clip_path, outdir) : null;
+    // Находка 1 (живой проход 2026-08-24): та же заглушка, что `finishedRowHtml` теперь рисует
+    // для очереди «Готово» -- один и тот же `deadMediaUrls`, потому что и тут, и там разметка
+    // пересобирается заново на каждый опрос/refresh, и без заглушки `<video>` бил бы тот же 404
+    // по кругу, только реже (панель проекта перечитывается по действию, не по таймеру).
     const frame = clipUrl
-      ? `<div class="frame"><video src="${escapeHtml(clipUrl)}" preload="metadata" controls></video></div>`
+      ? (deadMedia && deadMedia.has(clipUrl)
+          ? `<div class="frame">${deadMediaPlaceholderHtml("клип удалён")}</div>`
+          : `<div class="frame"><video src="${escapeHtml(clipUrl)}" preload="metadata" controls `
+            + `data-media-url="${escapeHtml(clipUrl)}"></video></div>`)
       : `<div class="frame"></div>`;
     const promptText = String(scene.prompt || "").slice(0, 260);
     return `<div class="scene-card">${frame}`
@@ -2795,7 +2967,7 @@ function startPage() {
     if (proj.kind === "song" || !proj.scenes.length) return "";
     const done = proj.scenes.filter((s) => s.status === "done").length;
     const cards = proj.scenes.slice().sort((a, b) => a.idx - b.idx)
-      .map((scene) => projectSceneCardHtml(scene, proj.id, outdir)).join("");
+      .map((scene) => projectSceneCardHtml(scene, proj.id, outdir, deadMediaUrls)).join("");
     return `<div class="proj-stage">`
       + `<div class="proj-stage-head">`
       + `<span class="t">Сцены</span>`
@@ -4187,6 +4359,27 @@ function startPage() {
 
   // -- подписки ---------------------------------------------------------------------------
 
+  /** Находка 1 (живой проход 2026-08-24): единственное место, где `<video>`/`<img>` c
+   *  `data-media-url` узнаёт, что его собственный файл 404 — capture-фаза на `document`, не
+   *  обычная подписка на самом элементе (их создаёт заново каждая перерисовка, вешать
+   *  обработчик было бы негде до того, как узел уже есть) и не делегирование через bubble (у
+   *  `error` на медиа-элементах его нет вовсе — MDN: image/media load failures don't bubble;
+   *  capture идёт сверху вниз независимо от этого и до цели всё равно доходит).
+   *
+   *  Меняет узел немедленно (`outerHTML =`), не ждёт следующего `poll()`/`refreshProjectDetail`:
+   *  человек не должен 20 секунд смотреть на пустой чёрный прямоугольник или битую иконку, зная
+   *  уже сейчас, что там ничего нет. `deadMediaUrls.add` — для СЛЕДУЮЩЕЙ перерисовки: без него
+   *  этот же `outerHTML =` дал бы честную заглушку один раз, а через `POLL_MS` `renderQueue()`
+   *  пересобрала бы тот же живой `<video src>` и запрос повторился бы снова. */
+  document.addEventListener("error", (event) => {
+    const el = event.target;
+    const url = el && el.dataset && el.dataset.mediaUrl;
+    if (!url || deadMediaUrls.has(url)) return;
+    deadMediaUrls.add(url);
+    const label = el.tagName === "VIDEO" ? "клип удалён" : "снимок удалён";
+    el.outerHTML = deadMediaPlaceholderHtml(label);
+  }, true);
+
   document.addEventListener("click", (event) => {
     // Кадр готовой задачи — не кнопка, а `<video>` (см. `finishedRowHtml`): щёлкнули —
     // пуск/пауза на месте, без своих элементов управления и без открытия вкладки, повторный
@@ -4324,6 +4517,20 @@ function startPage() {
       const idx = button.dataset.idx;
       if (!window.confirm(`Пересчитать сцену ${idx}? Эта и все следующие сцены будут `
                           + `инвалидированы и пересчитаны заново.`)) return;
+      // `deadMediaUrls`'s own docstring: ретрай инвалидирует эту сцену И все следующие
+      // (подтверждение выше называет это прямо) — снимаем пометку с клипов всех их, не только
+      // retried-сцены, иначе новый файл следующей сцены останется под старой заглушкой до
+      // ручного переоткрытия карточки.
+      if (project && project.project) {
+        const outdir = state && state.outdir;
+        const n = Number(idx);
+        (project.project.scenes || []).forEach((scene) => {
+          if (scene.idx >= n && scene.clip_path) {
+            const url = projectMediaUrl(scene.clip_path, outdir);
+            if (url) deadMediaUrls.delete(url);
+          }
+        });
+      }
       withProject(() => api(
         "POST", `/api/projects/${encodeURIComponent(id)}/scenes/${encodeURIComponent(idx)}/retry`, {}));
       return;

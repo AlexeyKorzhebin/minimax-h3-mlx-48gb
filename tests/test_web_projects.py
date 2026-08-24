@@ -1225,7 +1225,7 @@ def test_project_assembly_carries_a_cache_buster_v_once_final_exists(_serve, mon
         code = worker.run_job(srv.queue_root, job, spawn=spawn, outdir=srv.root)
         assert code == 0
 
-    def fake_assemble_run(project_path, *, run=None):
+    def fake_assemble_run(project_path, *, run=None, log=None):
         proj = project_module.load_project(project_path)
         final = proj.path.parent / "assembly" / "final.mp4"
         final.parent.mkdir(parents=True, exist_ok=True)
@@ -1275,7 +1275,7 @@ def test_video_project_full_lifecycle(_serve, monkeypatch):
 
     assembled = {}
 
-    def fake_assemble_run(project_path, *, run=None):
+    def fake_assemble_run(project_path, *, run=None, log=None):
         proj = project_module.load_project(project_path)
         final = proj.path.parent / "assembly" / "final.mp4"
         final.parent.mkdir(parents=True, exist_ok=True)
@@ -2222,6 +2222,92 @@ def test_a_fast_double_click_on_a_scenario_button_sends_only_one_request(_serve,
     assert len(final["scenario_scenes"]) >= 1, (
         "the one request that *did* go out must still have actually written a scenario -- got "
         f"{final}")
+
+
+# == Находка 2 (волна ux-фиксов 2026-08-24): editing a scene's tail must not lose/duplicate ========
+# == the common visual-bible prefix on save ========================================================
+
+
+_SCENARIO_PREFIX_SCRIPT = Path(__file__).resolve().parent / "_scenario_prefix_check.mjs"
+
+_PREFIX_BIBLE = "BIBLE TEXT HERE, long enough to matter.\n"
+_PREFIX_SCENES = [
+    {"tag": "verse", "start": 0.0, "end": 8.0,
+     "prompt": _PREFIX_BIBLE + "Scene: alpha walks by the shore.", "duration": 7.0},
+    {"tag": "verse", "start": 8.0, "end": 16.0,
+     "prompt": _PREFIX_BIBLE + "Scene: beta runs along the shore.", "duration": 7.0},
+]
+
+
+def _run_scenario_prefix_check(base_url: str, pid: str, edit_idx: int, edited_tail: str,
+                                timeout=30) -> dict:
+    """Runs `_scenario_prefix_check.mjs` (see its own module docstring) against a real,
+    already-running server -- drives the *real* `app.js` through editing one scene's TAIL field
+    (what `.scenario-prompt` now holds, `projectScenarioSceneHtml`'s own docstring) and reports
+    exactly what `collectScenarioScenes` sent as that scene's full `prompt` in the `PUT` body.
+    """
+    encoded = base64.b64encode(edited_tail.encode("utf-8")).decode("ascii")
+    result = subprocess.run(
+        [_NODE, str(_SCENARIO_PREFIX_SCRIPT), _APP_JS_URL, base_url, pid, str(edit_idx), encoded],
+        capture_output=True, text=True, timeout=timeout)
+    assert result.returncode == 0, (
+        f"_scenario_prefix_check.mjs failed:\nstdout: {result.stdout}\nstderr: {result.stderr}")
+    return json.loads(result.stdout)
+
+
+@_needs_node_for_scenario_race
+def test_editing_a_scenes_tail_reconstructs_the_full_prompt_without_losing_or_duplicating_the_prefix(
+        _serve, monkeypatch):
+    """Находка 2 (живой проход 2026-08-24, `ux-syuzhet-report.md`): before this fix, every scene's
+    `.scenario-prompt` field held the FULL promt, including the visual bible every scene repeats
+    verbatim (`docs/h3-prompt-system.md`) -- on a real scenario the bible is the longest passage in
+    the field, and the three lines visible without scrolling were identical across all 16-38 scene
+    cards, while the one thing that actually differs (what happens in this scene) sat below the
+    fold.
+
+    The fix slices the shared prefix out of what the textarea shows (`scenarioCommonPrefix` +
+    `projectScenarioSceneHtml`), and shows it once, read-only, above the list. That makes
+    `collectScenarioScenes` (`app.js`) responsible for gluing `prefix + tail` back together before
+    `PUT` -- get it wrong (drop the prefix, or paste it twice) and the edit that reaches disk is
+    silently corrupted, not merely displayed oddly: `PUT .../scenario` replaces the whole scene
+    list at once (`web._edit_project_scenario`'s own docstring), so there is no server-side check
+    that would catch a client that reconstructed the wrong string.
+
+    This drives the real `app.js`, edits scene 0's tail only, and checks three things a fabricated
+    unit test of `scenarioCommonPrefix` alone cannot: (1) the actual `PUT` body carries the bible
+    back on the edited scene, exactly once; (2) the untouched scene (index 1) is sent with its
+    original, whole prompt unchanged -- `collectScenarioScenes`'s own on-disk fallback for a scene
+    not present in the DOM; (3) what actually lands on disk matches.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    status, put_first = srv._request(
+        "PUT", f"/api/projects/{pid}/scenario", {"scenario_scenes": _PREFIX_SCENES})
+    assert status == 200, put_first
+
+    base_url = f"http://{web.LOOPBACK}:{srv.port}"
+    edited_tail = "Scene: alpha dances under fireworks tonight."
+    result = _run_scenario_prefix_check(base_url, pid, 0, edited_tail)
+
+    assert result["putStatus"] == 200, result
+    sent = result["putBody"]["scenario_scenes"]
+    assert len(sent) == 2, f"both scenes must be sent -- PUT replaces the whole list: {sent}"
+
+    expected_edited = _PREFIX_BIBLE + edited_tail
+    assert sent[0]["prompt"] == expected_edited, (
+        "the edited scene's prompt must be exactly prefix+tail -- not missing the bible, and not "
+        f"carrying it twice: got {sent[0]['prompt']!r}, expected {expected_edited!r}")
+    assert sent[0]["prompt"].count(_PREFIX_BIBLE.strip()) == 1, (
+        f"the bible must appear exactly once in the edited scene's prompt: {sent[0]['prompt']!r}")
+
+    assert sent[1]["prompt"] == _PREFIX_SCENES[1]["prompt"], (
+        "the untouched scene must be sent with its own on-disk prompt unchanged, byte for byte -- "
+        f"got {sent[1]['prompt']!r}")
+
+    final_scenes = result["finalProject"]["scenario_scenes"]
+    assert final_scenes[0]["prompt"] == expected_edited, (
+        f"what actually landed on disk must match what was sent: {final_scenes[0]['prompt']!r}")
+    assert final_scenes[1]["prompt"] == _PREFIX_SCENES[1]["prompt"]
 
 
 # == Retry: track (task 7's own small addition to the server, "Пересчитать трек") ================

@@ -1095,6 +1095,17 @@ details.adv > summary .hint {
 .frame .tc { left: 9px; }
 .frame .dur { right: 9px; }
 
+/* Находка 1 (живой проход 2026-08-24): заглушка вместо `<video>`/`<img>` для медиа, чей файл
+   уже отвечал 404 в этой вкладке (`deadMediaPlaceholderHtml`, app.js) -- та же пустая рамка,
+   что и у карточки без кадра вовсе (комментарий выше, "битая картинка хуже пустой"), только
+   с подписью: пустое место без объяснения читается как "ещё грузится", а не "файла больше нет". */
+.frame .media-gone {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  padding: 10px; text-align: center;
+  font: 500 11.5px/1.4 var(--ui); color: var(--frame-ink); letter-spacing: -.005em;
+}
+
 .rcard .info { padding: 11px 12px; }
 .rcard .info .n {
   display: flex; align-items: center; gap: 8px;
@@ -1416,6 +1427,13 @@ audio.proj-audio { width: 100%; margin-top: 8px; display: block; }
    провайдера чата -- гибкая ширина с потолком, а не `.pick`'s собственный статичный max-width,
    чтобы на 360px строка переносилась, а не сжимала выпадашку до нечитаемой полоски. */
 .proj-scenario-gen select.scenario-provider { flex: 1 1 160px; max-width: 220px; min-width: 0; }
+/* Находка 2 (живой проход 2026-08-24): блок общей части промптов, над списком сцен -- та же
+   свёрнутая карточка, что `details.adv` уже рисует для настроек модели (шеврон, серый саммари),
+   только тело в одну колонку (текст библии + подпись «не редактируется здесь»), не `.adv-body`'s
+   собственная двухколоночная сетка -- содержимому здесь спорить не с чем. */
+.scenario-common { margin-top: 10px; }
+.scenario-common .adv-body.scenario-common-body { display: block; }
+.scenario-common .scenario-common-body .proj-lyrics { margin-top: 0; }
 .scenario-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
 .scenario-scene {
   border: 1px solid var(--hairline); border-radius: var(--r-inner);
