@@ -54,14 +54,24 @@ class _FakeLlama:
     `stream_chunks` list with no `[DONE]` frame in it is exactly how a test simulates a connection
     that closed mid-stream. `chat_payload` and `health`/`delay` behave unchanged when the request
     is not a stream request, or `stream_chunks` is `None` -- existing callers that never pass it
-    see no change at all.
+    see no change at all. A request that sends `"stream": true` but finds `stream_chunks is None`
+    falls straight through to the ordinary `chat_payload`/200/`application/json` response below --
+    exactly what a provider that silently ignores `stream` and answers a plain body anyway looks
+    like on the wire, with no separate mock needed for it (review round 2, I1).
+
+    `chat_status` (review round 2, I3 -- `bad_provider_reply` for an HTTP error status): the POST
+    response's status code, 200 by default. Set it to a 4xx/5xx to make `urlopen` raise
+    `HTTPError` the way a real provider does for "`max_tokens` is not supported for this model" or
+    similar -- the body is still `chat_payload`, so a test can shape what a provider's error body
+    would have said even though `provider.py` is not supposed to read it for this status family.
     """
 
     def __init__(self, chat_payload=None, health: int = 200, delay: float = 0.0,
                  models_payload=None, models_status: int = 200, models_raw=None,
-                 stream_chunks=None):
+                 stream_chunks=None, chat_status: int = 200):
         handler_cls = self._make_handler(chat_payload, health, delay, models_payload,
-                                         models_status, models_raw, stream_chunks)
+                                         models_status, models_raw, stream_chunks,
+                                         chat_status)
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
         self.port = self.httpd.server_address[1]
         self.requests: list[dict] = []
@@ -70,7 +80,8 @@ class _FakeLlama:
         self.thread.start()
 
     def _make_handler(self, chat_payload, health, delay=0.0, models_payload=None,
-                      models_status=200, models_raw=None, stream_chunks=None):
+                      models_status=200, models_raw=None, stream_chunks=None,
+                      chat_status=200):
         class Handler(http.server.BaseHTTPRequestHandler):
             seen: list = []
 
@@ -114,7 +125,7 @@ class _FakeLlama:
                         self.wfile.flush()
                     return
                 out = json.dumps(chat_payload or {}).encode()
-                self.send_response(200)
+                self.send_response(chat_status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(out)))
                 self.end_headers()

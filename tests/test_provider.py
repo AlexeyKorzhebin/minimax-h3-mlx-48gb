@@ -5,8 +5,10 @@ http.server в потоке, отвечающий на /health и /v1/chat/compl
 `tests/_fake_llama.py`, потому что тем же моком пользуются маршруты чата
 (`tests/test_chat_web.py`).
 """
+import http.client
 import json
 import textwrap
+from unittest.mock import patch
 
 import pytest
 
@@ -867,11 +869,21 @@ def test_stream_done_ends_the_stream_and_later_frames_are_never_read(tmp_path):
 def test_stream_reasoning_deltas_never_reach_the_accumulated_content(tmp_path):
     """A reasoning model may stream `reasoning`/`reasoning_content`/`thinking` deltas before its
     real answer (ai-writer 2.0's own ADR-065 warning, applied here) -- none of the three may end
-    up concatenated into `content`, which must contain only the actual JSON reply."""
+    up concatenated into `content`, which must contain only the actual JSON reply.
+
+    All three key spellings are exercised, not just two: review round 2's cheap findings flagged
+    that the original version of this test covered `reasoning_content` (via `_delta_chunk`'s own
+    `reasoning=` kwarg) and `thinking` (the hand-built dict below) but never literal `reasoning`,
+    even though `_read_sse`'s own docstring names it as a real spelling some providers use --
+    clean coverage, since it cannot actually leak given the implementation only ever reads
+    `delta["content"]`, but a docstring naming three things and a test exercising two is exactly
+    the kind of gap this file's own mutation-testing rule exists to close.
+    """
     content = _TURN["choices"][0]["message"]["content"]
     fake = _FakeLlama(stream_chunks=_sse(
         _delta_chunk(reasoning="Дай подумаю, как лучше ответить..."),
         {"choices": [{"delta": {"thinking": "ещё немного думаю"}}]},
+        {"choices": [{"delta": {"reasoning": "и вот что я решила"}}]},
         _delta_chunk(content, finish_reason="stop"),
     ))
     try:
@@ -881,7 +893,9 @@ def test_stream_reasoning_deltas_never_reach_the_accumulated_content(tmp_path):
         fake.close()
     # The reasoning text must not have leaked into the reply -- not as a prefix, not anywhere.
     assert "думаю" not in turn["reply"]
+    assert "решила" not in turn["reply"]
     assert "думаю" not in json.dumps(turn, ensure_ascii=False)
+    assert "решила" not in json.dumps(turn, ensure_ascii=False)
     assert turn["reply"] == "Сделал мрачнее."
 
 
@@ -998,3 +1012,260 @@ def test_stream_also_works_through_chat_scenario_the_shared_code_path(tmp_path):
     assert turn["scenario"]["sections"][0]["tag"] == "verse"
     (req,) = fake.requests
     assert req["body"]["stream"] is True
+
+
+# -- review round 2: I1 -- a provider's own mid-stream refusal, or a stream request answered with
+# a plain body, must not read as "nobody answered" -----------------------------------------------
+
+
+def test_stream_error_chunk_mid_stream_is_a_named_bad_provider_reply_not_chat_unreachable(
+        tmp_path):
+    """OpenRouter's own documented shape for an upstream failure *mid-stream* -- a `data:` event
+    carrying `error` instead of `choices` -- must be read as the provider's own explanation
+    (`bad_provider_reply`, the same code the non-streaming 200-with-`{"error": ...}` envelope
+    already gets), not silently skipped until the stream runs dry and reports `chat_unreachable`
+    ("check the address and that it's running") for a provider that was up and said exactly what
+    was wrong (review round 2, I1)."""
+    fake = _FakeLlama(stream_chunks=[
+        f"data: {json.dumps({'error': {'message': 'upstream provider is overloaded'}})}\n\n",
+        # A [DONE] follows even though the correct implementation never reaches it (the raise
+        # happens on the error chunk itself) -- without it, a *mutated* implementation that
+        # dropped the error-chunk check would fall through to reading the real socket to EOF with
+        # no [DONE] and no finish_reason, which turned out to be exactly as racy against this
+        # HTTP/1.0 mock server as the earlier SSE cut-stream case (`_CutIter`'s own docstring,
+        # above) -- sometimes fast, sometimes a multi-second hang. Terminating cleanly here keeps
+        # the mutation check (and this test, on a slow CI box) fast and deterministic either way.
+        "data: [DONE]\n\n",
+    ])
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat({**_llama_cfg(fake.port), "stream": True}, {},
+                         [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_provider_reply"
+        assert err.value.code != "chat_unreachable"
+        assert "overloaded" in str(err.value)
+        assert len(fake.requests) == 1, "провайдер объяснился -- не повод переспрашивать"
+    finally:
+        fake.close()
+
+
+def test_stream_true_but_provider_ignores_it_and_answers_plain_json_still_returns_the_turn(
+        tmp_path):
+    """A provider that does not actually support streaming and answers one ordinary JSON body
+    anyway (`Content-Type: application/json`, no `stream_chunks` configured on the mock at all)
+    must still be read as a normal completion -- not run through `_read_sse`, which would find no
+    line starting with `data:`, reach EOF with no `finish_reason`, and report `chat_unreachable`
+    for a provider that was up and had, in fact, answered (review round 2, I1)."""
+    fake = _FakeLlama(chat_payload=_TURN)  # no stream_chunks: falls through to the ordinary body
+    try:
+        turn = provider.chat({**_llama_cfg(fake.port), "stream": True}, {},
+                             [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn["reply"] == "Сделал мрачнее."
+    (req,) = fake.requests
+    assert req["body"]["stream"] is True, "запрос всё равно попросил поток -- ответил провайдер"
+
+
+# -- review round 2: I2 -- `content: null` must not crash the `bad_model_json` message itself ----
+
+
+def test_bad_model_json_message_does_not_crash_when_content_is_json_null(tmp_path):
+    """A reasoning model can answer `content: null` (valid JSON; `json.loads(None)` is a
+    `TypeError`, exactly what the existing `except (json.JSONDecodeError, TypeError)` around
+    `raw2` is there for) with a `finish_reason` that is not `"length"`. The message-building line
+    itself used to slice `raw2` unconditionally (`raw2[:400]`), which crashes with an unnamed
+    `TypeError: 'NoneType' object is not subscriptable` on exactly this input -- reaching the page
+    as a bare 500 «сервер споткнулся» instead of the named `bad_model_json` this whole branch
+    exists to produce (review round 2, I2)."""
+    fake = _FakeLlama(chat_payload={"choices": [{"message": {"content": None}}]})
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_model_json"
+        assert len(fake.requests) == 2, "обычный формат-отказ по-прежнему получает один повтор"
+    finally:
+        fake.close()
+
+
+# -- review round 2: I3 -- an HTTP error status is the provider answering, not nobody answering --
+
+
+def test_http_error_status_is_a_named_bad_provider_reply_not_chat_unreachable(tmp_path):
+    """A 4xx/5xx with the provider's own explanation ("max_tokens is not supported for this
+    model" -- a live shape this exact review round's own new fields, `max_tokens_param` and
+    `send_temperature`, are the most likely thing to produce if misconfigured) must read as the
+    provider answering, not as nobody answering at all -- `bad_provider_reply`, never
+    `chat_unreachable` (review round 2, I3). The body is deliberately not echoed (I4's own
+    reasoning: an HTTP error body from an arbitrary host is exactly the shape a misconfigured
+    proxy could use to echo request headers back) -- only the status and reason phrase ride in
+    the message."""
+    fake = _FakeLlama(chat_payload={"error": "max_tokens is not supported for this model"},
+                      chat_status=400)
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_provider_reply"
+        assert err.value.code != "chat_unreachable"
+        assert "400" in str(err.value)
+        assert "max_tokens is not supported" not in str(err.value), "тело не эхо -- см. I4"
+        assert len(fake.requests) == 1
+    finally:
+        fake.close()
+
+
+def test_gateway_status_from_an_http_error_is_still_chat_unreachable(tmp_path):
+    """502/503/504 are gateway/proxy-level codes, not an answer from the origin provider itself --
+    discovered directly on this development machine, whose own system HTTP proxy answers a bare
+    502 for a connection nobody is listening on (`urllib.request.getproxies()` picks it up
+    automatically, outside any test's control). Without this carve-out in `ask()`'s `HTTPError`
+    branch, that 502 read as `bad_provider_reply` -- "the provider answered" -- when in fact
+    nothing at `_base_url` ever did, and the two pre-existing "nobody is listening" tests
+    (`test_chat_with_no_provider_listening_raises_a_named_error` and its `chat_scenario` twin)
+    would regress on exactly this machine if this carve-out were ever removed."""
+    fake = _FakeLlama(chat_payload={"error": "different host, different failure"}, chat_status=502)
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "chat_unreachable"
+        assert err.value.code != "bad_provider_reply"
+    finally:
+        fake.close()
+
+
+# -- review round 2: I4 -- an echoed bearer token must not ride in a `bad_provider_reply` ---------
+
+
+def test_bad_provider_reply_redacts_an_echoed_bearer_token_non_stream(tmp_path):
+    """M3 (see `test_provider`'s own docstring, and `test_a_two_hundred_carrying_a_providers_own_
+    error_is_a_named_refusal`'s neighbourhood) closed this exact vector for `test_provider`'s own
+    `detail`: a misconfigured proxy in front of a provider can echo *request* headers, the bearer
+    token among them, back in a 200 body. `_chat_turn`'s own `bad_provider_reply` deliberately
+    keeps echoing the provider's body (unlike the probe -- diagnostic text a person debugging an
+    actual broken chat turn needs) -- but must not keep echoing a bearer token specifically if the
+    echoed body happens to carry one (review round 2, I4)."""
+    fake = _FakeLlama(chat_payload={
+        "echo": {"headers": {"Authorization": "Bearer sk-real-secret-abc123"}}})
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_provider_reply"
+        assert "sk-real-secret-abc123" not in str(err.value)
+        assert "Bearer" in str(err.value), "текст остаётся диагностическим -- не пустой вырез"
+    finally:
+        fake.close()
+
+
+def test_stream_bad_provider_reply_redacts_an_echoed_bearer_token(tmp_path):
+    """Same vector, over the streaming error-chunk path added for I1 above -- a proxy that echoes
+    request headers back inside `data: {"error": ...}` must not leak the token either."""
+    fake = _FakeLlama(stream_chunks=[
+        f"data: {json.dumps({'error': {'echo': 'Authorization: Bearer sk-stream-secret-xyz'}})}"
+        f"\n\n",
+        # Same reason as the sibling test above: keeps a mutated implementation's fallback path
+        # off the racy real-socket-EOF timing instead of leaving it to chance.
+        "data: [DONE]\n\n",
+    ])
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat({**_llama_cfg(fake.port), "stream": True}, {},
+                         [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_provider_reply"
+        assert "sk-stream-secret-xyz" not in str(err.value)
+        assert "Bearer" in str(err.value)
+    finally:
+        fake.close()
+
+
+# -- review round 2: cheap -- `http.client.HTTPException` was an untested line -------------------
+
+
+def test_incomplete_read_mid_response_is_the_same_named_chat_unreachable():
+    """`http.client.HTTPException` (`IncompleteRead` among others) is not an `OSError` -- without
+    it in `ask()`'s transport `except` clause, a connection cut mid-response (fewer bytes than the
+    provider's own `Content-Length` promised) would escape as a raw, unnamed exception instead of
+    the same honest `chat_unreachable` an outright-refused connection already gets. Flagged in
+    review round 2 as an untested line: removing it from the `except` tuple broke no test.
+
+    Proven directly against `urlopen` rather than a real socket: forcing a real connection to
+    supply fewer bytes than its own `Content-Length` promised turned out to be exactly as racy as
+    the earlier SSE cut-stream case (`_CutIter`'s own docstring, above) -- sometimes a clean
+    `IncompleteRead`, sometimes a `ConnectionResetError` that the pre-existing `OSError` branch
+    would have caught regardless, leaving it genuinely unclear whether this branch was ever
+    exercised. Patching `urlopen` to raise the exact exception removes the race and the ambiguity.
+    """
+    with patch("h3_48gb.provider.urllib.request.urlopen",
+              side_effect=http.client.IncompleteRead(b"partial")):
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(1), {}, [{"role": "user", "content": "x"}])
+    assert err.value.code == "chat_unreachable"
+
+
+# -- review round 2: cheap -- `max_tokens_param` typos went out on the wire silently --------------
+
+
+def test_max_tokens_param_with_an_unknown_wire_key_is_a_named_config_refusal(tmp_path):
+    """A typo in `max_tokens_param` (`"maxTokens"` instead of `max_tokens`) does not fail on the
+    wire -- an OpenAI-shaped API just ignores an unrecognised JSON key -- so without this check
+    the request would go out with no real limit set at all, and the resulting truncation would
+    blame a parameter that was already correct (review round 2, I-cheap). Checked, and refused by
+    name, before a single request goes out."""
+    fake = _FakeLlama(chat_payload=_TURN)
+    cfg = {**_llama_cfg(fake.port), "max_tokens_param": "maxTokens"}
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(cfg, {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_provider_config"
+        assert "maxTokens" in str(err.value)
+        assert len(fake.requests) == 0, "конфиг сломан -- переспрашивать нечего"
+    finally:
+        fake.close()
+
+
+def test_max_tokens_param_known_values_are_unaffected_by_the_new_check(tmp_path):
+    """Regression guard for the check above: both values this file actually knows how to send
+    must keep working exactly as the earlier `max_tokens_param`/`send_temperature` fix round left
+    them."""
+    fake = _FakeLlama(chat_payload=_TURN)
+    try:
+        provider.chat({**_llama_cfg(fake.port), "max_tokens_param": "max_completion_tokens"}, {},
+                     [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    assert "max_completion_tokens" in req["body"]
+
+
+# -- review round 2: accepted-but-cheap -- honest wording when `ctx`, not `max_tokens`, capped it -
+
+
+def test_chat_truncated_message_blames_ctx_when_the_cap_came_from_it_not_max_tokens(tmp_path):
+    """When the effective `max_tokens` came from the `ctx`-derived cap (no explicit `max_tokens`
+    written for this provider), "raise `max_tokens`" sent a person to add a field that was not
+    the cause and, on its own, would not have changed anything -- the field actually governing
+    the limit here is `ctx`. The message must name it."""
+    fake = _FakeLlama(chat_payload={
+        "choices": [{"message": {"content": ""}, "finish_reason": "length"}]})
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "chat_truncated"
+        assert "ctx" in str(err.value)
+    finally:
+        fake.close()
+
+
+def test_chat_truncated_message_still_blames_max_tokens_when_it_was_set_explicitly(tmp_path):
+    """Regression guard: a provider with an explicit `max_tokens` in `providers.json` (not
+    `ctx`-capped, even though `ctx` is also present in the same entry) must keep the original,
+    unmodified advice."""
+    fake = _FakeLlama(chat_payload={
+        "choices": [{"message": {"content": ""}, "finish_reason": "length"}]})
+    cfg = {**_llama_cfg(fake.port), "max_tokens": 500}
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(cfg, {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "chat_truncated"
+        assert "поднимите `max_tokens`" in str(err.value)
+    finally:
+        fake.close()

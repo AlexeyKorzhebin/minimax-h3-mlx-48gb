@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import subprocess
 import time
 import urllib.error
@@ -332,6 +333,40 @@ def _base_url(cfg: dict) -> str:
 DEFAULT_MAX_TOKENS = 24000
 
 
+#: Wire keys `_chat_turn` is willing to put the completion-token limit under (see
+#: `max_tokens_param` in `_chat_turn`'s own docstring). A typo here (`"maxTokens"`, say) does not
+#: fail on the wire -- an unrecognised JSON key is not itself an error to an OpenAI-shaped API, it
+#: is just ignored -- so the request goes out with the intended number nowhere in it, the
+#: provider falls back to its own stingy default, and the reply comes back looking exactly like
+#: the original bug this file exists to fix (`finish_reason: "length"`) with a `chat_truncated`
+#: message that tells the person to raise a parameter that was already right. Checked against
+#: this fixed list instead, so a typo is a named, honest `bad_provider_config` naming the exact
+#: bad value, not a silent no-op that blames the wrong knob.
+_KNOWN_MAX_TOKENS_PARAMS = frozenset({"max_tokens", "max_completion_tokens"})
+
+#: Matches an `Authorization: Bearer <token>`-shaped value inside text a provider (or something
+#: in front of it) sent back, so it can be scrubbed before riding inside a `ProviderError`
+#: message. `bad_provider_reply`'s own contract (`cli.py`'s `ERROR_CODES`) is to show a person up
+#: to 400 characters of whatever the provider actually said -- deliberately more permissive than
+#: `test_provider`'s own `detail`, which never echoes a body at all (see that function's "M3"
+#: comment below: a misconfigured proxy in front of a provider can echo *request* headers, the
+#: bearer token among them, back in a 200 body). `bad_provider_reply` keeps the echo because it is
+#: diagnostic text a person debugging an actual broken chat turn needs and a casual connectivity
+#: probe does not -- but the exact proxy-echo risk M3 closed applies here too, so the one shape a
+#: token could plausibly take is scrubbed out before anything else in the body reaches the
+#: message, rather than leaving that vector open for the sake of matching `cli.py:236`'s "first
+#: 400 characters" to the letter. `cli.py:236`'s contract still holds -- it was never a promise to
+#: echo *secrets*, only the provider's own explanation.
+_BEARER_TOKEN_RE = re.compile(r"(?i)(bearer\s+)\S+")
+
+
+def _redact_secrets(text: str) -> str:
+    """Scrub an echoed `Authorization: Bearer <token>` out of `text` before it reaches a
+    `ProviderError` message. See `_BEARER_TOKEN_RE` for why this exists instead of dropping the
+    echo entirely."""
+    return _BEARER_TOKEN_RE.sub(r"\1[скрыто]", text)
+
+
 def _read_sse(r) -> tuple[str, str | None]:
     """Accumulate one OpenAI-style Server-Sent-Events stream into `(content, finish_reason)` --
     the exact tuple shape `_chat_turn`'s non-streaming `ask()` branch already returns, so the
@@ -395,9 +430,25 @@ def _read_sse(r) -> tuple[str, str | None]:
         except json.JSONDecodeError:
             raise ProviderError(
                 "bad_provider_reply",
-                f"провайдер прислал не-JSON фрагмент потока: {data[:400]}")
+                f"провайдер прислал не-JSON фрагмент потока: "
+                f"{_redact_secrets(data)[:400]}")
         choices = chunk.get("choices") if isinstance(chunk, dict) else None
         if not choices:
+            # OpenRouter's own documented shape for an upstream failure *mid-stream* -- not only
+            # the 200-with-`{"error": ...}` envelope the non-streaming path already refuses
+            # (`_envelope_to_turn` below), but the same shape one frame later: a `data:` event
+            # carrying `error` instead of `choices`. Without this check it fell into the same
+            # silent `continue` a genuinely empty/usage-only chunk (no `choices`, and nothing to
+            # do with an error) already takes -- the stream then ran out with no `finish_reason`,
+            # and the provider's own explanation was reported as `chat_unreachable`, "check the
+            # address and that it's running", for a provider that was up, answered, and said
+            # exactly what was wrong.
+            error = chunk.get("error") if isinstance(chunk, dict) else None
+            if error is not None:
+                raise ProviderError(
+                    "bad_provider_reply",
+                    f"провайдер прислал отказ в потоке: "
+                    f"{_redact_secrets(json.dumps(chunk, ensure_ascii=False))[:400]}")
             continue
         choice = choices[0]
         delta = choice.get("delta") if isinstance(choice, dict) else None
@@ -450,6 +501,12 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
     failures) runs unchanged and does not know which shape produced its input.
     """
     max_tokens = cfg.get("max_tokens")
+    # Tracks whether the effective `max_tokens` below came from the `ctx`-derived cap rather than
+    # from an explicit `providers.json` value -- `_truncated()` needs this to blame the field that
+    # is actually governing the limit, not always the wire key by name (review round 2, I-cheap:
+    # advising "raise `max_tokens`" when `ctx` is what set the ceiling sent a person to edit a
+    # field that was never written and would not change anything).
+    ctx_capped = False
     if max_tokens is None:
         max_tokens = DEFAULT_MAX_TOKENS
         # `llama-local`'s own `ctx` is llama.cpp's `n_ctx` -- prompt *and* completion sharing one
@@ -462,6 +519,7 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
         ctx = cfg.get("ctx")
         if ctx:
             max_tokens = min(max_tokens, max(ctx // 2, 1024))
+            ctx_capped = True
     # Which JSON key the limit above rides on. Never both, and never guessed from the model name:
     # caila.io's Anthropic routes (`just-ai/anthropic-claude/...`) silently *ignore*
     # `max_completion_tokens` -- the whole budget still goes to the provider's own default -- and
@@ -472,6 +530,18 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
     # caila's Anthropic routes all take it; the one exception (a reasoning model behind caila)
     # sets `max_tokens_param: "max_completion_tokens"` in its own `providers.json` entry.
     token_limit_key = cfg.get("max_tokens_param", "max_tokens")
+    if token_limit_key not in _KNOWN_MAX_TOKENS_PARAMS:
+        # Checked before a single byte goes on the wire: a typo here does not fail on the wire
+        # (see `_KNOWN_MAX_TOKENS_PARAMS`), it silently ships a request with no limit the human
+        # actually asked for, and the resulting `finish_reason: "length"` would then blame a key
+        # that was already correct. Not retried, and no request sent at all -- there is nothing a
+        # second attempt at the same bad config could fix.
+        raise ProviderError(
+            "bad_provider_config",
+            f"providers.json называет параметром лимита вывода `{token_limit_key}` -- этот файл "
+            f"умеет отправлять лимит только под `max_tokens` или `max_completion_tokens`, "
+            f"опечатка в `max_tokens_param` ушла бы на провод и провайдер её молча "
+            f"проигнорировал бы")
     body = {"model": cfg.get("model", cfg.get("preset", "default")),
             "messages": messages,
             token_limit_key: max_tokens,
@@ -508,6 +578,32 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
     if cfg.get("type") == "openai" and key_env:
         headers["Authorization"] = f"Bearer {env.get(key_env, '')}"
 
+    def _envelope_to_turn(payload) -> tuple[str, str | None]:
+        """Walk a plain OpenAI-style completion envelope into `(content, finish_reason)` -- shared
+        between the ordinary non-streaming request and the "provider ignored `stream: true` and
+        answered one plain JSON body anyway" fallback in `ask()` below, so a provider that does
+        not actually support streaming still gets a real answer, or a real named refusal, instead
+        of `_read_sse` reading a body that never had a `data:` line in it and reporting a stream
+        that was never actually cut (review round 2, I1).
+
+        A 200 does not mean the body is a completion. OpenRouter answers 200 with
+        `{"error": {"message": ...}}` when *its* upstream fails, and a proxy in front of any
+        provider can answer 200 with something else entirely. Walking that with plain subscripting
+        raised `KeyError`/`TypeError`, which is not a `ProviderError` -- so the server's `except
+        provider.ProviderError` missed it and the page was told 500 «сервер споткнулся» for a
+        failure that never was this server's. The envelope is checked here, once, where the bytes
+        are parsed.
+        """
+        try:
+            choice = payload["choices"][0]
+            content = choice["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            raise ProviderError(
+                "bad_provider_reply",
+                f"провайдер ответил 200, но не ходом: "
+                f"{_redact_secrets(json.dumps(payload, ensure_ascii=False))[:400]}")
+        return content, (choice.get("finish_reason") if isinstance(choice, dict) else None)
+
     def ask(msgs):
         """Returns `(content, finish_reason)` -- `finish_reason` may be `None`, not every provider
         sends one, and its absence is not itself a failure."""
@@ -516,14 +612,47 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
                                      headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=600) as r:
-                if stream:
+                # `stream` only ever *asks* for SSE; it does not guarantee the provider answers
+                # with it. A provider that ignores `"stream": true` and answers one plain JSON
+                # body (its own declared `Content-Type` says so) is not a broken stream -- it is
+                # an ordinary completion that happened to arrive over a request that asked for
+                # something else, and `_envelope_to_turn` below already knows how to read that
+                # shape. Gating on the response's own header, not just the request we sent, is
+                # what review round 2 (I1) asked for: without it, that plain JSON body had no line
+                # starting with `data:`, `_read_sse` ran it to EOF and reported `chat_unreachable`
+                # for a provider that was up and had, in fact, answered.
+                if stream and "text/event-stream" in r.headers.get("Content-Type", ""):
                     # `_read_sse` reads `r` to completion (or raises) itself -- its own
                     # `chat_unreachable`/`bad_provider_reply` for a dropped or malformed stream
                     # must reach the caller unchanged, not get relabelled by the `except` below,
                     # which is why it returns straight out of this `try` rather than assigning
                     # into a variable the `except` could shadow.
                     return _read_sse(r)
-                payload = json.loads(r.read())
+                payload_bytes = r.read()
+        except urllib.error.HTTPError as err:
+            # `HTTPError` is a `URLError` *subclass* -- without this branch listed first, a 4xx or
+            # 5xx with a real explanation in its body (say, "max_tokens is not supported for this
+            # model") fell into the catch-all below and read as `chat_unreachable`, "check the
+            # address and that it's running", for a provider that answered promptly with exactly
+            # the reason a wrongly set `max_tokens_param`/`send_temperature` would produce (review
+            # round 2, I3) -- which is precisely the shape a misconfigured new field in this same
+            # round is most likely to produce. The body itself is never read here, not even for
+            # the message: an HTTP error body from an arbitrary host is exactly the shape M3 (see
+            # `_redact_secrets`) already worried a misconfigured proxy could use to echo request
+            # headers back, and the status plus reason phrase is already the actionable part.
+            if err.code in (502, 503, 504):
+                # Gateway/proxy-level codes, not an answer from the origin: something *in front
+                # of* the actual provider could not reach it -- which is exactly what
+                # `chat_unreachable` already means, not "the provider explained itself". Found
+                # writing the test for the branch above: this development machine's own system
+                # HTTP proxy (`urllib.request.getproxies()`) answers a bare 502 for a refused
+                # local connection, and without this carve-out that 502 was misread as a real
+                # provider reply, breaking the two pre-existing `chat_unreachable`
+                # "nobody is listening" tests that this same round must not regress.
+                raise ProviderError(
+                    "chat_unreachable", f"провайдер недоступен: {err.code} {err.reason}")
+            raise ProviderError(
+                "bad_provider_reply", f"провайдер ответил {err.code}: {err.reason}")
         # `http.client.HTTPException` (`IncompleteRead` among others) is not an `OSError` -- a
         # stream cut mid-response by a socket-level failure surfaces through it, not through
         # `URLError`/`OSError`, and without it here that failure would escape as a raw, unnamed
@@ -534,32 +663,37 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
             # other transport failure -- never leak the raw urllib exception
             # (or headers, which may carry the bearer token) to the caller.
             raise ProviderError("chat_unreachable", f"провайдер недоступен: {err}")
-        # A 200 does not mean the body is a completion. OpenRouter answers 200 with
-        # `{"error": {"message": ...}}` when *its* upstream fails, and a proxy in front of any
-        # provider can answer 200 with something else entirely. Walking that with plain
-        # subscripting raised `KeyError`/`TypeError`, which is not a `ProviderError` -- so the
-        # server's `except provider.ProviderError` missed it and the page was told 500 «сервер
-        # споткнулся» for a failure that never was this server's. The envelope is checked here,
-        # once, where the bytes are parsed.
         try:
-            choice = payload["choices"][0]
-            content = choice["message"]["content"]
-        except (KeyError, IndexError, TypeError):
+            payload = json.loads(payload_bytes)
+        except (json.JSONDecodeError, TypeError):
+            # The same "200, but not a completion" refusal `_envelope_to_turn` gives a
+            # structurally-wrong-but-still-JSON body -- here the body is not even JSON (a captive
+            # portal's HTML, say). Same code, same 400-char/redacted budget, one step earlier.
             raise ProviderError(
                 "bad_provider_reply",
-                f"провайдер ответил 200, но не ходом: "
-                f"{json.dumps(payload, ensure_ascii=False)[:400]}")
-        return content, (choice.get("finish_reason") if isinstance(choice, dict) else None)
+                f"провайдер ответил 200, но не JSON: "
+                f"{_redact_secrets(payload_bytes.decode('utf-8', errors='replace'))[:400]}")
+        return _envelope_to_turn(payload)
 
     def _truncated() -> ProviderError:
         # Named separately from `bad_model_json`: the model did not break the schema, it was
         # stopped before it could finish speaking. Conflating the two used to show a person «модель
         # не удержала формат: » with an empty tail for a model that never got the chance to hold
         # any format at all -- a dead end pointing at the wrong culprit.
+        if ctx_capped:
+            # `max_tokens` was never written for this provider -- `ctx` set the ceiling (see
+            # `ctx_capped` above). "Raise `max_tokens`" would have sent a person to add a field
+            # that was not the cause and, on its own, changes nothing (the cap only applies to the
+            # *implicit* default); the field that actually governs the limit here is `ctx`.
+            advice = (f"поднимите `ctx` у этого провайдера в providers.json -- лимит вывода "
+                     f"здесь взят от него (min({DEFAULT_MAX_TOKENS}, ctx // 2)), явного "
+                     f"`{token_limit_key}` в конфиге нет")
+        else:
+            advice = f"поднимите `{token_limit_key}` у этого провайдера в providers.json"
         return ProviderError(
             "chat_truncated",
             f"ответ обрезан лимитом вывода ({token_limit_key}={max_tokens}) раньше, чем модель "
-            f"закончила -- поднимите `{token_limit_key}` у этого провайдера в providers.json")
+            f"закончила -- {advice}")
 
     raw, finish_reason = ask(messages)
     if finish_reason == "length":
@@ -574,7 +708,8 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
         try:
             return json.loads(raw2)
         except (json.JSONDecodeError, TypeError):
-            raise ProviderError("bad_model_json", f"модель не удержала формат: {raw2[:400]}")
+            raise ProviderError("bad_model_json",
+                               f"модель не удержала формат: {(raw2 or '')[:400]}")
 
 
 def chat(cfg: dict, env: dict, messages: list[dict]) -> dict:
