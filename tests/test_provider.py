@@ -396,6 +396,34 @@ def test_system_prompt_defaults_invented_speech_to_russian_without_touching_pres
         "no rule letting an explicit user language request override the Russian default"
 
 
+def test_system_prompt_demands_positive_absence_and_per_scene_accent_color_binding():
+    """The 2026-08-24 live run ("Amazon and hoplite") specified full nudity plus one accessory
+    each (a crimson cord in her braid, a dented helmet with no crest) and a palette where crimson
+    was the only saturated color. By scene 2 the model had drawn loincloths on both fighters that
+    the prompt never mentioned, grown a crest on the helmet the prompt explicitly said had none,
+    and moved the crimson accent off the cord and onto the invented loincloth. The doc's fix is two
+    rules: state an absence positively (not "no clothing" but what specifically is and isn't
+    there), and restate which object carries an accent color in every scene, not once -- because
+    the visual bible block that carries both is the only thing a downstream scene ever sees of an
+    earlier one.
+    """
+    raw = provider.system_prompt().split("**The visual bible.**", 1)[1].split(
+        "## Song mode", 1)[0]
+    section = re.sub(r"\s+", " ", raw)
+
+    # rule 1: silence gets read as permission -- absence has to be stated positively
+    assert re.search(r"[Ss]tate an absence positively", section), \
+        "no rule demanding an absence be stated positively rather than left silent"
+    assert re.search(r'no crest and no plume', section), \
+        "no concrete positive-absence example (helmet without crest/plume)"
+
+    # rule 2: an accent color has to be re-tied to its object every time, not stated once
+    assert re.search(r"[Bb]ind an accent color to the object", section), \
+        "no rule binding an accent color to the object carrying it"
+    assert re.search(r"[Rr]estate which object the color is on in every scene", section), \
+        "no rule requiring the color-object binding to repeat every scene, not just once"
+
+
 # -- A4: slug -----------------------------------------------------------------------------------
 
 

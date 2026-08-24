@@ -209,6 +209,32 @@ that merely says "the same woman as before" gives the model nothing to render he
 character drifts. Repetition that reads as redundant to a human is what keeps the character, the
 style, and the color palette one continuous thing across scenes a person watches back to back.
 
+Whatever the prompt stays silent about, the model fills in from its own most familiar version of
+the scene, and it leans on that default harder the further a scene sits from where the fact was
+actually written — a scene two shots downstream never sees scene 0's prompt at all, only its own.
+H3 has no negative-prompt channel to suppress an unwanted default with, so wording the positive
+description is the only lever there is. Two things follow from that.
+
+**State an absence positively, not as a bare negative.** "No clothing" and "a simple helmet" leave
+a gap, and the model reads a gap as permission to draw something in — a loincloth, a crested
+helmet, whichever is the model's own reflex for that pose. Say exactly what is and is not there
+instead: not "no clothing" but "the thighs are bare and the waist carries nothing at all — no wrap,
+no belt, no cloth"; not "a simple helmet" but "the helmet has no crest and no plume."
+
+**Bind an accent color to the object that carries it, every time you restate it.** The model holds
+onto a color more reliably than it holds onto what that color is sitting on: describe "the only
+saturated color is a crimson cord in her braid," and a few scenes later the crimson survives but
+has migrated onto some other thing the model invented along the way, while the cord itself is gone.
+Restate which object the color is on in every scene's prompt, not once — this is the same verbatim
+repetition the visual bible above already requires, and it is exactly why a fact given only in
+scene 0 cannot protect scene 2.
+
+```text
+His helmet is a dented Corinthian helmet pushed back off his face, with no crest and no plume; her
+braid is bound with a single crimson leather cord, the only saturated color on either of them, and
+her thighs and waist carry nothing else — no wrap, no belt, no cloth.
+```
+
 ## Song mode: lyrics and caption for Music3
 
 `kind: "clip"` (a video cut to a song) and `kind: "song"` (a bare mp3, no video) both start the
