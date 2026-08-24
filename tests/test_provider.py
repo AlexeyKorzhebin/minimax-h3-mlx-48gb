@@ -137,6 +137,162 @@ def test_invalid_model_json_gets_one_retry_then_a_named_error(tmp_path):
         fake.close()
 
 
+# -- fix round: `max_tokens` never sent, and a truncated reply misreported as `bad_model_json` --
+#
+# Found live against caila.io's `claude-opus-5`: with no `max_tokens` in the request, the
+# provider's own default (4096) is far too small for a full scenario reply, the model spends the
+# whole budget reasoning, and answers `finish_reason: "length"` with an *empty* `content`. That
+# empty string then fell into the same `bad_model_json` branch a genuinely malformed reply does --
+# «модель не удержала формат: » with nothing after the colon, which is not what happened: the
+# model never got the chance to hold any format at all.
+
+
+def test_chat_sends_max_tokens_with_the_measured_default_when_the_provider_has_no_ctx(tmp_path):
+    """An external (`type: "openai"`) provider carries no `ctx` in `providers.json` -- there is
+    nothing here to cap the default against, so the plain measured default
+    (`provider.DEFAULT_MAX_TOKENS`) must reach the wire unchanged."""
+    fake = _FakeLlama(chat_payload=_TURN)
+    cfg = {"type": "openai", "base_url": f"http://127.0.0.1:{fake.port}", "model": "m"}
+    try:
+        provider.chat(cfg, {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    assert req["body"]["max_tokens"] == provider.DEFAULT_MAX_TOKENS
+
+
+def test_chat_caps_the_implicit_max_tokens_default_against_a_small_local_ctx(tmp_path):
+    """`llama-local`'s own `ctx` is `n_ctx` -- prompt *and* completion sharing one budget. Blindly
+    defaulting to a completion-only budget sized for an external provider (24000) on a `ctx` of
+    4096 would leave no room for the prompt at all and trade one broken run for another. Only the
+    *implicit* default is capped -- `_llama_cfg`'s `ctx` is 4096, so the sent value must be well
+    under `DEFAULT_MAX_TOKENS`, not equal to it.
+    """
+    fake = _FakeLlama(chat_payload=_TURN)
+    try:
+        provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    sent = req["body"]["max_tokens"]
+    assert sent == 2048, sent  # max(4096 // 2, 1024)
+    assert sent < provider.DEFAULT_MAX_TOKENS
+
+
+def test_chat_sends_an_explicit_max_tokens_from_providers_json_unchanged(tmp_path):
+    """A human wrote `max_tokens` into this provider's own entry -- that is their call, not this
+    module's, and it must reach the wire exactly as written even when it is larger than half the
+    local `ctx` the capping above would otherwise impose on an *implicit* default."""
+    fake = _FakeLlama(chat_payload=_TURN)
+    cfg = {**_llama_cfg(fake.port), "max_tokens": 32000}  # well past ctx=4096 // 2 on purpose
+    try:
+        provider.chat(cfg, {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    assert req["body"]["max_tokens"] == 32000
+
+
+# -- `max_tokens_param`/`send_temperature`: caila.io's own two divergences ----------------------
+#
+# caila.io's Anthropic routes (`just-ai/anthropic-claude/...`) silently ignore
+# `max_completion_tokens` -- exactly the failure this whole fix round exists to close -- and need
+# `max_tokens` instead; an OpenAI reasoning model behind the same host does the opposite and
+# rejects `max_tokens` outright, needing `max_completion_tokens`. Never both at once, and the
+# choice is a config field, not a guess from the model's name.
+
+
+def test_max_tokens_param_picks_the_wire_key_the_limit_is_sent_under(tmp_path):
+    """The default (`max_tokens`) is what every provider this module already talks to except one
+    reasoning model needs -- unchanged by this test. An entry that names a different wire key must
+    see the number ride under *that* key, and the default key must then be entirely absent (a
+    provider that rejects `max_tokens` outright, as OpenAI's reasoning models do, must not see it
+    at all, even alongside the right one)."""
+    fake = _FakeLlama(chat_payload=_TURN)
+    cfg = {**_llama_cfg(fake.port), "max_tokens_param": "max_completion_tokens", "max_tokens": 999}
+    try:
+        provider.chat(cfg, {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    assert req["body"]["max_completion_tokens"] == 999
+    assert "max_tokens" not in req["body"]
+
+
+def test_send_temperature_false_omits_temperature_from_the_body(tmp_path):
+    """The escape hatch for a provider that rejects `temperature` outright (an OpenAI reasoning
+    model, or caila.io on a route from its own documented "инцидент #273") -- `temperature` must
+    not appear in the body at all, not even as `null`, when a provider's own entry opts out."""
+    fake = _FakeLlama(chat_payload=_TURN)
+    cfg = {**_llama_cfg(fake.port), "send_temperature": False, "temperature": 0.9}
+    try:
+        provider.chat(cfg, {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    assert "temperature" not in req["body"]
+
+
+def test_send_temperature_defaults_to_true_unchanged_from_before(tmp_path):
+    """Regression guard for the flag above: a provider entry that says nothing about
+    `send_temperature` at all (every real entry in `providers.json` today) must keep sending
+    `temperature` exactly as it did before this field existed."""
+    fake = _FakeLlama(chat_payload=_TURN)
+    try:
+        provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    assert req["body"]["temperature"] == 0.7
+
+
+def test_finish_reason_length_is_a_named_truncation_not_bad_model_json(tmp_path):
+    """The bug as reproduced: an empty `content` with `finish_reason: "length"` must not read as
+    «the model would not hold the schema» -- it never got to try. And retrying is pointless: the
+    same `max_tokens` will hit the same wall, so exactly one request goes out, not two."""
+    fake = _FakeLlama(chat_payload={
+        "choices": [{"message": {"content": ""}, "finish_reason": "length"}]})
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "chat_truncated"
+        assert err.value.code != "bad_model_json"
+        assert len(fake.requests) == 1, "тот же лимит на повторе даст тот же обрыв — не повторяем"
+    finally:
+        fake.close()
+
+
+def test_finish_reason_length_wins_even_over_nonempty_but_cut_content(tmp_path):
+    """Truncation is not only an empty string -- a partial JSON fragment with
+    `finish_reason: "length"` must still be reported as the honest cut, not `bad_model_json`,
+    even though `json.loads` on that fragment would also fail and could otherwise fall into the
+    same branch a genuinely malformed reply does."""
+    fake = _FakeLlama(chat_payload={
+        "choices": [{"message": {"content": '{"reply": "почти дописал'},
+                     "finish_reason": "length"}]})
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "chat_truncated"
+    finally:
+        fake.close()
+
+
+def test_empty_content_with_no_truncation_marker_is_still_bad_model_json(tmp_path):
+    """The other half of the same fix: an empty (or malformed) reply that carries no
+    `finish_reason: "length"` at all -- an ordinary format failure, unrelated to any output-token
+    limit -- must keep going through the existing one-retry-then-`bad_model_json` path unchanged.
+    """
+    fake = _FakeLlama(chat_payload={"choices": [{"message": {"content": ""}}]})
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_model_json"
+        assert len(fake.requests) == 2, "обычный формат-отказ по-прежнему получает один повтор"
+    finally:
+        fake.close()
+
+
 def test_a_two_hundred_carrying_a_providers_own_error_is_a_named_refusal(tmp_path):
     """OpenRouter answers 200 with `{"error": {...}}` when *its* upstream fails.
 
@@ -561,6 +717,22 @@ def test_chat_scenario_with_no_provider_listening_raises_the_same_named_error_as
     with pytest.raises(provider.ProviderError) as err:
         provider.chat_scenario(_llama_cfg(port), {}, [{"role": "user", "content": "x"}])
     assert err.value.code == "chat_unreachable"
+
+
+def test_chat_scenario_finish_reason_length_is_the_same_named_truncation_as_chat(tmp_path):
+    """`_chat_turn` is shared between `chat` and `chat_scenario` -- this is the exact bug report
+    the task describes (a full scenario reply is the one shape big enough to actually hit a
+    stingy external `max_tokens` default), checked through the scenario entry point rather than
+    assumed from `chat`'s own coverage above."""
+    fake = _FakeLlama(chat_payload={
+        "choices": [{"message": {"content": ""}, "finish_reason": "length"}]})
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat_scenario(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "chat_truncated"
+        assert len(fake.requests) == 1
+    finally:
+        fake.close()
 
 
 def test_system_prompt_carries_the_clip_scenario_section():

@@ -1727,6 +1727,30 @@ def test_generate_scenario_refuses_a_malformed_llm_reply_as_bad_model_json(_serv
     assert detail["stages"]["scenario"] == "draft", "a bad reply must not open the gate"
 
 
+def test_generate_scenario_refuses_a_reply_cut_by_the_providers_own_output_limit(_serve,
+                                                                                  monkeypatch):
+    """The live bug this fix round closes: caila.io's `claude-opus-5`, with no `max_tokens` sent,
+    spent its whole (small, provider-default) output budget reasoning and answered
+    `finish_reason: "length"` with an empty `content` -- a full 19-section scenario is exactly the
+    shape of reply big enough to hit this. That must reach the page as `chat_truncated`, not
+    `bad_model_json` (a genuinely different failure this same empty-content shape used to be
+    mistaken for), and must leave the scenario gate exactly where the malformed-reply case above
+    does: `draft`, no scenes written.
+    """
+    fake = _FakeLlama(chat_payload={
+        "choices": [{"message": {"content": ""}, "finish_reason": "length"}]})
+    try:
+        srv = _serve(providers_port=fake.port)
+        pid = _clip_project_with_approved_track(srv, monkeypatch)
+        status, payload = srv.post_json_raw(f"/api/projects/{pid}/scenario/generate", {})
+    finally:
+        fake.close()
+    assert (status, payload["error"]["code"]) == (502, "chat_truncated"), payload
+    detail = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert detail["stages"]["scenario"] == "draft", "a truncated reply must not open the gate"
+    assert detail["scenario_scenes"] == []
+
+
 # -- the python validation jsonschema/grammar-constrained decoding cannot express -----------------
 
 

@@ -317,6 +317,20 @@ def _base_url(cfg: dict) -> str:
     return f"http://127.0.0.1:{cfg['port']}"
 
 
+#: Default completion-token limit when a `providers.json` entry does not set its own `max_tokens`
+#: (the wire key this rides under is a separate, provider-configurable choice -- see
+#: `max_tokens_param` below). Found by the bug this constant fixes: caila.io's `claude-opus-5`
+#: answers `finish_reason: "stop"` with a valid 43 KB, 19-section `SCENARIO_SCHEMA` reply -- the
+#: pipeline's own full-song ceiling -- at ~20 000 completion tokens (measured directly, 226 s).
+#: This sits above that measurement rather than on it.
+#:
+#: `llama-server`'s own default (no `max_tokens` sent at all) is generous enough that the bug this
+#: fixes never showed up locally -- only a real external provider's much stingier default (4096
+#: for the one that surfaced this) does. That asymmetry is why a *default* is needed at all rather
+#: than always trusting whatever the provider does when the field is omitted.
+DEFAULT_MAX_TOKENS = 24000
+
+
 def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
                retry_reminder: str) -> dict:
     """One turn of the OpenAI chat protocol, response shaped by `schema`.
@@ -331,23 +345,61 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
     shape gets exactly one retry with a system reminder appended, then a
     named ProviderError carrying the raw text for diagnosis.
 
-    Three named failures leave here, and they are three because the page says
-    three different things: `chat_unreachable` (nobody answered),
-    `bad_provider_reply` (a 200 that is not a completion -- the provider's own
-    error envelope) and `bad_model_json` (a completion whose text is not the
-    schema). Only the last is worth a retry: the other two are not the model
-    failing to phrase an answer, they are there being no answer to phrase.
+    Four named failures leave here, and they are four because the page says four different
+    things: `chat_unreachable` (nobody answered), `bad_provider_reply` (a 200 that is not a
+    completion -- the provider's own error envelope), `chat_truncated` (the provider cut the
+    reply short at its own output-token limit before the schema was finished) and `bad_model_json`
+    (a completion whose text is not the schema, and was not cut short). Only the last is worth a
+    retry: the other three are not the model failing to phrase an answer, they are there being no
+    answer to phrase -- and for `chat_truncated` specifically, retrying with the same limit would
+    hit the same wall again, so it is not retried at all (see below).
     """
+    max_tokens = cfg.get("max_tokens")
+    if max_tokens is None:
+        max_tokens = DEFAULT_MAX_TOKENS
+        # `llama-local`'s own `ctx` is llama.cpp's `n_ctx` -- prompt *and* completion sharing one
+        # budget, unlike an external provider's separate `max_tokens`. Defaulting to a completion
+        # budget sized for the measurement above (~20k) on a `ctx` that does not have 20k tokens
+        # to spare after the prompt would turn this fix into the same failure with an extra step.
+        # Only the *implicit* default is capped this way: a `max_tokens` a human actually wrote
+        # into `providers.json` is their own choice and is sent unchanged, `ctx` included -- this
+        # `if` is only reachable when they wrote none.
+        ctx = cfg.get("ctx")
+        if ctx:
+            max_tokens = min(max_tokens, max(ctx // 2, 1024))
+    # Which JSON key the limit above rides on. Never both, and never guessed from the model name:
+    # caila.io's Anthropic routes (`just-ai/anthropic-claude/...`) silently *ignore*
+    # `max_completion_tokens` -- the whole budget still goes to the provider's own default -- and
+    # need `max_tokens`; OpenAI's own reasoning models (`o1`-`o4`, `gpt-5*`) do the opposite and
+    # *reject* `max_tokens` outright, needing `max_completion_tokens`. `"max_tokens"` is the
+    # default because it is what every provider this file currently talks to except one reasoning
+    # model needs -- llama-server, an ordinary (non-reasoning) `openai`-typed provider, and
+    # caila's Anthropic routes all take it; the one exception (a reasoning model behind caila)
+    # sets `max_tokens_param: "max_completion_tokens"` in its own `providers.json` entry.
+    token_limit_key = cfg.get("max_tokens_param", "max_tokens")
     body = {"model": cfg.get("model", cfg.get("preset", "default")),
             "messages": messages,
-            "temperature": cfg.get("temperature", 0.7),
+            token_limit_key: max_tokens,
             "response_format": {"type": "json_schema", "json_schema": schema}}
+    # `send_temperature: false` in a provider's own entry leaves `temperature` out of the body
+    # entirely. Default `true` (unchanged behaviour): every provider this file currently talks to
+    # sends an explicit `temperature` in `providers.json` and today's live caila.io call still
+    # answered `claude-opus-5` with `temperature: 0.7` accepted -- but caila.io is on record
+    # (its own outage, "инцидент #273") rejecting `temperature` on *some* of its routes, and an
+    # OpenAI reasoning model is on record rejecting it outright. Rather than guess which of this
+    # roster's entries is next, the escape hatch is a config flag: a provider that starts refusing
+    # `temperature` gets `send_temperature: false` in its own entry, no code change.
+    send_temperature = cfg.get("send_temperature", True)
+    if send_temperature:
+        body["temperature"] = cfg.get("temperature", 0.7)
     headers = {"Content-Type": "application/json"}
     key_env = cfg.get("api_key_env")
     if cfg.get("type") == "openai" and key_env:
         headers["Authorization"] = f"Bearer {env.get(key_env, '')}"
 
     def ask(msgs):
+        """Returns `(content, finish_reason)` -- `finish_reason` may be `None`, not every provider
+        sends one, and its absence is not itself a failure."""
         req = urllib.request.Request(_base_url(cfg) + "/v1/chat/completions",
                                      data=json.dumps({**body, "messages": msgs}).encode(),
                                      headers=headers, method="POST")
@@ -367,19 +419,35 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
         # споткнулся» for a failure that never was this server's. The envelope is checked here,
         # once, where the bytes are parsed.
         try:
-            return payload["choices"][0]["message"]["content"]
+            choice = payload["choices"][0]
+            content = choice["message"]["content"]
         except (KeyError, IndexError, TypeError):
             raise ProviderError(
                 "bad_provider_reply",
                 f"провайдер ответил 200, но не ходом: "
                 f"{json.dumps(payload, ensure_ascii=False)[:400]}")
+        return content, (choice.get("finish_reason") if isinstance(choice, dict) else None)
 
-    raw = ask(messages)
+    def _truncated() -> ProviderError:
+        # Named separately from `bad_model_json`: the model did not break the schema, it was
+        # stopped before it could finish speaking. Conflating the two used to show a person «модель
+        # не удержала формат: » with an empty tail for a model that never got the chance to hold
+        # any format at all -- a dead end pointing at the wrong culprit.
+        return ProviderError(
+            "chat_truncated",
+            f"ответ обрезан лимитом вывода ({token_limit_key}={max_tokens}) раньше, чем модель "
+            f"закончила -- поднимите `{token_limit_key}` у этого провайдера в providers.json")
+
+    raw, finish_reason = ask(messages)
+    if finish_reason == "length":
+        raise _truncated()
     try:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         reminder = {"role": "system", "content": retry_reminder}
-        raw2 = ask([reminder, *messages])
+        raw2, finish_reason2 = ask([reminder, *messages])
+        if finish_reason2 == "length":
+            raise _truncated()
         try:
             return json.loads(raw2)
         except (json.JSONDecodeError, TypeError):
@@ -389,7 +457,7 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
 def chat(cfg: dict, env: dict, messages: list[dict]) -> dict:
     """One turn of the OpenAI chat protocol, response shaped by PROMPT_SCHEMA.
 
-    See `_chat_turn` for the shared mechanics (retry, the three named failures) this and
+    See `_chat_turn` for the shared mechanics (retry, the four named failures) this and
     `chat_scenario` both build on.
     """
     return _chat_turn(cfg, env, messages, PROMPT_SCHEMA,

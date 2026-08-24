@@ -5087,7 +5087,7 @@ _PROVIDER_SOURCE = (PROJECT_ROOT / "h3_48gb" / "provider.py").read_text(encoding
 #: *checked* against the source below rather than trusted, which is the half that grows.
 _CHAT_CODES = ("chat_not_found", "chat_busy", "chat_corrupt", "bad_image", "gpu_busy",
                "provider_unavailable", "llama_did_not_start", "chat_unreachable",
-               "bad_model_json", "bad_provider_reply")
+               "chat_truncated", "bad_model_json", "bad_provider_reply")
 
 #: Everything else the page has to name in Russian. Not a chat code -- `checkpoint_without_adaln`
 #: comes back from `POST /api/jobs`, out of the dry-run that validates a submission -- but the

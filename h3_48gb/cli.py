@@ -220,7 +220,7 @@ ERROR_CODES = {
     "queue_unwritable": "the queue directory could not be read or written; see `detail.path`",
     "media_type_not_allowed": "/media serves only finished clips and preview frames, and that is not one",
     "range_not_satisfiable": "the request's Range header names bytes outside the file `/media` resolved; `detail.total` is the file's real length",
-    # The chat prompt editor. The first three are the server's own refusals; the last three are
+    # The chat prompt editor. The first three are the server's own refusals; the last four are
     # raised inside `h3_48gb.provider` and reach the wire unchanged, because a failure of the model
     # is not a failure of this server and a page that has to tell them apart matches on the code.
     "chat_not_found": "there is no chat session with that id under `<outdir>/chat/`",
@@ -231,7 +231,8 @@ ERROR_CODES = {
     "gpu_busy": "a generation is running, so the local chat model is not raised: it would want the same 31 GB",
     "llama_did_not_start": "llama-server was spawned but never answered /health; the log tail is in the message",
     "chat_unreachable": "the chat provider did not answer at all -- not started, crashed, or the wrong address",
-    "bad_model_json": "the chat model would not hold the answer schema, twice in a row",
+    "chat_truncated": "the chat provider cut the reply short at its own output-token limit (`finish_reason: \"length\"`) before the schema was finished -- not retried, since retrying with the same limit hits the same wall; raise `max_tokens` for this provider in providers.json",
+    "bad_model_json": "the chat model would not hold the answer schema, twice in a row, and was not cut short by the provider's own token limit (see `chat_truncated` for that case)",
     "bad_provider_reply": "the chat provider answered 200 with something that is not a completion -- OpenRouter's own `{\"error\": ...}` body, or a proxy's page; the body's first 400 characters are in the message",
     # Router-level refusals: produced by `web._router_code` (and by the standard library's own
     # error path behind it) rather than by a `raise CliError(...)`, which is why the contract test
