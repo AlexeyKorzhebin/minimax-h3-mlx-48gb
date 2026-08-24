@@ -432,7 +432,18 @@ class FakeVideoVAE:
     delegates to `MiniMaxH3Pipeline._decode_video` (see `h3_48gb/pipeline.py`) — the numpy tail
     was inlined and rewritten to finish in uint8 on the MLX side. `.decode()` ignores its input
     and hands back a fixed tiny tensor, same trick `StubVAE` in
-    `tests/test_decode_video_uint8.py` uses to isolate this from the real 5.21 GB VAE."""
+    `tests/test_decode_video_uint8.py` uses to isolate this from the real 5.21 GB VAE.
+
+    That tensor must not be all zeros: `_decode_video` unnormalizes it with `PIXEL_MEAN`/
+    `PIXEL_STD` before `_validate_decoded_frames` (`h3_48gb/pipeline.py`) runs `framecheck` over
+    the result, and a zero latent unnormalizes to exactly `(124, 116, 104)` — `framecheck.
+    FILL_COLOR`, the flat-fill signature of an unwritten VAE tile (`h3_48gb/framecheck.py`).
+    `find_corrupt_frames` correctly reads that as corruption and raises, which is what actually
+    broke these two tests for about a month: not a pipeline defect, a fixture that predates the
+    corruption check (patch 0003) and happened to fabricate the one RGB triple that check exists
+    to catch. `mx.ones` unnormalizes to a color nowhere near `FILL_COLOR`, and the frame is 1x1 so
+    `tile_seam_score` never has enough points to fire either way (`MIN_SEAM_POINTS`) — this frame
+    passes validation honestly, not by dodging it."""
 
     def __init__(self, events: list[str]):
         self._events = events
@@ -443,7 +454,7 @@ class FakeVideoVAE:
 
     def decode(self, latents):
         self._events.append("decode:video")
-        return mx.zeros((1, 3, 1, 1, 1))
+        return mx.ones((1, 3, 1, 1, 1))
 
     def unload(self):
         self._events.append("unload:video_vae")
