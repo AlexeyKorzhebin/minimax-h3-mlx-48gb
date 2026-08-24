@@ -1322,8 +1322,10 @@ def test_run_job_dispatches_an_assemble_kind_to_h3_48gb_assemble_run(tmp_path, m
     """
     calls = []
 
-    def fake_run(project_path, *, run):
+    def fake_run(project_path, *, run, log=None):
         calls.append((Path(project_path), run))
+        if log is not None:
+            log("fake cleanup: removed 0 item(s), freed 0 bytes")
         return Path(project_path).parent / "final.mp4"
 
     monkeypatch.setattr(assemble, "run", fake_run)
@@ -1344,6 +1346,11 @@ def test_run_job_dispatches_an_assemble_kind_to_h3_48gb_assemble_run(tmp_path, m
     assert called_path == proj.path
     assert callable(called_run), "assemble.run must receive an injectable run callable"
     assert caffeinate_calls == [["caffeinate", "-dimsu", "-w", str(os.getpid())]]
+    # Task 9 (2026-08-24, user-approved): `assemble.run` is called with `log=log_lines.append`, so
+    # its own cleanup summary lands in this job's own log record, not on stderr.
+    log_text = q.log_path(root, job.id).read_text(encoding="utf-8")
+    assert "fake cleanup: removed 0 item(s), freed 0 bytes" in log_text
+    assert "assemble job done" in log_text
 
 
 # -- I1a (fix round 1, 2026-08-18 review): a failed assemble job marks stages.assembly failed -----
@@ -1355,7 +1362,7 @@ def test_i1a_a_failed_assemble_job_marks_stages_assembly_failed(tmp_path, monkey
     assembly stage that is not `"draft"`, so the project looked permanently in-flight with no job
     actually working on it.
     """
-    def boom(project_path, *, run):
+    def boom(project_path, *, run, log=None):
         raise RuntimeError("ffmpeg exploded")
 
     monkeypatch.setattr(assemble, "run", boom)
@@ -1445,7 +1452,7 @@ def test_i1b_a_finished_assemble_job_also_calls_advance_project(tmp_path, monkey
         advance_calls.append(project.id)
         return {"action": "nothing_to_do"}
 
-    def fake_run(project_path, *, run):
+    def fake_run(project_path, *, run, log=None):
         return Path(project_path).parent / "final.mp4"
 
     monkeypatch.setattr(assemble, "run", fake_run)
@@ -1746,7 +1753,7 @@ def test_task4_assemble_jobs_own_subprocess_is_a_tracked_child_while_it_runs(tmp
 
     monkeypatch.setattr(_FakeTrackedChild, "communicate", spying_communicate)
 
-    def fake_assemble_run(project_path, *, run):
+    def fake_assemble_run(project_path, *, run, log=None):
         result = run(["ffprobe", "fake"], capture_output=True, text=True)
         seen["result_returncode"] = result.returncode
         seen["result_stdout"] = result.stdout

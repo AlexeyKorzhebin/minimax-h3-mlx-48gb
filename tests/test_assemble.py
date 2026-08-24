@@ -9,6 +9,7 @@ Everything else here substitutes a fake `run` (a `spawn` for `submit`), the same
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1224,6 +1225,215 @@ def test_run_leaves_intermediate_files_in_place_when_assembly_fails(tmp_path):
         "the video-only concat must survive a failed assembly for diagnosis")
     reloaded = project_module.load_project(proj.path)
     assert reloaded.stages["assembly"] != "done"
+
+
+# -- Task 9 (2026-08-24, user-approved): post-success cleanup of checkpoints/previews/keyframes --
+
+
+def _scene_output_dir(proj, idx: int) -> Path:
+    """A scene's own relocated job directory, e.g. `<project>/scenes/20260101-1200-scene-<idx>/`
+    -- mirrors what `queue._relocate_to_job_subdir` actually produces for a project scene's
+    `kind="generate"` job (see `assemble._scene_generate_args`/`worker._handle_project_scene_
+    result`'s own `f"{job.output_stem}.mp4"`), close enough for these tests: what matters is that
+    it sits under `<project>/scenes/`, not the exact stamp/slug shape.
+    """
+    return proj.path.parent / "scenes" / f"20260101-1200-scene-{idx}"
+
+
+def _write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def _seed_scene_scaffolding(proj, idx: int, clip_bytes: bytes, checkpoint_files: list[bytes],
+                             preview_files: list[bytes]) -> Path:
+    """Writes one scene's own clip plus its `checkpoints/` and `*preview*.jpg` scaffolding onto
+    disk, and returns the clip path -- the realistic on-disk shape `_cleanup_project_artifacts`
+    is meant to sweep (module docstring's "scenes/*/checkpoints/").
+    """
+    scene_dir = _scene_output_dir(proj, idx)
+    clip_path = scene_dir / f"h3-scene-{idx}-896x512.mp4"
+    _write(clip_path, clip_bytes)
+    for i, data in enumerate(checkpoint_files):
+        _write(scene_dir / "checkpoints" / f"h3-scene-{idx}-step{i:02d}.safetensors", data)
+    for i, data in enumerate(preview_files):
+        _write(scene_dir / f"h3-scene-{idx}-896x512-preview-step{i:02d}.jpg", data)
+    return clip_path
+
+
+def test_cleanup_project_artifacts_removes_checkpoints_previews_keyframes_with_exact_totals(
+        tmp_path):
+    """Direct unit test of `_cleanup_project_artifacts`: pins the exact `removed`/`freed_bytes`
+    totals (not just "something was removed"), so a mutation that under-counts, double-counts, or
+    silently skips one of the three artifact kinds shows up as a wrong number, not just a wrong
+    boolean.
+    """
+    proj = _make_project(tmp_path, "video", audio_mode="clips")
+    clip0 = _seed_scene_scaffolding(
+        proj, 0, b"clip0-bytes",
+        checkpoint_files=[b"x" * 50, b"y" * 61],  # scene 0 checkpoints: 111 bytes, 1 directory
+        preview_files=[b"a" * 10, b"b" * 20])       # scene 0 previews: 2 files, 30 bytes
+    clip1 = _seed_scene_scaffolding(
+        proj, 1, b"clip1-bytes",
+        checkpoint_files=[b"z" * 73],                # scene 1 checkpoints: 73 bytes, 1 directory
+        preview_files=[b"c" * 30])                    # scene 1 previews: 1 file, 30 bytes
+    keyframes_dir = proj.path.parent / "keyframes"
+    _write(keyframes_dir / "keyframe-000.png", b"k" * 5)
+    _write(keyframes_dir / "keyframe-001.png", b"k" * 15)  # keyframes/: 1 directory, 20 bytes
+    proj.scenes = [
+        _make_scene(0, clip_path=str(clip0)),
+        _make_scene(1, clip_path=str(clip1)),
+    ]
+    proj.save()
+
+    outcome = assemble._cleanup_project_artifacts(proj)
+
+    assert outcome.removed == 6, "2 checkpoints dirs + 3 preview files + 1 keyframes dir"
+    assert outcome.freed_bytes == 264, "111 + 73 + 30 + 30 + 20"
+    assert outcome.errors == ()
+    assert outcome.summary() == "assembly cleanup: removed 6 item(s), freed 264 bytes"
+    assert not (_scene_output_dir(proj, 0) / "checkpoints").exists()
+    assert not (_scene_output_dir(proj, 1) / "checkpoints").exists()
+    assert list(_scene_output_dir(proj, 0).glob("*preview*.jpg")) == []
+    assert list(_scene_output_dir(proj, 1).glob("*preview*.jpg")) == []
+    assert not keyframes_dir.exists()
+    assert clip0.is_file() and clip0.read_bytes() == b"clip0-bytes", "a scene's own clip survives"
+    assert clip1.is_file() and clip1.read_bytes() == b"clip1-bytes"
+
+
+def test_run_success_cleans_up_but_keeps_clips_final_track_and_project_json(tmp_path):
+    """End-to-end: a successful `run()` sweeps checkpoints/previews/keyframes, leaves every clip,
+    `final.mp4`, `track/`, and `project.json` alone, and reports the cleanup summary through the
+    `log` callback -- the exact wiring `worker._run_assemble_job` relies on to put it in the job's
+    own log.
+    """
+    proj = _make_project(tmp_path, "video", audio_mode="clips")
+    clip0 = _seed_scene_scaffolding(proj, 0, b"clip0", checkpoint_files=[b"c" * 9],
+                                     preview_files=[b"p" * 4])
+    track_file = proj.path.parent / "track" / "song.mp3"
+    _write(track_file, b"song-bytes")
+    proj.scenes = [_make_scene(0, clip_path=str(clip0))]
+    proj.save()
+    fake = _FakeRun()
+    log_lines: list[str] = []
+
+    final = assemble.run(proj.path, run=fake, log=log_lines.append)
+
+    assert final == proj.path.parent / "assembly" / "final.mp4"
+    assert clip0.is_file(), "a scene's own clip is never touched by the cleanup"
+    assert not (_scene_output_dir(proj, 0) / "checkpoints").exists()
+    assert list(_scene_output_dir(proj, 0).glob("*preview*.jpg")) == []
+    assert not (proj.path.parent / "keyframes").exists()
+    assert track_file.is_file() and track_file.read_bytes() == b"song-bytes"
+    assert proj.path.is_file()
+    assert log_lines == ["assembly cleanup: removed 2 item(s), freed 13 bytes"], (
+        "checkpoints dir (9 bytes) + preview jpg (4 bytes) = 13, no keyframes dir this time")
+
+
+def test_run_does_not_clean_up_anything_when_assembly_fails(tmp_path):
+    """The flip side: a *failed* assembly (duration drift no padding can close) must leave every
+    scene's checkpoints/previews and the project's keyframes/ untouched -- a retry needs whatever a
+    human might use to diagnose the failure, and the module docstring's own gate is "only after
+    success".
+    """
+    proj = _make_project(tmp_path, "clip", audio_mode="song",
+                          track={"mastered_mp3": str(tmp_path / "song.mastered.mp3"),
+                                 "duration": 100.0})
+    clip0 = _seed_scene_scaffolding(proj, 0, b"clip0", checkpoint_files=[b"c" * 9],
+                                     preview_files=[b"p" * 4])
+    keyframes_dir = proj.path.parent / "keyframes"
+    _write(keyframes_dir / "keyframe-000.png", b"k")
+    proj.scenes = [_make_scene(0, clip_path=str(clip0))]
+    proj.save()
+    # Video comes back far short of the 100s track -- no freeze-frame padding closes that gap.
+    fake = _FakeRun(ffprobe_durations=[5.0, 5.0])
+
+    with pytest.raises(assemble.AssembleError, match="tolerance"):
+        assemble.run(proj.path, run=fake)
+
+    assert (_scene_output_dir(proj, 0) / "checkpoints").is_dir()
+    assert len(list(_scene_output_dir(proj, 0).glob("*preview*.jpg"))) == 1
+    assert keyframes_dir.is_dir()
+
+
+def test_cleanup_project_artifacts_skips_a_scene_dir_outside_the_project_directory(tmp_path):
+    """Task 9: "уборка не должна уметь выйти за каталог проекта". A scene whose own `clip_path`
+    (however it got there -- a hand-edited `project.json`, in production always this worker's own
+    write) sits *outside* `proj.path.parent` must not have anything under it touched.
+    """
+    proj = _make_project(tmp_path, "video", audio_mode="clips")
+    outside_dir = tmp_path / "outside-the-project"
+    clip_outside = outside_dir / "h3-scene-0-896x512.mp4"
+    _write(clip_outside, b"clip0")
+    _write(outside_dir / "checkpoints" / "h3-scene-0-step00.safetensors", b"c" * 9)
+    _write(outside_dir / "h3-scene-0-896x512-preview-step00.jpg", b"p" * 4)
+    proj.scenes = [_make_scene(0, clip_path=str(clip_outside))]
+    proj.save()
+
+    outcome = assemble._cleanup_project_artifacts(proj)
+
+    assert outcome.removed == 0
+    assert outcome.freed_bytes == 0
+    assert (outside_dir / "checkpoints").is_dir()
+    assert (outside_dir / "checkpoints" / "h3-scene-0-step00.safetensors").is_file()
+    assert (outside_dir / "h3-scene-0-896x512-preview-step00.jpg").is_file()
+
+
+def test_cleanup_project_artifacts_skips_a_scene_dir_reached_through_a_symlinked_ancestor(
+        tmp_path):
+    """Same containment rule, symlink flavour, chosen so it actually exercises `_path_within`'s
+    own `resolve()` call rather than `shutil.rmtree`'s unrelated (and separately already-existing)
+    refusal to operate directly on a symlink: `<project>/scenes` itself is a symlink to a
+    directory outside the project. A `clip_path` string built through it
+    (`<project>/scenes/job0/...`) *looks* like it is under the project by plain prefix comparison,
+    but `Path.resolve()` follows the symlink and lands outside `proj.path.parent` -- exactly the
+    case a naive `str(path).startswith(str(root))` containment check would get wrong and
+    `_path_within` must not.
+    """
+    proj = _make_project(tmp_path, "video", audio_mode="clips")
+    escaped_scenes = tmp_path / "escaped-scenes"
+    clip_via_symlink = proj.path.parent / "scenes" / "job0" / "h3-scene-0-896x512.mp4"
+    real_clip = escaped_scenes / "job0" / "h3-scene-0-896x512.mp4"
+    _write(real_clip, b"clip0")
+    _write(escaped_scenes / "job0" / "checkpoints" / "h3-scene-0-step00.safetensors", b"c" * 9)
+    _write(escaped_scenes / "job0" / "h3-scene-0-896x512-preview-step00.jpg", b"p" * 4)
+    (proj.path.parent / "scenes").symlink_to(escaped_scenes)
+    proj.scenes = [_make_scene(0, clip_path=str(clip_via_symlink))]
+    proj.save()
+
+    outcome = assemble._cleanup_project_artifacts(proj)
+
+    assert outcome.removed == 0
+    assert outcome.freed_bytes == 0
+    assert (escaped_scenes / "job0" / "checkpoints").is_dir()
+    assert (escaped_scenes / "job0" / "checkpoints" / "h3-scene-0-step00.safetensors").is_file()
+    assert (escaped_scenes / "job0" / "h3-scene-0-896x512-preview-step00.jpg").is_file()
+
+
+def test_run_can_be_retried_after_its_own_cleanup_ran(tmp_path):
+    """Task 9: "assembly/retry после уборки работает". `run()` never reads a scene's checkpoints,
+    previews, or keyframes -- only `clip_path` and the project's own track fields -- so calling it
+    again after its own cleanup already removed all three (exactly what `POST /assembly/retry`
+    does: reset `stages.assembly` to `"draft"` and let `advance_project` resubmit) must still
+    succeed.
+    """
+    proj = _make_project(tmp_path, "video", audio_mode="clips")
+    clip0 = _seed_scene_scaffolding(proj, 0, b"clip0", checkpoint_files=[b"c" * 9],
+                                     preview_files=[b"p" * 4])
+    proj.scenes = [_make_scene(0, clip_path=str(clip0))]
+    proj.save()
+
+    first = assemble.run(proj.path, run=_FakeRun())
+    assert first == proj.path.parent / "assembly" / "final.mp4"
+    assert not (_scene_output_dir(proj, 0) / "checkpoints").exists(), "sanity: first run cleaned up"
+
+    reloaded = project_module.load_project(proj.path)
+    reloaded.set_stage_status("assembly", "draft")
+    second = assemble.run(reloaded.path, run=_FakeRun())
+
+    assert second == first
+    reloaded_again = project_module.load_project(proj.path)
+    assert reloaded_again.stages["assembly"] == "done"
 
 
 # -- no-mlx discipline --------------------------------------------------------------------------

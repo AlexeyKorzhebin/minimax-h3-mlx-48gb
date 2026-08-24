@@ -512,6 +512,12 @@ def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
     too; if `_project_arg` itself cannot parse `job.args` (malformed beyond what `queue.submit`'s
     own `_validate_args_shape_for_kind` already guards against at submission time), there is no
     project to mark and this just fails the job honestly, as before.
+
+    **Task 9 (2026-08-24, user-approved): `assemble.run` is given `log=log_lines.append`** -- a
+    successful assembly's own post-success cleanup (scene checkpoints/previews, `keyframes/`)
+    reports how much it removed through that callback, so "removed N item(s), freed M bytes" lands
+    in this job's own log record (`log_text` below, `q.finish`'s `log_tail`) rather than on
+    `assemble.run`'s stderr default, which nothing here captures.
     """
     log_lines: list[str] = []
     try:
@@ -532,7 +538,11 @@ def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
 
         run = _tracked_child_run(spawn)
         with _caffeinate_block(spawn=spawn):
-            assemble.run(project_path, run=run)
+            # Task 9 (2026-08-24, user-approved): `assemble.run`'s own post-success cleanup
+            # (checkpoints/previews/keyframes) reports "removed N, freed M bytes" through this
+            # `log` callback -- routing it into `log_lines` puts it on the job's own log record
+            # (`q.finish`'s `log_tail`) instead of `assemble.run`'s stderr default.
+            assemble.run(project_path, run=run, log=log_lines.append)
         log_lines.append("assemble job done")
         return 0, "\n".join(log_lines) + "\n"
     except Exception as exc:  # noqa: BLE001 -- same reasoning as `_run_song_job`.

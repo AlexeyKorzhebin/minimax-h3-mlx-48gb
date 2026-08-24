@@ -29,6 +29,16 @@ task's own review round: `run(project_path, *, run=subprocess.run)` takes the sa
 `h3_48gb.worker._run_assemble_job` passes `_tracked_child_run(spawn)` through it exactly as it
 already does for a song job -- see that function's own docstring for the mechanism.
 
+**Task 9 (2026-08-24, user-approved): a successful `run()` also sweeps every scene's own
+`checkpoints/` directory, its `*preview*.jpg` files, and the project's `keyframes/` directory** --
+resume scaffolding and progress snapshots for a scene chain that has, by the time this runs,
+already finished; a finished project's own report (task brief on the "Колыбельная" clip) measured
+these at ~85% of a project's on-disk weight. `_cleanup_project_artifacts` is the whole thing --
+see its own docstring for the containment check and the "only after success, only inside the
+project directory" gate. Never touches a scene's own `clip_path` (`assembly/retry` re-concatenates
+those; `scenes/<idx>/retry` re-extracts a keyframe from the *previous* scene's clip, not from
+`keyframes/`), `final.mp4`, `project.json`, `track/`, or the job's own logs.
+
 **No `mlx` import, ever** -- same discipline as `h3_48gb.worker`/`h3_48gb.songrun` (see their own
 module docstrings): this module runs inside the worker process, which sits idle for days between
 30+ GB generations. Every subprocess this module drives is `ffmpeg`/`ffprobe`, never MLX, and a
@@ -59,6 +69,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -527,7 +538,7 @@ def _mux_mixed_audio(video_path, clip_audio_path, track_audio_path, out_path: Pa
 # -- run(): the assemble job body -----------------------------------------------------------------
 
 
-def run(project_path, *, run=subprocess.run) -> Path:
+def run(project_path, *, run=subprocess.run, log=None) -> Path:
     """Assemble every `done` scene's clip into `<project>/assembly/final.mp4` and return its path.
     This *is* the `kind="assemble"` job body -- `h3_48gb.worker._run_assemble_job` calls it, under
     the same lease/caffeinate wrapping every other job kind gets (see `worker.py`'s own docstrings).
@@ -574,6 +585,13 @@ def run(project_path, *, run=subprocess.run) -> Path:
     this function, unlike that one, is not itself the worker glue: `advance_project` may be reading
     the same project concurrently (through its own `Project` object) as this runs, and a blind
     `save()` here could clobber whatever it just wrote.
+
+    **Task 9 (2026-08-24, user-approved): success also sweeps scene checkpoints/previews and
+    `keyframes/`** (`_cleanup_project_artifacts`, called last, after the project is already marked
+    `done`) -- see that function's own docstring for the containment check and why this is safe to
+    call unconditionally at this one point. `log` (default: stderr, `_default_cleanup_log`) is
+    where the cleanup's own "removed N, freed M bytes" summary goes -- `worker._run_assemble_job`
+    passes `log_lines.append` so the summary rides the job's own log instead.
     """
     proj = project_module.load_project(project_path)
     if proj.kind not in ("video", "clip"):
@@ -661,6 +679,12 @@ def run(project_path, *, run=subprocess.run) -> Path:
     # `final.mp4` itself. A failure anywhere above this point returns/raises before reaching here,
     # so the intermediates from a failed attempt are always left in place for a human to inspect.
     _cleanup_intermediate_assembly_files(assembly_dir)
+    # Task 9 (2026-08-24, user-approved): scene checkpoints/previews and the project's own
+    # keyframes/ are pure scaffolding once assembly has actually succeeded too -- same "only after
+    # success" reasoning as the intermediates above, see `_cleanup_project_artifacts`'s own
+    # docstring for the containment check.
+    outcome = _cleanup_project_artifacts(proj)
+    (log or _default_cleanup_log)(outcome.summary())
     return final_path
 
 
@@ -687,6 +711,173 @@ def _cleanup_intermediate_assembly_files(assembly_dir: Path) -> None:
                 shutil.rmtree(dir_path, ignore_errors=True)
         except OSError:
             pass
+
+
+# -- Task 9 (2026-08-24, user-approved): sweep scene checkpoints/previews and keyframes/ ----------
+
+
+#: `_extract_valid_last_frame`/preview writing both use this exact shape (`preview.py`'s own
+#: `<stem>-preview-stepNN.jpg`, `cli.py`'s `--preview-stem` default) -- broad enough (`*preview*`)
+#: to match it without hard-coding the step-number padding.
+_SCENE_PREVIEW_GLOB = "*preview*.jpg"
+
+
+@dataclass(frozen=True)
+class _CleanupOutcome:
+    """What `_cleanup_project_artifacts` actually removed -- `removed` counts filesystem entries
+    acted on (one per checkpoints directory, one per preview jpg, one for `keyframes/` itself, not
+    a recursive file count), `freed_bytes` is measured before each deletion, `errors` is every
+    `OSError` this swallowed, turned into a readable line instead of a raised exception (task 9:
+    "падение самой уборки ... НЕ должно ронять сборку ... но молчать нельзя").
+    """
+
+    removed: int
+    freed_bytes: int
+    errors: tuple[str, ...]
+
+    def summary(self) -> str:
+        base = f"assembly cleanup: removed {self.removed} item(s), freed {self.freed_bytes} bytes"
+        if self.errors:
+            base += f"; {len(self.errors)} error(s) ({'; '.join(self.errors)})"
+        return base
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    """Whether `path` resolves to somewhere inside `root` -- the containment check every deletion
+    in `_cleanup_project_artifacts` runs immediately before touching anything (task 9: "уборка не
+    должна уметь выйти за каталог проекта"). `resolve()` on both sides so a symlinked path
+    component cannot read as "inside" by string comparison alone while actually pointing outside
+    `root` -- a scene directory that is legitimately under the project, but whose own `checkpoints`
+    entry happens to be a symlink elsewhere, is still caught by checking the specific path about to
+    be deleted, not just its parent.
+    """
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _path_size_bytes(path: Path) -> int:
+    """Total bytes `path` (a file or a directory tree) occupies right now -- called before
+    deletion, since there is nothing left to stat after. Best effort: a file that vanishes or
+    cannot be stat'd between the walk and the read (a concurrent process, a permission error)
+    contributes 0 instead of raising -- an exact count would need a lock this cleanup, being
+    best-effort by design, has no business taking.
+    """
+    try:
+        if path.is_file():
+            return path.stat().st_size
+    except OSError:
+        return 0
+    total = 0
+    try:
+        children = list(path.rglob("*"))
+    except OSError:
+        return total
+    for child in children:
+        if child.is_file():
+            try:
+                total += child.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def _cleanup_project_artifacts(proj) -> _CleanupOutcome:
+    """Task 9 (2026-08-24, user-approved): after a *successful* assembly, delete every scene's own
+    `checkpoints/` directory and `*preview*.jpg` files, plus the project's own `keyframes/`
+    directory -- pure scaffolding for a scene chain that has, by the time this ever runs, already
+    finished. Called exactly once, from `run()`'s own success path, after `final.mp4` exists,
+    every duration check has passed, and the project is already marked `assembly = "done"` -- that
+    call site, not anything checked inside this function, is the entire "only after success" gate:
+    any failure anywhere above it in `run()` returns or raises before this is ever reached, so a
+    failed or interrupted assembly never loses the checkpoints a retry might still need.
+
+    **Never a glob over the wider `outdir`.** Every path here is built from `proj.path.parent`
+    (the project directory) or from a scene's own `clip_path` -- already known-good, project-scoped
+    data written by this same worker (`worker._handle_project_scene_result`'s `f"{job.output_stem}
+    .mp4"`) -- and every one is re-checked with `_path_within` immediately before deletion anyway,
+    so a `clip_path` a hand-edited `project.json` (or a symlink) points outside the project
+    directory is skipped rather than followed.
+
+    **Never touches a scene's own clip.** Only `checkpoints/` and `*preview*.jpg` inside a scene's
+    own output directory are removed -- the clip itself (`h3-<tag>-<W>x<H>.mp4`, right next to
+    them) is what `assembly/retry`'s re-concat and `scenes/<idx>/retry`'s keyframe re-extraction
+    both still need, and this function has no business touching it.
+
+    **Deletion never raises.** Every `OSError` -- a permission problem, a file another process
+    still has open -- is caught and folded into the returned `errors` tuple instead: `run()` has
+    already written `final.mp4` and marked the project `done` by the time this is called, and a
+    cleanup failure must not turn that success into a raised exception (task 9: "падение самой
+    уборки ... НЕ должно ронять сборку").
+
+    **Absence is not an error.** A checkpoints directory, a preview jpg, or `keyframes/` that is
+    already gone (a human cleaned up by hand, an earlier partial run of this same cleanup after a
+    worker restart) is skipped silently -- the same rule `_cleanup_intermediate_assembly_files`
+    already follows for the assembly-dir intermediates.
+    """
+    project_dir = proj.path.parent
+    removed = 0
+    freed_bytes = 0
+    errors: list[str] = []
+
+    for scene in proj.scenes:
+        clip_path = scene.get("clip_path")
+        if not clip_path:
+            continue
+        scene_dir = Path(clip_path).parent
+        if not _path_within(scene_dir, project_dir):
+            continue
+
+        checkpoints_dir = scene_dir / "checkpoints"
+        if checkpoints_dir.is_dir() and _path_within(checkpoints_dir, project_dir):
+            freed = _path_size_bytes(checkpoints_dir)
+            try:
+                shutil.rmtree(checkpoints_dir)
+                removed += 1
+                freed_bytes += freed
+            except OSError as exc:
+                errors.append(f"{checkpoints_dir}: {type(exc).__name__}: {exc}")
+
+        try:
+            preview_files = sorted(scene_dir.glob(_SCENE_PREVIEW_GLOB))
+        except OSError as exc:
+            preview_files = []
+            errors.append(f"{scene_dir} (preview scan): {type(exc).__name__}: {exc}")
+        for preview in preview_files:
+            if not _path_within(preview, project_dir):
+                continue
+            try:
+                freed = preview.stat().st_size
+            except OSError:
+                freed = 0
+            try:
+                preview.unlink()
+                removed += 1
+                freed_bytes += freed
+            except OSError as exc:
+                errors.append(f"{preview}: {type(exc).__name__}: {exc}")
+
+    keyframes_dir = project_dir / "keyframes"
+    if keyframes_dir.is_dir() and _path_within(keyframes_dir, project_dir):
+        freed = _path_size_bytes(keyframes_dir)
+        try:
+            shutil.rmtree(keyframes_dir)
+            removed += 1
+            freed_bytes += freed
+        except OSError as exc:
+            errors.append(f"{keyframes_dir}: {type(exc).__name__}: {exc}")
+
+    return _CleanupOutcome(removed=removed, freed_bytes=freed_bytes, errors=tuple(errors))
+
+
+def _default_cleanup_log(message: str) -> None:
+    """`run()`'s own default `log` -- stderr, matching the module's existing "worth telling a
+    human" convention (`_extract_valid_last_frame`'s own `WARNING:` print). A caller that wants the
+    summary on the job's own record instead (`worker._run_assemble_job`) passes `log_lines.append`.
+    """
+    print(message, file=sys.stderr, flush=True)
 
 
 # -- Scene note: how a project scene's ordinary `kind="generate"` job is tagged ------------------
