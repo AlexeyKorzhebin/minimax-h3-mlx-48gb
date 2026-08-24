@@ -382,17 +382,33 @@ def test_system_prompt_defaults_invented_speech_to_russian_without_touching_pres
     # collapse markdown line-wrap so a phrase split across two source lines still matches
     section = re.sub(r"\s+", " ", raw)
 
-    # the default applies to speech the model invents, not to every line -- and it names Russian
-    assert re.search(r"invent\w*.*default.*\[Russian\]", section), \
-        "no rule tying invented speech to a [Russian] default"
+    # the default sentence must name Russian right where the default itself is stated -- not
+    # merely somewhere later in the section, where the language list and the example both mention
+    # `[Russian]` too and would keep a wide `invent...default...[Russian]` search green even if
+    # the default itself were mutated to name a different language (review found this: mutating
+    # `[Russian]` -> `[English]` right here left a `.*`-based search passing on the unrelated
+    # `[Russian]` occurrences downstream)
+    assert "Default that invented speech to `[Russian]`" in section, \
+        "the default sentence no longer names [Russian] as the invented-speech default"
 
     # the preservation rule for a user-supplied line must still stand, untouched by the new default
     assert "never translate or rewrite it" in section
-    assert re.search(r"applies only to a line the user actually gave you", section), \
+    assert "applies only to a line the user actually gave you" in section, \
         "preservation rule no longer scoped to user-supplied lines"
 
-    # an explicit request from the user for a language still outranks the Russian default
-    assert re.search(r"user names a language.*outranks the default", section), \
+    # the default must still explicitly defer to the preservation rule, in that direction -- pin
+    # the literal directional sentence itself, not just "preservation" and "default" both being
+    # present somewhere nearby, which a flipped ("always overrides") or silently negated sentence
+    # would still satisfy (review found this: mutating `never overrides` -> `always overrides` was
+    # not caught by any assertion in the previous version of this test)
+    assert "it never overrides the preservation rule above" in section, \
+        "the default no longer states that it defers to (never overrides) the preservation rule"
+
+    # an explicit request from the user for a language still outranks the Russian default -- pin
+    # the literal phrase (no wildcard between subject and verb) so a negation slipped in front of
+    # "outranks" -- e.g. "an explicit request never outranks the default", which still contains
+    # "outranks the default" as a substring -- cannot pass silently the way the wildcard version did
+    assert "an explicit request outranks the default" in section, \
         "no rule letting an explicit user language request override the Russian default"
 
 
