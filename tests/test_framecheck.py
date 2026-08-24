@@ -178,9 +178,9 @@ def test_tile_seam_positions_for_1344x768_are_pinned_to_the_measured_geometry():
     896x512 tests above: that canvas's overlap boundaries happen to land on the same positions
     whether the ratio is 16 or 8, so a wrong ratio would sail through every 896x512-only
     assertion. 1344x768 IS sensitive -- measured (task-1-report.md): mutating the ratio 16 -> 8
-    shifts 5 of its 12 columns (528, 704, 896, 960 move to 536, 720, 904, 976) and 2 of its 6 rows
-    (160, 416 move to 168, 424). Pinning the exact tuple for this canvas is what actually exercises
-    the ratio, not just the tiling arithmetic's shape.
+    shifts 6 of its 12 columns (528, 704, 784, 896, 960, 1152 move to 536, 720, 792, 904, 976,
+    1160) and 2 of its 6 rows (160, 416 move to 168, 424). Pinning the exact tuple for this canvas
+    is what actually exercises the ratio, not just the tiling arithmetic's shape.
     """
     assert framecheck._tile_seam_positions(1344) == (
         176, 256, 352, 432, 528, 608, 704, 784, 896, 960, 1088, 1152)
@@ -233,16 +233,34 @@ def test_tile_seam_score_ignores_a_historical_grid_column_on_a_non_native_canvas
 
 def test_tile_seam_score_is_disabled_below_min_seam_points_on_448x288():
     """448x288 gets only 4 total measurement points (`_tile_seam_positions(448)` has 2,
-    `_tile_seam_positions(288)` has 2) -- below `MIN_SEAM_POINTS` (8, chosen from the measured
-    false-positive rate at 4 points: see its own docstring). `tile_seam_score` must return the
-    clean value unconditionally there, regardless of frame content, rather than compute a ratio
-    over too few points to be meaningful. `zero_fill_fraction` is untouched and still the
-    corruption signal that canvas relies on.
+    `_tile_seam_positions(288)` has 2) -- below `MIN_SEAM_POINTS` (11, raised from an initial 8
+    by a fix-round-1 review that found the 8-10 band unmeasured and unsafe: see the constant's own
+    docstring). `tile_seam_score` must return the clean value unconditionally there, regardless of
+    frame content, rather than compute a ratio over too few points to be meaningful.
+    `zero_fill_fraction` is untouched and still the corruption signal that canvas relies on.
     """
     assert len(framecheck._tile_seam_positions(448)) + len(framecheck._tile_seam_positions(288)) < framecheck.MIN_SEAM_POINTS
 
     rng = np.random.default_rng(11)
     frame = np.clip(128.0 + rng.normal(0.0, 40.0, size=(288, 448, 3)), 0, 255).astype(np.uint8)
+
+    assert framecheck.tile_seam_score(frame) == 1.0
+
+
+def test_tile_seam_score_stays_disabled_at_the_min_seam_points_boundary_896x448():
+    """Guards the exact floor `MIN_SEAM_POINTS` sits at (11): 896x448 -- the fix-round-1 review's
+    own proxy canvas for the unmeasured 8-10 band -- gives exactly 10 total points
+    (`_tile_seam_positions(896)` has 8 columns, `_tile_seam_positions(448)` has 2 rows), one below
+    the floor. The only other MIN_SEAM_POINTS test runs at 4 points, nowhere near either boundary,
+    so a regression back to `MIN_SEAM_POINTS = 8` or `= 10` would enable the check here and this
+    test would be the one to notice: 896x448 is exactly one of the canvases the review measured a
+    real false positive on (proxy material, max seam_score 2.62 there) before the floor was raised.
+    """
+    assert len(framecheck._tile_seam_positions(896)) + len(framecheck._tile_seam_positions(448)) == 10
+    assert 10 < framecheck.MIN_SEAM_POINTS
+
+    rng = np.random.default_rng(13)
+    frame = np.clip(128.0 + rng.normal(0.0, 40.0, size=(448, 896, 3)), 0, 255).astype(np.uint8)
 
     assert framecheck.tile_seam_score(frame) == 1.0
 
