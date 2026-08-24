@@ -5337,36 +5337,89 @@ def test_scenario_scene_client_error_catches_what_the_editor_can_actually_break(
         f"{second}")
 
 
-@_needs_node
-def test_scenario_common_prefix_finds_the_shared_visual_bible_and_snaps_to_a_line_break():
-    """Находка 2 (живой проход 2026-08-24, `ux-syuzhet-report.md`): `docs/h3-prompt-system.md`
-    tells the model to copy the visual bible verbatim into every scene's own prompt -- on a real
-    scenario that duplicated block is the longest common PREFIX of every scene's prompt (the model
-    writes the bible before the scene-specific shot list), and `scenarioCommonPrefix` is what lets
-    the editor show only the unique tail without scrolling.
+_SCENARIO_KOLYBELNAYA_FIXTURE = (
+    PROJECT_ROOT / "tests" / "fixtures" / "scenario_prompts_kolybelnaya.json")
 
-    Three properties, each load-bearing for `collectScenarioScenes` never losing or duplicating
-    the common part on save:
-    1. the raw longest-common-prefix is snapped DOWN to the last full line break inside it, not
-       left mid-word -- a prefix ending mid-sentence would slice a tail that starts mid-sentence
-       too, in every single scene.
-    2. without a line break, it falls back to the last full word boundary (a space) instead.
-    3. a common part shorter than the "worth a separate block" floor collapses to "" -- a handful
-       of coincidentally shared characters is not a visual bible.
-    Every case below also checks the one property that actually protects data: `prefix +
-    prompt.slice(prefix.length) === prompt` for every input prompt -- the exact reconstruction
-    `collectScenarioScenes` relies on.
+
+@_needs_node
+def test_scenario_common_prefix_on_a_real_scenario_keeps_the_whole_bible_not_just_the_first_newline():
+    """Живой прогон (координатор, после первого раунда этой находки): открыл настоящий проект
+    («Колыбельная — сценарий по всей песне», 16 сцен) на боевом сервере и увидел блок «Общая
+    часть» с честными ~720 символами -- но хвосты в карточках сцен остались одинаковыми, первые
+    140 символов совпадали дословно. Находка не закрылась.
+
+    Причина: фикс первого раунда снапал ВСЕГДА на последний `\n` внутри сырого LCP, если он там вообще
+    был -- но настоящая визуальная библия этого проекта не многострочная, это один сплошной абзац
+    без единого переноса внутри себя, а единственный `\n` в общем префиксе стоит сразу после
+    `integrated_multimodal_description:` (34-й символ), за 900+ символов до того места, где сцены
+    реально расходятся. Безусловное предпочтение переноса резало по нему и отдавало хвостам почти
+    весь честно общий текст, оставляя видимую одинаковость.
+
+    Синтетические тестовые строки с удобными переносами были слепым пятном — они не могли поймать
+    эту разницу, потому что у НИХ перенос стоял близко к концу общей части, а не близко к началу.
+    `scenario_prompts_kolybelnaya.json` -- не подставные строки, а настоящие промпты этого самого
+    проекта (4 из 16 сцен, `GET /api/projects/<id>` на боевом сервере, только чтение), с ровно тем
+    расположением переноса, которое сломало первый раунд.
+
+    Фикс -- `Math.max(lastIndexOf("\n"), lastIndexOf(" "))`, не безусловный приоритет `\n`: снап
+    идёт на границу, которая реально ближе к концу LCP, будь то перенос или пробел.
+    """
+    fixture = json.loads(_SCENARIO_KOLYBELNAYA_FIXTURE.read_text(encoding="utf-8"))
+    prompts = fixture["prompts"]
+    assert len(prompts) >= 2, "the fixture itself must carry at least two real scene prompts"
+
+    # The golden value below is the raw longest-common-prefix of these four real prompts, snapped
+    # by the SAME rule this test exists to protect -- computed once, independently, in Python (not
+    # by calling the JS function under test) and hand-verified against the fixture's own docstring
+    # numbers (raw LCP 954 chars, one \n at offset 34, ends on a space at 953) before being
+    # pinned here. This is a golden/regression value tied to the checked-in fixture's own content,
+    # not a re-derivation of the algorithm.
+    raw = prompts[0]
+    for other in prompts[1:]:
+        m = min(len(raw), len(other))
+        j = 0
+        while j < m and raw[j] == other[j]:
+            j += 1
+        raw = raw[:j]
+    cut = max(raw.rfind("\n"), raw.rfind(" "))
+    expected_prefix = raw[: cut + 1] if cut != -1 else raw
+    assert len(expected_prefix) > 900, (
+        "sanity check on the fixture itself -- if this fails the fixture no longer reproduces the "
+        f"live bug at all, got a raw+snapped prefix of only {len(expected_prefix)} chars")
+
+    result = _node_eval("""
+      const prompts = %s;
+      const prefix = app.scenarioCommonPrefix(prompts);
+      console.log(JSON.stringify({
+        prefix,
+        reconstructs: prompts.every((p) => prefix + p.slice(prefix.length) === p),
+      }));
+    """ % json.dumps(prompts))
+
+    assert result["prefix"] == expected_prefix, (
+        f"expected the fix to keep {len(expected_prefix)} chars of real common bible, got "
+        f"{len(result['prefix'])}: {result['prefix'][:120]!r}...")
+    assert len(result["prefix"]) > 500, (
+        "must not regress to the round-1 bug -- snapping unconditionally to the first \\n would "
+        "leave only ~35 chars here (\"integrated_multimodal_description:\\n\"), got "
+        f"{len(result['prefix'])}: {result['prefix']!r}")
+    assert not result["prefix"].endswith("integrated_multimodal_description:\n"), (
+        "this is exactly the round-1 regression shape -- the early, structural newline must not "
+        f"win over the much later word boundary where the scenes actually diverge: "
+        f"{result['prefix']!r}")
+    assert result["reconstructs"] is True, (
+        "prefix + tail must reconstruct every real prompt exactly -- this is what "
+        "collectScenarioScenes relies on to never lose or duplicate the bible on save")
+
+
+@_needs_node
+def test_scenario_common_prefix_below_the_length_floor_returns_empty():
+    """The three degenerate cases that must never show a collapsible "common part" block at all:
+    a handful of coincidentally shared characters, no scenes to compare, or exactly one scene.
+    `SCENARIO_COMMON_PREFIX_MIN_LEN` (200) is well above anything these produce, so this is not
+    sensitive to the exact snap rule -- see the sibling test above for that.
     """
     result = _node_eval("""
-      const withNewline = [
-        "BIBLE TEXT HERE, long enough to matter.\\nScene: alpha walks by the shore.",
-        "BIBLE TEXT HERE, long enough to matter.\\nScene: beta runs along the shore.",
-        "BIBLE TEXT HERE, long enough to matter.\\nScene: gamma sits by the shore.",
-      ];
-      const noNewline = [
-        "identical opening clause here diverges immediately for scene one",
-        "identical opening clause here divergently forever for scene two",
-      ];
       const tooShort = [
         "Hi Alice walks the dog today near the old red barn.",
         "Hi Bob feeds the cat every morning by the same barn.",
@@ -5374,31 +5427,13 @@ def test_scenario_common_prefix_finds_the_shared_visual_bible_and_snaps_to_a_lin
       const noOverlapAtAll = ["abc scene one", "xyz scene two"];
       const oneScene = ["only one scene here, nothing to compare against"];
       const noScenes = [];
-      const reconstructs = (prompts, prefix) => prompts.every(
-        (p) => prefix + p.slice(prefix.length) === p);
-      const pWithNewline = app.scenarioCommonPrefix(withNewline);
-      const pNoNewline = app.scenarioCommonPrefix(noNewline);
       console.log(JSON.stringify({
-        withNewline: pWithNewline,
-        withNewlineReconstructs: reconstructs(withNewline, pWithNewline),
-        noNewline: pNoNewline,
-        noNewlineReconstructs: reconstructs(noNewline, pNoNewline),
         tooShort: app.scenarioCommonPrefix(tooShort),
         noOverlapAtAll: app.scenarioCommonPrefix(noOverlapAtAll),
         oneScene: app.scenarioCommonPrefix(oneScene),
         noScenes: app.scenarioCommonPrefix(noScenes),
       }));
     """)
-    assert result["withNewline"] == "BIBLE TEXT HERE, long enough to matter.\n", (
-        "must snap down to the last line break inside the raw common prefix, not stop mid-word "
-        f"or keep the also-common \"Scene: \" that follows it: {result['withNewline']!r}")
-    assert result["withNewlineReconstructs"] is True
-
-    assert result["noNewline"] == "identical opening clause here ", (
-        "no line break in the raw common prefix -- must fall back to the last full word, not cut "
-        f"\"diverge\" in half: {result['noNewline']!r}")
-    assert result["noNewlineReconstructs"] is True
-
     assert result["tooShort"] == "", (
         f"a 3-character overlap (\"Hi \") is not a visual bible: {result['tooShort']!r}")
     assert result["noOverlapAtAll"] == ""

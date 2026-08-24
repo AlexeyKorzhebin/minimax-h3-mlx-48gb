@@ -2230,12 +2230,32 @@ def test_a_fast_double_click_on_a_scenario_button_sends_only_one_request(_serve,
 
 _SCENARIO_PREFIX_SCRIPT = Path(__file__).resolve().parent / "_scenario_prefix_check.mjs"
 
-_PREFIX_BIBLE = "BIBLE TEXT HERE, long enough to matter.\n"
+# `_PREFIX_BIBLE` is a real slice of scene 0's own prompt in `scenario_prompts_kolybelnaya.json`
+# (the same fixture `test_web.py`'s `scenarioCommonPrefix` regression test reads), not a hand-typed
+# string -- a hand-typed bible with a convenient early "\n" was exactly the round-1 blind spot (see
+# that test's own docstring): it snapped fine on synthetic strings and silently kept almost nothing
+# of a real, single-paragraph visual bible. Cut to the last full sentence within the first 400
+# characters, so this fixture also carries a real embedded "\n" long before the cut, the same shape
+# that broke round 1.
+_KOLYBELNAYA_FIXTURE = json.loads(
+    (Path(__file__).resolve().parent / "fixtures" / "scenario_prompts_kolybelnaya.json")
+    .read_text(encoding="utf-8"))
+_REAL_BIBLE_SOURCE = _KOLYBELNAYA_FIXTURE["prompts"][0]
+_PREFIX_BIBLE = _REAL_BIBLE_SOURCE[:_REAL_BIBLE_SOURCE.rfind(". ", 0, 400) + 2]
+assert len(_PREFIX_BIBLE) >= 300, (
+    "sanity check on the fixture -- this must stay well above SCENARIO_COMMON_PREFIX_MIN_LEN "
+    f"(200) for the test below to mean anything, got {len(_PREFIX_BIBLE)} chars")
+assert "\n" in _PREFIX_BIBLE, (
+    "must keep the fixture's own early newline -- that positioning is the whole point")
+
+# The two seed scenes diverge on the very first character after the bible (Alpha/Beta) -- no
+# shared label like "Scene: " in between, so the raw common prefix of these two prompts is exactly
+# `_PREFIX_BIBLE`, and `expected_edited` below needs no separate accounting for it.
 _PREFIX_SCENES = [
     {"tag": "verse", "start": 0.0, "end": 8.0,
-     "prompt": _PREFIX_BIBLE + "Scene: alpha walks by the shore.", "duration": 7.0},
+     "prompt": _PREFIX_BIBLE + "Alpha walks by the shore.", "duration": 7.0},
     {"tag": "verse", "start": 8.0, "end": 16.0,
-     "prompt": _PREFIX_BIBLE + "Scene: beta runs along the shore.", "duration": 7.0},
+     "prompt": _PREFIX_BIBLE + "Beta runs along the shore.", "duration": 7.0},
 ]
 
 
@@ -2286,7 +2306,7 @@ def test_editing_a_scenes_tail_reconstructs_the_full_prompt_without_losing_or_du
     assert status == 200, put_first
 
     base_url = f"http://{web.LOOPBACK}:{srv.port}"
-    edited_tail = "Scene: alpha dances under fireworks tonight."
+    edited_tail = "Alice dances under fireworks tonight."
     result = _run_scenario_prefix_check(base_url, pid, 0, edited_tail)
 
     assert result["putStatus"] == 200, result
