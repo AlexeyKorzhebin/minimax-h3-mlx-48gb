@@ -133,16 +133,28 @@ def _tile_seam_positions(length: int) -> tuple[int, ...]:
 #: outright instead of computing a ratio — too few points for an average to mean anything rather
 #: than just amplify whatever one of them happens to land on.
 #:
-#: Measured (`.superpowers/fixes-2026-08-24/task-1-report.md` has the full tables): 896x512 gets
-#: 11 points (8 columns + 3 rows) and 1344x768 gets 18 (12 + 6) — every clean frame across every
-#: available clip at those canvases (524 and 970 frames respectively, all clips on disk, not just
-#: a 60-frame sample) scored under 1.6, while the two reference corrupt frames still scored 19-32x
-#: over threshold. 448x288 gets only 4 (2 + 2) — and at 4 points, false positives were real and
-#: frequent: up to seam_score 3720+ across the 23 available clean 448x288 clips and the two
-#: gates-2026-08-20 `assembly/final.mp4` outputs, the same failure mode that stalled боевые
-#: ворота 2026-08-20 on clean footage. Below this floor, only `zero_fill_fraction` (canvas-size-
-#: independent, catches the same corruption `patches/0003` targets) still watches for corruption.
-MIN_SEAM_POINTS = 8
+#: Measured (`.superpowers/fixes-2026-08-24/task-1-report.md` has the full tables, including the
+#: fix-round-1 review that raised this from 8): 896x512 gets 11 points (8 columns + 3 rows) and
+#: 1344x768 gets 18 (12 + 6) — every clean frame across every available clip at those canvases
+#: (732 and 970 frames respectively, all clips on disk, not just a 60-frame sample) scored under
+#: 1.6, while the two reference corrupt frames still scored 19-32x over threshold. 448x288 gets
+#: only 4 (2 + 2) — and at 4 points, false positives were real and frequent: up to seam_score
+#: 3720+ across the 23 available clean 448x288 clips and the two gates-2026-08-20
+#: `assembly/final.mp4` outputs, the same failure mode that stalled боевые ворота 2026-08-20 on
+#: clean footage.
+#:
+#: **8-10 points is an unmeasured band, not a verified-safe one.** No real canvas in this
+#: project's rotation lands there, so it was never checked against real decode output; a
+#: fix-round-1 review measured it on resampled proxy material instead (896x512/1344x768 clips
+#: resized to 672x384/896x448/768x432, all landing on 8 or 10 points) and found real false
+#: positives there too: 672x384 (8 points) 2/5023 frames over threshold (max 3.29), 896x448 (10
+#: points) 1/3456 (max 2.62) — against 0 anywhere at 11+ points on the same material. Not a
+#: native decode, but the brief's own criterion is that a single false frame stalls a whole scene
+#: chain, so an unverified 8-10-point band is not a safe place to leave the check on. The floor is
+#: therefore set at 11 — the smallest point count actually measured clean, not the smallest
+#: theoretically distinguishable one. Below it, only `zero_fill_fraction` (canvas-size-independent,
+#: catches the same corruption `patches/0003` targets) still watches for corruption.
+MIN_SEAM_POINTS = 11
 
 #: Above this, `tile_seam_score`'s ratio of seam-adjacent pixel deltas to a same-tile baseline a
 #: few pixels over reads as a real discontinuity rather than picture detail. Chosen empirically by

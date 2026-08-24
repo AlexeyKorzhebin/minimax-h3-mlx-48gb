@@ -70,9 +70,8 @@ def test_zero_fill_fraction_tolerates_the_documented_slop():
 def test_is_frame_corrupt_catches_every_flat_frame_from_the_chunk_recon_calibration():
     """`chunk-recon/corruption-map.csv` is the investigation's own frame-by-frame calibration of
     the 2026-08-19 corrupted scenes (1600 frames, 8 real 896x512 clips). `flat > 0` marks a frame
-    the investigation itself identified as having an unwritten (zero-fill) tile -- 36 frames of the
-    1600, measured directly (not the brief's first-draft "1036", which this test's own setup
-    disproves: that count doesn't exist in the file's `flat` column, which is boolean `0`/`1`).
+    the investigation itself identified as having an unwritten (zero-fill) tile -- the `flat`
+    column is boolean `0`/`1`, and 36 of the 1600 rows read `1` (measured directly off the file).
     `zero_fill_fraction`/`is_frame_corrupt` are untouched by the 2026-08-24 tile-seam fix; this
     pins that they still catch every one of those 36 frames, reading the actual pixels off the
     real clips rather than trusting the csv's own `seam_score` column (computed with the old,
@@ -92,7 +91,7 @@ def test_is_frame_corrupt_catches_every_flat_frame_from_the_chunk_recon_calibrat
     with csv_path.open() as f:
         rows = list(csv_module.DictReader(f))
     flat_rows = [r for r in rows if r["flat"] == "1"]
-    assert len(flat_rows) == 36  # the measured count, not the brief's unverified "1036"
+    assert len(flat_rows) == 36  # measured directly off the csv's boolean `flat` column
 
     by_clip: dict[str, list[int]] = {}
     for r in flat_rows:
@@ -172,6 +171,41 @@ def test_tile_seam_positions_for_896x512_is_a_superset_of_the_historical_calibra
 
     assert historical_columns <= set(framecheck._tile_seam_positions(896))
     assert historical_rows <= set(framecheck._tile_seam_positions(512))
+
+
+def test_tile_seam_positions_for_1344x768_are_pinned_to_the_measured_geometry():
+    """`VAE_SPATIAL_COMPRESSION_RATIO` (fix-round-1 review, I2) has no test coverage from the
+    896x512 tests above: that canvas's overlap boundaries happen to land on the same positions
+    whether the ratio is 16 or 8, so a wrong ratio would sail through every 896x512-only
+    assertion. 1344x768 IS sensitive -- measured (task-1-report.md): mutating the ratio 16 -> 8
+    shifts 5 of its 12 columns (528, 704, 896, 960 move to 536, 720, 904, 976) and 2 of its 6 rows
+    (160, 416 move to 168, 424). Pinning the exact tuple for this canvas is what actually exercises
+    the ratio, not just the tiling arithmetic's shape.
+    """
+    assert framecheck._tile_seam_positions(1344) == (
+        176, 256, 352, 432, 528, 608, 704, 784, 896, 960, 1088, 1152)
+    assert framecheck._tile_seam_positions(768) == (160, 256, 336, 416, 512, 592)
+
+
+def test_vae_spatial_compression_ratio_matches_the_real_weights_config():
+    """`VAE_SPATIAL_COMPRESSION_RATIO` is this module's own hardcoded copy of
+    `VideoVAEConfig.spatial_compression_ratio` (`framecheck` cannot import `video_vae`, see the
+    module docstring's mlx-free contract) -- if the real weights' config ever disagreed, seam
+    positions would silently stop matching the actual decode tiling with nothing to notice. Checks
+    it directly against `~/models/h3-converted/video_vae/source/config.json`'s `space_down`,
+    skip-gated the same way `test_vae_decode_parity.py` gates on a real checkpoint.
+    """
+    import json
+
+    config_path = Path.home() / "models/h3-converted/video_vae/source/config.json"
+    if not config_path.is_file():
+        pytest.skip(f"no checkpoint config at {config_path}")
+    config = json.loads(config_path.read_text())
+    ratio = 1
+    for factor in config["space_down"]:
+        ratio *= factor
+
+    assert framecheck.VAE_SPATIAL_COMPRESSION_RATIO == ratio
 
 
 def test_tile_seam_score_ignores_a_historical_grid_column_on_a_non_native_canvas():
