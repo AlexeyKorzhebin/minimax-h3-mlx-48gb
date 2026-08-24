@@ -7,6 +7,7 @@ variable does, so the roster can be shown to the page verbatim.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import subprocess
 import time
@@ -331,6 +332,95 @@ def _base_url(cfg: dict) -> str:
 DEFAULT_MAX_TOKENS = 24000
 
 
+def _read_sse(r) -> tuple[str, str | None]:
+    """Accumulate one OpenAI-style Server-Sent-Events stream into `(content, finish_reason)` --
+    the exact tuple shape `_chat_turn`'s non-streaming `ask()` branch already returns, so the
+    truncation/retry logic downstream (`_chat_turn` itself) does not know or care which wire shape
+    produced it. `r` is an already-open response (the object `urllib.request.urlopen` hands back).
+
+    Why this exists at all: caila.io -- the gateway in front of every external provider this file
+    talks to -- drops a request that runs past some idle window between 4 and 7 minutes (measured:
+    a full song-scenario call to `claude-opus-5` was cut with `RemoteDisconnected` at 7m16s; the
+    same call with a shorter brief passed uncut at 226s). A single `SCENARIO_SCHEMA` reply
+    (~20k completion tokens) is exactly the shape long enough to hit that wall. A stream keeps
+    bytes moving on the wire the whole time it is being generated, which is what actually prevents
+    the drop -- see `cfg.get("stream")` in `_chat_turn` for the config flag this is gated on.
+
+    Wire format: each event is a `data: <json>` line, terminated by a blank line; a line starting
+    with `:` is a comment. Both blank lines and comments are skipped, per the SSE spec every
+    provider here follows. `data: [DONE]` ends the stream normally and is not itself JSON.
+
+    Only `choices[0].delta.content` is collected. A reasoning model's `delta.reasoning` /
+    `reasoning_content` / `thinking` is never read -- those keys simply are not `content`, so
+    reasoning text can never be mistaken for the answer (the exact failure ai-writer 2.0's own
+    ADR-065 warns about: "thinking models stream their reasoning in delta chunks", and a client
+    that treats any chunk as the answer breaks on them). If a model spends its whole stream
+    reasoning and answers with an empty `content`, that empty string comes back here exactly as an
+    empty non-streaming `content` already does -- `_chat_turn` sends it through the same
+    `chat_truncated` (if cut) or `bad_model_json` (if not) branches, honestly, not smuggled through
+    as if reasoning were the reply.
+
+    Two ways this refuses instead of guessing:
+    - a `data:` line whose payload does not parse as JSON -- `bad_provider_reply`, the same code
+      the non-streaming path uses for "a 200 whose body is not a completion": a chunk that breaks
+      the wire protocol is exactly that, one frame later.
+    - the stream ends -- server closes the connection, or a socket error surfaces while reading --
+      before `[DONE]` ever arrived *and* no chunk ever carried a `finish_reason`: `chat_unreachable`.
+      Named the same as an outright-refused connection on purpose: either way the provider did not
+      finish talking, and a half-collected `content` is never returned as if it were whole -- the
+      whole point of this fix is to hold a connection open long enough to finish, and an
+      interrupted one failed at exactly that job.
+
+    A stream that ends with a `finish_reason` already seen but no separate `[DONE]` frame is *not*
+    treated as that same failure: `finish_reason` (`"stop"`, `"length"`, ...) is itself the
+    model's own "I am done" signal, `[DONE]` is a protocol nicety layered on top of it, and some
+    gateways close the socket right after the final chunk without ever sending it. Refusing that
+    case would turn a provider quirk into a false `chat_unreachable` for a reply that in fact
+    completed -- `finish_reason: "length"` still reaches `_chat_turn`'s own truncation check either
+    way, so `chat_truncated` is not lost by tolerating this.
+    """
+    content_parts: list[str] = []
+    finish_reason: str | None = None
+    for raw_line in r:
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line or line.startswith(":"):
+            continue
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            return "".join(content_parts), finish_reason
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            raise ProviderError(
+                "bad_provider_reply",
+                f"провайдер прислал не-JSON фрагмент потока: {data[:400]}")
+        choices = chunk.get("choices") if isinstance(chunk, dict) else None
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = choice.get("delta") if isinstance(choice, dict) else None
+        piece = delta.get("content") if isinstance(delta, dict) else None
+        if piece:
+            content_parts.append(piece)
+        fr = choice.get("finish_reason") if isinstance(choice, dict) else None
+        if fr:
+            finish_reason = fr
+    # The loop ran out (the socket hit EOF) without ever seeing `[DONE]`. If a `finish_reason`
+    # already arrived, the model itself signalled the end -- `[DONE]` was only a missing formality,
+    # not a cut reply -- so this is a normal completion, `finish_reason` ("length" included) intact
+    # for `_chat_turn`'s own truncation check.
+    if finish_reason is not None:
+        return "".join(content_parts), finish_reason
+    # No `finish_reason` ever arrived either: the connection closed, or was cut, with no signal at
+    # all that generation ended. Reported the same way an unreachable provider is: whatever partial
+    # `content` was collected above is discarded rather than returned as if it were complete.
+    raise ProviderError(
+        "chat_unreachable",
+        "поток оборвался раньше [DONE] -- провайдер закрыл соединение посреди ответа")
+
+
 def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
                retry_reminder: str) -> dict:
     """One turn of the OpenAI chat protocol, response shaped by `schema`.
@@ -353,6 +443,11 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
     retry: the other three are not the model failing to phrase an answer, they are there being no
     answer to phrase -- and for `chat_truncated` specifically, retrying with the same limit would
     hit the same wall again, so it is not retried at all (see below).
+
+    `cfg["stream"]` (default `False`) switches the wire shape from one plain JSON body to Server-
+    Sent Events, parsed by `_read_sse` into the exact same `(content, finish_reason)` tuple the
+    plain path produces -- everything below this point (truncation check, retry, the four named
+    failures) runs unchanged and does not know which shape produced its input.
     """
     max_tokens = cfg.get("max_tokens")
     if max_tokens is None:
@@ -392,6 +487,22 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
     send_temperature = cfg.get("send_temperature", True)
     if send_temperature:
         body["temperature"] = cfg.get("temperature", 0.7)
+    # `stream: true` in a provider's own entry asks for Server-Sent Events instead of one plain
+    # JSON body -- the workaround for the caila.io idle-drop measured directly against
+    # `claude-opus-5` (`RemoteDisconnected` at 7m16s on a full song-scenario call, the same call
+    # uncut at 226s with a shorter brief): a stream keeps bytes moving on the wire for the whole
+    # ~20k-completion-token reply, which is what actually prevents the drop -- switching model or
+    # schema does not. See `_read_sse` for how the chunks are parsed back into one reply.
+    #
+    # Default `False`, and omitted from the body entirely rather than sent as `false`, the same
+    # convention `send_temperature`'s own flag uses: today's plain request/response path already
+    # works against both `llama-local` (no gateway sits in front of it -- this failure has never
+    # shown up there) and every external provider currently in the roster, and flipping the wire
+    # shape globally risks breaking a codepath that has nothing to fix. This is an escape hatch a
+    # provider opts into in its own `providers.json` entry, not a default behaviour change.
+    stream = cfg.get("stream", False)
+    if stream:
+        body["stream"] = True
     headers = {"Content-Type": "application/json"}
     key_env = cfg.get("api_key_env")
     if cfg.get("type") == "openai" and key_env:
@@ -405,8 +516,20 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
                                      headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=600) as r:
+                if stream:
+                    # `_read_sse` reads `r` to completion (or raises) itself -- its own
+                    # `chat_unreachable`/`bad_provider_reply` for a dropped or malformed stream
+                    # must reach the caller unchanged, not get relabelled by the `except` below,
+                    # which is why it returns straight out of this `try` rather than assigning
+                    # into a variable the `except` could shadow.
+                    return _read_sse(r)
                 payload = json.loads(r.read())
-        except (urllib.error.URLError, OSError) as err:
+        # `http.client.HTTPException` (`IncompleteRead` among others) is not an `OSError` -- a
+        # stream cut mid-response by a socket-level failure surfaces through it, not through
+        # `URLError`/`OSError`, and without it here that failure would escape as a raw, unnamed
+        # exception instead of the same honest `chat_unreachable` an outright-refused connection
+        # already gets.
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
             # Connection refused (server not up / crashed), timeout, or any
             # other transport failure -- never leak the raw urllib exception
             # (or headers, which may carry the bearer token) to the caller.

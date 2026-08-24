@@ -761,3 +761,240 @@ def test_system_prompt_carries_the_clip_scenario_section():
             "meaning, not from restaging",
     ):
         assert anchor in text, anchor
+
+
+# -- stream: caila.io idle-drop workaround (Task 4) --------------------------------------------
+#
+# Measured, not assumed: a full-song `SCENARIO_SCHEMA` request to `claude-opus-5` behind caila.io
+# was cut with `RemoteDisconnected: Remote end closed connection without response` at 7m16s; the
+# same call with a shorter brief passed uncut at 226s. `cfg["stream"]` (default `False`, an
+# escape hatch a provider opts into -- unchanged for every provider already in `providers.json`)
+# switches `_chat_turn` to Server-Sent Events so bytes keep moving on the wire for the whole
+# ~20k-token reply. `_read_sse` is the parser; these tests exercise it only through `chat`/
+# `chat_scenario`, the same way every other `_chat_turn` mechanic in this file already is.
+
+
+def _sse(*chunks) -> list:
+    """`stream_chunks` for `_FakeLlama`: one `data:` frame per positional `dict`, terminated by
+    an explicit `[DONE]` frame -- the common case every test below wants unless it is deliberately
+    testing what happens *without* one.
+    """
+    return [*chunks, "data: [DONE]\n\n"]
+
+
+def _delta_chunk(content: str | None = None, finish_reason: str | None = None,
+                 reasoning: str | None = None) -> dict:
+    delta = {}
+    if content is not None:
+        delta["content"] = content
+    if reasoning is not None:
+        delta["reasoning_content"] = reasoning
+    choice = {"delta": delta}
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
+    return {"choices": [choice]}
+
+
+def test_stream_true_in_providers_json_puts_stream_true_on_the_wire(tmp_path):
+    """The config flag has to actually reach the request body -- checked by reading what the mock
+    server recorded, not by trusting the code path that claims to set it."""
+    content = _TURN["choices"][0]["message"]["content"]
+    fake = _FakeLlama(stream_chunks=_sse(_delta_chunk(content, finish_reason="stop")))
+    try:
+        provider.chat({**_llama_cfg(fake.port), "stream": True}, {},
+                     [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    assert req["body"]["stream"] is True
+
+
+def test_stream_omitted_by_default_leaves_the_body_unchanged(tmp_path):
+    """The other half of the same flag: a provider entry that says nothing about `stream` (every
+    real entry in `providers.json` today) must not carry the key at all -- not even as `false` --
+    so the non-streaming path this fix must not break stays byte-for-byte what it was before."""
+    fake = _FakeLlama(chat_payload=_TURN)
+    try:
+        provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    assert "stream" not in req["body"]
+
+
+def test_stream_chunks_concatenate_into_the_whole_reply(tmp_path):
+    """The point of SSE here is that no single chunk carries the whole answer -- a real 20k-token
+    reply arrives over hundreds of them. Split one valid turn's JSON across three separate `data:`
+    frames and check `chat` hands back the exact same parsed turn `_TURN` itself would, not a
+    fragment of it."""
+    content = _TURN["choices"][0]["message"]["content"]
+    third = len(content) // 3
+    parts = [content[:third], content[third:2 * third], content[2 * third:]]
+    assert "".join(parts) == content, "sanity: the split must not lose a byte"
+    fake = _FakeLlama(stream_chunks=_sse(
+        _delta_chunk(parts[0]),
+        _delta_chunk(parts[1]),
+        _delta_chunk(parts[2], finish_reason="stop"),
+    ))
+    try:
+        turn = provider.chat({**_llama_cfg(fake.port), "stream": True}, {},
+                             [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn["reply"] == "Сделал мрачнее."
+    assert turn["prompt"]["integrated_multimodal_description"] == "[Shot 1] Live-action…"
+
+
+def test_stream_done_ends_the_stream_and_later_frames_are_never_read(tmp_path):
+    """`[DONE]` is the honest end of the answer -- content in a `data:` frame written after it must
+    never reach the accumulated reply. Proven by putting a frame that, if read, would corrupt the
+    otherwise-valid JSON after `[DONE]`."""
+    content = _TURN["choices"][0]["message"]["content"]
+    fake = _FakeLlama(stream_chunks=[
+        f"data: {json.dumps(_delta_chunk(content, finish_reason='stop'))}\n\n",
+        "data: [DONE]\n\n",
+        # If this were read, it would append garbage after the closing brace and break json.loads.
+        f"data: {json.dumps(_delta_chunk('GARBAGE-AFTER-DONE'))}\n\n",
+    ])
+    try:
+        turn = provider.chat({**_llama_cfg(fake.port), "stream": True}, {},
+                             [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn["reply"] == "Сделал мрачнее."
+
+
+def test_stream_reasoning_deltas_never_reach_the_accumulated_content(tmp_path):
+    """A reasoning model may stream `reasoning`/`reasoning_content`/`thinking` deltas before its
+    real answer (ai-writer 2.0's own ADR-065 warning, applied here) -- none of the three may end
+    up concatenated into `content`, which must contain only the actual JSON reply."""
+    content = _TURN["choices"][0]["message"]["content"]
+    fake = _FakeLlama(stream_chunks=_sse(
+        _delta_chunk(reasoning="Дай подумаю, как лучше ответить..."),
+        {"choices": [{"delta": {"thinking": "ещё немного думаю"}}]},
+        _delta_chunk(content, finish_reason="stop"),
+    ))
+    try:
+        turn = provider.chat({**_llama_cfg(fake.port), "stream": True}, {},
+                             [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    # The reasoning text must not have leaked into the reply -- not as a prefix, not anywhere.
+    assert "думаю" not in turn["reply"]
+    assert "думаю" not in json.dumps(turn, ensure_ascii=False)
+    assert turn["reply"] == "Сделал мрачнее."
+
+
+def test_stream_finish_reason_length_in_the_last_chunk_gives_chat_truncated(tmp_path):
+    """The same honest distinction the non-streaming path already makes (see the `chat_truncated`
+    fix-round tests above) must survive the wire-shape change: a stream whose last chunk carries
+    `finish_reason: "length"` is a cut reply, not a malformed one -- `chat_truncated`, not
+    `bad_model_json`, and not retried (the same `max_tokens` would hit the same wall)."""
+    fake = _FakeLlama(stream_chunks=_sse(
+        _delta_chunk('{"reply": "почти дописал'),
+        _delta_chunk(finish_reason="length"),
+    ))
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat({**_llama_cfg(fake.port), "stream": True}, {},
+                         [{"role": "user", "content": "x"}])
+        assert err.value.code == "chat_truncated"
+        assert err.value.code != "bad_model_json"
+        assert len(fake.requests) == 1, "тот же лимит на повторе даст тот же обрыв — не повторяем"
+    finally:
+        fake.close()
+
+
+class _CutIter:
+    """A fake `r` for `_read_sse` that yields a few lines and then simply stops -- exactly what
+    `_read_sse`'s `for raw_line in r:` sees once a real socket's connection is cut mid-response,
+    without going through a real loopback TCP connection to get there.
+
+    Tried the real-socket route first: `_FakeLlama` answers a short `stream_chunks` list with no
+    `[DONE]`, over `ThreadingHTTPServer`'s ordinary "handler returns -> framework closes the
+    connection" teardown. It is genuinely racy -- five back-to-back runs of that exact scenario
+    against a real loopback socket came back as one clean success, two `ConnectionResetError`s and
+    two multi-second hangs before the read finally timed out, all from the *same* code and the
+    *same* machine, only the OS's own scheduling of the accept thread's teardown differed run to
+    run. That race is a property of driving a real socket race from a lightweight test server, not
+    of the code under test -- `_read_sse`'s own EOF branch runs identically no matter what kind of
+    object it is iterating, so this is what actually gets exercised, deterministically and in
+    microseconds rather than seconds.
+    """
+
+    def __init__(self, lines: list[bytes]):
+        self._lines = lines
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+def test_stream_cut_before_any_finish_reason_is_chat_unreachable_not_a_partial_parse():
+    """The connection ending mid-answer -- no `[DONE]`, no `finish_reason` at all -- must be a
+    named, honest refusal and must not hand back the JSON fragment collected so far as if it were
+    a real (if malformed) reply: `chat_unreachable`, never `bad_model_json`, and the fragment
+    itself must not appear in the error message as if it had been parsed."""
+    lines = [
+        (f"data: {json.dumps(_delta_chunk('{\"reply\": \"почти'))}\n").encode(),
+        b"\n",
+        # No finish_reason chunk, no [DONE] -- the iterable just ends here, as a cut socket would.
+    ]
+    with pytest.raises(provider.ProviderError) as err:
+        provider._read_sse(_CutIter(lines))
+    assert err.value.code == "chat_unreachable"
+    assert err.value.code != "bad_model_json"
+    assert "почти" not in str(err.value), "half-collected content must not read as if parsed"
+
+
+def test_stream_non_json_data_frame_is_a_named_bad_provider_reply_not_a_silent_crash(tmp_path):
+    """A `data:` line whose payload is not JSON breaks the wire protocol mid-stream -- the same
+    class of failure the non-streaming path's `bad_provider_reply` already names for "a 200 that
+    is not a completion". Must not raise an unnamed `json.JSONDecodeError` straight out of this
+    module, and must not be retried (the malformed frame is not the model failing to hold a
+    schema)."""
+    fake = _FakeLlama(stream_chunks=[
+        "data: это не json совсем\n\n",
+        "data: [DONE]\n\n",
+    ])
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat({**_llama_cfg(fake.port), "stream": True}, {},
+                         [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_provider_reply"
+        assert len(fake.requests) == 1, "сломанный кадр — не повод переспрашивать"
+    finally:
+        fake.close()
+
+
+def test_stream_invalid_model_json_gets_one_retry_then_a_named_error(tmp_path):
+    """The one-retry-then-named-error mechanic (`test_invalid_model_json_gets_one_retry_then_a_
+    named_error` for the non-streaming path) must survive the wire-shape change: a stream whose
+    accumulated `content` is not valid JSON, with no truncation marker, gets exactly one retry
+    before `bad_model_json` -- checked by request count, so a retry that silently stopped
+    happening would be caught."""
+    fake = _FakeLlama(stream_chunks=_sse(_delta_chunk("не json", finish_reason="stop")))
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat({**_llama_cfg(fake.port), "stream": True}, {},
+                         [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_model_json"
+        assert len(fake.requests) == 2, "должен быть ровно один повтор"
+    finally:
+        fake.close()
+
+
+def test_stream_also_works_through_chat_scenario_the_shared_code_path(tmp_path):
+    """`_chat_turn` is shared between `chat` and `chat_scenario` -- checked through the scenario
+    entry point rather than assumed from `chat`'s own coverage above, the same way the
+    `finish_reason: "length"` fix round checks both entry points separately."""
+    payload = _scenario_payload()
+    content = payload["choices"][0]["message"]["content"]
+    fake = _FakeLlama(stream_chunks=_sse(_delta_chunk(content, finish_reason="stop")))
+    try:
+        turn = provider.chat_scenario({**_llama_cfg(fake.port), "stream": True}, {},
+                                      [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn["scenario"]["sections"][0]["tag"] == "verse"
+    (req,) = fake.requests
+    assert req["body"]["stream"] is True

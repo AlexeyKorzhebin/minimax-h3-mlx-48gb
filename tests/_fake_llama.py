@@ -41,12 +41,27 @@ class _FakeLlama:
     `port_alive`/`ensure_up` and deliberately stays unlogged, or every existing `(req,) =
     fake.requests`/`fake.requests == []` assertion in the other provider/chat tests would break
     the moment this class started being used anywhere near a running local provider.
+
+    `stream_chunks` (task: SSE streaming): when the incoming chat POST body carries `"stream":
+    true` *and* this is not `None`, the response is `text/event-stream` instead of one JSON body
+    -- each item is written out in order, flushed individually so a test can assert on partial
+    delivery. A `dict` item is wrapped as one `data: <json>\n\n` frame (the ordinary case: a
+    chunk shaped like `{"choices": [{"delta": {...}, "finish_reason": ...}]}`); a `str` item is
+    written verbatim, for the cases a dict cannot express -- a malformed non-JSON `data:` line, a
+    comment line, or the `"data: [DONE]\n\n"` terminator itself. Deliberately no `Content-Length`
+    and no chunked-transfer-encoding: this handler answers HTTP/1.0 (the class default,
+    unchanged), so the socket simply closes once every item has been written, and a
+    `stream_chunks` list with no `[DONE]` frame in it is exactly how a test simulates a connection
+    that closed mid-stream. `chat_payload` and `health`/`delay` behave unchanged when the request
+    is not a stream request, or `stream_chunks` is `None` -- existing callers that never pass it
+    see no change at all.
     """
 
     def __init__(self, chat_payload=None, health: int = 200, delay: float = 0.0,
-                 models_payload=None, models_status: int = 200, models_raw=None):
+                 models_payload=None, models_status: int = 200, models_raw=None,
+                 stream_chunks=None):
         handler_cls = self._make_handler(chat_payload, health, delay, models_payload,
-                                         models_status, models_raw)
+                                         models_status, models_raw, stream_chunks)
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
         self.port = self.httpd.server_address[1]
         self.requests: list[dict] = []
@@ -55,7 +70,7 @@ class _FakeLlama:
         self.thread.start()
 
     def _make_handler(self, chat_payload, health, delay=0.0, models_payload=None,
-                      models_status=200, models_raw=None):
+                      models_status=200, models_raw=None, stream_chunks=None):
         class Handler(http.server.BaseHTTPRequestHandler):
             seen: list = []
 
@@ -89,6 +104,15 @@ class _FakeLlama:
                                          "headers": dict(self.headers)})
                 if delay:
                     time.sleep(delay)
+                if body.get("stream") and stream_chunks is not None:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    for item in stream_chunks:
+                        frame = item if isinstance(item, str) else f"data: {json.dumps(item)}\n\n"
+                        self.wfile.write(frame.encode())
+                        self.wfile.flush()
+                    return
                 out = json.dumps(chat_payload or {}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
