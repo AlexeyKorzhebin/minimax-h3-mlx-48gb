@@ -1392,6 +1392,9 @@ details.adv > summary .hint {
    уже используют для отказа/успеха в этой же панели, никаких новых токенов. */
 .proj-stage-note.ok  { color: var(--done-ink); font-weight: 500; }
 .proj-stage-note.bad { color: var(--fail-ink); font-weight: 500; }
+/* Находка 1 (волна ux-фиксов 2026-08-24): «идёт запрос» -- тот же сигнальный тон, что уже
+   значит «GPU считает» в остальной панели (`--accent-ink`), не новый цвет для того же смысла. */
+.proj-stage-note.busy { color: var(--accent-ink); font-weight: 500; }
 .proj-lyrics {
   margin: 8px 0 0; padding: 9px 10px; border-radius: var(--r-xs);
   background: var(--bg); border: 1px solid var(--hairline);

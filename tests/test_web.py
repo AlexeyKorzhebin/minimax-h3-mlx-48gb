@@ -5098,7 +5098,12 @@ _CHAT_CODES = ("chat_not_found", "chat_busy", "chat_corrupt", "bad_image", "gpu_
 #: person meets it in the same place, as a red box under the form, and the sentence has to say
 #: which field fixes it. Separate from `_CHAT_CODES` because the provider-derived test below is
 #: about the chat half specifically.
-_SUBMIT_CODES = ("checkpoint_without_adaln",)
+#:
+#: `scenario_invalid` (находка 2, волна ux-фиксов 2026-08-24) rides along with the no-`detail`
+#: shape this sweep exercises (`errorText({error: {code, message: "почему"}})`, nothing else) --
+#: `test_scenario_invalid_and_args_invalid_name_which_scene_and_what_is_wrong` below covers the
+#: `detail.index`/`detail.reason` shape the server actually sends, which this generic sweep can't.
+_SUBMIT_CODES = ("checkpoint_without_adaln", "scenario_invalid")
 
 _PAGE_CODES = _CHAT_CODES + _SUBMIT_CODES
 
@@ -5150,6 +5155,133 @@ def test_every_provider_failure_reaches_the_page_with_a_sentence_of_its_own():
     assert raised, "the raise sites moved -- this test is reading nothing"
     missing = raised - set(_CHAT_CODES)
     assert not missing, f"{sorted(missing)} can reach the page but is not in `_CHAT_CODES`"
+
+
+@_needs_node
+def test_scenario_invalid_and_args_invalid_name_which_scene_and_what_is_wrong():
+    """Находка 2 (волна ux-фиксов 2026-08-24, `ux-syuzhet-report.md`): before this fix,
+    `scenario_invalid` had no `case` at all (`default:` -- «Отказ: scenario_invalid», the code
+    itself, on a Russian page) and `args_invalid` from the scenario editor fell into the same
+    generic «Запрос не той формы» as every other shape of that code, losing the one thing a person
+    actually needs -- *which* scene is wrong. Reproduced trivially: erase a scene's duration,
+    blur the field -- `collectScenarioScenes` (`app.js`) sends `0`, a real number, so the server's
+    `scenario_invalid`/`duration_out_of_range` is what actually fires, not `args_invalid`.
+
+    Checks each `detail.reason` `_validate_scenario_scenes` (web.py) can send, that the scene
+    number (`detail.index + 1`, one-based -- what a person reading the editor's own numbering
+    would expect) is named, and that `detail.min`/`detail.max` -- not a hardcoded guess -- drive
+    the two numeric sentences. Also checks the `args_invalid` discrimination this fix has to get
+    right: the scenario editor's own shape (`detail = {"index": i}`, nothing else -- `_typed_
+    scenario_scene` in web.py) must name the scene and say "промпт", but the *different* shape
+    the session-project-creation route sends for the same code (`detail = {"index": i, "type":
+    ...}` -- `web.py`'s own `session project.scenes[i]...`) must NOT be mistaken for it, since
+    that route's `index`-carrying failures are not always about an empty prompt.
+    """
+    reasons_and_min_snippets = _node_eval("""
+      const say = (code, detail) => app.errorText({error: {code, message: "server said so",
+                                                             detail}}).title;
+      const scenarioReasons = ["empty", "end_before_start", "does_not_start_at_zero",
+        "gap_or_overlap", "does_not_end_at_track_duration", "section_too_short",
+        "duration_out_of_range"];
+      const titles = scenarioReasons.map(
+        (reason) => say("scenario_invalid", {index: 2, reason}));
+      const emptyNoIndex = say("scenario_invalid", {reason: "empty"});
+      const durationRange = say("scenario_invalid",
+        {index: 0, reason: "duration_out_of_range", duration: 2, min: 5, max: 10});
+      const sectionShort = say("scenario_invalid",
+        {index: 0, reason: "section_too_short", span: 3, min: 5});
+      const unknownReason = say("scenario_invalid", {index: 0, reason: "a_future_rule"});
+      const scenarioArgsInvalid = say("args_invalid", {index: 0});
+      const sessionArgsInvalid = say("args_invalid", {index: 0, type: "int"});
+      const jobArgsInvalid = say("args_invalid", {stderr: "usage: h3 generate ..."});
+      console.log(JSON.stringify({titles, emptyNoIndex, durationRange, sectionShort,
+                                   unknownReason, scenarioArgsInvalid, sessionArgsInvalid,
+                                   jobArgsInvalid}));
+    """)
+    titles = reasons_and_min_snippets["titles"]
+    # Все семь причин называют сцену (`index: 2` -> «Сцена 3», нумерация с единицы) и дают РАЗНЫЙ
+    # текст -- ни одна не пересказывает код отказа латиницей.
+    assert len(set(titles)) == len(titles), f"two different reasons share one sentence: {titles}"
+    for title in titles:
+        assert title.startswith("Сцена 3: "), f"scene number missing or wrong: {title!r}"
+        assert not _LATIN_WORD.search(title), f"not in Russian: {title!r}"
+    assert reasons_and_min_snippets["emptyNoIndex"] == "В сюжете нет ни одной сцены — добавьте " \
+        "хотя бы одну.", "the one reason with no `index` must not claim a scene number"
+
+    # Числа -- из `detail.min`/`detail.max`, не зашитый порог: если сервер когда-нибудь пришлёт
+    # другой диапазон, страница обязана сказать именно его.
+    assert "от 5 до 10" in reasons_and_min_snippets["durationRange"], (
+        reasons_and_min_snippets["durationRange"])
+    assert "минимум 5" in reasons_and_min_snippets["sectionShort"], (
+        reasons_and_min_snippets["sectionShort"])
+    # Причина, которую этот код ещё не знает (будущее правило сервера) -- честный "не проходит
+    # проверку", не пустая строка и не падение.
+    assert reasons_and_min_snippets["unknownReason"].startswith("Сцена 1: "), (
+        reasons_and_min_snippets["unknownReason"])
+
+    assert reasons_and_min_snippets["scenarioArgsInvalid"] == \
+        "Сцена 1: промпт нельзя оставить пустым", reasons_and_min_snippets["scenarioArgsInvalid"]
+    # Тот же код, форма `detail` другая (`type` тоже есть) -- НЕ редактор сюжета, значит не
+    # "промпт", а честный неспецифичный текст.
+    assert "промпт" not in reasons_and_min_snippets["sessionArgsInvalid"], (
+        "the session-project-creation route's own args_invalid must not be mistaken for the "
+        f"scenario editor's: {reasons_and_min_snippets['sessionArgsInvalid']!r}")
+    assert reasons_and_min_snippets["sessionArgsInvalid"] == "Запрос не той формы"
+    # Старое поведение (командная строка задачи) не тронуто.
+    assert reasons_and_min_snippets["jobArgsInvalid"] == "Командная строка не годится"
+
+
+@_needs_node
+def test_scenario_scene_client_error_catches_what_the_editor_can_actually_break():
+    """Находка 2 (волна ux-фиксов 2026-08-24), «стоит ли валидировать клиентом»: `scenarioScene
+    ClientError` (`app.js`) is the client-side half of that answer -- it catches the two things a
+    person can actually break by hand in the scenario editor (an empty prompt, a duration outside
+    5..10s) before `saveScenario` ever sends the `PUT`, using the exact `error.code`/`detail`
+    shape `errorText` (tested above) already knows how to turn into a Russian sentence.
+
+    Mirrors what `collectScenarioScenes` (`app.js`) actually produces: an erased duration field
+    becomes `0` (`Number("")`), never `NaN` -- this is why the reproduction named in the report
+    ("стереть длительность, увести фокус") trips `duration_out_of_range`, not a type error.
+    """
+    good = {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "a shot of a lake", "duration": 7}
+    result = _node_eval("""
+      const good = %s;
+      const withEmptyPrompt = [{...good, prompt: ""}];
+      const withWhitespacePrompt = [{...good, prompt: "   "}];
+      const withErasedDuration = [{...good, duration: 0}];
+      const withTooLongDuration = [{...good, duration: 11}];
+      const withNaNDuration = [{...good, duration: NaN}];
+      const secondSceneBad = [good, {...good, tag: "chorus", prompt: ""}];
+      console.log(JSON.stringify({
+        allGood: app.scenarioSceneClientError([good, {...good, tag: "chorus"}]),
+        emptyPrompt: app.scenarioSceneClientError(withEmptyPrompt),
+        whitespacePrompt: app.scenarioSceneClientError(withWhitespacePrompt),
+        erasedDuration: app.scenarioSceneClientError(withErasedDuration),
+        tooLongDuration: app.scenarioSceneClientError(withTooLongDuration),
+        nanDuration: app.scenarioSceneClientError(withNaNDuration),
+        secondSceneBad: app.scenarioSceneClientError(secondSceneBad),
+      }));
+    """ % json.dumps(good))
+
+    assert result["allGood"] is None, "two valid scenes must not be refused"
+
+    for key in ("emptyPrompt", "whitespacePrompt"):
+        err = result[key]
+        assert err is not None, f"{key} must be refused"
+        assert err["code"] == "args_invalid"
+        assert err["detail"] == {"index": 0}
+
+    for key in ("erasedDuration", "tooLongDuration", "nanDuration"):
+        err = result[key]
+        assert err is not None, f"{key} must be refused"
+        assert err["code"] == "scenario_invalid"
+        assert err["detail"]["reason"] == "duration_out_of_range"
+        assert err["detail"]["index"] == 0
+
+    second = result["secondSceneBad"]
+    assert second is not None and second["detail"]["index"] == 1, (
+        "the first (valid) scene must not be flagged -- only the actually broken second one: "
+        f"{second}")
 
 
 @_needs_node

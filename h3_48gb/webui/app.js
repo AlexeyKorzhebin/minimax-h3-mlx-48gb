@@ -1205,9 +1205,44 @@ export function errorText(payload) {
     // формы» — например `mode`, которого не знает генератор. Про второе «командная строка не
     // годится» — неправда, а страница обязана называть вещи своими именами.
     case "args_invalid":
-      return detail.stderr
-        ? { title: "Командная строка не годится", pre: detail.stderr }
-        : { title: "Запрос не той формы", pre: error.message };
+      if (detail.stderr) return { title: "Командная строка не годится", pre: detail.stderr };
+      // Находка 2 (волна ux-фиксов 2026-08-24): редактор сюжета шлёт `args_invalid` с одним
+      // только `index` в `detail` (`_typed_scenario_scene`, web.py) -- ни у одного другого
+      // вызывающего этот код `detail` так не выглядит: у создания проекта из сессии чата
+      // (`web.py`'s own `session project.scenes[i]...`) `index` всегда идёт вместе с `type`, а у
+      // командной строки задачи -- со `stderr`, разобранным веткой выше. Из ЭТОГО редактора
+      // `tag`/`start`/`end` не редактируются (только читаются с диска, см. `collectScenarioScenes`),
+      // а `duration` та же функция всегда шлёт числом (пустое поле -- это `0`, не `NaN`) -- заново
+      // проверить на сервере может только пустой промпт.
+      if (typeof detail.index === "number" && !("type" in detail)) {
+        return { title: `Сцена ${detail.index + 1}: промпт нельзя оставить пустым`,
+                 pre: error.message };
+      }
+      return { title: "Запрос не той формы", pre: error.message };
+    // Находка 2: `_validate_scenario_scenes` (web.py) — правила покрытия и длины сцены, те же
+    // для `/scenario/generate` и для каждого `PUT /scenario`. `detail.reason` — свой на каждое
+    // правило, `detail.index` есть у всех, кроме «сюжет совсем пуст».
+    case "scenario_invalid": {
+      const idx = typeof detail.index === "number" ? detail.index + 1 : null;
+      const prefix = idx ? `Сцена ${idx}: ` : "";
+      const reasons = {
+        empty: "В сюжете нет ни одной сцены — добавьте хотя бы одну.",
+        end_before_start: "Конец сцены раньше её начала.",
+        does_not_start_at_zero: "Сцены должны начинаться с самого начала трека (0 c), а не с "
+          + "середины.",
+        gap_or_overlap: "Между этой и соседней сценой разрыв или наложение — по времени сцены "
+          + "должны идти впритык, без пропусков.",
+        does_not_end_at_track_duration: "Сцены должны закрывать трек до самого конца, а сейчас "
+          + "в конце остаётся кусок без сцены.",
+        section_too_short: `Участок трека под эту сцену короче, чем может быть сцена (минимум `
+          + `${detail.min ?? 5}с).`,
+        duration_out_of_range: `Длительность вне допустимого диапазона (от ${detail.min ?? 5} `
+          + `до ${detail.max ?? 10}с).`,
+      };
+      return { title: prefix + (reasons[detail.reason] || "Не проходит проверку сервера — "
+                                                          + "подробности ниже."),
+               pre: error.message };
+    }
     case "command_not_allowed":
       return { title: "Через очередь ставится только `generate` с чекпойнтом",
                pre: error.message };
@@ -1295,6 +1330,36 @@ export function errorText(payload) {
       return { title: error.code ? `Отказ: ${error.code}` : "Запрос не прошёл",
                pre: error.message || null };
   }
+}
+
+/** Находка 2 (волна ux-фиксов 2026-08-24), «стоит ли заодно валидировать клиентом»: да, но
+ *  только два правила из `web._validate_scenario_scenes`/`_typed_scenario_scene`, потому что
+ *  только эти два редактор вообще может нарушить руками — `tag`/`start`/`end` в нём не поля, а
+ *  подписи (`projectScenarioSceneHtml`'s own comment), `collectScenarioScenes` шлёт их с диска
+ *  нетронутыми. Покрытие/наезды между сценами тут проверять нечем: границы у сцен и так общие
+ *  (одна кончается там, где начинается следующая) и правкой не расходятся. Возвращает `null`
+ *  (можно слать) или объект в форме `error.detail`/`error.code`, которую уже понимает
+ *  `errorText` выше — тот же текст, что показал бы сервер, но без похода на него и обратно:
+ *  дырка ловится тривиально («стереть длительность и увести фокус»), незачем ждать 400.
+ *  `5`/`10` дублируют `web.SCENE_MIN_SECONDS`/`SCENE_MAX_SECONDS` — то же дублирование, что
+ *  уже есть в `min="5" max="10"` у самого поля (`projectScenarioSceneHtml`). */
+export function scenarioSceneClientError(scenes) {
+  for (let i = 0; i < scenes.length; i++) {
+    const scene = scenes[i];
+    if (!String(scene.prompt == null ? "" : scene.prompt).trim()) {
+      return { code: "args_invalid", detail: { index: i },
+               message: `entry ${i}: \`prompt\` must be a non-empty string` };
+    }
+    const dur = Number(scene.duration);
+    if (!Number.isFinite(dur) || dur < 5 || dur > 10) {
+      return { code: "scenario_invalid",
+               detail: { index: i, reason: "duration_out_of_range", duration: dur,
+                        min: 5, max: 10 },
+               message: `section ${i}: \`duration\` must be between 5 and 10, got `
+                      + `${scene.duration}` };
+    }
+  }
+  return null;
 }
 
 /* ===========================================================================
@@ -2420,7 +2485,7 @@ function startPage() {
     const outdir = state && state.outdir;
     $("project-body").innerHTML = projectScriptStageHtml(proj)
       + projectTrackStageHtml(proj, project.active_job, outdir)
-      + projectScenarioStageHtml(proj)
+      + projectScenarioStageHtml(proj, projectBusy)
       + projectScenesStageHtml(proj, outdir)
       + projectAssemblyStageHtml(proj, outdir);
   }
@@ -2568,7 +2633,7 @@ function startPage() {
    *  Пустая роспись (`providers.json` не настроен вовсе) — не место для этой строки: «Сгенерировать
    *  сюжет» и без выбора провайдера честно ответит `provider_unavailable` через уже показанный
    *  `showProjectError`, а рисовать пустой `<select>` тут нечего. */
-  function projectScenarioProviderPickHtml(proj) {
+  function projectScenarioProviderPickHtml(proj, busy) {
     const rows = scenarioProviders || [];
     if (!rows.length) return "";
     const options = rows.map((row) =>
@@ -2577,10 +2642,12 @@ function startPage() {
       + `${escapeHtml(row.name)}`
       + (row.available ? "" : ` · ${escapeHtml(row.reason || "недоступен")}`)
       + `</option>`).join("");
+    const disabledAttr = busy ? " disabled" : "";
     return `<select class="pick scenario-provider" id="scenario-provider" `
-      + `data-id="${escapeHtml(proj.id)}" aria-label="провайдер сценария">${options}</select>`
+      + `data-id="${escapeHtml(proj.id)}" aria-label="провайдер сценария"${disabledAttr}>`
+      + `${options}</select>`
       + `<button class="ghost" type="button" data-act="scenario-test-provider" `
-      + `data-id="${escapeHtml(proj.id)}">Проверить</button>`;
+      + `data-id="${escapeHtml(proj.id)}"${disabledAttr}>Проверить</button>`;
   }
 
   /** Честный результат последней пробы («Проверить») — `null`, пока пробы не было. Три исхода,
@@ -2597,27 +2664,42 @@ function startPage() {
       + `${escapeHtml(t.name)}: ${escapeHtml(t.detail || (t.ok ? "доступен" : "недоступен"))}</p>`;
   }
 
-  function projectScenarioStageHtml(proj) {
+  /** `busy` -- `projectBusy` на момент отрисовки (Task 7, находка 1 волны ux-фиксов
+   *  2026-08-24): пока идёт любой запрос, меняющий проект, кнопки этого этапа — единственные на
+   *  всю панель, за которые реально можно заплатить дважды (внешний провайдер думает 2-7 минут,
+   *  и `gpu_busy` в `web.py` защищает только локальную модель, см. отчёт волны) — дизейблятся, а
+   *  `.proj-scenario-busy-note` вместо `hidden` показывает, что запрос идёт. Этот путь рендера
+   *  (через `renderProjectModal`) вызывается только там, где это уже безопасно -- при открытии
+   *  панели и в `finally` `withProject` -- НЕ синхронно из-под `focusout`: полная пересборка
+   *  `#project-body` там снесла бы узел кнопки, за которую браузер вот-вот дошлёт `click` (см.
+   *  `pendingScenarioSave`'s own docstring про гонку блюра/клика), и клик пропал бы молча. Для
+   *  немедленной реакции на сам клик служит `setScenarioBusyUi` — она правит уже отрисованные
+   *  узлы напрямую, а не через этот рендер. */
+  function projectScenarioStageHtml(proj, busy) {
     if (proj.kind !== "clip" || proj.stages.track !== "approved") return "";
     const status = proj.stages.scenario;
     const statusWord = { draft: "не начат", awaiting_approval: "ждёт утверждения",
                          approved: "утверждён" }[status] || status;
     const scenes = proj.scenario_scenes || [];
     const editable = status !== "approved";
+    const disabledAttr = busy ? " disabled" : "";
     const gate = status === "awaiting_approval"
       ? `<button class="inverse" type="button" data-act="approve-scenario" `
-        + `data-id="${escapeHtml(proj.id)}">Утвердить сюжет</button>` : "";
+        + `data-id="${escapeHtml(proj.id)}"${disabledAttr}>Утвердить сюжет</button>` : "";
     const genRow = editable
       ? `<div class="proj-scenario-gen">`
-        + projectScenarioProviderPickHtml(proj)
+        + projectScenarioProviderPickHtml(proj, busy)
         + `<button class="ghost" type="button" data-act="scenario-generate" `
-        + `data-id="${escapeHtml(proj.id)}">Сгенерировать сюжет</button>`
+        + `data-id="${escapeHtml(proj.id)}"${disabledAttr}>Сгенерировать сюжет</button>`
         + `<button class="ghost" type="button" data-act="scenario-procedural" `
-        + `data-id="${escapeHtml(proj.id)}">Сюжет без LLM</button>`
+        + `data-id="${escapeHtml(proj.id)}"${disabledAttr}>Сюжет без LLM</button>`
         + (scenes.length ? `<button class="ghost" type="button" data-act="scenario-save" `
-            + `data-id="${escapeHtml(proj.id)}">Сохранить</button>` : "")
+            + `data-id="${escapeHtml(proj.id)}"${disabledAttr}>Сохранить</button>` : "")
         + `</div>`
         + projectScenarioProviderTestNoteHtml()
+        + `<p class="proj-stage-note busy" aria-live="polite"${busy ? "" : " hidden"}>Идёт запрос `
+        + `к серверу — внешняя модель может думать пару минут, локальная вдобавок ещё и `
+        + `поднимается. Кнопки вернутся, как только он закончится.</p>`
         + `<p class="proj-stage-note">Генерация может поднять модель — как в диалоге; если `
         + `сейчас идёт прогон, кнопка честно откажет и ничего не тронет.</p>` : "";
     const list = scenes.length
@@ -2666,9 +2748,23 @@ function startPage() {
 
   /** Возвращает (и держит в `pendingScenarioSave`) свой собственный промис -- три сценарных
    *  обработчика клика ниже ждут именно его первым делом, см. `pendingScenarioSave`'s own
-   *  docstring above для того, какую гонку это закрывает. */
+   *  docstring above для того, какую гонку это закрывает.
+   *
+   *  Находка 2 (волна ux-фиксов 2026-08-24): `scenarioSceneClientError` ловит то же самое, что
+   *  сервер бы отказал 400-м, но до сети -- отказ виден мгновенно, а не после круга на сервер и
+   *  обратно за тем же самым текстом. Ничего не уходит на диск -- `PUT` просто не отправляется,
+   *  `pendingScenarioSave` остаётся тем, чем был (ждать нечего, новой записи не случилось). */
   function saveScenario(id) {
     const scenes = collectScenarioScenes();
+    const clientError = scenarioSceneClientError(scenes);
+    if (clientError) {
+      // `withProject`'s собственный `finally` тут не пробежит (запрос не уходит) -- а именно он
+      // обычно снимает дизейбл, поставленный кликом «Сохранить» (`setScenarioBusyUi(true)`
+      // перед этим вызовом) -- снимаем сами, иначе кнопки зависнут заблокированными.
+      setScenarioBusyUi(false);
+      showProjectError({ error: clientError });
+      return pendingScenarioSave || Promise.resolve();
+    }
     pendingScenarioSave = withProject(() => api(
       "PUT", `/api/projects/${encodeURIComponent(id)}/scenario`, { scenario_scenes: scenes }));
     return pendingScenarioSave;
@@ -2730,6 +2826,32 @@ function startPage() {
       + `<span class="proj-stage-status">${escapeHtml(statusWord)}</span>`
       + `<div class="spacer"></div>${retry}</div>`
       + `<div class="proj-stage-body">${link}</div></div>`;
+  }
+
+  /** Немедленная реакция на клик по одной из кнопок этапа «Сюжет» (находка 1, волна ux-фиксов
+   *  2026-08-24) — правит УЖЕ ОТРИСОВАННЫЕ узлы `#project-body` напрямую (`.disabled =`/`.hidden
+   *  =`), а не через `renderProjectModal()`: тот пересобирает узел целиком (`innerHTML =`), и
+   *  вызванный синхронно из-под `focusout` снёс бы кнопку, за которой браузер вот-вот доставит
+   *  свой собственный `click` (см. `pendingScenarioSave`'s own docstring — то самое «блюр ушёл в
+   *  PUT, клик уже бьёт свой запрос»), и клик пропал бы молча, не вызвав вообще ничего. Отсюда
+   *  вызывается только из обработчиков клика, ПОСЛЕ того как их собственный `click` уже доставлен
+   *  — на этот узел она поэтому влиять не может, только на соседние (генерация/утверждение —
+   *  один общий `projectBusy`, значит и одна общая блокировка на всех). Выключать обратно не
+   *  нужно: `withProject`'s `finally` всё равно перечитывает и перерисовывает панель целиком
+   *  (`refreshProjectDetail`) с уже честным `projectBusy === false`. */
+  function setScenarioBusyUi(busy) {
+    // `document.querySelectorAll` c префиксом `#project-body`, не `$("project-body")`'s own --
+    // тот же приём, что `collectScenarioScenes` уже использует для `.scenario-prompt`/
+    // `.scenario-duration` чуть выше, а не второй свой.
+    document.querySelectorAll('#project-body [data-act="scenario-generate"], '
+      + '#project-body [data-act="scenario-procedural"], '
+      + '#project-body [data-act="scenario-save"], '
+      + '#project-body [data-act="scenario-test-provider"], '
+      + '#project-body [data-act="approve-scenario"], '
+      + '#project-body #scenario-provider')
+      .forEach((el) => { el.disabled = busy; });
+    const note = document.querySelector("#project-body .proj-stage-note.busy");
+    if (note) note.hidden = !busy;
   }
 
   /** Тот же принцип, что `withQueue`: флаг занятости, отказ красной плашкой, и в любом исходе —
@@ -4129,6 +4251,10 @@ function startPage() {
       // ключ в той ветке просто не читает (`web._generate_project_scenario`'s own docstring),
       // так что отправлять его туда бессмысленно, а не только безвредно.
       const providerName = procedural ? "" : scenarioProviderChoice;
+      // Находка 1 (волна ux-фиксов 2026-08-24): клик уже доставлен -- дизейблить кнопки этапа
+      // сейчас безопасно (см. `setScenarioBusyUi`'s own docstring про то, почему это не через
+      // `renderProjectModal()`).
+      setScenarioBusyUi(true);
       // I2 (фикс-раунд 2, ревью 2026-08-19): дождаться блюра, который мог уйти на PUT долей
       // секунды раньше этого клика (см. `pendingScenarioSave`'s own docstring), прежде чем бить
       // свой собственный запрос -- иначе оба запроса летят гонкой и один тихо теряет правку.
@@ -4149,17 +4275,23 @@ function startPage() {
       const name = select ? select.value : "";
       if (!name) return;
       scenarioProviderChoice = name;
+      setScenarioBusyUi(true);
       withProject(async () => {
         const result = await api("POST", `/api/providers/${encodeURIComponent(name)}/test`, {});
         scenarioProviderTest = { name, ...result };
       });
       return;
     }
-    if (button.dataset.act === "scenario-save") { saveScenario(id); return; }
+    if (button.dataset.act === "scenario-save") {
+      setScenarioBusyUi(true);
+      saveScenario(id);
+      return;
+    }
     if (button.dataset.act === "approve-scenario") {
       if (!window.confirm(
         "Утвердить сюжет? Дальше начнётся генерация сцен — сюжет больше нельзя будет "
         + "поправить.")) return;
+      setScenarioBusyUi(true);
       // I2 (фикс-раунд 2, ревью 2026-08-19): то же ожидание, что у `scenario-generate` выше --
       // это как раз тот клик, что заводит блюр-плюс-approve гонку живого гейта.
       withProject(async () => {

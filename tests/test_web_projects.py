@@ -2161,6 +2161,69 @@ def test_approving_the_scenario_right_after_a_blurred_edit_does_not_lose_it(_ser
         f"{[s['prompt'] for s in final['scenes']]!r}")
 
 
+# == Находка 1 (волна ux-фиксов 2026-08-24): the scenario buttons must not fire twice =============
+
+
+_SCENARIO_BUSY_SCRIPT = Path(__file__).resolve().parent / "_scenario_busy_check.mjs"
+
+
+def _run_scenario_busy_check(base_url: str, pid: str, timeout=30) -> dict:
+    """Runs `_scenario_busy_check.mjs` (see its own module docstring) against a real, already
+    running server -- drives the *real* `app.js` through two clicks on "Сюжет без LLM" fired back
+    to back, and reports whether the second click's own listener ran at all and how many `POST
+    .../scenario/generate` requests actually went out.
+    """
+    result = subprocess.run(
+        [_NODE, str(_SCENARIO_BUSY_SCRIPT), _APP_JS_URL, base_url, pid],
+        capture_output=True, text=True, timeout=timeout)
+    assert result.returncode == 0, (
+        f"_scenario_busy_check.mjs failed:\nstdout: {result.stdout}\nstderr: {result.stderr}")
+    return json.loads(result.stdout)
+
+
+@_needs_node_for_scenario_race
+def test_a_fast_double_click_on_a_scenario_button_sends_only_one_request(_serve, monkeypatch):
+    """Находка 1 (волна ux-фиксов 2026-08-24, `ux-syuzhet-report.md`): before this fix, `projectBusy`
+    was set but never read by any button's own `disabled` state -- a second click on "Сгенерировать
+    сюжет"/"Сюжет без LLM"/"Утвердить сюжет" while the first request was still in flight (an
+    external LLM provider can take 2-7 minutes; nothing on the page said anything was happening at
+    all) sent a second, independent request, and whichever one's response landed second silently
+    overwrote the first's scenario with no 409 and no banner.
+
+    `app.js`'s own fix is `setScenarioBusyUi` -- called synchronously, from inside each scenario
+    button's own click handler, the instant that handler runs (so it can never suppress the very
+    click that triggered it, only a later one -- see its own docstring for why this is not done
+    through `renderProjectModal()`'s `innerHTML` rebuild instead). This test proves the guard
+    actually stops the second request from ever being sent, not merely that the *first* one
+    behaves -- `_scenario_busy_check.mjs` fires two clicks with no `await` between them (the exact
+    gesture a fast real double-click produces) and models the one piece of real browser behaviour
+    that makes the guard work at all: a disabled form control never receives a `click` event.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=12.0)
+
+    base_url = f"http://{web.LOOPBACK}:{srv.port}"
+    result = _run_scenario_busy_check(base_url, pid)
+
+    assert result["firstDelivered"] is True, (
+        "the first click must reach app.js's own click listener -- nothing was disabled yet")
+    assert result["disabledRightAfterFirstClick"] is True, (
+        "setScenarioBusyUi must disable the scenario buttons synchronously, before the first "
+        f"click's own request is even sent -- got {result}")
+    assert result["secondDelivered"] is False, (
+        "the second click must never reach app.js's click listener at all -- the button is "
+        f"already disabled by the time it fires -- got {result}")
+    assert result["generateCallCount"] == 1, (
+        "exactly one POST /scenario/generate must have been sent -- a second one would mean the "
+        f"double-click guard let a duplicate (potentially paid) request through -- got {result}")
+
+    final = srv._request("GET", f"/api/projects/{pid}")[1]["project"]
+    assert final["stages"]["scenario"] == "awaiting_approval"
+    assert len(final["scenario_scenes"]) >= 1, (
+        "the one request that *did* go out must still have actually written a scenario -- got "
+        f"{final}")
+
+
 # == Retry: track (task 7's own small addition to the server, "Пересчитать трек") ================
 
 
