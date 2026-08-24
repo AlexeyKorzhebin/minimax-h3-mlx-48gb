@@ -2900,6 +2900,15 @@ class _Handler(BaseHTTPRequestHandler):
             return self._queue_start()
         if path.startswith("/api/chat/") and path.endswith("/message"):
             return self._chat_message(path[len("/api/chat/"):-len("/message")])
+        if path.startswith("/api/providers/"):
+            # Task 2 ("выбор провайдера для сценария"): `/api/providers/<name>/test`, the cheap
+            # probe the "Сюжет" panel's own button hits before a long scenario turn -- told apart
+            # by the path's own shape (2 segments, second is "test"), the same convention the
+            # `/api/projects/<id>/...` routes below already use rather than a `startswith`/
+            # `endswith` chain.
+            parts = path[len("/api/providers/"):].split("/")
+            if len(parts) == 2 and parts[1] == "test":
+                return self._test_provider(parts[0])
         if path == "/api/uploads":
             return self._upload_frame()
         if path == "/api/projects":
@@ -4003,7 +4012,16 @@ class _Handler(BaseHTTPRequestHandler):
                 f"проект {raw_id}: сценарий уже утверждён (сейчас {current!r})",
                 {"id": raw_id, "stage": "scenario", "status": current})
 
-        payload = self._json_request(allowed=("procedural",))
+        # Task 2 ("выбор провайдера для сценария"): `provider` rides this route the same way it
+        # already rides the chat route's own turn (`_locked_turn`, `web.py:4948`) -- accepted
+        # here and simply never read in the `procedural` branch below, since `{"procedural":
+        # true}` never touches a model at all and a provider named beside it would be answering a
+        # question nobody asked. Ignored, not refused: refusing would make `{"procedural": true,
+        # "provider": "x"}` a caller mistake, and it is not one -- the page's own provider
+        # <select> stays visible (and its choice sticks in memory) whether or not the human's
+        # next click is "Сгенерировать сюжет" or "Сюжет без LLM", so the field is very often
+        # present on both.
+        payload = self._json_request(allowed=("procedural", "provider"))
         raw_procedural = payload.get("procedural")
         if raw_procedural is not None and not isinstance(raw_procedural, bool):
             raise CliError("args_invalid", "`procedural` must be a boolean",
@@ -4030,7 +4048,25 @@ class _Handler(BaseHTTPRequestHandler):
                     "scenario_no_lyrics",
                     f"проект {raw_id}: нет ни лирики, ни авто-транскрипта — писать сценарий не "
                     f"из чего", {"id": raw_id})
-            name, cfg = self._active_provider()
+            # Task 2: the same "provider in the body, or the roster's active one" the chat route
+            # already does (`_locked_turn`, `web.py:4948`) -- copied rather than shared, for the
+            # same reason `_generate_project_scenario`'s own docstring already gives for the rest
+            # of this route's provider mechanics ("copied and not factored out because
+            # `_locked_turn` also carries a chat session's whole lock"). One thing this route
+            # checks that the chat route does not: a *named* provider that is not in the roster
+            # at all is `args_invalid` here, not `provider_unavailable` -- the chat route's own
+            # `<select>` can only ever send a name `/api/providers` just listed, but this route's
+            # caller is a raw HTTP client as far as the server is concerned, and a typo in the
+            # body is the caller's mistake, not "the provider forgot its token" (`available is
+            # False`, the *known*-but-unusable case `provider_unavailable` still answers below).
+            roster = provider.load_providers(self.server.outdir)
+            name = self._string_of(payload, "provider") or roster["active"]
+            if name is not None and name not in roster["providers"]:
+                raise CliError(
+                    "args_invalid",
+                    f"проект {raw_id}: неизвестный провайдер {name!r}",
+                    {"provider": name, "known": sorted(roster["providers"])})
+            cfg = roster["providers"].get(name) or {}
             if not cfg or not cfg.get("available"):
                 return 409, "application/json", _error_bytes(
                     "provider_unavailable",
@@ -4503,6 +4539,44 @@ class _Handler(BaseHTTPRequestHandler):
                    "reason": cfg.get("reason")} for name, cfg in roster["providers"].items()]
         return 200, "application/json", _json_bytes(
             {"ok": True, "active": roster["active"], "providers": listed})
+
+    def _test_provider(self, name: str) -> tuple[int, str, bytes]:
+        """`POST /api/providers/<name>/test`: the cheap probe (Task 2, "выбор провайдера для
+        сценария") the "Сюжет" panel's own «Проверить» button hits before spending a scenario
+        turn on a provider that was never going to answer -- the idea ai-writer 2.0's `POST
+        /providers/{id}/test` already proves out, scaled down to the one thing this project needs
+        (see `provider.test_provider`'s own docstring for the "no heavy capability job" line).
+
+        **Always 200**, unlike every other route on this server: this is a diagnostic, not an
+        action, and a provider that is merely unreachable right now is not this *request's*
+        failure -- the wire shape is `{"ok", "reachable", "detail", "provider"}` (`ok`/`reachable`/
+        `detail` straight from `provider.test_provider`, `provider` added here so the panel can
+        tell two in-flight probes apart without keeping its own bookkeeping). The one exception
+        that *does* raise is a name the roster does not know at all (`args_invalid`, before any
+        network call) -- a typo in the path, the caller's mistake, the same distinction `/scenario/
+        generate`'s own provider lookup just drew for the identical reason.
+
+        **`available is False` (no token) never reaches `provider.test_provider`, let alone the
+        network** -- `load_providers` already computed the honest reason (`"нет токена X"`), and
+        repeating that request only to time out or answer 401 would cost seconds to tell a person
+        something the roster already knew for free.
+
+        **No secret reaches this response under any branch**: `provider.test_provider` never
+        returns the token (`_chat_turn`'s own discipline: it goes out in a header, never back in
+        a value), and this method never reads `.env` into the response itself either.
+        """
+        self._json_request(allowed=())
+        roster = provider.load_providers(self.server.outdir)
+        cfg = roster["providers"].get(name)
+        if cfg is None:
+            raise CliError("args_invalid", f"нет провайдера {name}",
+                           {"provider": name, "known": sorted(roster["providers"])})
+        if cfg.get("type") == "openai" and not cfg.get("available"):
+            return 200, "application/json", _json_bytes(
+                {"ok": False, "reachable": False,
+                 "detail": cfg.get("reason") or "провайдер недоступен", "provider": name})
+        result = provider.test_provider(cfg, provider.load_env(self.server.outdir))
+        return 200, "application/json", _json_bytes({**result, "provider": name})
 
     def _active_provider(self) -> tuple[str | None, dict]:
         """`(name, cfg)` of the active provider -- `(None, {})` when there is no roster at all.

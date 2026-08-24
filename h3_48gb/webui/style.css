@@ -1388,6 +1388,10 @@ details.adv > summary .hint {
 .proj-stage-note {
   margin: 8px 0 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.5; white-space: pre-wrap;
 }
+/* Task 2: результат «Проверить провайдера» -- те же два чернила, что `.hint.bad`/`.est-said`
+   уже используют для отказа/успеха в этой же панели, никаких новых токенов. */
+.proj-stage-note.ok  { color: var(--done-ink); font-weight: 500; }
+.proj-stage-note.bad { color: var(--fail-ink); font-weight: 500; }
 .proj-lyrics {
   margin: 8px 0 0; padding: 9px 10px; border-radius: var(--r-xs);
   background: var(--bg); border: 1px solid var(--hairline);
@@ -1405,6 +1409,10 @@ audio.proj-audio { width: 100%; margin-top: 8px; display: block; }
    карточки, не `.scene-grid`: там кадр и превью, здесь текст промпта и два коротких поля,
    одна колонка читается быстрее, чем сетка из четырёх узких. */
 .proj-scenario-gen { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* Task 2 ("выбор провайдера для сценария"): тот же приём, что у `.mhead .prov` для селектора
+   провайдера чата -- гибкая ширина с потолком, а не `.pick`'s собственный статичный max-width,
+   чтобы на 360px строка переносилась, а не сжимала выпадашку до нечитаемой полоски. */
+.proj-scenario-gen select.scenario-provider { flex: 1 1 160px; max-width: 220px; min-width: 0; }
 .scenario-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
 .scenario-scene {
   border: 1px solid var(--hairline); border-radius: var(--r-inner);

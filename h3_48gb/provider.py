@@ -410,3 +410,77 @@ def chat_scenario(cfg: dict, env: dict, messages: list[dict]) -> dict:
     return _chat_turn(cfg, env, messages, SCENARIO_SCHEMA,
                       "Ответ строго одним JSON-объектом по схеме "
                       "{reply: string, scenario: object|null}. Без другого текста.")
+
+
+def test_provider(cfg: dict, env: dict, timeout: float = 5.0) -> dict:
+    """A cheap connectivity probe for one provider entry -- Task 2 ("выбор провайдера для
+    сценария"), the idea taken from ai-writer 2.0's `ProviderService.test_connection` (`GET
+    {base_url}/models`) but scaled to what this module actually needs: no detected-capabilities
+    job, just "does this provider answer at all", asked *before* a scenario turn, not after it
+    times out.
+
+    Returns `{"ok": bool, "reachable": bool, "detail": str, ...}` -- never raises, so a route can
+    hand the dict straight back as the response body without its own try/except. `ok` is this
+    module's verdict on whether the provider is currently *usable*; `reachable` is a narrower
+    "did a socket answer", kept separate because `llama-local` down is `ok=True` (an ordinary
+    state -- `ensure_up` will raise it at generation time) while `reachable=False` for it, and an
+    `openai` provider that answers with the wrong shape is `reachable=True` but `ok=False`.
+
+    `type: "openai"` -- `GET {base_url}/v1/models`, the same bearer header `_chat_turn` sends,
+    `timeout` seconds (a handful, not `_chat_turn`'s own 600s: a probe is worth nothing if it can
+    itself hang for a minute). **Not `{base_url}/models`** -- `_base_url` already strips `/v1`,
+    the same way `_chat_turn` adds `/v1/chat/completions` itself; `/models` alone 404s on every
+    real provider. Success returns however many model ids the response named (`models`, capped at
+    20 so a provider with hundreds does not bloat the response); failure -- no token, no answer,
+    or a 200 that is not a models list -- is a plain, honest `detail`, never the raw exception
+    (which can carry a URL with a query string) and never the token itself, which never leaves
+    this function to begin with -- it goes out in a header, not a returned value.
+
+    `type: "llama-local"` -- `port_alive` only, no request built or sent. A port that is not up
+    is not a failure this function reports as one (`ok=True`): the model raises on its own
+    schedule (`ensure_up`, at generation time), and a probe screaming red for a state that is
+    completely ordinary would train a person to ignore the red the one time it means something.
+    """
+    if cfg.get("type") == "llama-local":
+        alive = port_alive(cfg.get("port", 0))
+        return {
+            "ok": True,
+            "reachable": alive,
+            "detail": ("llama-server отвечает" if alive
+                      else "порт не поднят — поднимется при генерации"),
+        }
+
+    headers = {}
+    key_env = cfg.get("api_key_env")
+    if key_env:
+        headers["Authorization"] = f"Bearer {env.get(key_env, '')}"
+
+    req = urllib.request.Request(_base_url(cfg) + "/v1/models", headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+    except (urllib.error.URLError, OSError) as err:
+        # Same care `_chat_turn`'s own `chat_unreachable` takes: the raw exception (and any
+        # header it might echo back) never reaches the caller, only a plain sentence.
+        return {"ok": False, "reachable": False, "detail": f"провайдер недоступен: {err}"}
+
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {"ok": False, "reachable": True,
+               "detail": "провайдер ответил, но не JSON"}
+
+    models = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return {"ok": False, "reachable": True,
+               "detail": f"провайдер ответил 200, но не списком моделей: "
+                        f"{json.dumps(payload, ensure_ascii=False)[:200]}"}
+    names = [m.get("id") for m in models if isinstance(m, dict) and m.get("id")]
+    count = len(models)
+    return {
+        "ok": True,
+        "reachable": True,
+        "detail": f"{count} {'модель' if count == 1 else 'моделей'}"
+                 + (f": {', '.join(names[:20])}" if names else ""),
+        "models": names[:20],
+    }

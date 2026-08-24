@@ -2077,6 +2077,22 @@ function startPage() {
   // -- проекты (Task 7) --------------------------------------------------------------------
   let project = null;          // {id, project: {...as_dict()}, active_job} панели, или null
   let projectBusy = false;     // идёт запрос, меняющий проект — та же роль, что `busy` у очереди
+  /** Роспись `/api/providers`, для селектора провайдера в этапе «Сюжет» (Task 2, "выбор
+   *  провайдера для сценария") — своя копия, не `chat.providers`: панель проектов открывается
+   *  без модалки чата, поэтому `chat` в этот момент может быть `null` (см. `loadProviders`'s
+   *  own `if (chat) chat.providers = rows`, тот же приём, что и здесь). */
+  let scenarioProviders = null;
+  /** Имя провайдера, выбранное в селекторе этапа «Сюжет» — переживает перерисовку панели
+   *  (`renderProjectModal` перестраивает `<select>` заново на каждый `refreshProjectDetail`,
+   *  ровно как `.scenario-prompt`/`.scenario-duration` ниже переживают её через `project.
+   *  project.scenario_scenes`), но никогда не пишется в `providers.json` — выбор на один запуск,
+   *  как и у чата (`provider.py:236-239`). `null` значит «ещё не трогали», и тогда селектор
+   *  показывает роспись `active`, не пустую строку. */
+  let scenarioProviderChoice = null;
+  /** `{name, ok, reachable, detail}` последней пробы «Проверить провайдера», или `null` —
+   *  сбрасывается при открытии другого проекта и при смене выбора в селекторе, чтобы результат
+   *  пробы одного провайдера не выглядел ответом про другой. */
+  let scenarioProviderTest = null;
   /** Промис последнего `saveScenario` (или `null`, если ни один ещё не запускался) -- I2, фикс-
    *  раунд 2 (ревью 2026-08-19): «Утвердить сюжет»/«Сгенерировать сюжет» бьются кликом сразу после
    *  блюра поля (см. делегированный `focusout` ниже), и блюр, и клик уходят в `withProject` не
@@ -2323,13 +2339,36 @@ function startPage() {
   async function openProjectModal(id) {
     project = { id, project: null, active_job: null };
     projectMp3 = null;
+    scenarioProviderChoice = null;
+    scenarioProviderTest = null;
     $("project-modal").hidden = false;
     $("project-title").textContent = id;
     $("project-kind-badge").textContent = "";
     $("project-estimate").textContent = "";
     $("project-body").innerHTML = '<p class="empty pad">Загрузка…</p>';
     clearProjectError();
+    // Роспись провайдеров грузится до первой отрисовки тела, а не параллельно с ней: этап
+    // «Сюжет» строит свой `<select>` из `scenarioProviders`, и панель, отрисованная раньше её
+    // прихода, показала бы пустой селектор до следующего клика — тот же порядок, что `loadProviders`
+    // уже держит для чата (роспись готова раньше, чем её первый раз рисуют).
+    await loadScenarioProviders();
     await refreshProjectDetail();
+  }
+
+  /** Роспись `/api/providers` для этапа «Сюжет» — своя копия `loadProviders`'s чатовой (`app.js`,
+   *  выше): тот же `GET`, тот же контракт `{active, providers}`, отдельная переменная, потому что
+   *  панель проектов и модалка чата открываются независимо друг от друга. Молчаливый пустой список
+   *  на отказ — панель уже умеет показывать «Сюжет ещё не написан»/«Провайдеров нет» через
+   *  `projectScenarioStageHtml` без специального сообщения об ошибке росписи, а второй способ
+   *  сказать «роспись не прочиталась» здесь только продублировал бы `showProjectError`. */
+  async function loadScenarioProviders() {
+    try {
+      const roster = await api("GET", "/api/providers");
+      scenarioProviders = roster.providers || [];
+      if (scenarioProviderChoice === null) scenarioProviderChoice = roster.active || "";
+    } catch {
+      scenarioProviders = [];
+    }
   }
 
   /** Перечитывает панель уже открытого проекта — после каждого действия (`withProject`) и на
@@ -2510,6 +2549,43 @@ function startPage() {
    *  список остаётся видимым, но `editable=false` убирает и поля ввода, и кнопки — сюжет
    *  зафиксирован, сцены строятся из него (`approve/scenario`), редактировать больше нечего.
    */
+  /** Селектор провайдера + кнопка «Проверить» для этапа «Сюжет» (Task 2, "выбор провайдера для
+   *  сценария") — тот же приём, что `loadProviders`'s `$("chat-provider")` наполняет для чата
+   *  (недоступный провайдер остаётся в списке серым, со своей причиной), только рисуется здесь
+   *  строкой разметки, а не через `.innerHTML` статичного элемента: этот `<select>` живёт внутри
+   *  `#project-body`, который `renderProjectModal` целиком перестраивает при каждой правке.
+   *  Пустая роспись (`providers.json` не настроен вовсе) — не место для этой строки: «Сгенерировать
+   *  сюжет» и без выбора провайдера честно ответит `provider_unavailable` через уже показанный
+   *  `showProjectError`, а рисовать пустой `<select>` тут нечего. */
+  function projectScenarioProviderPickHtml(proj) {
+    const rows = scenarioProviders || [];
+    if (!rows.length) return "";
+    const options = rows.map((row) =>
+      `<option value="${escapeHtml(row.name)}"${row.available ? "" : " disabled"}`
+      + `${row.name === scenarioProviderChoice ? " selected" : ""}>`
+      + `${escapeHtml(row.name)}`
+      + (row.available ? "" : ` · ${escapeHtml(row.reason || "недоступен")}`)
+      + `</option>`).join("");
+    return `<select class="pick scenario-provider" id="scenario-provider" `
+      + `data-id="${escapeHtml(proj.id)}" aria-label="провайдер сценария">${options}</select>`
+      + `<button class="ghost" type="button" data-act="scenario-test-provider" `
+      + `data-id="${escapeHtml(proj.id)}">Проверить</button>`;
+  }
+
+  /** Честный результат последней пробы («Проверить») — `null`, пока пробы не было. Три исхода,
+   *  не два: `ok=false` — красным (`bad`, провайдер правда недоступен); `ok=true` и `reachable`
+   *  — зелёным (`ok`, ответил прямо сейчас); `ok=true` без `reachable` — это ветка `POST
+   *  /api/providers/<name>/test` для неподнятого `llama-local` (`web._test_provider`'s own
+   *  docstring: "не выдаётся за ошибку") -- ни один из двух цветов не подходит, обычные чернила
+   *  заметки, как у «Сюжет ещё не написан» выше. */
+  function projectScenarioProviderTestNoteHtml() {
+    if (!scenarioProviderTest) return "";
+    const t = scenarioProviderTest;
+    const tone = !t.ok ? "bad" : (t.reachable ? "ok" : "");
+    return `<p class="proj-stage-note ${tone}">`
+      + `${escapeHtml(t.name)}: ${escapeHtml(t.detail || (t.ok ? "доступен" : "недоступен"))}</p>`;
+  }
+
   function projectScenarioStageHtml(proj) {
     if (proj.kind !== "clip" || proj.stages.track !== "approved") return "";
     const status = proj.stages.scenario;
@@ -2522,6 +2598,7 @@ function startPage() {
         + `data-id="${escapeHtml(proj.id)}">Утвердить сюжет</button>` : "";
     const genRow = editable
       ? `<div class="proj-scenario-gen">`
+        + projectScenarioProviderPickHtml(proj)
         + `<button class="ghost" type="button" data-act="scenario-generate" `
         + `data-id="${escapeHtml(proj.id)}">Сгенерировать сюжет</button>`
         + `<button class="ghost" type="button" data-act="scenario-procedural" `
@@ -2529,6 +2606,7 @@ function startPage() {
         + (scenes.length ? `<button class="ghost" type="button" data-act="scenario-save" `
             + `data-id="${escapeHtml(proj.id)}">Сохранить</button>` : "")
         + `</div>`
+        + projectScenarioProviderTestNoteHtml()
         + `<p class="proj-stage-note">Генерация может поднять модель — как в диалоге; если `
         + `сейчас идёт прогон, кнопка честно откажет и ничего не тронет.</p>` : "";
     const list = scenes.length
@@ -4035,13 +4113,34 @@ function startPage() {
       if (already && !window.confirm(
         "Перегенерировать сюжет? Написанные сцены будут заменены.")) return;
       const procedural = button.dataset.act === "scenario-procedural";
+      // Task 2 ("выбор провайдера для сценария"): выбранный в `#scenario-provider` провайдер
+      // едет только с LLM-путём -- `{"procedural": true}` не зовёт модель вовсе, и сервер этот
+      // ключ в той ветке просто не читает (`web._generate_project_scenario`'s own docstring),
+      // так что отправлять его туда бессмысленно, а не только безвредно.
+      const providerName = procedural ? "" : scenarioProviderChoice;
       // I2 (фикс-раунд 2, ревью 2026-08-19): дождаться блюра, который мог уйти на PUT долей
       // секунды раньше этого клика (см. `pendingScenarioSave`'s own docstring), прежде чем бить
       // свой собственный запрос -- иначе оба запроса летят гонкой и один тихо теряет правку.
       withProject(async () => {
         if (pendingScenarioSave) await pendingScenarioSave;
         return api("POST", `/api/projects/${encodeURIComponent(id)}/scenario/generate`,
-          procedural ? { procedural: true } : {});
+          procedural ? { procedural: true }
+                     : (providerName ? { provider: providerName } : {}));
+      });
+      return;
+    }
+    // Task 2: «Проверить» рядом с селектором провайдера -- дешёвая проба до долгого хода
+    // (`POST /api/providers/<name>/test`, всегда 200 -- см. его собственный докстринг в
+    // `web.py`), поэтому `api()` не бросает на честном "недоступен" и результат просто кладётся
+    // в `scenarioProviderTest` для следующей отрисовки.
+    if (button.dataset.act === "scenario-test-provider") {
+      const select = document.getElementById("scenario-provider");
+      const name = select ? select.value : "";
+      if (!name) return;
+      scenarioProviderChoice = name;
+      withProject(async () => {
+        const result = await api("POST", `/api/providers/${encodeURIComponent(name)}/test`, {});
+        scenarioProviderTest = { name, ...result };
       });
       return;
     }
@@ -4106,6 +4205,18 @@ function startPage() {
       ? field.value !== original.prompt
       : Number(field.value) !== original.duration;
     if (changed) saveScenario(project.id);
+  });
+
+  // Task 2: `#scenario-provider` тоже пересоздаётся при каждой перерисовке панели (тот же повод,
+  // что у `focusout` выше), поэтому и его собственный выбор ловится делегированно, не прямым
+  // `addEventListener` на элементе. Смена провайдера гасит результат прошлой пробы -- он был
+  // честным ответом про другое имя, и показывать его дальше значило бы приписывать чужой отказ
+  // (или чужой успех) только что выбранному провайдеру.
+  document.addEventListener("change", (event) => {
+    if (event.target.id !== "scenario-provider") return;
+    scenarioProviderChoice = event.target.value;
+    scenarioProviderTest = null;
+    renderProjectModal();
   });
 
   $("submit").addEventListener("click", submit);

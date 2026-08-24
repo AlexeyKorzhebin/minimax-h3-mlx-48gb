@@ -1588,6 +1588,118 @@ def test_generate_scenario_provider_unavailable(_serve, monkeypatch):
     assert (status, payload["error"]["code"]) == (409, "provider_unavailable"), payload
 
 
+# == Task 2 ("выбор провайдера для сценария"): `provider` in the body ==============================
+
+
+def _two_provider_roster(active_port, other_port):
+    """Two `openai` entries, no `api_key_env` (both `available`), on two distinct fake ports --
+    `active` is the roster's default, `other` is the one a request can ask for explicitly."""
+    return {
+        "active": {"type": "openai", "base_url": f"http://127.0.0.1:{active_port}", "model": "m"},
+        "other": {"type": "openai", "base_url": f"http://127.0.0.1:{other_port}", "model": "m"},
+    }
+
+
+def test_generate_scenario_with_an_explicit_provider_goes_to_it_not_the_active_one(_serve,
+                                                                                    monkeypatch):
+    """Checked by what actually answered, not by the HTTP status: the two fakes write two
+    different scene prompts, and only the one named in the body may be the source of the scene
+    that comes back -- the active fake must not have seen a single request."""
+    fake_active = _FakeLlama(chat_payload=_scenario_turn_payload([
+        _scenario_section("verse", 0.0, 16.0, "active must never be asked"),
+    ]))
+    fake_other = _FakeLlama(chat_payload=_scenario_turn_payload([
+        _scenario_section("verse", 0.0, 16.0, "the explicitly chosen provider wrote this"),
+    ]))
+    try:
+        srv = _serve(providers=_two_provider_roster(fake_active.port, fake_other.port),
+                     active="active")
+        pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+        generated = srv.post_json(f"/api/projects/{pid}/scenario/generate", {"provider": "other"})
+    finally:
+        fake_active.close()
+        fake_other.close()
+    assert fake_active.requests == [], "активный провайдер получил запрос, хотя выбрали другого"
+    (req,) = fake_other.requests
+    assert generated["project"]["scenario_scenes"][0]["prompt"] == (
+        "the explicitly chosen provider wrote this")
+
+
+def test_generate_scenario_without_a_provider_still_uses_the_active_one(_serve, monkeypatch):
+    """The mirror of the test above: no `provider` in the body, and the *other* fake -- present
+    in the roster but not active -- must stay untouched."""
+    fake_active = _FakeLlama(chat_payload=_scenario_turn_payload([
+        _scenario_section("verse", 0.0, 16.0, "active answered as usual"),
+    ]))
+    fake_other = _FakeLlama(chat_payload=_scenario_turn_payload([
+        _scenario_section("verse", 0.0, 16.0, "other must never be asked"),
+    ]))
+    try:
+        srv = _serve(providers=_two_provider_roster(fake_active.port, fake_other.port),
+                     active="active")
+        pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+        generated = srv.post_json(f"/api/projects/{pid}/scenario/generate", {})
+    finally:
+        fake_active.close()
+        fake_other.close()
+    assert fake_other.requests == [], "провайдер, который не выбирали, получил запрос"
+    assert generated["project"]["scenario_scenes"][0]["prompt"] == "active answered as usual"
+
+
+def test_generate_scenario_with_an_unknown_provider_name_is_refused_before_any_side_effect(
+        _serve, monkeypatch):
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch)
+    status, payload = srv.post_json_raw(
+        f"/api/projects/{pid}/scenario/generate", {"provider": "does-not-exist"})
+    assert (status, payload["error"]["code"]) == (400, "args_invalid"), payload
+    assert payload["error"]["detail"]["provider"] == "does-not-exist"
+    detail = srv.get_json(f"/api/projects/{pid}")["project"]
+    assert detail["stages"]["scenario"] == "draft", "a rejected name must not open the gate"
+    assert detail["scenario_scenes"] == [], "a rejected name must not write any scenes"
+
+
+def test_generate_scenario_with_an_explicit_but_token_less_provider_is_refused_before_the_model(
+        _serve, monkeypatch):
+    """Named explicitly, known to the roster, but `available is False` (no token) -- a 409 with
+    its own reason before any network call, and the active fake (present and reachable) must not
+    have been asked either: the human picked a *specific* unusable provider, not "whatever is
+    active"."""
+    fake_active = _FakeLlama(chat_payload=_scenario_turn_payload([
+        _scenario_section("verse", 0.0, 16.0, "must not be asked"),
+    ]))
+    try:
+        providers = {
+            "active": {"type": "openai", "base_url": f"http://127.0.0.1:{fake_active.port}",
+                      "model": "m"},
+            "needs-token": {"type": "openai", "base_url": "http://127.0.0.1:1", "model": "m",
+                           "api_key_env": "OPENROUTER_API_KEY"},
+        }
+        srv = _serve(providers=providers, active="active")
+        pid = _clip_project_with_approved_track(srv, monkeypatch)
+        status, payload = srv.post_json_raw(
+            f"/api/projects/{pid}/scenario/generate", {"provider": "needs-token"})
+    finally:
+        fake_active.close()
+    assert (status, payload["error"]["code"]) == (409, "provider_unavailable"), payload
+    assert "OPENROUTER_API_KEY" in payload["error"]["message"]
+    assert fake_active.requests == [], "неверно выбранный провайдер не должен трогать активного"
+
+
+def test_generate_scenario_ignores_a_provider_named_alongside_procedural(_serve, monkeypatch):
+    """`{"procedural": true, "provider": "..."}`: no model is ever called in the procedural
+    branch, so the name is accepted (not `args_invalid`) and simply never used -- proven here by
+    naming a provider the roster does not even contain, which would be `args_invalid` on the LLM
+    path (see the test above) but must succeed here."""
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch)
+    status, payload = srv.post_json_raw(
+        f"/api/projects/{pid}/scenario/generate",
+        {"procedural": True, "provider": "does-not-exist-either"})
+    assert status == 200, payload
+    assert payload["project"]["stages"]["scenario"] == "awaiting_approval"
+
+
 def test_generate_scenario_with_no_provider_listening_answers_chat_unreachable(_serve,
                                                                                 monkeypatch):
     """An external (`type: "openai"`) provider on a closed port -- not a `llama-local` one, whose
@@ -2408,3 +2520,118 @@ def test_duplicating_a_project_scenes_job_is_refused(_serve):
 
     status, answer = srv.post_json_raw(f"/api/jobs/{job_id}/duplicate", {})
     assert (status, answer["error"]["code"]) == (409, "project_scene_locked"), answer
+
+
+# == Task 2 ("выбор провайдера для сценария"): `POST /api/providers/<name>/test` ===================
+#
+# The cheap probe, before the scenario route's own long turn -- `GET {base_url}/v1/models` for
+# `openai`, `port_alive` for `llama-local`. `_FakeLlama`'s `do_GET` had to grow a `/v1/models`
+# branch for these (`tests/_fake_llama.py`): unpatched, it 404s everything but `/health` and never
+# records a GET into `.requests` at all, so a test against the unpatched mock could not tell "the
+# route actually hit `/v1/models`" from "the route hit nothing and the mock's blanket 404 happened
+# to look like a failure branch" -- see that file's own docstring on `models_payload`.
+
+
+def test_provider_test_route_succeeds_and_names_the_exact_path_it_asked(_serve):
+    fake = _FakeLlama(models_payload={"data": [{"id": "gpt-strong"}, {"id": "gpt-fast"}]})
+    try:
+        srv = _serve(providers={"ext": {"type": "openai",
+                                        "base_url": f"http://127.0.0.1:{fake.port}",
+                                        "model": "m"}},
+                     active="ext")
+        status, payload = srv.post_json_raw("/api/providers/ext/test", {})
+    finally:
+        fake.close()
+    assert status == 200, payload
+    assert payload["ok"] is True
+    assert payload["reachable"] is True
+    assert payload["models"] == ["gpt-strong", "gpt-fast"]
+    (req,) = fake.requests
+    assert req["path"] == "/v1/models", (
+        "проба обязана ходить именно на /v1/models -- _base_url() уже без /v1, "
+        "путь /models даст 404 на любом реальном провайдере")
+
+
+def test_provider_test_route_reports_a_missing_token_without_any_network_call(_serve):
+    fake = _FakeLlama(models_payload={"data": [{"id": "should-never-be-seen"}]})
+    try:
+        srv = _serve(providers={"ext": {"type": "openai",
+                                        "base_url": f"http://127.0.0.1:{fake.port}",
+                                        "model": "m", "api_key_env": "OPENROUTER_API_KEY"}},
+                     active="ext")  # no .env -> the token is missing
+        status, payload = srv.post_json_raw("/api/providers/ext/test", {})
+    finally:
+        fake.close()
+    assert status == 200, payload
+    assert payload["ok"] is False
+    assert "OPENROUTER_API_KEY" in payload["detail"]
+    assert fake.requests == [], "нет токена -- пробовать сеть незачем и не следовало"
+
+
+def test_provider_test_route_reports_an_unreachable_provider_honestly(_serve):
+    srv = _serve(providers={"ext": {"type": "openai", "base_url": "http://127.0.0.1:1",
+                                    "model": "m"}},
+                 active="ext")  # port 1: nobody is listening
+    status, payload = srv.post_json_raw("/api/providers/ext/test", {})
+    assert status == 200, payload
+    assert payload["ok"] is False
+    assert payload["reachable"] is False
+    assert "недоступен" in payload["detail"]
+
+
+def test_provider_test_route_reports_a_response_that_is_not_a_models_list(_serve):
+    """`ok=False` here -- but `reachable=True`, not the same failure as no answer at all: the
+    provider is up, it just did not answer with what a models probe expects."""
+    fake = _FakeLlama(models_payload={"error": "not a models list"})
+    try:
+        srv = _serve(providers={"ext": {"type": "openai",
+                                        "base_url": f"http://127.0.0.1:{fake.port}",
+                                        "model": "m"}},
+                     active="ext")
+        status, payload = srv.post_json_raw("/api/providers/ext/test", {})
+    finally:
+        fake.close()
+    assert status == 200, payload
+    assert payload["ok"] is False
+    assert payload["reachable"] is True
+
+
+def test_provider_test_route_for_a_local_port_that_is_not_up_is_not_shown_as_an_error(_serve):
+    """A `llama-local` provider whose port nobody answers on is an ordinary state (the model
+    raises itself, on `ensure_up`, at generation time) -- `ok` must stay `True`."""
+    srv = _serve(providers={"local": {"type": "llama-local", "port": 1}}, active="local")
+    status, payload = srv.post_json_raw("/api/providers/local/test", {})
+    assert status == 200, payload
+    assert payload["ok"] is True, "неподнятый порт локальной модели -- не отказ пробы"
+    assert payload["reachable"] is False
+
+
+def test_provider_test_route_for_a_local_port_that_is_up(_serve):
+    fake = _FakeLlama()  # /health answers 200 by default
+    try:
+        srv = _serve(providers={"local": {"type": "llama-local", "port": fake.port}},
+                     active="local")
+        status, payload = srv.post_json_raw("/api/providers/local/test", {})
+    finally:
+        fake.close()
+    assert status == 200, payload
+    assert payload["ok"] is True
+    assert payload["reachable"] is True
+
+
+def test_provider_test_route_never_leaks_the_token(_serve):
+    fake = _FakeLlama(models_payload={"data": [{"id": "m1"}]})
+    try:
+        srv = _serve(providers={"ext": {"type": "openai",
+                                        "base_url": f"http://127.0.0.1:{fake.port}",
+                                        "model": "m", "api_key_env": "OPENROUTER_API_KEY"}},
+                     active="ext", env="OPENROUTER_API_KEY=sk-very-secret\n")
+        status, payload = srv.post_json_raw("/api/providers/ext/test", {})
+        assert status == 200, payload
+        assert "sk-very-secret" not in json.dumps(payload, ensure_ascii=False)
+        (req,) = fake.requests
+        assert req["headers"].get("Authorization") == "Bearer sk-very-secret", (
+            "провайдер обязан получить токен -- проверяется, что он ушёл наружу правильно, "
+            "а не то, что заголовок пуст")
+    finally:
+        fake.close()
