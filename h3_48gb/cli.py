@@ -498,7 +498,9 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
                      help="apply a Turbo LoRA at run time (pairs with a few-step --steps); "
                           "defaults to the battle recipe's LoRA")
     sub.add_argument("--turbo-strength", type=float, default=1.0,
-                     help="LoRA strength (default 1.0; lower it toward 0.8 if the image over-sharpens)")
+                     help="LoRA strength (default 1.0 for a single supervised run; RESULTS.md's "
+                          "own 'Few-step sampling' calibration for the 4-bit base is 0.45 -- 1.0 "
+                          "measures 213%% motion and visibly over-sharpens, 0.45 lands at 117%%)")
     sub.add_argument("--preview-decoder", choices=("vae", "tae", "latent"), default="tae",
                      help="decoder for in-flight previews (default: tae, ~400x faster than vae)")
     sub.add_argument("--json", action="store_true", help="emit a machine-readable report")

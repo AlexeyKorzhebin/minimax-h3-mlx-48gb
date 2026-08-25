@@ -859,6 +859,15 @@ def test_system_prompt_carries_the_clip_scenario_section():
     its audio in post, so lip-sync cannot exist), the visual bible copied verbatim into every
     scene, audio negatives staying out of the video prompt, and imagery drawn from a section's
     meaning rather than its exact, possibly misheard, words.
+
+    P0 fix (keyframe-chain defect, 2026-08-25): also anchors "Breaking the chain on a cast
+    change" -- `docs/h3-prompt-system.md`'s own section is the ONLY mechanism that ever teaches
+    the model to write `scene.fresh_start` at all (`provider.SCENARIO_SCHEMA` merely permits the
+    key, it does not explain when to set it -- see that schema's own comment). Deleting the
+    section leaves every other test in this suite green (the schema, `web.py`'s plumbing, and
+    `assemble.py`'s consumer all work fine against a scenario that happens to never set the
+    flag), so nothing else in the whole test run would ever catch that regression -- only this
+    anchor list does.
     """
     text = provider.system_prompt()
     for anchor in (
@@ -874,6 +883,10 @@ def test_system_prompt_carries_the_clip_scenario_section():
             "verbatim, word for word",
             "Audio negatives",
             "meaning, not from restaging",
+            "Breaking the chain on a cast change",
+            "scene.fresh_start: true",
+            "with no reference frame",
+            "Leave it false (or omit it)",
     ):
         assert anchor in text, anchor
 

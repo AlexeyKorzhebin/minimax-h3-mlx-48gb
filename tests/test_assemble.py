@@ -838,6 +838,46 @@ def test_advance_project_missing_fresh_start_key_behaves_exactly_like_before_thi
     assert "--image" in args, "an old scene dict with no `fresh_start` key must still chain"
 
 
+def test_advance_project_chain_heals_after_a_fresh_start_scene(tmp_path):
+    """M2 (review round 2, 2026-08-26): the task brief's own named shape -- scene 0 normal, scene
+    1 flagged `fresh_start` (already rendered, t2v, no keyframe of its own), scene 2 back to
+    normal. `fresh_start` only ever breaks the link INTO the scene that carries it -- scene 2 must
+    still chain an i2v keyframe extracted from scene 1's own clip (not scene 0's, and not skipped
+    the way scene 1's own submission was), proving the chain heals on the very next scene rather
+    than staying broken for the rest of the project. Scene 1 is already `done` here (its own
+    submission is proven by the other fresh_start tests above) -- only scene 2's own submission
+    (`advance_project`'s next step) is exercised.
+    """
+    clip0 = tmp_path / "scene0.mp4"
+    clip0.write_bytes(b"fake mp4 0")
+    clip1 = tmp_path / "scene1.mp4"
+    clip1.write_bytes(b"fake mp4 1")
+    proj = _make_project(tmp_path, "video", scenes=[
+        _make_scene(0, status="done", clip_path=str(clip0)),
+        _make_scene(1, status="done", clip_path=str(clip1), fresh_start=True),
+        _make_scene(2, status="pending", fresh_start=False),
+    ])
+    submit = _RecordingSubmit()
+    fake_run = _FakeRun(ffprobe_durations=[7.0])  # scene 1's clip duration -> keyframe at 5.5s
+
+    result = assemble.advance_project(proj, tmp_path / "queue", tmp_path / "out", submit=submit,
+                                       run=fake_run)
+
+    assert result["action"] == "submitted_scene"
+    assert result["idx"] == 2
+    args = submit.calls[0]["args"]
+    assert "--image" in args
+    keyframe_path = args[args.index("--image") + 1]
+    assert Path(keyframe_path).name == "keyframe-001.png", (
+        "the keyframe must be named after scene 1 (the scene it was pulled FROM), not scene 0 -- "
+        f"got {keyframe_path}")
+    prompt_arg = args[1]
+    assert "is fully referenced" in prompt_arg, (
+        "scene 2 (fresh_start=False) must still get the i2v instruction line")
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.scenes[2]["keyframe_path"] == keyframe_path
+
+
 def test_advance_project_keyframe_timestamp_floors_at_zero_for_a_short_clip(tmp_path):
     clip = tmp_path / "scene0.mp4"
     clip.write_bytes(b"fake mp4")

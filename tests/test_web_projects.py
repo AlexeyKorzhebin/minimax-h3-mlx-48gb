@@ -444,6 +444,63 @@ def test_build_clip_scenes_from_scenario_split_keeps_fresh_start_only_on_the_fir
     assert scenes[2]["fresh_start"] is False
 
 
+def test_build_clip_scenes_from_scenario_fresh_start_survives_the_min_length_fold():
+    """M1 (review round 2, 2026-08-26): a section between `SCENE_MIN_SECONDS -
+    _COVERAGE_TOLERANCE_SECONDS` (4.95s) and `SCENE_MIN_SECONDS` (5.0s) clears `_validate_
+    scenario_scenes`'s own refusal (it only rejects strictly under 4.95s) but is still short
+    enough for `build_clip_scenes`'s own unconditional final `_fold_short_segments(...,
+    SCENE_MIN_SECONDS)` pass to fold it into its neighbour -- see `_validate_scenario_scenes`'s
+    own docstring for the honest account of that band. A section's own PROMPT is expected to be
+    lost there (the fold keeps the survivor's own fields, same as any other fold) -- but its
+    `fresh_start` must not be, or a cast change flagged on a section this short would silently
+    resurrect the exact keyframe-chain defect this field exists to close.
+
+    Three sections: 0 (survives untouched), 1 (survives, absorbs section 2), 2 (4.97s, `fresh_
+    start: true`, folds backward into section 1). Section 2's own PROMPT must be gone (folded
+    away); its `fresh_start` must have landed on the built scene section 1 folded into.
+    """
+    scenario_scenes = [
+        _scenario_scene("zero", 0.0, 5.0, "prompt zero"),
+        _scenario_scene("one", 5.0, 10.0, "prompt one"),
+        _scenario_scene("two", 10.0, 14.97, "prompt two", duration=4.97, fresh_start=True),
+    ]
+    scenes = web.build_clip_scenes(_scenario_track(14.97), scenario_scenes=scenario_scenes)
+
+    assert len(scenes) == 2, (
+        "section two must have folded into section one, not survived as its own scene -- "
+        f"got {len(scenes)} scenes")
+    assert scenes[0]["fresh_start"] is False
+    assert scenes[1]["fresh_start"] is True, (
+        "section two's own fresh_start must survive the fold onto the scene it merged into")
+    assert "prompt one" in scenes[1]["prompt"]
+    assert "prompt two" not in scenes[1]["prompt"], (
+        "the absorbed section's own prompt is expected to be lost -- only fresh_start must "
+        "survive the fold, not the whole section")
+
+
+def test_build_clip_scenes_from_scenario_fresh_start_survives_a_forward_carried_fold():
+    """The other half of M1's fix: `_fold_short_segments`'s own forward-carry branch (a short,
+    eligible segment folds INTO the next one when there is no earlier survivor to merge backward
+    into yet -- the very first section(s) of a scenario). `carry_fresh_start` has to accumulate
+    across that branch the same way `carry_start` already accumulates position, or a cast-change
+    flag on a short opening section would be lost exactly like the backward-merge case this
+    module's other test already covers. Not `idx`-realistic for `assemble.py`'s own `idx > 0`
+    gate (the merged scene lands at idx 0 here) -- this test is about `_fold_short_segments`'s own
+    mechanism in isolation, not about which scene index ends up carrying it.
+    """
+    scenario_scenes = [
+        _scenario_scene("short", 0.0, 4.97, "prompt short", duration=4.97, fresh_start=True),
+        _scenario_scene("long", 4.97, 10.0, "prompt long"),
+    ]
+    scenes = web.build_clip_scenes(_scenario_track(10.0), scenario_scenes=scenario_scenes)
+
+    assert len(scenes) == 1, f"the short opening section must have folded forward -- got {scenes}"
+    assert scenes[0]["fresh_start"] is True, (
+        "the short section's own fresh_start must survive the forward-carry fold")
+    assert "prompt long" in scenes[0]["prompt"]
+    assert "prompt short" not in scenes[0]["prompt"]
+
+
 def test_build_clip_scenes_procedural_path_never_sets_fresh_start():
     """The procedural path (`scenario_scenes=None`) has no concept of `fresh_start` at all -- every
     scene it builds must read `False`, the same as before this field existed anywhere in the
@@ -2515,16 +2572,19 @@ def test_editing_a_scenes_tail_reconstructs_the_full_prompt_without_losing_or_du
 _SCENARIO_FRESH_START_SCRIPT = Path(__file__).resolve().parent / "_scenario_fresh_start_check.mjs"
 
 
-def _run_scenario_fresh_start_check(base_url: str, pid: str, toggle_idx: int,
-                                     timeout=30) -> dict:
+def _run_scenario_fresh_start_check(base_url: str, pid: str, toggle_idx: int, *,
+                                     expect_no_put: bool = False, timeout=30) -> dict:
     """Runs `_scenario_fresh_start_check.mjs` (see its own module docstring) against a real,
     already-running server -- drives the *real* `app.js` through checking one scene's own
     `.scenario-fresh-start` box and reports exactly what `collectScenarioScenes` sent in the `PUT`
-    body, plus the server's own final state.
+    body, plus the server's own final state. `expect_no_put=True` (M6) drives a `toggle_idx` the
+    script's own `change` listener must refuse -- the script then reports only `{"putSent": bool}`
+    instead of waiting for a `PUT` that must never arrive.
     """
-    result = subprocess.run(
-        [_NODE, str(_SCENARIO_FRESH_START_SCRIPT), _APP_JS_URL, base_url, pid, str(toggle_idx)],
-        capture_output=True, text=True, timeout=timeout)
+    args = [_NODE, str(_SCENARIO_FRESH_START_SCRIPT), _APP_JS_URL, base_url, pid, str(toggle_idx)]
+    if expect_no_put:
+        args.append("1")
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     assert result.returncode == 0, (
         f"_scenario_fresh_start_check.mjs failed:\nstdout: {result.stdout}\nstderr: {result.stderr}")
     return json.loads(result.stdout)
@@ -2570,6 +2630,41 @@ def test_checking_the_fresh_start_box_saves_it_through_put_and_leaves_other_scen
     final = result["finalProject"]
     assert final["scenario_scenes"][1]["fresh_start"] is True
     assert final["scenario_scenes"][0]["fresh_start"] is False
+
+    # M3 (review round 2, 2026-08-26): scene 0's own checkbox must not even be rendered -- the
+    # flag does nothing on scene 0 (`assemble._submit_next_scene`'s own `idx > 0` gate).
+    rendered = result["renderedHtml"]
+    assert 'class="scenario-fresh-start" data-idx="1"' in rendered, rendered
+    assert 'class="scenario-fresh-start" data-idx="0"' not in rendered, rendered
+
+
+@_needs_node_for_scenario_race
+def test_checking_a_stale_fresh_start_box_does_not_put(_serve, monkeypatch):
+    """M6 (review round 2, 2026-08-26): the `focusout` listener for `.scenario-prompt`/
+    `.scenario-duration` already refuses to save a field whose own `data-idx` no longer names a
+    real scene (`(project.project.scenario_scenes || [])[idx]` missing -- a panel render that is
+    stale by the time the event fires, e.g. a scenario just regenerated with fewer scenes). The
+    `change` listener for `.scenario-fresh-start` needs the identical guard -- this drives it with
+    `toggle_idx=5` against a two-scene project (indices 0-1 only) and proves no `PUT` is ever sent
+    for it.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    status, put_first = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "a quiet room",
+             "duration": 6.0},
+            {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "the same room, later",
+             "duration": 7.0},
+        ],
+    })
+    assert status == 200, put_first
+
+    base_url = f"http://{web.LOOPBACK}:{srv.port}"
+    result = _run_scenario_fresh_start_check(base_url, pid, 5, expect_no_put=True)
+
+    assert result["putSent"] is False, (
+        "a change event on a `data-idx` outside the current scenario_scenes must not PUT at all")
 
 
 # == Retry: track (task 7's own small addition to the server, "Пересчитать трек") ================

@@ -16,8 +16,12 @@
 // (Node 18+) against a real, already-running `h3_48gb.web` server, logging every request's URL
 // and body.
 
-const [, , appUrl, baseUrl, pid, toggleIdxArg] = process.argv;
+const [, , appUrl, baseUrl, pid, toggleIdxArg, expectNoPutArg] = process.argv;
 const toggleIdx = Number(toggleIdxArg);
+// M6 (review round 2, 2026-08-26): pass "1" as a 5th arg to drive a `data-idx` this test expects
+// the `change` listener to refuse (its own staleness guard) -- the script then does NOT wait for
+// a PUT that should never come, it waits a fixed window and reports whether one arrived anyway.
+const expectNoPut = expectNoPutArg === "1";
 
 function fail(message) {
   process.stderr.write(`${message}\n`);
@@ -25,7 +29,8 @@ function fail(message) {
 }
 
 if (!appUrl || !baseUrl || !pid || !toggleIdxArg || !Number.isFinite(toggleIdx)) {
-  fail("usage: node _scenario_fresh_start_check.mjs <appUrl> <baseUrl> <pid> <toggleIdx>");
+  fail("usage: node _scenario_fresh_start_check.mjs <appUrl> <baseUrl> <pid> <toggleIdx> "
+     + "[expectNoPut: 0|1]");
 }
 
 // -- a generic, self-mocking DOM node -- identical to `_scenario_prefix_check.mjs`'s own -----------
@@ -159,6 +164,13 @@ async function main() {
     8000, "GET /api/projects/<id> from openProjectModal");
   await sleep(30);
 
+  // M3 (review round 2, 2026-08-26): scene 0's own `.scenario-fresh-start` checkbox must be
+  // hidden entirely -- the flag does nothing on scene 0 (`assemble._submit_next_scene`'s own
+  // `idx > 0` gate). `$("project-body").innerHTML = ...` (`app.js`'s own `renderProjectModal`)
+  // writes straight into this test's stub element's `store.innerHTML` (`makeStub`'s own setter),
+  // so the real, actually-rendered markup can be inspected here without a real DOM/parser.
+  const renderedHtml = getElementById("project-body").innerHTML;
+
   // "check" the toggled scene's own checkbox -- ONLY this one field exists in the DOM, matching
   // exactly what a real render would show for a card the user just clicked.
   const checkbox = {
@@ -176,6 +188,17 @@ async function main() {
 
   (listeners.change || []).forEach((fn) => fn({ target: checkbox }));
 
+  if (expectNoPut) {
+    // No `waitFor` on a PUT that must never arrive -- a fixed window instead, long enough that a
+    // real (buggy) PUT would already have landed (every other PUT in this whole file's own tests
+    // resolves in well under a second against a local server).
+    await sleep(1000);
+    const putSent = callLog.some((c) => c.method === "PUT"
+      && c.url === `/api/projects/${pid}/scenario`);
+    process.stdout.write(JSON.stringify({ putSent }));
+    process.exit(0);
+  }
+
   await waitFor(
     () => callLog.some((c) => c.method === "PUT" && c.url === `/api/projects/${pid}/scenario`
       && c.done),
@@ -190,6 +213,7 @@ async function main() {
     putStatus: put.status,
     putBody: JSON.parse(put.body),
     finalProject: finalJson.project,
+    renderedHtml,
   }));
   process.exit(0);
 }

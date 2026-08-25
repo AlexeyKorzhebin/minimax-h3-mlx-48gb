@@ -982,20 +982,45 @@ def _fold_short_segments(segments: list[dict], min_seconds: float, *,
     `[segments[0]["start"], segments[-1]["end"])` still belongs to exactly one segment afterwards,
     only the boundaries move -- a short segment's own identity (prompt, `sung`) is what is lost,
     which is the point of "merge" rather than "keep, only shorter".
+
+    **M1 (review round 2, 2026-08-26): `fresh_start` survives a fold by OR, not by falling out
+    with the rest of an absorbed segment's identity.** `build_clip_scenes`'s own unconditional
+    final pass (`_fold_short_segments(segments, SCENE_MIN_SECONDS)`, no `eligible` filter) can
+    absorb a `scenario_scenes=` section that carries `fresh_start: true` -- `_validate_scenario_
+    scenes` only refuses a section shorter than `SCENE_MIN_SECONDS - _COVERAGE_TOLERANCE_SECONDS`
+    (4.95s), so a 4.95-5.0s section clears that gate and still reaches this fold (see
+    `_validate_scenario_scenes`'s own docstring for the honest account of that band). A cast
+    change flagged on a section is a fact about the timeline the human/model actually meant, not
+    an artifact of which side of a fold it happened to land on -- losing `fresh_start` there would
+    silently resurrect the exact P0 defect (kefyrame chain dragging a departed character through)
+    this field exists to close, on a section too short to trigger the refusal that would otherwise
+    have caught it. `carry_fresh_start` accumulates every absorbed segment's own flag across an
+    entire forward-carried run (mirroring `carry_start`'s own accumulation of position), and the
+    backward-merge branch ORs directly into `result[-1]` on every merge -- so a survivor's own
+    `fresh_start` is `True` if it, or *any* segment folded into it from either direction, carried
+    one. Written unconditionally (`bool(seg.get("fresh_start")) or ...`), so a procedural-path
+    segment (no such key at all) always folds to an explicit `False`, never `None`/absent --
+    consistent with `_scenario_segments`'s own `.get("fresh_start", False)` default.
     """
     result: list[dict] = []
     carry_start = None
+    carry_fresh_start = False
     for seg in segments:
         start = seg["start"] if carry_start is None else carry_start
         carry_start = None
         length = seg["end"] - start
         if eligible(seg) and length < min_seconds:
             if result:
-                result[-1] = {**result[-1], "end": seg["end"]}
+                result[-1] = {**result[-1], "end": seg["end"],
+                              "fresh_start": bool(result[-1].get("fresh_start"))
+                                             or bool(seg.get("fresh_start"))}
             else:
                 carry_start = start
+                carry_fresh_start = carry_fresh_start or bool(seg.get("fresh_start"))
             continue
-        result.append({**seg, "start": start})
+        result.append({**seg, "start": start,
+                       "fresh_start": bool(seg.get("fresh_start")) or carry_fresh_start})
+        carry_fresh_start = False
     if carry_start is not None:
         # Every segment was short and eligible -- the whole timeline collapses into whatever is
         # left of it. M1 (fix round 1, 2026-08-19 review): `result` is *provably* still empty here,
@@ -1005,7 +1030,8 @@ def _fold_short_segments(segments: list[dict], min_seconds: float, *,
         # segment merges backward into `result[-1]` instead, never setting `carry_start` again). A
         # dead `if result: ...` branch used to sit here for the case that can never happen;
         # removed rather than covered, since there is no input that reaches it to cover.
-        result.append({**segments[-1], "start": carry_start})
+        result.append({**segments[-1], "start": carry_start,
+                       "fresh_start": bool(segments[-1].get("fresh_start")) or carry_fresh_start})
     return result
 
 
@@ -1445,8 +1471,26 @@ def _validate_scenario_scenes(scenes: list[dict], duration: float) -> None:
     prompt -- fine for a procedural section (nobody wrote it by hand), not fine for a human- or
     LLM-authored one, whose prompt disappearing without so much as a refusal is exactly the failure
     mode a human gate exists to prevent. Refusing here, before either `/scenario/generate` or `PUT
-    /scenario` ever writes the scene to disk, is what keeps that fold from ever actually running
-    against an authored scenario in practice.
+    /scenario` ever writes the scene to disk, is what keeps that fold from running against an
+    authored scenario **in the common case** -- not in every case.
+
+    **M1 (review round 2, 2026-08-26): a section between `SCENE_MIN_SECONDS -
+    _COVERAGE_TOLERANCE_SECONDS` (4.95s) and `SCENE_MIN_SECONDS` (5.0s) clears this refusal and
+    still gets folded.** The check just below is `span < SCENE_MIN_SECONDS -
+    _COVERAGE_TOLERANCE_SECONDS`, deliberately tolerant so a section landing a few milliseconds
+    under 5.0s from float arithmetic elsewhere is not refused for a rounding artifact -- but
+    `build_clip_scenes`'s own final `_fold_short_segments(segments, SCENE_MIN_SECONDS)` pass has
+    no such tolerance (`length < min_seconds`, exact), so a section of, say, 4.97s passes this
+    gate honestly and is *still* silently folded into its neighbour there, its own prompt
+    discarded exactly like a procedural section's would be. This band is accepted, not closed --
+    narrowing it would mean either refusing a section this check currently, correctly, tolerates
+    (a real regression for the rounding case above) or growing `_fold_short_segments`'s own
+    tolerance to match (a wider behaviour change touching the procedural path too, out of this
+    fix's scope). What the P0 fix for the keyframe-chain defect *does* close in this band:
+    `_fold_short_segments` now carries `fresh_start` through a fold by OR rather than dropping it
+    with the rest of the absorbed section's identity (see that function's own docstring) -- a
+    scenario author's prompt can still be silently lost in this 0.05s-wide gap, but the actual
+    cast-change signal this task exists for cannot.
 
     Raises `CliError("scenario_invalid", ...)`, `detail` naming the offending section's own index
     and exactly what is wrong with it (`detail["reason"]`) -- the shared check both `/scenario/

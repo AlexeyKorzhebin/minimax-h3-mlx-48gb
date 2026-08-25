@@ -172,7 +172,14 @@ async function main() {
     dataset: { idx: String(editIdx) },
     value: editedTail,
     classList: { contains: (c) => c === "scenario-prompt" },
-    closest(sel) { return sel.includes("scenario-prompt") ? this : null; },
+    // Exact match, not `.includes()` -- the real listener's own selector is the exact
+    // compound string `.scenario-prompt, .scenario-duration` (`app.js`'s own `focusout`
+    // listener) -- a substring match would still "match" a mutated selector like
+    // `.scenario-prompt-typo, .scenario-duration` and silently defeat a mutation check
+    // against that listener (found live, review round 2026-08-26: `tests/
+    // _scenario_fresh_start_check.mjs`'s own first pass at this same mock did exactly
+    // that).
+    closest(sel) { return sel === ".scenario-prompt, .scenario-duration" ? this : null; },
   };
   (listeners.focusout || []).forEach((fn) => fn({ target: field }));
 

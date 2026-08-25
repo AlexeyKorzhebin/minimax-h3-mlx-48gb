@@ -2786,6 +2786,15 @@ function startPage() {
    *  text alone (no keyframe from the previous scene, a visible cut on the splice); unchecked
    *  (the default), it chains normally. */
   function projectScenarioFreshStartFieldHtml(scene, idx, editable) {
+    if (idx === 0) return "";
+    // M3 (review round 2, 2026-08-26): scene 0 has no keyframe behind it either way -- the
+    // flag only matters inside `assemble._submit_next_scene`'s own `if idx > 0 and not scene.
+    // get("fresh_start")` gate, which never even runs for scene 0. The flag is still stored and
+    // passed through for it, same as any other scene (no reason to refuse it there), but a
+    // control that does nothing on this one card would only teach a human clicking through
+    // 16-38 cards that the toggle is unreliable. Hidden outright here, in both modes, rather
+    // than shown disabled: a disabled control still invites "why is this greyed out" on every
+    // single project's scene 0.
     const title = "Кейфрейм из предыдущей сцены не используется (t2v) — состав или локация "
       + "меняются, кадр предыдущей сцены протащил бы ушедших дальше (docs/h3-prompt-system.md).";
     if (editable) {
@@ -4681,6 +4690,14 @@ function startPage() {
   document.addEventListener("change", (event) => {
     const field = event.target.closest(".scenario-fresh-start");
     if (!field || !project || !project.project) return;
+    // M6 (review round 2, 2026-08-26): the same staleness guard `focusout` above already makes
+    // for `.scenario-prompt`/`.scenario-duration` -- a checkbox from a panel render that is
+    // already stale (the scene at this `data-idx` no longer exists in the freshly reloaded
+    // `project.project.scenario_scenes`, e.g. a scenario just regenerated with fewer scenes)
+    // must not fire a `PUT` for an index that is not there any more.
+    const idx = Number(field.dataset.idx);
+    const original = (project.project.scenario_scenes || [])[idx];
+    if (!original) return;
     saveScenario(project.id);
   });
 
