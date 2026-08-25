@@ -2777,6 +2777,26 @@ function startPage() {
    *  про то, откуда там взялась одинаковость). Полный промпт как строка нигде не хранится и не
    *  идёт в `value` — `collectScenarioScenes` складывает `prefix + tail` заново перед `PUT`,
    *  тем же `prefix`, вычисленным из тех же (ещё не сохранённых) исходных данных. */
+  /** `fresh_start` (P0 fix, keyframe-chain defect 2026-08-25): editable as a checkbox before
+   *  approval, changed straight on `change` (not `focusout` -- a checkbox has no meaningful blur,
+   *  see the delegated `change` listener below), read-only afterwards as a plain badge -- the
+   *  same editable/read-only split every other scenario field already gets (`web._edit_project_
+   *  scenario`'s own docstring: "PUT-правки разрешены только до утверждения"). `docs/h3-prompt-
+   *  system.md`, "Breaking the chain on a cast change" -- checked, a scenario scene renders from
+   *  text alone (no keyframe from the previous scene, a visible cut on the splice); unchecked
+   *  (the default), it chains normally. */
+  function projectScenarioFreshStartFieldHtml(scene, idx, editable) {
+    const title = "Кейфрейм из предыдущей сцены не используется (t2v) — состав или локация "
+      + "меняются, кадр предыдущей сцены протащил бы ушедших дальше (docs/h3-prompt-system.md).";
+    if (editable) {
+      return `<label class="fresh-start-toggle" title="${title}">`
+        + `<input type="checkbox" class="scenario-fresh-start" data-idx="${idx}"`
+        + `${scene.fresh_start ? " checked" : ""}>начать с чистого листа</label>`;
+    }
+    return scene.fresh_start
+      ? `<span class="fresh-start-badge" title="${title}">с чистого листа</span>` : "";
+  }
+
   function projectScenarioSceneHtml(scene, idx, editable, prefix) {
     const timing = `${formatTimestamp(scene.start)}–${formatTimestamp(scene.end)}`;
     const full = String(scene.prompt == null ? "" : scene.prompt);
@@ -2794,11 +2814,12 @@ function startPage() {
         + `data-idx="${idx}" value="${escapeHtml(String(scene.duration))}">`
         + `<span class="u">с</span></span>`
       : `<span class="scenario-duration-ro mono">${formatFine(scene.duration)}</span>`;
+    const freshStartField = projectScenarioFreshStartFieldHtml(scene, idx, editable);
     return `<div class="scenario-scene" data-idx="${idx}">`
       + `<div class="scenario-scene-head">`
       + `<span class="tag mono">${escapeHtml(scene.tag)}</span>`
       + `<span class="timing mono">${timing}</span>`
-      + `<div class="spacer"></div>${durField}`
+      + `<div class="spacer"></div>${freshStartField}${durField}`
       + `</div>${promptField}</div>`;
   }
 
@@ -2968,11 +2989,20 @@ function startPage() {
     document.querySelectorAll("#project-body .scenario-duration").forEach((el) => {
       durations[el.dataset.idx] = Number(el.value);
     });
+    // `fresh_start` (P0 fix, keyframe-chain defect 2026-08-25): same "field present in the DOM
+    // wins, otherwise fall back to the disk value" contract as `prompts`/`durations` above --
+    // `.checked` is read straight off the checkbox, no parsing to fail on the way `Number(el.
+    // value)` above can.
+    const freshStarts = {};
+    document.querySelectorAll("#project-body .scenario-fresh-start").forEach((el) => {
+      freshStarts[el.dataset.idx] = el.checked;
+    });
     return base.map((scene, idx) => ({
       tag: scene.tag, start: scene.start, end: scene.end,
       prompt: idx in prompts ? prompts[idx] : scene.prompt,
       duration: (idx in durations && Number.isFinite(durations[idx]))
         ? durations[idx] : scene.duration,
+      fresh_start: idx in freshStarts ? freshStarts[idx] : Boolean(scene.fresh_start),
     }));
   }
 
@@ -4640,6 +4670,18 @@ function startPage() {
       ? field.value !== original.prompt
       : Number(field.value) !== original.duration;
     if (changed) saveScenario(project.id);
+  });
+
+  // `fresh_start` (P0 fix, keyframe-chain defect 2026-08-25): a checkbox has no meaningful
+  // `focusout` -- clicking it fires `change` immediately with the new state already applied, so
+  // that is the save trigger here, not the blur `.scenario-prompt`/`.scenario-duration` use above.
+  // Delegated for the same reason as `focusout` above: the checkbox is rebuilt on every panel
+  // re-render. No "did it actually change" guard is needed the way the fields above have one --
+  // `change` on a checkbox only ever fires when its own `checked` state just flipped.
+  document.addEventListener("change", (event) => {
+    const field = event.target.closest(".scenario-fresh-start");
+    if (!field || !project || !project.project) return;
+    saveScenario(project.id);
   });
 
   // Task 2: `#scenario-provider` тоже пересоздаётся при каждой перерисовке панели (тот же повод,

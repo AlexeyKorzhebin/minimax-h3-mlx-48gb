@@ -1021,12 +1021,25 @@ def _split_long_segment(seg: dict) -> list[dict]:
     (`ceil`'s own definition) bounds it at `SCENE_MAX_SECONDS * length / (length + SCENE_MAX_SECONDS)`
     from below, which is already above `SCENE_MIN_SECONDS` for every `length` this is ever called
     with (`length > SCENE_MAX_SECONDS == 2 * SCENE_MIN_SECONDS`).
+
+    **`fresh_start` (P0 fix, keyframe-chain defect 2026-08-25) is true on at most the first piece.**
+    A straight `{**seg, ...}` spread would copy a scenario section's own `fresh_start: true` onto
+    *every* piece it splits into -- wrong, because all `n` pieces are the same section, sharing one
+    prompt and one composition; the cast/location change `fresh_start` exists to signal happened
+    once, at this section's own start, not again between two pieces of the section it was cut into.
+    Only `pieces[0]` keeps whatever `fresh_start` `seg` carried (`True` or absent, procedural
+    segments have no such key at all and are left untouched); every later piece is forced to
+    `False` so it still chains an i2v keyframe off the piece right before it.
     """
     length = seg["end"] - seg["start"]
     n = max(1, math.ceil(length / SCENE_MAX_SECONDS))
     per = length / n
-    return [{**seg, "start": seg["start"] + i * per, "end": seg["start"] + (i + 1) * per}
-            for i in range(n)]
+    pieces = [{**seg, "start": seg["start"] + i * per, "end": seg["start"] + (i + 1) * per}
+              for i in range(n)]
+    if pieces and pieces[0].get("fresh_start"):
+        for piece in pieces[1:]:
+            piece["fresh_start"] = False
+    return pieces
 
 
 def _clip_style_block(caption: str) -> str:
@@ -1120,6 +1133,14 @@ def _scenario_segments(scenario_scenes: list[dict], style_block: str | None) -> 
     unchanged. `tag` has no consumer in the coverage nadrezka at all -- it exists for the gate UI
     (Task 4) to label a scene by its song section, not for this module.
 
+    **`fresh_start` (P0 fix, keyframe-chain defect 2026-08-25) is carried through, unlike `tag`/
+    `duration`.** `_typed_scenario_scene` already defaults a missing one to `False`, so every
+    entry here has the key -- `_fold_short_segments`/`_split_long_segment` downstream both build
+    their own results with `{**seg, ...}`, which passes any key they do not know about (this one
+    included) straight through to `build_clip_scenes`'s own final scene dict untouched, except
+    `_split_long_segment`'s own explicit handling for the one case a straight spread would get
+    wrong -- see its docstring.
+
     Raises `ProjectSceneBuildError`, not a bare `KeyError`/`TypeError`, for an entry missing
     `start`/`end`/`prompt` or whose `start` cannot be compared -- the same discipline the procedural
     path already uses turning missing lyric lines into a clear refusal rather than a 500.
@@ -1132,7 +1153,8 @@ def _scenario_segments(scenario_scenes: list[dict], style_block: str | None) -> 
     try:
         return [{"start": float(scene["start"]), "end": float(scene["end"]),
                  "prompt": scene["prompt"] if (style_block and style_block in scene["prompt"])
-                 else f"{scene['prompt']}{style_clause}"} for scene in ordered]
+                 else f"{scene['prompt']}{style_clause}",
+                 "fresh_start": bool(scene.get("fresh_start", False))} for scene in ordered]
     except (KeyError, TypeError) as exc:
         raise ProjectSceneBuildError(f"malformed scenario scene entry: {exc}") from exc
 
@@ -1322,9 +1344,15 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None,
     scenes = []
     for i, seg in enumerate(expanded):
         snapped, carry = _snap_scene_duration(seg["end"] - seg["start"], carry)
+        # `fresh_start` (P0 fix, keyframe-chain defect 2026-08-25): present on `seg` only for the
+        # `scenario_scenes=` path (`_scenario_segments`/`_split_long_segment`, see their own
+        # docstrings) -- the procedural path's own segments never carry it, so `.get(..., False)`
+        # is what makes every procedurally-built scene read exactly as it did before this field
+        # existed. `assemble._submit_next_scene` is the actual consumer: `True` here skips
+        # extracting a keyframe from the previous scene's clip entirely.
         scenes.append({"idx": i, "prompt": seg["prompt"], "duration": snapped,
                        "status": "pending", "job_id": None, "clip_path": None,
-                       "keyframe_path": None})
+                       "keyframe_path": None, "fresh_start": seg.get("fresh_start", False)})
 
     snapped_total = sum(s["duration"] for s in scenes)
     if not (duration - _SNAPPED_COVERAGE_SHORTFALL_SECONDS - _COVERAGE_TOLERANCE_SECONDS
@@ -1343,7 +1371,9 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None,
 # `POST .../scenario/generate` (LLM or `{"procedural": true}`), `PUT .../scenario` (hand edits,
 # before approval) and `approve/scenario` (in `_approve_project_stage` below) all funnel through
 # the same on-disk shape `Project.scenario_scenes` already fixes (task 3 report): flat dicts,
-# `{"tag": str, "start": float, "end": float, "prompt": str, "duration": float}`. The functions
+# `{"tag": str, "start": float, "end": float, "prompt": str, "duration": float, "fresh_start":
+# bool}` (`fresh_start` added by the P0 fix for the keyframe-chain defect, 2026-08-25 -- see
+# `_typed_scenario_scene`'s own docstring). The functions
 # below are the shared plumbing every one of those three routes needs: turning a raw dict (from a
 # `PUT` body, or mapped out of a `chat_scenario` reply) into that exact shape with its fields typed
 # and coerced (`_typed_scenario_scene`), checking the *content* rule jsonschema cannot express --
@@ -1353,11 +1383,12 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None,
 
 
 def _typed_scenario_scene(raw, i: int) -> dict:
-    """One entry of a flat scenario-scenes list -- `{"tag", "start", "end", "prompt", "duration"}`
-    -- type-checked and coerced into `Project.scenario_scenes`'s own exact storage shape. `raw` may
-    come from a `PUT /scenario` body (a human's own hand edit) or from an already-unwrapped section
-    of a `chat_scenario` reply (`_scenario_turn_to_scenes`) -- both sources need the identical
-    checks, so this is the one place that makes them, shared rather than duplicated.
+    """One entry of a flat scenario-scenes list -- `{"tag", "start", "end", "prompt", "duration",
+    "fresh_start"}` -- type-checked and coerced into `Project.scenario_scenes`'s own exact storage
+    shape. `raw` may come from a `PUT /scenario` body (a human's own hand edit) or from an
+    already-unwrapped section of a `chat_scenario` reply (`_scenario_turn_to_scenes`) -- both
+    sources need the identical checks, so this is the one place that makes them, shared rather
+    than duplicated.
 
     Raises a bare `ValueError` naming exactly what is wrong with entry `i` -- never `KeyError`/
     `TypeError` -- so each caller can turn that into the error code that fits its own source
@@ -1365,11 +1396,25 @@ def _typed_scenario_scene(raw, i: int) -> dict:
     nobody but the model is responsible for): the same "one shared check, two different callers
     decide what it is worth" split `_json_request`'s own docstring already uses elsewhere in this
     module.
+
+    **`fresh_start` (P0 fix, keyframe-chain defect 2026-08-25): optional, defaults to `False`.**
+    `docs/h3-prompt-system.md`'s "Breaking the chain on a cast change" -- a section where the cast
+    or location changes from the one before it gets `fresh_start: true`, so `advance_project`
+    renders it from text alone instead of chaining an automatic keyframe off the previous scene's
+    own (now stale) composition. Absent entirely (an old scene written before this field existed,
+    or a model/human that simply never sets it) means exactly what an explicit `false` would --
+    `raw.get("fresh_start", False)` reads the same value either way, matching `SCENARIO_SCHEMA`'s
+    own "optional, not nullable-required" choice for this field (that schema's own comment). Any
+    *present* value that is not a bool (a string, a number, `null`) is rejected outright, the same
+    "wrong type is refused, not coerced" discipline every other field on this entry already gets --
+    a truthy string like `"false"` silently becoming `True` would flip a scene into a visual cut
+    nobody asked for.
     """
     if not isinstance(raw, dict):
         raise ValueError(f"entry {i} is not an object")
     tag, start, end = raw.get("tag"), raw.get("start"), raw.get("end")
     prompt, dur = raw.get("prompt"), raw.get("duration")
+    fresh_start = raw.get("fresh_start", False)
     if not isinstance(tag, str):
         raise ValueError(f"entry {i}: `tag` must be a string")
     if not isinstance(start, (int, float)) or isinstance(start, bool):
@@ -1380,8 +1425,10 @@ def _typed_scenario_scene(raw, i: int) -> dict:
         raise ValueError(f"entry {i}: `prompt` must be a non-empty string")
     if not isinstance(dur, (int, float)) or isinstance(dur, bool):
         raise ValueError(f"entry {i}: `duration` must be a number")
+    if not isinstance(fresh_start, bool):
+        raise ValueError(f"entry {i}: `fresh_start` must be a boolean")
     return {"tag": tag, "start": float(start), "end": float(end), "prompt": prompt,
-            "duration": float(dur)}
+            "duration": float(dur), "fresh_start": fresh_start}
 
 
 def _validate_scenario_scenes(scenes: list[dict], duration: float) -> None:
@@ -1576,6 +1623,13 @@ def _scenario_turn_to_scenes(turn) -> tuple[list[dict], str | None]:
         flat = {"tag": section.get("tag"), "start": section.get("start"),
                 "end": section.get("end"), "prompt": scene.get("prompt"),
                 "duration": scene.get("duration")}
+        # `fresh_start` (SCENARIO_SCHEMA's own "optional, not nullable-required" field) is only
+        # added to `flat` when the model actually wrote it -- `scene.get("fresh_start")` alone
+        # would turn a model that simply omitted the key into an explicit `None`, which
+        # `_typed_scenario_scene`'s own type check rejects outright instead of defaulting to
+        # `False` the way an absent key does.
+        if "fresh_start" in scene:
+            flat["fresh_start"] = scene["fresh_start"]
         try:
             scenes.append(_typed_scenario_scene(flat, i))
         except ValueError as exc:

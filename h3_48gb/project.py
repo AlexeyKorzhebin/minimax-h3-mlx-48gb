@@ -787,7 +787,8 @@ class Project:
         own route needs.
 
         **Does not validate `scenario_scenes`' own shape** (each entry's `tag`/`start`/`end`/
-        `prompt`/`duration`) -- exactly like `update_track` never validates `sections`' shape: that
+        `prompt`/`duration`/`fresh_start`) -- exactly like `update_track` never validates
+        `sections`' shape: that
         is `h3_48gb.provider.SCENARIO_SCHEMA` (the LLM response)'s job, and, for coverage
         specifically, `h3_48gb.web.build_clip_scenes`'s own `scenario_scenes=` mode (the python
         check jsonschema cannot express: "0 -> track.duration, no gaps, no overlaps") -- both

@@ -697,6 +697,48 @@ def test_scenario_schema_sections_carry_tag_start_end_and_a_scene():
     assert scene["properties"]["duration"]["type"] == "number"
 
 
+def test_scenario_schema_scene_carries_an_optional_fresh_start_boolean():
+    """P0 fix (keyframe-chain defect, 2026-08-25): `fresh_start` is declared in `scene["properties"]`
+    (so `additionalProperties: False` still permits it) but deliberately left OUT of `scene[
+    "required"]` -- unlike `PROMPT_SCHEMA`'s own nullable-but-required `prompt`/`project`, there is
+    nothing wrong with a model that never writes this key at all (`docs/h3-prompt-system.md`,
+    "Breaking the chain on a cast change": most sections continue the same cast/location and never
+    need it). `required` staying exactly `["prompt", "duration"]` is the same assertion the
+    pre-existing `test_scenario_schema_sections_carry_tag_start_end_and_a_scene` already makes --
+    repeated here so a change that quietly adds `fresh_start` to `required` fails this test even if
+    that one somehow does not.
+    """
+    scene = _scenario_fields()["sections"]["items"]["properties"]["scene"]
+    assert scene["properties"]["fresh_start"]["type"] == "boolean"
+    assert scene["required"] == ["prompt", "duration"]
+    assert "fresh_start" not in scene["required"]
+
+
+def test_scenario_schema_accepts_fresh_start_true_false_or_absent_but_rejects_a_string():
+    """jsonschema's own behaviour for a property outside `required`: absent is valid (the model
+    just didn't write it), and when present it must actually be a boolean -- a string like `"true"`
+    is not silently coerced, it is a schema violation, the same as any other wrong-typed field on
+    this entry.
+    """
+    import jsonschema
+
+    section = {"tag": "verse", "start": 0, "end": 8,
+               "scene": {"prompt": "[Shot 1] a lantern-lit nursery", "duration": 8}}
+    base = {"reply": "ok", "scenario": {"sections": [section], "style_block": "warm light"}}
+
+    for value in (True, False):
+        turn = json.loads(json.dumps(base))
+        turn["scenario"]["sections"][0]["scene"]["fresh_start"] = value
+        jsonschema.validate(turn, provider.SCENARIO_SCHEMA["schema"])  # must not raise
+
+    jsonschema.validate(base, provider.SCENARIO_SCHEMA["schema"])  # absent key: also valid
+
+    turn = json.loads(json.dumps(base))
+    turn["scenario"]["sections"][0]["scene"]["fresh_start"] = "true"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(turn, provider.SCENARIO_SCHEMA["schema"])
+
+
 def test_scenario_schema_accepts_a_well_formed_turn_and_rejects_bad_ones():
     """The brief's own three checks, all against `jsonschema` itself rather than dict inspection,
     so this would actually catch a completion a real `response_format` rejection would too (review

@@ -156,6 +156,20 @@ SCENARIO_SCHEMA = {
                                         # section's own `start`/`end` span actually runs.
                                         "duration": {"type": "number", "minimum": 5,
                                                     "maximum": 10},
+                                        # Genuinely optional, not in `required` below -- unlike
+                                        # `reply`/`prompt`/`project` above (PROMPT_SCHEMA's own
+                                        # "nullable-but-required" convention, for a field the model
+                                        # must always *answer*, even with `null`), a scene's cast
+                                        # does not change every section, and there is nothing wrong
+                                        # with a model that simply never writes this key. jsonschema
+                                        # and llama.cpp's own grammar-from-schema compiler (module
+                                        # docstring above) both treat a property absent from
+                                        # `required` as omittable while still enforcing its type
+                                        # when present -- an omitted key here means exactly what an
+                                        # explicit `false` would (`docs/h3-prompt-system.md`,
+                                        # "Breaking the chain on a cast change": "false (or omit
+                                        # it)"), so nothing downstream needs the key to exist.
+                                        "fresh_start": {"type": "boolean"},
                                     },
                                     "required": ["prompt", "duration"],
                                     "additionalProperties": False,

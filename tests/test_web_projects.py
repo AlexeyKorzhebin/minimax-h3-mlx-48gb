@@ -275,9 +275,11 @@ def _scenario_track(duration, caption="Warm pop ballad.\nSteady beat.\n"):
     return {"duration": duration, "caption": caption}
 
 
-def _scenario_scene(tag, start, end, prompt, duration=None):
-    return {"tag": tag, "start": start, "end": end, "prompt": prompt,
-            "duration": duration if duration is not None else min(10.0, max(5.0, end - start))}
+def _scenario_scene(tag, start, end, prompt, duration=None, **extra):
+    scene = {"tag": tag, "start": start, "end": end, "prompt": prompt,
+             "duration": duration if duration is not None else min(10.0, max(5.0, end - start))}
+    scene.update(extra)
+    return scene
 
 
 def test_build_clip_scenes_from_scenario_covers_the_full_track():
@@ -393,6 +395,65 @@ def test_build_clip_scenes_from_scenario_ignores_track_sections_lyrics_and_capti
     scenario_scenes = [_scenario_scene("verse", 0.0, 8.0, "prompt A")]
     scenes = web.build_clip_scenes(track, scenario_scenes=scenario_scenes)
     assert scenes[0]["prompt"] == "prompt A"
+
+
+# -- fresh_start (P0 fix, keyframe-chain defect 2026-08-25) --------------------------------------
+
+
+def test_build_clip_scenes_from_scenario_carries_fresh_start_onto_the_built_scene():
+    """`docs/h3-prompt-system.md`'s "Breaking the chain on a cast change" -- a section stamped
+    `fresh_start: true` must reach `assemble._submit_next_scene` as `scenes[i]["fresh_start"] ==
+    True`, and a section that leaves it `false` must reach it as `False`, not merely "truthy" --
+    pinned per-scene so a mutant that ORs every scene's own flag together (or always returns the
+    first section's value) is caught.
+    """
+    scenario_scenes = [
+        _scenario_scene("verse", 0.0, 8.0, "Aldred and the baby in the hall"),
+        _scenario_scene("chorus", 8.0, 16.0, "Aldred alone, the baby gone", fresh_start=True),
+    ]
+    scenes = web.build_clip_scenes(_scenario_track(16.0), scenario_scenes=scenario_scenes)
+    assert scenes[0]["fresh_start"] is False
+    assert scenes[1]["fresh_start"] is True
+
+
+def test_build_clip_scenes_from_scenario_defaults_fresh_start_to_false_when_absent():
+    """A scenario section with no `fresh_start` key at all (every scenario written before this
+    field existed, or a model turn that never mentions it) must build a scene with `fresh_start ==
+    False` -- not `None`, not a missing key `assemble._submit_next_scene`'s own `.get()` would
+    have tolerated anyway, but the exact value an explicit `false` would have produced.
+    """
+    scenario_scenes = [_scenario_scene("verse", 0.0, 8.0, "prompt A")]
+    assert "fresh_start" not in scenario_scenes[0]
+    scenes = web.build_clip_scenes(_scenario_track(8.0), scenario_scenes=scenario_scenes)
+    assert scenes[0]["fresh_start"] is False
+
+
+def test_build_clip_scenes_from_scenario_split_keeps_fresh_start_only_on_the_first_piece():
+    """A section long enough to split (`_split_long_segment`) that also carries `fresh_start:
+    true` must not repeat the chain break inside itself -- all pieces are the same section, the
+    same composition, cut only because H3's own 10s ceiling forced it. Only the earliest piece
+    (where the cast/location actually changed) keeps `fresh_start`; every later piece still chains
+    an i2v keyframe off the piece immediately before it.
+    """
+    scenario_scenes = [_scenario_scene("verse", 0.0, 23.0, "a single continuous shot of rain",
+                                       fresh_start=True)]
+    scenes = web.build_clip_scenes(_scenario_track(23.0), scenario_scenes=scenario_scenes)
+    assert len(scenes) == 3
+    assert scenes[0]["fresh_start"] is True
+    assert scenes[1]["fresh_start"] is False
+    assert scenes[2]["fresh_start"] is False
+
+
+def test_build_clip_scenes_procedural_path_never_sets_fresh_start():
+    """The procedural path (`scenario_scenes=None`) has no concept of `fresh_start` at all -- every
+    scene it builds must read `False`, the same as before this field existed anywhere in the
+    codebase.
+    """
+    sections = [{"name": "verse", "start": 0.0, "end": 8.0},
+                {"name": "chorus", "start": 8.0, "end": None}]
+    scenes = web.build_clip_scenes(_track(sections, 16.0, _TWO_SECTION_LYRICS))
+    assert scenes
+    assert all(s["fresh_start"] is False for s in scenes)
 
 
 def test_build_clip_scenes_from_scenario_refuses_a_track_with_no_measured_duration():
@@ -1500,7 +1561,8 @@ def test_generate_scenario_from_an_llm_reply_opens_the_gate(_serve, monkeypatch)
     scenes = generated["project"]["scenario_scenes"]
     assert len(scenes) == 2
     assert scenes[0] == {"tag": "verse", "start": 0.0, "end": 8.0,
-                         "prompt": "[Shot 1] wide shot, dusk street.", "duration": 8.0}
+                         "prompt": "[Shot 1] wide shot, dusk street.", "duration": 8.0,
+                         "fresh_start": False}
     assert generated["project"]["scenario_style_block"].startswith("A neon-lit stage")
 
     (req,) = fake.requests
@@ -1903,6 +1965,123 @@ def test_edit_scenario_rejects_a_malformed_entry_as_args_invalid(_serve, monkeyp
         "PUT", f"/api/projects/{pid}/scenario",
         {"scenario_scenes": [{"tag": "verse", "start": 0.0, "prompt": "a", "duration": 8.0}]})
     assert (status, payload["error"]["code"]) == (400, "args_invalid"), payload
+
+
+# -- fresh_start (P0 fix, keyframe-chain defect 2026-08-25): PUT /scenario -------------------------
+
+
+def test_edit_scenario_accepts_and_stores_fresh_start_true(_serve, monkeypatch):
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+
+    status, edited = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "a", "duration": 6.0,
+             "fresh_start": False},
+            {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "b", "duration": 7.0,
+             "fresh_start": True},
+        ],
+    })
+    assert status == 200, edited
+    scenes = edited["project"]["scenario_scenes"]
+    assert scenes[0]["fresh_start"] is False
+    assert scenes[1]["fresh_start"] is True
+
+
+def test_edit_scenario_omitting_fresh_start_defaults_to_false(_serve, monkeypatch):
+    """No `fresh_start` key at all on a `PUT` entry -- an editor built before this field existed,
+    or a human who never touched the new checkbox -- must store `False`, not omit the key or
+    raise, so every scene this route has ever accepted keeps working unchanged.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+
+    status, edited = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 16.0, "prompt": "a", "duration": 8.0},
+        ],
+    })
+    assert status == 200, edited
+    assert edited["project"]["scenario_scenes"][0]["fresh_start"] is False
+
+
+def test_edit_scenario_rejects_a_non_boolean_fresh_start(_serve, monkeypatch):
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+
+    status, payload = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 16.0, "prompt": "a", "duration": 8.0,
+             "fresh_start": "true"},
+        ],
+    })
+    assert (status, payload["error"]["code"]) == (400, "args_invalid"), payload
+
+
+# == Full path (P0 fix, keyframe-chain defect 2026-08-25): flag survives generate -> PUT -> ========
+# == approve -> the submitted scene's own args (no --image/no i2v line for the flagged scene) ======
+
+
+def test_fresh_start_flag_reaches_the_submitted_scenes_own_generate_args(_serve, monkeypatch):
+    """The whole path the task exists for: a scenario with a cast change on its second section,
+    `PUT` through the gate, `approve/scenario` (which calls `build_clip_scenes` and `assemble.
+    advance_project` for real -- `worker.run_job`'s own fakes stand in for the GPU, not for any
+    of the code between the `PUT` and the job this test inspects), scene 0's own job faked
+    `done`, and the *second* scene's own submitted `generate` job checked directly: no `--image`,
+    no `SCENE_I2V_INSTRUCTION` line -- while a sibling project whose scenario never sets the flag
+    gets both, on the identical two-section shape. Both assertions live in one test so a change
+    that breaks either the "on" or the "off" path is caught by the same run.
+    """
+    srv = _serve()
+
+    def _run_scene_zero_and_return_scene_ones_args(pid):
+        approved = srv.post_json(f"/api/projects/{pid}/approve/scenario", {})
+        assert approved["project"]["stages"]["scenario"] == "approved"
+        scene0_job_id = approved["project"]["scenes"][0]["job_id"]
+        job = q.claim(srv.queue_root)
+        assert job.id == scene0_job_id
+        _write_fake_clip(job)
+        code = worker.run_job(srv.queue_root, job, spawn=_scene_hook_spawn(), outdir=srv.root)
+        assert code == 0
+        # the post-job hook already submitted scene 1 -- read it back off the queue rather than
+        # off `project.json` (whose own `scenes[i]` this route never records `args` onto). Two
+        # projects' own jobs share one queue in this test, so the lookup is by `note` (`scene_
+        # note(pid, 1)`, unique per project+scene), not merely "not scene 0's own id" -- the other
+        # project's still-pending scene 1 job would otherwise match that too loosely.
+        jobs, _broken = q.scan(srv.queue_root)
+        second_job = next(j for j in jobs if j.note == assemble_module.scene_note(pid, 1))
+        return second_job.args
+
+    pid_flagged = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    status, put = srv._request("PUT", f"/api/projects/{pid_flagged}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 8.0,
+             "prompt": "Aldred carries the baby through the hall", "duration": 6.0},
+            {"tag": "chorus", "start": 8.0, "end": 16.0,
+             "prompt": "Aldred alone in the empty hall, the baby gone", "duration": 7.0,
+             "fresh_start": True},
+        ],
+    })
+    assert status == 200, put
+    flagged_args = _run_scene_zero_and_return_scene_ones_args(pid_flagged)
+    assert "--image" not in flagged_args
+    assert "is fully referenced" not in flagged_args[1]
+
+    pid_plain = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    status, put = srv._request("PUT", f"/api/projects/{pid_plain}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "a quiet room", "duration": 6.0},
+            {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "the same room, later",
+             "duration": 7.0},
+        ],
+    })
+    assert status == 200, put
+    plain_args = _run_scene_zero_and_return_scene_ones_args(pid_plain)
+    assert "--image" in plain_args
+    assert "is fully referenced" in plain_args[1]
 
 
 def test_edit_scenario_from_draft_opens_the_gate(_serve, monkeypatch):
@@ -2328,6 +2507,69 @@ def test_editing_a_scenes_tail_reconstructs_the_full_prompt_without_losing_or_du
     assert final_scenes[0]["prompt"] == expected_edited, (
         f"what actually landed on disk must match what was sent: {final_scenes[0]['prompt']!r}")
     assert final_scenes[1]["prompt"] == _PREFIX_SCENES[1]["prompt"]
+
+
+# == P0 fix (keyframe-chain defect, 2026-08-25): the fresh_start checkbox saves through PUT ========
+
+
+_SCENARIO_FRESH_START_SCRIPT = Path(__file__).resolve().parent / "_scenario_fresh_start_check.mjs"
+
+
+def _run_scenario_fresh_start_check(base_url: str, pid: str, toggle_idx: int,
+                                     timeout=30) -> dict:
+    """Runs `_scenario_fresh_start_check.mjs` (see its own module docstring) against a real,
+    already-running server -- drives the *real* `app.js` through checking one scene's own
+    `.scenario-fresh-start` box and reports exactly what `collectScenarioScenes` sent in the `PUT`
+    body, plus the server's own final state.
+    """
+    result = subprocess.run(
+        [_NODE, str(_SCENARIO_FRESH_START_SCRIPT), _APP_JS_URL, base_url, pid, str(toggle_idx)],
+        capture_output=True, text=True, timeout=timeout)
+    assert result.returncode == 0, (
+        f"_scenario_fresh_start_check.mjs failed:\nstdout: {result.stdout}\nstderr: {result.stderr}")
+    return json.loads(result.stdout)
+
+
+@_needs_node_for_scenario_race
+def test_checking_the_fresh_start_box_saves_it_through_put_and_leaves_other_scenes_alone(
+        _serve, monkeypatch):
+    """Drives the real `app.js`'s own delegated `change` listener for `.scenario-fresh-start`
+    (`docs/h3-prompt-system.md`, "Breaking the chain on a cast change") -- checking scene 1's own
+    box must fire `PUT /api/projects/<id>/scenario` with `scenario_scenes[1]["fresh_start"] ==
+    True`, on `change` (no blur needed, unlike the text/duration fields `_scenario_prefix_check.
+    mjs` already covers), while scene 0 -- never touched in this script's own fake DOM -- must be
+    sent with its on-disk `fresh_start` (`False`) unchanged, `collectScenarioScenes`'s own
+    fallback for a field this test's "DOM" never populates.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    status, put_first = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "a quiet room",
+             "duration": 6.0},
+            {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "the same room, later",
+             "duration": 7.0},
+        ],
+    })
+    assert status == 200, put_first
+
+    base_url = f"http://{web.LOOPBACK}:{srv.port}"
+    result = _run_scenario_fresh_start_check(base_url, pid, 1)
+
+    assert result["putStatus"] == 200, result
+    sent = result["putBody"]["scenario_scenes"]
+    assert len(sent) == 2, f"both scenes must be sent -- PUT replaces the whole list: {sent}"
+    assert sent[1]["fresh_start"] is True, sent
+    assert sent[0]["fresh_start"] is False, (
+        "the untouched scene must be sent with its own on-disk fresh_start unchanged -- "
+        f"got {sent[0]!r}")
+    assert sent[1]["prompt"] == "the same room, later", (
+        "checking the box must not disturb the prompt this script never touched -- "
+        f"got {sent[1]['prompt']!r}")
+
+    final = result["finalProject"]
+    assert final["scenario_scenes"][1]["fresh_start"] is True
+    assert final["scenario_scenes"][0]["fresh_start"] is False
 
 
 # == Retry: track (task 7's own small addition to the server, "Пересчитать трек") ================

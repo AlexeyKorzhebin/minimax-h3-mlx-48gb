@@ -1118,13 +1118,24 @@ def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
 
     try:
         keyframe = None
-        if idx > 0:
+        # P0 fix (keyframe-chain defect, 2026-08-25 nightly run): `web.build_clip_scenes` stamps
+        # `fresh_start: true` on a scenario scene whose cast or location changes from the one
+        # before it (`docs/h3-prompt-system.md`, "Breaking the chain on a cast change") -- that
+        # scene must render from text alone, with no automatic keyframe, so the previous scene's
+        # own (now stale) composition cannot win over the new prompt the way `SCENE_I2V_
+        # INSTRUCTION` otherwise guarantees it does. Checked *before* extraction, not after: this
+        # skips the `ffmpeg`/`ffprobe` work entirely rather than throwing away a keyframe this
+        # scene was never going to use (module docstring: "not to waste work"). Scene 0 is
+        # untouched by this flag either way -- `idx > 0` already gates the whole branch below, and
+        # scene 0's own t2v-vs-start_image choice in the `elif idx == 0` branch has nothing to do
+        # with a scenario scene's own `fresh_start`.
+        if idx > 0 and not scene.get("fresh_start"):
             prev = _scene_by_idx(proj.scenes, idx - 1)
             prev_clip = prev.get("clip_path") if prev else None
             if prev_clip:
                 keyframe = _extract_keyframe(
                     prev_clip, proj.path.parent / "keyframes", idx - 1, run=run)
-        else:
+        elif idx == 0:
             # Design spec, "Клипы": "Первая сцена: t2v (или i2v, если у проекта загружен стартовый
             # кадр)". Task 1's schema has no formal `start_image` field -- reading it off
             # `as_dict()`'s pass-through for unknown top-level keys (`Project._apply`'s own

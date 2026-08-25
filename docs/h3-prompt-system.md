@@ -335,7 +335,9 @@ The context for this turn always carries three things:
 
 Your JSON answer's `scenario` field carries the result: `{"sections": [...], "style_block":
 string}`. Each entry in `sections` is `{"tag": string, "start": number, "end": number, "scene":
-{"prompt": string, "duration": number}}` — one scene per section, in order.
+{"prompt": string, "duration": number, "fresh_start": boolean}}` — one scene per section, in
+order. `fresh_start` is optional and defaults to false; see "Breaking the chain on a cast change"
+below for when to set it.
 
 `start`/`end` are seconds into the track. Together the sections must cover the whole song with no
 gap and no overlap: the first section's `start` is `0`, the last section's `end` equals the track's
@@ -362,6 +364,22 @@ scene is generated as its own independent run, and the only thing carrying ident
 from one clip into the next is the text each scene's own prompt repeats. `style_block` existing as
 its own field is a convenience for showing and editing it once, in one place — it does not replace
 copying the same words into every `scene.prompt` in full.
+
+### Breaking the chain on a cast change
+
+Every scene after the first is normally rendered *from the previous scene's own last frame* — the
+pipeline feeds it in as a reference image, and the previous scene's composition, cast, and
+location win over whatever the new scene's own prompt says. That is what carries visual identity
+from cut to cut, and it is also exactly what goes wrong the moment a scene's own story leaves
+something behind: a character who exits, a new character who enters, or the action moving to a
+new location. The old frame does not know the story moved on, and it drags the old composition
+into every following scene regardless of what the prompt now describes.
+
+Set `scene.fresh_start: true` on a section where the cast or location actually changes from the
+one before it — someone leaves or arrives, or the action relocates. That section renders from
+text alone, with no reference frame, at the cost of a visible cut on the splice — a fair trade for
+not carrying a departed character (or a stray artifact from the last frame) through every scene
+that follows. Leave it false (or omit it) everywhere the composition just continues.
 
 ### No sung close-ups
 

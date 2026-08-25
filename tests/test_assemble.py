@@ -87,9 +87,10 @@ class _FakeRun:
 
 
 def _make_scene(idx, *, status="done", clip_path=None, prompt="a scene", duration=5.0,
-                 job_id=None, keyframe_path=None):
+                 job_id=None, keyframe_path=None, fresh_start=False):
     return {"idx": idx, "prompt": prompt, "duration": duration, "status": status,
-            "job_id": job_id, "clip_path": clip_path, "keyframe_path": keyframe_path}
+            "job_id": job_id, "clip_path": clip_path, "keyframe_path": keyframe_path,
+            "fresh_start": fresh_start}
 
 
 def _make_project(tmp_path, kind="clip", *, audio_mode=None, scenes=None, track=None,
@@ -750,6 +751,91 @@ def test_advance_project_extracts_a_keyframe_and_submits_the_next_scene_with_ima
     assert keyframe_calls[0][keyframe_calls[0].index("-ss") + 1] == "4.500"
     reloaded = project_module.load_project(proj.path)
     assert reloaded.scenes[1]["keyframe_path"] == keyframe_path
+
+
+# -- P0 fix (keyframe-chain defect, 2026-08-25 nightly run): fresh_start breaks the chain --------
+
+
+def test_advance_project_fresh_start_scene_skips_extraction_and_ships_a_t2v_job(tmp_path,
+                                                                                 monkeypatch):
+    """A scenario scene stamped `fresh_start: true` (cast/location change, docs/h3-prompt-
+    system.md's "Breaking the chain on a cast change") must submit as a plain t2v job -- no
+    `--image`, no `SCENE_I2V_INSTRUCTION` line -- and must never even try to extract a keyframe
+    from the previous scene's clip (module docstring: "not to waste work"). `assemble.
+    _extract_keyframe` is monkeypatched to raise if called at all, so this fails loudly rather
+    than merely failing to find `--image` in the args for some other reason.
+    """
+    def _boom(*a, **k):
+        raise AssertionError("_extract_keyframe must not be called for a fresh_start scene")
+    monkeypatch.setattr(assemble, "_extract_keyframe", _boom)
+    clip = tmp_path / "scene0.mp4"
+    clip.write_bytes(b"fake mp4")
+    proj = _make_project(tmp_path, "video", scenes=[
+        _make_scene(0, status="done", clip_path=str(clip)),
+        _make_scene(1, status="pending", prompt="Aldred alone in the empty hall",
+                    fresh_start=True),
+    ])
+    submit = _RecordingSubmit()
+
+    result = assemble.advance_project(proj, tmp_path / "queue", tmp_path / "out", submit=submit,
+                                       run=_FakeRun())
+
+    assert result["action"] == "submitted_scene"
+    assert result["idx"] == 1
+    args = submit.calls[0]["args"]
+    assert "--image" not in args
+    prompt_arg = args[1]
+    assert prompt_arg == "Aldred alone in the empty hall"
+    assert "is fully referenced" not in prompt_arg
+    reloaded = project_module.load_project(proj.path)
+    assert reloaded.scenes[1]["keyframe_path"] is None
+
+
+def test_advance_project_fresh_start_false_scene_chains_normally(tmp_path):
+    """The direct counterpart: `fresh_start: false`, explicit, on a scene after scene 0 with a
+    done previous clip -- must chain exactly as every pre-existing chaining test already proves
+    (`--image` present, keyframe extracted). Guards against a fix that reads `fresh_start`
+    inverted (skips the chain when it is `False` instead of `True`).
+    """
+    clip = tmp_path / "scene0.mp4"
+    clip.write_bytes(b"fake mp4")
+    proj = _make_project(tmp_path, "video", scenes=[
+        _make_scene(0, status="done", clip_path=str(clip)),
+        _make_scene(1, status="pending", fresh_start=False),
+    ])
+    submit = _RecordingSubmit()
+    fake_run = _FakeRun(ffprobe_durations=[6.0])
+
+    assemble.advance_project(proj, tmp_path / "queue", tmp_path / "out", submit=submit,
+                              run=fake_run)
+
+    args = submit.calls[0]["args"]
+    assert "--image" in args
+
+
+def test_advance_project_missing_fresh_start_key_behaves_exactly_like_before_this_field_existed(
+        tmp_path):
+    """Byte-for-byte backward compatibility: a `project.json` written before this field existed
+    has scene dicts with no `fresh_start` key at all -- `.get("fresh_start")`, not `["fresh_start"]`,
+    must read that exactly as `False` (chains normally), not raise a `KeyError` and not treat
+    absence as truthy.
+    """
+    clip = tmp_path / "scene0.mp4"
+    clip.write_bytes(b"fake mp4")
+    scene0 = _make_scene(0, status="done", clip_path=str(clip))
+    scene1 = _make_scene(1, status="pending")
+    del scene0["fresh_start"]
+    del scene1["fresh_start"]
+    proj = _make_project(tmp_path, "video", scenes=[scene0, scene1])
+    submit = _RecordingSubmit()
+    fake_run = _FakeRun(ffprobe_durations=[6.0])
+
+    result = assemble.advance_project(proj, tmp_path / "queue", tmp_path / "out", submit=submit,
+                                       run=fake_run)
+
+    assert result["action"] == "submitted_scene"
+    args = submit.calls[0]["args"]
+    assert "--image" in args, "an old scene dict with no `fresh_start` key must still chain"
 
 
 def test_advance_project_keyframe_timestamp_floors_at_zero_for_a_short_clip(tmp_path):
