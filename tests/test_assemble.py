@@ -564,6 +564,27 @@ def test_scene_generate_args_produces_a_different_output_stem_on_each_call(tmp_p
     assert args1[args1.index("--tag") + 1] != args2[args2.index("--tag") + 1]
 
 
+# -- _scene_generate_args: Turbo strength (calibration, docs/RESULTS.md + A/B 2026-08-25) --------
+
+
+def test_scene_generate_args_carries_the_calibrated_turbo_strength():
+    """A project scene chain runs unattended (`advance_project` submits every scene with nobody
+    watching the frame), so it needs its own calibrated `--turbo-strength` rather than inheriting
+    `cli.py`'s own human-facing default of 1.0 -- `docs/RESULTS.md` ("Few-step sampling") measures
+    1.0 at 213% of reference motion and visibly over-sharp, 0.45 at 117%; confirmed by eye, same
+    seed/prompt/keyframe A/B on 2026-08-25 (sharpness 612 vs. 187). Pins the *value* the constant
+    carries, not merely the flag's presence -- a mutation that swaps `SCENE_TURBO_STRENGTH` for
+    the CLI's own 1.0 default (or any other number) must fail this test.
+    """
+    scene = _make_scene(0, status="pending")
+
+    args, _ = assemble._scene_generate_args(scene, None, Path("/tmp/scenes"))
+
+    assert "--turbo-strength" in args
+    assert args[args.index("--turbo-strength") + 1] == str(assemble.SCENE_TURBO_STRENGTH)
+    assert assemble.SCENE_TURBO_STRENGTH == 0.45
+
+
 # -- _scene_generate_args: the i2v instruction line (review round, I2) ---------------------------
 
 

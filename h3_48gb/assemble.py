@@ -90,6 +90,21 @@ ASSEMBLY_FPS = 24
 #: exactly like what a human leaving the web form's canvas fields untouched would get.
 DEFAULT_SCENE_CANVAS = (896, 512)
 
+#: The Turbo LoRA strength every project scene's `generate` job is submitted with. `cli.py`'s own
+#: `--turbo-strength` default (1.0) stays 1.0 -- untouched here, and deliberately: that default is
+#: for a human running a single `h3 generate` by hand, who can see the frame and back off the
+#: strength themselves. A project scene chain has nobody watching it (`advance_project` submits
+#: every scene unattended, per-scene, hours apart) and needs its own calibrated default instead of
+#: inheriting the CLI's.
+#:
+#: `docs/RESULTS.md`, "Few-step sampling": at 1.0 on the 4-bit base, motion measures 213% of the
+#: reference and the frame goes visibly over-sharp; at 0.45 it lands at 117%. Confirmed by eye,
+#: same seed/prompt/keyframe A/B on 2026-08-25 (scene 2, "Амазонки", 448x288): 1.0 read as "прямо
+#: пластик" (sharpness 612 vs. 187 at 0.45, motion peaks +28%) -- the bench-wrapper patch that
+#: carried `--turbo-strength 0.45` into every project scene before this constant existed (git log,
+#: 2026-08-25) is what this constant makes unnecessary.
+SCENE_TURBO_STRENGTH = 0.45
+
 #: `h3 generate`'s own default step count (`cli.DEFAULT_STEPS`), duplicated here rather than
 #: imported -- `cli.py` is safe to import (it does not pull in `mlx` at module level, see
 #: `web.py`'s own `from h3_48gb.cli import ...`), but this module's only use for the number is
@@ -973,6 +988,10 @@ def _scene_generate_args(scene: dict, keyframe, scenes_dir: Path) -> tuple[list[
     against the prompt's own leading whitespace stripped (`lstrip()`), so a prompt the model wrote
     with the sentence already in place is passed through unchanged instead of getting a second copy
     glued on top of the first.
+
+    Always carries `--turbo-strength` set to `SCENE_TURBO_STRENGTH` -- see that constant's own
+    docstring for the calibration; `cli.py`'s own `--turbo-strength` default (1.0) is untouched,
+    so a lone `h3 generate` a human runs by hand is unaffected.
     """
     idx = scene["idx"]
     width, height = DEFAULT_SCENE_CANVAS
@@ -992,6 +1011,7 @@ def _scene_generate_args(scene: dict, keyframe, scenes_dir: Path) -> tuple[list[
     args = ["generate", prompt,
             "--width", str(width), "--height", str(height),
             "--duration", str(scene["duration"]),
+            "--turbo-strength", str(SCENE_TURBO_STRENGTH),
             "--tag", tag,
             "--outdir", str(scenes_dir)]
     if keyframe is not None:
