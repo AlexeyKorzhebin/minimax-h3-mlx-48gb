@@ -572,14 +572,24 @@ class Project:
         return self
 
     def set_scene_status(self, idx: int, status: str, *, job_id=_UNSET_JOB_ID,
-                          clip_path: str | None = None, keyframe_path: str | None = None
-                          ) -> "Project":
-        """Set scene `idx`'s status, and any of `job_id`/`clip_path`/`keyframe_path` that are
-        given. `clip_path`/`keyframe_path` left as `None` are left exactly as they already were on
+                          clip_path: str | None = None, keyframe_path: str | None = None,
+                          head_drop_frames: int | None = None) -> "Project":
+        """Set scene `idx`'s status, and any of `job_id`/`clip_path`/`keyframe_path`/
+        `head_drop_frames` that are given. `clip_path`/`keyframe_path`/`head_drop_frames` left as
+        `None` are left exactly as they already were on
         disk -- this is a partial update, matching how the worker actually learns these facts one
         at a time (a `clip_path` only once the job is `done`); neither is how a scene gets these
         two fields *cleared* -- that is `invalidate_scene_chain`'s job, which sets them to `None`
         explicitly rather than by omission.
+
+        **`head_drop_frames` (latent-handoff wave, task 5)** is how many frames of this scene's own
+        clip head reproduce the scene before it -- 22 for a latent-chained scene, 5 for a keyframe
+        fallback, 0 for scene 0 and every `fresh_start` scene. Written by `assemble.
+        _submit_next_scene` in the same call that records the keyframe, and read back by `assemble.
+        _scene_head_drop_frames` at assembly time; `0` is a real value here, not "unchanged" (the
+        sentinel is `None`, as for the two paths above). `invalidate_scene_chain` deliberately does
+        **not** clear it: an invalidated scene is re-submitted before it is ever assembled, and
+        that re-submission rewrites this field from scratch.
 
         **`job_id` follows a different convention (C1, fix round 1, 2026-08-18 review): omitting
         it leaves it unchanged, but passing `job_id=None` explicitly *clears* it.** Every call
@@ -604,6 +614,8 @@ class Project:
                 scene["clip_path"] = clip_path
             if keyframe_path is not None:
                 scene["keyframe_path"] = keyframe_path
+            if head_drop_frames is not None:
+                scene["head_drop_frames"] = int(head_drop_frames)
             write_json_durably(self.path, data)
             self._apply(data)
         return self

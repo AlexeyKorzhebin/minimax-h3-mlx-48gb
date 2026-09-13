@@ -1,0 +1,326 @@
+{
+ "_provenance": "Геометрия ночного прогона 4 («Колыбельная», 40 сцен) — снята с одобренного сценария ~/Research/TestVideo/_бэкапы/night4-scenario.json (project.scenario_scenes) 2026-08-26. Промпты заменены короткими заглушками: под тестом арифметика сетки длительностей, а не текст. Все start/end/duration/fresh_start и track.duration — дословно из прогона.",
+ "track_duration": 304.879979,
+ "scenario_scenes": [
+  {
+   "tag": "opening-vigil",
+   "start": 0.0,
+   "end": 10.0,
+   "duration": 10.0,
+   "fresh_start": true,
+   "prompt": "integrated_multimodal_description:\n[Shot 0] opening-vigil"
+  },
+  {
+   "tag": "vigil-tenderness",
+   "start": 10.0,
+   "end": 20.0,
+   "duration": 10.0,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 1] vigil-tenderness"
+  },
+  {
+   "tag": "vigil-promise",
+   "start": 20.0,
+   "end": 30.0,
+   "duration": 10.0,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 2] vigil-promise"
+  },
+  {
+   "tag": "aldred-at-door",
+   "start": 30.0,
+   "end": 38.1,
+   "duration": 8.1,
+   "fresh_start": true,
+   "prompt": "integrated_multimodal_description:\n[Shot 3] aldred-at-door"
+  },
+  {
+   "tag": "aldred-waits",
+   "start": 38.1,
+   "end": 45.48,
+   "duration": 7.38,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 4] aldred-waits"
+  },
+  {
+   "tag": "map-revealed",
+   "start": 45.48,
+   "end": 52.64,
+   "duration": 7.16,
+   "fresh_start": true,
+   "prompt": "integrated_multimodal_description:\n[Shot 5] map-revealed"
+  },
+  {
+   "tag": "stitched-route",
+   "start": 52.64,
+   "end": 59.86,
+   "duration": 7.22,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 6] stitched-route"
+  },
+  {
+   "tag": "warm-hour",
+   "start": 59.86,
+   "end": 67.4,
+   "duration": 7.54,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 7] warm-hour"
+  },
+  {
+   "tag": "memory-touch",
+   "start": 67.4,
+   "end": 75.2,
+   "duration": 7.8,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 8] memory-touch"
+  },
+  {
+   "tag": "first-refrain",
+   "start": 75.2,
+   "end": 83.92,
+   "duration": 8.72,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 9] first-refrain"
+  },
+  {
+   "tag": "ancient-name",
+   "start": 83.92,
+   "end": 90.96,
+   "duration": 7.04,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 10] ancient-name"
+  },
+  {
+   "tag": "darkness-ripens",
+   "start": 90.96,
+   "end": 98.04,
+   "duration": 7.08,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 11] darkness-ripens"
+  },
+  {
+   "tag": "eastern-dawn",
+   "start": 98.04,
+   "end": 105.58,
+   "duration": 7.54,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 12] eastern-dawn"
+  },
+  {
+   "tag": "wind-at-doors",
+   "start": 105.58,
+   "end": 112.6,
+   "duration": 7.02,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 13] wind-at-doors"
+  },
+  {
+   "tag": "silent-pressure",
+   "start": 112.6,
+   "end": 119.62,
+   "duration": 7.02,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 14] silent-pressure"
+  },
+  {
+   "tag": "old-wind",
+   "start": 119.62,
+   "end": 127.4,
+   "duration": 7.78,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 15] old-wind"
+  },
+  {
+   "tag": "tower-prayer",
+   "start": 127.4,
+   "end": 134.44,
+   "duration": 7.04,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 16] tower-prayer"
+  },
+  {
+   "tag": "lake-reflection",
+   "start": 134.44,
+   "end": 141.78,
+   "duration": 7.34,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 17] lake-reflection"
+  },
+  {
+   "tag": "ring-gift",
+   "start": 141.78,
+   "end": 149.18,
+   "duration": 7.4,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 18] ring-gift"
+  },
+  {
+   "tag": "signet-keepsake",
+   "start": 149.18,
+   "end": 156.22,
+   "duration": 7.04,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 19] signet-keepsake"
+  },
+  {
+   "tag": "second-refrain",
+   "start": 156.22,
+   "end": 163.18,
+   "duration": 6.96,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 20] second-refrain"
+  },
+  {
+   "tag": "pale-ring-band",
+   "start": 163.18,
+   "end": 170.94,
+   "duration": 7.76,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 21] pale-ring-band"
+  },
+  {
+   "tag": "castle-darkens",
+   "start": 170.94,
+   "end": 177.98,
+   "duration": 7.04,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 22] castle-darkens"
+  },
+  {
+   "tag": "east-awaits",
+   "start": 177.98,
+   "end": 186.22,
+   "duration": 8.24,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 23] east-awaits"
+  },
+  {
+   "tag": "descent",
+   "start": 186.22,
+   "end": 194.0,
+   "duration": 7.78,
+   "fresh_start": true,
+   "prompt": "integrated_multimodal_description:\n[Shot 24] descent"
+  },
+  {
+   "tag": "handoff-and-departure",
+   "start": 194.0,
+   "end": 202.0,
+   "duration": 8.0,
+   "fresh_start": true,
+   "prompt": "integrated_multimodal_description:\n[Shot 25] handoff-and-departure"
+  },
+  {
+   "tag": "empty-arms",
+   "start": 202.0,
+   "end": 209.5,
+   "duration": 7.5,
+   "fresh_start": true,
+   "prompt": "integrated_multimodal_description:\n[Shot 26] empty-arms"
+  },
+  {
+   "tag": "solitary-return",
+   "start": 209.5,
+   "end": 215.5,
+   "duration": 6.0,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 27] solitary-return"
+  },
+  {
+   "tag": "hall-of-candles",
+   "start": 215.5,
+   "end": 221.7,
+   "duration": 6.2,
+   "fresh_start": true,
+   "prompt": "integrated_multimodal_description:\n[Shot 28] hall-of-candles"
+  },
+  {
+   "tag": "doors-and-blade",
+   "start": 221.7,
+   "end": 229.06,
+   "duration": 7.36,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 29] doors-and-blade"
+  },
+  {
+   "tag": "inherited-duty",
+   "start": 229.06,
+   "end": 236.34,
+   "duration": 7.28,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 30] inherited-duty"
+  },
+  {
+   "tag": "wedding-cloak",
+   "start": 236.34,
+   "end": 243.54,
+   "duration": 7.2,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 31] wedding-cloak"
+  },
+  {
+   "tag": "seventh-flame",
+   "start": 243.54,
+   "end": 251.86,
+   "duration": 8.32,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 32] seventh-flame"
+  },
+  {
+   "tag": "last-farewell",
+   "start": 251.86,
+   "end": 259.94,
+   "duration": 8.08,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 33] last-farewell"
+  },
+  {
+   "tag": "returning-name",
+   "start": 259.94,
+   "end": 266.54,
+   "duration": 6.6,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 34] returning-name"
+  },
+  {
+   "tag": "steel-vow",
+   "start": 266.54,
+   "end": 274.46,
+   "duration": 7.92,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 35] steel-vow"
+  },
+  {
+   "tag": "finale-decoy",
+   "start": 274.46,
+   "end": 282.0,
+   "duration": 7.54,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 36] finale-decoy"
+  },
+  {
+   "tag": "finale-blade-reflection",
+   "start": 282.0,
+   "end": 290.0,
+   "duration": 8.0,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 37] finale-blade-reflection"
+  },
+  {
+   "tag": "finale-last-stand",
+   "start": 290.0,
+   "end": 299.0,
+   "duration": 9.0,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 38] finale-last-stand"
+  },
+  {
+   "tag": "finale-light-and-feather",
+   "start": 299.0,
+   "end": 304.88,
+   "duration": 5.88,
+   "fresh_start": false,
+   "prompt": "integrated_multimodal_description:\n[Shot 39] finale-light-and-feather"
+  }
+ ]
+}

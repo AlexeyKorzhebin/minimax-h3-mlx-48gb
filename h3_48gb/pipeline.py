@@ -32,6 +32,7 @@ for why a preview can only ever decode the VAE's minimum chunk, not an arbitrary
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -41,7 +42,19 @@ import mlx.core as mx
 import numpy as np
 
 from minimax_h3_mlx.config import DiTConfig, PipelineConfig
-from minimax_h3_mlx.packing import PIXEL_MEAN, PIXEL_STD, unpatchify_video_tokens
+# `_ROPE_FRAMES_PER_LATENT` is private to `packing`, and imported anyway: it *is* the latent
+# frame grid (`1, 4, 4, 4, 4` pixel frames per latent frame), and `pinned_pixel_indices` has to
+# be that same grid or the tail lands on the wrong moment of the next scene. Re-deriving it from
+# the public `_temporal_position_grid` would mean dividing rotary times by `5/3` and rounding —
+# the same numbers, arrived at through a float round trip, for the sake of not naming a private.
+from minimax_h3_mlx.packing import (
+    FRAMES_PER_CHUNK,
+    LATENTS_PER_CHUNK,
+    PIXEL_MEAN,
+    PIXEL_STD,
+    _ROPE_FRAMES_PER_LATENT,
+    unpatchify_video_tokens,
+)
 from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
 
 from . import framecheck, memory
@@ -61,6 +74,107 @@ def _file_identity(path: Path | None) -> list | None:
         return None
     path = Path(path)
     return [path.name, path.stat().st_size if path.exists() else None]
+
+
+# -- the latent tail: a scene's last few latent frames, kept for the next one -------------------
+#
+# `docs/FEASIBILITY-latent-handoff.md` §1.2-§1.3. The finished video latent is patchified and
+# normalized exactly as `_encode_keyframes` produces conditioning rows, so the tail of scene N is
+# already in the space scene N+1 wants — no VAE round trip at either end, and no conversion in
+# between. What that costs is a slice and a file.
+
+#: `__call__` keyword arguments this feature owns, stripped before the upstream signature is
+#: bound — the same trick, for the same two reasons, as `h3_48gb.preview.PREVIEW_KWARGS`:
+#: upstream's `__call__` would reject an unknown keyword, and `request_identity` hashes
+#: `bound.arguments` wholesale, so anything that survives the bind joins the checkpoint identity.
+#: Where a scene writes its tail must not decide which checkpoint it resumes from.
+LATENT_TAIL_KWARGS = ("save_latent_tail", "latent_tail_stem")
+
+#: Appended to the run's output stem. `<stem>-latent-tail.safetensors`, per spec §1.3.
+LATENT_TAIL_SUFFIX = "-latent-tail.safetensors"
+
+#: The safetensors metadata key the tail's JSON description lives under. In the *same* file as
+#: the array rather than a sidecar `.json`, and that is the whole reason: two files cannot be
+#: renamed into place together, so a sidecar reintroduces exactly the torn state the atomic write
+#: below exists to prevent — a tail whose geometry says one thing and whose rows say another.
+LATENT_TAIL_META_KEY = "h3_latent_tail"
+
+#: Bumped when the metadata below stops meaning what a previous version's reader assumed.
+LATENT_TAIL_FORMAT = 1
+
+
+def pop_latent_tail_kwargs(kwargs: dict) -> dict:
+    """Remove and return this feature's keyword arguments from a ``__call__`` kwargs dict."""
+    return {name: kwargs.pop(name) for name in LATENT_TAIL_KWARGS if name in kwargs}
+
+
+def latent_tail_pixel_frames(latent_frames: int) -> int:
+    """Pixel frames a tail of ``latent_frames`` latent frames covers: ``17m + 5`` for ``5m + 2``.
+
+    The grid is not a convention, it is the video VAE's own chunking (``FRAMES_PER_CHUNK`` /
+    ``LATENTS_PER_CHUNK``, packing.py:46-47): the first latent frame of a clip carries one pixel
+    frame and every later one carries four, so ``L`` latent frames cover ``4L - 3`` pixel frames —
+    which is a whole number of chunks, and therefore a valid clip start, only when ``L = 5m + 2``.
+    That is what makes the tail free: the next scene's own latent grid reproduces it frame for
+    frame, with no resampling anywhere (spec §1.3, and the same ``5, 22, 39, 56`` window list
+    Motion-Context arrived at).
+
+    Raises:
+        ValueError: for any other length. Loudly, and here rather than at the end of a run: a tail
+            off this grid cannot be handed to the next scene at all.
+    """
+    remainder = (latent_frames - 2) % LATENTS_PER_CHUNK
+    if latent_frames < 2 or remainder:
+        raise ValueError(
+            f"A latent tail must be 5m + 2 latent frames (2, 7, 12, 17, ...) so it lands on the "
+            f"next scene's own latent grid, got {latent_frames}."
+        )
+    return FRAMES_PER_CHUNK * ((latent_frames - 2) // LATENTS_PER_CHUNK) + LATENTS_PER_CHUNK
+
+
+def latent_tail_pixel_indices(latent_frames: int) -> list[int]:
+    """Where the tail's frames sit on the *next* scene's rotary clock: ``0, 1, 5, 9, 13, 17, ...``
+
+    One entry per latent frame, in packed order, and each one is what `build_packed_sequence`
+    wants as a `keyframe_anchors` element (patch 0004): a **pixel**-frame index, from which it
+    computes ``anchor_time = num_text + 5/3 * index``. Written into the tail's metadata rather
+    than recomputed on the reading side so this arithmetic lives in one place (spec §1.3).
+    """
+    indices, position = [], 0
+    for frame in range(latent_frames):
+        indices.append(position)
+        position += _ROPE_FRAMES_PER_LATENT[frame % len(_ROPE_FRAMES_PER_LATENT)]
+    return indices
+
+
+def write_safetensors_atomically(path: Path, arrays: dict, metadata: dict) -> None:
+    """Write, flush to stable storage, then rename over whatever was there.
+
+    `CheckpointStore.write`'s sequence (`h3_48gb/checkpoint.py:368-394`), and deliberately not
+    `h3_48gb.queue.write_text_durably`, which is a text protocol. Order matters: without the
+    ``fsync`` the rename can be durable while the bytes it points at are not, and a power loss
+    would leave a file whose safetensors header promises data that is not there. Any failure
+    removes the temporary file and leaves the previous file — a scene behind, but whole — exactly
+    where it was.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.stem}.tmp-{os.getpid()}{path.suffix}")
+    try:
+        mx.save_safetensors(str(temp), arrays, metadata=metadata)
+        fd = os.open(temp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temp, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
 
 
 # -- configs read without touching the weights -------------------------------------------------
@@ -244,6 +358,11 @@ def _validate_decoded_frames(frames: np.ndarray) -> None:
 class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
     """`MiniMaxH3Pipeline` with phase-scoped residency, a precomputed AdaLN table and resumable runs."""
 
+    #: The in-flight `--save-latent-tail` request, or `None`. A class attribute as well as an
+    #: instance one so `_decode_video` can be driven by a stand that never ran `__init__` (the
+    #: `Bare` stub in tests/test_decode_video_uint8.py) without it having to know this exists.
+    _latent_tail: dict | None = None
+
     def __init__(self, dit, text_encoder, video_vae, audio_vae, config, adaln_cache_path=None,
                  verbose: bool = True, weights_id: dict | None = None):
         super().__init__(dit, text_encoder, video_vae, audio_vae, config)
@@ -405,6 +524,17 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         upstream's own numpy path byte-for-byte on a random small latent.
         """
         mx.eval(rows)
+        # The one seam where the latent is still raw. `rows` has just been materialized, so the
+        # write cannot drag the transformer's last forward into itself, and the two lines below
+        # have not yet unpatchified or denormalized it out of the space the next scene wants. That
+        # seam is *before* `_validate_decoded_frames` below, though -- the corruption check needs
+        # decoded pixels, which do not exist yet -- so a tail written here can still turn out to
+        # belong to a clip the validator later condemns. `tail_path` is only set when *this* call
+        # wrote a file, so the failure handler below removes exactly that file and nothing a prior,
+        # successful run left behind.
+        tail_path = None
+        if self._latent_tail is not None:
+            tail_path = self._save_latent_tail(rows, num_latent_frames, latent_height, latent_width)
         self.dit.unload()
         self._cache = None
         self._cache_timesteps = None
@@ -439,8 +569,94 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         frames = (frames * 255.0 + 0.5).astype(mx.uint8)
         frames = frames[0].transpose(1, 2, 3, 0)  # -> (F, H, W, 3)
         frames = np.array(frames)
-        _validate_decoded_frames(frames)
+        try:
+            _validate_decoded_frames(frames)
+        except Exception:
+            # Хвост уже лежит на диске (шов записи — до декода, у валидатора там ещё нет
+            # пикселей), а клип только что осуждён: не убрать файл — значит оставить артефакт,
+            # который позже `--latent` подберёт как вход следующей сцены (ревью задачи 3, P2-6).
+            # Только файл ЭТОГО вызова — прошлые успешные хвосты не трогаются. Best-effort:
+            # ошибка уборки не должна заслонить настоящую ошибку валидации.
+            if tail_path is not None:
+                try:
+                    tail_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
         return frames
+
+    def _save_latent_tail(self, rows, num_latent_frames, latent_height, latent_width) -> Path:
+        """Cut the last `L` latent frames off the finished latent and write them beside the clip.
+
+        **The slice** (spec §1.3). `rows` is `video_rows[n_cond_v:]` — the generated video latent,
+        patchified frame-major by `patchify_video_latents` (its `transpose(0,2,4,6,1,3,5,7)`), so
+        latent frame `f` owns rows ``[f*R, (f+1)*R)`` and the whole tail is one contiguous slice:
+
+            R = rows_per_frame = (latent_height // ph) * (latent_width // pw)
+            L = 5m + 2                        latent frames kept, m >= 0
+              covers 17m + 5 pixel frames     of this clip's own timeline
+            tail = rows[(F - L) * R:]         shape (L*R, video_patch_dim), F = num_latent_frames
+
+        `R` is taken from `rows.shape[0] // F` rather than recomputed from the canvas: it is then
+        the layout's own answer, and a disagreement with `F` (a remainder) is a refusal rather
+        than a silently misaligned cut. `L`'s `5m + 2` shape is enforced by
+        `latent_tail_pixel_frames`, which explains why it is the only grid that works.
+
+        **The geometry in the metadata** comes from the request (`_latent_tail_request`, off
+        `bound.arguments`, the same source `_install_preview` reads), because the canvas the
+        operator asked for is what the next scene has to match — `latent_height`/`latent_width`
+        here are its 16x-divided shadow.
+
+        Returns:
+            The path written, `<stem>-latent-tail.safetensors`.
+        """
+        request = self._latent_tail
+        latent_frames = int(request["latent_frames"])
+        rows_per_frame, remainder = divmod(int(rows.shape[0]), int(num_latent_frames))
+        if remainder:
+            raise RuntimeError(
+                f"{rows.shape[0]} generated rows do not divide into {num_latent_frames} latent "
+                f"frames — the packed layout is not what this expects, and any tail cut from it "
+                f"would start mid-frame."
+            )
+        if latent_frames > num_latent_frames:
+            raise ValueError(
+                f"A tail of {latent_frames} latent frames was asked for, but this clip has only "
+                f"{num_latent_frames}."
+            )
+        pixel_frames = latent_tail_pixel_frames(latent_frames)
+
+        tail = rows[(num_latent_frames - latent_frames) * rows_per_frame:]
+        # Materialize the slice for the same reason `mx.eval(rows)` above exists: the write must
+        # not be the thing that runs it. `rows` is already real, so this is one slice's worth of
+        # work and nothing of the transformer is left in the graph.
+        mx.eval(tail)
+
+        width, height = request["canvas"]
+        meta = {
+            "format": LATENT_TAIL_FORMAT,
+            "canvas": [int(width), int(height)],
+            "latent_frames": latent_frames,
+            "m": (latent_frames - 2) // LATENTS_PER_CHUNK,
+            "pixel_frames": pixel_frames,
+            "rows_per_frame": rows_per_frame,
+            "row_dim": int(rows.shape[1]),
+            "latent_height": int(latent_height),
+            "latent_width": int(latent_width),
+            "patch_size": [int(p) for p in self.dit.config.patch_size],
+            "dtype": str(tail.dtype).rsplit(".", 1)[-1],
+            "source_latent_frames": int(num_latent_frames),
+            # What the next scene passes as `keyframe_anchors` — written, not recomputed there.
+            "pinned_pixel_indices": latent_tail_pixel_indices(latent_frames),
+        }
+
+        path = Path(f"{request['stem']}{LATENT_TAIL_SUFFIX}")
+        write_safetensors_atomically(path, {"video_tail": tail},
+                                     {LATENT_TAIL_META_KEY: json.dumps(meta)})
+        if request.get("verbose"):
+            print(f"latent tail: {latent_frames} latent frames ({pixel_frames} pixel frames) "
+                  f"-> {path}", flush=True)
+        return path
 
     def _decode_audio(self, rows, *args, **kwargs):
         """Release the video VAE before the audio VAE loads — they are never needed together."""
@@ -591,6 +807,7 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
         # them.
         checkpoint_kwargs = pop_checkpoint_kwargs(kwargs)
         preview_options = pop_preview_kwargs(kwargs)
+        latent_tail_options = pop_latent_tail_kwargs(kwargs)
         preview_every = int(preview_options.get("preview_every", 0) or 0)
         preview_stem = preview_options.get("preview_stem")
         preview_decoder = preview_options.get("preview_decoder", "vae") or "vae"
@@ -635,7 +852,15 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
             ]
             args, kwargs = bound.args[1:], bound.kwargs
 
+        # Sized here, off the same `bound.arguments` the preview reads, so a tail that cannot be
+        # written (no stem, off-grid, longer than the clip) is refused now rather than at the end
+        # of a multi-hour run — the tail is the *point* of a chained scene, and discovering it was
+        # never going to be written after the diffusion loop costs the whole scene.
+        latent_tail = self._latent_tail_request(latent_tail_options, bound.arguments)
+
         original_dit = self.dit
+        original_latent_tail = self._latent_tail
+        self._latent_tail = latent_tail
         if preview_every:
             self.dit = self._install_preview(original_dit, preview_every, preview_stem,
                                              bound.arguments, decoder=preview_decoder)
@@ -643,6 +868,49 @@ class LazyMiniMaxH3Pipeline(CheckpointingPipeline, MiniMaxH3Pipeline):
             return super().__call__(*args, **kwargs, **checkpoint_kwargs)
         finally:
             self.dit = original_dit
+            self._latent_tail = original_latent_tail
+
+    def _latent_tail_request(self, options: dict, arguments: dict) -> dict | None:
+        """Validate `--save-latent-tail` against this request's geometry, or return `None`.
+
+        Re-derives the canvas and the latent frame count from the request exactly as
+        `_install_preview` does, and for the same reason: there is nowhere inside upstream's
+        `__call__` to reach for them without duplicating the loop. Only the canvas travels into
+        the metadata — the row geometry `_save_latent_tail` writes comes from the rows themselves.
+        """
+        latent_frames = int(options.get("save_latent_tail", 0) or 0)
+        if latent_frames == 0:
+            return None
+
+        from minimax_h3_mlx.packing import (
+            FPS, align_num_frames, resolve_canvas_size, video_latent_num_frames,
+        )
+
+        latent_tail_pixel_frames(latent_frames)     # raises on anything off the 5m + 2 grid
+        stem = options.get("latent_tail_stem")
+        if stem is None:
+            raise ValueError(
+                "`save_latent_tail` > 0 requires `latent_tail_stem`: the tail is written to "
+                "`<latent_tail_stem>-latent-tail.safetensors`."
+            )
+
+        height, width = arguments["height"], arguments["width"]
+        if height is None or width is None:
+            height, width = resolve_canvas_size(*arguments["aspect"])
+        num_frames = align_num_frames(int(round(arguments["duration_seconds"] * FPS)))
+        num_latent_frames = video_latent_num_frames(num_frames)
+        if latent_frames > num_latent_frames:
+            raise ValueError(
+                f"`save_latent_tail={latent_frames}` is longer than the clip: "
+                f"{arguments['duration_seconds']} s is {num_frames} frames, which the video VAE "
+                f"encodes as {num_latent_frames} latent frames."
+            )
+        return {
+            "latent_frames": latent_frames,
+            "stem": Path(stem),
+            "canvas": (int(width), int(height)),
+            "verbose": bool(arguments.get("verbose", True)),
+        }
 
     def _install_preview(self, dit, every: int, stem, arguments: dict,
                          decoder: str = "vae") -> PreviewInterceptor:

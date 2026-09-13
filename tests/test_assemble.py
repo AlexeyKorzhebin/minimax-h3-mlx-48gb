@@ -87,10 +87,18 @@ class _FakeRun:
 
 
 def _make_scene(idx, *, status="done", clip_path=None, prompt="a scene", duration=5.0,
-                 job_id=None, keyframe_path=None, fresh_start=False):
-    return {"idx": idx, "prompt": prompt, "duration": duration, "status": status,
-            "job_id": job_id, "clip_path": clip_path, "keyframe_path": keyframe_path,
-            "fresh_start": fresh_start}
+                 job_id=None, keyframe_path=None, fresh_start=False, head_drop_frames=None):
+    """`head_drop_frames=None` (the default) writes **no** such key at all -- that is the shape
+    every `project.json` written before the latent-handoff wave has, and the shape
+    `assemble._scene_head_drop_frames`'s own "absent means 1 for a chaining scene, 0 for scene 0"
+    fallback exists for. Pass an integer only when a test is about that field itself.
+    """
+    scene = {"idx": idx, "prompt": prompt, "duration": duration, "status": status,
+             "job_id": job_id, "clip_path": clip_path, "keyframe_path": keyframe_path,
+             "fresh_start": fresh_start}
+    if head_drop_frames is not None:
+        scene["head_drop_frames"] = head_drop_frames
+    return scene
 
 
 def _make_project(tmp_path, kind="clip", *, audio_mode=None, scenes=None, track=None,
@@ -150,6 +158,11 @@ def test_chaining_scene_indices_is_every_scene_after_scene_zero(tmp_path):
     """The "plan" half of the fix, checked with no ffmpeg call at all: exactly the scenes with
     idx>0 need their own frame 0 dropped -- scene 0 has no automatic keyframe behind it and must
     never appear.
+
+    These scenes carry **no** `head_drop_frames` field (`_make_scene`'s own default), i.e. the
+    pre-latent-handoff shape, so this also pins that wave's retro fallback: an old `project.json`
+    re-assembles exactly as it did before. The field-driven cases (22/5/0, mixed within one
+    project) live in `tests/test_latent_chain.py`.
     """
     scenes = [
         _make_scene(0, clip_path=str(tmp_path / "a.mp4")),

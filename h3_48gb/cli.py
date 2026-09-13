@@ -155,10 +155,17 @@ ERROR_CODES = {
     "checkpoint_locked": "another process already holds the lock for this checkpoint",
     "preview_interval_negative": "--preview-every is negative; 0 disables previews, N > 0 sets a cadence",
     "end_image_without_image": "--end-image was given without --image; the end frame anchors a run that must also have a start frame",
+    "latent_with_image": "--latent was given with --image; a scene continues from a latent tail or from a keyframe, never from both",
+    "latent_not_found": "--latent points at a file that does not exist",
+    "latent_unreadable": "--latent exists but is not a latent tail this build can read",
+    "latent_canvas_mismatch": "--latent was saved on a different canvas than this run asks for; a latent tail cannot cross a change of resolution",
+    "latent_tail_off_grid": "--save-latent-tail is not on the 5m+2 latent-frame grid (2, 7, 12, 17, ...) the next scene can start from",
+    "latent_anchors_off_grid": "--latent's pinned_pixel_indices are not the anchors a tail of that many latent frames belongs at on the next scene's own grid -- hand-edited or written by a different build",
     "image_not_found": "a keyframe path does not exist",
     "image_unreadable": "a keyframe exists but could not be decoded as an image",
     "image_aspect_unsupported": "a keyframe's aspect ratio is outside the 1:4..4:1 the model supports",
     "partial_canvas_with_image": "--image was given with only one of --width/--height",
+    "partial_canvas_with_latent": "--latent was given with only one of --width/--height",
     "lora_not_found": "--turbo-lora points at a file that does not exist",
     "turbo_strength_invalid": "--turbo-strength is not a finite number",
     "adaln_cache_unreadable": "--adaln-cache exists but is not a readable AdaLN table",
@@ -298,6 +305,17 @@ class RunSpec:
     #: two arrangements, so the flags deliberately cannot express a third.
     image: Path | None = None
     end_image: Path | None = None
+    #: Continue from the raw latent tail a previous scene left behind
+    #: (`<its stem>-latent-tail.safetensors`) instead of from a decoded PNG keyframe. The rows go
+    #: in as `condition_latent_rows` and the anchors come out of the file's own metadata, so this
+    #: flag replaces both halves of `--image` at once — which is why the two cannot be combined.
+    #: See `docs/FEASIBILITY-latent-handoff.md`.
+    latent: Path | None = None
+    #: Save the last N latent frames of this run for the *next* scene, as
+    #: `<output_stem>-latent-tail.safetensors`. `N = 5m + 2` (2, 7, 12, 17, ...) — the only lengths
+    #: that land on the next scene's own latent grid; 0 disables. N=2 is free (spec §1.5), N=7 is
+    #: about one second of context and costs ~21-28% of the diffusion.
+    save_latent_tail: int = 0
     #: Decode a preview JPEG every N steps; 0 disables previews. On by default since TAE made a
     #: preview cost 0.125 s instead of 49.3 — see `preview_decoder`.
     preview_every: int = 5
@@ -406,6 +424,28 @@ class RunSpec:
             raise CliError("end_image_without_image",
                            "--end-image needs --image: the end frame is the far anchor of a "
                            "run whose near anchor is the start frame.")
+        # One conditioning slot, two claimants. Upstream refuses this too (patch 0005), but only
+        # after the text encoder has run; here it costs nothing and names the flags that clashed.
+        if self.latent is not None and self.image is not None:
+            raise CliError("latent_with_image",
+                           "--latent and --image cannot be combined: both fill the conditioning "
+                           "block, and the packed layout has room for one of them. A chained "
+                           "scene continues from the latent tail; drop --image.",
+                           {"latent": str(self.latent), "image": str(self.image)})
+        # The `5m + 2` grid, spelled out here rather than imported: `__post_init__` must not pull
+        # in mlx (see `load_keyframes`), and `h3_48gb.pipeline.latent_tail_pixel_frames` — the one
+        # this must agree with — does. `test_only_a_5m_plus_2_tail_can_start_the_next_scene`
+        # compares the two rather than trusting them to stay in step.
+        if self.save_latent_tail and (self.save_latent_tail < 2
+                                      or (self.save_latent_tail - 2) % 5):
+            raise CliError(
+                "latent_tail_off_grid",
+                f"--save-latent-tail must be 5m + 2 latent frames (2, 7, 12, 17, ...) so the tail "
+                f"lands on the next scene's own latent grid, got {self.save_latent_tail}",
+                {"save_latent_tail": self.save_latent_tail})
+        if self.latent is not None and not Path(self.latent).exists():
+            raise CliError("latent_not_found", f"--latent does not exist: {self.latent}",
+                           {"path": str(self.latent)})
         import math
 
         if self.turbo_lora is not None and not Path(self.turbo_lora).exists():
@@ -465,6 +505,14 @@ def _add_run_flags(sub: argparse.ArgumentParser) -> None:
                      help="condition the first frame on this image")
     sub.add_argument("--end-image", type=Path, default=None,
                      help="also condition the last frame; requires --image")
+    # The chained-scene path. A latent tail carries the previous scene's motion, not just its last
+    # picture, and it skips the VAE encode (and the vision tower) entirely on the way in.
+    sub.add_argument("--latent", type=Path, default=None,
+                     help="continue from a previous scene's latent tail "
+                          "(<its stem>-latent-tail.safetensors); cannot be combined with --image")
+    sub.add_argument("--save-latent-tail", type=int, default=0, metavar="N",
+                     help="save the last N latent frames as <stem>-latent-tail.safetensors for "
+                          "the next scene to continue from; N = 5m+2 (2, 7, 12, 17), 0 disables")
     # This sets nothing: the mode is fully determined by --image/--end-image (see `check_mode`
     # below `resolve_prompt`). It exists so a typo in a filename or a flag is refused in the
     # first second, rather than discovered an hour later by watching the finished clip.
@@ -630,62 +678,125 @@ def build_parser() -> argparse.ArgumentParser:
 DEFAULT_CANVAS = (896, 512)
 
 
-def resolve_canvas(image: Path | None, width: int | None, height: int | None) -> tuple[int, int]:
-    """Decide the canvas, deriving it from the keyframe when the caller did not say.
+def _latent_tail_canvas(path: Path) -> tuple[int, int]:
+    """`(width, height)` a latent tail was saved at, read without loading anything else from it.
+
+    `resolve_canvas`'s counterpart to opening a PNG for `--image`: a tiny, dedicated read
+    rather than a call into `load_latent_tail`, which does the full validated read (format,
+    anchors, row count) later, once mlx and upstream are already on the path anyway. Imported
+    lazily, exactly like `load_keyframes`/`load_latent_tail`, so a run that never touches
+    `--latent` does not pull mlx into `import h3_48gb`.
+    """
+    import mlx.core as mx
+
+    from h3_48gb.pipeline import LATENT_TAIL_FORMAT, LATENT_TAIL_META_KEY
+
+    try:
+        _, metadata = mx.load(str(path), return_metadata=True)
+        meta = json.loads(metadata[LATENT_TAIL_META_KEY])
+        canvas = [int(value) for value in meta["canvas"]]
+        version = int(meta["format"])
+    except Exception as exc:            # noqa: BLE001 -- every way this file can be wrong
+        raise CliError(
+            "latent_unreadable",
+            f"--latent could not be read as a latent tail: {path} ({exc}). It must be a file "
+            f"written by --save-latent-tail.",
+            {"path": str(path)},
+        ) from exc
+    if version != LATENT_TAIL_FORMAT:
+        raise CliError(
+            "latent_unreadable",
+            f"--latent is format {version}, but this build writes and reads format "
+            f"{LATENT_TAIL_FORMAT}: {path}",
+            {"path": str(path), "format": version})
+    if len(canvas) != 2:
+        raise CliError(
+            "latent_unreadable",
+            f"--latent's metadata carries a canvas of {canvas}, not [width, height]: {path}",
+            {"path": str(path), "canvas": canvas})
+    return canvas[0], canvas[1]
+
+
+def resolve_canvas(image: Path | None, latent: Path | None, width: int | None,
+                   height: int | None) -> tuple[int, int]:
+    """Decide the canvas, deriving it from the keyframe or the latent tail when the caller did not say.
 
     A keyframe is the geometry anchor — the reference resolves the canvas from the first frame's
     aspect (`reference/diffusers/modular/before_encoder.py:173`), and for good reason: the first
     keyframe is *stretched* onto whatever canvas it lands on, without preserving aspect. Left at
     the 16:9 default, a portrait photograph is silently squashed into a landscape clip.
 
-    EXIF orientation is applied before the size is read. A camera stores rotation as a tag rather
-    than rotating pixels, so a portrait photo reports itself as landscape — and would pick exactly
-    the canvas this function exists to avoid.
+    A latent tail is the same kind of anchor, for a chained scene: the rows in it were cut from a
+    finished latent at a specific `latent_height`/`latent_width`, and `load_latent_tail` refuses to
+    condition a run whose canvas does not match — so deriving that canvas here, when the caller did
+    not pass one, means `h3 generate --latent prev-tail.safetensors` just works instead of failing
+    with `latent_canvas_mismatch` against the text-only default.
+
+    EXIF orientation is applied before a keyframe's size is read. A camera stores rotation as a tag
+    rather than rotating pixels, so a portrait photo reports itself as landscape — and would pick
+    exactly the canvas this function exists to avoid.
     """
     if width is not None and height is not None:
         return width, height
-    if image is None:
-        default_width, default_height = DEFAULT_CANVAS
-        return width if width is not None else default_width, \
-            height if height is not None else default_height
 
-    # Half a canvas is worse than none: `--width 640` alone against a 3:2 photo used to pair the
-    # requested width with the *derived* height, producing a canvas of neither aspect and
-    # stretching the frame into it without a word.
-    if width is not None or height is not None:
-        raise CliError(
-            "partial_canvas_with_image",
-            "--image derives the canvas from the keyframe, so pass both --width and --height or "
-            f"neither. Got only --{'width' if width is not None else 'height'}.",
-            {"width": width, "height": height},
-        )
+    if image is not None:
+        # Half a canvas is worse than none: `--width 640` alone against a 3:2 photo used to pair
+        # the requested width with the *derived* height, producing a canvas of neither aspect and
+        # stretching the frame into it without a word.
+        if width is not None or height is not None:
+            raise CliError(
+                "partial_canvas_with_image",
+                "--image derives the canvas from the keyframe, so pass both --width and --height "
+                f"or neither. Got only --{'width' if width is not None else 'height'}.",
+                {"width": width, "height": height},
+            )
 
-    from PIL import Image, ImageOps, UnidentifiedImageError
+        from PIL import Image, ImageOps, UnidentifiedImageError
 
-    from h3_48gb._upstream import ensure_on_path  # noqa: F401  (puts upstream on sys.path)
-    from minimax_h3_mlx.packing import resolve_canvas_size
+        from h3_48gb._upstream import ensure_on_path  # noqa: F401  (puts upstream on sys.path)
+        from minimax_h3_mlx.packing import resolve_canvas_size
 
-    # `RunSpec.__post_init__` refuses a missing keyframe with `image_not_found`, but it only runs
-    # once the canvas is known — so these three failures reach the user from here, and must carry
-    # the same codes rather than a raw PIL traceback.
-    if not Path(image).exists():
-        raise CliError("image_not_found", f"--image does not exist: {image}", {"image": str(image)})
-    try:
-        with Image.open(image) as raw:
-            source = ImageOps.exif_transpose(raw).size
-    except (OSError, UnidentifiedImageError) as exc:
-        raise CliError("image_unreadable", f"--image could not be read: {image} ({exc})",
-                       {"image": str(image)}) from exc
-    try:
-        derived_height, derived_width = resolve_canvas_size(*source)
-    except ValueError as exc:
-        raise CliError(
-            "image_aspect_unsupported",
-            f"--image is {source[0]}x{source[1]}; MiniMax-H3 supports aspect ratios from 1:4 to "
-            f"4:1. Crop it, or pass --width and --height explicitly. ({exc})",
-            {"image": str(image), "size": list(source)},
-        ) from exc
-    return derived_width, derived_height
+        # `RunSpec.__post_init__` refuses a missing keyframe with `image_not_found`, but it only
+        # runs once the canvas is known — so these three failures reach the user from here, and
+        # must carry the same codes rather than a raw PIL traceback.
+        if not Path(image).exists():
+            raise CliError("image_not_found", f"--image does not exist: {image}", {"image": str(image)})
+        try:
+            with Image.open(image) as raw:
+                source = ImageOps.exif_transpose(raw).size
+        except (OSError, UnidentifiedImageError) as exc:
+            raise CliError("image_unreadable", f"--image could not be read: {image} ({exc})",
+                           {"image": str(image)}) from exc
+        try:
+            derived_height, derived_width = resolve_canvas_size(*source)
+        except ValueError as exc:
+            raise CliError(
+                "image_aspect_unsupported",
+                f"--image is {source[0]}x{source[1]}; MiniMax-H3 supports aspect ratios from 1:4 "
+                f"to 4:1. Crop it, or pass --width and --height explicitly. ({exc})",
+                {"image": str(image), "size": list(source)},
+            ) from exc
+        return derived_width, derived_height
+
+    if latent is not None:
+        # Symmetric with `--image`: half a canvas against a tail saved at, say, 448x896 would pair
+        # the requested axis with a default on the other, producing a canvas `load_latent_tail`
+        # then refuses anyway — but only after the checkpoint's own refusal machinery has run.
+        if width is not None or height is not None:
+            raise CliError(
+                "partial_canvas_with_latent",
+                "--latent derives the canvas from the tail's own metadata, so pass both --width "
+                f"and --height or neither. Got only --{'width' if width is not None else 'height'}.",
+                {"width": width, "height": height},
+            )
+        if not Path(latent).exists():
+            raise CliError("latent_not_found", f"--latent does not exist: {latent}",
+                           {"path": str(latent)})
+        return _latent_tail_canvas(Path(latent))
+
+    default_width, default_height = DEFAULT_CANVAS
+    return width if width is not None else default_width, \
+        height if height is not None else default_height
 
 
 def resolve_prompt(prompt: str | None, prompt_file: Path | None) -> tuple[str, str | None]:
@@ -762,7 +873,7 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
     """
     prompt, prompt_file = resolve_prompt(args.prompt, args.prompt_file)
     check_mode(getattr(args, "mode", None), args.image, args.end_image)
-    width, height = resolve_canvas(args.image, args.width, args.height)
+    width, height = resolve_canvas(args.image, args.latent, args.width, args.height)
     return RunSpec(
         prompt=prompt, width=width, height=height,
         duration=args.duration, steps=args.steps, seed=args.seed,
@@ -770,6 +881,7 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
         checkpoint_dir=args.checkpoint_dir,
         no_checkpoint=getattr(args, "no_checkpoint", False),
         image=args.image, end_image=args.end_image,
+        latent=args.latent, save_latent_tail=args.save_latent_tail,
         preview_every=args.preview_every, preview_stem=args.preview_stem,
         preview_decoder=args.preview_decoder,
         keep_raw=getattr(args, "keep_raw", False),
@@ -832,6 +944,93 @@ def load_keyframes(spec: RunSpec) -> tuple[list, tuple[str, ...]]:
                 {"patch": "patches/0001-keyframe-masked-scatter.patch"},
             )
     return images, tuple(anchors)
+
+
+def load_latent_tail(spec: RunSpec) -> tuple[object | None, tuple[int, ...]]:
+    """Read a previous scene's latent tail, and the anchors that place it on this run's clock.
+
+    The sibling of `load_keyframes`, and its replacement rather than its companion: a latent tail
+    fills the same conditioning block a keyframe would, so `RunSpec.__post_init__` refuses the two
+    together and `run_generate` takes these anchors *instead of* the keyframe ones.
+
+    Nothing is converted. The rows were written straight out of `_decode_video` — patchified,
+    normalized `(latent - mean) / std`, float32 — which is exactly the space `_encode_keyframes`
+    produces, so they go into `condition_latent_rows` as they come off the disk (spec §1.2).
+
+    The anchors come from the file's own `pinned_pixel_indices` rather than being recomputed here:
+    the grid arithmetic lives in `h3_48gb.pipeline.latent_tail_pixel_indices`, once, on the
+    writing side. Recomputing it on the reading side is how two copies of a formula drift.
+
+    Returns:
+        ``(rows, anchors)``, or ``(None, ())`` when the run has no ``--latent``.
+    """
+    if spec.latent is None:
+        return None, ()
+
+    # Imported here, not at module scope: a text-only run must not pull in mlx (and upstream with
+    # it) merely because this module was imported. Same rule `load_keyframes` follows.
+    import mlx.core as mx
+
+    from h3_48gb.pipeline import LATENT_TAIL_FORMAT, LATENT_TAIL_META_KEY, latent_tail_pixel_indices
+
+    path = Path(spec.latent)
+    try:
+        arrays, metadata = mx.load(str(path), return_metadata=True)
+        meta = json.loads(metadata[LATENT_TAIL_META_KEY])
+        rows = arrays["video_tail"]
+        anchors = tuple(int(index) for index in meta["pinned_pixel_indices"])
+        canvas = [int(value) for value in meta["canvas"]]
+        rows_per_frame = int(meta["rows_per_frame"])
+        version = int(meta["format"])
+    except Exception as exc:            # noqa: BLE001 -- every way this file can be wrong
+        raise CliError(
+            "latent_unreadable",
+            f"--latent could not be read as a latent tail: {path} ({exc}). It must be a file "
+            f"written by --save-latent-tail.",
+            {"path": str(path)},
+        ) from exc
+
+    if version != LATENT_TAIL_FORMAT:
+        raise CliError(
+            "latent_unreadable",
+            f"--latent is format {version}, but this build writes and reads format "
+            f"{LATENT_TAIL_FORMAT}: {path}",
+            {"path": str(path), "format": version})
+    # Refused here rather than by the pipeline's own shape check, which is correct but fires only
+    # after the text encoder has loaded. The canvas is the one thing a chain cannot change
+    # mid-way, and it is knowable in the first second.
+    if canvas != [spec.width, spec.height]:
+        raise CliError(
+            "latent_canvas_mismatch",
+            f"--latent was saved at {canvas[0]}x{canvas[1]} but this run asks for "
+            f"{spec.width}x{spec.height}. A latent tail cannot cross a change of resolution — "
+            f"pass --width {canvas[0]} --height {canvas[1]}, or start the scene from a keyframe.",
+            {"path": str(path), "latent_canvas": canvas, "run_canvas": [spec.width, spec.height]})
+    # `pinned_pixel_indices` must be the *one* set of anchors a tail of `len(anchors)` latent
+    # frames can have -- `latent_tail_pixel_indices`, the same formula the writing side used
+    # (spec §1.3). A file whose anchors were hand-edited, truncated, or written by a build with
+    # different grid arithmetic would otherwise pin the tail's rows to pixel frames on the next
+    # scene's timeline that do not correspond to any real position -- silently, since a latent has
+    # no timestamp of its own to check against. This is a different failure from
+    # `latent_tail_off_grid` (`RunSpec.__post_init__`, which refuses a *requested* tail length
+    # that is not `5m + 2` before any file exists) -- here the length can be perfectly valid and
+    # the *anchors* are simply not what that length implies, which only a file already on disk can
+    # exhibit.
+    expected_anchors = tuple(latent_tail_pixel_indices(len(anchors)))
+    if anchors != expected_anchors:
+        raise CliError(
+            "latent_anchors_off_grid",
+            f"--latent's pinned_pixel_indices are {list(anchors)}, but a tail of {len(anchors)} "
+            f"latent frames belongs at {list(expected_anchors)} on the next scene's own grid: "
+            f"{path}. Hand-edited, or written by a different build.",
+            {"path": str(path), "anchors": list(anchors), "expected": list(expected_anchors)})
+    if rows.shape[0] != len(anchors) * rows_per_frame:
+        raise CliError(
+            "latent_unreadable",
+            f"--latent holds {rows.shape[0]} rows but its metadata describes {len(anchors)} "
+            f"latent frames of {rows_per_frame} rows: {path}",
+            {"path": str(path)})
+    return rows, anchors
 
 
 def run_dry(spec: RunSpec) -> dict:
@@ -915,6 +1114,12 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
     try:
         # Load conditioning keyframes if provided.
         images, keyframe_anchors = load_keyframes(spec)
+        # ...or the previous scene's latent tail, which fills the same block. `RunSpec` has
+        # already refused both at once, so this can only replace an empty tuple — but it replaces
+        # rather than extends deliberately: the anchors belong to the rows they place.
+        condition_latent_rows, latent_anchors = load_latent_tail(spec)
+        if condition_latent_rows is not None:
+            keyframe_anchors = latent_anchors
 
         # `verbose` here is not one of h3_48gb.checkpoint's own kwargs — it is upstream's own
         # `MiniMaxH3Pipeline.__call__` parameter, which `CheckpointingPipeline.__call__` also reads
@@ -929,7 +1134,12 @@ def run_generate(spec: RunSpec, pipeline_factory=None, save_mp4_fn=None, save_wa
                       preview_every=spec.preview_every,
                       preview_stem=str(preview_stem) if spec.preview_every else None,
                       preview_decoder=spec.preview_decoder,
-                      images=images or None, keyframe_anchors=keyframe_anchors)
+                      images=images or None, keyframe_anchors=keyframe_anchors,
+                      condition_latent_rows=condition_latent_rows,
+                      # Fork-only, popped before upstream's signature is bound — so, like
+                      # `preview_*`, they stay out of the run's identity digest.
+                      save_latent_tail=spec.save_latent_tail,
+                      latent_tail_stem=str(stem) if spec.save_latent_tail else None)
     except CheckpointMismatch as exc:
         # The message from h3_48gb.checkpoint names the file and the fields that differ, but a
         # user reading it has no way to construct that filename themselves — so name the flag.

@@ -39,6 +39,20 @@ project directory" gate. Never touches a scene's own `clip_path` (`assembly/retr
 those; `scenes/<idx>/retry` re-extracts a keyframe from the *previous* scene's clip, not from
 `keyframes/`), `final.mp4`, `project.json`, `track/`, or the job's own logs.
 
+**The chain rides a latent tail, not a PNG keyframe** (wave "перенос латента", task 5;
+`docs/FEASIBILITY-latent-handoff.md` §1.4/§3, схема A). A scene with `idx > 0` that is not
+`fresh_start` is submitted with `--latent <the previous scene's own tail>` instead of `--image`,
+and without `SCENE_I2V_INSTRUCTION` -- that sentence announces a picture the request no longer
+carries. Such a scene asks for `OVERLAP_PIXEL_FRAMES` more frames than it delivers (its render
+reproduces the tail it was conditioned on) and hands them straight back to `_drop_head_frames`, so
+`web.build_clip_scenes` snaps its promised duration onto a `17k` grid rather than `17k + 5` (§4.1);
+the number of head frames each scene actually drops is recorded on the scene itself
+(`head_drop_frames`), not re-derived from its index. The keyframe machinery stays in place and is
+still reached three ways: scene 0 with an uploaded `start_image`, a future illustrator-drawn frame,
+and the fallback for a chained scene whose tail is missing -- the last of which is capped at
+`MAX_CONSECUTIVE_KEYFRAME_FALLBACKS` in a row so a systematically broken `--save-latent-tail`
+fails loudly instead of degrading a whole night back to keyframes.
+
 **No `mlx` import, ever** -- same discipline as `h3_48gb.worker`/`h3_48gb.songrun` (see their own
 module docstrings): this module runs inside the worker process, which sits idle for days between
 30+ GB generations. Every subprocess this module drives is `ffmpeg`/`ffprobe`, never MLX, and a
@@ -129,6 +143,67 @@ SCENE_I2V_INSTRUCTION = (
     "For the target video, at 0.00 seconds into the target video, "
     "<Picture 1> (from [Shot 1]) is fully referenced."
 )
+
+# -- Latent handoff (wave "перенос латента", task 5): the scene chain's own constants -------------
+#
+# `docs/FEASIBILITY-latent-handoff.md` §1.3/§3, схема A. Everything below is `m = 1` -- the tail
+# Motion-Context itself defaults to ("22 видеокадра ≈ 1 с"), the point the wave's own live A/B was
+# run at, and the only value the night of 2026-08-27 ships with.
+#
+# **All three are local constants, imported from nothing.** `h3_48gb.pipeline` (which actually
+# writes the tail) has `import mlx.core` at module scope, and this module's own docstring ("No
+# `mlx` import, ever") forbids acquiring that import graph in a process that sits idle for days
+# between generations -- so the numbers are duplicated here, exactly the way `web.py` duplicates
+# H3's frame grid for the same reason. `tests/test_latent_chain.py` checks the two copies against
+# each other, so a drift is a failing test rather than a lost night.
+
+#: The `m` of the tail formulas below (`5m + 2` latent frames, `17m + 5` pixel frames). Named so
+#: the two constants that follow read as arithmetic instead of as magic numbers.
+_SCENE_LATENT_TAIL_CHUNKS = 1
+
+#: How many *latent* frames a scene saves for the next one -- `--save-latent-tail N`, `N = 5m + 2`
+#: (2, 7, 12, 17, ... -- `cli.py`'s own `__post_init__` refuses anything else). This is the number
+#: that goes on the command line.
+SCENE_LATENT_TAIL_FRAMES = 5 * _SCENE_LATENT_TAIL_CHUNKS + 2
+
+#: How many *pixel* frames those latent frames cover -- `17m + 5`, the row `{5, 22, 39, 56}` of
+#: spec §1.3. Load-bearing twice over: a chained scene asks for this many frames **on top of** what
+#: it delivers (the head of its render reproduces the tail it was conditioned on), and
+#: `_drop_head_frames` cuts exactly this many back off before the concat. `web._SCENE_LATENT_
+#: OVERLAP_FRAMES` is the same number on the timeline side -- that is what makes a chained scene's
+#: delivered duration land on `17k` rather than `17k + 5` (§4.1).
+OVERLAP_PIXEL_FRAMES = 17 * _SCENE_LATENT_TAIL_CHUNKS + 5
+
+#: What `_submit_next_scene` writes as a scene's own `head_drop_frames` when the previous scene's
+#: latent tail is missing and the chain falls back to the old keyframe path (P0-4). **Five, not
+#: one, and not `OVERLAP_PIXEL_FRAMES`:** a keyframe duplicates exactly *one* head frame, so 22
+#: would cut real picture -- but the scene's stored duration was snapped onto the *chained* grid
+#: (`17k`, `web._snap_scene_duration`), which is not a length H3 can render, so `align_num_frames`
+#: rounds the request up by exactly 5 frames. Dropping `1 duplicate + 4` therefore lands the
+#: delivered clip back on the `17k` the timeline was promised, to the frame.
+KEYFRAME_FALLBACK_HEAD_DROP_FRAMES = 5
+
+#: How many keyframe fallbacks in a row `_submit_next_scene` tolerates before refusing outright
+#: (P0-4). One or two missing tails is a scene generated before this wave, a full disk, an
+#: interrupted run -- honest local degradation. Three in a row is not local: it means
+#: `--save-latent-tail` is systematically not producing files, and continuing would silently turn
+#: the whole night back into the keyframe chain this wave exists to get off (and, worse, one that
+#: also overshoots its own promised durations by 17 frames a scene). Refusing fails one scene
+#: loudly instead.
+MAX_CONSECUTIVE_KEYFRAME_FALLBACKS = 3
+
+#: `h3_48gb.pipeline.LATENT_TAIL_SUFFIX`, duplicated for the same import reason as everything else
+#: in this block -- the filename `pipeline._save_latent_tail` writes next to a run's own output,
+#: appended to that run's `output_stem`.
+LATENT_TAIL_SUFFIX = "-latent-tail.safetensors"
+
+#: MiniMax-H3's own renderable frame grid (`17j + 5`), duplicated from
+#: `upstream.minimax_h3_mlx.packing` for the same reason `web.py` duplicates it -- `align_num_frames`
+#: rounds any other request up to the next point on it. Used by `_scene_generate_args` to refuse a
+#: chained scene whose request would land off it.
+_H3_FRAMES_PER_CHUNK = 17
+_H3_LATENTS_PER_CHUNK = 5
+
 
 #: Task brief: "для kind=clip длительность final == длительность трека ±0.5 с". Applied to every
 #: `audio_mode` whose final audio *is* the track (`"song"`/`"mix"`), not only `kind == "clip"` --
@@ -234,60 +309,109 @@ def _has_audio_stream(path, *, run) -> bool:
 # -- P0-2 (боевые ворота 2026-08-19): drop a chaining scene's own duplicate/corrupted frame 0 -----
 
 
-def _chaining_scene_indices(scenes) -> list[int]:
-    """Which of `scenes` need their own clip's frame 0 dropped before assembly -- every scene after
-    the first (design spec, "Клипы": "Первая сцена: t2v (или i2v, если ... загружен стартовый
-    кадр)" -- every scene *after* scene 0 is chained off the previous scene's own automatic
-    keyframe, scene 0 never is, regardless of whether it happens to be i2v off an uploaded
-    `start_image`). This is the "plan" half of the fix, kept as a pure function deliberately: a
-    test can assert exactly which indices it names without spinning up any `ffmpeg` call at all.
+def _scene_head_drop_frames(scene: dict) -> int:
+    """How many frames of `scene`'s own clip head are a reproduction of the scene *before* it, and
+    must be cut before the concat -- read off the scene's own `head_drop_frames` field, which
+    `_submit_next_scene` writes at submit time (latent-handoff wave, task 5).
+
+    Three values in practice, and the field is about this scene's **входе**, never its tail:
+
+    * `OVERLAP_PIXEL_FRAMES` (22) -- the scene started from the previous scene's own latent tail
+      and its render reproduces all 22 pixel frames of it;
+    * `KEYFRAME_FALLBACK_HEAD_DROP_FRAMES` (5) -- the tail was missing and the chain fell back to a
+      PNG keyframe: one duplicated frame plus the four `align_num_frames` added on top of a
+      `17k` duration (see that constant's own docstring);
+    * `0` -- scene 0 and every `fresh_start` scene: they render from text (or an uploaded start
+      frame) and duplicate nothing at all.
+
+    **A scene with no such field at all falls back to the pre-wave behaviour, per index** -- 1 for
+    a chaining scene, 0 for scene 0, exactly what `_drop_first_frame` did before this wave existed.
+    That is not a convenience: `project.json` files from the night-3 and "Амазонки" runs carry no
+    `head_drop_frames` anywhere, and re-running `assemble.run` over one of them has to reproduce
+    the same `final.mp4` byte for byte, not quietly stop trimming (idx>0 defaulting to 0) or trim
+    scene 0 (a flat default of 1).
     """
-    return sorted(scene["idx"] for scene in scenes if scene["idx"] > 0)
+    value = scene.get("head_drop_frames")
+    if value is None:
+        return 1 if scene["idx"] > 0 else 0
+    return int(value)
 
 
-def _drop_first_frame(clip_path, out_path: Path, *, run) -> Path:
-    """A copy of `clip_path` with its own frame 0 removed -- the fix for P0-2 (боевые ворота
-    2026-08-19): a chaining scene's frame 0 is *meant* to duplicate the automatic keyframe the
-    previous scene's own clip already ended on (`_extract_keyframe`'s own "кадр из предпоследней
-    секунды предыдущего клипа"), but the repro landed an i2v run's own frame 0 corrupted (RGB
+def _chaining_scene_indices(scenes) -> list[int]:
+    """Which of `scenes` need frames cut off their own clip's head before assembly -- every scene
+    whose `_scene_head_drop_frames` is greater than zero.
+
+    Before the latent-handoff wave this was the literal `idx > 0` (design spec, "Клипы": every
+    scene *after* scene 0 is chained off the previous scene's own automatic keyframe, and its own
+    frame 0 duplicates it -- P0-2, боевые ворота 2026-08-19). It is no longer an index question:
+    a `fresh_start` scene has `idx > 0` and duplicates nothing, a latent-chained scene duplicates
+    22 frames rather than one, and both facts live on the scene itself. Still a pure function,
+    deliberately: a test can assert exactly which indices it names with no `ffmpeg` call at all.
+    """
+    return sorted(scene["idx"] for scene in scenes if _scene_head_drop_frames(scene) > 0)
+
+
+def _drop_head_frames(clip_path, out_path: Path, frames: int, *, run) -> Path:
+    """A copy of `clip_path` with its first `frames` frames removed.
+
+    **Why anything is dropped at all.** Originally P0-2 (боевые ворота 2026-08-19), one frame: a
+    chaining scene's frame 0 is *meant* to duplicate the automatic keyframe the previous scene's
+    own clip already ended on, but the repro landed an i2v run's own frame 0 corrupted (RGB
     banding/blocking) instead -- squarely on the one frame most likely to sit right on the visible
-    cut between two scenes. Dropping it does not reopen the seam: the cut becomes "scene i's own
-    last frame -> scene i+1's own *second* frame", which reads as the identical cut to a human,
-    since frame 0 and frame 1 of an i2v run are meant to look like the same reference picture held
-    for a beat.
+    cut between two scenes. Since the latent-handoff wave the same call also carries the real
+    arithmetic of the chain: a scene conditioned on the previous scene's latent tail re-renders all
+    `OVERLAP_PIXEL_FRAMES` of it, and those frames are the previous scene's picture, not this
+    one's. Dropping them does not reopen the seam -- the cut becomes "scene i's own last frame ->
+    scene i+1's own first *new* frame", which is exactly the cut the timeline was built for.
+
+    The count is never guessed from the picture: it is known before the job is even submitted
+    (`head_drop_frames`, written by `_submit_next_scene`), the same way both ComfyUI projects in
+    the recon do it -- no pixel-level seam detection anywhere.
 
     Re-encoded to the same profile every other step in this module uses (crf 18/yuv420p/aac), so
     the file this writes needs no further re-encode wherever `run` uses it downstream. Audio is
-    carried through unmodified via an *optional* map (`0:a:0?`) -- a scene clip may have no audio
-    track at all (`_has_audio_stream`'s own precondition, checked separately later in `run`), and
-    this step must not fail over a stream that was simply never there.
+    kept via an *optional* map (`0:a:0?`) -- a scene clip may have no audio track at all
+    (`_has_audio_stream`'s own precondition, checked separately later in `run`), and this step
+    must not fail over a stream that was simply never there -- **and it is trimmed in lockstep
+    with the picture** (`atrim` by the same `frames/24` seconds). Carrying the audio through
+    unmodified was the night-4 assembly failure (2026-08-27, live): every trimmed clip held
+    22/24 s more audio than video, the concat demuxer padded each segment to its longest stream,
+    and 33 seams of duplicated freeze-frames added +29.9 s -- straight past
+    `DURATION_TOLERANCE_SECONDS` after a full night of GPU. The overlap's audio belongs to the
+    previous scene's picture exactly like the overlap's frames do: both go together.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(clip_path),
-           "-vf", "trim=start_frame=1,setpts=PTS-STARTPTS",
+           "-vf", f"trim=start_frame={frames},setpts=PTS-STARTPTS",
+           "-af", f"atrim=start={frames / 24},asetpts=PTS-STARTPTS",
            "-map", "0:v:0", "-map", "0:a:0?",
            "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "192k", str(out_path)]
-    _run_ffmpeg(cmd, run, f"ffmpeg first-frame drop ({clip_path})")
+    _run_ffmpeg(cmd, run, f"ffmpeg head-frame drop ({frames} frames, {clip_path})")
     return out_path
 
 
 def _build_video_clip_paths(scenes, raw_clip_paths, workdir: Path, *, run) -> list[str]:
     """The path list every video-bearing concat call in `run` uses in place of the scenes' own raw
-    `clip_path`s -- scene 0's own clip passed through untouched, every chaining scene's clip
-    (`_chaining_scene_indices`) replaced with `_drop_first_frame`'s own trimmed copy. Kept separate
-    from the raw `clip_paths` list `run` also keeps around: the audio-only concat/preflight
-    (`"mix"` mode) reads the clips' own *original* audio, never this trimmed copy, since P0-2 is a
-    picture-only fix -- nothing about a chaining scene's own audio track duplicates anything.
+    `clip_path`s -- every scene with a non-zero `_scene_head_drop_frames` replaced with
+    `_drop_head_frames`' own trimmed copy, everything else (scene 0, every `fresh_start` scene)
+    passed through **untouched, with no re-encode at all**: a second libx264 pass buys nothing when
+    zero frames are being removed, and costs generation-grade minutes and a generation of quality
+    on every unchained scene (seven of them in the night-4 layout).
+
+    Kept separate from the raw `clip_paths` list `run` also keeps around: the audio-only
+    concat/preflight (`"mix"` mode) reads the clips' own *original* audio, never this trimmed copy
+    -- this is a picture-only correction, and nothing about a chained scene's own audio track
+    duplicates the scene before it (spec §2: there is no audio-latent handoff, deliberately).
     """
-    chaining = set(_chaining_scene_indices(scenes))
     paths = []
     for scene, raw_path in zip(scenes, raw_clip_paths):
-        if scene["idx"] not in chaining:
+        drop = _scene_head_drop_frames(scene)
+        if drop <= 0:
             paths.append(raw_path)
             continue
         out_path = workdir / f"scene-{scene['idx']:03d}-trimmed.mp4"
-        paths.append(str(_drop_first_frame(raw_path, out_path, run=run)))
+        paths.append(str(_drop_head_frames(raw_path, out_path, drop, run=run)))
     return paths
 
 
@@ -581,12 +705,14 @@ def run(project_path, *, run=subprocess.run, log=None) -> Path:
     render whose picture and song do not line up. `audio_mode == "clips"` skips all of this: there
     is no track to measure against, so the concatenated clips' own combined length is the answer.
 
-    **P0-2 (боевые ворота 2026-08-19): every measurement above already reflects the frame-0 drop.**
-    `video_clip_paths` (`_build_video_clip_paths`) replaces every chaining scene's raw clip with a
-    copy that has had its own frame 0 removed *before* the first `_concat`/`_ffprobe_duration` call
-    in this function ever runs -- the shortfall this measures, and the freeze-frame pad it computes
-    to close it, are both already sized against the *actual*, post-drop frame count, not the
-    pre-drop one. Nothing downstream needs a separate correction for the dropped frames.
+    **P0-2 (боевые ворота 2026-08-19), extended by the latent-handoff wave: every measurement
+    above already reflects the head-frame drop.** `video_clip_paths` (`_build_video_clip_paths`)
+    replaces every chained scene's raw clip with a copy that has had its own `head_drop_frames`
+    (22 for a latent-chained scene, 5 for a keyframe fallback, 0 for scene 0 and every
+    `fresh_start` scene) removed *before* the first `_concat`/`_ffprobe_duration` call in this
+    function ever runs -- the shortfall this measures, and the freeze-frame pad it computes to
+    close it, are both already sized against the *actual*, post-drop frame count, not the pre-drop
+    one. Nothing downstream needs a separate correction for the dropped frames.
 
     **I4 (fix round 1, 2026-08-18 review): the same tolerance check is repeated against
     `final.mp4` itself**, after the mux step, not only against the pre-mux, video-only concat --
@@ -632,10 +758,10 @@ def run(project_path, *, run=subprocess.run, log=None) -> Path:
 
     # P0-2 (боевые ворота 2026-08-19): every concat call below that touches the *picture* uses
     # `video_clip_paths`, not the scenes' own raw `clip_paths` -- a chaining scene's own clip has
-    # had its frame 0 dropped (`_build_video_clip_paths`/`_drop_first_frame`). Audio-only work
-    # (`_has_audio_stream`'s preflight, the "mix"-mode clip-audio concat below) still reads the
-    # untouched `clip_paths` -- this fix is picture-only, nothing about a chaining scene's own
-    # audio track duplicates anything the way frame 0 does.
+    # had its own `head_drop_frames` removed (`_build_video_clip_paths`/`_drop_head_frames`).
+    # Audio-only work (`_has_audio_stream`'s preflight, the "mix"-mode clip-audio concat below)
+    # still reads the untouched `clip_paths` -- this is picture-only, nothing about a chained
+    # scene's own audio track duplicates the scene before it (spec §2: no audio-latent handoff).
     video_clip_paths = _build_video_clip_paths(scenes, clip_paths, assembly_dir / "trim", run=run)
 
     if audio_mode in ("song", "mix"):
@@ -959,7 +1085,23 @@ def _scene_wallclock_estimate_seconds(width: int, height: int, duration: float,
     return diffusion + overhead
 
 
-def _scene_generate_args(scene: dict, keyframe, scenes_dir: Path) -> tuple[list[str], str]:
+def _latent_tail_path_for(clip_path) -> Path:
+    """Where the latent tail of the run that produced `clip_path` lives.
+
+    **Derived, never stored** (P0-3(а), review): `worker._handle_project_scene_result` writes a
+    scene's own `clip_path` as `f"{job.output_stem}.mp4"` (`worker.py:628`), and
+    `pipeline._save_latent_tail` writes the tail as `f"{output_stem}{LATENT_TAIL_SUFFIX}"` -- the
+    same stem, decided by `RunSpec.output_stem` before either file exists. A third `project.json`
+    field holding the path would be one more thing to keep in sync across `queue`'s own stem
+    rewrites, a retry's new stem, and `invalidate_scene_chain`; deriving it means the tail path
+    dies exactly when `clip_path` does, which is precisely the invalidation semantics we want and
+    already have for free.
+    """
+    return Path(str(clip_path)[:-4] + LATENT_TAIL_SUFFIX)
+
+
+def _scene_generate_args(scene: dict, keyframe, scenes_dir: Path, *, latent=None,
+                          save_latent_tail: bool = True) -> tuple[list[str], str]:
     """The `args`/`output_stem` pair for one scene's `kind="generate"` job -- `--width`/`--height`
     always explicit (module docstring: "`advance_project` never queries the CLI for a scene's
     canvas"), `--image` only when a keyframe exists (scene 0 with no uploaded start frame gets
@@ -992,6 +1134,32 @@ def _scene_generate_args(scene: dict, keyframe, scenes_dir: Path) -> tuple[list[
     Always carries `--turbo-strength` set to `SCENE_TURBO_STRENGTH` -- see that constant's own
     docstring for the calibration; `cli.py`'s own `--turbo-strength` default (1.0) is untouched,
     so a lone `h3 generate` a human runs by hand is unaffected.
+
+    **`latent=` (latent-handoff wave, task 5, схема A of spec §3) replaces `--image`, never joins
+    it.** A chained scene continues from the previous scene's own raw video latent, so it gets
+    `--latent <path>` and, deliberately, **no** `SCENE_I2V_INSTRUCTION`: that sentence promises
+    "`<Picture 1>` ... is fully referenced" and there is no picture in the request any more.
+    `cli.py` refuses `--latent` together with `--image` outright (`latent_with_image`), so the two
+    can never both be passed by accident; `keyframe` is expected to be `None` whenever `latent` is
+    given, and this function does not attempt to reconcile them.
+
+    **A latent request asks for `OVERLAP_PIXEL_FRAMES` more frames than the scene delivers.** The
+    head of the render reproduces the tail it was conditioned on, and `_drop_head_frames` cuts
+    exactly those before the concat, so `scene["duration"]` (what `project.json` stores, what
+    `web.build_clip_scenes` promised the track) is the *delivered* length and the `--duration` this
+    builds is `delivered + OVERLAP_PIXEL_FRAMES`. Computed in **frames** and divided once, not
+    added as `22/24` seconds, so the number on the command line is exactly the grid point and not
+    a float that rounds to its neighbour.
+
+    That request is then checked against H3's own `17j + 5` grid and refused (`AssembleError`) if
+    it misses -- **the grid, not a 10-second ceiling** (P1-4). A chained scene at the top of the
+    duration range legitimately asks for 260 frames (10.833s): `cli.py` has no upper duration
+    bound, and a request off the grid is the actual defect, because `align_num_frames` would round
+    it up silently and hand back a clip longer than the timeline budgeted for.
+
+    `save_latent_tail=True` (the default) appends `--save-latent-tail SCENE_LATENT_TAIL_FRAMES`.
+    Every scene but the last gets it, `fresh_start` scenes included -- a broken chain still has to
+    feed the scene after it (spec §3, last paragraph).
     """
     idx = scene["idx"]
     width, height = DEFAULT_SCENE_CANVAS
@@ -1008,14 +1176,32 @@ def _scene_generate_args(scene: dict, keyframe, scenes_dir: Path) -> tuple[list[
     prompt = scene["prompt"]
     if keyframe is not None and not prompt.lstrip().startswith(SCENE_I2V_INSTRUCTION):
         prompt = f"{SCENE_I2V_INSTRUCTION}\n\n{prompt}"
+    if latent is not None:
+        requested_frames = round(scene["duration"] * ASSEMBLY_FPS) + OVERLAP_PIXEL_FRAMES
+        if (requested_frames - _H3_LATENTS_PER_CHUNK) % _H3_FRAMES_PER_CHUNK:
+            raise AssembleError(
+                f"scene {idx} would ask for {requested_frames} frames "
+                f"({scene['duration']:.4f}s delivered + {OVERLAP_PIXEL_FRAMES} carried over from "
+                f"the latent tail), which is not on H3's own {_H3_FRAMES_PER_CHUNK}j+"
+                f"{_H3_LATENTS_PER_CHUNK} frame grid -- align_num_frames would round it up and "
+                f"hand back a longer clip than the timeline budgeted for. A chained scene's own "
+                f"duration must be a multiple of {_H3_FRAMES_PER_CHUNK} frames "
+                f"(web._snap_scene_duration's chained grid).")
+        duration_arg = str(requested_frames / ASSEMBLY_FPS)
+    else:
+        duration_arg = str(scene["duration"])
     args = ["generate", prompt,
             "--width", str(width), "--height", str(height),
-            "--duration", str(scene["duration"]),
+            "--duration", duration_arg,
             "--turbo-strength", str(SCENE_TURBO_STRENGTH),
             "--tag", tag,
             "--outdir", str(scenes_dir)]
-    if keyframe is not None:
+    if latent is not None:
+        args += ["--latent", str(latent)]
+    elif keyframe is not None:
         args += ["--image", str(keyframe)]
+    if save_latent_tail:
+        args += ["--save-latent-tail", str(SCENE_LATENT_TAIL_FRAMES)]
     output_stem = str(Path(scenes_dir) / f"h3-{tag}-{width}x{height}")
     return args, output_stem
 
@@ -1065,6 +1251,33 @@ def _extract_keyframe(clip_path, dest_dir: Path, source_idx: int, *, run) -> Pat
 #: once `submit()` succeeds, or with `None` (scene reset to `"pending"`) if it raises -- never left
 #: on disk either way once `_submit_next_scene` returns.
 _SCENE_CLAIM_PLACEHOLDER_JOB_ID = "claiming"
+
+
+def _consecutive_keyframe_fallbacks(scenes, idx: int) -> int:
+    """How many scenes immediately *before* `idx` already fell back to a keyframe because their own
+    latent tail was missing -- walking backward while each scene's `head_drop_frames` is exactly
+    `KEYFRAME_FALLBACK_HEAD_DROP_FRAMES`, which is the on-disk record that a fallback happened.
+
+    The walk stops at anything else, and that is the point: scene 0, a `fresh_start` scene and a
+    normally chained latent scene all carry a different value (`0`, `0`, `OVERLAP_PIXEL_FRAMES`),
+    so a project that legitimately breaks its chain often never accumulates a streak. Only a real
+    run of consecutive failures -- the shape a systematically broken `--save-latent-tail` produces
+    -- reaches `MAX_CONSECUTIVE_KEYFRAME_FALLBACKS`.
+
+    A scene from before this wave has no `head_drop_frames` at all, so `_scene_head_drop_frames`'s
+    own retro default (1) is what the walk sees, and the streak stops there too -- an old project
+    resumed under new code never trips the refusal on the strength of its history.
+    """
+    count = 0
+    by_idx = {scene["idx"]: scene for scene in scenes}
+    cursor = idx - 1
+    while cursor >= 0:
+        scene = by_idx.get(cursor)
+        if scene is None or scene.get("head_drop_frames") != KEYFRAME_FALLBACK_HEAD_DROP_FRAMES:
+            break
+        count += 1
+        cursor -= 1
+    return count
 
 
 def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
@@ -1118,6 +1331,8 @@ def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
 
     try:
         keyframe = None
+        latent = None
+        head_drop_frames = 0
         # P0 fix (keyframe-chain defect, 2026-08-25 nightly run): `web.build_clip_scenes` stamps
         # `fresh_start: true` on a scenario scene whose cast or location changes from the one
         # before it (`docs/h3-prompt-system.md`, "Breaking the chain on a cast change") -- that
@@ -1133,8 +1348,43 @@ def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
             prev = _scene_by_idx(proj.scenes, idx - 1)
             prev_clip = prev.get("clip_path") if prev else None
             if prev_clip:
-                keyframe = _extract_keyframe(
-                    prev_clip, proj.path.parent / "keyframes", idx - 1, run=run)
+                # Latent-handoff wave, task 5 (spec §1.4/§3, схема A): the chain's normal input is
+                # the previous scene's own raw video-latent tail, written next to its clip by the
+                # same `output_stem` (`_latent_tail_path_for`). No `--image`, no keyframe
+                # extraction, no `keyframes/` directory, and none of the structural 1.5-second
+                # rewind `KEYFRAME_LEAD_SECONDS` costs every seam today.
+                tail = _latent_tail_path_for(prev_clip)
+                if tail.is_file():
+                    latent = tail
+                    head_drop_frames = OVERLAP_PIXEL_FRAMES
+                else:
+                    # P0-4: honest local degradation, but not an unlimited one. A tail can be
+                    # missing for reasons that are nobody's fault (a scene generated before this
+                    # wave, a full disk, an interrupted run) -- that scene falls back to the old
+                    # keyframe path and says so. Three of those in a row is a different animal:
+                    # `--save-latent-tail` is systematically producing nothing, and carrying on
+                    # would quietly turn the whole night back into the keyframe chain this wave
+                    # exists to leave. Checked *before* the ffmpeg work, so the refusal costs
+                    # nothing and cannot be confused with an extraction failure.
+                    streak = _consecutive_keyframe_fallbacks(proj.scenes, idx)
+                    if streak + 1 >= MAX_CONSECUTIVE_KEYFRAME_FALLBACKS:
+                        raise AssembleError(
+                            f"scene {idx}: the latent tail {tail} is missing, and this would be "
+                            f"fallback number {streak + 1} in a row -- --save-latent-tail is not "
+                            f"producing files at all, so the whole chain is silently degrading "
+                            f"back to keyframes (and overshooting every chained scene's own "
+                            f"promised duration by {_H3_FRAMES_PER_CHUNK} frames). Refusing "
+                            f"instead; fix the tail writing and retry this scene.")
+                    print(f"WARNING: scene {idx}: latent tail {tail} is missing -- falling back to "
+                          f"a keyframe extracted from {prev_clip} "
+                          f"({streak + 1} of {MAX_CONSECUTIVE_KEYFRAME_FALLBACKS} allowed in a "
+                          f"row); this scene will drop "
+                          f"{KEYFRAME_FALLBACK_HEAD_DROP_FRAMES} head frames instead of "
+                          f"{OVERLAP_PIXEL_FRAMES}",
+                          file=sys.stderr, flush=True)
+                    keyframe = _extract_keyframe(
+                        prev_clip, proj.path.parent / "keyframes", idx - 1, run=run)
+                    head_drop_frames = KEYFRAME_FALLBACK_HEAD_DROP_FRAMES
         elif idx == 0:
             # Design spec, "Клипы": "Первая сцена: t2v (или i2v, если у проекта загружен стартовый
             # кадр)". Task 1's schema has no formal `start_image` field -- reading it off
@@ -1147,7 +1397,13 @@ def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
                 keyframe = Path(start_image)
 
         scenes_dir = proj.path.parent / "scenes"
-        args, output_stem = _scene_generate_args(scene, keyframe, scenes_dir)
+        # Every scene but the last saves a tail for the scene after it -- `fresh_start` scenes
+        # included (spec §3: a broken chain still has to feed what follows it). The last scene has
+        # nobody to feed, and 331 kB (448x288) / 1.18 MB (896x512) per scene is not worth writing
+        # for nothing.
+        last_idx = max(other["idx"] for other in proj.scenes)
+        args, output_stem = _scene_generate_args(scene, keyframe, scenes_dir, latent=latent,
+                                                  save_latent_tail=idx != last_idx)
         note = scene_note(proj, idx)
         width, height = DEFAULT_SCENE_CANVAS
         estimate = {"seconds": _scene_wallclock_estimate_seconds(width, height, scene["duration"])}
@@ -1158,11 +1414,17 @@ def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
         proj.set_scene_status(idx, "pending", job_id=None)
         raise
 
+    # `head_drop_frames` rides the same one write that already records the keyframe (task 5): what
+    # this scene's own head duplicates is decided here, at submit time, and `run()` must not have
+    # to re-derive it from an index months later.
     proj.set_scene_status(idx, "running", job_id=job.id,
-                           keyframe_path=str(keyframe) if keyframe is not None else None)
+                           keyframe_path=str(keyframe) if keyframe is not None else None,
+                           head_drop_frames=head_drop_frames)
 
     return {"action": "submitted_scene", "idx": idx, "job_id": job.id,
-            "keyframe": str(keyframe) if keyframe is not None else None}
+            "keyframe": str(keyframe) if keyframe is not None else None,
+            "latent": str(latent) if latent is not None else None,
+            "head_drop_frames": head_drop_frames}
 
 
 def _submit_assembly(proj, queue_root, *, submit) -> dict:

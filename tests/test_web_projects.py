@@ -61,13 +61,35 @@ _THREE_SECTION_LYRICS = "[intro]\n" + _TWO_SECTION_LYRICS
 
 
 def _assert_scene_durations_on_h3_grid(scenes):
-    """Every scene's own `duration` already sits on H3's `17n + 5` frame grid (C1, final review) --
-    `round(duration * 24) % 17 == 5` is `align_num_frames`'s own fixed point, proving that the
-    pipeline's own upward rounding is a no-op against what `build_clip_scenes` promised, not a
-    silent stretch."""
+    """Every scene's own `duration` already sits on the H3 frame grid *that scene actually renders
+    on* (C1, final review; re-split by the latent-handoff wave, task 6) -- proving that the
+    pipeline's own upward rounding (`align_num_frames`) is a no-op against what `build_clip_scenes`
+    promised, not a silent stretch.
+
+    Two grids, because a chained scene requests more than it delivers (`docs/FEASIBILITY-latent-
+    handoff.md` §4.1):
+
+    * **scene 0 and every `fresh_start` scene** render from text or a picture, so what they request
+      *is* what they deliver: `round(duration * 24) % 17 == 5`, `align_num_frames`'s own fixed point.
+    * **a chained scene** starts from the previous scene's own latent tail, requests
+      `duration * 24 + web._SCENE_LATENT_OVERLAP_FRAMES` frames and hands the overlap back to
+      `assemble._drop_head_frames`: the *delivered* count is a plain multiple of 17, and it is the
+      *request* that must land on `17j + 5`. Both halves are asserted -- "delivered % 17 == 0"
+      alone would also pass for a scene whose request fell off H3's grid entirely.
+    """
     for s in scenes:
         frames = round(s["duration"] * 24)
-        assert frames % 17 == 5, f"scene {s['idx']} duration {s['duration']} is not on the H3 grid"
+        if s["idx"] > 0 and not s.get("fresh_start", False):
+            assert frames % 17 == 0, (
+                f"scene {s['idx']} is chained: it delivers {frames} frames, but a chained scene's "
+                f"own grid is 17k (its request, {frames + 22}, must land on 17j+5)")
+            assert (frames + web._SCENE_LATENT_OVERLAP_FRAMES - 5) % 17 == 0, (
+                f"scene {s['idx']}: request {frames + web._SCENE_LATENT_OVERLAP_FRAMES} is not on "
+                f"H3's own 17j+5 grid")
+        else:
+            assert frames % 17 == 5, (
+                f"scene {s['idx']} is not chained: it delivers {frames} frames, but its own grid "
+                f"is 17n+5")
 
 
 def _assert_scene_total_within_snap_tolerance(scenes, duration):
@@ -624,6 +646,152 @@ def test_snap_scene_duration_never_exceeds_scene_max_seconds():
     snapped, _carry = web._snap_scene_duration(9.9, 0.7)
     assert snapped <= web.SCENE_MAX_SECONDS
     assert snapped == pytest.approx(226 / 24, abs=1e-6)
+
+
+# == Задача 6, волна «перенос латента»: у сцепленной сцены своя сетка длительностей ================
+#
+# `docs/FEASIBILITY-latent-handoff.md` §4.1: сцена, которая стартует с латентного хвоста
+# предыдущей, ПОЛУЧАЕТ на `OVERLAP_PIXEL_FRAMES = 22` кадра больше, чем отдаёт в сборку --
+# запрос `R = D + 22` обязан лежать на H3-сетке `17j + 5`, значит доставляемое
+# `D = R - 22 = 17(j+1) - 17 - ... = 17k` кратно 17 БЕЗ остатка 5. Без этой правки каждая
+# сцепленная сцена ночного прогона отдаёт на 0.917 с меньше обещанного (33 сцены * 0.917 =
+# 30.3 с против `assemble.DURATION_TOLERANCE_SECONDS` = 0.5 с) -- сборка падает
+# детерминированно.
+
+
+def _night4_layout():
+    """Реальная раскладка ночного прогона 4 -- 40 сцен, 7 из них `fresh_start`
+    (`[0, 3, 5, 24, 25, 26, 28]`), трек 304.880 с. Геометрия снята с одобренного сценария
+    (`tests/data/night4-scenario-layout.json`, см. его `_provenance`), промпты заменены
+    заглушками: под тестом арифметика сетки, а не текст.
+    """
+    raw = json.loads((Path(__file__).resolve().parent / "data" /
+                      "night4-scenario-layout.json").read_text(encoding="utf-8"))
+    return raw["track_duration"], raw["scenario_scenes"]
+
+
+def test_snap_scene_duration_puts_a_chained_scene_on_the_multiple_of_seventeen_grid():
+    """(а) Прямой замер: одна и та же сырая длительность снапается на РАЗНЫЕ сетки в зависимости
+    от того, стартует сцена с латентного хвоста или нет. 7.5 с сцепленной сцены -> 170 кадров
+    (17*10), той же несцепленной -> 175 (17*10+5). Пинится именно значение, а не «оба на какой-то
+    сетке»: сетка `17k+5` тоже «какая-то сетка», и мутация «сетка 17k+5 для всех» её бы прошла.
+    """
+    chained, chained_carry = web._snap_scene_duration(7.5, 0.0, chained=True)
+    plain, plain_carry = web._snap_scene_duration(7.5, 0.0, chained=False)
+
+    assert round(chained * 24) == 170
+    assert round(chained * 24) % 17 == 0
+    assert round(plain * 24) == 175
+    assert round(plain * 24) % 17 == 5
+    # carry -- остаток, который телескопится в следующую сцену; снап вниз, значит он ровно
+    # «сколько эта сцена не добрала».
+    assert chained_carry == pytest.approx(7.5 - 170 / 24, abs=1e-9)
+    assert plain_carry == pytest.approx(7.5 - 175 / 24, abs=1e-9)
+
+
+def test_build_clip_scenes_gives_a_chained_scenario_scene_the_multiple_of_seventeen_grid():
+    """Тот же факт через публичную функцию: признак сцепленности (`idx > 0` И НЕ `fresh_start`)
+    берётся на месте снапа в `build_clip_scenes`, а не приходит параметром снаружи.
+    """
+    duration = 21.0
+    scenes = web.build_clip_scenes(_scenario_track(duration), scenario_scenes=[
+        _scenario_scene("a", 0.0, 7.0, "первая сцена", fresh_start=True),
+        _scenario_scene("b", 7.0, 14.0, "сцепленная сцена"),
+        _scenario_scene("c", 14.0, 21.0, "разрыв цепочки", fresh_start=True),
+    ])
+
+    assert [s["fresh_start"] for s in scenes] == [True, False, True]
+    assert round(scenes[1]["duration"] * 24) % 17 == 0, (
+        f"сцена 1 сцеплена -- её доставляемая длительность обязана быть кратна 17, "
+        f"получено {round(scenes[1]['duration'] * 24)} кадров")
+    assert [round(s["duration"] * 24) for s in scenes] == [158, 170, 175]
+    assert round(scenes[0]["duration"] * 24) % 17 == 5
+    assert round(scenes[2]["duration"] * 24) % 17 == 5
+    _assert_scene_durations_on_h3_grid(scenes)
+
+
+def test_build_clip_scenes_covers_the_real_night_four_layout_within_tolerance():
+    """(б) Покрытие на РЕАЛЬНОЙ раскладке ночи: 40 сцен, 33 сцепленных, 7 `fresh_start`, трек
+    304.880 с. Ревью пересчитало недобор на этой раскладке в 0.255 с -- это ровно финальный
+    `carry` телескопической суммы, и он обязан остаться внутри допусков (`web`
+    `_SNAPPED_COVERAGE_SHORTFALL_SECONDS` = 1.0 + 0.05, `assemble.DURATION_TOLERANCE_SECONDS`
+    = 0.5). Синтетика этого не ловит: провал появляется только на длинной цепочке, где ошибка
+    сетки копится сценa за сценой.
+    """
+    duration, scenario_scenes = _night4_layout()
+
+    scenes = web.build_clip_scenes(_scenario_track(duration), scenario_scenes=scenario_scenes)
+
+    assert len(scenes) == 40, "раскладка ночи не должна ни складываться, ни резаться"
+    assert [s["idx"] for s in scenes if s["fresh_start"]] == [0, 3, 5, 24, 25, 26, 28]
+    _assert_scene_durations_on_h3_grid(scenes)
+    shortfall = duration - sum(s["duration"] for s in scenes)
+    assert shortfall == pytest.approx(0.255, abs=0.05), (
+        f"недобор на ночной раскладке {shortfall:.3f} с -- ревью посчитало 0.255 с")
+    assert shortfall < assemble_module.DURATION_TOLERANCE_SECONDS, (
+        "недобор обязан лежать внутри допуска сборки, иначе ночь падает на "
+        "_pad_with_freeze_frame")
+
+
+def test_snap_scene_duration_clamps_a_short_chained_scene_up_onto_its_own_grid():
+    """(в) КРАЙ: секция 5.0 с на сцепленной сетке. Ближайшая точка ВНИЗ -- 119 кадров (4.958 с),
+    ниже `SCENE_MIN_SECONDS`, значит кламп толкает ВВЕРХ -- и обязан толкнуть на сцепленную
+    сетку (136 = 17*8), а не на 141 (17*8+5) чужой сетки. `carry` при этом уходит в МИНУС: сцена
+    забрала больше, чем ей было отпущено, и следующая обязана это увидеть.
+    """
+    snapped, carry = web._snap_scene_duration(5.0, 0.0, chained=True)
+
+    assert round(snapped * 24) == 136, (
+        f"кламп снизу обязан лечь на сцепленную сетку 17k, получено {round(snapped * 24)} кадров")
+    assert snapped >= web.SCENE_MIN_SECONDS
+    assert carry < 0, "перерасход обязан уехать в следующую сцену минусом, а не испариться"
+    assert carry == pytest.approx(5.0 - 136 / 24, abs=1e-9)
+
+
+def test_build_clip_scenes_absorbs_a_short_chained_scenes_negative_carry(tmp_path):
+    """(в), продолжение: тот же край в живом построении. Утверждается ФАКТИЧЕСКОЕ поведение --
+    сцены строятся, минусовой carry гасится следующей сценой, покрытие сходится ТОЧНО, а не
+    молча портится.
+    """
+    duration = 25.0
+    scenes = web.build_clip_scenes(_scenario_track(duration), scenario_scenes=[
+        _scenario_scene("a", 0.0, 10.0, "первая сцена", fresh_start=True),
+        _scenario_scene("b", 10.0, 15.0, "короткая сцепленная"),
+        _scenario_scene("c", 15.0, 25.0, "длинная сцепленная"),
+    ])
+
+    assert [round(s["duration"] * 24) for s in scenes] == [226, 136, 238]
+    _assert_scene_durations_on_h3_grid(scenes)
+    assert sum(s["duration"] for s in scenes) == pytest.approx(duration, abs=1e-9), (
+        "минусовой carry короткой сцены обязан быть списан со следующей, а не добавлен к треку")
+
+
+def test_build_clip_scenes_refuses_when_a_clamped_chained_scene_overshoots_the_track():
+    """(в), вторая половина: если гасить перерасход нечем (сцепленная сцена под клампом стоит
+    последней), суммарная длительность вылезает ЗА трек -- и это честный отказ
+    `ProjectSceneBuildError`, а не молча отгруженный таймлайн, который сборка потом не сможет
+    подрезать (`assemble.run` умеет только доклеивать freeze-frame).
+    """
+    with pytest.raises(web.ProjectSceneBuildError, match="frame grid"):
+        web.build_clip_scenes(_scenario_track(15.0), scenario_scenes=[
+            _scenario_scene("a", 0.0, 10.0, "первая сцена", fresh_start=True),
+            _scenario_scene("b", 10.0, 15.0, "короткая сцепленная"),
+        ])
+
+
+def test_web_does_not_import_mlx_or_the_pipeline_for_the_chained_grid():
+    """Контракт модуля (`web.py`'s own docstring: "No `mlx` import, ever"): константы сетки
+    сцепленной сцены обязаны быть СВОИ, а не импортированные из `h3_48gb.pipeline`, который на
+    уровне модуля тянет `mlx.core`. Смотрятся именно строки импорта (в комментариях и докстрингах
+    `h3_48gb.pipeline` упоминается законно и часто).
+    """
+    imports = [line.strip() for line in
+               (Path(web.__file__)).read_text(encoding="utf-8").splitlines()
+               if line.strip().startswith(("import ", "from "))]
+    assert not [ln for ln in imports if "mlx" in ln], imports
+    assert not [ln for ln in imports if "pipeline" in ln], imports
+    assert web._SCENE_LATENT_OVERLAP_FRAMES == 22
+    assert web._CHAINED_GRID_REMAINDER == 0
 
 
 # == Server fixtures ===============================================================================
@@ -2278,10 +2446,15 @@ def test_edit_scenario_duration_does_not_change_the_built_scenes_own_length(_ser
     `duration` `7.0 -> 6.0` still produced a built scene of `7.29s` -- the built length tracks the
     section span, not the edited field, whatever it says.
 
-    Both sections here span exactly `8.0s`, which lands precisely on H3's own frame grid with zero
-    carry (`8.0 * 24 == 192 == 17*11 + 5`) -- so the built duration is an *exact* `8.0`, not merely
-    "close to 8, not 6/9", which is what makes this assertion pin the actual mechanism rather than a
-    tolerance band both the edited and the derived value could fall inside.
+    Both sections here span exactly `8.0s`; both built durations are therefore *exact*, not merely
+    "close to 8, not 6/9", which is what makes these assertions pin the actual mechanism rather than
+    a tolerance band both the edited and the derived value could fall inside. The two exact values
+    differ because the two scenes render on different grids (latent-handoff wave, task 6,
+    `_assert_scene_durations_on_h3_grid`'s own docstring): scene 0 is not chained and `8.0 * 24 ==
+    192 == 17*11 + 5` is already a grid point, so it comes back as exactly `8.0`; scene 1 is chained
+    and delivers the largest multiple of 17 at or below 192 -- `187/24 ≈ 7.7917s`, with the request
+    it actually renders (`187 + 22 == 209 == 17*12 + 5`) back on H3's own grid. Neither is the
+    edited `duration` field, which is the whole point.
     """
     srv = _serve()
     pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
@@ -2303,9 +2476,10 @@ def test_edit_scenario_duration_does_not_change_the_built_scenes_own_length(_ser
     assert built[0]["duration"] == pytest.approx(8.0), (
         "built duration must come from the section span (8.0s), not the edited `duration` field "
         f"(6.0s): got {built[0]['duration']}")
-    assert built[1]["duration"] == pytest.approx(8.0), (
-        "built duration must come from the section span (8.0s), not the edited `duration` field "
-        f"(9.0s): got {built[1]['duration']}")
+    assert built[1]["duration"] == pytest.approx(187 / 24), (
+        "built duration must come from the section span (8.0s, snapped onto the chained scene's "
+        f"own 17k grid), not the edited `duration` field (9.0s): got {built[1]['duration']}")
+    _assert_scene_durations_on_h3_grid(built)
 
 
 # == I2 (fix round 2, 2026-08-19 review): approve-scenario must wait for a pending blur-save =======

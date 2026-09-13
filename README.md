@@ -32,11 +32,11 @@ different instruments, and the honest version of that is in
 [`docs/RESULTS.md`](docs/RESULTS.md)** — including the fact that the RSS trace never sampled the
 encoding phase at all, so the 28.2 GB and the 11.5 GB were never observed by the same tool.
 
-## The four modules, and the three source patches
+## The four modules, and the five source patches
 
 Everything this fork adds lives in `h3_48gb/`, applied to upstream from the outside — the four
 modules below. `upstream/` itself is a vendored clone, pinned to commit `fcd9e9b`, and carries
-exactly three source edits, all applied during setup below:
+exactly five source edits, all applied during setup below:
 
 * `patches/0001-keyframe-masked-scatter.patch`, without which keyframe runs die inside the text
   encoder. Text-only runs never reach it.
@@ -51,6 +51,25 @@ exactly three source edits, all applied during setup below:
   root cause: corrupted keyframes and tile-seam blocking in generated clips). `h3_48gb.framecheck`
   is defense in depth on top of this — every decoded clip, automatic keyframe and freeze-frame pad
   is still checked for the two symptoms before it is trusted.
+* `patches/0004-latent-anchors.patch`, a bit-identical generalization of `build_packed_sequence`'s
+  `keyframe_anchors`: alongside the existing `"first"`/`"last"` literals (left byte-for-byte
+  unchanged), an integer anchor now conditions on an arbitrary pixel-frame index of the rotary
+  time axis — the mechanism a latent-tail handoff between scenes needs to anchor mid-clip, not
+  just at the first or last frame (`docs/FEASIBILITY-latent-handoff.md` §1.1). Without it, an
+  integer anchor fails loudly with `ValueError` from `packing.py`; nothing yet in this fork passes
+  one.
+* `patches/0005-condition-latent-rows.patch`, a `condition_latent_rows` parameter on
+  `MiniMaxH3Pipeline.__call__`: conditioning rows supplied already patchified and normalized, in
+  place of encoding keyframe images through the video VAE — the other half of a latent-tail
+  handoff (`docs/FEASIBILITY-latent-handoff.md` §1.2). The rows are noised to `t = 0.999` exactly
+  like an image keyframe's, since they occupy the same slot of the packed layout; the float16
+  round trip inside `_encode_keyframes` is deliberately not applied, as it reproduces a rounding
+  that happens inside the reference's VAE encode. Three loud refusals — a shape that does not
+  match the request's geometry, a dtype that is not float32, and `images` passed alongside — and
+  nothing changes for a run that does not pass the parameter: without it the new kwarg is a
+  `TypeError`, and with it the argument is excluded from the run identity so every existing
+  checkpoint keeps its digest (`h3_48gb/checkpoint.py`, `_IDENTITY_EXCLUDED`, which also carries
+  the standing warning that the digest is blind to the tail until the handoff wave's task 4).
 
 Patching from the outside keeps the two trees separable, but the pin is not optional: this fork
 rebinds `FinalLayer.__class__`, binds `inspect.signature(MiniMaxH3Pipeline.__call__)` in three
@@ -103,7 +122,7 @@ maps the way out. Known future work, not a permanent ceiling.
 
 ```bash
 # 0. Dependencies: this needs an Apple Silicon Mac, Python 3.12, and ffmpeg on PATH.
-#    upstream/ is a vendored clone this fork patches from the outside — see "The four patches"
+#    upstream/ is a vendored clone this fork patches from the outside — see "The five patches"
 #    above — and is never committed here, so clone it yourself first.
 #    Pin the commit. This fork rebinds `FinalLayer.__class__` and binds
 #    `inspect.signature(MiniMaxH3Pipeline.__call__)` in three places, and docs/DESIGN.md cites
@@ -129,6 +148,18 @@ git -C upstream apply ../patches/0002-attention-memory-levers.patch
 #    non-deterministically corrupt a tile under allocator pressure). `LazyMiniMaxH3Pipeline._decode_
 #    video` refuses to decode on an unpatched checkout with a message naming this command.
 git -C upstream apply ../patches/0003-vae-decode-eval.patch
+
+#    The fourth patch generalizes `build_packed_sequence`'s keyframe_anchors to accept an integer
+#    pixel-frame index alongside the existing "first"/"last" literals (docs/FEASIBILITY-latent-
+#    handoff.md §1.1). Nothing in this fork passes an integer anchor yet; skipping it only matters
+#    once something does, at which point it fails loudly with a ValueError from packing.py.
+git -C upstream apply ../patches/0004-latent-anchors.patch
+
+#    The fifth patch adds `condition_latent_rows` to MiniMaxH3Pipeline.__call__ — conditioning
+#    rows handed in already patchified and normalized, instead of encoding keyframe images
+#    through the video VAE (docs/FEASIBILITY-latent-handoff.md §1.2). Nothing in this fork passes
+#    it yet either; skipping it makes the new kwarg a TypeError, never a silent no-op.
+git -C upstream apply ../patches/0005-condition-latent-rows.patch
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 ./.venv/bin/pip install -e .   # installs the `h3` console script

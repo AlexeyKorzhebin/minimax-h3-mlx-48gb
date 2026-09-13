@@ -115,6 +115,12 @@ def test_a_missing_tensor_still_fails(tmp_path):
     """And the check has teeth in the other direction too."""
     _write_checkpoint(tmp_path)
     loaded = dict(mx.load(str(tmp_path / "model.safetensors")))
+    # `mx.load` is lazy mmap-views into the file; saving over the SAME path below would rewrite
+    # the bytes those views still point at. That poisons the process, and the abort strikes much
+    # later, in whatever unrelated test materializes an `mx.load` next (found 2026-08-26: full
+    # suite died with `Fatal Python error: Aborted` inside test_latent_tail's round-trip; this
+    # pair reproduces it two tests long). Materialize before overwriting.
+    mx.eval(*loaded.values())
     victim = next(k for k in loaded if k.startswith("blocks.0."))
     del loaded[victim]
     mx.save_safetensors(str(tmp_path / "model.safetensors"), loaded)

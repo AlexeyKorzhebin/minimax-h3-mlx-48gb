@@ -62,7 +62,21 @@ FORMAT_VERSION = 1
 _META_KEY = "h3_checkpoint"
 
 #: Request arguments that do not change the result and so do not belong in the run identity.
-_IDENTITY_EXCLUDED = frozenset({"self", "verbose", "drop_adaln"})
+#:
+#: ``condition_latent_rows`` is the one entry here that does NOT satisfy that description, and it
+#: is a deliberate, temporary hole — read this before resuming anything that carries a latent tail.
+#: `request_identity` hashes ``bound.arguments`` wholesale, so merely *adding* the parameter to
+#: upstream's signature — even left at its ``None`` default — would change the digest of every run
+#: this fork has ever made and orphan every checkpoint on disk. Excluding it keeps existing runs
+#: byte-identical (tests/test_pipeline_latent.py pins the digest against a value captured before
+#: the parameter existed), at the price that **the digest is blind to the tail**: two scenes that
+#: differ only in the latent they continue from share one identity and therefore one checkpoint
+#: file. Regenerate scene N-1, and an interrupted scene N resumes against the old context while
+#: `_check_seam` sees a perfect match, because the run rebuilds exactly what is in the file now
+#: (docs/FEASIBILITY-latent-handoff.md §4.2). Until task 4 of the latent-handoff wave — a
+#: `FORMAT_VERSION` bump plus a real content digest of the tail, alongside `_checkpoint_path_for`
+#: in cli.py — latent scenes must not be resumed. BACKLOG.md carries the same warning.
+_IDENTITY_EXCLUDED = frozenset({"self", "verbose", "drop_adaln", "condition_latent_rows"})
 
 #: Fork-only keyword arguments of ``__call__``, stripped before the upstream signature is bound.
 CHECKPOINT_KWARGS = (

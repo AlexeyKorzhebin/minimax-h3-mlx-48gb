@@ -86,6 +86,10 @@ READ_ONLY_ROOTS = frozenset({"models"})
 PATH_FLAGS = {
     "--prompt-file": "read", "--image": "read", "--end-image": "read",
     "--checkpoint": "read", "--adaln-cache": "read", "--turbo-lora": "read",
+    # `--latent` (волна переноса латента, 2026-08-26): читается как `--image` -- хвост предыдущей
+    # сцены, лежащий в её каталоге рана. Конвейер начнёт передавать его в задаче 5; политика
+    # заводится вместе с самим флагом, как этот словарь и требует.
+    "--latent": "read",
     "--outdir": "write", "--checkpoint-dir": "write", "--preview-stem": "write",
 }
 
@@ -865,22 +869,63 @@ _H3_FPS = 24
 _H3_FRAMES_PER_CHUNK = 17
 _H3_LATENTS_PER_CHUNK = 5
 
+#: How many pixel frames of the previous scene a *chained* scene reproduces at its own head, and
+#: therefore hands back to `assemble._drop_head_frames` instead of delivering to the timeline --
+#: `17m + 5` for the `m = 1` tail (`5m + 2 = 7` latent frames) the latent-handoff wave ships
+#: (`docs/FEASIBILITY-latent-handoff.md` §1.3's own `{5, 22, 39, 56}` table, §3 "Схема A").
+#:
+#: **Duplicated from `assemble.OVERLAP_PIXEL_FRAMES` on purpose, not imported.** Same reason the
+#: three H3 constants above are duplicated rather than pulled from `packing.py`: `assemble.py` is
+#: itself `mlx`-free, but it is a *worker*-side module whose import graph this request-path module
+#: has no business acquiring for one integer, and pulling the number out of `h3_48gb.pipeline`
+#: (where the tail is actually written) would drag `mlx.core` in at module scope, which this
+#: module's own docstring forbids outright. The two copies are checked against each other by
+#: `tests/test_latent_chain.py`, so a drift is a failing test, not a silently wrong timeline.
+_SCENE_LATENT_OVERLAP_FRAMES = 22
 
-def _grid_frames_at_or_below(frames: int) -> int:
-    """The largest H3-valid frame count (`17n + 5`) at or below `frames`, floored at the grid's own
-    minimum (`n=0`, i.e. `_H3_LATENTS_PER_CHUNK`) if `frames` is smaller than that."""
-    remainder = (frames - _H3_LATENTS_PER_CHUNK) % _H3_FRAMES_PER_CHUNK
-    candidate = frames - remainder
-    return candidate if candidate >= _H3_LATENTS_PER_CHUNK else _H3_LATENTS_PER_CHUNK
+#: The frame-grid offset a *chained* scene's own **delivered** duration sits on, as opposed to the
+#: `_H3_LATENTS_PER_CHUNK` (`17n + 5`) every un-chained scene sits on (`docs/FEASIBILITY-latent-
+#: handoff.md` §4.1, "Снап длительности против длины переносимого хвоста").
+#:
+#: The arithmetic in one line: what H3 can actually *render* is always `17j + 5` frames
+#: (`align_num_frames` rounds anything else up), a chained scene *requests*
+#: `R = D + _SCENE_LATENT_OVERLAP_FRAMES` and *delivers* `D`, so `D = 17j + 5 - 22 = 17(j - 1)` --
+#: a multiple of 17 with **no** `+5`. Computed from the two constants rather than written as a
+#: literal `0`, so it stays correct if the wave ever moves off `m = 1` (`m = 0`: `22 -> 5` and this
+#: becomes `0` too; `m = 2`: `22 -> 39` and this becomes `(5 - 39) % 17 == 0` as well -- every
+#: `17m + 5` overlap lands here, which is exactly why the tail lengths are on that grid).
+_CHAINED_GRID_REMAINDER = (_H3_LATENTS_PER_CHUNK
+                           - _SCENE_LATENT_OVERLAP_FRAMES) % _H3_FRAMES_PER_CHUNK
 
 
-def _grid_frames_at_or_above(frames: int) -> int:
-    """The smallest H3-valid frame count (`17n + 5`) at or above `frames`."""
-    below = _grid_frames_at_or_below(frames)
+def _grid_frames_at_or_below(frames: int, *, remainder: int = _H3_LATENTS_PER_CHUNK) -> int:
+    """The largest H3-valid frame count at or below `frames`, floored at that grid's own minimum
+    if `frames` is smaller than that.
+
+    `remainder` picks *which* grid: `_H3_LATENTS_PER_CHUNK` (the default, `17n + 5`) is what an
+    un-chained scene both requests and delivers; `_CHAINED_GRID_REMAINDER` (`17k`) is what a
+    chained scene *delivers* after `assemble` drops the `_SCENE_LATENT_OVERLAP_FRAMES` frames its
+    request carried on top. The step is `_H3_FRAMES_PER_CHUNK` for both and is deliberately **not**
+    a parameter: both grids are the same H3 chunk length, only offset differently, and a step this
+    function could be handed that is not `FRAMES_PER_CHUNK` is not a grid H3 can render at all.
+
+    The floor is `remainder` for an offset grid (`n=0` is a real, if tiny, point on `17n + 5`) and
+    a full step for `remainder == 0` (`k=0` would be a zero-length clip, not a grid point).
+    """
+    minimum = remainder if remainder else _H3_FRAMES_PER_CHUNK
+    candidate = frames - (frames - remainder) % _H3_FRAMES_PER_CHUNK
+    return candidate if candidate >= minimum else minimum
+
+
+def _grid_frames_at_or_above(frames: int, *, remainder: int = _H3_LATENTS_PER_CHUNK) -> int:
+    """The smallest H3-valid frame count at or above `frames`, on whichever grid `remainder` names
+    (see `_grid_frames_at_or_below`)."""
+    below = _grid_frames_at_or_below(frames, remainder=remainder)
     return below if below >= frames else below + _H3_FRAMES_PER_CHUNK
 
 
-def _snap_scene_duration(seconds: float, carry: float) -> tuple[float, float]:
+def _snap_scene_duration(seconds: float, carry: float, *,
+                          chained: bool = False) -> tuple[float, float]:
     """One scene's own duration, snapped onto H3's frame grid (C1, final review), and the leftover
     `carry` the caller should fold into the *next* scene's own target.
 
@@ -910,14 +955,37 @@ def _snap_scene_duration(seconds: float, carry: float) -> tuple[float, float]:
     grid point that is still in range rather than left to breach it; `carry`'s own return value
     still reflects what this step actually spent either way, so the next scene sees the true
     remainder regardless of which branch fired.
+
+    **`chained=True` snaps onto a different grid** (`_CHAINED_GRID_REMAINDER`, `17k`, rather than
+    `17n + 5`) -- the latent-handoff wave, `docs/FEASIBILITY-latent-handoff.md` §4.1. A scene that
+    starts from the previous scene's own latent tail instead of a keyframe *requests*
+    `_SCENE_LATENT_OVERLAP_FRAMES` more frames than it *delivers*: the head of its render
+    reproduces the tail it was conditioned on, and `assemble._drop_head_frames` cuts exactly those
+    before the concat. What this function returns is the **delivered** number (that is what
+    `project.json` stores and what the coverage check below is about); `assemble` adds the overlap
+    back on when it builds the scene's own `--duration`. Without the separate grid every chained
+    scene silently delivers `22/24 = 0.917s` less than it promised -- 33 chained scenes on the
+    night-4 layout is 30s against `assemble.DURATION_TOLERANCE_SECONDS`'s 0.5s, i.e. a
+    deterministic assembly failure, not a drift.
+
+    `carry` is untouched by the split: it is still "target minus what this step actually spent",
+    which telescopes so the whole clip's own shortfall equals the final scene's own carry. The
+    `SCENE_MIN_SECONDS` clamp can push a chained scene *above* its target (the `17k` grid's lowest
+    in-range point, 136 frames, is 0.667s above the 5s floor), which makes `carry` **negative** --
+    deliberately: the next scene must see that overspend and give the seconds back, and the total
+    coverage check at the bottom of `build_clip_scenes` is what refuses honestly if there is no
+    next scene left to give them back from.
     """
+    remainder = _CHAINED_GRID_REMAINDER if chained else _H3_LATENTS_PER_CHUNK
     target = seconds + carry
     frames = max(_H3_LATENTS_PER_CHUNK, round(target * _H3_FPS))
-    snapped = _grid_frames_at_or_below(frames) / _H3_FPS
+    snapped = _grid_frames_at_or_below(frames, remainder=remainder) / _H3_FPS
     if snapped < SCENE_MIN_SECONDS:
-        snapped = _grid_frames_at_or_above(round(SCENE_MIN_SECONDS * _H3_FPS)) / _H3_FPS
+        snapped = _grid_frames_at_or_above(round(SCENE_MIN_SECONDS * _H3_FPS),
+                                            remainder=remainder) / _H3_FPS
     elif snapped > SCENE_MAX_SECONDS:
-        snapped = _grid_frames_at_or_below(round(SCENE_MAX_SECONDS * _H3_FPS)) / _H3_FPS
+        snapped = _grid_frames_at_or_below(round(SCENE_MAX_SECONDS * _H3_FPS),
+                                            remainder=remainder) / _H3_FPS
     return snapped, target - snapped
 
 
@@ -1369,7 +1437,16 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None,
     carry = 0.0
     scenes = []
     for i, seg in enumerate(expanded):
-        snapped, carry = _snap_scene_duration(seg["end"] - seg["start"], carry)
+        # Latent-handoff wave, task 6 (`docs/FEASIBILITY-latent-handoff.md` §4.1): a scene is
+        # *chained* -- and therefore snaps onto the `17k` grid rather than `17n + 5` -- exactly
+        # when `assemble._submit_next_scene` will hand it the previous scene's own latent tail:
+        # `idx > 0` (scene 0 has nothing behind it) **and** not `fresh_start` (§3: the whole point
+        # of a break is that the previous scene must not leak into this one, and a latent leaks
+        # *more* than a keyframe would). Read here, at the snap, from the same two facts
+        # `assemble` reads later from `project.json` -- deliberately not stored as a third field
+        # a hand edit could put out of sync with the duration it explains.
+        chained = i > 0 and not seg.get("fresh_start", False)
+        snapped, carry = _snap_scene_duration(seg["end"] - seg["start"], carry, chained=chained)
         # `fresh_start` (P0 fix, keyframe-chain defect 2026-08-25): present on `seg` only for the
         # `scenario_scenes=` path (`_scenario_segments`/`_split_long_segment`, see their own
         # docstrings) -- the procedural path's own segments never carry it, so `.get(..., False)`
