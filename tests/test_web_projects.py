@@ -22,6 +22,7 @@ Three rules repeat from `tests/test_web.py`/`tests/test_chat_web.py`:
 """
 import base64
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -158,9 +159,13 @@ def test_build_clip_scenes_splits_a_section_longer_than_ten_seconds():
     assert len(scenes) == 3  # ceil(23/10) == 3
     for s in scenes:
         assert web.SCENE_MIN_SECONDS <= s["duration"] <= web.SCENE_MAX_SECONDS
-    # A split section shares one prompt across every one of its pieces (task 6's own decision:
-    # a straight cut inside the same section is invisible -- one continuous shot).
-    assert len({s["prompt"] for s in scenes}) == 1
+    # A split section keeps one section prompt across its pieces, but every piece after the
+    # first appends the continuation clause (night run 3, 2026-08-26: identical text + the
+    # previous piece's keyframe rendered as the same scene looping).
+    assert scenes[0]["prompt"].endswith(".")
+    assert not scenes[0]["prompt"].endswith(web.SPLIT_CONTINUATION_CLAUSE)
+    for s in scenes[1:]:
+        assert s["prompt"] == scenes[0]["prompt"] + web.SPLIT_CONTINUATION_CLAUSE
 
 
 def test_build_clip_scenes_merges_a_short_trailing_section_into_its_neighbour():
@@ -170,9 +175,10 @@ def test_build_clip_scenes_merges_a_short_trailing_section_into_its_neighbour():
     _assert_scene_total_within_snap_tolerance(scenes, 12.0)
     _assert_scene_durations_on_h3_grid(scenes)
     # The 2s tail (chorus) is under SCENE_MIN_SECONDS -- merged backward into the verse, and the
-    # merged 12s scene then re-splits (>10s) into two pieces sharing one prompt.
+    # merged 12s scene then re-splits (>10s) into two pieces: one section prompt, the later
+    # piece carrying the continuation clause.
     assert len(scenes) == 2
-    assert len({s["prompt"] for s in scenes}) == 1
+    assert scenes[1]["prompt"] == scenes[0]["prompt"] + web.SPLIT_CONTINUATION_CLAUSE
 
 
 def test_build_clip_scenes_handles_a_track_with_nothing_sung_at_all():
@@ -328,7 +334,10 @@ def test_build_clip_scenes_from_scenario_splits_a_section_longer_than_ten_second
     assert len(scenes) == 3  # ceil(23/10) == 3, same rule as the procedural path's own split
     for s in scenes:
         assert web.SCENE_MIN_SECONDS <= s["duration"] <= web.SCENE_MAX_SECONDS
-    assert len({s["prompt"] for s in scenes}) == 1  # one section, one prompt, shared across pieces
+    # one section prompt shared across pieces; pieces after the first say they continue the shot
+    assert scenes[0]["prompt"] == "a single continuous shot of rain"
+    for s in scenes[1:]:
+        assert s["prompt"] == "a single continuous shot of rain" + web.SPLIT_CONTINUATION_CLAUSE
 
 
 def test_build_clip_scenes_from_scenario_folds_a_short_trailing_section_into_its_neighbour():
@@ -343,8 +352,8 @@ def test_build_clip_scenes_from_scenario_folds_a_short_trailing_section_into_its
     _assert_scene_total_within_snap_tolerance(scenes, 12.0)
     _assert_scene_durations_on_h3_grid(scenes)
     assert len(scenes) == 2  # the 2s outro folds into the verse, the merged 12s re-splits into two
-    assert len({s["prompt"] for s in scenes}) == 1
-    assert "prompt A" in scenes[0]["prompt"]
+    assert scenes[0]["prompt"] == "prompt A"
+    assert scenes[1]["prompt"] == "prompt A" + web.SPLIT_CONTINUATION_CLAUSE
 
 
 def test_build_clip_scenes_from_scenario_glues_style_block_verbatim_onto_every_scene():
@@ -1785,9 +1794,12 @@ def test_generate_scenario_from_an_llm_reply_opens_the_gate(_serve, monkeypatch)
     assert generated["project"]["stages"]["scenario"] == "awaiting_approval"
     scenes = generated["project"]["scenario_scenes"]
     assert len(scenes) == 2
+    # `state_in`/`state_out` land as empty strings for a reply that carried no passport at all
+    # (this fixture's own sections do not) -- the retro contract: a scenario written before the
+    # passport existed is stored, built and rendered byte for byte as it was.
     assert scenes[0] == {"tag": "verse", "start": 0.0, "end": 8.0,
                          "prompt": "[Shot 1] wide shot, dusk street.", "duration": 8.0,
-                         "fresh_start": False}
+                         "fresh_start": False, "state_in": "", "state_out": ""}
     assert generated["project"]["scenario_style_block"].startswith("A neon-lit stage")
 
     (req,) = fake.requests
@@ -2566,7 +2578,9 @@ def test_approving_the_scenario_right_after_a_blurred_edit_does_not_lose_it(_ser
     assert final["scenario_scenes"][0]["prompt"] == edited_prompt, (
         "the edit must survive on disk, not revert to the stale pre-edit prompt -- got "
         f"{final['scenario_scenes'][0]['prompt']!r}")
-    assert all(scene["prompt"] == edited_prompt for scene in final["scenes"]), (
+    # A split piece may carry `web.SPLIT_CONTINUATION_CLAUSE` on top -- what this test pins is
+    # that every built scene starts from the EDITED prompt, not a stale one.
+    assert all(scene["prompt"].startswith(edited_prompt) for scene in final["scenes"]), (
         "the built scene(s) must be built from the edited prompt, not a stale one -- got "
         f"{[s['prompt'] for s in final['scenes']]!r}")
 
@@ -3382,3 +3396,647 @@ def test_provider_test_route_never_leaks_the_token(_serve):
             "а не то, что заголовок пуст")
     finally:
         fake.close()
+
+
+def test_build_clip_scenes_split_pieces_after_the_first_carry_a_continuation_clause():
+    """Night run 3 (2026-08-26): a section spanning past `SCENE_MAX_SECONDS` is mechanically cut
+    into pieces that all shared the section's single prompt verbatim -- and each piece chains
+    i2v off the previous piece's last frame, so identical text + same start frame rendered as
+    the same scene looping two or three times in a row (16 twin groups out of 40 scenes; the
+    user saw the loops with the naked eye). The system prompt now tells the model to keep
+    sections inside 10s, but the splitter stays as the fallback for a model that overruns -- and
+    its later pieces must now say they CONTINUE the shot rather than restate it: the first piece
+    keeps the section's own prompt untouched, every later piece appends
+    `web.SPLIT_CONTINUATION_CLAUSE` so the render moves forward instead of resetting.
+    """
+    base = "a single continuous shot of rain"
+    scenario_scenes = [_scenario_scene("verse", 0.0, 23.0, base)]
+    scenes = web.build_clip_scenes(_scenario_track(23.0), scenario_scenes=scenario_scenes)
+    assert len(scenes) == 3
+    assert scenes[0]["prompt"] == base, "the first piece must keep the section prompt untouched"
+    for piece in scenes[1:]:
+        assert piece["prompt"] == base + web.SPLIT_CONTINUATION_CLAUSE, (
+            "a later piece must append the continuation clause, once, at the end")
+    assert web.SPLIT_CONTINUATION_CLAUSE.startswith(" "), (
+        "the clause glues onto prompt text and must carry its own separating space")
+
+
+def test_edit_scenario_accepts_a_null_fresh_start_as_false(_serve, monkeypatch):
+    """The nullable-but-required schema convention (2026-08-26, OpenAI strict mode rejects a
+    property outside `required` -- see test_provider's schema tests): a model with no chain
+    break to declare answers `fresh_start: null`, and `_typed_scenario_scene` must store that
+    as plain `False` -- not refuse it, and not store a `None` that would poison the JSON shape
+    `Project.scenario_scenes` fixes. Strings are still refused (the test right above)."""
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+
+    status, payload = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "a", "duration": 8.0,
+             "fresh_start": None},
+            {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "b", "duration": 8.0,
+             "fresh_start": True},
+        ],
+    })
+    assert status == 200, payload
+    stored = payload["project"]["scenario_scenes"]
+    assert stored[0]["fresh_start"] is False
+    assert stored[1]["fresh_start"] is True
+
+
+# == Passport wave (2026-08-27): `state_in`/`state_out` ==========================================
+#
+# SPEC-scene-prompt-structure.md §5. Night 4's own defect class: an object or a character changes
+# position between two scenes with no action anywhere that moved it (the sword put down on the
+# table and back in his hand one scene later; the baby handed over outside and the mother suddenly
+# inside by the door). The world's state lived implicitly, in two prompts written as independent
+# descriptions, so nothing ever had to agree.
+#
+# **The chain is built by the code, not by the model** (S1-3 review). The model writes `state_out`
+# for every scene, and `state_in` for exactly two kinds of scene: scene 0 and every `fresh_start`
+# scene -- the two that have no previous frame to inherit from. Every other scene's `state_in` is
+# OVERWRITTEN, unconditionally, with the previous scene's own `state_out`. That makes SPEC §5's
+# "state_in of N+1 == state_out of N, verbatim" true by construction, and it is deliberately NOT
+# validated as a pair anywhere on the `generate` path: a whitespace difference re-rolling a 20 000
+# token reply is an unacceptable refusal, and this module's own precedent (`_style_clause`) already
+# fixes rather than refuses.
+
+
+def _scenario_turn(*scenes, style_block="warm light"):
+    """A `provider.chat_scenario` reply, in the exact shape `_scenario_turn_to_scenes` parses --
+    `scenes` given as `(tag, start, end, prompt, extra_scene_fields)` tuples.
+    """
+    sections = []
+    for i, (tag, start, end, prompt, extra) in enumerate(scenes):
+        scene = {"prompt": prompt, "duration": min(10.0, max(5.0, end - start))}
+        scene.update(extra)
+        sections.append({"tag": tag, "start": start, "end": end, "scene": scene})
+    return {"reply": "вот сюжет", "scenario": {"sections": sections, "style_block": style_block}}
+
+
+def test_typed_scenario_scene_keeps_a_written_passport_exactly_as_given():
+    scene = web._typed_scenario_scene(
+        {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "p", "duration": 8.0,
+         "state_in": "she stands at the door, empty-handed",
+         "state_out": "the sword lies flat on the oak table"}, 0)
+    assert scene["state_in"] == "she stands at the door, empty-handed"
+    assert scene["state_out"] == "the sword lies flat on the oak table"
+
+
+def test_typed_scenario_scene_folds_an_absent_or_null_passport_to_an_empty_string():
+    """Two sources produce a passport-less entry and neither is an error. **Absent:** every
+    scenario written before this field existed, and every entry the procedural path builds
+    (`_procedural_scenario_scenes` puts exactly five keys on a scene and knows nothing about a
+    passport). **`null`:** the nullable-but-required schema convention (`SCENARIO_SCHEMA`, and
+    `fresh_start`'s own 2026-08-26 fix) -- a model with nothing to declare answers `null`.
+
+    Both must land as `""`, never `None`: everything downstream reads the passport as a string
+    (`if state_in:`, `.strip()`, string concatenation into a prompt), and a `None` leaking into
+    `Project.scenario_scenes` would be a JSON null on disk that every one of those readers would
+    then have to defend against separately.
+    """
+    absent = web._typed_scenario_scene(
+        {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "p", "duration": 8.0}, 0)
+    assert absent["state_in"] == "" and absent["state_out"] == ""
+
+    nulls = web._typed_scenario_scene(
+        {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "p", "duration": 8.0,
+         "state_in": None, "state_out": None}, 0)
+    assert nulls["state_in"] == "" and nulls["state_out"] == ""
+
+
+@pytest.mark.parametrize("field", ["state_in", "state_out"])
+@pytest.mark.parametrize("bad", [7, 1.5, True, ["a"], {"a": 1}])
+def test_typed_scenario_scene_refuses_a_non_string_passport(field, bad):
+    """Wrong type is refused, not coerced -- the same discipline every other field on this entry
+    already gets. `str(7)` would silently write "7" into a video prompt as the world's state.
+    """
+    raw = {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "p", "duration": 8.0, field: bad}
+    with pytest.raises(ValueError) as err:
+        web._typed_scenario_scene(raw, 3)
+    assert f"entry 3: `{field}` must be a string" in str(err.value)
+
+
+def test_scenario_turn_carries_the_models_own_state_out_onto_every_scene():
+    scenes, _ = web._scenario_turn_to_scenes(_scenario_turn(
+        ("verse", 0.0, 8.0, "p0", {"state_in": "she is at the door", "state_out": "она у стола"}),
+        ("chorus", 8.0, 16.0, "p1", {"state_out": "меч лежит на столе"}),
+    ))
+    assert [s["state_out"] for s in scenes] == ["она у стола", "меч лежит на столе"]
+
+
+def test_scenario_turn_overwrites_a_chained_scenes_state_in_with_the_previous_state_out():
+    """**The derivation, and the whole architectural decision behind this wave.** A chained scene's
+    `state_in` is written by the CODE, not by the model: `scenes[i]["state_in"] =
+    scenes[i-1]["state_out"]`, unconditionally, for every `i > 0` that is not a `fresh_start`.
+
+    Unconditionally is the load-bearing word. The model here writes a `state_in` on scene 1 that
+    *contradicts* scene 0's own `state_out` -- exactly the drift SPEC §5's verbatim-match rule was
+    written to catch -- and the pipeline must simply replace it, not merge it, not prefer it, and
+    not refuse the whole reply. A `!=`-style refusal on this path would re-roll a 20 000 token
+    scenario over a stray space; overwriting makes the invariant true by construction instead.
+    """
+    scenes, _ = web._scenario_turn_to_scenes(_scenario_turn(
+        ("verse", 0.0, 8.0, "p0", {"state_in": "она у двери", "state_out": "меч лежит на столе"}),
+        ("chorus", 8.0, 16.0, "p1", {"state_in": "меч у него в руке",
+                                     "state_out": "он выходит в коридор"}),
+        ("bridge", 16.0, 24.0, "p2", {"state_in": "", "state_out": "коридор пуст"}),
+    ))
+    assert scenes[1]["state_in"] == "меч лежит на столе", (
+        "a chained scene's own state_in must be REPLACED by the previous scene's state_out, "
+        f"not kept: got {scenes[1]['state_in']!r}")
+    assert scenes[2]["state_in"] == "он выходит в коридор", (
+        "the derivation must run down the whole chain, not only onto scene 1")
+
+
+def test_scenario_turn_keeps_the_models_own_state_in_on_scene_zero_and_on_a_fresh_start():
+    """The two scenes the model IS responsible for: scene 0 (nothing before it) and every
+    `fresh_start` scene (renders from text alone, no reference frame -- so its passport is the
+    only thing that describes the new world at all). Deriving either one from a neighbour would
+    throw away the only exhaustive description in the reply.
+    """
+    scenes, _ = web._scenario_turn_to_scenes(_scenario_turn(
+        ("verse", 0.0, 8.0, "p0", {"state_in": "она у двери, руки пусты",
+                                   "state_out": "меч лежит на столе"}),
+        ("chorus", 8.0, 16.0, "p1", {"state_in": "зал: он один у стола",
+                                     "state_out": "он берёт меч", "fresh_start": True}),
+    ))
+    assert scenes[0]["state_in"] == "она у двери, руки пусты", \
+        "scene 0 has no previous scene to derive from -- its own state_in must survive"
+    assert scenes[1]["state_in"] == "зал: он один у стола", (
+        "a fresh_start scene's own exhaustive state_in must survive -- it has no reference frame "
+        f"to inherit a composition from: got {scenes[1]['state_in']!r}")
+
+
+def test_scenario_turn_warns_but_does_not_refuse_an_empty_passport_at_a_chain_break(caplog):
+    """A `fresh_start` scene (or scene 0) that came back with no `state_in` at all is a real gap --
+    that scene renders from text alone and its passport is the only description of the new world
+    there is. It is still **not** a refusal: `bad_model_json` costs a full re-roll of a 20 000
+    token reply, and a retry does not fix a model that simply did not write the field. The scene
+    keeps an empty passport (the glue step then simply pastes nothing) and the gap is logged for
+    the human who is about to read the whole scenario at the gate anyway.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="h3_48gb.web"):
+        scenes, _ = web._scenario_turn_to_scenes(_scenario_turn(
+            ("verse", 0.0, 8.0, "p0", {"state_in": "", "state_out": "меч лежит на столе"}),
+            ("chorus", 8.0, 16.0, "p1", {"state_in": "", "state_out": "он берёт меч",
+                                         "fresh_start": True}),
+            ("bridge", 16.0, 24.0, "p2", {"state_in": "", "state_out": "коридор пуст"}),
+        ))
+
+    assert scenes[0]["state_in"] == "" and scenes[1]["state_in"] == "", \
+        "an empty passport at a chain break is kept as empty, not invented and not refused"
+    assert scenes[2]["state_in"] == "он берёт меч", \
+        "a chained scene is still derived normally alongside the warning"
+
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warned) == 2, f"one warning per gap, got {warned}"
+    assert any("0" in m for m in warned) and any("1" in m for m in warned), warned
+    assert all("state_in" in m for m in warned), warned
+
+
+def test_scenario_turn_does_not_warn_when_every_chain_break_carries_its_passport(caplog):
+    """The other side of the warning: a well-formed reply must be silent. A warning that fires on
+    every scenario is a warning nobody reads by the third run.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="h3_48gb.web"):
+        web._scenario_turn_to_scenes(_scenario_turn(
+            ("verse", 0.0, 8.0, "p0", {"state_in": "она у двери", "state_out": "меч на столе"}),
+            ("chorus", 8.0, 16.0, "p1", {"state_in": "", "state_out": "он берёт меч"}),
+        ))
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_edit_scenario_stores_the_passport_through_put(_serve, monkeypatch):
+    """`PUT /scenario` is the path a human's own hand edit takes (and the path `app.js` sends the
+    whole list back on). The passport has to survive it -- the gate is the only place a person
+    ever fixes a passport the model got wrong.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    status, payload = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "a", "duration": 8.0,
+             "state_in": "она у двери, руки пусты", "state_out": "меч лежит на столе"},
+            {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "b", "duration": 8.0,
+             "state_in": "меч лежит на столе", "state_out": None},
+        ],
+    })
+    assert status == 200, payload
+    stored = payload["project"]["scenario_scenes"]
+    assert stored[0]["state_in"] == "она у двери, руки пусты"
+    assert stored[0]["state_out"] == "меч лежит на столе"
+    assert stored[1]["state_in"] == "меч лежит на столе"
+    assert stored[1]["state_out"] == "", "a null passport is stored as an empty string, not null"
+
+
+def test_edit_scenario_rejects_a_non_string_passport(_serve, monkeypatch):
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    status, payload = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 16.0, "prompt": "a", "duration": 8.0,
+             "state_out": 7},
+        ],
+    })
+    assert (status, payload["error"]["code"]) == (400, "args_invalid")
+    assert "`state_out` must be a string" in payload["error"]["message"]
+
+
+def test_the_procedural_path_builds_scenes_with_no_passport_keys_and_nothing_downstream_breaks(
+        _serve, monkeypatch):
+    """S2-3: `_procedural_scenario_scenes` puts exactly five keys on a scene (`tag`, `start`,
+    `end`, `prompt`, `duration`) and never goes through `_typed_scenario_scene` at all -- the
+    `/scenario/generate?procedural` route writes its output straight to disk. Every new passport
+    reader must therefore read through `.get(..., "")`, never `scene["state_in"]`, or the whole
+    LLM-free branch dies with a `KeyError` the moment somebody presses "сюжет без LLM".
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    payload = srv.post_json(f"/api/projects/{pid}/scenario/generate", {"procedural": True})
+    scenes = payload["project"]["scenario_scenes"]
+    assert scenes and all("state_in" not in s and "state_out" not in s for s in scenes), (
+        "the procedural path is expected to keep writing passport-less scenes -- if that ever "
+        f"changes this test's premise is gone, not the rule: {scenes[0]}")
+
+    built = web.build_clip_scenes(_scenario_track(16.0), scenario_scenes=scenes)
+    assert len(built) >= 1, "building scenes from a passport-less scenario must not raise"
+
+
+_SCENARIO_PASSPORT_SCRIPT = Path(__file__).resolve().parent / "_scenario_passport_check.mjs"
+
+
+def _run_scenario_passport_check(base_url: str, pid: str, edit_idx: int, edited_tail: str,
+                                 timeout=30) -> dict:
+    """Runs `_scenario_passport_check.mjs` (see its own module docstring) against a real,
+    already-running server -- drives the *real* `app.js` through one scene's own prompt edit and
+    reports exactly what `collectScenarioScenes` put in the `PUT` body, plus the server's own
+    final state.
+    """
+    encoded = base64.b64encode(edited_tail.encode("utf-8")).decode("ascii")
+    result = subprocess.run(
+        [_NODE, str(_SCENARIO_PASSPORT_SCRIPT), _APP_JS_URL, base_url, pid, str(edit_idx),
+         encoded],
+        capture_output=True, text=True, timeout=timeout)
+    assert result.returncode == 0, (
+        f"_scenario_passport_check.mjs failed:\nstdout: {result.stdout}\nstderr: {result.stderr}")
+    return json.loads(result.stdout)
+
+
+@_needs_node_for_scenario_race
+def test_editing_one_scene_does_not_erase_every_scenes_passport(_serve, monkeypatch):
+    """Мутация (е) из брифа. `state_in`/`state_out` have no UI control on this page at all -- they
+    reach the server only through `collectScenarioScenes`'s own on-disk fallback. Drop the two
+    lines that carry them and the page looks and behaves identically, the `PUT` still returns 200,
+    and the server (which folds an absent passport to `""`) quietly erases every passport in the
+    scenario the first time anyone fixes a typo at the gate. Nothing else in this suite would go
+    red, because nothing else drives the real `app.js`.
+
+    So: two scenes with passports on disk, a person edits scene 1's prompt, and BOTH scenes must
+    come back out of the `PUT` body with their passports intact -- the edited one and the one the
+    fake DOM never even rendered.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    status, put_first = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 8.0, "prompt": "a quiet room",
+             "duration": 6.0, "state_in": "она у двери, руки пусты",
+             "state_out": "меч лежит на столе, она у окна"},
+            {"tag": "chorus", "start": 8.0, "end": 16.0, "prompt": "the same room, later",
+             "duration": 7.0, "state_in": "меч лежит на столе, она у окна",
+             "state_out": "она выходит в коридор, меч остаётся на столе"},
+        ],
+    })
+    assert status == 200, put_first
+
+    base_url = f"http://{web.LOOPBACK}:{srv.port}"
+    result = _run_scenario_passport_check(base_url, pid, 1, "the same room, much later")
+
+    assert result["putStatus"] == 200, result
+    sent = result["putBody"]["scenario_scenes"]
+    assert len(sent) == 2, (
+        f"the whole list is replaced by a PUT -- both scenes must be sent: {sent}")
+    assert sent[1]["prompt"] == "the same room, much later", (
+        "the edit itself must still reach the server -- otherwise this test proves nothing about "
+        f"the passport riding alongside it: {sent[1]}")
+    assert sent[0]["state_in"] == "она у двери, руки пусты", sent[0]
+    assert sent[0]["state_out"] == "меч лежит на столе, она у окна", sent[0]
+    assert sent[1]["state_in"] == "меч лежит на столе, она у окна", (
+        "the EDITED scene's own passport must ride along with the edit, not be dropped: "
+        f"{sent[1]!r}")
+    assert sent[1]["state_out"] == "она выходит в коридор, меч остаётся на столе", sent[1]
+
+    final = result["finalProject"]["scenario_scenes"]
+    assert final[0]["state_in"] == "она у двери, руки пусты", final[0]
+    assert final[1]["state_out"] == "она выходит в коридор, меч остаётся на столе", final[1]
+
+
+@_needs_node_for_scenario_race
+def test_the_gate_grows_no_passport_widget(_serve, monkeypatch):
+    """The other half of the decision: this wave deliberately adds NO UI control for the passport
+    (the read-only display was cut by review -- "ВЫРЕЗАНО этой волной"). `collectScenarioScenes`
+    passes the fields through, and that is all. Pinned so a later wave adding a widget has to come
+    back here and say so on purpose rather than by accident -- the fields are carried by the
+    on-disk fallback precisely *because* nothing renders them, and a half-added widget that renders
+    a passport without collecting it would silently erase every one it displayed.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    status, _ = srv._request("PUT", f"/api/projects/{pid}/scenario", {
+        "scenario_scenes": [
+            {"tag": "verse", "start": 0.0, "end": 16.0, "prompt": "a quiet room", "duration": 8.0,
+             "state_in": "она у двери", "state_out": "меч лежит на столе"},
+        ],
+    })
+    assert status == 200
+
+    base_url = f"http://{web.LOOPBACK}:{srv.port}"
+    result = _run_scenario_passport_check(base_url, pid, 0, "a quiet room, edited")
+    rendered = result["renderedHtml"]
+    assert "scenario-state-in" not in rendered and "scenario-state-out" not in rendered, \
+        "a passport widget appeared in the gate -- collectScenarioScenes must be taught to read it"
+
+
+# == Passport wave, part 3: gluing `state_in` into the built prompt ==============================
+#
+# The passport is only worth writing if the video model actually reads it. SPEC §5: "`state_in`
+# вклеивается в промпт сцены (как библия): видеомодель получает стартовое состояние текстом, а не
+# догадкой."
+#
+# **Position, not just presence** (S2-1 review). An H3 prompt is three labelled fields in one
+# string, `integrated_multimodal_description` / `overall_soundscape` / `non_diegetic_music`. A
+# state block appended to the *end* of that string lands inside `non_diegetic_music` -- a
+# description of the world's furniture read as an instruction about the score. It belongs at the
+# end of the description field instead, which is why the glue is a helper that cuts the prompt at
+# its first `"\n\noverall_soundscape:"` rather than a `+`.
+
+
+def _built_prompts(scenario_scenes, duration):
+    return [s["prompt"] for s in web.build_clip_scenes(
+        _scenario_track(duration), scenario_scenes=scenario_scenes)]
+
+
+def _h3_prompt(description, *, marker=True, sep="\n"):
+    """`sep` defaults to a SINGLE newline -- the form the live model actually writes (night-4:
+    80/80 field labels separated by one `\n`; night-3 used `\n\n` -- 61/61). The glue helper
+    must catch both, so tests exercise the live form by default and the double form explicitly
+    (review of the passport wave, B1: a `\n\n`-only marker missed 40/40 real prompts and the
+    fixture's own `\n\n` hid it)."""
+    tail = (f"{sep}overall_soundscape: distant rain on stone.{sep}"
+            "non_diegetic_music: a low sustained cello.")
+    return f"integrated_multimodal_description: {description}" + (tail if marker else "")
+
+
+def test_state_in_is_glued_at_the_end_of_the_description_not_onto_the_end_of_the_prompt():
+    """S2-1: a tail concat puts the world's state inside `non_diegetic_music`, where H3 reads it
+    as a note about the score. The block has to sit at the END of
+    `integrated_multimodal_description` -- after everything the scene's own description says, and
+    before the `overall_soundscape:` label that starts the next field.
+    """
+    prompt = _h3_prompt("[Shot 1] Aldred crosses the empty hall.")
+    (built,) = _built_prompts(
+        [_scenario_scene("verse", 0.0, 8.0, prompt,
+                         state_in="the sword lies flat on the oak table")], 8.0)
+
+    block = " State at the first frame: the sword lies flat on the oak table."
+    assert block in built, f"the passport never reached the prompt at all: {built!r}"
+    assert built.index(block) < built.index("overall_soundscape:"), (
+        "the state block landed AFTER the description field -- a tail concat puts it inside "
+        f"non_diegetic_music, which is exactly the defect this helper exists to avoid: {built!r}")
+    assert built.startswith("integrated_multimodal_description: [Shot 1] Aldred crosses the "
+                            "empty hall." + block + "\n"), (
+        f"the block must sit at the very end of the description, not spliced mid-sentence: "
+        f"{built!r}")
+    assert built.endswith("non_diegetic_music: a low sustained cello."), (
+        f"gluing the passport must not disturb the two sound fields at all: {built!r}")
+
+
+def test_a_prompt_with_no_soundscape_marker_takes_the_state_block_as_a_tail():
+    """A hand-written or malformed scene prompt with no `overall_soundscape:` label at all has no
+    description field to end -- the whole string is the description. The block goes on the end,
+    which is the correct place for that shape, rather than the glue silently doing nothing.
+    """
+    (built,) = _built_prompts(
+        [_scenario_scene("verse", 0.0, 8.0, _h3_prompt("a bare room", marker=False),
+                         state_in="she stands at the door")], 8.0)
+    assert built.endswith(" State at the first frame: she stands at the door."), built
+
+
+def test_an_empty_state_in_glues_nothing_at_all():
+    """The retro contract for every scenario written before this wave: with no passport, the built
+    prompt is byte for byte what it always was. An empty passport that still glued " State at the
+    first frame: ." would change all 40 prompts of an existing project.
+    """
+    prompt = _h3_prompt("[Shot 1] a bare room")
+    without_key = _scenario_scene("verse", 0.0, 8.0, prompt)
+    empty = _scenario_scene("verse", 0.0, 8.0, prompt, state_in="", state_out="меч на столе")
+    assert _built_prompts([without_key], 8.0) == [prompt]
+    assert _built_prompts([empty], 8.0) == [prompt]
+    assert "State at the first frame" not in _built_prompts([empty], 8.0)[0]
+
+
+def test_only_the_first_piece_of_a_split_section_carries_the_state_block():
+    """`_split_long_segment` cuts an over-length section into consecutive clips that all share one
+    prompt. They are one shot, played through: only the first piece actually starts at the state
+    the passport describes. Pieces 2+ start mid-action, and telling H3 that the sword is back on
+    the table at the top of piece 3 would re-stage the shot -- the same reasoning `fresh_start`
+    already gets ("true on at most the first piece") and the same reason those pieces carry the
+    continuation clause instead.
+    """
+    prompt = _h3_prompt("[Shot 1] a single continuous shot of rain")
+    built = _built_prompts(
+        [_scenario_scene("verse", 0.0, 23.0, prompt, state_in="the sword lies on the table")],
+        23.0)
+    assert len(built) == 3
+    assert "State at the first frame: the sword lies on the table." in built[0]
+    for piece in built[1:]:
+        assert "State at the first frame" not in piece, (
+            f"a later piece of a split section must carry no state block: {piece!r}")
+        assert piece.endswith(web.SPLIT_CONTINUATION_CLAUSE), (
+            "the continuation clause is the tail those pieces DO carry -- it must not have been "
+            f"disturbed by the passport glue: {piece!r}")
+
+
+def test_a_forward_carried_fold_moves_the_state_block_onto_the_surviving_scene():
+    """`_fold_short_segments` folds a run of short segments **forward** when there is no earlier
+    survivor to absorb them -- i.e. at the very START of the timeline. The survivor then begins
+    where the first absorbed segment began, so the world's state at its first frame is the
+    absorbed segment's own `state_in`, not its own. Without `carry_state_in` the built scene would
+    open with a passport describing a moment several seconds later than the frame it labels --
+    worse than no passport at all, because it is confidently wrong.
+    """
+    short = _scenario_scene("intro", 0.0, 4.97, _h3_prompt("a short intro"), duration=4.97,
+                            state_in="she stands in the doorway, the infant in her arms")
+    long = _scenario_scene("verse", 4.97, 10.0, _h3_prompt("the hall"), duration=8.0,
+                           state_in="she is already seated by the cradle")
+    built = _built_prompts([short, long], 10.0)
+    assert len(built) == 1, f"the short opening section folds forward into one scene: {built}"
+    assert "State at the first frame: she stands in the doorway, the infant in her arms." \
+        in built[0], (
+        "the folded-away section's own state_in must ride onto the survivor -- the scene now "
+        f"STARTS where that section started: {built[0]!r}")
+    assert "she is already seated by the cradle" not in built[0], (
+        "the survivor's own state_in describes a frame that is no longer the first one")
+
+
+def test_a_backward_fold_keeps_the_surviving_scenes_own_state_block():
+    """The other fold direction: a short section absorbed into the segment BEFORE it only moves
+    that segment's `end`. Its first frame does not move, so its own `state_in` is still the right
+    one and must not be replaced by the absorbed section's.
+    """
+    first = _scenario_scene("verse", 0.0, 5.0, _h3_prompt("the hall"), duration=5.0,
+                            state_in="she stands in the doorway")
+    short = _scenario_scene("tail", 5.0, 9.97, _h3_prompt("a short tail"), duration=4.97,
+                            state_in="she is seated by the cradle")
+    built = _built_prompts([first, short], 9.97)
+    assert len(built) == 1, built
+    assert "State at the first frame: she stands in the doorway." in built[0], built[0]
+    assert "she is seated by the cradle" not in built[0], (
+        "a backward fold does not move the survivor's own first frame -- its passport stands")
+
+
+def test_state_out_never_reaches_a_built_scene():
+    """`state_out` is the model's half of the chain and the pipeline's input for deriving the next
+    scene's `state_in`. It describes the LAST frame, so gluing it into a prompt would tell H3 to
+    open on the shot's own ending. It stops at the scenario list and goes no further.
+    """
+    built = _built_prompts(
+        [_scenario_scene("verse", 0.0, 8.0, _h3_prompt("the hall"),
+                         state_in="she stands at the door",
+                         state_out="ЭТОГО В ПРОМПТЕ БЫТЬ НЕ ДОЛЖНО")], 8.0)
+    assert "ЭТОГО В ПРОМПТЕ БЫТЬ НЕ ДОЛЖНО" not in built[0], built[0]
+
+
+def test_the_procedural_path_still_builds_prompts_byte_for_byte(_serve, monkeypatch):
+    """S2-3 again, this time through the glue: the procedural path's segments have no `state_in`
+    key at all, and its built prompts must be exactly what they were before this wave.
+    """
+    srv = _serve()
+    pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+    scenes = srv.post_json(f"/api/projects/{pid}/scenario/generate",
+                           {"procedural": True})["project"]["scenario_scenes"]
+    built = web.build_clip_scenes(_scenario_track(16.0), scenario_scenes=scenes)
+    assert built and all("State at the first frame" not in s["prompt"] for s in built), built
+
+
+def test_the_whole_passport_path_from_a_model_reply_to_the_built_prompt(_serve, monkeypatch):
+    """End to end, with nothing simulated between the steps: an LLM reply carrying passports ->
+    `/scenario/generate` (which derives the chain) -> a `PUT` whose body carries *exactly* the
+    fields `app.js`'s own `collectScenarioScenes` sends, and nothing else -> `approve/scenario`,
+    which really runs `build_clip_scenes` -> the prompts actually written into `project.json`.
+
+    The `PUT` body is the load-bearing part: it is the only representation of the page in this
+    test, and every field the page forgets to send is a field the server folds to `""` and the
+    scenario loses. If `collectScenarioScenes` ever stops carrying the passport, this test goes
+    red at the last assertion even though every route involved answered 200.
+    """
+    reply = _scenario_turn_payload([
+        {"tag": "verse", "start": 0.0, "end": 8.0,
+         "scene": {"prompt": _h3_prompt("[Shot 1] Aldred carries the baby through the hall"),
+                   "duration": 6.0, "fresh_start": None,
+                   "state_in": "Aldred stands at the door, the infant in his arms",
+                   "state_out": "the sword lies flat on the oak table, Aldred by the window"}},
+        {"tag": "chorus", "start": 8.0, "end": 16.0,
+         "scene": {"prompt": _h3_prompt("[Shot 1] Aldred alone in the empty hall"),
+                   "duration": 7.0, "fresh_start": None,
+                   "state_in": "ЭТО МОДЕЛЬ ПРИДУМАЛА, ДЕРИВАТ ДОЛЖЕН ЭТО ЗАТЕРЕТЬ",
+                   "state_out": "the hall is empty, the sword still on the table"}},
+    ])
+    fake = _FakeLlama(chat_payload=reply)
+    try:
+        srv = _serve(providers_port=fake.port)
+        pid = _clip_project_with_approved_track(srv, monkeypatch, duration=16.0)
+        generated = srv.post_json(f"/api/projects/{pid}/scenario/generate", {})
+    finally:
+        fake.close()
+
+    stored = generated["project"]["scenario_scenes"]
+    assert stored[1]["state_in"] == "the sword lies flat on the oak table, Aldred by the window", (
+        "the derivation must have replaced the model's own second state_in already at generate "
+        f"time: {stored[1]}")
+
+    # exactly the shape `collectScenarioScenes` builds -- same keys, same order, nothing more
+    body = [{"tag": s["tag"], "start": s["start"], "end": s["end"], "prompt": s["prompt"],
+             "duration": s["duration"], "fresh_start": s["fresh_start"],
+             "state_in": s["state_in"], "state_out": s["state_out"]} for s in stored]
+    status, put = srv._request("PUT", f"/api/projects/{pid}/scenario",
+                               {"scenario_scenes": body})
+    assert status == 200, put
+
+    approved = srv.post_json(f"/api/projects/{pid}/approve/scenario", {})
+    prompts = [s["prompt"] for s in approved["project"]["scenes"]]
+    assert len(prompts) == 2, prompts
+    for i, expected in enumerate([
+            "Aldred stands at the door, the infant in his arms",
+            "the sword lies flat on the oak table, Aldred by the window"]):
+        block = f" State at the first frame: {expected}."
+        assert block in prompts[i], f"scene {i} carries no passport: {prompts[i]!r}"
+        assert prompts[i].index(block) < prompts[i].index("overall_soundscape:"), (
+            f"scene {i}'s passport landed outside the description field: {prompts[i]!r}")
+    assert "ЭТО МОДЕЛЬ ПРИДУМАЛА" not in " ".join(prompts)
+
+
+def test_state_block_lands_before_the_soundscape_label_in_both_live_separator_forms():
+    """B1 of the passport-wave review: night-4's model wrote `\ndescription-label:` with a SINGLE
+    newline (80/80 labels), night-3 with a double one (61/61) -- the glue must catch both, or the
+    passport lands inside `non_diegetic_music` on every scene of a whole night run.
+    """
+    for sep in ("\n", "\n\n"):
+        prompt = _h3_prompt("[Shot 1] the hall", sep=sep)
+        (built,) = _built_prompts(
+            [_scenario_scene("verse", 0.0, 8.0, prompt, state_in="the sword lies on the table")],
+            8.0)
+        block = " State at the first frame: the sword lies on the table."
+        assert block in built, f"sep={sep!r}: the passport never reached the prompt: {built!r}"
+        assert built.index(block) < built.index("overall_soundscape:"), (
+            f"sep={sep!r}: the block landed after the description field: {built!r}")
+
+
+def test_a_state_in_containing_a_field_label_cannot_forge_a_second_sound_field():
+    """Injection guard (review, low): the model writes the passport as free text, so a state_in
+    that happens to contain a newline plus `overall_soundscape:` would otherwise produce a prompt
+    with TWO pairs of sound fields inside the description. Newlines in the glued block are
+    flattened to spaces -- the passport is one sentence of the description, never new lines.
+    """
+    (built,) = _built_prompts(
+        [_scenario_scene("verse", 0.0, 8.0, _h3_prompt("the hall"),
+                         state_in="a candle burns\noverall_soundscape: forged silence")], 8.0)
+    # Нейтрализация — это схлопывание \n: инжектированная метка остаётся словами внутри
+    # описания (метка поля обязана стоять в начале строки, см. _SOUNDSCAPE_MARKER_RX).
+    line_start_labels = re.findall(r"(?m)^[ \t]*overall_soundscape[ \t]*:", built)
+    assert len(line_start_labels) == 1, (
+        f"the injected text forged a second line-start sound field: {built!r}")
+    assert "forged silence" in built.split("\noverall_soundscape:")[0], (
+        f"the flattened injection must sit inside the description, before the real label: "
+        f"{built!r}")
+
+
+def test_a_mid_chain_gap_in_the_passport_is_logged_not_swallowed(caplog):
+    """Review M1: the model forgot scene 0's `state_out` but wrote a meaningful `state_in` on
+    scene 1 -- the derivation rightly overwrites it with the empty string (the chain is the
+    pipeline's, not the model's), but silently: no warning fired, the human at the gate sees a
+    hole in the passport and the log says nothing. A gap ANYWHERE in the chain deserves the same
+    warning the scene-0/fresh_start branch already gives.
+    """
+    import logging
+    turn = {"reply": "ok", "scenario": {"style_block": "warm light", "sections": [
+        {"tag": "a", "start": 0, "end": 8,
+         "scene": {"prompt": "p0", "duration": 8, "fresh_start": True,
+                   "state_in": "she is by the cradle", "state_out": None}},
+        {"tag": "b", "start": 8, "end": 16,
+         "scene": {"prompt": "p1", "duration": 8, "fresh_start": False,
+                   "state_in": "модель это придумала", "state_out": "the hall is empty"}},
+    ]}}
+    with caplog.at_level(logging.WARNING, logger="h3_48gb.web"):
+        scenes, _ = web._scenario_turn_to_scenes(turn)
+    assert scenes[1]["state_in"] == "", "the derivation must still overwrite with the empty chain"
+    gap_warnings = [r for r in caplog.records if "state_out" in r.getMessage()]
+    assert gap_warnings, (
+        "an empty `state_out` feeding a chained scene must be logged -- the gate human needs to "
+        "know the hole came from the model, not from the pipeline")

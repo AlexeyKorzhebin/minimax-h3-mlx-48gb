@@ -114,6 +114,66 @@ with small amplitude at slow speed toward the folded letter in her hands."
 Amplitude: `with small amplitude` (small-range change) or `with large amplitude` (large-range
 change). Speed: `at slow speed` or `at fast speed`.
 
+## Light and effects
+
+Light is written the way an object is written: name the source, the path it travels, the surface
+that carries it, and its tempo. All four, every time. "A warm glow" alone is not a light, it is a
+mood word; H3 needs something to attach the brightness to, and when the prompt gives it nothing it
+attaches the brightness to nothing — it draws the light itself as a thing in the room.
+
+That is exactly what an abstract light event asks for. A phrase like "flashes pulsing across the
+vaults", "light that flares and dies", or "a pulse of glow spreading through the hall" names no
+source and no surface,
+and H3 renders them as free-floating colored blobs drifting through the air — the cheapest video
+effect there is, and the one thing in a shot that reads as generated at a glance. Light with no
+named source and no named surface never goes into a prompt at all.
+
+Write the beat with its four parts instead:
+
+```text
+a warm glow from distant fires enters ONLY through the windows and lies on the stone as a slow, soft reflection; every light in the frame comes from a named source and rests on a named surface
+```
+
+Source: the fires beyond the wall. Path: through the windows. Carrier: the stone floor. Tempo:
+slow. The same siege, the same feeling, nothing loose in the air to render.
+
+A sharp or colored change of light — a flare, a lamp going out, a door opening onto daylight — is
+allowed only as a story event with an explicit cause in the frame or just outside it, and the cause
+is written into the scene along with the light it makes.
+
+The ban is a class, not a word list. "Flashes pulsing" was cut from a scenario and came back a
+night later as "candle flames tremble gently" — a synonym the letter of the rule missed, and H3
+answered it the same way: the trembling left the wick, and colored patches danced over the fabric
+and the floor for the whole shot. Any verb that animates light or flame — tremble, flicker,
+waver, dance, pulse, shimmer, flutter — is the same request in different spelling, in the sound
+field as much as in the picture. Flames burn steadily; reflections lie still; the only thing that
+moves in a frame is a character or an object a character moves. When a scene genuinely needs
+unsteady light, it is a story event with a cause, per the paragraph above — never an ambient
+texture.
+
+Pale and patterned fabric is the surface this failure loves most. A light cloth under two colored
+sources (candle amber against moon blue) is where unstable color lands first, so any prominent
+fabric is pinned in words: "plain undyed pale linen, a single solid colour, no pattern". A fabric
+left as just "pale swaddling" came back as a patchwork quilt cycling its colors frame to frame.
+
+A class fix belongs in the bible and in every scene's own tail — never in the one scene where the
+bad word was spotted. On night 6 the flame wording was corrected in scene 0 alone, because that is
+where the grep hit, and scene 0 came back clean while the other thirty-nine kept the defect
+untouched: mean frame-to-frame color drift 0.031 in scene 0 against 0.10-1.22 everywhere else. The
+same scene across the two renders is the A/B, same framing and same static camera — 0.282 -> 0.034,
+two spikes -> zero. So the rule holds and the placement was wrong. Two placements, both required:
+the sentence goes into the style block (it is glued verbatim into every prompt), and a short
+restatement goes at the very end of each scene's own description, where the working version of
+scene 0 carried it. The bible alone is not enough — it already said "every visible light has a
+named source and surface" through all forty prompts of the defective render, and colored patches
+crawled the walls anyway; what stopped them was the explicit sentence next to the action.
+
+One caution when editing the bible: the pipeline glues the style block onto a scenario prompt only
+when the prompt does not already carry it verbatim (`_scenario_segments`). Change
+`scenario_style_block` without rewriting the copy embedded in every scenario prompt and the old
+block stays while the new one is appended — two bibles in one prompt. Rewrite both in the same
+pass, and assert the block appears exactly once in every built prompt.
+
 ## Speech
 
 Anyone who speaks, sings, or produces an off-screen human voice gets a stable ID: `(S1)`, `(S2)`,
@@ -199,10 +259,11 @@ scene's own `prompt` — a scene is written before its own mode is decided (scen
 scene after it runs `i2v` off an automatic keyframe), and the pipeline adds that line itself, once
 it actually knows which scenes need it.
 
-**The visual bible.** Describe every character, the visual style, and the palette in *exactly the
-same words* in every single scene's `prompt` — not summarized, not referenced, not "same as
-before": copy a character's appearance sentence verbatim from scene 1's prompt into scene 2's,
-scene 3's, and every scene after that. Each scene is generated as its own independent run, and the
+**The visual bible.** Describe every character *present in the scene*, the visual style, and the
+palette in *exactly the same words* in every scene's `prompt` — not summarized, not referenced,
+not "same as before": copy a character's appearance sentence verbatim from one scene's prompt
+into every other scene where that character appears. (A scene the character is not in gets no
+portrait and no mention of them — see "Never name an absent character" below.) Each scene is generated as its own independent run, and the
 only thing carrying identity across the cut from one clip into the next is an automatic keyframe
 image (composition, not identity) plus whatever text each scene's own prompt repeats — a scene
 that merely says "the same woman as before" gives the model nothing to render her from, and the
@@ -220,6 +281,26 @@ a gap, and the model reads a gap as permission to draw something in — a loincl
 helmet, whichever is the model's own reflex for that pose. Say exactly what is and is not there
 instead: not "no clothing" but "the thighs are bare and the waist carries nothing at all — no wrap,
 no belt, no cloth"; not "a simple helmet" but "the helmet has no crest and no plume."
+
+**Never name an absent character, even in a negation.** "No old manservant anywhere in the frame"
+is an invitation to draw the manservant: H3 has no negative-prompt channel, so the words
+themselves are what summons him, whatever "no" stands in front of them — the same way "no
+loincloth" plants a loincloth. Write the emptiness positively instead: "she is completely alone
+in the vast hall", "her arms are empty", "the room holds only her, the table and the sword". The
+same goes for objects that have left the story — a handed-off bundle, a removed ring: describe
+what the frame holds now (a bare finger with a pale band of skin), never the thing that is gone.
+
+**Say where every character is and what holds them up.** A pose named but not placed is a gap of
+the same kind, and the model fills it with the most compact arrangement it knows: "a vigil at the
+cradle" gave the mother rendered inside the cradle, next to the infant, because nothing in the
+prompt said what she was sitting on or which side of the cradle she was on. Every scene names who
+stands or sits where, and on what. The support is never left implied — a chair, a bench, the
+floor, a doorway, a saddle — and the character's position relative to the objects around them is
+written with a preposition, not left to the model's own reflex for that pose.
+
+```text
+she sits on a low wooden chair BESIDE the cradle; only the infant lies inside the cradle
+```
 
 **Bind an accent color to the object that carries it, every time you restate it.** The model holds
 onto a color more reliably than it holds onto what that color is sitting on: describe "the only
@@ -335,7 +416,8 @@ The context for this turn always carries three things:
 
 Your JSON answer's `scenario` field carries the result: `{"sections": [...], "style_block":
 string}`. Each entry in `sections` is `{"tag": string, "start": number, "end": number, "scene":
-{"prompt": string, "duration": number, "fresh_start": boolean}}` — one scene per section, in
+{"prompt": string, "duration": number, "fresh_start": boolean, "state_in": string, "state_out":
+string}}` — one scene per section, in
 order. `fresh_start` is optional and defaults to false; see "Breaking the chain on a cast change"
 below for when to set it.
 
@@ -351,19 +433,84 @@ this document teaches: `integrated_multimodal_description`, `overall_soundscape`
 `non_diegetic_music`, `[Shot N]` and camera vocabulary, `<d>[Language]...</d>` speech tags where
 they apply — nothing about the format changes just because the prompt is now one scene among many
 cut to a song. `scene.duration` is bounded the same **5 to 10 seconds** "Scenario mode" already
-gives its own `scenes` above, for the same reason: the pipeline generates and stitches one clip per
-scene, and 10 seconds is the ceiling a single clip is written to reach, whatever the section's own
-`start`/`end` span actually runs — a chorus twenty seconds long still gets a `scene.duration`
-inside the 5-10 s ceiling.
+gives its own `scenes` above — and so is the section's own span: keep `end - start` itself inside
+5 to 10 seconds, and cut a longer musical passage into several consecutive sections, each with its
+own distinct prompt that moves the action forward. This is not stylistic advice but how the
+pipeline works: a section spanning past 10 seconds is split mechanically into consecutive clips
+that all share the section's single prompt, and on screen that reads as the same scene looping
+two or three times in a row — a twenty-second chorus written as one section becomes the same
+shot played twice back to back. Write what happens in each half of that chorus instead.
 
-`style_block` is the visual bible for the whole clip — every character's appearance, the visual
-style, and the palette, written once. Copy it **verbatim, word for word**, into every single
-section's `scene.prompt` — not summarized, not referenced, not "same as before". This is exactly
-the repetition rule "Scenario mode" already gives its own `scenes` above, for the same reason: each
-scene is generated as its own independent run, and the only thing carrying identity across the cut
-from one clip into the next is the text each scene's own prompt repeats. `style_block` existing as
-its own field is a convenience for showing and editing it once, in one place — it does not replace
-copying the same words into every `scene.prompt` in full.
+`style_block` is the visual bible for the whole clip — the visual style, the palette, the setting,
+and the recurring named objects, written once. Copy it **verbatim, word for word**, into every
+single section's `scene.prompt` — not summarized, not referenced, not "same as before". This is
+exactly the repetition rule "Scenario mode" already gives its own `scenes` above, for the same
+reason: each scene is generated as its own independent run, and the only thing carrying identity
+across the cut from one clip into the next is the text each scene's own prompt repeats.
+`style_block` existing as its own field is a convenience for showing and editing it once, in one
+place — it does not replace copying the same words into every `scene.prompt` in full.
+
+The bible carries **no character portraits**. Because it is glued into every scene's prompt, a
+portrait riding in it keeps describing a character to the video model long after the story left
+them behind — a departed character's portrait in the bible is a standing instruction to draw them
+in every scene to the end of the clip. A character's full appearance sentence lives instead in the
+prompts of the scenes where the character actually appears — the same sentence, verbatim, in each
+of them, exactly as the visual bible rule above already demands — and a scene where the character
+does not appear must not mention them at all, not even to say they are gone.
+
+Every scene's prompt also says where each present character is and what holds them up — "she
+sits on a low wooden chair BESIDE the cradle; only the infant lies inside the cradle" — the same
+pose-and-support rule the visual bible section gives for `kind: "video"`, and the passport's
+`state_in` is where that pose lives between scenes.
+
+### The continuity passport: `state_in` and `state_out`
+
+A scene's `prompt` describes what *happens*; the passport declares what is *true* at the scene's
+two edges. Two more fields on every scene carry it:
+
+- `state_out` — the state of the world at the scene's **last** frame: for every character present,
+  where they are, in what pose, and what is in their hands; for every recurring object, where it
+  lies or hangs. Short declarative clauses, one per entity, joined by ` | `.
+- `state_in` — the same, for the scene's **first** frame.
+
+**Write `state_out` on every single scene.** Write `state_in` only on scene 0 and on any scene with
+`fresh_start: true`; leave it as an empty string on every other scene. A chained scene's `state_in`
+is derived by the pipeline itself from the previous scene's `state_out` and overwritten there, so
+writing it a second time spends tokens on text that is thrown away and can only ever disagree with
+what actually gets used.
+
+A `fresh_start` scene's own `state_in` must be **exhaustive** — that scene renders from text alone,
+with no reference frame to inherit a composition from, so everything the passport leaves out is
+something the model invents from scratch. Scene 0 is the same case for the same reason.
+
+Name an entity the same way in every passport line in the whole scenario — "the sword", not "the
+blade" in one scene and "his weapon" three scenes later. This is the same verbatim-repetition rule
+the visual bible already lives by. The chain itself is the pipeline's job, not yours: it makes
+scene 8's `state_in` literally scene 7's `state_out`, word for word — which is exactly why scene
+7's `state_out` has to be written as a complete, self-standing picture of the world.
+
+**Every `state_in` is glued verbatim into that scene's own prompt** as a sentence of the
+description ("State at the first frame: ..."), so the video model reads it as literal stage
+directions. Two things follow. Write every passport line in English — it lands in an English
+prompt. And write it positively, the same way the description itself must be written ("Never name
+an absent character" above applies to passports in full force): "her arms are empty, the hall
+holds only her and the table" — never "Aldred is no longer in the hall" or "the ring is gone",
+which would plant the very words that summon them.
+
+**The state changes only inside a scene, by an action that scene's own prompt describes.** If the
+sword is lying on the table at the end of scene 4, scene 5 cannot open with it back in his hand:
+either scene 5's prompt shows him picking it up, or the sword stays on the table. An object or a
+person that moves between two scenes with nothing that moved them is the most visible continuity
+defect this pipeline produces, and this rule is the whole reason the passport exists.
+
+```text
+state_out: "Aldred stands at the far end of the hall, empty-handed | the sword lies flat on the oak table, hilt toward the door | the cradle stands beside the hearth, the infant asleep inside it"
+```
+
+A location changes between two scenes only when the previous scene's `state_out` itself ends in the
+transition ("she steps through the doorway into the corridor"), or when the next scene is marked
+`fresh_start: true` and its own `state_in` describes the new place in full. People and things never
+teleport across a chain break either — the camera and the location may move, the world may not.
 
 ### Breaking the chain on a cast change
 
@@ -376,10 +523,45 @@ new location. The old frame does not know the story moved on, and it drags the o
 into every following scene regardless of what the prompt now describes.
 
 Set `scene.fresh_start: true` on a section where the cast or location actually changes from the
-one before it — someone leaves or arrives, or the action relocates. That section renders from
+one before it — someone leaves or arrives, the action relocates, or a key object needs its own
+composition (a sword alone on an empty table). One exception: a location change the previous
+scene's `state_out` itself performs ("she steps through the doorway into the corridor") continues
+the chain — the transition was shown, nothing snaps. That section renders from
 text alone, with no reference frame, at the cost of a visible cut on the splice — a fair trade for
 not carrying a departed character (or a stray artifact from the last frame) through every scene
 that follows. Leave it false (or omit it) everywhere the composition just continues.
+
+One planning rule rides on top: **an event never lands in the cut.** A break placed *on* the beat
+hides the beat — a scenario that ended one scene on "the doors hold" and opened the next, fresh,
+on "the doors hang burst inward" showed everything about the siege except the one moment the
+whole finale existed for. The audience saw a closed door, then a broken one, and asked what
+happened. If a scene's story contains an event, the event happens on screen, inside a scene, with
+frames on both sides of it; a `fresh_start` boundary goes before the build-up or after the
+aftermath, never between cause and effect.
+
+### Objects the model can keep, and objects it cannot
+
+Three object rules, each paid for with a ruined take:
+
+**Counts above three do not hold.** A passport can repeat "seven tall candles" from scene to
+scene without a single slip and the render will still show seven, then four, then five — H3 draws
+"a row of candles" and rolls the count every scene, because it cannot count to seven any more
+than it can spell. Give a countable prop a count the model can actually hold — one, two, three —
+or stage the row so it cannot be counted at all: trailing out of frame, half-hidden behind a
+figure. Never hang a story beat on an on-screen number bigger than three.
+
+**A handoff duplicates the object unless the empty place is written.** "She lifts the sword from
+the table" describes the sword in her hands and leaves the model still holding the prompt's
+earlier image of the sword on the table — so it renders both, and the frame has two swords. Every
+pickup, put-down, or handover writes both halves of the transfer: the object in its new place
+*and* the old place explicitly empty — "she lifts the single longsword from the table, and the
+table where it lay is left bare."
+
+**A held object gets its contact point named, every scene, no exceptions.** Seven consecutive
+scenes said "both hands around the hilt" and held; the one scene that relaxed to "holds the sword
+in both hands" rendered her gripping the blade. What is not named is not kept — the passport rule
+applied to fingers: write "by its hilt, below the crossguard, blade pointing upward", or the
+model decides for itself which end of a sword is for holding.
 
 ### No sung close-ups
 

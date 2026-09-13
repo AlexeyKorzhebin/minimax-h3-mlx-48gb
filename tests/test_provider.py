@@ -692,46 +692,97 @@ def test_scenario_schema_sections_carry_tag_start_end_and_a_scene():
     assert section["properties"]["start"]["type"] == "number"
     assert section["properties"]["end"]["type"] == "number"
     scene = section["properties"]["scene"]
-    assert scene["required"] == ["prompt", "duration"]
+    assert scene["required"] == ["prompt", "duration", "fresh_start", "state_in", "state_out"]
     assert scene["properties"]["prompt"]["type"] == "string"
     assert scene["properties"]["duration"]["type"] == "number"
 
 
-def test_scenario_schema_scene_carries_an_optional_fresh_start_boolean():
-    """P0 fix (keyframe-chain defect, 2026-08-25): `fresh_start` is declared in `scene["properties"]`
-    (so `additionalProperties: False` still permits it) but deliberately left OUT of `scene[
-    "required"]` -- unlike `PROMPT_SCHEMA`'s own nullable-but-required `prompt`/`project`, there is
-    nothing wrong with a model that never writes this key at all (`docs/h3-prompt-system.md`,
-    "Breaking the chain on a cast change": most sections continue the same cast/location and never
-    need it). `required` staying exactly `["prompt", "duration"]` is the same assertion the
-    pre-existing `test_scenario_schema_sections_carry_tag_start_end_and_a_scene` already makes --
-    repeated here so a change that quietly adds `fresh_start` to `required` fails this test even if
-    that one somehow does not.
+def test_scenario_schema_scene_fresh_start_is_nullable_but_required():
+    """2026-08-26, measured live: OpenAI's strict `json_schema` mode (Azure and OpenAI both,
+    behind caila's openrouter proxy for `gpt-5.6-sol`) rejects the whole schema with
+    `invalid_json_schema` -- "'required' is required ... including every key in properties.
+    Missing 'fresh_start'" -- when a declared property is left out of `required`. The original
+    "genuinely optional, not in required" choice (P0 fix 2026-08-25) only ever worked because
+    caila's Anthropic route does not enforce strict mode. The fix is `PROMPT_SCHEMA`'s own
+    pre-existing nullable-but-required convention (`reply`/`prompt`/`project`): the key is in
+    `required`, and a model with nothing to say answers `null`, which downstream treats exactly
+    as `false` (`web._typed_scenario_scene`).
     """
     scene = _scenario_fields()["sections"]["items"]["properties"]["scene"]
-    assert scene["properties"]["fresh_start"]["type"] == "boolean"
-    assert scene["required"] == ["prompt", "duration"]
-    assert "fresh_start" not in scene["required"]
+    assert scene["properties"]["fresh_start"]["type"] == ["boolean", "null"]
+    assert scene["required"] == ["prompt", "duration", "fresh_start", "state_in", "state_out"]
 
 
-def test_scenario_schema_accepts_fresh_start_true_false_or_absent_but_rejects_a_string():
-    """jsonschema's own behaviour for a property outside `required`: absent is valid (the model
-    just didn't write it), and when present it must actually be a boolean -- a string like `"true"`
-    is not silently coerced, it is a schema violation, the same as any other wrong-typed field on
-    this entry.
+def test_scenario_schema_scene_carries_a_nullable_but_required_state_passport():
+    """Passport wave (2026-08-27), SPEC-scene-prompt-structure.md §5. Night 4's own defect: a sword
+    put down on the table in one scene is back in the character's hand in the next, with no action
+    anywhere that picked it up -- the world's state lives only implicitly, in two prompts written
+    as independent descriptions, so nothing ever had to agree.
+
+    `state_in`/`state_out` make it explicit, and they follow the **same nullable-but-required
+    convention `fresh_start` was moved to on 2026-08-26** (OpenAI strict `json_schema` mode refuses
+    a declared property left out of `required` -- see the test right above and `SCENARIO_SCHEMA`'s
+    own comment): both keys are in `required`, and a model with nothing to declare answers `null`,
+    which `web._typed_scenario_scene` stores as an empty string. Repeating that mistake on a brand
+    new field would break the exact same providers all over again.
+    """
+    scene = _scenario_fields()["sections"]["items"]["properties"]["scene"]
+    assert scene["properties"]["state_in"]["type"] == ["string", "null"]
+    assert scene["properties"]["state_out"]["type"] == ["string", "null"]
+    assert sorted(scene["required"]) == \
+        ["duration", "fresh_start", "prompt", "state_in", "state_out"]
+
+
+def test_scenario_schema_accepts_a_null_passport_but_rejects_a_non_string_one():
+    """The nullable-but-required contract exercised through `jsonschema` itself, the same way
+    `fresh_start`'s own is just below: a string and `null` both validate, an absent key does not
+    (strict providers demand every property in `required`), and a number is a violation rather
+    than something a provider would coerce into text on the way through.
+    """
+    import jsonschema
+
+    def _scene(**over):
+        scene = {"prompt": "[Shot 1] a lantern-lit nursery", "duration": 8, "fresh_start": None,
+                 "state_in": "", "state_out": "the sword lies flat on the oak table"}
+        scene.update(over)
+        return {"reply": "ok", "scenario": {
+            "sections": [{"tag": "verse", "start": 0, "end": 8, "scene": scene}],
+            "style_block": "warm light"}}
+
+    schema = provider.SCENARIO_SCHEMA["schema"]
+    for value in ("she stands at the door, empty-handed", "", None):
+        jsonschema.validate(_scene(state_in=value), schema)  # must not raise
+        jsonschema.validate(_scene(state_out=value), schema)  # must not raise
+
+    for key in ("state_in", "state_out"):
+        turn = _scene()
+        del turn["scenario"]["sections"][0]["scene"][key]
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(turn, schema)
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(_scene(**{key: 7}), schema)
+
+
+def test_scenario_schema_accepts_fresh_start_true_false_or_null_but_rejects_a_string():
+    """The nullable-but-required contract, exercised with jsonschema: `true`/`false`/`null` are
+    all valid, an ABSENT key now violates the schema (strict providers demand every property in
+    `required` -- see the schema test above), and a string like `"true"` is a violation, not a
+    coercion, same as any other wrong-typed field.
     """
     import jsonschema
 
     section = {"tag": "verse", "start": 0, "end": 8,
-               "scene": {"prompt": "[Shot 1] a lantern-lit nursery", "duration": 8}}
+               "scene": {"prompt": "[Shot 1] a lantern-lit nursery", "duration": 8,
+                         "state_in": "", "state_out": "the sword lies flat on the oak table"}}
     base = {"reply": "ok", "scenario": {"sections": [section], "style_block": "warm light"}}
 
-    for value in (True, False):
+    for value in (True, False, None):
         turn = json.loads(json.dumps(base))
         turn["scenario"]["sections"][0]["scene"]["fresh_start"] = value
         jsonschema.validate(turn, provider.SCENARIO_SCHEMA["schema"])  # must not raise
 
-    jsonschema.validate(base, provider.SCENARIO_SCHEMA["schema"])  # absent key: also valid
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(base, provider.SCENARIO_SCHEMA["schema"])  # absent key: now invalid
 
     turn = json.loads(json.dumps(base))
     turn["scenario"]["sections"][0]["scene"]["fresh_start"] = "true"
@@ -751,10 +802,14 @@ def test_scenario_schema_accepts_a_well_formed_turn_and_rejects_bad_ones():
     good = {"reply": "вот сюжет из двух сцен", "scenario": {
         "sections": [
             {"tag": "verse", "start": 0, "end": 8,
-             "scene": {"prompt": "[Shot 1] Cinematic, a lantern-lit nursery…", "duration": 8}},
+             "scene": {"prompt": "[Shot 1] Cinematic, a lantern-lit nursery…", "duration": 8,
+                       "fresh_start": None,
+                       "state_in": "she stands in the doorway, the infant in her arms",
+                       "state_out": "she sits on a low wooden chair beside the cradle"}},
             {"tag": "chorus", "start": 8, "end": 16,
              "scene": {"prompt": "[Shot 1] Cinematic, the same nursery, moonlight…",
-                       "duration": 8}},
+                       "duration": 8, "fresh_start": False, "state_in": None,
+                       "state_out": "the cradle is still, she has not moved"}},
         ],
         "style_block": "A tired mother in a pale blue nightgown, a wooden crib, warm lamplight.",
     }}
@@ -782,10 +837,11 @@ def _scenario_payload() -> dict:
     scenario = {
         "sections": [
             {"tag": "verse", "start": 0, "end": 8,
-             "scene": {"prompt": "[Shot 1] Cinematic, a lantern-lit nursery…", "duration": 8}},
+             "scene": {"prompt": "[Shot 1] Cinematic, a lantern-lit nursery…", "duration": 8,
+                       "fresh_start": None}},
             {"tag": "chorus", "start": 8, "end": 16,
              "scene": {"prompt": "[Shot 1] Cinematic, the same nursery, moonlight…",
-                       "duration": 8}},
+                       "duration": 8, "fresh_start": False}},
         ],
         "style_block": "A tired mother in a pale blue nightgown, a wooden crib, warm lamplight.",
     }
@@ -889,6 +945,98 @@ def test_system_prompt_carries_the_clip_scenario_section():
             "Leave it false (or omit it)",
     ):
         assert anchor in text, anchor
+
+
+def _passport_section(text: str) -> str:
+    """The continuity-passport subsection's own body, line-wrap collapsed. Sliced by its own
+    heading rather than searched for across the whole document: the rules below only do their job
+    where the model is being told what to answer with, and an anchor that merely "matches
+    somewhere" would stay green if the whole subsection were filed under, say, `## Speech`.
+    """
+    assert "\n### The continuity passport" in text, \
+        "no continuity-passport subsection in the system prompt at all"
+    raw = text.split("\n### The continuity passport", 1)[1].split("\n### ", 1)[0]
+    return re.sub(r"\s+", " ", raw)
+
+
+def test_system_prompt_teaches_the_continuity_passport_and_who_writes_which_half():
+    """Passport wave (2026-08-27), SPEC-scene-prompt-structure.md §5. Night 4 shipped a sword that
+    teleported off the table back into a hand between two scenes, and a mother who was outside
+    handing over the baby in one scene and inside by the door in the next -- no action anywhere
+    moved either of them. Each scene's prompt was written as an independent description, so nothing
+    ever had to agree with anything.
+
+    `SCENARIO_SCHEMA` only permits the two keys; this section is the only thing that ever tells the
+    model what to put in them -- and, just as importantly, **which half of the chain it is NOT
+    responsible for.** The pipeline overwrites a chained scene's `state_in` from the previous
+    scene's `state_out` unconditionally (`web._scenario_turn_to_scenes`), so a model that dutifully
+    writes both halves everywhere is burning ~2400 tokens a reply on text that is thrown away. If
+    this instruction drifts, nothing else in the suite goes red: the schema still validates, the
+    derivation still runs, and the only symptom is a bigger bill and a model confused about who
+    owns the chain.
+    """
+    section = _passport_section(provider.system_prompt())
+
+    # what the two fields mean, at which frame
+    assert "the state of the world at the scene's **last** frame" in section, \
+        "`state_out` no longer pinned to the scene's last frame"
+    assert "the same, for the scene's **first** frame" in section, \
+        "`state_in` no longer pinned to the scene's first frame"
+
+    # the division of labour -- this is the whole point of the section
+    assert "Write `state_out` on every single scene." in section, \
+        "the model is no longer told to write state_out on every scene"
+    assert ("Write `state_in` only on scene 0 and on any scene with `fresh_start: true`"
+            in section), \
+        "the model is no longer told that state_in is its job on ONLY those two kinds of scene"
+    assert "derived by the pipeline itself from the previous scene's `state_out`" in section, \
+        "the doc no longer says the pipeline derives the rest of the chain (the model will keep " \
+        "writing state_in everywhere, ~2400 wasted tokens a reply)"
+
+    # a chain break has no visual input to lean on, so its own passport carries the whole world
+    assert "must be **exhaustive**" in section, \
+        "a fresh_start scene's state_in is no longer required to be exhaustive"
+    assert "no reference frame to inherit a composition from" in section, \
+        "the reason a chain break needs an exhaustive passport is gone"
+
+    # the rule the passport exists to enforce -- the teleporting sword itself
+    assert ("The state changes only inside a scene, by an action that scene's own prompt "
+            "describes.") in section, \
+        "the no-teleporting rule is gone or has lost its `only`"
+
+    # one vocabulary across the whole scenario, same reason the visual bible is verbatim
+    assert "Name an entity the same way in every passport line in the whole scenario" in section, \
+        "entities may now drift name between passports, which defeats reading the chain at all"
+
+
+def test_the_passport_section_sits_inside_the_clip_scenario_answer_shape():
+    """Placement, checked the same way the light section's own is: the passport is part of "what
+    you answer" on a clip-scenario turn, and it must sit between that heading and "Breaking the
+    chain on a cast change" -- the fresh_start section right after it refers to the passport rule
+    it now follows, and a passport filed anywhere else is read by the model while it is answering
+    a different question.
+    """
+    text = provider.system_prompt()
+    what_you_answer = text.index("\n### What you answer\n")
+    passport = text.index("\n### The continuity passport")
+    breaking = text.index("\n### Breaking the chain on a cast change\n")
+    assert what_you_answer < passport < breaking, (
+        "the passport subsection must sit between `### What you answer` and `### Breaking the "
+        f"chain on a cast change`, got {what_you_answer} / {passport} / {breaking}")
+
+
+def test_the_documented_scene_shape_carries_the_passport_fields():
+    """The literal `{"prompt": ..., "duration": ..., ...}` line under "What you answer" is what a
+    model actually copies when it builds its answer -- a passport section that teaches two fields
+    the scene shape above it never mentions gets written by some models and silently dropped by
+    others.
+    """
+    text = provider.system_prompt()
+    shape = re.sub(r"\s+", " ", text.split("\n### What you answer\n", 1)[1]
+                   .split("\n### ", 1)[0])
+    assert ('{"prompt": string, "duration": number, "fresh_start": boolean, "state_in": string, '
+            '"state_out": string}') in shape, \
+        "the documented `scene` shape does not carry `state_in`/`state_out`"
 
 
 # -- stream: caila.io idle-drop workaround (Task 4) --------------------------------------------
@@ -1423,3 +1571,151 @@ def test_chat_truncated_message_still_blames_max_tokens_when_it_was_set_explicit
         assert "поднимите `max_tokens`" in str(err.value)
     finally:
         fake.close()
+
+
+def test_system_prompt_forbids_long_sections_and_bible_portraits_and_naming_the_absent():
+    """Night run 3 (2026-08-26), user's own review of the assembled clip -- three defects, all
+    traced to rules this document used to give:
+
+    - "the same scene loops two or three times in a row": 16 of 40 built scenes were twin
+      groups sharing one prompt, because the doc blessed sections up to 30s ("a chorus twenty
+      seconds long...") and `web._split_long_segment` clones the section's single prompt onto
+      every mechanical piece. The rule now keeps the section's own span inside 5-10s.
+    - "the old manservant stands in the last scenes like a ghost": his full portrait rode inside
+      `style_block`, which is glued verbatim into all 40 prompts -- 16 of them after his exit.
+      The bible now carries no character portraits at all.
+    - the portrait problem is compounded by negation: "no old manservant anywhere" NAMES him,
+      and H3 has no negative-prompt channel -- the words summon what the "no" disclaims. Absent
+      characters are now never named, the emptiness is written positively.
+
+    Anchors are exact literals: semantic mutations of these rules (never->always, the 2026-08-24
+    lesson) must break at least one anchor.
+    """
+    text = provider.system_prompt()
+    for anchor in (
+            # section span: 5-10s is the SECTION's own budget, not just scene.duration's
+            "cut a longer musical passage into several consecutive sections",
+            "the same scene looping",
+            # bible carries no portraits; scenes without the character stay silent about them
+            "no character portraits",
+            "must not mention them at all",
+            # absence: naming is summoning
+            "Never name an absent character, even in a negation",
+            "an invitation to draw the manservant",
+    ):
+        assert anchor in text, anchor
+
+
+# == Passport wave (2026-08-27): light, poses (SPEC-scene-prompt-structure.md §4, §3) ============
+#
+# Two of night 4's own four defects need no code at all -- they are things the document never told
+# the model, and the model duly invented its own answer for each. Both sections below are pinned by
+# exact literals for the same reason `test_system_prompt_forbids_long_sections...` above is: a
+# semantic mutation of the rule (`never` -> `always`, a dropped "only") has to break an anchor, not
+# merely reword a paragraph a looser regex would still match (lesson of 2026-08-24).
+
+
+def _light_section(text: str) -> str:
+    """The `## Light and effects` section's own body, line-wrap collapsed so a phrase split across
+    two source lines still matches. Sliced by the heading, not by a wide search of the whole
+    document -- an anchor that only "matches somewhere" would stay green if the rule were moved out
+    of its own section entirely.
+    """
+    assert "\n## Light and effects\n" in text, \
+        "no `## Light and effects` section in the system prompt at all"
+    raw = text.split("\n## Light and effects\n", 1)[1].split("\n## ", 1)[0]
+    return re.sub(r"\s+", " ", raw)
+
+
+def test_system_prompt_demands_physically_motivated_light_and_forbids_free_floating_glow():
+    """Nights 1-4 ("Колыбельная") all rendered blinking orange orbs hanging in mid-air -- the
+    cheapest video effect there is -- and night 4's own frame 2:13 pinned it. The prompts asked for
+    "flashes pulsing across the vaults": a light event with no source, no path, and no surface to
+    land on. H3 has nothing to attach such a light to, so it draws the light itself as an object.
+
+    The rule (SPEC-scene-prompt-structure.md §4): every light in a prompt names four things --
+    source, path, carrier, tempo -- and an abstract light event never goes in at all.
+    """
+    section = _light_section(provider.system_prompt())
+
+    # the four parts, named as a set: a rule that only says "motivate your light" leaves the model
+    # to decide what motivation means
+    assert "name the source, the path it travels, the surface that carries it, and its tempo" \
+        in section, "the light rule no longer names all four parts (source/path/carrier/tempo)"
+
+    # the defect itself, named with the exact wording that produced it
+    assert "flashes pulsing across the vaults" in section, \
+        "no concrete example of the abstract light event this rule exists to forbid"
+    assert "free-floating colored blobs drifting through the air" in section, \
+        "the rule no longer says what H3 actually renders an unmotivated light event as"
+
+    # the prohibition itself, stated with its polarity -- `never` -> `always` here must go red
+    assert "Light with no named source and no named surface never goes into a prompt at all." \
+        in section, "the prohibition on unmotivated light is gone or has flipped polarity"
+
+    # the replacement, verbatim from the spec: the model needs the shape of a correct one, not
+    # only the shape of the wrong one
+    assert ("a warm glow from distant fires enters ONLY through the windows and lies on the stone "
+            "as a slow, soft reflection; every light in the frame comes from a named source and "
+                "rests on a named surface") in section, \
+        "the spec's own worked replacement example for the siege scene is missing or reworded"
+
+    # the one narrow exception, with its condition attached
+    assert "only as a story event with an explicit cause in the frame or just outside it" \
+        in section, "the exception for sharp/colored light no longer requires an on-screen cause"
+
+
+def test_the_light_section_sits_after_camera_vocabulary_and_before_speech():
+    """Placement is load-bearing twice over. It belongs with the other "how to write the picture"
+    craft sections (`## Camera vocabulary`), not among the answer-shape rules -- and it must stay
+    OUT of the stretch between `**The visual bible.**` and `## Song mode`, which
+    `test_system_prompt_demands_positive_absence_and_per_scene_accent_color_binding` slices whole:
+    a `## `-section landing inside that slice bloats what that test reads and quietly changes what
+    it is asserting about.
+    """
+    text = provider.system_prompt()
+    camera = text.index("\n## Camera vocabulary\n")
+    light = text.index("\n## Light and effects\n")
+    speech = text.index("\n## Speech\n")
+    assert camera < light < speech, (
+        "`## Light and effects` must sit after `## Camera vocabulary` and before `## Speech`, "
+        f"got camera={camera} light={light} speech={speech}")
+
+    bible = text.index("**The visual bible.**")
+    song_mode = text.index("\n## Song mode")
+    assert not (bible < light < song_mode), (
+        "`## Light and effects` landed inside the visual-bible slice that "
+        "test_system_prompt_demands_positive_absence_and_per_scene_accent_color_binding reads")
+
+
+def test_system_prompt_demands_an_explicit_pose_and_support_for_every_character():
+    """Night 4: "a vigil at the cradle" put the mother INSIDE the cradle, next to the infant. The
+    prompt named the pose only by its name and left the geometry -- who is on what, relative to
+    what -- for the model to fill in, and the model filled it in with the most compact arrangement
+    it knew.
+
+    The rule (SPEC-scene-prompt-structure.md §3): every scene says who stands or sits where and on
+    what, with the support named. Anchored inside the visual-bible block of `kind: "video"`, beside
+    "Never name an absent character" -- both are the same lesson (the positive description is the
+    only channel there is), and a rule filed somewhere else in the document is a rule the model
+    reads while writing something else.
+    """
+    text = provider.system_prompt()
+    raw = text.split("**The visual bible.**", 1)[1].split("## Song mode", 1)[0]
+    section = re.sub(r"\s+", " ", raw)
+
+    assert "Say where every character is and what holds them up" in section, \
+        "no rule demanding an explicit pose and support for each character in the scene"
+    assert "Every scene names who stands or sits where, and on what" in section, \
+        "the per-scene scope of the pose rule is gone (a fact given once cannot protect scene 2)"
+
+    # polarity: `never` -> `always` here must go red
+    assert "The support is never left implied" in section, \
+        "the prohibition on an implied support is gone or has flipped polarity"
+
+    # the spec's own worked example, verbatim -- the wrong reading and the right one in one line
+    assert ("she sits on a low wooden chair BESIDE the cradle; only the infant lies inside the "
+            "cradle") in section, \
+        "the spec's own cradle example is missing or reworded"
+    assert "the mother rendered inside the cradle" in section, \
+        "the defect this rule was paid for is no longer named beside it"

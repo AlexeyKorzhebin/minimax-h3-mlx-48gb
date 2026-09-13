@@ -33,6 +33,7 @@ import fcntl
 import hashlib
 import io
 import json
+import logging
 import math
 import mimetypes
 import os
@@ -56,6 +57,14 @@ from h3_48gb.cli import DEFAULT_CANVAS, ERROR_CODES, CliError, build_parser
 from h3_48gb.project import PROJECT_KINDS
 from h3_48gb.worker import (WORKER_LOCK_NAME, align_job_wallclock_estimate_seconds,
                             song_job_wallclock_estimate_seconds)
+
+#: Module logger. The request log is `BaseHTTPRequestHandler.log_message`'s own business (quiet
+#: unless `make_server(verbose=True)`); this one exists for the handful of places where the server
+#: notices something a *human* will want to know about but that is deliberately not a refusal --
+#: currently only the continuity passport missing at a chain break (`_scenario_turn_to_scenes`).
+#: Named rather than the root logger so a test can pin it (`caplog.at_level(..., logger="h3_48gb.
+#: web")`) without swallowing every other library's own records.
+_log = logging.getLogger(__name__)
 
 #: The only address this server ever binds. Not a parameter, and deliberately not one: a flag that
 #: could hold `0.0.0.0` is a flag someone eventually sets, and this server has no authentication of
@@ -818,6 +827,17 @@ def build_state(queue_root, outdir) -> dict:
 SCENE_MIN_SECONDS = 5.0
 SCENE_MAX_SECONDS = 10.0
 
+#: Glued onto every piece after the first when `_split_long_segment` has to cut an over-length
+#: section. Identical text + an i2v keyframe of the previous piece's last frame rendered as the
+#: same scene looping two or three times in a row (night run 3, 2026-08-26: 16 twin groups out of
+#: 40 scenes, seen by the user with the naked eye). The system prompt now keeps sections inside
+#: `SCENE_MAX_SECONDS` so this split is a fallback, not the norm -- but when it does fire, a later
+#: piece has to *say* it continues the shot, or the render restates it. Leading space: the clause
+#: is appended to prompt text directly.
+SPLIT_CONTINUATION_CLAUSE = (
+    " Direct continuation of the previous shot in the same setting: the action visibly moves"
+    " forward, never repeating or resetting the movement already shown.")
+
 #: Task brief ("Проекты", task 6): an instrumental gap under this many seconds is not worth its own
 #: scene -- folded into whichever sung scene borders it. At or above, it becomes its own
 #: instrumental scene with a fallback prompt (`_GAP_SCENE_PROMPT`), no second LLM call.
@@ -1069,10 +1089,25 @@ def _fold_short_segments(segments: list[dict], min_seconds: float, *,
     one. Written unconditionally (`bool(seg.get("fresh_start")) or ...`), so a procedural-path
     segment (no such key at all) always folds to an explicit `False`, never `None`/absent --
     consistent with `_scenario_segments`'s own `.get("fresh_start", False)` default.
+
+    **`state_in` (continuity passport, 2026-08-27 wave) is carried on the FORWARD branch only**,
+    and for a different reason than `fresh_start`'s, which is why it is not the same accumulator. A
+    passport labels one specific frame -- the segment's first. A *backward* merge only moves the
+    survivor's own `end`, so its first frame does not move and its own passport still describes it
+    exactly; the absorbed segment's passport described a moment in the middle of the merged
+    segment and is correctly discarded with the rest of its identity. A *forward* carry moves the
+    survivor's own `start` earlier, onto the first absorbed segment's -- so the survivor now opens
+    on a frame its own passport does not describe, and the right passport is the one belonging to
+    the earliest segment of the carried run. `carry_state_in` therefore keeps the FIRST non-empty
+    one it sees (`carry_state_in or ...`, unlike `carry_fresh_start`'s OR-of-every-flag) and wins
+    over the survivor's own when the run finally lands. Getting this wrong is worse than having no
+    passport at all: the scene would open with a confident, wrong description of its own first
+    frame, glued straight into the prompt.
     """
     result: list[dict] = []
     carry_start = None
     carry_fresh_start = False
+    carry_state_in = ""
     for seg in segments:
         start = seg["start"] if carry_start is None else carry_start
         carry_start = None
@@ -1085,10 +1120,13 @@ def _fold_short_segments(segments: list[dict], min_seconds: float, *,
             else:
                 carry_start = start
                 carry_fresh_start = carry_fresh_start or bool(seg.get("fresh_start"))
+                carry_state_in = carry_state_in or seg.get("state_in", "")
             continue
         result.append({**seg, "start": start,
-                       "fresh_start": bool(seg.get("fresh_start")) or carry_fresh_start})
+                       "fresh_start": bool(seg.get("fresh_start")) or carry_fresh_start,
+                       "state_in": carry_state_in or seg.get("state_in", "")})
         carry_fresh_start = False
+        carry_state_in = ""
     if carry_start is not None:
         # Every segment was short and eligible -- the whole timeline collapses into whatever is
         # left of it. M1 (fix round 1, 2026-08-19 review): `result` is *provably* still empty here,
@@ -1099,7 +1137,8 @@ def _fold_short_segments(segments: list[dict], min_seconds: float, *,
         # dead `if result: ...` branch used to sit here for the case that can never happen;
         # removed rather than covered, since there is no input that reaches it to cover.
         result.append({**segments[-1], "start": carry_start,
-                       "fresh_start": bool(segments[-1].get("fresh_start")) or carry_fresh_start})
+                       "fresh_start": bool(segments[-1].get("fresh_start")) or carry_fresh_start,
+                       "state_in": carry_state_in or segments[-1].get("state_in", "")})
     return result
 
 
@@ -1124,6 +1163,15 @@ def _split_long_segment(seg: dict) -> list[dict]:
     Only `pieces[0]` keeps whatever `fresh_start` `seg` carried (`True` or absent, procedural
     segments have no such key at all and are left untouched); every later piece is forced to
     `False` so it still chains an i2v keyframe off the piece right before it.
+
+    **`state_in` (continuity passport, 2026-08-27 wave) is cleared on every piece but the first**,
+    the same shape and the same argument as `fresh_start` right above. The passport describes the
+    section's own first frame; only `pieces[0]` still starts on it. Piece 2 starts mid-action, and
+    telling H3 that the sword is back on the table at the top of it is an instruction to re-stage
+    the shot -- the exact "the same scene played two or three times in a row" defect the
+    continuation clause below exists to fight, made worse by a sentence that actively describes the
+    starting composition. Those pieces carry state the way the pipeline already carries it inside
+    one shot: the latent tail plus `SPLIT_CONTINUATION_CLAUSE`.
     """
     length = seg["end"] - seg["start"]
     n = max(1, math.ceil(length / SCENE_MAX_SECONDS))
@@ -1133,6 +1181,14 @@ def _split_long_segment(seg: dict) -> list[dict]:
     if pieces and pieces[0].get("fresh_start"):
         for piece in pieces[1:]:
             piece["fresh_start"] = False
+    if pieces and pieces[0].get("state_in"):
+        for piece in pieces[1:]:
+            piece["state_in"] = ""
+    # Каждый кусок после первого продолжает план, а не переигрывает его: тот же текст плюс
+    # кейфрейм предыдущего куска рендерился как зацикленная сцена (ночь 3, 2026-08-26).
+    for piece in pieces[1:]:
+        if piece.get("prompt"):
+            piece["prompt"] = piece["prompt"] + SPLIT_CONTINUATION_CLAUSE
     return pieces
 
 
@@ -1155,6 +1211,56 @@ def _clip_style_block(caption: str) -> str:
     first_line = next((line.strip() for line in first_paragraph.splitlines() if line.strip()), "")
     sentence = first_line.split(". ", 1)[0].rstrip(".").strip()
     return sentence
+
+
+#: Where `integrated_multimodal_description` ends and the next of an H3 prompt's three labelled
+#: fields begins (`docs/h3-prompt-system.md`, "The three core fields, and their order"). The
+#: passport is spliced in right before this, never after it.
+#: The boundary of the description field, as the model ACTUALLY writes it: night-4 separated
+#: every field label with a single `\n` (80/80), night-3 with `\n\n` (61/61) -- the doc never
+#: named a separator, so the model floats between the two. A literal `"\n\noverall_soundscape:"`
+#: missed 40/40 live prompts and quietly dropped every passport into `non_diegetic_music`
+#: (passport-wave review, B1). Label-at-line-start is the same understanding `app.js`'s own
+#: field regex uses.
+_SOUNDSCAPE_MARKER_RX = re.compile(r"\n[ \t]*overall_soundscape[ \t]*:")
+
+
+def _glue_state_block(prompt: str, state_in: str) -> str:
+    """`prompt` with the continuity passport (`state_in`) spliced in at the END of its own
+    `integrated_multimodal_description` field -- SPEC-scene-prompt-structure.md §5: "`state_in`
+    вклеивается в промпт сцены (как библия): видеомодель получает стартовое состояние текстом, а не
+    догадкой". Empty `state_in` returns `prompt` unchanged, byte for byte: every scenario written
+    before this field existed builds exactly as it always did.
+
+    **Not a tail concat, and that is the whole reason this is a function** (S2-1 review). An H3
+    prompt is three labelled fields inside one string, in a fixed order, and the last of them is
+    `non_diegetic_music`. `prompt + block` therefore does not append to the prompt, it appends to
+    the *score description* -- H3 reads a sentence about where the sword is lying as an instruction
+    about the music. The block belongs at the end of the description field instead, which is what
+    cutting at the first `_SOUNDSCAPE_MARKER_RX` match finds.
+
+    First occurrence, not last: `overall_soundscape:` can legitimately be *named* again further
+    down (a prompt that discusses its own fields, a model that repeats the label inside
+    `non_diegetic_music`), and the field boundary is the first one. No marker at all -- a
+    hand-written scene, or a model that skipped the sound fields -- means the whole string is the
+    description, and the end of the string is the end of the description: the block goes on the
+    tail, which is the correct place *for that shape*, rather than the glue quietly doing nothing.
+
+    `SPLIT_CONTINUATION_CLAUSE` is deliberately NOT routed through here (six tests pin it as an
+    exact tail, and it genuinely is one -- it is an instruction about the shot as a whole, not a
+    line of the description).
+    """
+    if not state_in:
+        return prompt
+    # Переводы строк в паспорте схлопываются в пробелы: модель пишет state свободным текстом, и
+    # `\n` + метка поля внутри него подделали бы вторую пару звуковых полей прямо в описании
+    # (ревью паспортной волны, инъекция маркера). Паспорт — одно предложение описания.
+    flat = " ".join(state_in.split())
+    block = f" State at the first frame: {flat}."
+    m = _SOUNDSCAPE_MARKER_RX.search(prompt)
+    if m is None:
+        return prompt + block
+    return prompt[:m.start()] + block + prompt[m.start():]
 
 
 def _style_clause(style_block: str | None) -> str:
@@ -1227,6 +1333,18 @@ def _scenario_segments(scenario_scenes: list[dict], style_block: str | None) -> 
     unchanged. `tag` has no consumer in the coverage nadrezka at all -- it exists for the gate UI
     (Task 4) to label a scene by its song section, not for this module.
 
+    **`state_in` (continuity passport, 2026-08-27 wave) is carried too -- and `state_out` is
+    not.** `state_out` describes the section's LAST frame; nothing below this line has any use for
+    it (the chain it feeds was already derived, once, in `_scenario_turn_to_scenes`), and gluing it
+    into a prompt would tell H3 to open on the shot's own ending. `state_in` is carried as a raw
+    field rather than glued into `prompt` right here, because both of the two passes below it can
+    still change *which frame the segment starts on*: `_fold_short_segments` can move a segment's
+    own `start` earlier (its forward carry), and `_split_long_segment` cuts a section into pieces
+    of which only the first still starts where the passport says. Both need the raw string to do
+    that correctly; the glue itself runs once, at the end, in `build_clip_scenes`'s own final loop
+    (`_glue_state_block`). Read with `.get(..., "")` for the same reason `fresh_start` is: the
+    procedural path's entries (`_procedural_scenario_scenes`, five keys) never carry one.
+
     **`fresh_start` (P0 fix, keyframe-chain defect 2026-08-25) is carried through, unlike `tag`/
     `duration`.** `_typed_scenario_scene` already defaults a missing one to `False`, so every
     entry here has the key -- `_fold_short_segments`/`_split_long_segment` downstream both build
@@ -1248,7 +1366,8 @@ def _scenario_segments(scenario_scenes: list[dict], style_block: str | None) -> 
         return [{"start": float(scene["start"]), "end": float(scene["end"]),
                  "prompt": scene["prompt"] if (style_block and style_block in scene["prompt"])
                  else f"{scene['prompt']}{style_clause}",
-                 "fresh_start": bool(scene.get("fresh_start", False))} for scene in ordered]
+                 "fresh_start": bool(scene.get("fresh_start", False)),
+                 "state_in": scene.get("state_in", "")} for scene in ordered]
     except (KeyError, TypeError) as exc:
         raise ProjectSceneBuildError(f"malformed scenario scene entry: {exc}") from exc
 
@@ -1453,7 +1572,15 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None,
         # is what makes every procedurally-built scene read exactly as it did before this field
         # existed. `assemble._submit_next_scene` is the actual consumer: `True` here skips
         # extracting a keyframe from the previous scene's clip entirely.
-        scenes.append({"idx": i, "prompt": seg["prompt"], "duration": snapped,
+        # The continuity passport is glued in HERE and nowhere earlier (2026-08-27 wave): both
+        # passes above can still change which frame a segment starts on -- `_fold_short_segments`
+        # moves a survivor's own `start` back over a forward-carried run, `_split_long_segment`
+        # cuts a section into pieces of which only the first still opens on the passport's frame --
+        # and the glue has to run after the last of them, on whatever `state_in` actually survived.
+        # `.get(..., "")` (never `seg["state_in"]`): the procedural path's segments have no such
+        # key at all, and `_glue_state_block("")` returns the prompt byte for byte unchanged.
+        prompt = _glue_state_block(seg["prompt"], seg.get("state_in", ""))
+        scenes.append({"idx": i, "prompt": prompt, "duration": snapped,
                        "status": "pending", "job_id": None, "clip_path": None,
                        "keyframe_path": None, "fresh_start": seg.get("fresh_start", False)})
 
@@ -1506,18 +1633,48 @@ def _typed_scenario_scene(raw, i: int) -> dict:
     renders it from text alone instead of chaining an automatic keyframe off the previous scene's
     own (now stale) composition. Absent entirely (an old scene written before this field existed,
     or a model/human that simply never sets it) means exactly what an explicit `false` would --
-    `raw.get("fresh_start", False)` reads the same value either way, matching `SCENARIO_SCHEMA`'s
-    own "optional, not nullable-required" choice for this field (that schema's own comment). Any
-    *present* value that is not a bool (a string, a number, `null`) is rejected outright, the same
+    `raw.get("fresh_start", False)` reads the same value either way, and an explicit `null` folds
+    to `False` too -- `SCENARIO_SCHEMA` made the field nullable-but-required on 2026-08-26 (OpenAI
+    strict mode refuses a property outside `required`; see that schema's own comment), so `null`
+    is the schema-level spelling of "nothing to declare". Any other
+    *present* value that is not a bool (a string, a number) is rejected outright, the same
     "wrong type is refused, not coerced" discipline every other field on this entry already gets --
     a truthy string like `"false"` silently becoming `True` would flip a scene into a visual cut
     nobody asked for.
+
+    **`state_in`/`state_out` (continuity passport, 2026-08-27 wave): `None` and absent both mean
+    `""`, and the value is always stored as a string.** `docs/h3-prompt-system.md`'s "The
+    continuity passport" -- the world's state at the scene's first and last frame, so a sword put
+    down on a table cannot be back in a hand one scene later with no action that moved it
+    (SPEC-scene-prompt-structure.md §5, night 4). Three sources legitimately produce no passport at
+    all and none of them is an error: a scenario written before this field existed, a
+    `_procedural_scenario_scenes` entry (five keys, no passport concept), and a model answering
+    `null` under the nullable-but-required schema convention. Folding all three to `""` rather than
+    keeping `None` around is what lets every downstream reader treat the passport as plain text
+    (`if state_in:`, string concatenation into a prompt) instead of defending against a JSON null
+    each on its own. A *present* non-string is refused outright, same as every other field here:
+    coercing `7` would paste "7" into a video prompt as the state of the world.
     """
     if not isinstance(raw, dict):
         raise ValueError(f"entry {i} is not an object")
     tag, start, end = raw.get("tag"), raw.get("start"), raw.get("end")
     prompt, dur = raw.get("prompt"), raw.get("duration")
+    # `None` folds to `False` alongside "absent": the schema is nullable-but-required
+    # (2026-08-26, OpenAI strict mode refuses a property outside `required` -- see
+    # `SCENARIO_SCHEMA`'s own comment), so a model with no chain break to declare answers
+    # `null`. Strings and numbers are still refused below, not coerced.
     fresh_start = raw.get("fresh_start", False)
+    if fresh_start is None:
+        fresh_start = False
+    # Absent and `null` both fold to `""` here, for the three reasons the docstring above gives.
+    passport = {}
+    for field in ("state_in", "state_out"):
+        value = raw.get(field, "")
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            raise ValueError(f"entry {i}: `{field}` must be a string")
+        passport[field] = value
     if not isinstance(tag, str):
         raise ValueError(f"entry {i}: `tag` must be a string")
     if not isinstance(start, (int, float)) or isinstance(start, bool):
@@ -1531,7 +1688,7 @@ def _typed_scenario_scene(raw, i: int) -> dict:
     if not isinstance(fresh_start, bool):
         raise ValueError(f"entry {i}: `fresh_start` must be a boolean")
     return {"tag": tag, "start": float(start), "end": float(end), "prompt": prompt,
-            "duration": float(dur), "fresh_start": fresh_start}
+            "duration": float(dur), "fresh_start": fresh_start, **passport}
 
 
 def _validate_scenario_scenes(scenes: list[dict], duration: float) -> None:
@@ -1715,6 +1872,32 @@ def _scenario_turn_to_scenes(turn) -> tuple[list[dict], str | None]:
     the wrong type -- the same defensive checks `_locked_turn` already makes on a plain `chat()`
     reply (`isinstance(turn, dict)`, `reply` a string), extended one level in to `scenario`'s own
     `sections`/`style_block`.
+
+    **The continuity chain is built here, by this code, not by the model** (2026-08-27 wave, S1-3
+    review; SPEC-scene-prompt-structure.md §5). The model is responsible for `state_out` on every
+    scene and for `state_in` on exactly two kinds of scene -- scene 0 and every `fresh_start`
+    scene, the only two with no previous frame to inherit from. Every other scene's `state_in` is
+    **overwritten unconditionally** with the previous scene's own `state_out` once the whole list
+    is built. Three things follow, all deliberate:
+
+    - SPEC §5's invariant ("`state_in` of N+1 == `state_out` of N, verbatim") is true *by
+      construction*. There is no pairwise validation anywhere on this path and none is to be added:
+      a mismatch refusal here would re-roll a 20 000-token scenario over a stray space, which is an
+      unacceptable failure for a button a person presses and then waits 2-7 minutes on. This module
+      already has the precedent -- `_style_clause` fixes a missing bible rather than refusing the
+      reply. The `PUT /scenario` path is a human editing text with their eyes on it, and is left
+      alone entirely.
+    - Whatever the model wrote into a chained scene's `state_in` is discarded, not merged and not
+      preferred. `docs/h3-prompt-system.md` tells it not to write one there at all (~2400 tokens a
+      reply saved on a full song), but a model that writes one anyway must not be able to introduce
+      a contradiction the derivation was supposed to make impossible.
+    - A `fresh_start` scene (or scene 0) that came back with an **empty** `state_in` is a real gap
+      -- that scene renders from text alone, so its passport is the only description of the world
+      it gets -- but it is still not a refusal: `bad_model_json` costs a full re-roll and a retry
+      does not make a model write a field it just decided to skip. The scene keeps an empty
+      passport (the glue step then pastes nothing at all, and the scene behaves exactly as it did
+      before this field existed), and the gap is logged for the human who is about to read the
+      whole scenario at the gate anyway.
     """
     if not isinstance(turn, dict):
         raise _BadScenarioReply(f"модель вернула не объект: {type(turn).__name__}")
@@ -1751,10 +1934,36 @@ def _scenario_turn_to_scenes(turn) -> tuple[list[dict], str | None]:
         # `False` the way an absent key does.
         if "fresh_start" in scene:
             flat["fresh_start"] = scene["fresh_start"]
+        # Same "absent is not `null`" care as `fresh_start` right above -- `_typed_scenario_scene`
+        # folds both to `""` for the passport, but adding the key only when the model actually
+        # wrote it keeps the two paths honest and keeps this mapping readable as one rule.
+        for field in ("state_in", "state_out"):
+            if field in scene:
+                flat[field] = scene[field]
         try:
             scenes.append(_typed_scenario_scene(flat, i))
         except ValueError as exc:
             raise _BadScenarioReply(str(exc)) from exc
+
+    # The derivation -- see this function's own docstring for why the chain is built here and not
+    # validated as a pair anywhere. Unconditional for every chained scene: whatever the model wrote
+    # into `state_in` there is replaced, never merged.
+    for i, scene in enumerate(scenes):
+        if i > 0 and not scene["fresh_start"]:
+            scene["state_in"] = scenes[i - 1]["state_out"]
+            if not scene["state_in"]:
+                # Ревью M1: дыра в СЕРЕДИНЕ цепочки (модель забыла `state_out` предыдущей
+                # сцены) раньше молчала -- дериват честно перетирал паспорт пустой строкой, и
+                # человек на гейте видел дырку без единой строки в логе.
+                _log.warning(
+                    "сцена %d (%r): у предыдущей сцены пустой `state_out` -- цепочка паспорта "
+                    "рвётся, в промпт этой сцены не вклеится ничего; дыру сделала модель, "
+                    "проверьте обе сцены на гейте", i, scene["tag"])
+        elif not scene["state_in"]:
+            _log.warning(
+                "сцена %d (%r): нет `state_in`, а он тут обязателен (%s) — паспорт остаётся "
+                "пустым, в промпт не вклеится ничего; проверьте сцену на гейте",
+                i, scene["tag"], "начало клипа" if i == 0 else "fresh_start, разрыв цепочки")
     return scenes, style_block
 
 

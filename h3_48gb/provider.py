@@ -156,22 +156,56 @@ SCENARIO_SCHEMA = {
                                         # section's own `start`/`end` span actually runs.
                                         "duration": {"type": "number", "minimum": 5,
                                                     "maximum": 10},
-                                        # Genuinely optional, not in `required` below -- unlike
-                                        # `reply`/`prompt`/`project` above (PROMPT_SCHEMA's own
-                                        # "nullable-but-required" convention, for a field the model
-                                        # must always *answer*, even with `null`), a scene's cast
-                                        # does not change every section, and there is nothing wrong
-                                        # with a model that simply never writes this key. jsonschema
-                                        # and llama.cpp's own grammar-from-schema compiler (module
-                                        # docstring above) both treat a property absent from
-                                        # `required` as omittable while still enforcing its type
-                                        # when present -- an omitted key here means exactly what an
-                                        # explicit `false` would (`docs/h3-prompt-system.md`,
-                                        # "Breaking the chain on a cast change": "false (or omit
-                                        # it)"), so nothing downstream needs the key to exist.
-                                        "fresh_start": {"type": "boolean"},
+                                        # Nullable-but-required -- the same convention
+                                        # `reply`/`prompt`/`project` above already use. The
+                                        # original "genuinely optional, not in required" choice
+                                        # (P0 fix 2026-08-25) was rejected live on 2026-08-26 by
+                                        # OpenAI's strict `json_schema` mode (Azure and OpenAI
+                                        # both, behind caila's openrouter proxy for
+                                        # `gpt-5.6-sol`): `invalid_json_schema`, "'required' is
+                                        # required ... including every key in properties.
+                                        # Missing 'fresh_start'" -- it only ever worked because
+                                        # caila's Anthropic route does not enforce strict mode.
+                                        # A model with no chain break to declare answers `null`,
+                                        # which `web._typed_scenario_scene` stores as `False`
+                                        # (`docs/h3-prompt-system.md`, "Breaking the chain on a
+                                        # cast change": "false (or omit it)").
+                                        "fresh_start": {"type": ["boolean", "null"]},
+                                        # The continuity passport (2026-08-27 wave, SPEC-scene-
+                                        # prompt-structure.md §5): the world's state at this
+                                        # scene's first (`state_in`) and last (`state_out`) frame,
+                                        # short declarative clauses joined by " | ". Night 4's own
+                                        # defect class -- a sword put down on a table and back in a
+                                        # hand one scene later, with no action anywhere that moved
+                                        # it -- comes from neighbouring prompts being written as
+                                        # independent descriptions with nothing that has to agree.
+                                        #
+                                        # Nullable-but-required, the SAME convention `fresh_start`
+                                        # above was moved to on 2026-08-26 and for the same
+                                        # measured reason: OpenAI's strict `json_schema` mode
+                                        # (Azure and OpenAI both, behind caila's openrouter proxy)
+                                        # rejects the whole schema with `invalid_json_schema` --
+                                        # "'required' is required ... including every key in
+                                        # properties" -- for any declared property left out of
+                                        # `required`. Repeating that mistake on a new field would
+                                        # break the same providers all over again, so `null` is
+                                        # the schema-level spelling of "nothing to declare" here
+                                        # too; `web._typed_scenario_scene` stores it as `""`.
+                                        #
+                                        # Only two kinds of scene are the model's own job to write
+                                        # `state_in` for -- scene 0 and every `fresh_start` scene.
+                                        # Every other scene's `state_in` is overwritten by the
+                                        # pipeline from the previous scene's `state_out`
+                                        # (`web._scenario_turn_to_scenes`), which is what makes
+                                        # SPEC §5's verbatim-match invariant true by construction
+                                        # instead of by a refusal that would re-roll a 20 000
+                                        # token reply over a stray space. See
+                                        # `docs/h3-prompt-system.md`, "The continuity passport".
+                                        "state_in": {"type": ["string", "null"]},
+                                        "state_out": {"type": ["string", "null"]},
                                     },
-                                    "required": ["prompt", "duration"],
+                                    "required": ["prompt", "duration", "fresh_start",
+                                                 "state_in", "state_out"],
                                     "additionalProperties": False,
                                 },
                             },

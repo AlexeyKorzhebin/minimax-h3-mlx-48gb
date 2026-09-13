@@ -3012,6 +3012,13 @@ function startPage() {
       duration: (idx in durations && Number.isFinite(durations[idx]))
         ? durations[idx] : scene.duration,
       fresh_start: idx in freshStarts ? freshStarts[idx] : Boolean(scene.fresh_start),
+      // Паспорт непрерывности (волна 2026-08-27): у `state_in`/`state_out` НЕТ своего контрола на
+      // этой странице -- их никто не рисует и никто не правит руками, они просто едут с диска
+      // обратно на диск. Без этих двух строк `PUT` (он заменяет весь список целиком) молча
+      // затирает паспорта всего сценария при первой же правке опечатки на гейте: сервер трактует
+      // отсутствующее поле как пустую строку, 400 не будет, на экране ничего не изменится.
+      state_in: scene.state_in || "",
+      state_out: scene.state_out || "",
     }));
   }
 
