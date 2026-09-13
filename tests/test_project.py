@@ -392,6 +392,108 @@ def test_invalidate_scene_chain_lets_next_pending_scene_pick_it_back_up(tmp_path
     assert scene["idx"] == 1
 
 
+# -- invalidate_scene_chain: stops at the next fresh_start boundary -----------------------------
+
+
+def _project_with_fresh_scenes(tmp_path, n, fresh_idxs=()):
+    """`n` scenes, all `"done"` with distinct `job_id`/`clip_path`/`keyframe_path` already set, so
+    a test can tell "reset" apart from "left alone" by more than just `status`. `fresh_idxs` marks
+    which scene indices carry `fresh_start=True` -- the chain-break boundary
+    `invalidate_scene_chain` must now respect.
+    """
+    project = p.create_project(tmp_path, "video", "scenes")
+    project.scenes = [
+        {"idx": i, "prompt": f"scene {i}", "duration": 5.0, "status": "done",
+         "job_id": f"job-{i}", "clip_path": f"/x/{i}.mp4", "keyframe_path": f"/x/{i}.png",
+         "fresh_start": i in fresh_idxs}
+        for i in range(n)
+    ]
+    project.save()
+    return project
+
+
+def test_invalidate_scene_chain_stops_before_the_next_fresh_start_scene(tmp_path):
+    project = _project_with_fresh_scenes(tmp_path, 6, fresh_idxs={3})
+
+    project.invalidate_scene_chain(0)
+
+    for i in (0, 1, 2):
+        assert project.scenes[i]["status"] == "pending"
+        assert project.scenes[i]["job_id"] is None
+        assert project.scenes[i]["clip_path"] is None
+        assert project.scenes[i]["keyframe_path"] is None
+    for i in (3, 4, 5):
+        assert project.scenes[i]["status"] == "done", (
+            "a fresh_start scene does not depend on the invalidated one -- must be left alone")
+        assert project.scenes[i]["job_id"] == f"job-{i}"
+        assert project.scenes[i]["clip_path"] == f"/x/{i}.mp4"
+        assert project.scenes[i]["keyframe_path"] == f"/x/{i}.png"
+    assert project.stages["scenes"] == "draft"
+    assert project.stages["assembly"] == "draft"
+    assert project.assembly["final_path"] is None
+
+    reloaded = p.load_project(project.path)
+    assert reloaded.scenes[3]["status"] == "done"
+
+
+def test_invalidate_scene_chain_resets_idx_itself_even_when_idx_is_fresh_start(tmp_path):
+    """`idx` itself always resets, whether or not it carries `fresh_start` -- only a *later* scene's
+    `fresh_start` stops the reset. Scene 5 is the next fresh_start boundary after scene 3, so it
+    (and nothing past scene 4) survives.
+    """
+    project = _project_with_fresh_scenes(tmp_path, 6, fresh_idxs={3, 5})
+
+    project.invalidate_scene_chain(3)
+
+    for i in (3, 4):
+        assert project.scenes[i]["status"] == "pending"
+        assert project.scenes[i]["job_id"] is None
+        assert project.scenes[i]["clip_path"] is None
+        assert project.scenes[i]["keyframe_path"] is None
+    assert project.scenes[5]["status"] == "done"
+    assert project.scenes[5]["job_id"] == "job-5"
+    assert project.scenes[5]["clip_path"] == "/x/5.mp4"
+    assert project.scenes[5]["keyframe_path"] == "/x/5.png"
+    for i in (0, 1, 2):
+        assert project.scenes[i]["status"] == "done"
+
+
+def test_invalidate_scene_chain_resets_the_whole_tail_when_no_scene_has_fresh_start(tmp_path):
+    """Old projects (written before `fresh_start` existed) have no such key on any scene -- an
+    absent `fresh_start` must be treated as `False`, falling back to the pre-fresh_start "whole
+    tail" behaviour.
+    """
+    project = p.create_project(tmp_path, "video", "scenes")
+    project.scenes = [
+        {"idx": i, "prompt": f"scene {i}", "duration": 5.0, "status": "done",
+         "job_id": f"job-{i}", "clip_path": f"/x/{i}.mp4", "keyframe_path": f"/x/{i}.png"}
+        for i in range(4)
+    ]
+    project.save()
+
+    project.invalidate_scene_chain(0)
+
+    for i in range(4):
+        assert project.scenes[i]["status"] == "pending"
+        assert project.scenes[i]["job_id"] is None
+        assert project.scenes[i]["clip_path"] is None
+        assert project.scenes[i]["keyframe_path"] is None
+
+
+def test_invalidate_scene_chain_on_the_last_scene_resets_only_that_scene(tmp_path):
+    project = _project_with_fresh_scenes(tmp_path, 4, fresh_idxs=set())
+
+    project.invalidate_scene_chain(3)
+
+    assert project.scenes[3]["status"] == "pending"
+    assert project.scenes[3]["job_id"] is None
+    assert project.scenes[3]["clip_path"] is None
+    assert project.scenes[3]["keyframe_path"] is None
+    for i in (0, 1, 2):
+        assert project.scenes[i]["status"] == "done"
+        assert project.scenes[i]["job_id"] == f"job-{i}"
+
+
 # -- list_projects: survives a broken project.json --------------------------------------------
 
 

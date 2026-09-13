@@ -693,12 +693,28 @@ class Project:
             return dict(scene)
 
     def invalidate_scene_chain(self, idx: int) -> "Project":
-        """Reset scene `idx` and every scene after it to `pending`, clearing each one's `job_id`,
-        `clip_path` and `keyframe_path`. This is the "пересчёт отдельной сцены" button (design
-        spec, "Клипы"): every scene from `idx` onward carries an automatic keyframe derived,
-        transitively, from scene `idx`'s own clip, so reusing any of them after scene `idx`
-        changes would silently keep stale downstream clips -- clearing the whole tail is the
-        "честное предупреждение" the design spec calls for, not a convenience.
+        """Reset scene `idx` and every scene after it *up to, but not including, the next
+        `fresh_start` scene* to `pending`, clearing each reset scene's `job_id`, `clip_path` and
+        `keyframe_path`. This is the "пересчёт отдельной сцены" button (design spec, "Клипы"): a
+        chained scene carries an automatic keyframe derived, transitively, from scene `idx`'s own
+        clip, so reusing it after scene `idx` changes would silently keep a stale downstream clip
+        -- resetting it is the "честное предупреждение" the design spec calls for, not a
+        convenience. A `fresh_start` scene is the one place that dependency is deliberately absent
+        (design spec: it renders from `--image`/text, never `--latent`, and inherits no keyframe
+        from what came before it) -- reusing *it* after scene `idx` changes is not stale, so
+        stopping there rather than blowing past it avoids re-inflating this into the old
+        "честное предупреждение блуждающего хвоста" this method used to be before `fresh_start`
+        existed, back when every scene really did depend on every earlier one.
+
+        `idx` itself always resets, even when `idx` carries its own `fresh_start` -- the caller
+        asked to invalidate *that* scene, and `fresh_start` only ever describes what a scene
+        inherits from its predecessor, not whether resetting the scene itself is warranted. The
+        boundary search starts at the first scene *after* `idx`: the first one (in ascending
+        `idx` order) with `fresh_start` true is left untouched, and so is everything from there on
+        -- it, and everything chained from it, does not depend on scene `idx` at all. A scene
+        without a `fresh_start` key at all (every project written before the field existed) reads
+        as `False` via `.get("fresh_start", False)`, so an old project with no such scenes falls
+        back to the pre-`fresh_start` "reset the whole tail" behaviour unchanged.
 
         Also resets the `scenes` and `assembly` stages back to `"draft"` (the pending-equivalent
         for a stage -- `STAGE_STATUSES` has no separate `"pending"`) and clears
@@ -707,17 +723,22 @@ class Project:
         `pending`, and any existing `assembly.final_path` was rendered from clips at least one of
         which this call just invalidated, so leaving it in place would silently keep serving a
         stale final video. `stages.script`/`stages.track` are untouched -- a scene invalidation has
-        nothing to say about either of those.
+        nothing to say about either of those. (This stage/final_path reset fires even when the
+        fresh_start boundary is immediately after `idx` and only one scene is actually reset -- the
+        `scenes` stage still covered that one scene, and it just went back to `pending`.)
         """
         with _project_lock(self.path.parent, exclusive=True):
             data = _read_data(self.path)
             _find_scene(data["scenes"], idx)  # raises UnknownScene if idx does not exist
-            for scene in data["scenes"]:
-                if scene["idx"] >= idx:
-                    scene["status"] = "pending"
-                    scene["job_id"] = None
-                    scene["clip_path"] = None
-                    scene["keyframe_path"] = None
+            for scene in sorted(data["scenes"], key=lambda scene: scene["idx"]):
+                if scene["idx"] < idx:
+                    continue
+                if scene["idx"] > idx and scene.get("fresh_start", False):
+                    break
+                scene["status"] = "pending"
+                scene["job_id"] = None
+                scene["clip_path"] = None
+                scene["keyframe_path"] = None
             data["stages"]["scenes"] = "draft"
             data["stages"]["assembly"] = "draft"
             data["assembly"]["final_path"] = None

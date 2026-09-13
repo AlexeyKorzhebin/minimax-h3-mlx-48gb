@@ -4717,10 +4717,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _retry_project_scene(self, raw_id: str, raw_idx: str) -> tuple[int, str, bytes]:
         """`POST /api/projects/<id>/scenes/<idx>/retry`: "пересчёт отдельной сцены" (design spec,
-        "Клипы") -- invalidates scene `idx` and every scene after it
-        (`Project.invalidate_scene_chain`, "честное предупреждение": every later scene's automatic
-        keyframe was derived, transitively, from this one's own clip), then resubmits from there
-        (`assemble.advance_project`, the same call the script/track gates use to start the chain).
+        "Клипы") -- invalidates scene `idx` and every scene after it up to, but not including, the
+        next `fresh_start` scene (`Project.invalidate_scene_chain`, "честное предупреждение": each
+        reset scene's automatic keyframe was derived, transitively, from this one's own clip -- a
+        `fresh_start` scene carries no such dependency, so it and everything chained from it is
+        left alone), then resubmits from there (`assemble.advance_project`, the same call the
+        script/track gates use to start the chain).
 
         **Cancels the tail's own pending queue jobs first (I1, fix round 1, 2026-08-19 review),
         before invalidating anything on `project.json`** -- see `_cancel_project_scene_tail_jobs`'s
