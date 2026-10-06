@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вариант C — таймлайн в центре</title>
+<!-- Вариант C: «монтажная». Проект — это таймлайн: дорожки Трек / Сцены / Апскейл / Сборка по общей шкале времени.
+     Очередь — та же ось, только дорожка видеокарты. Референсы — «плёнка» над таймлайном.
+     Статический макет, данные вымышленные. Экраны: #projects #scenes #library #queue ; ?theme=light|dark ; ?gpu=run|idle|foreign|qwen -->
+<style>
+:root{
+  --bg:#efebe2; --card:#faf8f3; --line:#d8d2c3; --ink:#221f1a; --ink2:#5f594d; --ink3:#968f7f;
+  --red:#d9411f; --red-ink:#fff; --red-soft:#f6dcd3; --good:#2f7d4f; --amber:#b9770e;
+  --tl:#1d1b18; --tl2:#2a2723; --tl-line:#3b3731; --tl-ink:#efe9dc; --tl-ink2:#a39b8a;
+  --tag:#0e6b5b; --tag-bg:#d5ece5;
+  --disp:"Iowan Old Style","Palatino Linotype",Georgia,serif; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; --mono:ui-monospace,Menlo,monospace;
+}
+:root[data-theme="dark"]{
+  --bg:#171512; --card:#211e1a; --line:#363128; --ink:#efe9dc; --ink2:#aaa292; --ink3:#756e60;
+  --red:#ff6a47; --red-ink:#1d0903; --red-soft:#3d2018; --good:#6fcf92; --amber:#e7a94a;
+  --tl:#0e0d0b; --tl2:#1a1815; --tl-line:#2c2924; --tag:#86e0cb; --tag-bg:#183530;}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#171512; --card:#211e1a; --line:#363128; --ink:#efe9dc; --ink2:#aaa292; --ink3:#756e60;
+  --red:#ff6a47; --red-ink:#1d0903; --red-soft:#3d2018; --good:#6fcf92; --amber:#e7a94a;
+  --tl:#0e0d0b; --tl2:#1a1815; --tl-line:#2c2924; --tag:#86e0cb; --tag-bg:#183530;}}
+*{box-sizing:border-box;margin:0}
+body{font:14.5px/1.5 var(--sans);background:var(--bg);color:var(--ink);min-height:100vh}
+button{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 15px;cursor:pointer}
+button.pri{background:var(--red);border-color:var(--red);color:var(--red-ink);font-weight:700}
+button.sm{padding:2px 11px;font-size:12.5px}
+.mono{font:12px var(--mono)}
+h1,h2,h3{font-family:var(--disp);font-weight:600}
+.bar{display:flex;align-items:center;gap:22px;padding:14px 32px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:9}
+.logo{font:italic 700 24px var(--disp);color:var(--red)}
+.bar nav{display:flex;gap:22px}.bar nav a{color:var(--ink2);text-decoration:none;padding:4px 0;border-bottom:2px solid transparent}.bar nav a.on{color:var(--ink);border-color:var(--red);font-weight:600}
+.sp{flex:1}
+.plate{display:flex;align-items:center;gap:10px;background:var(--tl);color:var(--tl-ink);border-radius:999px;padding:5px 6px 5px 14px;font-size:13px}
+.plate .dot{width:9px;height:9px;border-radius:50%;background:#58d68d}.plate[data-s=idle] .dot{background:#777}.plate[data-s=foreign] .dot,.plate[data-s=qwen] .dot{background:#f0b040}
+.plate button{background:var(--tl2);border-color:var(--tl-line);color:var(--tl-ink);padding:3px 12px;font-size:12.5px}
+.screen{display:none;padding:28px 32px 60px;max-width:1500px;margin:0 auto}.screen.on{display:block}
+.head{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:22px;gap:14px;flex-wrap:wrap}.head h1{font-size:34px;line-height:1.1}.sub{color:var(--ink2)}
+/* projects: плёнки */
+.films{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:20px}
+.film{background:var(--card);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.film .fr{display:grid;grid-template-columns:repeat(4,1fr);height:92px;gap:2px;background:#000;padding:8px 6px;position:relative}
+.film .fr i{border-radius:2px}
+.film .fr:before,.film .fr:after{content:"";position:absolute;left:0;right:0;height:5px;background:repeating-linear-gradient(90deg,transparent 0 8px,#555 8px 14px)}
+.film .fr:before{top:1px}.film .fr:after{bottom:1px}
+.film .b{padding:12px 16px 14px}.film h3{font-size:19px}
+.mini{display:flex;gap:2px;margin:10px 0 6px;height:10px}.mini i{flex:1;background:var(--line)}.mini i.d{background:var(--good)}.mini i.c{background:var(--red)}
+.film .m{display:flex;justify-content:space-between;color:var(--ink2);font-size:13px}
+/* project / timeline */
+.stagewrap{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(300px,1fr);gap:20px;margin-bottom:18px}
+.view{background:var(--tl);border-radius:8px;aspect-ratio:16/8;position:relative;overflow:hidden}
+.view .img{position:absolute;inset:0}
+.view .ctl{position:absolute;left:14px;right:14px;bottom:10px;color:#fff;display:flex;justify-content:space-between;font:12px var(--mono);text-shadow:0 1px 3px #000}
+.side{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:10px}
+.edit{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;line-height:1.8}
+.tag{font:600 12.5px var(--mono);color:var(--tag);background:var(--tag-bg);border-radius:4px;padding:1px 5px}.tag.bad{color:var(--red);background:var(--red-soft);outline:1px dashed var(--red)}
+.refs{display:flex;gap:8px;align-items:center;margin-bottom:16px;overflow-x:auto;padding-bottom:4px}
+.rf{flex:none;display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:3px 12px 3px 3px}
+.rf .av{width:30px;height:30px;border-radius:50%}.rf.on{border-color:var(--red);background:var(--red-soft)}
+.rf small{color:var(--ink3)}
+.tl{background:var(--tl);color:var(--tl-ink);border-radius:8px;padding:12px 0 14px;overflow-x:auto}
+.ruler{margin-left:96px;min-width:1200px;display:flex;font:11px var(--mono);color:var(--tl-ink2);border-bottom:1px solid var(--tl-line);padding-bottom:5px}
+.ruler span{flex:1}
+.lane{display:flex;align-items:stretch;min-height:44px;border-bottom:1px solid var(--tl-line);min-width:1296px}
+.lane>label{width:96px;flex:none;padding:8px 12px;font-size:12px;color:var(--tl-ink2);position:sticky;left:0;background:var(--tl);z-index:2;border-right:1px solid var(--tl-line)}
+.lane>label b{display:block;color:var(--tl-ink);font-size:12.5px}
+.blocks{display:flex;gap:2px;padding:4px 2px;flex:1;min-width:1200px;position:relative}
+.bk{flex:1;border-radius:3px;background:var(--tl2);border:1px solid var(--tl-line);font:10px var(--mono);color:var(--tl-ink2);padding:2px 4px;overflow:hidden;white-space:nowrap}
+.bk.ok{background:#1f4a33;border-color:#2c6d49;color:#c8f0d8}.bk.run{background:#6d4a0c;border-color:#e7a94a;color:#ffe3ad}.bk.bad{background:#5a1f16;border-color:#d9411f;color:#ffc9bd}.bk.sel{outline:2px solid var(--red);outline-offset:1px}
+.wave{flex:1;height:36px;margin:4px 2px;background:repeating-linear-gradient(90deg,#6a8c9a 0 2px,transparent 2px 4px);-webkit-mask:linear-gradient(transparent 0,#000 30%,#000 70%,transparent 100%);opacity:.75}
+.now{position:absolute;top:0;bottom:0;width:2px;background:var(--red)}
+.cta{display:flex;justify-content:space-between;align-items:center;margin-top:16px;gap:12px;flex-wrap:wrap}
+/* library: полки */
+.shelf{margin-bottom:26px}.shelf h3{font-size:20px;margin-bottom:10px;display:flex;gap:10px;align-items:baseline}.shelf h3 small{font:12px var(--sans);color:var(--ink3)}
+.row{display:flex;gap:14px;overflow-x:auto;padding-bottom:6px}
+.rc{flex:none;width:200px;background:var(--card);border:1px solid var(--line);border-radius:6px;overflow:hidden}.rc .im{height:120px}.rc .b{padding:8px 10px}.rc small{color:var(--ink3);display:block}
+.rc.add{display:grid;place-items:center;border-style:dashed;color:var(--ink3);text-align:center}
+/* queue */
+.qgrid{display:grid;grid-template-columns:260px minmax(0,1fr);gap:0;background:var(--tl);border-radius:8px;color:var(--tl-ink);overflow:hidden;margin-bottom:18px}
+.qgrid .pl{padding:16px;border-right:1px solid var(--tl-line);display:flex;flex-direction:column;gap:8px}
+.qgrid .pl .big{font:600 20px var(--disp)}
+.qgrid .tlw{overflow-x:auto;padding:12px 0}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:13px;color:var(--tl-ink2)}.kv span:nth-child(even){color:var(--tl-ink)}
+.alert{border:1px solid var(--amber);background:var(--red-soft);border-radius:8px;padding:12px 16px;display:flex;gap:12px;justify-content:space-between;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+.list{background:var(--card);border:1px solid var(--line);border-radius:8px}
+.li{display:grid;grid-template-columns:30px 1fr 170px auto;gap:12px;align-items:center;padding:10px 16px;border-top:1px solid var(--line)}.li:first-child{border:0}
+.pgb{height:6px;background:var(--line);border-radius:3px;overflow:hidden}.pgb i{display:block;height:100%;background:var(--red)}
+.demo{font-size:12px;color:var(--ink3);margin-bottom:12px}.demo a{margin-left:8px;color:var(--ink2)}
+.tabs{display:none}
+@media (max-width:860px){
+  .bar{padding:10px 14px;gap:10px}.bar nav{display:none}.plate .l{display:none}
+  .screen{padding:18px 14px 90px}.head h1{font-size:26px}
+  .stagewrap,.qgrid{grid-template-columns:1fr}.qgrid .pl{border-right:0;border-bottom:1px solid var(--tl-line)}
+  .li{grid-template-columns:24px 1fr}.li>*:nth-child(n+3){grid-column:2}
+  .tabs{display:flex;position:fixed;bottom:0;left:0;right:0;background:var(--card);border-top:1px solid var(--line);z-index:10}
+  .tabs a{flex:1;text-align:center;padding:11px 0 14px;font-size:12px;color:var(--ink2);text-decoration:none}.tabs a.on{color:var(--red);font-weight:700}
+  .films{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<header class="bar"><span class="logo">h3</span>
+  <nav><a href="#projects" data-s="projects">Проекты</a><a href="#library" data-s="library">Референсы</a><a href="#queue" data-s="queue">Очередь</a><a href="#settings" data-s="settings">Настройки</a></nav>
+  <span class="sp"></span><div class="plate" id="plate"><span class="dot"></span><span class="l" id="pt"></span><button id="pb"></button></div><button class="sm" id="theme">◐</button></header>
+<nav class="tabs"><a href="#projects" data-s="projects">Проекты</a><a href="#scenes" data-s="scenes">Монтаж</a><a href="#library" data-s="library">Референсы</a><a href="#queue" data-s="queue">Очередь</a></nav>
+
+<section class="screen" id="projects">
+  <div class="head"><div><h1>Проекты</h1><p class="sub">Клипы и ролики. Полоска под кадрами — маршрут: сценарий, сцены, апскейл, сборка.</p></div><button class="pri">+ Новый проект</button></div>
+  <div class="films" id="films"></div>
+</section>
+
+<section class="screen" id="scenes">
+  <div class="head"><div><p class="sub"><a href="#projects" style="color:inherit">Проекты</a> / клип · 3:47 · 40 сцен</p><h1>Колыбельная — ночь 5, паспорт</h1></div><div style="display:flex;gap:8px"><button>Чат по сценарию</button><button class="pri">Поставить 28 сцен в очередь</button></div></div>
+  <div class="refs" id="refs"></div>
+  <div class="stagewrap">
+    <div class="view"><div class="img" style="background:linear-gradient(135deg,hsl(18 35% 34%),hsl(40 30% 12%))"></div><div class="ctl"><span>▶ 2:14 / 3:47</span><span>сцена 14 · INTRO-VIGIL-14 · H3 896×576</span></div></div>
+    <div class="side"><div style="display:flex;justify-content:space-between;align-items:center"><h3>Сцена 14</h3><span class="mono" style="color:var(--amber)">● считается · шаг 5/8</span></div>
+      <div class="edit" id="edit"></div>
+      <div class="mono" id="cnt" style="color:var(--ink2)"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="pri">Пересчитать сцену</button><button>Отменить правку</button></div></div>
+  </div>
+  <div class="tl" id="tl"></div>
+  <div class="cta"><span class="sub">Маршрут: <b>сценарий ✓ → сцены 12/40 → апскейл LTX (вкл.) → сборка</b></span><label><input type="checkbox" checked> Апскейл LTX после сцен</label></div>
+</section>
+
+<section class="screen" id="library">
+  <div class="head"><div><h1>Референсы</h1><p class="sub">Общая библиотека. @-тег в тексте сцены подтягивает картинки; в проекте версия фиксируется.</p></div><div style="display:flex;gap:8px"><input placeholder="Поиск по тегу" style="border:1px solid var(--line);border-radius:999px;padding:6px 14px;background:var(--card);color:var(--ink)"><button class="pri">+ Загрузить</button></div></div>
+  <div id="shelves"></div>
+</section>
+
+<section class="screen" id="queue">
+  <div class="head"><div><h1>Очередь</h1><p class="sub">Видеокарта — одна дорожка. Что стоит дальше и когда это закончится.</p></div><button>⏸ Пауза</button></div>
+  <p class="demo">Состояние карты (макет): <a href="?gpu=run#queue">считает</a><a href="?gpu=idle#queue">свободна</a><a href="?gpu=foreign#queue">чужое</a><a href="?gpu=qwen#queue">Qwen</a></p>
+  <div id="qalert"></div>
+  <div class="qgrid"><div class="pl" id="gpl"></div>
+    <div class="tlw"><div class="ruler" style="margin-left:96px;min-width:1000px"><span>01:20</span><span>02:00</span><span>03:00</span><span>04:00</span><span>05:00</span><span>05:30</span></div>
+      <div class="lane" style="min-width:1096px"><label><b>GPU</b>H3</label><div class="blocks" style="min-width:1000px" id="gl"></div></div>
+      <div class="lane" style="min-width:1096px"><label><b>GPU</b>LTX</label><div class="blocks" style="min-width:1000px" id="gl2"></div></div>
+      <div class="lane" style="min-width:1096px;border:0"><label><b>CPU</b>сборка</label><div class="blocks" style="min-width:1000px" id="gl3"></div></div></div></div>
+  <div class="list" id="ql"></div>
+</section>
+<section class="screen" id="settings"><div class="head"><div><h1>Настройки</h1><p class="sub">Редкое: LLM, Qwen, умолчания модели.</p></div></div><div class="list"><div class="li" style="grid-template-columns:1fr auto"><span><b>LLM для чата и сценария</b><br><small class="sub">qwen-local · alex-neuro :8000</small></span><button>Сменить</button></div><div class="li" style="grid-template-columns:1fr auto"><span><b>Qwen на карте</b><br><small class="sub">выгружен нами в 01:12</small></span><button>Вернуть Qwen</button></div></div></section>
+
+<script>
+const $=s=>document.querySelector(s),q=new URLSearchParams(location.search);
+const g=(h,l)=>`linear-gradient(135deg,hsl(${h} 30% ${l||36}%),hsl(${h+30} 30% 14%))`;
+const P=[['Колыбельная — ночь 5, паспорт','клип','1100','12 из 40 сцен',215],['Колыбельная — ночь 4, гибрид В','клип','1111','готов · 3:47',160],['Амазонка и гоплит — диалоги, 30 с','ролик','1111','готов · 0:30',30],['Рыжий кот на рынке','ролик','1110','ждёт сборки',24],['Дождь по карнизу','клип','1000','ждёт утверждения трека',200],['Утренний город','клип','0000','сценарий',60]];
+$('#films').innerHTML=P.map(p=>`<article class="film"><div class="fr">${[0,1,2,3].map(i=>`<i style="background:${g(p[4]+i*14,30+i*3)}"></i>`).join('')}</div><div class="b"><div style="display:flex;justify-content:space-between;align-items:baseline"><h3>${p[0]}</h3><span class="mono" style="color:var(--ink3)">${p[1]}</span></div><div class="mini">${[...p[2]].map((c,i)=>`<i class="${c=='1'?'d':(p[2][i-1]=='1'?'c':'')}"></i>`).join('')}</div><div class="m"><span>${p[3]}</span><span>Открыть →</span></div></div></article>`).join('');
+const R=[['@mama','Человек',18,3],['@mladenets','Человек',48,1],['@zal','Место',215,2],['@plashch','Предмет',350,1],['@plenka','Стиль',160,4],['@golos-materi','Голос',270,1]];
+$('#refs').innerHTML='<b class="sub" style="flex:none">Референсы проекта</b>'+R.map((r,i)=>`<div class="rf ${[0,1,2,4].includes(i)?'on':''}"><div class="av" style="background:${g(r[2])}"></div><div><b class="mono">${r[0]}</b> <small>v${r[3]}</small></div></div>`).join('')+'<button class="sm" style="flex:none">+ из библиотеки</button>';
+$('#edit').innerHTML='<span class="tag">@mama</span> медленно качает колыбель, <span class="tag">@mladenets</span> не спит. <span class="tag">@plenka</span>, камера чуть приближается; в углу кадра <span class="tag bad">@sluga</span>.';
+$('#cnt').innerHTML='4 из 4 картинок уйдут в H3 · <span style="color:var(--red)">@sluga не найден — в очередь не пойдёт</span>';
+const st=i=>i<13?'ok':i==13?'run':i==19?'bad':'';
+const bl=n=>Array.from({length:n},(_,i)=>`<div class="bk ${st(i)} ${i==13?'sel':''}">${String(i+1).padStart(2,'0')}</div>`).join('');
+$('#tl').innerHTML=`<div class="ruler"><span>0:00</span><span>0:40</span><span>1:20</span><span>2:00</span><span>2:40</span><span>3:20</span><span>3:47</span></div>
+<div class="lane"><label><b>Трек</b>mp3</label><div class="wave"></div></div>
+<div class="lane"><label><b>Сцены</b>H3 · 40</label><div class="blocks">${bl(40)}<span class="now" style="left:35.5%"></span></div></div>
+<div class="lane"><label><b>Апскейл</b>LTX 0,6</label><div class="blocks"><div class="bk" style="flex:40">ждёт всех сцен</div></div></div>
+<div class="lane" style="border:0"><label><b>Сборка</b>ffmpeg</label><div class="blocks"><div class="bk" style="flex:40">ждёт апскейла</div></div></div>`;
+const sh=[['Люди','@mama','@mladenets'],['Места','@zal'],['Предметы','@plashch'],['Стиль','@plenka'],['Голос','@golos-materi']];
+$('#shelves').innerHTML=sh.map(s=>`<div class="shelf"><h3>${s[0]} <small>${s.length-1}</small></h3><div class="row">${s.slice(1).map(t=>{const r=R.find(x=>x[0]==t);return `<div class="rc"><div class="im" style="background:${g(r[2])}"></div><div class="b"><b class="mono">${r[0]}</b><small>версия ${r[3]} · 3 проекта</small></div></div>`}).join('')}<div class="rc add" style="min-height:160px">+ картинки<br><small>перетащите сюда</small></div></div></div>`).join('');
+const G={run:['Считает H3 · сцена 14','47 / 64 ГБ','61 °C','у панели'],idle:['Свободна','0 / 64 ГБ','38 °C','свободен'],foreign:['Занята чужим','18 / 64 ГБ','52 °C','ComfyUI Krea2'],qwen:['Qwen держит карту','31 / 64 ГБ','49 °C','свободен']};
+const gs=q.get('gpu')||'run',gg=G[gs];$('#plate').dataset.s=gs;$('#pt').textContent=gg[0]+' · '+gg[2];$('#pb').textContent=gs=='qwen'?'Выгрузить Qwen':gs=='foreign'?'ждём…':'Освободить карту';if(gs=='foreign')$('#pb').disabled=true;
+$('#gpl').innerHTML=`<div class="big">${gg[0]}</div><div class="kv"><span>Память</span><span>${gg[1]}</span><span>Темп.</span><span>${gg[2]} (защита 84)</span><span>Замок</span><span>${gg[3]}</span><span>Qwen</span><span>${gs=='qwen'?'запущен':'выгружен в 01:12'}</span></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="sm" ${gs=='foreign'?'disabled':''}>Освободить карту</button><button class="sm">${gs=='qwen'?'Выгрузить Qwen':'Вернуть Qwen'}</button></div>`;
+$('#gl').innerHTML='<div class="bk ok" style="flex:3">13 сц.</div><div class="bk run" style="flex:1">14</div>'+'<div class="bk" style="flex:26">сцены 15–40 · ≈ 3 ч 50 м</div>'+'<div class="bk" style="flex:0 0 0"></div>';
+$('#gl2').innerHTML='<div class="bk" style="flex:30"></div><div class="bk" style="flex:14">апскейл ×40 · ≈ 1 ч 20 м</div>';
+$('#gl3').innerHTML='<div class="bk" style="flex:44"></div><div class="bk" style="flex:3">сборка</div>';
+$('#qalert').innerHTML=gs=='qwen'?`<div class="alert"><span><b>Qwen держит карту</b> — H3 рядом не помещается. Выгрузить и начать?</span><span style="display:flex;gap:8px"><button class="pri">Выгрузить и начать</button><button>Пусть ждёт</button></span></div>`:gs=='foreign'?`<div class="alert"><span><b>Ждём карту:</b> ComfyUI Krea2 (pid 4412, 18 ГБ). Чужое не гасим — старт сам, когда освободится.</span></div>`:'';
+const Q=[['Сцена 14 · INTRO-VIGIL-14',62],['Сцена 15',0],['Сцена 16',0],['Апскейл ×40',0],['Сборка',0]];
+$('#ql').innerHTML=Q.map((r,i)=>`<div class="li"><b class="mono">${i+1}</b><span><b>${r[0]}</b><br><small class="sub">Колыбельная — ночь 5</small></span>${r[1]&&gs=='run'?`<div><div class="pgb"><i style="width:${r[1]}%"></i></div><small class="mono sub">шаг 5/8 · ≈3 мин</small></div>`:'<span class="mono sub">ждёт</span>'}<span><button class="sm">↑</button> <button class="sm">✕</button></span></div>`).join('');
+const th=q.get('theme');if(th)document.documentElement.dataset.theme=th;
+$('#theme').onclick=()=>{const d=document.documentElement;const dark=d.dataset.theme?d.dataset.theme=='dark':matchMedia('(prefers-color-scheme:dark)').matches;d.dataset.theme=dark?'light':'dark'};
+function route(){const h=(location.hash||'#projects').slice(1);document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('on',s.id==h));document.querySelectorAll('[data-s]').forEach(a=>a.classList.toggle('on',a.dataset.s==h||(h=='scenes'&&a.dataset.s=='projects')))}
+addEventListener('hashchange',route);route();
+</script>
+</body>
+</html>

@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вариант A — пошаговый маршрут</title>
+<!-- Вариант A: «мастер». Проект — это маршрут из четырёх шагов, на экране один шаг.
+     Статический макет: данные вымышленные (по мотивам проекта «Колыбельная — ночь 5»).
+     Адреса экранов: #projects  #scenes  #library  #queue ; тема: ?theme=dark|light ; состояние GPU: ?gpu=run|idle|foreign|qwen -->
+<style>
+:root{
+  --bg:#f5f2ea; --surface:#fffdf8; --sunk:#ece7db; --line:#ddd6c6; --ink:#1d2321; --ink2:#5b6460; --ink3:#8a918c;
+  --accent:#1f5a52; --accent-ink:#fff; --accent-soft:#d9e8e3; --warn:#a9500f; --warn-soft:#f6e3cf; --bad:#a32d2d; --good:#2c7a4b;
+  --tag:#14594f; --tag-bg:#d6e9e3;
+  --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#131716; --surface:#1b2120; --sunk:#10130f; --line:#2c3532; --ink:#e8ece9; --ink2:#a1aca6; --ink3:#6f7b75;
+  --accent:#6fc2b3; --accent-ink:#0c1a17; --accent-soft:#1f3532; --warn:#e0a46a; --warn-soft:#33261a; --bad:#e58a8a; --good:#76c593; --tag:#8fdccd; --tag-bg:#1f3a35;}}
+:root[data-theme="dark"]{
+  --bg:#131716; --surface:#1b2120; --sunk:#10130f; --line:#2c3532; --ink:#e8ece9; --ink2:#a1aca6; --ink3:#6f7b75;
+  --accent:#6fc2b3; --accent-ink:#0c1a17; --accent-soft:#1f3532; --warn:#e0a46a; --warn-soft:#33261a; --bad:#e58a8a; --good:#76c593; --tag:#8fdccd; --tag-bg:#1f3a35;}
+*{box-sizing:border-box;margin:0}
+html{background:var(--bg)} body{font:15px/1.5 var(--sans);color:var(--ink);background:var(--bg);min-height:100vh}
+button{font:inherit;color:inherit;cursor:pointer;border:1px solid var(--line);background:var(--surface);border-radius:8px;padding:7px 13px}
+button.pri{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+button.ghost{background:transparent}
+h1,h2,h3{font-family:var(--serif);font-weight:600;letter-spacing:-.01em}
+.mono{font-family:var(--mono);font-size:12.5px}
+/* top bar */
+.top{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:20px;padding:0 28px;height:60px}
+.brand{font-family:var(--serif);font-size:20px;font-weight:700;margin-right:8px}
+.nav{display:flex;gap:4px}.nav a{padding:8px 14px;border-radius:8px;color:var(--ink2);text-decoration:none;font-weight:500}
+.nav a.on{background:var(--accent-soft);color:var(--accent)}
+.sp{flex:1}
+.gpu{display:flex;align-items:center;gap:10px;border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:5px 6px 5px 14px;font-size:13px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--good);flex:none}
+.gpu[data-s=idle] .dot{background:var(--ink3)} .gpu[data-s=foreign] .dot,.gpu[data-s=qwen] .dot{background:var(--warn)}
+.gpu button{padding:4px 11px;border-radius:999px;font-size:13px}
+.wrap{max-width:1180px;margin:0 auto;padding:28px}
+.screen{display:none}.screen.on{display:block}
+.pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:22px;flex-wrap:wrap}
+.pagehead h1{font-size:30px}.sub{color:var(--ink2)}
+/* projects */
+.plist{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px}
+.pcard{background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}
+.pcard .pic{height:132px;position:relative}
+.pcard .body{padding:14px 16px 16px;display:flex;flex-direction:column;gap:8px}
+.pcard h3{font-size:18px}
+.kind{font-size:11px;letter-spacing:.06em;text-transform:uppercase;border:1px solid var(--line);border-radius:5px;padding:1px 6px;color:var(--ink2)}
+.route{display:flex;gap:4px}.route i{flex:1;height:5px;border-radius:3px;background:var(--line)}.route i.d{background:var(--good)}.route i.c{background:var(--accent)}
+.pcard .next{font-size:13px;color:var(--ink2);display:flex;justify-content:space-between;align-items:center;gap:8px}
+/* stepper */
+.stepper{display:flex;gap:0;margin:6px 0 26px;border:1px solid var(--line);border-radius:12px;background:var(--surface);overflow-x:auto}
+.step{flex:1;min-width:150px;padding:12px 16px;border-right:1px solid var(--line);display:flex;gap:11px;align-items:center;text-decoration:none;color:var(--ink2)}
+.step:last-child{border:0}
+.step b{width:26px;height:26px;border-radius:50%;border:1.5px solid var(--line);display:grid;place-items:center;font-size:13px;flex:none}
+.step.d b{background:var(--good);border-color:var(--good);color:#fff}.step.c{background:var(--accent-soft);color:var(--ink)}.step.c b{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.step small{display:block;font-size:12px;color:var(--ink3)}
+.step span{font-weight:600}
+.cols{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:24px;align-items:start}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:18px}
+.scenes{display:flex;flex-direction:column;gap:10px}
+.sc{display:grid;grid-template-columns:96px 1fr auto;gap:14px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:10px;align-items:center}
+.sc.sel{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+.thumb{height:60px;border-radius:7px}
+.sc .t{font-size:13px;color:var(--ink2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.st{font-size:12px;padding:2px 8px;border-radius:99px;background:var(--sunk);color:var(--ink2);white-space:nowrap}
+.st.ok{color:var(--good)}.st.run{background:var(--accent-soft);color:var(--accent)}.st.bad{color:var(--bad)}
+.tag{display:inline-block;font:600 13px var(--mono);color:var(--tag);background:var(--tag-bg);border-radius:5px;padding:0 5px}
+.tag.bad{color:var(--bad);background:var(--warn-soft);text-decoration:wavy underline}
+.editor{margin-top:16px}
+.ed-text{background:var(--sunk);border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-height:96px;line-height:1.75}
+.strip{display:flex;gap:8px;align-items:center;margin:12px 0;flex-wrap:wrap}
+.strip .im{width:54px;height:54px;border-radius:8px;position:relative;border:1px solid var(--line)}
+.strip .im em{position:absolute;left:3px;bottom:2px;font:600 10px var(--mono);color:#fff;text-shadow:0 1px 2px #000}
+.cnt{font-size:13px;color:var(--ink2);margin-left:6px}
+.rrow{display:flex;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+.rrow:first-of-type{border:0}.rrow .av{width:38px;height:38px;border-radius:50%;flex:none}
+.rrow small{display:block;color:var(--ink3);font-size:12px}
+.foot{display:flex;justify-content:space-between;align-items:center;margin-top:22px;gap:12px;flex-wrap:wrap}
+/* library */
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.chip{border:1px solid var(--line);border-radius:99px;padding:4px 12px;font-size:13px;background:var(--surface)}.chip.on{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.lib{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}
+.rc{background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.rc .im{height:150px;display:grid;grid-template-columns:repeat(2,1fr)}
+.rc .b{padding:12px 14px;display:flex;flex-direction:column;gap:6px}
+.rc p{font-size:13px;color:var(--ink2)}.meta{display:flex;justify-content:space-between;font-size:12px;color:var(--ink3)}
+.drop{border:2px dashed var(--line);border-radius:14px;display:grid;place-items:center;min-height:150px;color:var(--ink2);text-align:center;padding:12px}
+/* queue */
+.gpubox{display:grid;grid-template-columns:1.3fr 1fr;gap:18px;margin-bottom:22px}
+.gpubox .card h3{margin-bottom:8px}
+.bar{height:10px;border-radius:6px;background:var(--sunk);overflow:hidden;margin:6px 0}.bar i{display:block;height:100%;background:var(--accent)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:14px}.kv span:nth-child(odd){color:var(--ink3)}
+.banner{border:1px solid var(--warn);background:var(--warn-soft);border-radius:12px;padding:12px 16px;display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:12px}
+.qrow{display:grid;grid-template-columns:34px 1fr 150px auto;gap:12px;align-items:center;padding:12px 4px;border-top:1px solid var(--line)}
+.qrow:first-child{border:0}
+.demo{font-size:12px;color:var(--ink3);margin:0 0 10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}.demo a{color:var(--ink2);border:1px solid var(--line);border-radius:6px;padding:1px 8px;text-decoration:none}
+.tabbar{display:none}
+@media (max-width:820px){
+  .top{padding:0 14px;gap:10px;height:54px}.nav{display:none}.brand{font-size:18px}
+  .gpu .lbl-long{display:none}
+  .wrap{padding:16px 14px 90px}.pagehead h1{font-size:24px}
+  .cols,.gpubox{grid-template-columns:1fr}
+  .sc{grid-template-columns:72px 1fr;}.sc .st{grid-column:2}
+  .qrow{grid-template-columns:28px 1fr}.qrow .pg,.qrow>span:last-child{grid-column:2}
+  .tabbar{display:flex;position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:1px solid var(--line);z-index:6}
+  .tabbar a{flex:1;text-align:center;padding:10px 0 12px;font-size:12px;color:var(--ink2);text-decoration:none}.tabbar a.on{color:var(--accent);font-weight:700}
+  .stepper .step{min-width:130px}
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <span class="brand">h3</span>
+  <nav class="nav" id="nav"><a href="#projects" data-s="projects">Проекты</a><a href="#library" data-s="library">Референсы</a><a href="#queue" data-s="queue">Очередь</a><a href="#settings" data-s="settings">Настройки</a></nav>
+  <span class="sp"></span>
+  <div class="gpu" id="gpu"><span class="dot"></span><span id="gpu-t"></span><button id="gpu-b"></button></div>
+  <button class="ghost" id="theme" title="Тема">◐</button>
+</header>
+<nav class="tabbar" id="tabbar"><a href="#projects" data-s="projects">Проекты</a><a href="#library" data-s="library">Референсы</a><a href="#queue" data-s="queue">Очередь</a><a href="#settings" data-s="settings">Ещё</a></nav>
+
+<main class="wrap">
+<!-- 1. СПИСОК ПРОЕКТОВ -->
+<section class="screen" id="projects">
+  <div class="pagehead"><div><h1>Проекты</h1><p class="sub">11 проектов · в работе: «Колыбельная — ночь 5»</p></div><button class="pri">+ Новый проект</button></div>
+  <div class="plist" id="plist"></div>
+</section>
+
+<!-- 2. ПРОЕКТ, ШАГ «СЦЕНЫ» -->
+<section class="screen" id="scenes">
+  <div class="pagehead"><div><p class="sub"><a href="#projects" style="color:inherit">Проекты</a> / клип</p><h1>Колыбельная — ночь 5, паспорт</h1></div><div style="display:flex;gap:8px"><button class="ghost">Чат по сценарию</button><button class="ghost">⋯</button></div></div>
+  <div class="stepper">
+    <a class="step d" href="#scenes"><b>✓</b><div><span>Сценарий</span><small>утверждён · 40 сцен</small></div></a>
+    <a class="step c" href="#scenes"><b>2</b><div><span>Сцены</span><small>12 из 40 готово</small></div></a>
+    <a class="step" href="#scenes"><b>3</b><div><span>Апскейл</span><small>не начат · сила 0,6</small></div></a>
+    <a class="step" href="#scenes"><b>4</b><div><span>Сборка</span><small>после апскейла</small></div></a>
+  </div>
+  <div class="cols">
+    <div>
+      <div class="scenes" id="slist"></div>
+      <div class="card editor">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><h3>Сцена 14 · INTRO-VIGIL-14 · 2:10–2:20</h3><span class="st run">считается · шаг 5/8</span></div>
+        <div class="ed-text" id="edtext"></div>
+        <div class="strip" id="strip"></div>
+        <div class="foot" style="margin-top:6px"><span class="sub" style="font-size:13px">@ — подсказка с превью. Незнакомый тег подсвечивается до постановки в очередь.</span><span style="display:flex;gap:8px"><button class="ghost">Отменить правку</button><button class="pri">Пересчитать сцену</button></span></div>
+      </div>
+    </div>
+    <aside>
+      <div class="card"><h3 style="margin-bottom:6px">Референсы проекта</h3><div id="prefs"></div><button class="ghost" style="width:100%;margin-top:10px">+ Подключить из библиотеки</button></div>
+      <div class="card" style="margin-top:14px"><h3 style="margin-bottom:6px">Дальше по маршруту</h3><p class="sub" style="font-size:14px">Когда все 40 сцен готовы, шаг «Апскейл» откроется сам. Галочка «Апскейл LTX» в настройках маршрута включает его, снятая — пропускает.</p><label style="display:flex;gap:8px;margin-top:10px;align-items:center"><input type="checkbox" checked> Апскейл LTX после сцен</label></div>
+    </aside>
+  </div>
+  <div class="foot"><button class="ghost">← Сценарий</button><button class="pri">Поставить 28 сцен в очередь →</button></div>
+</section>
+
+<!-- 3. БИБЛИОТЕКА РЕФЕРЕНСОВ -->
+<section class="screen" id="library">
+  <div class="pagehead"><div><h1>Референсы</h1><p class="sub">Общая библиотека: теги работают во всех проектах, версия фиксируется в проекте.</p></div><input placeholder="Поиск по тегу…" style="padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);min-width:220px"></div>
+  <div class="filters"><span class="chip on">Все · 14</span><span class="chip">Люди · 5</span><span class="chip">Предметы · 3</span><span class="chip">Места · 3</span><span class="chip">Стиль · 2</span><span class="chip">Голос · 1</span></div>
+  <div class="lib" id="lib"></div>
+</section>
+
+<!-- 4. ОЧЕРЕДЬ + GPU -->
+<section class="screen" id="queue">
+  <div class="pagehead"><div><h1>Очередь</h1><p class="sub">Идёт: проект «Колыбельная — ночь 5», сцены</p></div><div style="display:flex;gap:8px"><button class="ghost">⏸ Пауза</button></div></div>
+  <p class="demo">Состояние карты (для макета): <a href="?gpu=run#queue">считает</a><a href="?gpu=idle#queue">свободна</a><a href="?gpu=foreign#queue">чужое</a><a href="?gpu=qwen#queue">Qwen держит</a></p>
+  <div id="banner"></div>
+  <div class="gpubox">
+    <div class="card"><h3>Видеокарта alex-neuro</h3><div id="gpucard"></div></div>
+    <div class="card"><h3>Маршрут очереди</h3><div class="kv"><span>Этап</span><span>Сцены → Апскейл → Сборка</span><span>Сделано</span><span>12 из 40 сцен</span><span>Осталось</span><span>≈ 4 ч 10 мин</span><span>Освободится</span><span>через 15 мин после пустой очереди</span></div></div>
+  </div>
+  <div class="card" id="qlist"></div>
+</section>
+
+<section class="screen" id="settings"><div class="pagehead"><div><h1>Настройки</h1><p class="sub">Провайдеры LLM, Qwen, пути, модель по умолчанию. Редко нужны — живут здесь, а не на главной.</p></div></div>
+  <div class="card"><div class="rrow"><div><b>LLM для чата и сценария</b><small>qwen-local · alex-neuro :8000</small></div><span class="sp"></span><button>Сменить</button></div>
+  <div class="rrow"><div><b>Qwen на видеокарте</b><small>выгружен панелью в 01:12, был запущен до этого</small></div><span class="sp"></span><button>Вернуть Qwen</button></div>
+  <div class="rrow"><div><b>Модель H3 по умолчанию</b><small>8 шагов · LoRA 1,00 · таблица l100</small></div><span class="sp"></span><button>Изменить</button></div></div>
+</section>
+</main>
+
+<script>
+const $=s=>document.querySelector(s), q=new URLSearchParams(location.search);
+const grad=(h,h2)=>`linear-gradient(135deg,hsl(${h} 28% 30%),hsl(${h2||h+40} 32% 16%))`;
+const refs=[
+ {t:'@mama',k:'Человек',d:'Молодая королева, тонкая, длинная тёмная коса, лицо без возраста.',v:3,h:18,n:3},
+ {t:'@mladenets',k:'Человек',d:'Младенец в льняных пеленах, один цвет, без узора.',v:1,h:40,n:2},
+ {t:'@zal',k:'Место',d:'Каменный зал замка, свечи, лунный свет из окон, дым снаружи.',v:2,h:215,n:4},
+ {t:'@plashch',k:'Предмет',d:'Бледный свадебный плащ с глубоко-красной застёжкой.',v:1,h:350,n:2},
+ {t:'@plenka',k:'Стиль',d:'Живая съёмка, анаморф, зерно, мелкая глубина резкости.',v:4,h:160,n:1},
+ {t:'@golos-materi',k:'Голос',d:'Низкий тёплый голос, шёпот, без вибрато.',v:1,h:270,n:1}];
+const proj=[
+ ['Колыбельная — ночь 5, паспорт','клип',12,40,'Сцены','Продолжить: поставить 28 сцен',215,[1,1,0,0]],
+ ['Колыбельная — ночь 4, гибрид В','клип',40,40,'Готово','Смотреть ролик',160,[1,1,1,1]],
+ ['Амазонка и гоплит — диалоги, 30 с','ролик',4,4,'Готово','Смотреть ролик',30,[1,1,1,1]],
+ ['Рыжий кот на рынке','ролик',3,3,'Сборка','Собрать ролик',25,[1,1,1,0]],
+ ['Дождь по карнизу','клип',0,0,'Трек','Утвердить трек',200,[1,0,0,0]],
+ ['Утренний город','клип',0,0,'Сценарий','Утвердить сценарий',60,[0,0,0,0]]];
+$('#plist').innerHTML=proj.map(p=>`<article class="pcard"><div class="pic" style="background:${grad(p[6])}"></div><div class="body"><div style="display:flex;justify-content:space-between;align-items:center"><h3>${p[0]}</h3><span class="kind">${p[1]}</span></div>
+<div class="route">${p[7].map((x,i)=>`<i class="${x?'d':(p[7][i-1]&&!x?'c':'')}"></i>`).join('')}</div>
+<div class="next"><span>Шаг: <b>${p[4]}</b>${p[3]?` · ${p[2]}/${p[3]}`:''}</span><button class="${p[4]=='Готово'?'ghost':'pri'}" style="padding:5px 11px">${p[5].split(':')[0]}</button></div></div></article>`).join('');
+const sc=[['INTRO-VIGIL-12','ok','Она сидит у колыбели, пальцы касаются края. Свет только от @plashch и свечей в @zal.','@mama @zal',215],['INTRO-VIGIL-13','ok','@mama склоняется над @mladenets, плащ спадает с плеча.','@mama @mladenets @plashch',350],['INTRO-VIGIL-14','run','@mama медленно качает колыбель, @mladenets не спит. @plenka, камера чуть приближается.','',18],['INTRO-VIGIL-15','','Широкий план: @zal пуст, свечи горят ровно. Никого в кадре.','@zal',200],['INTRO-VIGIL-16','','@mama поёт; губы почти не двигаются, @golos-materi.','@mama @golos-materi',270]];
+const stl={ok:'<span class="st ok">готово</span>',run:'<span class="st run">считается</span>','':'<span class="st">ждёт</span>'};
+$('#slist').innerHTML=sc.map((s,i)=>`<div class="sc ${i==2?'sel':''}"><div class="thumb" style="background:${grad(s[4])}"></div><div><b class="mono">${s[0]}</b><div class="t">${s[2].replace(/@[a-z-]+/g,m=>`<span class="tag">${m}</span>`)}</div></div>${stl[s[1]]}</div>`).join('')+'<p class="sub" style="text-align:center;font-size:13px">ещё 35 сцен · <a href="#scenes">показать все</a></p>';
+$('#edtext').innerHTML='<span class="tag">@mama</span> медленно качает колыбель, <span class="tag">@mladenets</span> не спит. <span class="tag">@plenka</span>, камера чуть приближается; в углу кадра <span class="tag bad">@sluga</span>.';
+$('#strip').innerHTML=[0,1,0,4].map((i,k)=>`<div class="im" style="background:${grad([18,40,215,160][k])}"><em>${['@mama','@mladenets','@zal','@plenka'][k]}</em></div>`).join('')+'<span class="cnt">4 из 4 картинок уйдут в H3 · <b style="color:var(--bad)">@sluga не найден</b></span>';
+$('#prefs').innerHTML=refs.slice(0,5).map(r=>`<div class="rrow"><div class="av" style="background:${grad(r.h)}"></div><div><b class="mono">${r.t}</b><small>${r.k} · версия ${r.v}${r.t=='@zal'?' · есть v3':''}</small></div></div>`).join('');
+$('#lib').innerHTML=refs.map(r=>`<article class="rc"><div class="im"><div style="background:${grad(r.h)}"></div><div style="background:${grad(r.h+30,r.h)}"></div></div><div class="b"><div style="display:flex;justify-content:space-between"><b class="mono">${r.t}</b><span class="kind">${r.k}</span></div><p>${r.d}</p><div class="meta"><span>версия ${r.v} · ${r.n} файл.</span><span>в 3 проектах</span></div></div></article>`).join('')+'<div class="drop">Перетащите картинки сюда<br><small>или выберите из загруженных</small></div>';
+const G={run:['Считает: H3, сцена 14 · 61 °C','Освободить карту','47 / 64 ГБ',73],idle:['Свободна · движки погашены','Освободить карту','0 / 64 ГБ',0],foreign:['Занята чужим: ComfyUI Krea2 (pid 4412)','—','18 / 64 ГБ',28],qwen:['Qwen держит карту · 31 / 64 ГБ','Выгрузить Qwen','31 / 64 ГБ',48]};
+const gs=q.get('gpu')||'run', g=G[gs];
+$('#gpu').dataset.s=gs; $('#gpu-t').innerHTML=`<span class="lbl-long">${g[0]}</span>`; const gb=$('#gpu-b'); gb.textContent=g[1]==='—'?'ждём…':g[1]; if(g[1]==='—')gb.disabled=true; if(gs=='idle')gb.textContent='Занять H3';
+$('#gpucard').innerHTML=`<p style="margin-bottom:8px">${g[0]}</p><div class="bar"><i style="width:${g[3]}%"></i></div><div class="kv"><span>Память</span><span>${g[2]}</span><span>Температура</span><span>${gs=='idle'?'38':'61'} °C (защита 84)</span><span>Замок</span><span>${gs=='foreign'?'занят ComfyUI':gs=='idle'?'свободен':'у панели'}</span><span>Qwen</span><span>${gs=='qwen'?'запущен (shared32)':'выгружен нами в 01:12'}</span></div><div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap"><button ${gs=='foreign'?'disabled':''}>Освободить карту</button><button>${gs=='qwen'?'Выгрузить Qwen':'Вернуть Qwen'}</button></div>`;
+$('#banner').innerHTML=gs=='qwen'?`<div class="banner"><span><b>Qwen держит карту.</b> H3 не поместится рядом. Выгрузить Qwen и начать расчёт?</span><span style="display:flex;gap:8px"><button class="pri">Выгрузить и начать</button><button class="ghost">Пусть ждёт</button></span></div>`:gs=='foreign'?`<div class="banner"><span><b>Ждём карту.</b> ComfyUI Krea2 (pid 4412) держит 18 ГБ. Мы чужое не гасим — очередь стартует сама, когда карта освободится.</span></div>`:'';
+const qs=[['Сцена 14 · INTRO-VIGIL-14','Колыбельная — ночь 5','run',62],['Сцена 15','Колыбельная — ночь 5','',0],['Сцена 16','Колыбельная — ночь 5','',0],['Сцена 17','Колыбельная — ночь 5','',0],['Апскейл: 40 сцен пачкой','Колыбельная — ночь 5 · LTX 0,6','',0],['Сборка ролика','Колыбельная — ночь 5','',0]];
+$('#qlist').innerHTML=qs.map((r,i)=>`<div class="qrow"><b class="mono">${i+1}</b><div><b>${r[0]}</b><div class="sub" style="font-size:13px">${r[1]}</div></div><div class="pg">${r[2]=='run'?(gs=='run'?`<div class="bar"><i style="width:62%"></i></div><small class="sub">шаг 5 из 8 · ≈ 3 мин</small>`:'<span class="st">ждёт карту</span>'):'<span class="st">ждёт</span>'}</div><span><button class="ghost">Пересчитать</button> <button class="ghost">✕</button></span></div>`).join('');
+// router / theme
+const th=q.get('theme'); if(th)document.documentElement.dataset.theme=th;
+$('#theme').onclick=()=>{const d=document.documentElement;d.dataset.theme=(d.dataset.theme=='dark'||(!d.dataset.theme&&matchMedia('(prefers-color-scheme:dark)').matches))?'light':'dark'};
+function route(){const h=(location.hash||'#projects').slice(1);document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('on',s.id==h));document.querySelectorAll('[data-s]').forEach(a=>a.classList.toggle('on',a.dataset.s==h||(h=='scenes'&&a.dataset.s=='projects')))}
+addEventListener('hashchange',route);route();
+</script>
+</body>
+</html>

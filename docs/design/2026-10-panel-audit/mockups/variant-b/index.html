@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вариант B — рабочий стол с панелями</title>
+<!-- Вариант B: «рабочий стол». Три панели (список / рабочая область / инспектор), узкая рейка слева,
+     постоянная строка состояния снизу: GPU, Qwen, очередь — всегда на виду, на любом экране.
+     Статический макет, данные вымышленные. Экраны: #projects #scenes #library #queue ; ?theme=light|dark ; ?gpu=run|idle|foreign|qwen -->
+<style>
+:root{ /* тёмная — основная; светлая — зеркало */
+  --bg:#0f1115; --p1:#151820; --p2:#1a1e27; --p3:#222733; --line:#2a303d; --ink:#e6e9ef; --ink2:#9aa3b2; --ink3:#667085;
+  --acc:#ffb454; --acc-ink:#1a1204; --acc-soft:#3a2c14; --good:#7bd88f; --bad:#ff7a7a; --blue:#7aa8ff; --tag:#7fe0c9; --tag-bg:#15342f;
+  --mono:ui-monospace,SFMono-Regular,Menlo,monospace; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+}
+:root[data-theme="light"]{
+  --bg:#e9ebef; --p1:#f6f7f9; --p2:#ffffff; --p3:#eceef3; --line:#d6dae2; --ink:#1a1d24; --ink2:#586072; --ink3:#8b93a3;
+  --acc:#b25e00; --acc-ink:#fff; --acc-soft:#f8e6cc; --good:#23834a; --bad:#c23b3b; --blue:#2f5fd0; --tag:#0f6a58; --tag-bg:#d3efe8;}
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){
+  --bg:#e9ebef; --p1:#f6f7f9; --p2:#ffffff; --p3:#eceef3; --line:#d6dae2; --ink:#1a1d24; --ink2:#586072; --ink3:#8b93a3;
+  --acc:#b25e00; --acc-ink:#fff; --acc-soft:#f8e6cc; --good:#23834a; --bad:#c23b3b; --blue:#2f5fd0; --tag:#0f6a58; --tag-bg:#d3efe8;}}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%}
+body{font:13.5px/1.45 var(--sans);color:var(--ink);background:var(--bg);display:grid;grid-template-columns:64px 1fr;grid-template-rows:1fr 34px;overflow:hidden}
+button{font:inherit;color:inherit;background:var(--p3);border:1px solid var(--line);border-radius:6px;padding:4px 10px;cursor:pointer}
+button.acc{background:var(--acc);color:var(--acc-ink);border-color:var(--acc);font-weight:700}
+button.sm{padding:1px 8px;font-size:12px}
+.mono{font-family:var(--mono);font-size:12px}
+.rail{background:var(--p1);border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;gap:4px;padding:10px 0}
+.rail .lg{font:800 15px var(--mono);color:var(--acc);margin-bottom:10px}
+.rail a{width:50px;padding:8px 0 6px;text-align:center;border-radius:8px;color:var(--ink2);text-decoration:none;font-size:10.5px}
+.rail a i{display:block;font-style:normal;font-size:18px;line-height:22px}
+.rail a.on{background:var(--acc-soft);color:var(--acc)}
+.rail .sp{flex:1}
+.stage{position:relative;min-width:0;min-height:0;overflow:hidden}
+.screen{display:none;height:100%}.screen.on{display:grid}
+.pane{background:var(--p2);border-right:1px solid var(--line);min-width:0;min-height:0;overflow:auto}
+.ph{position:sticky;top:0;background:var(--p1);border-bottom:1px solid var(--line);padding:8px 12px;display:flex;align-items:center;gap:8px;z-index:2;min-height:40px}
+.ph h2{font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink2);font-weight:700}
+.ph .sp{flex:1}
+.status{grid-column:1/3;background:var(--p1);border-top:1px solid var(--line);display:flex;align-items:center;gap:16px;padding:0 14px;font:12px var(--mono);color:var(--ink2);white-space:nowrap;overflow-x:auto}
+.status .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--good);margin-right:6px}
+.status[data-s=idle] .dot{background:var(--ink3)}.status[data-s=foreign] .dot,.status[data-s=qwen] .dot{background:var(--acc)}
+.status b{color:var(--ink)}.status .sp{flex:1}
+/* projects */
+#projects{grid-template-columns:minmax(0,1fr) 380px}
+table{width:100%;border-collapse:collapse}
+th{font:600 11px var(--sans);letter-spacing:.07em;text-transform:uppercase;color:var(--ink3);text-align:left;padding:7px 12px;border-bottom:1px solid var(--line);position:sticky;top:40px;background:var(--p2)}
+td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
+tr.sel td{background:var(--acc-soft)}tr:hover td{background:var(--p3)}
+.rt{display:inline-flex;gap:3px}.rt i{width:16px;height:6px;border-radius:2px;background:var(--line)}.rt i.d{background:var(--good)}.rt i.c{background:var(--acc)}
+.kind{font:700 10px var(--mono);color:var(--blue);border:1px solid var(--line);border-radius:4px;padding:0 5px}
+.prev{height:170px;border-bottom:1px solid var(--line)}
+.kvs{padding:12px;display:grid;grid-template-columns:90px 1fr;gap:6px 10px}.kvs span:nth-child(odd){color:var(--ink3)}
+/* scenes */
+#scenes{grid-template-columns:270px minmax(0,1fr) 330px}
+.srow{display:grid;grid-template-columns:22px 1fr auto;gap:8px;align-items:center;padding:7px 12px;border-bottom:1px solid var(--line)}
+.srow.sel{background:var(--acc-soft);box-shadow:inset 3px 0 var(--acc)}
+.srow small{color:var(--ink3);display:block;font:11px var(--mono)}
+.sd{width:10px;height:10px;border-radius:50%;background:var(--line)}.sd.ok{background:var(--good)}.sd.run{background:var(--acc);box-shadow:0 0 0 3px var(--acc-soft)}.sd.bad{background:var(--bad)}
+.player{aspect-ratio:16/7;margin:12px;border-radius:8px;position:relative;border:1px solid var(--line)}
+.player .ov{position:absolute;left:10px;bottom:8px;right:10px;display:flex;justify-content:space-between;font:11px var(--mono);color:#fff;text-shadow:0 1px 3px #000}
+.ptext{margin:0 12px;background:var(--p1);border:1px solid var(--line);border-radius:8px;padding:12px;font-size:14.5px;line-height:1.8;min-height:110px}
+.tag{font:600 12.5px var(--mono);color:var(--tag);background:var(--tag-bg);border-radius:4px;padding:1px 5px}.tag.bad{color:var(--bad);background:#3a1a1a;outline:1px dashed var(--bad)}
+:root[data-theme="light"] .tag.bad{background:#fbe1e1}
+.acts{display:flex;gap:8px;padding:12px;flex-wrap:wrap;align-items:center}
+.sec{padding:12px;border-bottom:1px solid var(--line)}.sec h3{font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink3);margin-bottom:8px}
+.ims{display:flex;gap:6px;flex-wrap:wrap}.im{width:58px;height:58px;border-radius:6px;border:1px solid var(--line);position:relative}
+.im em{position:absolute;left:3px;bottom:2px;font:600 9.5px var(--mono);color:#fff;text-shadow:0 1px 2px #000;font-style:normal}
+.im.add{display:grid;place-items:center;background:var(--p3);color:var(--ink3);font-size:20px}
+.cap{font:12px var(--mono);color:var(--ink2);margin-top:8px}
+.ref{display:flex;gap:9px;align-items:center;padding:6px 0}.ref .av{width:30px;height:30px;border-radius:6px;flex:none}.ref small{display:block;color:var(--ink3);font-size:11.5px}
+.route{display:grid;gap:4px}.route div{display:flex;justify-content:space-between;padding:5px 8px;border-radius:6px;background:var(--p1);border:1px solid var(--line)}.route .c{border-color:var(--acc);background:var(--acc-soft)}
+/* library */
+#library{grid-template-columns:200px minmax(0,1fr) 340px}
+.fl a{display:flex;justify-content:space-between;padding:7px 12px;color:var(--ink2);text-decoration:none;border-bottom:1px solid var(--line)}.fl a.on{color:var(--acc);background:var(--acc-soft)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;padding:12px}
+.card{border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--p1)}.card.sel{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc-soft)}
+.card .im2{height:96px}.card .b{padding:7px 9px}.card small{color:var(--ink3);font-size:11.5px}
+.fld{display:grid;gap:3px;margin-bottom:10px}.fld label{font-size:11px;color:var(--ink3);letter-spacing:.06em;text-transform:uppercase}
+.inp{background:var(--p1);border:1px solid var(--line);border-radius:6px;padding:6px 8px;color:var(--ink);font:inherit;min-height:32px}
+/* queue */
+#queue{grid-template-columns:minmax(0,1fr) 360px}
+.gp{padding:12px;display:grid;gap:10px}.meter{height:8px;border-radius:5px;background:var(--p3);overflow:hidden}.meter i{display:block;height:100%;background:var(--acc)}
+.alert{border:1px solid var(--acc);background:var(--acc-soft);border-radius:8px;padding:10px 12px;display:grid;gap:8px}
+.log{font:11.5px/1.5 var(--mono);color:var(--ink2);background:var(--p1);border:1px solid var(--line);border-radius:6px;padding:8px 10px;max-height:150px;overflow:auto}
+.pgb{width:110px;height:6px;background:var(--p3);border-radius:4px;overflow:hidden;display:inline-block;vertical-align:middle}.pgb i{display:block;height:100%;background:var(--acc)}
+.demo{padding:8px 12px;font-size:11.5px;color:var(--ink3);border-bottom:1px solid var(--line)}.demo a{color:var(--ink2);margin-left:6px}
+.tabs{display:none}
+@media (max-width:860px){
+  body{grid-template-columns:1fr;grid-template-rows:1fr 34px 54px}
+  .rail{display:none}.status{grid-column:1}
+  .tabs{display:flex;grid-row:3;background:var(--p1);border-top:1px solid var(--line)}
+  .tabs a{flex:1;text-align:center;color:var(--ink2);text-decoration:none;font-size:10.5px;padding:7px 0}.tabs a i{display:block;font-style:normal;font-size:18px}.tabs a.on{color:var(--acc)}
+  .screen.on{display:block;overflow:auto}
+  .pane{border-right:0;border-bottom:1px solid var(--line);overflow:visible}
+  #projects .pane+.pane,#library .pane:first-child{display:none}
+  .hide-m{display:none}
+  .status{font-size:11px;gap:10px}
+  #scenes .pane:first-child{max-height:210px;overflow:auto}
+  th:nth-child(n+4),td:nth-child(n+4){display:none}
+}
+</style>
+</head>
+<body>
+<nav class="rail" id="rail"><span class="lg">h3</span>
+  <a href="#projects" data-s="projects"><i>▤</i>Проекты</a><a href="#library" data-s="library"><i>◈</i>Рефы</a><a href="#queue" data-s="queue"><i>≡</i>Очередь</a><span class="sp"></span><a href="#settings" data-s="settings"><i>⚙</i>Настр.</a><button class="sm" id="theme">◐</button></nav>
+<div class="stage">
+<!-- ПРОЕКТЫ -->
+<section class="screen" id="projects">
+  <div class="pane"><div class="ph"><h2>Проекты · 11</h2><span class="sp"></span><input class="inp" placeholder="фильтр…" style="min-height:26px;width:150px"><button class="acc sm">+ Проект</button></div>
+    <table><tr><th>Название</th><th>Тип</th><th>Маршрут</th><th>Сцены</th><th>Изменён</th></tr><tbody id="ptb"></tbody></table></div>
+  <div class="pane hide-m2"><div class="ph"><h2>Выбрано</h2></div><div class="prev" style="background:linear-gradient(135deg,hsl(215 30% 32%),hsl(255 30% 14%))"></div>
+    <div class="sec"><b style="font-size:16px">Колыбельная — ночь 5, паспорт</b><div class="cap">клип · 40 сцен · трек 3:47</div></div>
+    <div class="kvs"><span>Маршрут</span><span>сценарий ✓ → <b style="color:var(--acc)">сцены 12/40</b> → апскейл → сборка</span><span>Референсы</span><span><span class="tag">@mama</span> <span class="tag">@zal</span> <span class="tag">@plenka</span> +3</span><span>Осталось</span><span>≈ 4 ч 10 мин</span></div>
+    <div class="acts"><button class="acc">Открыть</button><button>Чат по сценарию</button><button>⋯</button></div></div>
+</section>
+<!-- СЦЕНЫ -->
+<section class="screen" id="scenes">
+  <div class="pane"><div class="ph"><h2>Сцены · 40</h2><span class="sp"></span><button class="sm">фильтр</button></div><div id="srows"></div></div>
+  <div class="pane"><div class="ph"><b>Колыбельная — ночь 5</b><span class="route-inline mono" style="color:var(--ink3)">/ сцена 14 · INTRO-VIGIL-14 · 2:10–2:20</span><span class="sp"></span><button class="sm">← сценарий</button><button class="sm acc">в очередь 28 →</button></div>
+    <div class="player" style="background:linear-gradient(135deg,hsl(18 35% 30%),hsl(30 30% 12%))"><div class="ov"><span>▶ 00:04 / 00:10</span><span>H3 · 896×576 · seed 4412</span></div></div>
+    <div class="ptext" id="ptext"></div>
+    <div class="acts"><span class="cap" style="margin:0">@ — подсказка · <span style="color:var(--bad)">@sluga не найден — в очередь не пойдёт</span></span><span style="flex:1"></span><button>Отменить правку</button><button class="acc">Пересчитать сцену</button></div></div>
+  <div class="pane hide-m2" style="border:0"><div class="ph"><h2>Инспектор</h2></div>
+    <div class="sec"><h3>В H3 уйдёт · 4 из 4 картинок</h3><div class="ims" id="ims"></div><div class="cap">Subject 1 ← Picture 1,2 · Subject 2 ← Picture 3 …</div></div>
+    <div class="sec"><h3>Референсы проекта</h3><div id="pref"></div><button class="sm" style="width:100%;margin-top:6px">+ из библиотеки</button></div>
+    <div class="sec"><h3>Маршрут</h3><div class="route"><div>✓ Сценарий<span>40</span></div><div class="c">● Сцены<span>12/40</span></div><div>○ Апскейл LTX <span><input type="checkbox" checked></span></div><div>○ Сборка<span></span></div></div></div></div>
+</section>
+<!-- БИБЛИОТЕКА -->
+<section class="screen" id="library">
+  <div class="pane fl"><div class="ph"><h2>Тип</h2></div><a class="on">Все <span>14</span></a><a>Люди <span>5</span></a><a>Предметы <span>3</span></a><a>Места <span>3</span></a><a>Стиль <span>2</span></a><a>Голос <span>1</span></a></div>
+  <div class="pane"><div class="ph"><h2>Библиотека</h2><span class="sp"></span><input class="inp" placeholder="поиск по тегу…" style="min-height:26px;width:170px"><button class="acc sm">+ Загрузить</button></div><div class="grid" id="grid"></div></div>
+  <div class="pane" style="border:0"><div class="ph"><h2>Карточка</h2><span class="sp"></span><span class="mono" style="color:var(--ink3)">версия 3 из 3</span></div>
+    <div class="sec"><div class="ims"><div class="im" style="background:linear-gradient(135deg,hsl(18 35% 32%),hsl(18 30% 14%))"></div><div class="im" style="background:linear-gradient(135deg,hsl(48 35% 32%),hsl(48 30% 14%))"></div><div class="im" style="background:linear-gradient(135deg,hsl(0 25% 30%),hsl(0 25% 12%))"></div><div class="im add">+</div></div></div>
+    <div class="sec"><div class="fld"><label>Тег</label><input class="inp mono" value="@mama"></div><div class="fld"><label>Тип</label><select class="inp"><option>Человек</option></select></div><div class="fld"><label>Описание (для H3, по-английски)</label><textarea class="inp" rows="4">A slender young queen in her twenties, one long dark braid, unlined youthful face, natural skin texture.</textarea></div></div>
+    <div class="sec"><h3>Где используется</h3><div class="cap">Колыбельная ночь 5 (v3) · ночь 4 (v2) · ночь 3 (v1)</div><div class="acts" style="padding:8px 0 0"><button class="sm">Обновить до v3 в ночь 4</button></div></div>
+    <div class="acts"><button class="acc">Сохранить как v4</button><button>Удалить</button></div></div>
+</section>
+<!-- ОЧЕРЕДЬ -->
+<section class="screen" id="queue">
+  <div class="pane"><div class="ph"><h2>Очередь · 7</h2><span class="sp"></span><button class="sm">⏸ Пауза</button></div>
+    <div class="demo">Состояние карты (макет): <a href="?gpu=run#queue">считает</a><a href="?gpu=idle#queue">свободна</a><a href="?gpu=foreign#queue">чужое</a><a href="?gpu=qwen#queue">Qwen</a></div>
+    <div id="qalert" style="padding:12px 12px 0"></div>
+    <table><tr><th>#</th><th>Задача</th><th>Прогресс</th><th></th></tr><tbody id="qtb"></tbody></table>
+    <div class="sec"><h3>Журнал текущей задачи</h3><div class="log">01:21:07 sglang: сцена 14, шаг 5/8<br>01:21:00 acquire h3 → ready<br>01:20:44 сцена 13 готова · 8,9 МБ<br>01:12:03 qwen.sh stop (по кнопке)</div></div></div>
+  <div class="pane gp" style="border:0"><div class="ph" style="margin:-12px -12px 0"><h2>GPU · alex-neuro</h2></div><div id="gp"></div></div>
+</section>
+<section class="screen" id="settings"><div class="pane" style="border:0;grid-column:1/-1"><div class="ph"><h2>Настройки</h2></div>
+  <div class="sec"><h3>LLM</h3><div class="fld"><label>Провайдер чата и сценария</label><select class="inp"><option>qwen-local · alex-neuro :8000</option></select></div></div>
+  <div class="sec"><h3>Модель H3 по умолчанию</h3><div class="cap">8 шагов · LoRA 1,00 · таблица l100 · 896×576</div></div>
+  <div class="sec"><h3>Автоосвобождение карты</h3><div class="cap">через 15 мин после пустой очереди (H3_IDLE_RELEASE_MIN)</div></div></div></section>
+</div>
+<footer class="status" id="status"></footer>
+<nav class="tabs"><a href="#projects" data-s="projects"><i>▤</i>Проекты</a><a href="#scenes" data-s="scenes"><i>▦</i>Сцены</a><a href="#library" data-s="library"><i>◈</i>Рефы</a><a href="#queue" data-s="queue"><i>≡</i>Очередь</a></nav>
+<script>
+const $=s=>document.querySelector(s),q=new URLSearchParams(location.search);
+const g=(h,l)=>`linear-gradient(135deg,hsl(${h} 32% ${l||30}%),hsl(${h+30} 30% 12%))`;
+const P=[['Колыбельная — ночь 5, паспорт','клип','1100','12/40','сегодня 01:21'],['Колыбельная — ночь 4, гибрид В','клип','1111','40/40','29 авг'],['Амазонка и гоплит — диалоги, 30 с','ролик','1111','4/4','24 авг'],['Рыжий кот на рынке','ролик','1110','3/3','19 авг'],['Дождь по карнизу','клип','1000','—','19 авг'],['Утренний город','клип','0000','—','19 авг']];
+$('#ptb').innerHTML=P.map((p,i)=>`<tr class="${i?'':'sel'}"><td><b>${p[0]}</b></td><td><span class="kind">${p[1]}</span></td><td><span class="rt">${[...p[2]].map((c,k)=>`<i class="${c=='1'?'d':(p[2][k-1]=='1'&&c=='0'&&k<4?'c':'')}"></i>`).join('')}</span></td><td class="mono">${p[3]}</td><td class="mono" style="color:var(--ink3)">${p[4]}</td></tr>`).join('');
+const S=[['11','ok'],['12','ok'],['13','ok'],['14','run'],['15',''],['16',''],['17',''],['18',''],['19',''],['20','bad']];
+$('#srows').innerHTML=S.map((s,i)=>`<div class="srow ${s[0]=='14'?'sel':''}"><span class="sd ${s[1]}"></span><div><b class="mono">VIGIL-${s[0]}</b><small>${s[1]=='run'?'шаг 5/8 · 3 мин':s[1]=='bad'?'ошибка: тег @sluga':s[1]=='ok'?'готово · 9 с':'ждёт'}</small></div><span class="mono" style="color:var(--ink3)">${(+s[0]-1)*10/60|0}:${String((+s[0]-1)*10%60).padStart(2,'0')}</span></div>`).join('')+'<div class="srow"><span></span><small class="mono">… ещё 30</small></div>';
+$('#ptext').innerHTML='<span class="tag">@mama</span> медленно качает колыбель, <span class="tag">@mladenets</span> не спит. <span class="tag">@plenka</span>, камера чуть приближается; в углу кадра <span class="tag bad">@sluga</span>.';
+$('#ims').innerHTML=[['@mama',18],['@mladenets',48],['@zal',215],['@plenka',160]].map(r=>`<div class="im" style="background:${g(r[1])}"><em>${r[0]}</em></div>`).join('')+'<div class="im add">+</div>';
+const R=[['@mama','Человек',18,3],['@mladenets','Человек',48,1],['@zal','Место',215,2],['@plashch','Предмет',350,1],['@plenka','Стиль',160,4],['@golos-materi','Голос',270,1]];
+$('#pref').innerHTML=R.slice(0,5).map(r=>`<div class="ref"><div class="av" style="background:${g(r[2])}"></div><div><b class="mono">${r[0]}</b><small>${r[1]} · v${r[3]}${r[0]=='@zal'?' · есть v3':''}</small></div></div>`).join('');
+$('#grid').innerHTML=R.map((r,i)=>`<div class="card ${i?'':'sel'}"><div class="im2" style="background:${g(r[2])}"></div><div class="b"><b class="mono">${r[0]}</b><br><small>${r[1]} · v${r[3]} · 3 проекта</small></div></div>`).join('')+'<div class="card" style="display:grid;place-items:center;min-height:136px;color:var(--ink3);border-style:dashed">перетащите<br>картинки</div>';
+const G={run:['Считает H3 · сцена 14','61 °C','47 / 64 ГБ',73,'у панели'],idle:['Свободна','38 °C','0 / 64 ГБ',0,'свободен'],foreign:['Занята чужим','52 °C','18 / 64 ГБ',28,'ComfyUI Krea2'],qwen:['Qwen держит карту','49 °C','31 / 64 ГБ',48,'свободен']};
+const gs=q.get('gpu')||'run',gg=G[gs];
+$('#status').dataset.s=gs;
+$('#status').innerHTML=`<span><span class="dot"></span><b>GPU</b> ${gg[0]}</span><span>${gg[2]}</span><span>${gg[1]}</span><span>Qwen: ${gs=='qwen'?'запущен':'выгружен'}</span><span class="sp"></span><span>очередь: 7 задач · ≈4 ч 10 м</span><button class="sm acc" ${gs=='foreign'?'disabled':''}>${gs=='qwen'?'Выгрузить Qwen':'Освободить карту'}</button>`;
+$('#gp').innerHTML=`<div><b style="font-size:16px">${gg[0]}</b><div class="cap">sglang H3 :30020 · ${gs=='idle'?'погашен':gs=='foreign'?'не наш':'готов'}</div></div><div class="meter"><i style="width:${gg[3]}%"></i></div>
+<div class="kvs" style="padding:0"><span>Память</span><span>${gg[2]}</span><span>Темп.</span><span>${gg[1]} · защита 84</span><span>Замок</span><span>${gg[4]}</span><span>Qwen</span><span>${gs=='qwen'?'запущен (shared32)':'выгружен нами в 01:12'}</span><span>Автоотдача</span><span>через 15 мин пустой очереди</span></div>
+<div class="acts" style="padding:0"><button ${gs=='foreign'?'disabled':''}>Освободить карту</button><button class="${gs=='qwen'?'acc':''}">${gs=='qwen'?'Выгрузить Qwen':'Вернуть Qwen'}</button></div>`;
+$('#qalert').innerHTML=gs=='qwen'?`<div class="alert"><b>Qwen держит карту — H3 рядом не помещается.</b><div><button class="acc">Выгрузить и начать</button> <button>Пусть ждёт</button></div></div>`:gs=='foreign'?`<div class="alert"><b>Ждём: ComfyUI Krea2 (pid 4412, 18 ГБ).</b> Чужое не гасим; старт — автоматически, когда карта свободна.</div>`:'';
+const Q=[['Сцена 14','ночь 5',62],['Сцена 15','ночь 5',0],['Сцена 16','ночь 5',0],['Сцена 17','ночь 5',0],['Апскейл ×40 (LTX 0,6)','ночь 5',0],['Сборка','ночь 5',0]];
+$('#qtb').innerHTML=Q.map((r,i)=>`<tr><td class="mono">${i+1}</td><td><b>${r[0]}</b><div class="cap" style="margin:0">${r[1]}</div></td><td>${r[2]&&gs=='run'?`<span class="pgb"><i style="width:${r[2]}%"></i></span> <span class="mono">5/8</span>`:'<span class="mono" style="color:var(--ink3)">'+(r[2]?'ждёт карту':'ждёт')+'</span>'}</td><td style="text-align:right"><button class="sm">↑</button> <button class="sm">✕</button></td></tr>`).join('');
+const th=q.get('theme');if(th)document.documentElement.dataset.theme=th;
+$('#theme').onclick=()=>{const d=document.documentElement;const dark=d.dataset.theme?d.dataset.theme=='dark':!matchMedia('(prefers-color-scheme:light)').matches;d.dataset.theme=dark?'light':'dark'};
+function route(){const h=(location.hash||'#projects').slice(1);document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('on',s.id==h));document.querySelectorAll('[data-s]').forEach(a=>a.classList.toggle('on',a.dataset.s==h))}
+addEventListener('hashchange',route);route();
+</script>
+</body>
+</html>
