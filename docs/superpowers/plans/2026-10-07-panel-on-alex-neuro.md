@@ -22,7 +22,7 @@
 - Сообщения человеку — по-русски; комментарии, докстринги, идентификаторы — по-английски (как во всём пакете).
 - Новый код ошибки `CliError` обязан быть в `h3_48gb/cli.py:ERROR_CODES` (`CliError.__init__` делает `assert code in ERROR_CODES`, `cli.py:270`), статус — в `web.ERROR_STATUS`, если не 400.
 - Значения из спеки дословно: порт панели `8765`; `H3_ALLOWED_HOSTS=192.168.100.50:8765,alex-neuro:8765`; `H3_SGLANG_URL=http://127.0.0.1:30020`; `H3_COMFY_URL=http://127.0.0.1:8188`; `H3_DISPATCHER_URL=http://127.0.0.1:8790`; диспетчер слушает `127.0.0.1:8790`; `generation.lock` = `/home/alex/Projects/qwen-image21-lab/generation.lock`; `H3_IDLE_RELEASE_MIN` = 15; опрос sglang каждые 20 с; повтор acquire каждые 30 с; пропажа sglang — 5 попыток через 30 с; термозащита ≥ 80 °C → ждать до 72 °C; шаги по умолчанию 50; `flow_shift 12.0`, `audio_flow_shift 3.0`, `quality "lossless"`, `num_outputs_per_prompt 1`, `model "MiniMaxAI/MiniMax-H3"`; сетка кадров `17j+5` при 24 к/с; LTX `denoise 0.10`, сид 42, дополнение до `8k+1` кадров; SIGTERM группе своих процессов, ожидание до 120 с, SIGKILL.
-- Факты sglang, проверенные по коду сервера (`/home/alex/Projects/h3-lab/sglang-src/python/sglang/multimodal_gen/runtime/...`), обязательны для адаптера: `task ∈ {t2va, ref2va}` (fl2va вне v1); `duration_seconds` обязателен и в `[3, 15]`; keyframe только `frame_index: 0`; у reference нет `frame_index`; ключи условия только `type/uri/role/frame_index/start_time_seconds`; `aspect_ratio ∈ {auto, 21:9, 16:9, 4:3, 3:2, 1:1, 2:3, 3:4, 9:16}`; ref2va с keyframe без reference (картинка или аудио) → 400; t2va с непустыми conditions → 400; keyframe не нумеруется, `<Picture N>` — только reference-картинки с 1 в порядке условий, аудио — `<Audio j>` отдельно (`presentation.py:230-270`, `stages/text_encoding.py:385`); `DELETE /v1/videos/{id}` не останавливает GPU; неизвестный id → 404 `Video not found`; статусы только `queued`/`completed`/`failed`; тело 400 — `{"detail": "..."}`, сервер его не логирует — адаптер сохраняет его в задачу.
+- Факты sglang, проверенные по коду сервера (`/home/alex/Projects/h3-lab/sglang-src/python/sglang/multimodal_gen/runtime/...`), обязательны для адаптера: `task` всегда `ref2va` — сервер с `VARIANT=ref2va` обслуживает только его (проба 07.10, `h3-bench/logs/probe-t2va-20261007.log`: `t2va` принимается с HTTP 200 и падает при выполнении «task 't2va' is not served by MiniMax H3 partition 'ref2va'»), поэтому **у каждой сцены должен быть хотя бы один reference** (`@`-тег с картинкой или, в клипе, кусок трека), иначе отказ на валидации «нужен хотя бы один референс (@тег) в сцене»; `duration_seconds` обязателен и в `[3, 15]`; keyframe только `frame_index: 0`; у reference нет `frame_index`; ключи условия только `type/uri/role/frame_index/start_time_seconds`; `aspect_ratio ∈ {auto, 21:9, 16:9, 4:3, 3:2, 1:1, 2:3, 3:4, 9:16}`; ref2va с keyframe без reference (картинка или аудио) → 400 «ref2va keyframes require at least one reference condition»; пути условий — как в проверенных прогонах: картинки голым абсолютным путём, аудио `file://` (`chain_beach.py`, `runner_clip.py`); keyframe не нумеруется, `<Picture N>` — только reference-картинки с 1 в порядке условий, аудио — `<Audio j>` отдельно (`presentation.py:230-270`, `stages/text_encoding.py:385`); `DELETE /v1/videos/{id}` не останавливает GPU; неизвестный id → 404 `Video not found`; статусы только `queued`/`completed`/`failed`; тело 400 — `{"detail": "..."}`, сервер его не логирует — адаптер сохраняет его в задачу.
 - Docker-образ: `python:3.12-slim` + ffmpeg + node, без CUDA и без `mlx`/`mlx-vlm`/opencv/scipy; пользователь uid/gid 1000; `network_mode: host`; тома по тем же путям, что на хосте.
 - Ни один шаг плана не запускает GPU-работу на alex-neuro, кроме проб задачи 14, помеченных «требует свободной GPU».
 
@@ -33,7 +33,7 @@
 1. **Перезапуск диспетчера при поднятом своём H3.** Владелец ждёт, что панель продолжит пользоваться своим H3, а не сочтёт его чужим и не будет ждать вечно. Тест `test_restarted_dispatcher_still_owns_its_engine` (задача 7).
 2. **Теги в тексте сцены на границах.** `@alice,` в конце фразы — это тег `@alice`; `anna@alice.com` — не тег; `@Alice` — ошибка «тег пишется строчными», а не тихий пропуск. Тест `test_scene_tags_edge_cases` (задача 4).
 3. **Старые кадры ComfyUI от прошлой попытки той же сцены.** Повторный апскейл не должен склеить чужие PNG: префикс вывода уникален на попытку, число кадров сверяется с `8k+1`. Тест `test_upscale_prefix_is_unique_per_attempt_and_frame_count_is_checked` (задача 10).
-4. **Обрыв скачивания `/content`.** Недокачанный mp4 не должен выглядеть готовым для `queue.reconcile` (он считает «есть `.mp4`» успехом, `queue.py:1162`). Тест `test_download_is_atomic` (задача 6).
+4. **Обрыв скачивания `/content`.** Недокачанный mp4 не должен выглядеть готовым для `queue.reconcile` (он считает «есть `.mp4`» успехом, `queue.py:1165`). Тест `test_download_is_atomic` (задача 6).
 5. **Импортированный трек короче минимальной сцены или длиннее, чем покрывают сцены.** 4-секундный mp3 должен дать понятный отказ, а не сцену-огрызок. Тест `test_import_shorter_than_one_scene_is_refused` (задача 9).
 
 ---
@@ -75,7 +75,7 @@
 **Files:**
 - Create: `requirements-panel.txt`
 - Modify: `pyproject.toml:52` (маркеры), `conftest.py` (корень)
-- Modify (маркировка MLX/opencv-тестов, верх файла): `test_adaln_indexing.py`, `test_lazy_pipeline.py`, `test_preview.py`, `test_text_encoder_quant.py`, `test_vision_patch_embed_layout.py`, `tests/test_attention_levers.py`, `tests/test_checkpoint.py`, `tests/test_checkpoint_preview_integration.py`, `tests/test_decode_video_uint8.py`, `tests/test_dit_loader.py`, `tests/test_latent_tail.py`, `tests/test_pipeline_latent.py`, `tests/test_preview_tae.py`, `tests/test_sigma_grid.py`, `tests/test_tae.py`, `tests/test_vae_decode_eval_patch.py`, `tests/test_packing_latent.py`; opencv/scipy: `tests/test_cli_facerefine.py`, `tests/test_facepaste.py`, `tests/test_facetrack.py`, `tests/test_framecheck.py`
+- Modify (маркировка MLX/opencv-тестов, верх файла): `test_adaln_indexing.py`, `test_lazy_pipeline.py`, `test_preview.py`, `test_text_encoder_quant.py`, `test_vision_patch_embed_layout.py`, `tests/test_attention_levers.py`, `tests/test_checkpoint.py`, `tests/test_checkpoint_preview_integration.py`, `tests/test_decode_video_uint8.py`, `tests/test_dit_loader.py`, `tests/test_latent_tail.py`, `tests/test_pipeline_latent.py`, `tests/test_preview_tae.py`, `tests/test_sigma_grid.py`, `tests/test_tae.py`, `tests/test_vae_decode_eval_patch.py`, `tests/test_packing_latent.py`; opencv/scipy: `tests/test_cli_facerefine.py`, `tests/test_facepaste.py`, `tests/test_facetrack.py`; `tests/test_framecheck.py` — **не целиком** (сам `framecheck` — numpy): верхний `import cv2` (`test_framecheck.py:15`) убрать, в двух тестах, которые читают кадры через OpenCV (`test_is_frame_corrupt_catches_every_flat_frame_from_the_chunk_recon_calibration`, `test_tile_seam_score_catches_the_reference_corrupt_frame_from_the_2026_08_20_incident`), — декоратор `@pytest.mark.cv` и первой строкой `cv2 = pytest.importorskip("cv2", reason="cv: needs opencv-python and scipy, absent here")`
 - Modify (маркировка отдельных тестов, которые тянут mlx изнутри тела): `tests/test_bake_adaln.py` (тесты со строк 32, 54, 72, 95-99), `tests/test_facerefine.py` (тесты со строк 318, 455, 474-477, 507-509), `tests/test_cli.py` (тесты со строк 424 и 455), `test_qkv_permutation.py` (проверить прогоном)
 - Test: `tests/test_markers.py` (новый)
 
@@ -128,13 +128,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _run(tmp_path, body: str) -> subprocess.CompletedProcess:
-    test_file = tmp_path / "test_probe_marker.py"
+    """The probe file lives *inside* tests/ (and is removed afterwards): a file outside the
+    project root would not load the root conftest.py whose hook is under test."""
+    test_file = PROJECT_ROOT / "tests" / f"test_zz_probe_marker_{tmp_path.name}.py"
     test_file.write_text(body, encoding="utf-8")
-    return subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rs",
-         "--rootdir", str(PROJECT_ROOT), "-c", str(PROJECT_ROOT / "pyproject.toml"),
-         str(test_file)],
-        capture_output=True, text=True, cwd=PROJECT_ROOT, timeout=120)
+    try:
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rs",
+             str(test_file)],
+            capture_output=True, text=True, cwd=PROJECT_ROOT, timeout=120)
+    finally:
+        test_file.unlink(missing_ok=True)
 
 
 def test_a_marked_test_whose_module_is_missing_is_skipped_with_the_marker_reason(tmp_path):
@@ -252,8 +256,9 @@ git commit -m "test: маркеры mlx/cv и лёгкий venv панели —
 ## Task 1: Сеть: `--host`, `H3_ALLOWED_HOSTS`, Host/Origin
 
 **Files:**
-- Modify: `h3_48gb/web.py:5800-5832` (`make_server`), `h3_48gb/web.py:3114-3121` (`_check_host`), `h3_48gb/web.py:3175-3183` (`_check_origin`)
+- Modify: `h3_48gb/web.py:5800-5832` (`make_server`), `h3_48gb/web.py:3095` (`_check_host`, сравнение на `3114-3115`), `h3_48gb/web.py:3175-3183` (`_check_origin`)
 - Modify: `h3_48gb/cli.py:618-624` (подкоманда `web`), `h3_48gb/cli.py:1509-1543` (`run_web`), `h3_48gb/cli.py:2056-2057` (вызов), `h3_48gb/cli.py:148` (`ERROR_CODES`)
+- Modify: `tests/test_web.py:1367-1370` — `test_h3_web_has_no_host_flag` заменяется (защита не удаляется, а переходит в новую форму, шаг 4a)
 - Test: `tests/test_web_network.py` (новый)
 
 **Interfaces:**
@@ -460,6 +465,23 @@ def run_web(outdir: Path, port: int = 8765, host: str = "127.0.0.1") -> dict:
     "allowed_hosts_invalid": "an H3_ALLOWED_HOSTS entry is not host:port",
 ```
 
+- [ ] **Step 4a: Заменить старый тест «у `h3 web` нет `--host`»**
+
+`tests/test_web.py:1367-1370` — `test_h3_web_has_no_host_flag` проверял, что флага нет. Флаг появился, защита — в другой форме: внешний bind без списка отклоняется. Заменить тест на:
+```python
+def test_h3_web_beyond_the_loopback_needs_an_allow_list(tmp_path, monkeypatch):
+    """A bind-address flag is the one way this server could stop being loopback-only, so
+    `--host` beyond 127.0.0.1 is refused unless H3_ALLOWED_HOSTS names the page's host:port."""
+    from h3_48gb import cli
+
+    monkeypatch.delenv("H3_ALLOWED_HOSTS", raising=False)
+    (tmp_path / "out").mkdir()
+    with pytest.raises(CliError) as excinfo:
+        cli.run_web(tmp_path / "out", 0, "0.0.0.0")
+    assert excinfo.value.code == "external_bind_without_allowed_hosts"
+```
+Мутация: в `make_server` убрать проверку `host != LOOPBACK and not allowed_hosts` → этот тест FAIL `DID NOT RAISE` (вместе с `test_external_bind_without_a_list_is_refused_before_binding`).
+
 - [ ] **Step 5: Зелёный**
 
 Run: `env -u NODE_OPTIONS ~/venvs/h3-panel/bin/python -m pytest tests/test_web_network.py tests/test_web.py -q -p no:cacheprovider`
@@ -473,7 +495,7 @@ Expected: PASS (включая старые тесты Host/Origin `test_web.py:
 
 ```bash
 env -u NODE_OPTIONS ~/venvs/h3-panel/bin/python -m pytest -q -p no:cacheprovider
-git add h3_48gb/web.py h3_48gb/cli.py tests/test_web_network.py
+git add h3_48gb/web.py h3_48gb/cli.py tests/test_web_network.py tests/test_web.py
 git commit -m "feat(web): --host и H3_ALLOWED_HOSTS — доступ из домашней сети по списку"
 ```
 
@@ -726,6 +748,7 @@ git commit -m "feat: H3_ENGINE=mlx|sglang; caffeinate и Finder только н�
 
 **Files:**
 - Create: `h3_48gb/engines/__init__.py`, `h3_48gb/engines/sglang_args.py`, `h3_48gb/engines/estimate.py`
+- Modify: `pyproject.toml:33` — `packages = ["h3_48gb", "h3_48gb.engines"]` (список пакетов явный; без этого обычная установка подпакет не увидит)
 - Modify: `h3_48gb/web.py:607` (`check_path_flags` — параметр `flags`), `h3_48gb/web.py:2350` (`validate_args`), `h3_48gb/web.py:2478-2504` (`prepare_submission`), `h3_48gb/web.py:3844-3878` (`_estimate_only`)
 - Modify: `h3_48gb/cli.py:148` (`ERROR_CODES` дополняется кодами sglang)
 - Test: `tests/test_sglang_args.py` (новый), `tests/test_sglang_web.py` (новый)
@@ -767,12 +790,22 @@ def test_the_frame_grid_is_17n_plus_5():
         [5, 5, 22, 124, 124, 175, 175, 192, 209]
 
 
-def test_a_plain_scene_parses_to_t2va_with_table_aspect(tmp_path):
-    spec = sa.parse(_argv(tmp_path))
+def test_a_first_scene_with_one_reference_parses_to_ref2va_with_table_aspect(tmp_path):
+    ref = _png(tmp_path / "a.png")
+    spec = sa.parse(_argv(tmp_path, "--ref", ref))
     assert spec == SglangSpec(prompt="кот на подоконнике", width=896, height=512,
                               duration=7.291666666666667, frames=175, steps=50, seed=42,
-                              tag="scene-0-ab12", outdir=str(tmp_path), image=None, refs=(),
-                              audio=(), task="t2va", short_edge=512, aspect_ratio="16:9")
+                              tag="scene-0-ab12", outdir=str(tmp_path), image=None, refs=(ref,),
+                              audio=(), task="ref2va", short_edge=512, aspect_ratio="16:9")
+
+
+def test_a_scene_without_any_reference_is_refused(tmp_path):
+    """spec §4.1.3: the ref2va server serves only ref2va; a scene with nothing to reference has
+    no task it can run as -- refused here, not by a render that fails an hour later."""
+    with pytest.raises(SglangArgsError) as excinfo:
+        sa.parse(_argv(tmp_path))
+    assert (excinfo.value.code, excinfo.value.message) == \
+        ("ref2va_needs_reference", "нужен хотя бы один референс (@тег) в сцене")
 
 
 def test_a_chained_scene_with_refs_and_audio_parses_to_ref2va(tmp_path):
@@ -819,23 +852,24 @@ def test_an_off_grid_duration_names_the_next_grid_point(tmp_path):
                                "next_grid_seconds": 175 / 24})
 
 
-def test_t2va_with_conditions_is_refused(tmp_path):
+@pytest.mark.parametrize("task", ["t2va", "fl2va"])
+def test_any_task_but_ref2va_is_refused(tmp_path, task):
     with pytest.raises(SglangArgsError) as excinfo:
-        sa.parse(_argv(tmp_path, "--task", "t2va", "--ref", _png(tmp_path / "a.png")))
-    assert excinfo.value.code == "task_conditions_mismatch"
+        sa.parse(_argv(tmp_path, "--task", task, "--ref", _png(tmp_path / "a.png")))
+    assert excinfo.value.code == "sglang_args_invalid"
 
 
-def test_a_keyframe_without_any_reference_is_refused_with_the_chain_message(tmp_path):
+def test_a_keyframe_without_any_reference_is_refused(tmp_path):
     with pytest.raises(SglangArgsError) as excinfo:
         sa.parse(_argv(tmp_path, "--image", _png(tmp_path / "kf.png")))
     assert (excinfo.value.code, excinfo.value.message) == \
-        ("ref2va_needs_reference", "для цепочки нужен хотя бы один референс в сцене")
+        ("ref2va_needs_reference", "нужен хотя бы один референс (@тег) в сцене")
 
 
-def test_ref2va_with_nothing_is_refused(tmp_path):
-    with pytest.raises(SglangArgsError) as excinfo:
-        sa.parse(_argv(tmp_path, "--task", "ref2va"))
-    assert excinfo.value.code == "ref2va_needs_reference"
+def test_an_audio_reference_alone_is_enough(tmp_path):
+    piece = tmp_path / "piece.wav"
+    piece.write_bytes(b"RIFF")
+    assert sa.parse(_argv(tmp_path, "--audio", str(piece))).task == "ref2va"
 
 
 def test_more_refs_than_the_limit_is_refused(tmp_path):
@@ -868,17 +902,17 @@ def test_a_repeated_single_value_flag_is_refused(tmp_path):
 
 def test_aspect_must_be_auto_or_the_table_aspect(tmp_path):
     with pytest.raises(SglangArgsError) as excinfo:
-        sa.parse(_argv(tmp_path, "--aspect", "9:16"))
+        sa.parse(_argv(tmp_path, "--aspect", "9:16", "--ref", _png(tmp_path / "a.png")))
     assert excinfo.value.code == "sglang_args_invalid"
 
 
 def test_dry_run_report_and_output_stem(tmp_path):
-    spec = sa.parse(_argv(tmp_path))
+    spec = sa.parse(_argv(tmp_path, "--ref", _png(tmp_path / "a.png")))
     assert sa.output_stem(spec) == f"{tmp_path}/h3-scene-0-ab12-896x512"
     assert sa.dry_run_report(spec) == {
         "dry_run": True, "engine": "sglang", "output_stem": f"{tmp_path}/h3-scene-0-ab12-896x512",
         "canvas": "896x512", "duration_seconds": 7.291666666666667, "frames": 175,
-        "grid_points": 50, "task": "t2va"}
+        "grid_points": 50, "task": "ref2va"}
 ```
 
 - [ ] **Step 2: Падающие тесты оценки и веба**
@@ -913,6 +947,8 @@ def test_estimate_uses_only_the_last_ten_runs(tmp_path):
 
 def test_estimate_falls_back_to_the_bench_table_by_nearest_frames(tmp_path):
     assert est.estimate_seconds(tmp_path, width=896, height=512, frames=175) == \
+        {"seconds": 2810.0, "source": "table", "samples": 0}
+    assert est.estimate_seconds(tmp_path, width=896, height=512, frames=130) == \
         {"seconds": 345.0, "source": "table", "samples": 0}
     assert est.estimate_seconds(tmp_path, width=768, height=768, frames=209) == \
         {"seconds": 2820.0, "source": "table", "samples": 0}
@@ -925,8 +961,12 @@ def test_estimate_skips_corrupt_history_lines(tmp_path):
 
 
 def _sglang_job_args(live, *extra):
+    """Every sglang scene carries at least one reference (spec §4.1.3)."""
+    ref = live.outdir / "ref.png"
+    ref.write_bytes(b"\x89PNG\r\n\x1a\n")
     return ["generate", "кот", "--width", "896", "--height", "512",
-            "--duration", str(175 / 24), "--tag", "ночь", "--outdir", str(live.outdir), *extra]
+            "--duration", str(175 / 24), "--tag", "ночь", "--outdir", str(live.outdir),
+            "--ref", str(ref), *extra]
 
 
 def test_a_sglang_job_is_queued_without_a_dry_run_subprocess(queue_server, monkeypatch):  # noqa: F811
@@ -942,7 +982,7 @@ def test_a_sglang_job_is_queued_without_a_dry_run_subprocess(queue_server, monke
     # queue.submit relocates --outdir into a per-job subdirectory; the stem the queue stores must
     # be exactly the one the adapter will derive from the relocated argv.
     assert sa.output_stem(sa.parse(job["args"], check_files=False)) == job["output_stem"]
-    assert body["estimate"] == {"seconds": 345.0, "source": "table", "samples": 0}
+    assert body["estimate"] == {"seconds": 2810.0, "source": "table", "samples": 0}
 
 
 def test_mlx_flags_are_refused_on_sglang(queue_server, monkeypatch):  # noqa: F811
@@ -967,7 +1007,7 @@ def test_estimate_route_on_sglang(queue_server, monkeypatch):  # noqa: F811
     status, body = _call(queue_server, "POST", "/api/estimate",
                          {"args": _sglang_job_args(queue_server)})
     assert (status, body) == (200, {"ok": True, "estimate":
-                                    {"seconds": 345.0, "source": "table", "samples": 0}})
+                                    {"seconds": 2810.0, "source": "table", "samples": 0}})
 ```
 
 - [ ] **Step 3: Красный**
@@ -981,6 +1021,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'h3_48gb.engines'`.
 ```python
 """Render engines other than the in-tree MLX pipeline. Nothing here imports mlx."""
 ```
+`pyproject.toml`, секция `[tool.setuptools]`: `packages = ["h3_48gb", "h3_48gb.engines"]`.
 
 `h3_48gb/engines/sglang_args.py`:
 ```python
@@ -1011,7 +1052,9 @@ DEFAULT_MAX_REF_IMAGES = 6
 #: the mp4, not from this table: sglang picks its own frame for a short edge and an aspect.
 CANVAS_TABLE = {(896, 512): (512, "16:9"), (512, 896): (512, "9:16"), (768, 768): (768, "1:1")}
 ASPECT_RATIOS = ("auto", "21:9", "16:9", "4:3", "3:2", "1:1", "2:3", "3:4", "9:16")
-TASKS = ("t2va", "ref2va")
+#: spec §4.1.3, probe 2026-10-07: the server runs with VARIANT=ref2va and serves only ref2va
+#: (t2va is accepted with HTTP 200 and then fails "not served by MiniMax H3 partition 'ref2va'").
+TASKS = ("ref2va",)
 
 #: Path policy for `web.check_path_flags` on this engine (the MLX table `web.PATH_FLAGS` is pinned
 #: to the MLX parser's flags by test_web.py, so the two tables stay separate).
@@ -1027,8 +1070,7 @@ ERROR_CODES = {
     "canvas_unsupported_on_sglang": "--width/--height is not a canvas the sglang format table maps",
     "duration_out_of_range": "--duration is outside sglang's 3..15 s",
     "duration_off_grid": "--duration does not land on sglang's 17n+5 frame grid at 24 fps",
-    "ref2va_needs_reference": "ref2va needs a reference picture or audio; a keyframe alone is refused",
-    "task_conditions_mismatch": "t2va was asked for together with conditions",
+    "ref2va_needs_reference": "a scene needs at least one reference (an @tag picture, or a clip's track piece)",
     "too_many_reference_images": "more reference pictures than H3_MAX_REF_IMAGES allows per scene",
     "condition_file_missing": "a --image/--ref/--audio path does not exist",
 }
@@ -1171,17 +1213,14 @@ def parse(argv, *, environ=None, check_files: bool = True) -> SglangSpec:
     audio = tuple(values.get("--audio", []))
     has_reference = bool(refs or audio)
 
-    task = _one(values, "--task", "ref2va" if (image or has_reference) else "t2va")
+    task = _one(values, "--task", "ref2va")
     if task not in TASKS:
-        raise SglangArgsError("sglang_args_invalid", f"--task {task!r}: можно {TASKS}",
+        raise SglangArgsError("sglang_args_invalid",
+                              f"--task {task!r}: сервер H3 поднят как ref2va и обслуживает только его",
                               {"task": task})
-    if task == "t2va" and (image or has_reference):
-        raise SglangArgsError("task_conditions_mismatch",
-                              "t2va не принимает ни кейфрейм, ни референсы", {"task": task})
-    if task == "ref2va" and not has_reference:
-        message = ("для цепочки нужен хотя бы один референс в сцене" if image
-                   else "ref2va без референсов: нужен хотя бы один @-тег или кусок трека")
-        raise SglangArgsError("ref2va_needs_reference", message, {"keyframe": image})
+    if not has_reference:
+        raise SglangArgsError("ref2va_needs_reference", "нужен хотя бы один референс (@тег) в сцене",
+                              {"keyframe": image})
     limit = max_ref_images(environ)
     if len(refs) > limit:
         raise SglangArgsError("too_many_reference_images",
@@ -1230,11 +1269,11 @@ from pathlib import Path
 HISTORY_NAME = "sglang-history.jsonl"
 HISTORY_WINDOW = 10
 
-#: short edge -> {frames: median wall_s}. Counts behind each median: 512/124 ×21, 512/243 ×6,
-#: 512/277 ×1, 768/124 ×1, 768/192 ×2, 768/209 ×10. 512/175 and 512/192 (×4 each, 2810/2980 s)
-#: are left out on purpose: those were the beach ref2va runs with three 2048-px references, an
-#: order of magnitude off the plain runs either side of them.
-FALLBACK_SECONDS = {512: {124: 345.0, 243: 580.0, 277: 720.0},
+#: short edge -> {frames: median wall_s}. Counts behind each median: 512/124 ×21, 512/175 ×4,
+#: 512/192 ×4, 512/243 ×6, 512/277 ×1, 768/124 ×1, 768/192 ×2, 768/209 ×10. The 512/175 and
+#: 512/192 rows are the beach ref2va runs (references scaled to 2048 px) -- kept on purpose: on
+#: this server every scene is ref2va now (spec §4.1.3), so they are the closest to what runs.
+FALLBACK_SECONDS = {512: {124: 345.0, 175: 2810.0, 192: 2980.0, 243: 580.0, 277: 720.0},
                     768: {124: 1140.0, 192: 1793.0, 209: 2820.0}}
 
 
@@ -1330,13 +1369,13 @@ Expected: PASS.
 
 - [ ] **Step 8: Мутации**
 
-(а) В `grid_frames_up` заменить `(FRAME_REMAINDER - frames)` на `(frames - FRAME_REMAINDER)` → `test_the_frame_grid_is_17n_plus_5` FAIL. (б) Убрать проверку `task == "ref2va" and not has_reference` → `test_a_keyframe_without_any_reference_is_refused_with_the_chain_message` FAIL `DID NOT RAISE`. (в) Убрать строку `if engine.is_sglang(): return _prepare_submission_sglang(...)` → `test_a_sglang_job_is_queued_without_a_dry_run_subprocess` FAIL (`AssertionError: no subprocess on the sglang path` → 500). (г) В `estimate_seconds` заменить `same[-HISTORY_WINDOW:]` на `same[:HISTORY_WINDOW]` → `test_estimate_uses_only_the_last_ten_runs` FAIL `'seconds': 5.5 != 7.5`. Ошибки — в отчёт.
+(а) В `grid_frames_up` заменить `(FRAME_REMAINDER - frames)` на `(frames - FRAME_REMAINDER)` → `test_the_frame_grid_is_17n_plus_5` FAIL. (б) Убрать проверку `if not has_reference:` → `test_a_scene_without_any_reference_is_refused` и `test_a_keyframe_without_any_reference_is_refused` FAIL `DID NOT RAISE`. (в) Убрать строку `if engine.is_sglang(): return _prepare_submission_sglang(...)` → `test_a_sglang_job_is_queued_without_a_dry_run_subprocess` FAIL (`AssertionError: no subprocess on the sglang path` → 500). (г) В `estimate_seconds` заменить `same[-HISTORY_WINDOW:]` на `same[:HISTORY_WINDOW]` → `test_estimate_uses_only_the_last_ten_runs` FAIL `'seconds': 5.5 != 7.5`. Ошибки — в отчёт.
 
 - [ ] **Step 9: Полный прогон и commit**
 
 ```bash
 env -u NODE_OPTIONS ~/venvs/h3-panel/bin/python -m pytest -q -p no:cacheprovider
-git add h3_48gb/engines h3_48gb/web.py h3_48gb/cli.py tests/test_sglang_args.py tests/test_sglang_web.py
+git add h3_48gb/engines h3_48gb/web.py h3_48gb/cli.py pyproject.toml tests/test_sglang_args.py tests/test_sglang_web.py
 git commit -m "feat(sglang): парсер и валидатор argv, таблица форматов, сетка 17n+5, оценка времени"
 ```
 
@@ -2012,7 +2051,7 @@ Expected: PASS.
 
 - [ ] **Step 10: Мутации**
 
-(а) В `build_ref2va` поменять порядок обхода: `for number, tag in enumerate(reversed(tags), start=1)` → `test_build_ref2va_two_tags_one_with_two_pictures` FAIL (порядок `<Picture N>` и images). (б) В `_view` вернуть всегда `card["version"]` вместо `version` → `test_build_ref2va_uses_the_pinned_version_not_the_latest` FAIL. (в) В `_TAG_IN_TEXT_RE` убрать lookbehind `(?<![\w@.])` → `test_scene_tags_edge_cases` FAIL (в списке появится `@bob` из адреса `anna@bob.com`). (г) В `_put_project_references` писать `ref.get("version")` вместо `card["version"]` → `test_project_references_pin_latest_when_version_omitted` FAIL. Ошибки — в отчёт.
+(а) В `build_ref2va` поменять порядок обхода: `for number, tag in enumerate(reversed(tags), start=1)` → `test_build_ref2va_two_tags_one_with_two_pictures` FAIL (порядок `<Picture N>` и images). (б) В `_view` первую строку `entry = card["versions"].get(str(version))` заменить на `entry = card["versions"].get(str(card["version"]))` (всегда последняя версия, номер в ответе — запрошенный) → `test_build_ref2va_uses_the_pinned_version_not_the_latest` FAIL на `assert scene.images == (str(out / "library" / "alice" / "v1" / "01-a.png"),)` — придёт путь `v2/01-b.png`. (в) В `_TAG_IN_TEXT_RE` убрать lookbehind `(?<![\w@.])` → `test_scene_tags_edge_cases` FAIL (в списке появится `@bob` из адреса `anna@bob.com`). (г) В `_put_project_references` писать `ref.get("version")` вместо `card["version"]` → `test_project_references_pin_latest_when_version_omitted` FAIL. Ошибки — в отчёт.
 
 - [ ] **Step 11: Полный прогон и commit**
 
@@ -2027,8 +2066,9 @@ git commit -m "feat(library): библиотека референсов с ве�
 ## Task 5: Сцены при sglang: argv из `assemble`, цепочка через кейфрейм, снап, проверка тегов на гейтах, теги в чате
 
 **Files:**
-- Modify: `h3_48gb/assemble.py` — константы рядом с `OVERLAP_PIXEL_FRAMES` (`assemble.py:99-128`), новые `_extract_last_frame`, `_scene_generate_args_sglang`, `_submit_next_scene_sglang`; первая строка `_submit_next_scene` (`assemble.py:1283`)
-- Modify: `h3_48gb/web.py` — `_grid_frames_nearest`, `_snap_video_scenes_sglang`, `_scene_reference_errors` рядом с `_snap_scene_duration` (`web.py:947`); `_approve_project_stage` (`web.py:4264-4304`); `_chat_message`/`_locked_turn` (`web.py:5359-5447`)
+- Modify: `h3_48gb/assemble.py` — константы рядом с `OVERLAP_PIXEL_FRAMES` (`assemble.py:175`), новые `_extract_last_frame`, `_scene_generate_args_sglang`, `_submit_next_scene_sglang`; первая строка `_submit_next_scene` (`assemble.py:1283`)
+- Modify: `h3_48gb/web.py` — `_grid_frames_nearest`, `_snap_video_scenes_sglang`, `_scene_reference_errors` рядом с `_snap_scene_duration` (`web.py:947`); `_approve_project_stage` (`web.py:4264-4304`); `_chat_message` (`web.py:5314`, `allowed=` на `5359-5360`) / `_locked_turn` (`web.py:5364-5447`); новый маршрут `PUT /api/projects/<id>/settings`
+- Modify: `h3_48gb/project.py` — `DEFAULT_I2V_PREFIX`, атрибут `Project.i2v_prefix`, `Project.update_settings`, `create_project`, `_OWNED_TOP_LEVEL_FIELDS`
 - Modify: `h3_48gb/cli.py` (`ERROR_CODES` += `scene_references_invalid`)
 - Test: `tests/test_sglang_scenes.py` (новый), `tests/test_sglang_gates.py` (новый), `tests/test_sglang_chat_tags.py` (новый)
 
@@ -2040,9 +2080,9 @@ git commit -m "feat(library): библиотека референсов с ве�
   - `assemble._scene_generate_args_sglang(scene: dict, *, keyframe: Path | None, chained: bool, ref2va: library.Ref2VAScene, track_piece: Path | None, scenes_dir: Path, i2v_prefix: str = "") -> tuple[list[str], str]`
   - `assemble._submit_next_scene_sglang(proj, scene, queue_root, *, submit, run) -> dict` (тот же словарь, что у `_submit_next_scene`: `action/idx/job_id/keyframe/latent/head_drop_frames`; `latent` всегда `None`)
   - `web._SGLANG_OVERLAP_FRAMES = 1`, `web._grid_frames_nearest(frames, *, remainder) -> int`, `web._snap_video_scenes_sglang(scenes) -> list[dict]`, `web._scene_reference_errors(proj, scenes, outdir) -> list[dict]`
-  - поле проекта `i2v_prefix` (необязательное, читается через `proj.as_dict().get("i2v_prefix")`, по умолчанию пусто)
+  - `project.DEFAULT_I2V_PREFIX = "The video begins exactly on the provided first frame and continues it seamlessly: same characters, setting, lighting and camera style."` — без метки `<Picture N>`: кейфрейм на sglang не нумеруется; поле проекта `i2v_prefix` (старые проекты без поля получают значение по умолчанию при чтении), `Project.update_settings(*, i2v_prefix: str) -> Project`; `PUT /api/projects/<id>/settings {"i2v_prefix": str}` → `{"ok": true, "project": <payload>}`
   - запрос `POST /api/chat/<id>/message` принимает `"tags": ["@alice", ...]`; блок `library.references_context` дописывается в конец system и сохраняется в сессии.
-- Решение: латентного хвоста нет, кейфрейм — основной путь; лимит `MAX_CONSECUTIVE_KEYFRAME_FALLBACKS` к sglang-пути не относится (отдельная функция его не вызывает); кейфрейм — **буквальный последний кадр** (`-sseof -1`, как `chain_beach.py`), а не `dur - 1.5 с`, потому что sglang повторяет его кадром 0 и сборка срезает ровно 1 кадр.
+- Решение: у **каждой** сцены, кроме сцен клипа (у них аудио-референс — кусок трека), должен быть хотя бы один `@`-тег: `task` всегда `ref2va` (спека §4.1.3, проба 07.10). Латентного хвоста нет, кейфрейм — основной путь; лимит `MAX_CONSECUTIVE_KEYFRAME_FALLBACKS` к sglang-пути не относится (отдельная функция его не вызывает); кейфрейм — **буквальный последний кадр** (`-sseof -1`, как `chain_beach.py`), а не `dur - 1.5 с`, потому что sglang повторяет его кадром 0 и сборка срезает ровно 1 кадр.
 
 - [ ] **Step 1: Падающие тесты сцен**
 
@@ -2131,7 +2171,8 @@ def test_a_fifth_chained_scene_is_submitted_with_keyframe_refs_and_one_frame_ove
                       "keyframe": str(keyframe), "latent": None, "head_drop_frames": 1}
     alice = str(out / "library" / "alice" / "v1" / "01-face.png")
     beach = str(out / "library" / "beach" / "v1" / "01-pano.png")
-    prompt = ("subject_definitions:\n"
+    prompt = ("The video begins exactly on the provided first frame and continues it seamlessly: same characters, setting, lighting and camera style.\n\n"
+              "subject_definitions:\n"
               "<Subject 1> is a young woman, appearance from <Picture 1>.\n"
               "<Subject 2> is a wide beach, appearance from <Picture 2>.\n\n"
               "<Subject 1> walks on <Subject 2>")
@@ -2142,7 +2183,7 @@ def test_a_fifth_chained_scene_is_submitted_with_keyframe_refs_and_one_frame_ove
                  "--image", str(keyframe), "--aspect", "auto", "--ref", alice, "--ref", beach],
         "note": assemble.scene_note(proj, 4),
         "report": {"output_stem": str(pdir / "scenes" / "h3-scene-4-ab12-896x512")},
-        "estimate": {"seconds": 345.0, "source": "table", "samples": 0},
+        "estimate": {"seconds": 2810.0, "source": "table", "samples": 0},
         "kind": q.KIND_GENERATE}]
     assert commands == [["ffmpeg", "-y", "-loglevel", "error", "-sseof", "-1", "-i",
                          str(pdir / "scenes" / "s3.mp4"), "-update", "1", "-q:v", "1",
@@ -2156,16 +2197,30 @@ def test_a_fifth_chained_scene_is_submitted_with_keyframe_refs_and_one_frame_ove
         ("ref2va", str(keyframe), (alice, beach), "auto", 175)
 
 
-def test_a_first_scene_without_tags_is_t2va_with_no_conditions(tmp_path, monkeypatch):
+def test_a_first_scene_with_a_tag_is_ref2va_with_references_and_no_keyframe(tmp_path, monkeypatch):
     monkeypatch.setattr(assemble.secrets, "token_hex", lambda n: "cd34")
+    ref = str(_png(tmp_path / "r.png"))
     args, stem = assemble._scene_generate_args_sglang(
+        {"idx": 0, "prompt": "@cat", "duration": 175 / 24}, keyframe=None, chained=False,
+        ref2va=lib.Ref2VAScene("body", (ref,), (), ("@cat",)), track_piece=None,
+        scenes_dir=tmp_path, i2v_prefix="never on a first scene")
+    assert args == ["generate", "body", "--width", "896", "--height", "512",
+                    "--duration", str(175 / 24), "--steps", "50", "--seed", "42",
+                    "--tag", "scene-0-cd34", "--outdir", str(tmp_path), "--task", "ref2va",
+                    "--ref", ref]
+    assert stem == str(tmp_path / "h3-scene-0-cd34-896x512")
+    assert sa.parse(args).task == "ref2va"
+
+
+def test_the_parser_refuses_a_real_first_scene_argv_without_references(tmp_path, monkeypatch):
+    monkeypatch.setattr(assemble.secrets, "token_hex", lambda n: "0001")
+    args, _ = assemble._scene_generate_args_sglang(
         {"idx": 0, "prompt": "a cat", "duration": 175 / 24}, keyframe=None, chained=False,
         ref2va=lib.Ref2VAScene("a cat", (), (), ()), track_piece=None, scenes_dir=tmp_path)
-    assert args == ["generate", "a cat", "--width", "896", "--height", "512",
-                    "--duration", str(175 / 24), "--steps", "50", "--seed", "42",
-                    "--tag", "scene-0-cd34", "--outdir", str(tmp_path), "--task", "t2va"]
-    assert stem == str(tmp_path / "h3-scene-0-cd34-896x512")
-    assert sa.parse(args).task == "t2va"
+    with pytest.raises(sa.SglangArgsError) as excinfo:
+        sa.parse(args)
+    assert (excinfo.value.code, excinfo.value.message) == \
+        ("ref2va_needs_reference", "нужен хотя бы один референс (@тег) в сцене")
 
 
 def test_i2v_prefix_is_prepended_only_to_a_chained_scene(tmp_path, monkeypatch):
@@ -2197,7 +2252,7 @@ def test_the_parser_refuses_a_real_chained_argv_without_references(tmp_path, mon
     with pytest.raises(sa.SglangArgsError) as excinfo:
         sa.parse(args)
     assert (excinfo.value.code, excinfo.value.message) == \
-        ("ref2va_needs_reference", "для цепочки нужен хотя бы один референс в сцене")
+        ("ref2va_needs_reference", "нужен хотя бы один референс (@тег) в сцене")
 
 
 def test_the_parser_refuses_the_real_mlx_argv(tmp_path):
@@ -2277,7 +2332,7 @@ def _scene_generate_args_sglang(scene: dict, *, keyframe, chained: bool, ref2va,
     if chained and i2v_prefix:
         prompt = f"{i2v_prefix}\n\n{prompt}"
     audios = list(ref2va.audios) + ([str(track_piece)] if track_piece is not None else [])
-    task = "ref2va" if (keyframe is not None or ref2va.images or audios) else "t2va"
+    task = "ref2va"   # the only task the ref2va server serves (spec §4.1.3)
     args = ["generate", prompt, "--width", str(width), "--height", str(height),
             "--duration", str(requested / ASSEMBLY_FPS),
             "--steps", str(sglang_args.DEFAULT_STEPS),
@@ -2322,7 +2377,7 @@ def _submit_next_scene_sglang(proj, scene: dict, queue_root, *, submit, run) -> 
         scenes_dir = proj.path.parent / "scenes"
         args, output_stem = _scene_generate_args_sglang(
             scene, keyframe=keyframe, chained=chained, ref2va=ref2va, track_piece=track_piece,
-            scenes_dir=scenes_dir, i2v_prefix=proj.as_dict().get("i2v_prefix") or "")
+            scenes_dir=scenes_dir, i2v_prefix=proj.i2v_prefix)
         width, height = DEFAULT_SCENE_CANVAS
         frames = round(scene["duration"] * ASSEMBLY_FPS) + (SGLANG_OVERLAP_FRAMES if chained else 0)
         estimate = sglang_estimate.estimate_seconds(outdir, width=width, height=height,
@@ -2393,7 +2448,7 @@ def _video(live, prompts, durations, fresh=()):
 
 
 def test_approving_the_script_snaps_durations_to_the_delivered_grid(live):
-    proj = _video(live, ["a cat", "@alice waves", "@alice runs"], [7.0, 7.0, 10.0], fresh=(2,))
+    proj = _video(live, ["@alice sits", "@alice waves", "@alice runs"], [7.0, 7.0, 10.0], fresh=(2,))
     status, body = _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})
     assert status == 200, body
     assert [s["duration"] for s in p.load_project(proj.path).scenes] == \
@@ -2402,18 +2457,32 @@ def test_approving_the_script_snaps_durations_to_the_delivered_grid(live):
     assert sa.parse(job.args, check_files=False).frames == 175
 
 
-def test_a_chained_scene_without_tags_is_refused_and_nothing_is_queued(live):
-    proj = _video(live, ["a cat", "a dog"], [7.0, 7.0])
+def test_every_scene_without_a_tag_is_refused_and_nothing_is_queued(live):
+    """spec §4.1.3: every scene needs a reference -- the first and a fresh_start one too, not
+    only a chained one."""
+    proj = _video(live, ["a cat", "@alice and a dog", "a bird"], [7.0, 7.0, 7.0], fresh=(2,))
     status, body = _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})
     assert status == 400
     assert body["error"]["code"] == "scene_references_invalid"
     assert body["error"]["detail"] == {"scenes": [
-        {"idx": 1, "code": "ref2va_needs_reference",
-         "message": "для цепочки нужен хотя бы один референс в сцене"}]}
+        {"idx": 0, "code": "ref2va_needs_reference",
+         "message": "нужен хотя бы один референс (@тег) в сцене"},
+        {"idx": 2, "code": "ref2va_needs_reference",
+         "message": "нужен хотя бы один референс (@тег) в сцене"}]}
     reloaded = p.load_project(proj.path)
     assert reloaded.stages["script"] == "awaiting_approval"
-    assert [s["duration"] for s in reloaded.scenes] == [7.0, 7.0]
+    assert [s["duration"] for s in reloaded.scenes] == [7.0, 7.0, 7.0]
     assert _pending(live) == []
+
+
+def test_settings_route_changes_the_i2v_prefix(live):
+    proj = _video(live, ["@alice"], [7.0])
+    assert p.load_project(proj.path).i2v_prefix == p.DEFAULT_I2V_PREFIX
+    status, body = _call(live, "PUT", f"/api/projects/{proj.id}/settings",
+                         {"i2v_prefix": "Continue the shot."})
+    assert status == 200, body
+    assert (body["project"]["i2v_prefix"], p.load_project(proj.path).i2v_prefix) == \
+        ("Continue the shot.", "Continue the shot.")
 
 
 def test_an_unknown_and_a_malformed_tag_are_named_per_scene(live):
@@ -2434,7 +2503,7 @@ def test_too_many_pictures_is_refused(live, monkeypatch):
 
 def test_on_mlx_nothing_is_snapped_or_checked(live, monkeypatch):
     monkeypatch.setenv("H3_ENGINE", "mlx")
-    proj = _video(live, ["a cat", "a dog"], [7.0, 7.0])
+    proj = _video(live, ["a cat", "a dog"], [7.0, 7.0])   # no tags: fine on mlx
     monkeypatch.setattr("h3_48gb.assemble.advance_project", lambda *a, **k: {"action": "stub"})
     status, body = _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})
     assert status == 200, body
@@ -2514,13 +2583,11 @@ def _snap_video_scenes_sglang(scenes: list[dict]) -> list[dict]:
 
 
 def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
-    """spec §3.5/§4.1.3, checked at the gate so nothing is queued that sglang would 400: every
-    @tag well-formed and pinned to the project, pictures within H3_MAX_REF_IMAGES, and a scene
-    that carries a keyframe (chained, or scene 0 with a start image) names at least one reference
-    -- ref2va refuses a lone keyframe. A clip scene is exempt from the last rule: its track piece
-    is an audio reference."""
+    """spec §3.5/§4.1.3, checked at the gate so nothing is queued that sglang would refuse: every
+    @tag well-formed and pinned to the project, pictures within H3_MAX_REF_IMAGES, and **every**
+    scene names at least one reference -- the server serves only ref2va. A clip scene is exempt
+    from the last rule: its track piece is an audio reference."""
     pinned = {ref["tag"]: ref for ref in proj.references}
-    has_start_image = bool(proj.as_dict().get("start_image"))
     errors: list[dict] = []
     for scene in scenes:
         idx = scene["idx"]
@@ -2542,10 +2609,9 @@ def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
             errors.append({"idx": idx, "code": "too_many_reference_images",
                            "message": f"картинок-референсов {images}, а можно не больше {limit}"})
             continue
-        keyframed = (idx > 0 and not scene.get("fresh_start", False)) or (idx == 0 and has_start_image)
-        if keyframed and not tags and proj.kind != "clip":
+        if not tags and proj.kind != "clip":
             errors.append({"idx": idx, "code": "ref2va_needs_reference",
-                           "message": "для цепочки нужен хотя бы один референс в сцене"})
+                           "message": "нужен хотя бы один референс (@тег) в сцене"})
     return errors
 ```
 Метод `_Handler`:
@@ -2573,6 +2639,38 @@ def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
 ```
 `cli.ERROR_CODES["scene_references_invalid"] = "one or more scenes name @tags or references sglang would refuse"`.
 
+`project.py`:
+```python
+#: spec §4.1.3: the prefix a chained scene's prompt gets on sglang. No `<Picture N>` label -- the
+#: server does not number the keyframe (presentation.py:230-270), so "<Picture 1>" would name the
+#: first reference picture instead.
+DEFAULT_I2V_PREFIX = ("The video begins exactly on the provided first frame and continues it "
+                      "seamlessly: same characters, setting, lighting and camera style.")
+```
+`_OWNED_TOP_LEVEL_FIELDS` += `"i2v_prefix"`; `_apply`: `self.i2v_prefix = data.get("i2v_prefix", DEFAULT_I2V_PREFIX)`; `as_dict`: `"i2v_prefix": self.i2v_prefix,`; `create_project`: `"i2v_prefix": DEFAULT_I2V_PREFIX,`.
+```python
+    def update_settings(self, *, i2v_prefix: str) -> "Project":
+        if not isinstance(i2v_prefix, str):
+            raise ProjectError("i2v_prefix must be a string")
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            data["i2v_prefix"] = i2v_prefix.strip()
+            write_json_durably(self.path, data)
+            self._apply(data)
+        return self
+```
+`web.py`, `_route_put` (до ветки `/scenario`): `if path.startswith("/api/projects/") and path.endswith("/settings"): return self._put_project_settings(path[len("/api/projects/"):-len("/settings")])`;
+```python
+    def _put_project_settings(self, raw_id: str) -> tuple[int, str, bytes]:
+        proj = self._load_project(raw_id)
+        payload = self._json_request(allowed=("i2v_prefix",))
+        if not isinstance(payload.get("i2v_prefix"), str):
+            raise CliError("args_invalid", "`i2v_prefix` must be a string", {})
+        proj.update_settings(i2v_prefix=payload["i2v_prefix"])
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "project": _project_payload(project_module.load_project(proj.path))})
+```
+
 Чат: `_chat_message` — `allowed=("text", "prompt", "provider", "duration", "image", "set_mode", "tags")`. В `_locked_turn` перед сборкой `system`:
 ```python
         raw_tags = payload.get("tags")
@@ -2597,13 +2695,13 @@ Expected: PASS.
 
 - [ ] **Step 9: Мутации**
 
-(а) Убрать в `_submit_next_scene` строку перехода на sglang → `test_a_fifth_chained_scene_...` FAIL (уйдёт в MLX-путь: `--turbo-strength`, keyframe по `dur-1.5`). (б) `SGLANG_OVERLAP_FRAMES = 0` → тот же тест FAIL (`head_drop_frames` 0, длительность 174/24 вне сетки → `AssembleError`). (в) В `_snap_video_scenes_sglang` взять `remainder = _H3_LATENTS_PER_CHUNK` для всех → `test_approving_the_script_snaps_...` FAIL `[175/24, 175/24, ...]`. (г) Убрать условие `keyframed and not tags` → `test_a_chained_scene_without_tags_is_refused...` FAIL `assert 200 == 400`. (д) В `_locked_turn` не сохранять `session["tags"]` (использовать только `payload`) → вторая половина `test_chat_tags_ride_the_system_message` FAIL. Ошибки — в отчёт.
+(а) Убрать в `_submit_next_scene` строку перехода на sglang → `test_a_fifth_chained_scene_...` FAIL (уйдёт в MLX-путь: `--turbo-strength`, keyframe по `dur-1.5`). (б) `SGLANG_OVERLAP_FRAMES = 0` → тот же тест FAIL (`head_drop_frames` 0, длительность 174/24 вне сетки → `AssembleError`). (в) В `_snap_video_scenes_sglang` взять `remainder = _H3_LATENTS_PER_CHUNK` для всех → `test_approving_the_script_snaps_...` FAIL `[175/24, 175/24, ...]`. (г) Убрать условие `if not tags and proj.kind != "clip"` → `test_every_scene_without_a_tag_is_refused...` FAIL `assert 200 == 400`; заменить его на старое «только сцепленные» (`idx > 0 and not fresh_start`) → тот же тест FAIL на `detail` (нет сцен 0 и 2). (д) В `_locked_turn` не сохранять `session["tags"]` (использовать только `payload`) → вторая половина `test_chat_tags_ride_the_system_message` FAIL. Ошибки — в отчёт.
 
 - [ ] **Step 10: Полный прогон и commit**
 
 ```bash
 env -u NODE_OPTIONS ~/venvs/h3-panel/bin/python -m pytest -q -p no:cacheprovider
-git add h3_48gb/assemble.py h3_48gb/web.py h3_48gb/cli.py tests/test_sglang_scenes.py tests/test_sglang_gates.py tests/test_sglang_chat_tags.py
+git add h3_48gb/assemble.py h3_48gb/web.py h3_48gb/cli.py h3_48gb/project.py tests/test_sglang_scenes.py tests/test_sglang_gates.py tests/test_sglang_chat_tags.py
 git commit -m "feat(sglang): цепочка сцен через последний кадр, снап на сетку, проверка @-тегов на гейтах, теги в чате"
 ```
 
@@ -2621,16 +2719,16 @@ git commit -m "feat(sglang): цепочка сцен через последни
 **Interfaces:**
 - Consumes: `sglang_args.parse/SglangSpec` (задача 3), `sglang_estimate.record` (задача 3), `_scene_generate_args_sglang` (задача 5), `library.build_ref2va` (задача 4), `engine.is_sglang()`.
 - Produces (`queue.py`):
-  - `Job.engine_ref: str | None = None`, `Job.wait_reason: str | None = None`, `Job.cancel_reason: str | None = None` (старые файлы без полей читаются по умолчаниям)
+  - `Job.engine_ref: str | None = None`, `Job.wait_reason: str | None = None`, `Job.cancel_reason: str | None = None`, `Job.engine_submitted_at: float | None = None` (старые файлы без полей читаются по умолчаниям)
   - `Reconciled.resumable: list[Job]` — задачи в `running` с `engine_ref` и свободной арендой; в `pending` они **не** возвращаются
-  - `class JobNotRunning(QueueError)`; `set_running_fields(root, job_id, **fields) -> Job` (только `engine_ref`, `wait_reason`); `request_cancel(root, job_id, reason: str) -> Job`; `cancel_reason(root, job_id) -> str | None`
+  - `class JobNotRunning(QueueError)`; `set_running_fields(root, job_id, **fields) -> Job` (только `engine_ref`, `engine_submitted_at`, `wait_reason`); `request_cancel(root, job_id, reason: str) -> Job`; `cancel_reason(root, job_id) -> str | None`
 - Produces (`h3_48gb/engines/sglang.py`):
   - `MODEL`, `DEFAULT_URL = "http://127.0.0.1:30020"`, `POLL_SECONDS = 20.0`, `LOST_RETRIES = 5`, `LOST_RETRY_SECONDS = 30.0`
   - `normalize_h3_uri(value)`, `normalize_h3_conditions(conditions)` — перенос из `h3-bench/video_paths.py`
   - `class SglangHTTPError(Exception)` (`.status`, `.detail`, `.body`), `class SglangUnavailable(Exception)`
   - `class SglangClient(base_url: str, timeout: float = 60.0)`: `create(payload) -> dict`, `get(video_id) -> dict`, `delete(video_id) -> None`, `download(video_id, dest: Path) -> None` (атомарно через `.part`, сверка `Content-Length`)
   - `build_payload(spec: SglangSpec) -> dict`
-  - `run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep, clock=time.monotonic) -> tuple[int, str]`; `gate(job) -> str | None` (None — карта готова; строка — причина отмены во время ожидания). Задача 8 передаёт настоящий `gate`.
+  - `run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep, clock=time.time) -> tuple[int, str]` (`wall_s` — от принятого POST, и после рестарта тоже: время POST хранится в задаче); `gate(job) -> str | None` (None — карта готова; строка — причина отмены во время ожидания). Задача 8 передаёт настоящий `gate`.
 - Produces (`worker.py`): `_run_sglang_generate_job(root, outdir, job, *, gate=None) -> tuple[int, str]`; `run_job` при `H3_ENGINE=sglang` исполняет generate в процессе; `main_loop` первым делом возобновляет `state.resumable` (даже на паузе — это уже начатая сцена).
 - Produces (`web.py`): `DELETE /api/jobs/<id>` для `running` при sglang → `200 {"ok": true, "cancelling": true, "job": {...}, "message": "H3 досчитает сцену впустую, следующая задача начнётся после"}`.
 
@@ -2773,12 +2871,6 @@ def _spec(tmp_path, *extra, duration=175 / 24, prompt="p"):
                      *extra])
 
 
-def test_payload_t2va_has_empty_conditions(tmp_path):
-    assert sg.build_payload(_spec(tmp_path)) == {
-        **COMMON, "prompt": "p", "task": "t2va", "conditions": [],
-        "target": {"short_edge": 512, "aspect_ratio": "16:9", "duration_seconds": 175 / 24}}
-
-
 def test_payload_first_scene_with_references(tmp_path):
     a, b = _png(tmp_path / "a.png"), _png(tmp_path / "b.png")
     assert sg.build_payload(_spec(tmp_path, "--ref", a, "--ref", b)) == {
@@ -2855,9 +2947,11 @@ def test_normalize_rewrites_only_known_legacy_roots():
 @pytest.fixture
 def queued(tmp_path):
     root = q.layout(tmp_path / "queue")["root"]
-    args = ["generate", "p", "--width", "896", "--height", "512", "--duration", str(175 / 24),
-            "--tag", "t", "--outdir", str(tmp_path / "scenes")]
     (tmp_path / "scenes").mkdir()
+    ref = tmp_path / "ref.png"
+    ref.write_bytes(b"\x89PNG\r\n\x1a\n")
+    args = ["generate", "p", "--width", "896", "--height", "512", "--duration", str(175 / 24),
+            "--tag", "t", "--outdir", str(tmp_path / "scenes"), "--ref", str(ref)]
     job = q.submit(root, args, "", {"output_stem": str(tmp_path / "scenes" / "h3-t-896x512")}, {})
     return root, q.claim(root)
 
@@ -2929,6 +3023,43 @@ def test_sglang_failed_is_failed_with_its_message(queued, tmp_path):
     finally:
         fake.close()
     assert (code, log) == (1, "sglang: id=vid-1\nsglang: сцена упала: CUDA out of memory\n")
+
+
+def test_one_poll_interval_is_twenty_one_second_slices(queued, tmp_path):
+    root, job = queued
+    fake = FakeSglang(statuses=("queued", "completed"))
+    sleeps = []
+    try:
+        _run(job, root, tmp_path, fake, sleep=sleeps.append)
+    finally:
+        fake.close()
+    assert sleeps == [1.0] * 20
+
+
+def test_one_lost_poll_waits_thirty_one_second_slices(queued, tmp_path):
+    root, job = queued
+    fake = FakeSglang(statuses=("completed",), drop_gets=1)
+    sleeps = []
+    try:
+        _run(job, root, tmp_path, fake, sleep=sleeps.append)
+    finally:
+        fake.close()
+    assert sleeps == [1.0] * 30
+
+
+def test_wall_time_after_a_resume_counts_from_the_original_post(queued, tmp_path):
+    root, job = queued
+    fake = FakeSglang(statuses=("completed",))
+    fake.ids.append("vid-7")                       # posted by the previous worker
+    q.set_running_fields(root, job.id, engine_ref="vid-7", engine_submitted_at=50.0)
+    resumed = [j for j in q.scan(root)[0] if j.id == job.id][0]
+    try:
+        code, log = _run(resumed, root, tmp_path, fake, clock=_Clock(130.0))
+    finally:
+        fake.close()
+    assert (code, log) == (0, "sglang: продолжаю опрос id=vid-7 после рестарта\n"
+                              "sglang: готово, 80.0 с\n")
+    assert (fake.posts, _report(resumed)["wall_s"]) == ([], 80.0)
 
 
 def test_two_dropped_polls_are_survived(queued, tmp_path):
@@ -3045,8 +3176,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(sg, "LOST_RETRY_SECONDS", 0.0)
     root = q.layout(tmp_path / "queue")["root"]
     (tmp_path / "scenes").mkdir()
+    ref = tmp_path / "ref.png"
+    ref.write_bytes(b"\x89PNG\r\n\x1a\n")
     args = ["generate", "p", "--width", "896", "--height", "512", "--duration", str(175 / 24),
-            "--tag", "t", "--outdir", str(tmp_path / "scenes")]
+            "--tag", "t", "--outdir", str(tmp_path / "scenes"), "--ref", str(ref)]
     q.submit(root, args, "", {"output_stem": str(tmp_path / "scenes" / "h3-t-896x512")}, {})
     return root, tmp_path
 
@@ -3157,6 +3290,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'h3_48gb.engines.sglang
     wait_reason: str | None = None
     #: Set by the page (`request_cancel`) on a running sglang job; the adapter stops waiting.
     cancel_reason: str | None = None
+    #: Wall-clock time of the accepted POST, so `wall_s` after a resume still counts from it.
+    engine_submitted_at: float | None = None
 ```
 `Reconciled`: после `conflicted: list[Broken]` — `resumable: list[Job] = field(default_factory=list)` (докстринг: «running jobs with an `engine_ref` and a free lease: a worker died while sglang was computing; the next worker resumes polling them instead of re-posting»). В `reconcile`: `resumable: list[Job] = []`, во всех `Reconciled(...)` добавить `resumable=resumable`; перед `changed.append(_return_to_pending_locked(root, job.id))`:
 ```python
@@ -3170,7 +3305,7 @@ class JobNotRunning(QueueError):
     """A running-only mutation was asked of a job that is not in `running/`."""
 
 
-RUNNING_FIELDS = ("engine_ref", "wait_reason")
+RUNNING_FIELDS = ("engine_ref", "engine_submitted_at", "wait_reason")
 
 
 def _mutate_running(root, job_id: str, fields: dict) -> Job:
@@ -3384,11 +3519,10 @@ def _write_report(job, report: dict) -> None:
 
 
 def run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep,
-                 clock=time.monotonic) -> tuple[int, str]:
+                 clock=time.time) -> tuple[int, str]:
     spec = sglang_args.parse(job.args, check_files=False)
     payload = build_payload(spec)
     log: list[str] = []
-    started = clock()
     video_id = job.engine_ref
 
     def done(code: int, line: str, report: dict | None = None) -> tuple[int, str]:
@@ -3403,6 +3537,7 @@ def run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep,
             if reason:
                 return done(1, f"sglang: {reason} — сцена не начиналась\n",
                             {"status": "cancelled", "id": None, "reason": reason})
+        started = clock()
         try:
             video_id = client.create(payload)["id"]
         except SglangHTTPError as exc:
@@ -3412,9 +3547,11 @@ def run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep,
         except SglangUnavailable as exc:
             return done(1, f"sglang: H3 недоступен при постановке: {exc}\n",
                         {"status": "unavailable", "id": None, "error": str(exc)})
-        q.set_running_fields(root, job.id, engine_ref=video_id, wait_reason=None)
+        q.set_running_fields(root, job.id, engine_ref=video_id, engine_submitted_at=started,
+                             wait_reason=None)
         log.append(f"sglang: id={video_id}\n")
     else:
+        started = job.engine_submitted_at if job.engine_submitted_at is not None else clock()
         log.append(f"sglang: продолжаю опрос id={video_id} после рестарта\n")
 
     misses = 0
@@ -3518,7 +3655,7 @@ Expected: PASS.
 
 - [ ] **Step 9: Мутации**
 
-(а) В `reconcile` убрать ветку `if job.engine_ref: resumable.append(job); continue` → `test_restart_between_post_and_completed_...` FAIL (`resumable == []`, задача ушла в pending, затем второй POST: `assert 2 == 1`). (б) В `run_generate` не вызывать `q.set_running_fields(... engine_ref=...)` → тот же тест FAIL. (в) В `build_payload` поставить keyframe после референсов → `test_payload_chained_scene_...` FAIL. (г) В `download` писать сразу в `dest` вместо `.part` → `test_download_is_atomic` FAIL (`.mp4` существует). (д) В `run_generate` при 404 считать промах вместо `lost` → `test_an_id_sglang_forgot_fails_as_lost` FAIL (в логе «H3 пропал»). (е) `LOST_RETRIES = 4` → `test_five_dropped_polls_mean_h3_is_gone` FAIL. Ошибки — в отчёт.
+(а) В `reconcile` убрать ветку `if job.engine_ref: resumable.append(job); continue` → `test_restart_between_post_and_completed_...` FAIL (`resumable == []`, задача ушла в pending, затем второй POST: `assert 2 == 1`). (б) В `run_generate` не вызывать `q.set_running_fields(... engine_ref=...)` → тот же тест FAIL. (в) В `build_payload` поставить keyframe после референсов → `test_payload_chained_scene_...` FAIL. (г) В `download` писать сразу в `dest` вместо `.part` → `test_download_is_atomic` FAIL (`.mp4` существует). (д) В `run_generate` при 404 считать промах вместо `lost` → `test_an_id_sglang_forgot_fails_as_lost` FAIL (в логе «H3 пропал»). (е) `LOST_RETRIES = 4` → `test_five_dropped_polls_mean_h3_is_gone` FAIL. (ж) `POLL_SECONDS = 10.0` → `test_one_poll_interval_is_twenty_one_second_slices` FAIL `[1.0]*10 != [1.0]*20`; `LOST_RETRY_SECONDS = 20.0` → `test_one_lost_poll_waits_thirty_one_second_slices` FAIL. (з) На возобновлении брать `started = clock()` → `test_wall_time_after_a_resume...` FAIL `'готово, 0.0 с'`. Ошибки — в отчёт.
 
 - [ ] **Step 10: Полный прогон и commit**
 
@@ -3538,14 +3675,16 @@ git commit -m "feat(sglang): адаптер в процессе воркера �
 
 **Interfaces:**
 - Produces (HTTP на `127.0.0.1:8790`, JSON):
-  - `GET /status` → `{"ok": true, "own": {name: {"pid", "variant", "started_at", "log", "ready"}}, "foreign": [{"pid", "name", "memory_mb"}], "qwen": {"running", "unloaded_by_us"}, "lock": {"held_by_us", "path"}, "gpu": {"temperature_c", "memory_used_mb", "memory_total_mb"}, "server_outputs_bytes"}`
+  - `GET /status` → `{"ok": true, "own": {name: {"pid", "variant", "started_at", "log", "ready"}}, "foreign": [{"pid", "name", "memory_mb", "first_seen"}], "qwen": {"running", "unloaded_by_us"}, "lock": {"held_by_us", "path"}, "gpu": {"temperature_c", "memory_used_mb", "memory_total_mb"}, "server_outputs_bytes"}`
   - `POST /acquire {"engine": "h3"|"ltx"}` → `{"ok": true, "state": "ready"|"starting"|"wait"|"wait_qwen"|"failed", "engine", "reason"?, "foreign"?, "log"?}`; неизвестный движок → `400 {"ok": false, "error": {"code": "unknown_engine", ...}}`
   - `POST /release` → `{"ok": true, "stopped": [names]}`
   - `POST /qwen/unload` → `{"ok", "was_running", "exit_code"?}`
   - `POST /qwen/restore` → `{"ok": true, "state": "starting"}` или `409 {"ok": false, "error": {"code": "qwen_was_not_running", "message": "Qwen не был запущен до выгрузки"}}`
 - Produces (Python, для тестов): `parse_compute_apps(text) -> list[dict]`, `parse_gpu_stats(text) -> dict`, `EngineSpec`, `engine_specs() -> dict[str, EngineSpec]`, `GenerationLock(path)`, `Host`, `Dispatcher(*, host, specs, state_path, lock_path, server_outputs)`, `make_server(dispatcher, host="127.0.0.1", port=8790)`.
 - Команды запуска — как `h3-bench/pipeline.sh` (`h3_start`: `VARIANT=ref2va TE=<...nvfp4_awq...> ./serve.sh`; `comfy_start`: `.venv/bin/python main.py --port 8188 --output-directory $COMFY_OUTPUT_DIR --listen 127.0.0.1 --fast-disk --disable-auto-launch` из `ComfyUI/`). Остановка — **не** `pkill -f` (убил бы чужой ComfyUI/H3), а SIGTERM группе своего процесса, 120 с, SIGKILL группе.
-- Владение: pid и pgid в `state.json`; «своё» = запись есть и `/proc/<pid>/cmdline` содержит маркер движка (`serve.sh`/`sglang serve` для H3, `main.py --port 8188` для ComfyUI) — переиспользованный pid чужим процессом своим не считается.
+- Владение: pid и pgid в `state.json`; «своё» = pid из `state.json` **и** `/proc/<pid>/cmdline` содержит **все** маркеры движка: для H3 — `sglang`, ` serve `, `--model-variant ref2va`, `--port 30020` (`serve.sh:12` делает `exec sglang serve …`, поэтому pid из `Popen` и есть sglang; заодно это проверка варианта), для ComfyUI — `main.py`, `--port 8188`. Переиспользованный pid и чужой H3 с другим вариантом своими не считаются.
+- Блокировки: длинные операции (acquire/release/Qwen, ожидание до 120 с, `qwen.sh stop`) идут под `_ops`; `self.state` защищён коротким `_state`, который не держится во время kill/sleep/подпроцесса; `/status` берёт только `_state` и отвечает во время освобождения.
+- Чужие процессы: диспетчер помнит, когда впервые увидел каждый чужой pid (`first_seen`, в памяти), и отдаёт это в `foreign` — плашка показывает «уже N мин».
 - `generation.lock`: `flock(LOCK_EX|LOCK_NB)`; fd передаётся порождённому движку (`pass_fds`), поэтому замок живёт, пока жив свой движок, даже если диспетчер перезапустили; снимается ядром со смертью держателя.
 
 - [ ] **Step 1: Падающие тесты**
@@ -3572,6 +3711,7 @@ ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("gpu_dispatcher",
                                                ROOT / "tools" / "gpu-dispatcher" / "dispatcher.py")
 gd = importlib.util.module_from_spec(_spec)
+sys.modules["gpu_dispatcher"] = gd   # dataclasses resolve annotations through sys.modules
 _spec.loader.exec_module(gd)
 
 H3_READY = "http://127.0.0.1:30020/v1/models"
@@ -3586,6 +3726,8 @@ class FakeHost:
         self.next_pid = 4242
         self.die_on_term = True
         self.stats = {"temperature_c": 44, "memory_used_mb": 15, "memory_total_mb": 65536}
+        self.exec_cmdlines = {"h3": "/home/alex/Projects/h3-lab/.venv312/bin/python3 /home/alex/Projects/h3-lab/.venv312/bin/sglang serve --model-type diffusion --model-path /home/alex/Models/Video/MiniMax-H3/model-package --model-id minimax-h3 --model-variant ref2va --num-gpus 1 --host 127.0.0.1 --port 30020",
+                              "ltx": "/home/alex/Projects/comfy/.venv/bin/python main.py --port 8188 --output-directory /home/alex/Outputs/comfy/output --listen 127.0.0.1"}
 
     def gpu_apps(self):
         return [dict(app) for app in self.apps]
@@ -3601,7 +3743,8 @@ class FakeHost:
         self.next_pid += 1
         self.spawned.append((spec.name, tuple(spec.cmd), str(spec.cwd), dict(spec.env),
                              str(log_path), len(pass_fds)))
-        self.cmdlines[pid] = " ".join(spec.cmd)
+        # serve.sh execs sglang: by the time anyone looks, the pid's cmdline is sglang's own
+        self.cmdlines[pid] = self.exec_cmdlines[spec.name]
         self.pgids[pid] = pid
         self.alive_groups.add(pid)
         return pid, pid
@@ -3698,8 +3841,51 @@ def test_a_foreign_gpu_process_means_wait_and_is_named(tmp_path, host):
     answer = _dispatcher(tmp_path, host).acquire("ltx")
     assert answer == {"ok": True, "state": "wait", "engine": "ltx",
                       "reason": "GPU занята: comfy-python (pid 777, 30000 МБ)",
-                      "foreign": [{"pid": 777, "name": "comfy-python", "memory_mb": 30000}]}
+                      "foreign": [{"pid": 777, "name": "comfy-python", "memory_mb": 30000,
+                                   "first_seen": 1000.0}]}
     assert (host.spawned, host.killed) == ([], [])
+
+
+def test_first_seen_of_a_foreign_process_is_kept_across_calls(tmp_path, host):
+    host.apps = [{"pid": 777, "name": "comfy-python", "memory_mb": 30000}]
+    host.pgids[777] = 777
+    d = _dispatcher(tmp_path, host)
+    d.acquire("ltx")
+    host.t += 600
+    assert d.status()["foreign"] == [{"pid": 777, "name": "comfy-python", "memory_mb": 30000,
+                                      "first_seen": 1000.0}]
+
+
+def test_an_h3_with_another_variant_at_our_pid_is_not_ours(tmp_path, host):
+    _dispatcher(tmp_path, host).acquire("h3")
+    host.cmdlines[4242] = host.exec_cmdlines["h3"].replace("ref2va", "fl2va")
+    reborn = _dispatcher(tmp_path, host)
+    assert reborn.release() == {"ok": True, "stopped": []}
+    assert host.killed == []
+
+
+def test_status_answers_while_a_release_is_waiting_for_a_group_to_die(tmp_path, host):
+    import time as _time
+    d = _dispatcher(tmp_path, host)
+    d.acquire("h3")
+    entered, finish = threading.Event(), threading.Event()
+    real_kill = host.killpg
+
+    def slow_kill(pgid, sig):
+        entered.set()
+        finish.wait(5)
+        real_kill(pgid, sig)
+
+    host.killpg = slow_kill
+    worker = threading.Thread(target=d.release)
+    worker.start()
+    assert entered.wait(5)
+    started = _time.monotonic()
+    status = d.status()
+    assert _time.monotonic() - started < 1.0
+    assert status["own"]["h3"]["pid"] == 4242
+    finish.set()
+    worker.join(5)
 
 
 def test_a_foreign_h3_on_its_port_is_not_ours(tmp_path, host):
@@ -3925,7 +4111,8 @@ def engine_specs() -> dict[str, EngineSpec]:
             name="h3", cmd=("bash", str(H3_BENCH / "serve.sh")), cwd=H3_BENCH,
             env={"VARIANT": "ref2va", "TE": str(te)},
             ready_url="http://127.0.0.1:30020/v1/models", port=30020,
-            markers=("serve.sh", "sglang serve"), log_dir=H3_BENCH / "logs",
+            markers=("sglang", " serve ", "--model-variant ref2va", "--port 30020"),
+            log_dir=H3_BENCH / "logs",
             log_prefix="serve-panel", start_timeout=450.0, variant="ref2va", label="H3"),
         "ltx": EngineSpec(
             name="ltx",
@@ -3933,7 +4120,7 @@ def engine_specs() -> dict[str, EngineSpec]:
                  "--output-directory", str(OUTPUTS / "comfy/output"), "--listen", "127.0.0.1",
                  "--fast-disk", "--disable-auto-launch"),
             cwd=COMFY / "ComfyUI", ready_url="http://127.0.0.1:8188/system_stats", port=8188,
-            markers=("main.py --port 8188",), log_dir=COMFY / "logs", log_prefix="comfy-panel",
+            markers=("main.py", "--port 8188"), log_dir=COMFY / "logs", log_prefix="comfy-panel",
             start_timeout=600.0, label="ComfyUI"),
     }
 
@@ -4060,6 +4247,11 @@ class Host:
 
 
 class Dispatcher:
+    """Two locks, on purpose (review): `_ops` serialises the long operations -- acquire, release,
+    Qwen -- which may sleep up to 120 s while a group dies or wait on `qwen.sh stop`; `_state`
+    guards only reads and writes of `self.state` and is never held across a kill, a sleep or a
+    subprocess. `/status` takes `_state` alone, so it answers while a release is in progress."""
+
     def __init__(self, *, host, specs: dict, state_path: Path, lock_path: Path,
                  server_outputs: Path):
         self.host = host
@@ -4067,7 +4259,9 @@ class Dispatcher:
         self.state_path = Path(state_path)
         self.lock = GenerationLock(lock_path)
         self.server_outputs = Path(server_outputs)
-        self._mutex = threading.Lock()
+        self._ops = threading.Lock()
+        self._state = threading.Lock()
+        self._first_seen: dict[int, float] = {}
         self.state = self._load_state()
 
     # -- state ------------------------------------------------------------------------------
@@ -4086,87 +4280,96 @@ class Dispatcher:
         tmp.write_text(json.dumps(self.state, indent=1), encoding="utf-8")
         os.replace(tmp, self.state_path)
 
+    def _snapshot(self) -> dict:
+        with self._state:
+            return json.loads(json.dumps(self.state))
+
+    def _update(self, mutate) -> None:
+        with self._state:
+            mutate(self.state)
+            self._save_state()
+
     def _alive(self, name: str, record: dict) -> bool:
+        """Ours = the pid recorded in state.json AND its /proc cmdline carries every marker of
+        the engine. serve.sh `exec`s `sglang serve ...` (serve.sh:12), so the pid Popen returned
+        *is* sglang; requiring `--model-variant ref2va --port 30020` also proves the variant."""
         command = self.host.cmdline(record["pid"])
-        return bool(command) and any(marker in command for marker in self.specs[name].markers)
+        return bool(command) and all(marker in command for marker in self.specs[name].markers)
 
-    def _own(self, name: str) -> dict | None:
-        record = self.state["engines"].get(name)
-        if record and self._alive(name, record):
-            return record
-        return None
+    def _own_records(self, state: dict) -> dict:
+        return {name: record for name, record in state["engines"].items()
+                if self._alive(name, record)}
 
-    def _own_pgids(self) -> set[int]:
-        return {rec["pgid"] for name, rec in self.state["engines"].items() if self._own(name)}
+    def _foreign(self, own: dict) -> list[dict]:
+        own_pgids = {record["pgid"] for record in own.values()}
+        foreign = [app for app in self.host.gpu_apps()
+                   if self.host.pgid_of(app["pid"]) not in own_pgids]
+        now = self.host.wall()
+        seen = {app["pid"] for app in foreign}
+        for pid in list(self._first_seen):
+            if pid not in seen:
+                del self._first_seen[pid]
+        return [{**app, "first_seen": self._first_seen.setdefault(app["pid"], now)}
+                for app in foreign]
 
-    def _foreign(self) -> list[dict]:
-        own = self._own_pgids()
-        return [app for app in self.host.gpu_apps() if self.host.pgid_of(app["pid"]) not in own]
+    def _stop(self, name: str, record: dict) -> None:
+        """Called with `_ops` held and `_state` free: kill our group, wait, then forget it."""
+        if self._alive(name, record):
+            pgid = record["pgid"]
+            self.host.killpg(pgid, signal.SIGTERM)
+            deadline = self.host.monotonic() + STOP_GRACE_SECONDS
+            while self.host.group_alive(pgid) and self.host.monotonic() < deadline:
+                self.host.sleep(1.0)
+            if self.host.group_alive(pgid):
+                self.host.killpg(pgid, signal.SIGKILL)
+        self._update(lambda state: state["engines"].pop(name, None))
 
-    def _stop(self, name: str) -> None:
-        record = self.state["engines"].pop(name, None)
-        self._save_state()
-        if not record or not self._alive_record(name, record):
-            return
-        pgid = record["pgid"]
-        self.host.killpg(pgid, signal.SIGTERM)
-        deadline = self.host.monotonic() + STOP_GRACE_SECONDS
-        while self.host.group_alive(pgid) and self.host.monotonic() < deadline:
-            self.host.sleep(1.0)
-        if self.host.group_alive(pgid):
-            self.host.killpg(pgid, signal.SIGKILL)
-
-    def _alive_record(self, name: str, record: dict) -> bool:
-        return self._alive(name, record)
-
-    def _release_locked(self) -> list[str]:
-        stopped = [name for name in list(self.state["engines"]) if self._own(name)]
-        for name in list(self.state["engines"]):
-            self._stop(name)
+    def _release_all(self) -> list[str]:
+        state = self._snapshot()
+        stopped = sorted(self._own_records(state))
+        for name, record in state["engines"].items():
+            self._stop(name, record)
         self.lock.release()
         return stopped
 
     # -- handles ----------------------------------------------------------------------------
     def status(self) -> dict:
-        with self._mutex:
-            own = {}
-            for name, spec in self.specs.items():
-                record = self._own(name)
-                if record:
-                    own[name] = {"pid": record["pid"], "variant": record.get("variant"),
-                                 "started_at": record["started_at"], "log": record["log"],
-                                 "ready": self.host.url_ok(spec.ready_url)}
-            return {"ok": True, "own": own, "foreign": self._foreign(),
-                    "qwen": {"running": self.host.url_ok(QWEN_HEALTH),
-                             "unloaded_by_us": bool(self.state["qwen_was_running"])},
-                    "lock": {"held_by_us": bool(own) or self.lock.held,
-                             "path": str(self.lock.path)},
-                    "gpu": self.host.gpu_stats(),
-                    "server_outputs_bytes": self.host.dir_size(self.server_outputs)}
+        state = self._snapshot()
+        own = {}
+        for name, record in self._own_records(state).items():
+            own[name] = {"pid": record["pid"], "variant": record.get("variant"),
+                         "started_at": record["started_at"], "log": record["log"],
+                         "ready": self.host.url_ok(self.specs[name].ready_url)}
+        return {"ok": True, "own": own, "foreign": self._foreign(self._own_records(state)),
+                "qwen": {"running": self.host.url_ok(QWEN_HEALTH),
+                         "unloaded_by_us": bool(state["qwen_was_running"])},
+                "lock": {"held_by_us": bool(own) or self.lock.held, "path": str(self.lock.path)},
+                "gpu": self.host.gpu_stats(),
+                "server_outputs_bytes": self.host.dir_size(self.server_outputs)}
 
     def acquire(self, engine: str) -> dict:
-        with self._mutex:
+        with self._ops:
             spec = self.specs[engine]
-            record = self.state["engines"].get(engine)
+            state = self._snapshot()
+            record = state["engines"].get(engine)
             if record and not self._alive(engine, record):
-                self.state["engines"].pop(engine)
-                self._save_state()
+                self._update(lambda st: st["engines"].pop(engine, None))
                 if not record.get("ready"):
                     return {"ok": True, "state": "failed", "engine": engine, "log": record["log"],
                             "reason": "движок не поднялся, смотрите лог"}
                 record = None
             if record:
                 if self.host.url_ok(spec.ready_url):
-                    record["ready"] = True
-                    self._save_state()
+                    self._update(lambda st: st["engines"][engine].__setitem__("ready", True))
                     return {"ok": True, "state": "ready", "engine": engine}
                 if self.host.wall() - record["started_at"] > spec.start_timeout:
-                    self._stop(engine)
+                    self._stop(engine, record)
                     return {"ok": True, "state": "failed", "engine": engine, "log": record["log"],
                             "reason": f"движок не поднялся за {spec.start_timeout:g} с, "
                                       f"смотрите лог"}
                 return {"ok": True, "state": "starting", "engine": engine, "log": record["log"]}
-            foreign = self._foreign()
+            own = self._own_records(state)
+            foreign = self._foreign(own)
             if self.host.url_ok(QWEN_HEALTH):
                 return {"ok": True, "state": "wait_qwen", "engine": engine,
                         "reason": "Qwen держит карту", "foreign": foreign}
@@ -4178,43 +4381,40 @@ class Dispatcher:
             if self.host.url_ok(spec.ready_url):
                 return {"ok": True, "state": "wait", "engine": engine,
                         "reason": f"чужой {spec.label} на :{spec.port}", "foreign": []}
-            for other in self.specs:
-                if other != engine and self._own(other):
-                    self._stop(other)
+            for other, other_record in own.items():
+                if other != engine:
+                    self._stop(other, other_record)
             if not self.lock.try_acquire():
                 return {"ok": True, "state": "wait", "engine": engine,
                         "reason": "generation.lock занят", "foreign": []}
             stamp = datetime.fromtimestamp(self.host.wall()).strftime("%Y%m%d-%H%M%S")
             log_path = spec.log_dir / f"{spec.log_prefix}-{stamp}.log"
             pid, pgid = self.host.spawn(spec, log_path, pass_fds=(self.lock.fd,))
-            self.state["engines"][engine] = {"pid": pid, "pgid": pgid, "variant": spec.variant,
-                                             "started_at": self.host.wall(),
-                                             "log": str(log_path), "ready": False}
-            self._save_state()
+            new = {"pid": pid, "pgid": pgid, "variant": spec.variant,
+                   "started_at": self.host.wall(), "log": str(log_path), "ready": False}
+            self._update(lambda st: st["engines"].__setitem__(engine, new))
             return {"ok": True, "state": "starting", "engine": engine, "log": str(log_path)}
 
     def release(self) -> dict:
-        with self._mutex:
-            return {"ok": True, "stopped": self._release_locked()}
+        with self._ops:
+            return {"ok": True, "stopped": self._release_all()}
 
     def qwen_unload(self) -> tuple[int, dict]:
-        with self._mutex:
+        with self._ops:
             if not self.host.url_ok(QWEN_HEALTH):
                 return 200, {"ok": True, "was_running": False}
-            self.state["qwen_was_running"] = True
-            self._save_state()
+            self._update(lambda st: st.__setitem__("qwen_was_running", True))
             code = self.host.run_qwen("stop")
             return 200, {"ok": code == 0, "was_running": True, "exit_code": code}
 
     def qwen_restore(self) -> tuple[int, dict]:
-        with self._mutex:
-            if not self.state["qwen_was_running"]:
+        with self._ops:
+            if not self._snapshot()["qwen_was_running"]:
                 return 409, {"ok": False, "error": {"code": "qwen_was_not_running",
                                                     "message": "Qwen не был запущен до выгрузки"}}
-            self._release_locked()
+            self._release_all()
             self.host.start_qwen()
-            self.state["qwen_was_running"] = False
-            self._save_state()
+            self._update(lambda st: st.__setitem__("qwen_was_running", False))
             return 200, {"ok": True, "state": "starting"}
 
 
@@ -4319,17 +4519,12 @@ Expected: PASS.
 
 - [ ] **Step 5: Мутации**
 
-(а) В `_foreign` убрать фильтр по своим pgid (`return self.host.gpu_apps()`) → `test_acquiring_ltx_stops_our_h3_first` FAIL (свой H3 сочтён чужим → `wait`). (б) В `_alive` вернуть `True` без проверки маркера → `test_a_reused_pid_is_not_ours_and_is_never_killed` FAIL (`killed == [(4242, SIGTERM)]`). (в) В `_release_locked` гасить `host.gpu_apps()` целиком → `test_release_kills_only_our_exact_group` FAIL (в `killed` появляется 777). (г) Убрать `pass_fds=(self.lock.fd,)` → `test_acquire_on_a_free_card_...` FAIL (`0 == 1`). (д) Убрать проверку `qwen_was_running` в `qwen_restore` → `test_qwen_unload_and_restore_only_on_request` FAIL. (е) Перенести `if not self.lock.try_acquire()` выше цикла остановки своих движков → `test_after_a_restart_switching_engines_frees_the_inherited_lock_first` (ниже) FAIL `'wait' == 'starting'`. Ошибки — в отчёт.
+(а) В `_foreign` убрать фильтр по своим pgid (`return self.host.gpu_apps()`) → `test_acquiring_ltx_stops_our_h3_first` FAIL (свой H3 сочтён чужим → `wait`). (б) В `_alive` вернуть `True` без проверки маркера → `test_a_reused_pid_is_not_ours_and_is_never_killed` FAIL (`killed == [(4242, SIGTERM)]`); заменить `all(...)` на `any(...)` → `test_an_h3_with_another_variant_at_our_pid_is_not_ours` FAIL. (б2) В `_stop` обернуть kill/ожидание в `with self._state:` → `test_status_answers_while_a_release_...` FAIL (`status()` ждёт `_state` дольше 1 с). (в) В `_release_all` гасить `host.gpu_apps()` целиком → `test_release_kills_only_our_exact_group` FAIL (в `killed` появляется 777). (г) Убрать `pass_fds=(self.lock.fd,)` → `test_acquire_on_a_free_card_...` FAIL (`0 == 1`). (д) Убрать проверку `qwen_was_running` в `qwen_restore` → `test_qwen_unload_and_restore_only_on_request` FAIL. (е) Перенести `if not self.lock.try_acquire()` выше цикла остановки своих движков → `test_after_a_restart_switching_engines_frees_the_inherited_lock_first` (ниже) FAIL `'wait' == 'starting'`. Ошибки — в отчёт.
 
 Тест к мутации (е) — дописать в `tests/test_gpu_dispatcher.py` на шаге 1:
 ```python
-_HOLD = ("import fcntl, os, sys
-fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)
-"
-         "fcntl.flock(fd, fcntl.LOCK_EX)
-print('held', flush=True)
-sys.stdin.readline()
-")
+_HOLD = ("import fcntl, os, sys\nfd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)\n"
+         "fcntl.flock(fd, fcntl.LOCK_EX)\nprint('held', flush=True)\nsys.stdin.readline()\n")
 
 
 def test_after_a_restart_switching_engines_frees_the_inherited_lock_first(tmp_path, host):
@@ -4389,7 +4584,8 @@ git commit -m "feat(dispatcher): gpu-dispatcher — свои движки по p
   - `class worker._IdleRelease(minutes: float, client, clock=time.monotonic)` с `tick(root) -> None`
   - `q.has_active_jobs(root) -> bool`
   - Web: `GET /api/gpu` → `{"ok", "dispatcher": <status|null>, "dispatcher_error": <str|null>, "queue": {"pending": int, "paused": bool, "running": {"id", "kind", "note", "started_at", "wait_reason"} | null}}`; `POST /api/gpu/release {"confirm"?: bool}`; `POST /api/qwen/unload`; `POST /api/qwen/restore`
-  - коды `engine_not_sglang` (409), `dispatcher_unavailable` (502), `release_needs_confirm` (409), `qwen_was_not_running` (409)
+  - коды `engine_not_sglang` (409), `dispatcher_unavailable` (502), `release_needs_confirm` (409), `qwen_was_not_running` (409), `queue_busy` (409)
+  - «Освободить карту»: подтверждение и отмена — только для `generate`/`upscale`; если в работе сборка (ffmpeg, не GPU) — движки освобождаются сразу, сборка не трогается. «Вернуть Qwen» — только при пустой очереди.
 
 - [ ] **Step 1: Фейковый диспетчер**
 
@@ -4489,8 +4685,10 @@ def running(tmp_path, monkeypatch):
     monkeypatch.setenv("H3_ENGINE", "sglang")
     root = q.layout(tmp_path / "queue")["root"]
     (tmp_path / "scenes").mkdir()
+    ref = tmp_path / "ref.png"
+    ref.write_bytes(b"\x89PNG\r\n\x1a\n")
     args = ["generate", "p", "--width", "896", "--height", "512", "--duration", str(175 / 24),
-            "--tag", "t", "--outdir", str(tmp_path / "scenes")]
+            "--tag", "t", "--outdir", str(tmp_path / "scenes"), "--ref", str(ref)]
     q.submit(root, args, "", {"output_stem": str(tmp_path / "scenes" / "h3-t-896x512")}, {})
     return root, q.claim(root), tmp_path
 
@@ -4522,6 +4720,22 @@ def test_gate_waits_for_foreign_then_qwen_then_returns_ready(running):
                     "ждём GPU: поднимается h3"]
     assert [j for j in q.scan(root)[0] if j.id == job.id][0].wait_reason is None
     assert [c[2] for c in fake.calls if c[1] == "/acquire"] == [{"engine": "h3"}] * 4
+
+
+def test_retry_intervals_are_thirty_and_five_seconds(running):
+    root, job, _ = running
+    fake = FakeDispatcher(acquire=(
+        {"ok": True, "state": "wait", "engine": "h3", "reason": "x"},
+        {"ok": True, "state": "starting", "engine": "h3", "log": "/l"},
+        {"ok": True, "state": "ready", "engine": "h3"}))
+    sleeps = []
+    try:
+        gate = worker.make_gpu_gate(root, "h3", client=dc.DispatcherClient(fake.url),
+                                    sleep=sleeps.append)
+        assert gate(job) is None
+    finally:
+        fake.close()
+    assert sleeps == [1.0] * 30 + [1.0] * 5
 
 
 def test_a_hot_card_is_waited_down_to_72(running):
@@ -4764,6 +4978,27 @@ def test_confirmed_release_while_rendering_cancels_pauses_and_leaves_release_to_
     assert (status, body) == (200, {"ok": True, "paused": True, "releasing": True, "job": job.id})
     assert q.cancel_reason(root, job.id) == "released_by_user"
     assert q.is_paused(root) is True
+    assert disp.calls == []
+
+
+def test_release_during_an_assembly_frees_the_card_now_and_leaves_the_assembly(setup):
+    live, disp, root, tmp_path = setup
+    q.submit(root, ["assemble", "--project", str(tmp_path / "p" / "project.json")], "assemble P",
+             {"output_stem": str(tmp_path / "p" / "job-final")}, {}, kind=q.KIND_ASSEMBLE)
+    job = q.claim(root)
+    status, body = _call(live, "POST", "/api/gpu/release", {})
+    assert (status, body) == (200, {"ok": True, "paused": True, "releasing": False,
+                                    "released": ["h3"]})
+    assert q.cancel_reason(root, job.id) is None
+    assert [c[1] for c in disp.calls] == ["/release"]
+
+
+def test_qwen_restore_is_refused_while_the_queue_is_busy(setup):
+    live, disp, root, tmp_path = setup
+    _queue_running(root, tmp_path)
+    status, body = _call(live, "POST", "/api/qwen/restore", {})
+    assert (status, body["error"]["code"], body["error"]["message"]) == \
+        (409, "queue_busy", "вернуть Qwen можно после очереди: в ней ещё есть задачи")
     assert disp.calls == []
 
 
@@ -5032,7 +5267,8 @@ def _run_sglang_generate_job(root, outdir, job, *, gate=None) -> tuple[int, str]
         payload = self._json_request(allowed=("confirm",))
         root = self.server.queue_root
         running, _pending = self._running_job()
-        if running is not None:
+        if running is not None and running.kind in (q.KIND_GENERATE, "upscale"):
+            # only GPU work is cancelled; an assembly (ffmpeg, no GPU) keeps running
             if payload.get("confirm") is not True:
                 raise CliError("release_needs_confirm",
                                f"H3 считает {running.note or running.id} — освободить карту? "
@@ -5068,14 +5304,21 @@ def _run_sglang_generate_job(root, outdir, job, *, gate=None) -> tuple[int, str]
         return self._qwen_call("qwen_unload")
 
     def _qwen_restore(self):
+        # spec §2: «вернуть Qwen» is offered *after* the queue -- never under a running scene
+        running, pending = self._running_job()
+        if running is not None or pending:
+            raise CliError("queue_busy", "вернуть Qwen можно после очереди: в ней ещё есть задачи",
+                           {"running": running.id if running else None, "pending": pending})
         return self._qwen_call("qwen_restore")
 ```
-`ERROR_STATUS`: `"engine_not_sglang": 409, "dispatcher_unavailable": 502, "release_needs_confirm": 409, "qwen_was_not_running": 409`. `cli.ERROR_CODES`:
+(`"upscale"` — литерал до задачи 10, где появится `q.KIND_UPSCALE`; в задаче 10 заменить на константу.)
+`ERROR_STATUS`: `"engine_not_sglang": 409, "dispatcher_unavailable": 502, "release_needs_confirm": 409, "qwen_was_not_running": 409, "queue_busy": 409`. `cli.ERROR_CODES`:
 ```python
     "engine_not_sglang": "a GPU/Qwen route was called on a panel whose engine is not sglang",
     "dispatcher_unavailable": "the host gpu-dispatcher did not answer",
     "release_needs_confirm": "«Освободить карту» while a scene renders needs an explicit confirm",
     "qwen_was_not_running": "«вернуть Qwen» was asked, but Qwen was not running before the panel unloaded it",
+    "queue_busy": "«вернуть Qwen» was asked while the panel's queue still holds jobs",
 ```
 
 - [ ] **Step 8: Зелёный**
@@ -5085,7 +5328,7 @@ Expected: PASS. Тесты задачи 6, которые вызывают `work
 
 - [ ] **Step 9: Мутации**
 
-(а) В gate убрать ветку `if state == "ready"` температурной проверки (сразу `return None`) → `test_a_hot_card_is_waited_down_to_72` FAIL `[] == ['остываем, 81 °C', ...]`. (б) `COOL_C = 80` → тот же тест FAIL. (в) В `_IdleRelease.tick` не сбрасывать `since` при активных задачах → `test_idle_countdown_restarts_while_anything_is_queued` FAIL (`1 == 0`). (г) В `_gpu_release` убрать проверку `confirm` → `test_release_while_rendering_needs_confirmation` FAIL. (д) В `_run_sglang_generate_job` убрать освобождение по `released_by_user` → `test_released_by_user_releases_the_card...` FAIL `['/acquire'] == ['/acquire', '/release']`. (е) В `main_loop` создавать `_IdleRelease` и на mlx → `test_main_loop_never_talks_to_a_dispatcher_on_mlx` FAIL. Ошибки — в отчёт.
+(а) В gate убрать ветку `if state == "ready"` температурной проверки (сразу `return None`) → `test_a_hot_card_is_waited_down_to_72` FAIL `[] == ['остываем, 81 °C', ...]`. (б) `COOL_C = 80` → тот же тест FAIL. (в) В `_IdleRelease.tick` не сбрасывать `since` при активных задачах → `test_idle_countdown_restarts_while_anything_is_queued` FAIL (`1 == 0`). (г) В `_gpu_release` убрать проверку `confirm` → `test_release_while_rendering_needs_confirmation` FAIL. (д) В `_run_sglang_generate_job` убрать освобождение по `released_by_user` → `test_released_by_user_releases_the_card...` FAIL `['/acquire'] == ['/acquire', '/release']`. (е) В `main_loop` создавать `_IdleRelease` и на mlx → `test_main_loop_never_talks_to_a_dispatcher_on_mlx` FAIL. (ж) `ACQUIRE_RETRY_SECONDS = 20.0` или `STARTING_POLL_SECONDS = 10.0` → `test_retry_intervals_are_thirty_and_five_seconds` FAIL. (з) Убрать проверку `running.kind in (...)` в `_gpu_release` → `test_release_during_an_assembly...` FAIL (409 `release_needs_confirm`). (и) Убрать отказ `queue_busy` → `test_qwen_restore_is_refused_while_the_queue_is_busy` FAIL. Ошибки — в отчёт.
 
 - [ ] **Step 10: Полный прогон и commit**
 
@@ -5573,8 +5816,9 @@ git commit -m "feat(clip): клип под готовый трек без Whispe
 **Files:**
 - Create: `h3_48gb/engines/motion.py`, `h3_48gb/engines/ltx.py`, `h3_48gb/engines/ltx_workflow.json`, `tests/_fake_comfy.py`
 - Modify: `h3_48gb/project.py` — `STAGE_NAMES` += `"upscale"` (миграция: нет ключа → `"draft"`), `Project.set_scene_fields`
-- Modify: `h3_48gb/queue.py` — `KIND_UPSCALE = "upscale"`, `JOB_KINDS`
+- Modify: `h3_48gb/queue.py` — `KIND_UPSCALE = "upscale"`, `JOB_KINDS`, `_validate_args_shape_for_kind` (`queue.py:619-630`) знает `upscale`
 - Modify: `h3_48gb/worker.py` — `_run_upscale_job`, ветка в `run_job`
+- Modify: `h3_48gb/web.py:2020-2025` — активная задача проекта (`_project_active_job`, `web.py:1988`) видит `upscale` (`{"kind": "upscale", "job": ...}`); `_gpu_release` — литерал `"upscale"` заменить на `q.KIND_UPSCALE`
 - Modify: `pyproject.toml` — `package-data` += `"engines/*.json"`
 - Modify: `tests/test_project.py` — ожидаемый набор этапов (теперь 6)
 - Test: `tests/test_ltx_upscale.py` (новый)
@@ -5647,7 +5891,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 class FakeComfy:
@@ -5844,6 +6088,8 @@ def test_upscale_part_pads_uploads_waits_and_muxes(tmp_path):
                                                prompt="a beach", strength=0.3,
                                                prefix="h3panel/proj/h3-s0-896x512-a1")]
     assert fake.history_calls == ["p1", "p1"]
+    assert not (out_dir / "h3panel" / "proj" / "h3-s0-896x512-a1").exists()   # frames removed
+    assert not (clip.parent / "ltx-work" / "h3-s0-896x512-a1-pad.mp4").exists()
 
 
 def test_upscale_prefix_is_unique_per_attempt_and_frame_count_is_checked(tmp_path):
@@ -5997,6 +6243,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import subprocess
 import time
 import urllib.error
@@ -6138,6 +6385,10 @@ def upscale_part(clip, *, prompt, strength, prefix, client, comfy_output, run,
              "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(part)],
             run=run, what="ffmpeg mux")
     os.replace(part, out)
+    # The frames were only an intermediate; the -ltx part now holds them. They live in our own
+    # rw subdirectory of ComfyUI's output (compose.yaml mounts <output>/h3panel rw, the rest ro).
+    shutil.rmtree(frames_dir, ignore_errors=True)
+    padded.unlink(missing_ok=True)
     return out
 
 
@@ -6191,7 +6442,22 @@ def run_upscale(project_path, *, client, comfy_output, run, attempt: str, sleep=
 ```
 (`_find_scene(scenes, idx)` возвращает сам словарь сцены или бросает `UnknownScene`, `project.py:389-403`.) `tests/test_project.py:49` — ожидаемое множество этапов `{"script", "track", "scenario", "scenes", "upscale", "assembly"}`; если тест требует `draft` у всех, кроме `scenario`, — `upscale` тоже `draft`, условие остаётся верным.
 
-`queue.py`: `KIND_UPSCALE = "upscale"`, `JOB_KINDS = (KIND_GENERATE, KIND_SONG, KIND_ASSEMBLE, KIND_UPSCALE)`.
+`queue.py`: `KIND_UPSCALE = "upscale"`, `JOB_KINDS = (KIND_GENERATE, KIND_SONG, KIND_ASSEMBLE, KIND_UPSCALE)`; в `_validate_args_shape_for_kind` оба кортежа `(KIND_SONG, KIND_ASSEMBLE)` → `(KIND_SONG, KIND_ASSEMBLE, KIND_UPSCALE)` (иначе generate-задача с argv `["upscale", ...]` прошла бы, а upscale-задача без `--project` — тоже). Тест в `tests/test_ltx_upscale.py`:
+```python
+def test_upscale_job_args_are_shape_checked(tmp_path):
+    from h3_48gb import queue as q
+    root = q.layout(tmp_path / "queue")["root"]
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["upscale"], "", {"output_stem": str(tmp_path / "u")}, {}, kind=q.KIND_UPSCALE)
+    with pytest.raises(q.QueueError):
+        q.submit(root, ["upscale", "--project", "x"], "", {"output_stem": str(tmp_path / "u")}, {})
+```
+`web.py:2020-2025` (`_project_active_job`, `web.py:1988`), после ветки `song_job`:
+```python
+    upscale_job = _project_job_by_args(jobs, proj.path, q.KIND_UPSCALE)
+    if upscale_job is not None:
+        return {"kind": "upscale", "job": upscale_job.as_dict()}
+```
 
 `worker.py`:
 ```python
@@ -6212,7 +6478,11 @@ def _run_upscale_job(root, outdir, job) -> tuple[int, str]:
         return ltx.run_upscale(
             _project_arg(job.args), client=client,
             comfy_output=os.environ.get("H3_COMFY_OUTPUT_DIR", ltx.DEFAULT_COMFY_OUTPUT),
-            run=subprocess.run, attempt=job.id, cancelled=lambda: q.cancel_reason(root, job.id))
+            run=subprocess.run,
+            # unique per *run*, not per job: a job resumed after a restart is the same job id,
+            # and its second attempt must never read frames the first attempt left behind
+            attempt=f"{job.id}-{time.time_ns()}",
+            cancelled=lambda: q.cancel_reason(root, job.id))
     finally:
         if q.cancel_reason(root, job.id) == "released_by_user":
             try:
@@ -6244,6 +6514,7 @@ def test_the_upscale_job_asks_the_dispatcher_for_ltx(tmp_path, monkeypatch):
     root = q.layout(out / "queue")["root"]
     q.submit(root, ["upscale", "--project", str(proj.path)], "", {"output_stem": str(out / "u")},
              {}, kind=q.KIND_UPSCALE)
+    job_id = q.scan(root)[0][0].id
     try:
         code = worker.run_job(root, q.claim(root), outdir=out)
     finally:
@@ -6252,6 +6523,9 @@ def test_the_upscale_job_asks_the_dispatcher_for_ltx(tmp_path, monkeypatch):
     assert code == 0
     assert [c[2] for c in disp.calls if c[1] == "/acquire"] == [{"engine": "ltx"}]
     assert p.load_project(proj.path).scenes[0]["ltx_path"] == str(clip.with_name("s-ltx.mp4"))
+    (prefix,) = [wf["42"]["inputs"]["filename_prefix"] for wf in comfy.prompts]
+    import re
+    assert re.fullmatch(rf"h3panel/{proj.id}/s-{re.escape(job_id)}-\d+/f", prefix), prefix
 ```
 
 - [ ] **Step 8: Зелёный**
@@ -6261,7 +6535,7 @@ Expected: PASS.
 
 - [ ] **Step 9: Мутации**
 
-(а) В `run_upscale` считать силу внутри цикла по одной части (`motion.clip_motion([clip], ...)`) → `test_one_strength_for_the_whole_clip` FAIL (`[0.6, 0.15] != [x, x]`). (б) В `upscale_part` убрать проверку числа кадров → `test_upscale_prefix_is_unique...` FAIL `DID NOT RAISE`. (в) Префикс без `attempt` (`f"{PREFIX_ROOT}/{proj.id}/{clip.stem}"`) → `test_one_strength_for_the_whole_clip` FAIL на строке `filename_prefix`. (г) `pad_frames` → `((n + 7) // 8) * 8 + 1` → `test_pad_frames_is_8k_plus_1_like_run_ltx_sh` FAIL. (д) `SEED = 7` → `test_build_workflow_changes_exactly_five_inputs` FAIL (ожидание 42 записано в тесте явно). Ошибки — в отчёт.
+(а) В `run_upscale` считать силу внутри цикла по одной части (`motion.clip_motion([clip], ...)`) → `test_one_strength_for_the_whole_clip` FAIL (`[0.6, 0.15] != [x, x]`). (б) В `upscale_part` убрать проверку числа кадров → `test_upscale_prefix_is_unique...` FAIL `DID NOT RAISE`. (в) Префикс без `attempt` (`f"{PREFIX_ROOT}/{proj.id}/{clip.stem}"`) → `test_one_strength_for_the_whole_clip` FAIL на строке `filename_prefix`. (г) `pad_frames` → `((n + 7) // 8) * 8 + 1` → `test_pad_frames_is_8k_plus_1_like_run_ltx_sh` FAIL. (д) `SEED = 7` → `test_build_workflow_changes_exactly_five_inputs` FAIL (ожидание 42 записано в тесте явно). (е) Убрать `shutil.rmtree(frames_dir, ...)` → `test_upscale_part_pads_uploads_waits_and_muxes` FAIL на `assert not (... / "h3-s0-896x512-a1").exists()`. (ж) `attempt=job.id` вместо `f"{job.id}-{time.time_ns()}"` → `test_the_upscale_job_asks_the_dispatcher_for_ltx` FAIL на `re.fullmatch`. Ошибки — в отчёт.
 
 - [ ] **Step 10: Полный прогон и commit**
 
@@ -6278,7 +6552,10 @@ git commit -m "feat(ltx): апскейл LTX через HTTP ComfyUI — шаб�
 **Files:**
 - Modify: `h3_48gb/project.py` — `ROUTE_STAGES`, `OPTIONAL_ROUTE_STAGES`, `default_route`, проверка в `_validate_shape` (`project.py:322-370`), атрибут `Project.route`, `Project.route_enabled`, `Project.set_route_stage`, `create_project`, `_OWNED_TOP_LEVEL_FIELDS`
 - Modify: `h3_48gb/assemble.py` — `_submit_upscale`; `advance_project` (`assemble.py:1512-1519`); выбор частей в `run` (`assemble.py:745-751`)
-- Modify: `h3_48gb/web.py` — `PUT /api/projects/<id>/route`, `POST /api/projects/<id>/upscale/retry`
+- Modify: `h3_48gb/project.py:695-748` — `invalidate_scene_chain` сбрасывает `stages.upscale` в `draft` и убирает `ltx_path` у сброшенных сцен; `_ASSEMBLY_FIELDS` += `"draft_path"`
+- Modify: `h3_48gb/assemble.py` — `run(..., draft=False)`: черновая сборка из исходных частей в `assembly/draft.mp4`
+- Modify: `h3_48gb/worker.py:490-552` — `_run_assemble_job` передаёт `draft="--draft" in job.args`; падение черновой сборки не помечает `stages.assembly` как `failed`
+- Modify: `h3_48gb/web.py` — `PUT /api/projects/<id>/route`, `POST /api/projects/<id>/upscale/retry`, `POST /api/projects/<id>/assembly/draft`
 - Test: `tests/test_route.py` (новый)
 
 **Interfaces:**
@@ -6288,7 +6565,10 @@ git commit -m "feat(ltx): апскейл LTX через HTTP ComfyUI — шаб�
   - `project.default_route(kind: str) -> list[dict]` — `[{"stage", "enabled"}]`: video → scenario, scenes, upscale, assemble; clip → scenario, scenes, upscale, track, assemble; song → track
   - `Project.route: list[dict]`, `Project.route_enabled(stage) -> bool`, `Project.set_route_stage(stage, enabled: bool) -> Project`
   - `assemble._submit_upscale(proj, queue_root, *, submit) -> dict` (`{"action": "submitted_upscale", "job_id"}`)
-  - `PUT /api/projects/<id>/route {"upscale": bool}` → `{"ok": true, "project": <payload>}`; `POST /api/projects/<id>/upscale/retry` → `{"ok": true, "advance": {...}}`
+  - `PUT /api/projects/<id>/route {"upscale": bool}` → `{"ok": true, "project": <payload>}`; `POST /api/projects/<id>/upscale/retry` → `{"ok": true, "advance": {...}}`; `POST /api/projects/<id>/assembly/draft` → `{"ok": true, "job_id"}` (задача `["assemble", "--project", <path>, "--draft"]`)
+  - `assemble.run(project_path, *, run=subprocess.run, log=None, draft: bool = False) -> Path`; черновая: всегда из `clip_path`, результат `assembly/draft.mp4`, пишется `assembly.draft_path`, `stages.assembly` и артефакты проекта не трогаются
+- Решение по черновой сборке (после ревью): черновая сборка из исходных частей доступна всегда отдельным действием «Черновая сборка»; при выключенном апскейле обычная сборка и так идёт из исходных; финальная при включённом — из `-ltx`.
+- Пересъёмка после апскейла: `invalidate_scene_chain` (кнопка «пересчитать сцену») делает старые `-ltx` недействительными — `stages.upscale = "draft"`, `ltx_path` сброшенных сцен удаляется; когда сцены снова `done`, апскейл ставится заново и сборка не возьмёт старые части.
 - Правила: неизвестный этап или этап не своего `kind` в `route` — ошибка загрузки проекта (`ProjectNotFound`, как любой испорченный `project.json`), не тихий пропуск. Проект без `route` получает `default_route(kind)` при чтении. В v1 выключается только `upscale`. Апскейл исполняется только при `H3_ENGINE=sglang` — на Маке включённый этап пропускается (ComfyUI там нет), сборка идёт из исходных частей.
 
 - [ ] **Step 1: Падающие тесты**
@@ -6479,6 +6759,49 @@ def test_retry_a_failed_upscale(live, tmp_path):
     assert body["advance"]["action"] == "submitted_upscale"
     status, body = _call(live, "POST", f"/api/projects/{proj.id}/upscale/retry", {})
     assert (status, body["error"]["code"]) == (409, "project_stage_not_ready")
+
+
+def test_a_reshoot_after_upscale_invalidates_the_ltx_parts(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path, upscale_stage="done")
+    proj.invalidate_scene_chain(1)
+    reloaded = p.load_project(proj.path)
+    assert reloaded.stages["upscale"] == "draft"
+    assert ["ltx_path" in s for s in reloaded.scenes] == [True, False]
+    clip = proj.path.parent / "scenes" / "s1-new.mp4"
+    clip.write_bytes(b"raw2")
+    reloaded.set_scene_status(1, "done", job_id=None, clip_path=str(clip))
+    calls, submit = _submits()
+    assert assemble.advance_project(reloaded, tmp_path / "q", tmp_path / "out",
+                                    submit=submit)["action"] == "submitted_upscale"
+    assert [kind for _, kind in calls] == [q.KIND_UPSCALE]
+
+
+def test_draft_assembly_always_uses_the_raw_parts(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path, upscale_stage="done")
+    seen = []
+
+    def run(cmd, capture_output=True, text=True):
+        if "concat" in cmd:
+            listing = open(cmd[cmd.index("-i") + 1], encoding="utf-8").read()
+            seen.append([line[len("file '"):-1] for line in listing.splitlines()])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    out = assemble.run(proj.path, run=run, log=lambda line: None, draft=True)
+    reloaded = p.load_project(proj.path)
+    assert out == proj.path.parent / "assembly" / "draft.mp4"
+    assert seen == [[s["clip_path"] for s in proj.scenes]]
+    assert (reloaded.assembly["draft_path"], reloaded.stages["assembly"]) == (str(out), "draft")
+
+
+def test_draft_route_queues_a_draft_assembly(live, tmp_path):
+    proj = _done_project(tmp_path, upscale_stage="running")
+    status, body = _call(live, "POST", f"/api/projects/{proj.id}/assembly/draft", {})
+    assert status == 200, body
+    (job,) = q.scan(live.queue_root)[0]
+    assert (job.kind, job.args, body["job_id"]) == (
+        q.KIND_ASSEMBLE, ["assemble", "--project", str(proj.path), "--draft"], job.id)
 ```
 (`_done_project` создаёт проект в `tmp_path / "out"` — тот же каталог, что `outdir` фикстуры `live`.)
 
@@ -6566,7 +6889,7 @@ def _submit_upscale(proj, queue_root, *, submit) -> dict:
 ```
 В `run`, сбор `clip_paths` (`assemble.py:745-751`):
 ```python
-    use_ltx = (engine.is_sglang() and proj.route_enabled("upscale")
+    use_ltx = (not draft and engine.is_sglang() and proj.route_enabled("upscale")
                and proj.stages.get("upscale") == "done")
     clip_paths = []
     for scene in scenes:
@@ -6575,6 +6898,37 @@ def _submit_upscale(proj, queue_root, *, submit) -> dict:
             raise AssembleError(f"scene {scene['idx']} of {proj.id!r} is done but has no "
                                 f"{'ltx_path' if use_ltx else 'clip_path'}")
         clip_paths.append(clip_path)
+```
+Черновая сборка — в том же `run`: сигнатура `run(project_path, *, run=subprocess.run, log=None, draft: bool = False)`; `final_path = assembly_dir / ("draft.mp4" if draft else "final.mp4")`; в конце вместо записи финала:
+```python
+    if draft:
+        proj.update_assembly(draft_path=str(final_path))
+        _cleanup_intermediate_assembly_files(assembly_dir)
+        return final_path
+    proj.update_assembly(final_path=str(final_path))
+    proj.set_stage_status("assembly", "done")
+    ...  # the rest unchanged (intermediate + project artifact cleanup)
+```
+`project.py`: `_ASSEMBLY_FIELDS = ("audio_mode", "final_path", "draft_path")`.
+
+`project.py:invalidate_scene_chain` — в цикле по сброшенным сценам добавить `scene.pop("ltx_path", None)`, после `data["stages"]["assembly"] = "draft"` — `data["stages"]["upscale"] = "draft"`. Докстринг дополнить: «-ltx parts of the reset scenes are stale as soon as the raw part is: the whole clip is re-upscaled with one strength (spec §4.2.2), so the stage goes back to draft too».
+
+`worker.py`, `_run_assemble_job`: `draft = "--draft" in job.args`; вызов `assemble.run(project_path, run=run, log=log_lines.append, draft=draft)`; оба `_mark_assembly_failed(project_path)` выполнять только при `not draft` (черновая не влияет на стадию сборки).
+
+`web.py`, разбор `parts` в `_route_post`: `if len(parts) == 3 and parts[1] == "assembly" and parts[2] == "draft": return self._draft_project_assembly(parts[0])`;
+```python
+    def _draft_project_assembly(self, raw_id: str) -> tuple[int, str, bytes]:
+        proj = self._load_project(raw_id)
+        self._json_request(allowed=())
+        if not proj.scenes or any(scene.get("status") != "done" for scene in proj.scenes):
+            raise CliError("project_stage_not_ready",
+                           f"черновая сборка проекта {raw_id}: не все сцены готовы", {"id": raw_id})
+        output_stem = str(proj.path.parent / "assembly" / "job-draft")
+        with queue_write_errors(self.server.queue_root, what="the draft assembly"):
+            job = q.submit(self.server.queue_root, ["assemble", "--project", str(proj.path), "--draft"],
+                           f"draft assemble project {proj.id}", {"output_stem": output_stem}, {},
+                           kind=q.KIND_ASSEMBLE)
+        return 200, "application/json", _json_bytes({"ok": True, "job_id": job.id})
 ```
 
 - [ ] **Step 5: `web.py`**
@@ -6611,13 +6965,13 @@ Expected: PASS.
 
 - [ ] **Step 7: Мутации**
 
-(а) В `_check_route` убрать проверку `entry["stage"] not in allowed` → `test_a_bad_route_is_a_load_error...[route1]` FAIL `DID NOT RAISE`. (б) В `advance_project` убрать `engine.is_sglang() and` → `test_on_mlx_an_enabled_upscale_is_skipped` FAIL (`submitted_upscale`). (в) В `run` всегда брать `clip_path` → `test_assembly_after_upscale_uses_the_ltx_parts` FAIL. (г) В `_submit_upscale` убрать проверку `!= "draft"` → `test_on_sglang_done_scenes_submit_one_upscale_job...` FAIL (второй вызов снова `submitted_upscale`). Ошибки — в отчёт.
+(а) В `_check_route` убрать проверку `entry["stage"] not in allowed` → `test_a_bad_route_is_a_load_error...[route1]` FAIL `DID NOT RAISE`. (б) В `advance_project` убрать `engine.is_sglang() and` → `test_on_mlx_an_enabled_upscale_is_skipped` FAIL (`submitted_upscale`). (в) В `run` всегда брать `clip_path` → `test_assembly_after_upscale_uses_the_ltx_parts` FAIL. (г) В `_submit_upscale` убрать проверку `!= "draft"` → `test_on_sglang_done_scenes_submit_one_upscale_job...` FAIL (второй вызов снова `submitted_upscale`). (д) В `invalidate_scene_chain` не сбрасывать `stages.upscale` → `test_a_reshoot_after_upscale_invalidates_the_ltx_parts` FAIL (`'done' == 'draft'`, затем `submitted_assembly`). (е) В `run` убрать `not draft and` → `test_draft_assembly_always_uses_the_raw_parts` FAIL (в списке `-ltx`). Ошибки — в отчёт.
 
 - [ ] **Step 8: Полный прогон и commit**
 
 ```bash
 env -u NODE_OPTIONS ~/venvs/h3-panel/bin/python -m pytest -q -p no:cacheprovider
-git add h3_48gb/project.py h3_48gb/assemble.py h3_48gb/web.py tests/test_route.py tests/test_project.py
+git add h3_48gb/project.py h3_48gb/assemble.py h3_48gb/web.py h3_48gb/worker.py tests/test_route.py tests/test_project.py
 git commit -m "feat(route): маршрут проекта с этапом апскейла; сборка из -ltx частей"
 ```
 
@@ -6633,13 +6987,16 @@ git commit -m "feat(route): маршрут проекта с этапом апс
 - Test: `tests/test_webui_panel.py` (новый)
 
 **Interfaces:**
-- Consumes (только JSON-API, спека §10): `GET /api/state` (`engine`, `platform`), `GET /api/gpu`, `POST /api/gpu/release`, `POST /api/qwen/unload|restore`, `GET/POST /api/library`, `PUT /api/library/<name>`, `GET/PUT /api/projects/<id>/references`, `PUT /api/projects/<id>/route`, `POST /api/uploads`, `DELETE /api/jobs/<id>`, `POST /api/chat/<id>/message` с `tags`.
+- Consumes (только JSON-API, спека §10): `GET /api/state` (`engine`, `platform`), `GET /api/gpu`, `POST /api/gpu/release`, `POST /api/qwen/unload|restore`, `GET/POST /api/library`, `PUT /api/library/<name>`, `GET/PUT /api/projects/<id>/references`, `PUT /api/projects/<id>/route`, `PUT /api/projects/<id>/settings`, `POST /api/projects/<id>/assembly/draft`, `POST /api/uploads`, `DELETE /api/jobs/<id>`, `POST /api/chat/<id>/message` с `tags`.
 - Produces (`app.js`, все чистые, тестируются через node):
   - `gpuBanner(gpu, nowMs) -> {visible: bool, text: string, tone: "" | "wait" | "own" | "bad", qwenUnload: bool, qwenRestore: bool}`
-  - `notificationEvents(prev, next, nowMs) -> {events: [{kind, title, body}], lastWaitNotifyMs}` — снимок `{failedIds: [], readyProjectIds: [], awaitingProjectIds: [], waitReason: string|null, waitingSinceMs: number|null, lastWaitNotifyMs: number|null}`
-  - `sceneTagIssues(text, pinnedTags) -> [{tag, problem: "unknown"|"invalid"}]`
+  - `notificationEvents(prev, next, nowMs) -> {events: [{kind, title, body}], lastWaitNotifyMs}` — снимок `{failedIds: [], readyProjectIds: [], awaitingProjectIds: [], waitReason: string|null, waitingSinceMs: number|null, lastWaitNotifyMs: number|null}`; `prev === null` (первый снимок после открытия вкладки) — событий нет, только запоминание
+  - `sceneTagIssues(text, pinnedTags, {needsTag = false} = {}) -> [{tag, problem: "unknown"|"invalid"|"missing"}]` (`missing` — ни одного тега, а сцена не клипа: спека §4.1.3)
+  - `projectTagWarningsHtml(proj) -> string` — список сцен проекта, которые гейт отклонит
+  - `projectSettingsHtml(proj) -> string` — поле `i2v_prefix` и кнопка «Черновая сборка»
   - `tagSuggestions(text, caret, cards) -> cards[]`
   - `projectRouteHtml(proj) -> string`, `projectReferencesHtml(proj, cards, pinned) -> string`, `libraryCardsHtml(cards, outdir) -> string`
+- Плашка: у чужого процесса — «уже N мин» по `first_seen` диспетчера; «Вернуть Qwen» показывается только при пустой очереди (сервер в этом случае ещё и отвечает `409 queue_busy`, задача 8).
 - Produces (`web.py`): в ответе `/api/gpu` ключ `idle_release_at` — ISO-время автоосвобождения (`max(finished_at) + H3_IDLE_RELEASE_MIN`), только когда очередь пуста и свой движок поднят; иначе `null`.
 - Ограничение спеки §10: вёрстку старого интерфейса не улучшаем; новое — минимальные блоки, всё поведение — в JSON-API.
 
@@ -6675,7 +7032,8 @@ def _dispatcher(own=None, foreign=(), qwen=None, used_mb=40960):
 @_needs_node
 def test_banner_while_waiting_names_the_reason_and_the_holder():
     gpu = {"ok": True, "dispatcher_error": None, "idle_release_at": None,
-           "dispatcher": _dispatcher(foreign=[{"pid": 777, "name": "comfy", "memory_mb": 30720}]),
+           "dispatcher": _dispatcher(foreign=[{"pid": 777, "name": "comfy", "memory_mb": 30720,
+                                               "first_seen": 1791374400}]),   # 12:00Z
            "queue": {"pending": 2, "paused": False, "running": {
                "id": "j1", "kind": "generate", "note": "project scene P #3",
                "started_at": "2026-10-07T12:00:00Z",
@@ -6683,7 +7041,18 @@ def test_banner_while_waiting_names_the_reason_and_the_holder():
     assert _banner(gpu) == {
         "visible": True, "tone": "wait", "qwenUnload": False, "qwenRestore": False,
         "text": "Очередь стоит 30 мин: GPU занята: comfy (pid 777, 30720 МБ) — карту держит "
-                "comfy (pid 777, 30,0 ГБ)"}
+                "comfy (pid 777, 30,0 ГБ, уже 30 мин)"}
+
+
+@_needs_node
+def test_banner_offers_qwen_restore_only_with_an_empty_queue():
+    unloaded = _dispatcher(qwen={"running": False, "unloaded_by_us": True})
+    idle = {"ok": True, "dispatcher_error": None, "idle_release_at": None, "dispatcher": unloaded,
+            "queue": {"pending": 0, "paused": True, "running": None}}
+    assert _banner(idle) == {"visible": True, "tone": "", "qwenUnload": False, "qwenRestore": True,
+                             "text": "Qwen выгружен панелью — его можно вернуть"}
+    busy = {**idle, "queue": {"pending": 1, "paused": False, "running": None}}
+    assert _banner(busy)["qwenRestore"] is False
 
 
 @_needs_node
@@ -6754,6 +7123,15 @@ def test_notifications_failed_ready_and_decision_fire_once():
 
 
 @_needs_node
+def test_the_first_snapshot_after_opening_the_tab_notifies_nothing():
+    nxt = {**EMPTY, "failedIds": ["j9"], "readyProjectIds": ["p1"],
+           "waitReason": "GPU занята", "waitingSinceMs": 0}
+    assert _node_eval("console.log(JSON.stringify(app.notificationEvents("
+                      f"null, {json.dumps(nxt)}, {60 * 60_000})));") == \
+        {"events": [], "lastWaitNotifyMs": 3600000}
+
+
+@_needs_node
 def test_scene_tag_issues_and_suggestions():
     issues = _node_eval("console.log(JSON.stringify(app.sceneTagIssues("
                         "'@alice on @beach with @Bob and mail@x.com', ['@alice', '@beach'])));")
@@ -6761,6 +7139,9 @@ def test_scene_tag_issues_and_suggestions():
     issues = _node_eval("console.log(JSON.stringify(app.sceneTagIssues("
                         "'@alice meets @carol', ['@alice'])));")
     assert issues == [{"tag": "@carol", "problem": "unknown"}]
+    assert _node_eval("console.log(JSON.stringify(app.sceneTagIssues('a cat', [], {needsTag: true})));") \
+        == [{"tag": None, "problem": "missing"}]
+    assert _node_eval("console.log(JSON.stringify(app.sceneTagIssues('a cat', [])));") == []
     cards = [{"tag": "@alice", "kind": "person"}, {"tag": "@alex", "kind": "person"},
              {"tag": "@beach", "kind": "environment"}]
     picks = _node_eval("console.log(JSON.stringify(app.tagSuggestions("
@@ -6777,6 +7158,28 @@ def test_project_route_html_is_one_checkbox_bound_to_the_project():
                       " {stage: 'upscale', enabled: false}]})));")
     assert html == ('<label class="route-upscale"><input type="checkbox" class="route-upscale-box" '
                     'data-id="p1"> Апскейл LTX после всех сцен</label>')
+    on = _node_eval("console.log(JSON.stringify(app.projectRouteHtml("
+                    "{id: 'p1', route: [{stage: 'upscale', enabled: true}]})));")
+    assert on == ('<label class="route-upscale"><input type="checkbox" class="route-upscale-box" '
+                  'data-id="p1" checked> Апскейл LTX после всех сцен</label>')
+
+
+@_needs_node
+def test_project_tag_warnings_and_settings_html():
+    warn = _node_eval("console.log(JSON.stringify(app.projectTagWarningsHtml({kind: 'video', "
+                      "references: [{tag: '@alice', version: 1}], scenes: ["
+                      "{idx: 0, prompt: '@alice runs'}, {idx: 1, prompt: 'a dog'}, "
+                      "{idx: 2, prompt: '@bob waves'}]})));")
+    assert warn == ('<ul class="tag-warnings"><li>Сцена 1: нужен хотя бы один референс (@тег) в сцене</li>'
+                    '<li>Сцена 2: незнакомый тег @bob</li></ul>')
+    assert _node_eval("console.log(JSON.stringify(app.projectTagWarningsHtml({kind: 'clip', "
+                      "references: [], scenes: [{idx: 0, prompt: 'a dog'}]})));") == ""
+    settings = _node_eval("console.log(JSON.stringify(app.projectSettingsHtml("
+                          "{id: 'p1', i2v_prefix: 'Go <on>.'})));")
+    assert settings == ('<div class="project-settings" data-id="p1"><label>Начало сцепленной сцены '
+                        '(i2v_prefix) <textarea class="i2v-prefix" data-id="p1" rows="2">Go &lt;on&gt;.'
+                        '</textarea></label> <button type="button" class="draft-assembly" '
+                        'data-id="p1">Черновая сборка</button></div>')
 
 
 @_needs_node
@@ -6849,13 +7252,18 @@ export function gpuBanner(gpu, nowMs) {
     return { ...hidden, visible: true, tone: "bad",
              text: `Диспетчер GPU не отвечает: ${gpu.dispatcher_error}` };
   }
-  const qwenRestore = Boolean(d.qwen && d.qwen.unloaded_by_us && !d.qwen.running);
   const run = gpu.queue && gpu.queue.running;
+  // spec §2: «вернуть Qwen» only after the queue -- never while anything is queued or running
+  const queueEmpty = !run && !(gpu.queue && gpu.queue.pending);
+  const qwenRestore = Boolean(d.qwen && d.qwen.unloaded_by_us && !d.qwen.running && queueEmpty);
   if (run && run.wait_reason) {
     const since = Date.parse(run.started_at);
     const waited = Number.isFinite(since) ? Math.max(0, (nowMs - since) / 1000) : 0;
-    const holders = (d.foreign || [])
-      .map((a) => `${a.name} (pid ${a.pid}, ${formatGb(a.memory_mb / 1024)})`).join(", ");
+    const holders = (d.foreign || []).map((a) => {
+      const held = Number.isFinite(a.first_seen)
+        ? `, уже ${formatDuration(Math.max(0, nowMs / 1000 - a.first_seen))}` : "";
+      return `${a.name} (pid ${a.pid}, ${formatGb(a.memory_mb / 1024)}${held})`;
+    }).join(", ");
     const reason = run.wait_reason.replace(/^ждём GPU: /, "");
     return { visible: true, tone: "wait", qwenRestore,
              qwenUnload: run.wait_reason.includes("Qwen"),
@@ -6882,6 +7290,12 @@ const WAIT_NOTIFY_EVERY_MS = 60 * 60_000;
 /** Браузерные уведомления (спека §3.3.13): ожидание > 10 мин (повтор раз в час), сцена упала,
  *  проект готов, нужно решение. Каждое событие — один раз на переход. */
 export function notificationEvents(prev, next, nowMs) {
+  // The first snapshot after the tab opens only primes the state: everything already failed or
+  // finished before the page was opened is not news.
+  if (prev === null) {
+    const primed = next.waitReason && next.waitingSinceMs !== null ? nowMs : next.lastWaitNotifyMs;
+    return { events: [], lastWaitNotifyMs: primed };
+  }
   const events = [];
   let lastWait = next.lastWaitNotifyMs;
   if (next.waitReason && next.waitingSinceMs !== null) {
@@ -6905,7 +7319,7 @@ const TAG_IN_TEXT = /(?<![\w@.])@([A-Za-z0-9-]+)/g;
 const TAG_OK = /^@[a-z0-9-]{2,32}$/;
 
 /** @-теги сцены, которые не уйдут в H3 (спека §3.5): незнакомые проекту и написанные не так. */
-export function sceneTagIssues(text, pinnedTags) {
+export function sceneTagIssues(text, pinnedTags, { needsTag = false } = {}) {
   const issues = [];
   const seen = new Set();
   for (const match of String(text || "").matchAll(TAG_IN_TEXT)) {
@@ -6915,7 +7329,35 @@ export function sceneTagIssues(text, pinnedTags) {
     if (!TAG_OK.test(tag)) issues.push({ tag, problem: "invalid" });
     else if (!pinnedTags.includes(tag)) issues.push({ tag, problem: "unknown" });
   }
+  if (needsTag && seen.size === 0) issues.push({ tag: null, problem: "missing" });
   return issues;
+}
+
+const TAG_PROBLEM_TEXT = {
+  missing: () => "нужен хотя бы один референс (@тег) в сцене",
+  unknown: (tag) => `незнакомый тег ${tag}`,
+  invalid: (tag) => `тег ${tag} — только строчные`,
+};
+
+/** Сцены, которые гейт отклонит (спека §4.1.3, §3.5), — видно до нажатия «Утвердить». */
+export function projectTagWarningsHtml(proj) {
+  const pinned = (proj.references || []).map((ref) => ref.tag);
+  const needsTag = proj.kind !== "clip";
+  const rows = [];
+  for (const scene of proj.scenes || []) {
+    for (const issue of sceneTagIssues(scene.prompt, pinned, { needsTag })) {
+      rows.push(`<li>Сцена ${scene.idx}: ${escapeHtml(TAG_PROBLEM_TEXT[issue.problem](issue.tag))}</li>`);
+    }
+  }
+  return rows.length ? `<ul class="tag-warnings">${rows.join("")}</ul>` : "";
+}
+
+export function projectSettingsHtml(proj) {
+  const id = escapeHtml(proj.id);
+  return `<div class="project-settings" data-id="${id}"><label>Начало сцепленной сцены `
+    + `(i2v_prefix) <textarea class="i2v-prefix" data-id="${id}" rows="2">`
+    + `${escapeHtml(proj.i2v_prefix || "")}</textarea></label> `
+    + `<button type="button" class="draft-assembly" data-id="${id}">Черновая сборка</button></div>`;
 }
 
 /** Подсказка на `@`: карточки, чей тег начинается с набранного после последнего `@` до каретки. */
@@ -6988,8 +7430,7 @@ body:not([data-platform="darwin"]) [data-act="reveal"] { display: none; }
 DOM-половина `app.js` (внутри `if (typeof document !== "undefined")`-блока, рядом с `poll`):
 ```js
   let gpu = null;
-  let notifySnapshot = { failedIds: [], readyProjectIds: [], awaitingProjectIds: [],
-                         waitReason: null, waitingSinceMs: null, lastWaitNotifyMs: null };
+  let notifySnapshot = null;   // null until the first poll: opening the tab is not an event
   let libraryCards = [];
 
   async function pollGpu() {
@@ -7021,7 +7462,7 @@ DOM-половина `app.js` (внутри `if (typeof document !== "undefined"
       awaitingProjectIds: (projects || []).filter((p) => p.stages && Object.values(p.stages).includes("awaiting_approval")).map((p) => p.id),
       waitReason: run && run.wait_reason ? run.wait_reason : null,
       waitingSinceMs: run && run.wait_reason ? Date.parse(run.started_at) : null,
-      lastWaitNotifyMs: run && run.wait_reason ? notifySnapshot.lastWaitNotifyMs : null,
+      lastWaitNotifyMs: run && run.wait_reason && notifySnapshot ? notifySnapshot.lastWaitNotifyMs : null,
     };
     const { events, lastWaitNotifyMs } = notificationEvents(notifySnapshot, next, Date.now());
     notifySnapshot = { ...next, lastWaitNotifyMs };
@@ -7085,8 +7526,11 @@ DOM-половина `app.js` (внутри `if (typeof document !== "undefined"
 ```
 и `loadLibrary()` после первого `poll()`.
 
-Модалка проекта (`renderProjectModal`, `app.js:2671`): к сборке HTML добавить `projectRouteHtml(proj) + projectReferencesHtml(proj, libraryCards, proj.references || [])` перед `projectScenesStageHtml`. В общем делегированном обработчике `change` модалки:
+Модалка проекта (`renderProjectModal`, `app.js:2671`, объект проекта — `project.project`, переменная `project` объявлена на `app.js:2308`): к сборке HTML добавить `projectTagWarningsHtml(proj) + projectSettingsHtml(proj) + projectRouteHtml(proj) + projectReferencesHtml(proj, libraryCards, proj.references || [])` перед `projectScenesStageHtml`. Общего `change`-обработчика модалки нет: поля модалки пересоздаются при каждой перерисовке, поэтому, как уже сделано для `.scenario-fresh-start` (`app.js:4697`), вешается **новый делегированный** обработчик на `document` рядом с ним:
 ```js
+  document.addEventListener("change", (event) => {
+    const target = event.target;
+    if (!project || !project.project) return;
     if (target.classList.contains("route-upscale-box")) {
       api("PUT", `/api/projects/${encodeURIComponent(target.dataset.id)}/route`,
           { upscale: target.checked }).then(() => openProjectModal(target.dataset.id))
@@ -7100,21 +7544,43 @@ DOM-половина `app.js` (внутри `if (typeof document !== "undefined"
         .then(() => openProjectModal(box.dataset.id))
         .catch((err) => alert(err.payload ? err.payload.error.message : String(err)));
     }
+  });
+
+  document.addEventListener("focusout", (event) => {
+    const field = event.target.closest(".i2v-prefix");
+    if (!field || !project || !project.project) return;
+    if (field.value === (project.project.i2v_prefix || "")) return;
+    api("PUT", `/api/projects/${encodeURIComponent(field.dataset.id)}/settings`, { i2v_prefix: field.value })
+      .then(() => openProjectModal(field.dataset.id))
+      .catch((err) => alert(err.payload ? err.payload.error.message : String(err)));
+  });
+
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest(".draft-assembly");
+    if (!button) return;
+    api("POST", `/api/projects/${encodeURIComponent(button.dataset.id)}/assembly/draft`, {})
+      .then(() => poll())
+      .catch((err) => alert(err.payload ? err.payload.error.message : String(err)));
+  });
 ```
 (Отметка уже подключённой карточки отправляется без `version` — сервер закрепит последнюю; это и есть явная кнопка «обновить до последней версии»: снять и поставить галочку.)
 
-Подсказка тегов: в существующем `input`-обработчике `.scenario-prompt` (`app.js:2994`):
+Подсказка тегов. `input`-обработчика у `.scenario-prompt` нет (на `app.js:2994` — сбор значений в `collectScenarioScenes`, сохранение — делегированный `focusout` на `app.js:4679`); добавить **новый делегированный** `input` рядом с этим `focusout`:
 ```js
-      const pinned = (currentProject && currentProject.references || []).map((r) => r.tag);
-      const issues = sceneTagIssues(el.value, pinned);
+  document.addEventListener("input", (event) => {
+    const el = event.target.closest(".scenario-prompt");
+    if (!el || !project || !project.project) return;
+      const pinned = (project.project.references || []).map((r) => r.tag);
+      const issues = sceneTagIssues(el.value, pinned, { needsTag: project.project.kind !== "clip" });
       el.classList.toggle("has-tag-issues", issues.length > 0);
-      el.title = issues.map((i) => (i.problem === "unknown" ? `незнакомый тег ${i.tag}` : `тег ${i.tag} — только строчные`)).join("; ");
+      el.title = issues.map((i) => TAG_PROBLEM_TEXT[i.problem](i.tag)).join("; ");
       const hint = tagSuggestions(el.value, el.selectionStart, libraryCards.filter((c) => pinned.includes(c.tag)));
       let box = el.nextElementSibling && el.nextElementSibling.classList.contains("tag-hint") ? el.nextElementSibling : null;
       if (!box) { box = document.createElement("div"); box.className = "tag-hint"; el.after(box); }
       box.textContent = hint.length ? `теги: ${hint.map((c) => c.tag).join(" ")}` : "";
+  });
 ```
-(`currentProject` — объект проекта, который модалка уже держит; использовать фактическое имя переменной из `renderProjectModal`.) Теги чата: в отправке сообщения чата к телу добавить `tags: ($("chat-tags").value.match(/@[a-z0-9-]{2,32}/g) || [])`.
+(В клипе подсказка `missing` не показывается: у его сцен аудио-референс — кусок трека.) Теги чата: в отправке сообщения чата к телу добавить `tags: ($("chat-tags").value.match(/@[a-z0-9-]{2,32}/g) || [])`.
 
 - [ ] **Step 5: `idle_release_at` в web.py**
 
@@ -7138,7 +7604,7 @@ Expected: PASS (включая `test_the_page_asks_for_its_own_routes_in_a_way_t
 
 - [ ] **Step 7: Мутации**
 
-(а) В `gpuBanner` убрать `.replace(/^ждём GPU: /, "")` → `test_banner_while_waiting_...` FAIL. (б) `WAIT_NOTIFY_EVERY_MS = 30 * 60_000` → `test_notifications_wait_over_ten_minutes_then_hourly` FAIL (событие на 59-й минуте). (в) В `notificationEvents` не фильтровать уже виденные (`next[key]` вместо `fresh(key)`) → `test_notifications_failed_ready_and_decision_fire_once` FAIL на втором вызове. (г) Убрать lookbehind в `TAG_IN_TEXT` → `test_scene_tag_issues_and_suggestions` FAIL (`@x` из адреса). (д) В `projectReferencesHtml` проверять `version <= card.latest_version` → FAIL у `@alice` (появится лишняя «есть v3» у актуальной). Ошибки — в отчёт.
+(а) В `gpuBanner` убрать `.replace(/^ждём GPU: /, "")` → `test_banner_while_waiting_...` FAIL. (б) `WAIT_NOTIFY_EVERY_MS = 30 * 60_000` → `test_notifications_wait_over_ten_minutes_then_hourly` FAIL (событие на 59-й минуте). (в) В `notificationEvents` не фильтровать уже виденные (`next[key]` вместо `fresh(key)`) → `test_notifications_failed_ready_and_decision_fire_once` FAIL на втором вызове. (г) Убрать lookbehind в `TAG_IN_TEXT` → `test_scene_tag_issues_and_suggestions` FAIL (`@x` из адреса). (д) В `projectReferencesHtml` проверять `version <= card.latest_version` → FAIL у `@alice` (появится лишняя «есть v3» у актуальной). (е) Убрать ветку `if (prev === null)` → `test_the_first_snapshot_after_opening_the_tab_notifies_nothing` FAIL (события `failed`/`ready`/`wait`). (ж) Убрать `queueEmpty` из `qwenRestore` → `test_banner_offers_qwen_restore_only_with_an_empty_queue` FAIL. (з) В `projectRouteHtml` потерять `checked` → вторая половина `test_project_route_html_is_one_checkbox...` FAIL. (и) Убрать `needsTag && seen.size === 0` → `test_project_tag_warnings_and_settings_html` FAIL (нет «Сцена 1»). Ошибки — в отчёт.
 
 - [ ] **Step 8: Ручная проверка в браузере (Мак, без GPU)**
 
@@ -7206,6 +7672,7 @@ def test_compose_mounts_host_paths_at_the_same_paths_and_sets_the_spec_env():
             "network_mode: host", 'user: "1000:1000"', "restart: unless-stopped",
             "- /home/alex/Outputs/h3-panel:/home/alex/Outputs/h3-panel",
             "- /home/alex/Outputs/comfy/output:/home/alex/Outputs/comfy/output:ro",
+            "- /home/alex/Outputs/comfy/output/h3panel:/home/alex/Outputs/comfy/output/h3panel",
             "- /home/alex/Projects/h3-bench/inputs:/home/alex/Projects/h3-bench/inputs:ro",
             "H3_ENGINE: sglang", "H3_OUTDIR: /home/alex/Outputs/h3-panel",
             'H3_ALLOWED_HOSTS: "192.168.100.50:8765,alex-neuro:8765"',
@@ -7307,6 +7774,8 @@ services:
     volumes:
       - /home/alex/Outputs/h3-panel:/home/alex/Outputs/h3-panel
       - /home/alex/Outputs/comfy/output:/home/alex/Outputs/comfy/output:ro
+      # our own frames only, rw, so a finished -ltx part can remove its PNGs (task 10)
+      - /home/alex/Outputs/comfy/output/h3panel:/home/alex/Outputs/comfy/output/h3panel
       - /home/alex/Projects/h3-bench/inputs:/home/alex/Projects/h3-bench/inputs:ro
 ```
 `docker/entrypoint.sh` (исполняемый, `chmod +x` до коммита):
@@ -7396,8 +7865,9 @@ scp "$TMPDIR/h3-panel.bundle" alex-neuro:/home/alex/Projects/h3-panel.bundle
 ssh alex-neuro 'test -d /home/alex/Projects/h3-panel \
   && (cd /home/alex/Projects/h3-panel && git fetch /home/alex/Projects/h3-panel.bundle feat/panel-alex-neuro && git checkout -B feat/panel-alex-neuro FETCH_HEAD) \
   || git clone -b feat/panel-alex-neuro /home/alex/Projects/h3-panel.bundle /home/alex/Projects/h3-panel'
-ssh alex-neuro 'mkdir -p /home/alex/Outputs/h3-panel/probes && ls -ld /home/alex/Outputs/h3-panel'
+ssh alex-neuro 'mkdir -p /home/alex/Outputs/h3-panel/probes /home/alex/Outputs/comfy/output/h3panel && ls -ld /home/alex/Outputs/h3-panel /home/alex/Outputs/comfy/output/h3panel'
 ```
+(Каталог `h3panel` в выводе ComfyUI нужен до `docker compose up`: иначе Docker создаст его от root, и ни ComfyUI, ни панель не смогут в нём писать/удалять.)
 Expected: каталог `/home/alex/Projects/h3-panel` на ветке, `/home/alex/Outputs/h3-panel` принадлежит `alex`.
 
 - [ ] **Step 2 (без GPU): Проверка шаблона LTX против ComfyUI**
@@ -7447,12 +7917,14 @@ Expected: `sglang linux True`; `/api/gpu` с данными диспетчера
 """The probe script's payload builders (spec §6): the beach replay must be chain_beach.py's own
 payload, with only the step count cut so a probe never costs a 45-minute render."""
 import importlib.util
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("sglang_probes",
                                                ROOT / "tools" / "probes" / "sglang_probes.py")
 probes = importlib.util.module_from_spec(_spec)
+sys.modules["sglang_probes"] = probes
 _spec.loader.exec_module(probes)
 
 
@@ -7472,11 +7944,21 @@ def test_beach_payload_is_chain_beach_head_scene_with_one_step():
         "audio_flow_shift": 3.0, "seed": 42, "quality": "lossless"}
 
 
-def test_probe_payloads_cover_the_three_open_questions(tmp_path):
+def test_probe_payloads_cover_the_open_questions(tmp_path):
     payloads = probes.probe_payloads(tmp_path)
-    assert sorted(payloads) == ["eight_references", "keyframe_without_reference", "t2va_on_ref2va"]
-    assert (payloads["t2va_on_ref2va"]["task"], payloads["t2va_on_ref2va"]["conditions"]) == ("t2va", [])
+    assert sorted(payloads) == ["eight_references", "keyframe_without_reference",
+                                "picture_numbering"]
+    assert all(p["task"] == "ref2va" for p in payloads.values())
     assert [c["role"] for c in payloads["keyframe_without_reference"]["conditions"]] == ["keyframe"]
+    numbering = payloads["picture_numbering"]
+    assert [(c["role"], Path(c["uri"]).name) for c in numbering["conditions"]] == [
+        ("keyframe", "table.png"), ("reference", "red-cube.png"), ("reference", "blue-ball.png")]
+    assert numbering["prompt"] == (
+        "subject_definitions:\n"
+        "<Subject 1> is the object shown in <Picture 1>.\n"
+        "<Subject 2> is the object shown in <Picture 2>.\n\n"
+        "On the empty table, <Subject 1> stands at the left edge and <Subject 2> at the right "
+        "edge; the camera does not move.")
     assert [c["role"] for c in payloads["eight_references"]["conditions"]] == ["reference"] * 8
     assert all(p["num_inference_steps"] == 8 and p["target"]["duration_seconds"] == 3.0
                for p in payloads.values())
@@ -7496,6 +7978,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -7530,14 +8013,37 @@ def _card(path: Path, colour) -> str:
     return str(path)
 
 
+def _shape(path: Path, colour, *, ball: bool) -> str:
+    image = Image.new("RGB", (512, 512), (255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    (draw.ellipse if ball else draw.rectangle)((128, 128, 384, 384), fill=colour)
+    image.save(path)
+    return str(path)
+
+
 def probe_payloads(workdir: Path) -> dict[str, dict]:
     workdir.mkdir(parents=True, exist_ok=True)
     keyframe = _card(workdir / "kf.png", (200, 120, 40))
     refs = [_card(workdir / f"r{i}.png", ((i * 30) % 255, 80, 160)) for i in range(8)]
     base = {**_COMMON, "num_inference_steps": 8}
+    table = _card(workdir / "table.png", (150, 150, 150))
+    red = _shape(workdir / "red-cube.png", (220, 20, 20), ball=False)
+    blue = _shape(workdir / "blue-ball.png", (20, 40, 220), ball=True)
     return {
-        "t2va_on_ref2va": {**base, "prompt": "A calm sea at dawn.", "task": "t2va",
-                           "conditions": [], "target": dict(_PROBE_TARGET)},
+        # spec §6 (a), owner's decision after review: confirm by a render that, with a keyframe
+        # present, <Picture 1> is the first *reference* picture (the code says the keyframe is
+        # not numbered). Red on the left => confirmed; grey/table things on the left => not.
+        "picture_numbering": {
+            **base, "task": "ref2va",
+            "prompt": ("subject_definitions:\n"
+                       "<Subject 1> is the object shown in <Picture 1>.\n"
+                       "<Subject 2> is the object shown in <Picture 2>.\n\n"
+                       "On the empty table, <Subject 1> stands at the left edge and <Subject 2> "
+                       "at the right edge; the camera does not move."),
+            "conditions": [{"type": "image", "uri": table, "role": "keyframe", "frame_index": 0},
+                           {"type": "image", "uri": red, "role": "reference"},
+                           {"type": "image", "uri": blue, "role": "reference"}],
+            "target": {**_PROBE_TARGET, "aspect_ratio": "auto"}},
         "keyframe_without_reference": {
             **base, "prompt": "The scene continues.", "task": "ref2va",
             "conditions": [{"type": "image", "uri": keyframe, "role": "keyframe",
@@ -7585,7 +8091,7 @@ def _acquire_h3(dispatcher: DispatcherClient) -> bool:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("names", nargs="+",
-                        help="t2va_on_ref2va | keyframe_without_reference | eight_references | beach")
+                        help="picture_numbering | keyframe_without_reference | eight_references | beach")
     parser.add_argument("--keep-h3", action="store_true", help="do not release the card after")
     args = parser.parse_args(argv)
     dispatcher = DispatcherClient()
@@ -7603,6 +8109,13 @@ def main(argv=None) -> int:
             else:
                 payload = payloads[name]
             result = run_probe(name, payload, client)
+            if name == "picture_numbering" and result["result"] == "completed":
+                video = OUT_DIR / f"{out_path.stem}-picture-numbering.mp4"
+                client.download(result["id"], video)
+                frame = video.with_suffix(".png")
+                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "2", "-i", str(video),
+                                "-frames:v", "1", str(frame)], check=True)
+                result["frame"] = str(frame)     # the owner looks: red cube on the left?
             print(json.dumps(result, ensure_ascii=False))
             with out_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -7618,7 +8131,7 @@ if __name__ == "__main__":
 Run снова → PASS. Мутация: в `beach_payload` оставить `num_inference_steps: 50` → `test_beach_payload_...` FAIL; вернуть. Commit:
 ```bash
 git add tools/probes/sglang_probes.py tests/test_sglang_probes.py
-git commit -m "tools: пробы sglang для §6 — t2va на ref2va, кейфрейм без референсов, 8 картинок, повтор beach-01"
+git commit -m "tools: пробы sglang для §6 — нумерация Picture, кейфрейм без референсов, 8 картинок, повтор beach-01"
 ```
 Обновить код на сервере (шаг 1) и пересобрать образ (`docker compose build`).
 
@@ -7626,14 +8139,14 @@ git commit -m "tools: пробы sglang для §6 — t2va на ref2va, кей�
 
 ```bash
 ssh alex-neuro 'curl -s 127.0.0.1:8790/status | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[\"foreign\"], d[\"qwen\"])"'
-ssh alex-neuro 'cd /home/alex/Projects/h3-panel && docker compose run --rm --entrypoint python h3-panel tools/probes/sglang_probes.py keyframe_without_reference t2va_on_ref2va beach'
+ssh alex-neuro 'cd /home/alex/Projects/h3-panel && docker compose run --rm --entrypoint python h3-panel tools/probes/sglang_probes.py keyframe_without_reference picture_numbering beach'
 ```
 Ожидания и решения по каждой пробе (в отчёт — дословный JSON):
 1. `keyframe_without_reference` — ожидается `http_error 400` с `detail` о недостающем reference (по коду `request_validation.py:300-303`). Если `completed` — правило `ref2va_needs_reference` для цепочки ослабить нельзя без владельца: сообщить.
-2. `t2va_on_ref2va` — **открытый вопрос**: по коду sglang `t2va` относится к партиции `fl2va`, а сервер поднят с `VARIANT=ref2va`. Если `http_error` — первая сцена без тегов на этом сервере невозможна: тогда гейт (`_scene_reference_errors`, задача 5) должен требовать хотя бы один тег в **каждой** сцене ролика; правка — отдельная задача после решения владельца.
+2. `picture_numbering` — проба §6 (а): короткая сцена с кейфреймом (серый стол) и двумя референсами (красный куб — `<Picture 1>`, синий шар — `<Picture 2>`); скрипт скачивает ролик и снимает кадр на 2-й секунде (`result["frame"]`). Красный куб слева — правило нумерации (кейфрейм не нумеруется) подтверждено; иначе — остановиться и сообщить владельцу: сборка `subject_definitions` (задача 4) тогда неверна.
 3. `beach` — разбор прошлых 400 (`results-beach.jsonl`): `detail` теперь виден. Если `completed` — причина была в старых путях `/home/alex/h3-bench/...` (их чинит `normalize_h3_conditions`) или в чём-то ином, что пропало; записать.
 4. `eight_references` — только если 1–3 прошли и карта свободна: предел картинок и `peak_memory_mb`. По итогу владелец выбирает `H3_MAX_REF_IMAGES` (по умолчанию 6) в `compose.yaml`.
-Нумерация `<Picture N>` при кейфрейме + референсах пробой не проверяется: по коду сервера кейфрейм не нумеруется (`presentation.py:230-270`) — см. «Расхождения со спекой».
+(Проба `t2va` больше не нужна: 07.10 установлено, что сервер `VARIANT=ref2va` обслуживает только `ref2va`, — `h3-bench/logs/probe-t2va-20261007.log`.)
 
 - [ ] **Step 9 (требует свободной GPU; если занята чужим — отложить и сообщить владельцу): Дымовой прогон сцены через панель**
 
@@ -7660,8 +8173,8 @@ ssh alex-neuro 'cd /home/alex/Projects/h3-panel && docker compose run --rm --ent
 5. §3.3.7: `_llm_holds_gpu` живёт в `worker.py:859`; `pkill llama-server` — только `provider.py:358`, вызывается лишь в цикле по провайдерам `llama-local` (`web.py:5033-5038`) — условие уже выполнено, правки нет.
 
 **Модель проекта**
-6. §4.1.3 «`aspect_ratio` проекта» и «`i2v_prefix` проекта»: таких полей в проекте нет. Холст сцен прошит `assemble.DEFAULT_SCENE_CANVAS = (896, 512)` → `"16:9"`; `i2v_prefix` план добавляет как необязательное поле (по умолчанию пусто). Строки 512×896 и 768×768 таблицы форматов достижимы только ручными задачами, проекты их не выбирают.
-7. MLX-префикс `SCENE_I2V_INSTRUCTION` («`<Picture 1>` … fully referenced» про кейфрейм) на sglang **не используется**: по коду сервера кейфрейм не получает метки, и `<Picture 1>` — первая картинка-референс. Промпты `chain_beach.py` (кейфрейм = `<Picture 1>`, референсы = `<Picture 2..4>`) с кодом сервера расходятся — 8/8 сцен прошли, но подписи в них, вероятно, были сдвинуты. Риск для владельца, не для плана.
+6. §4.1.3 «`aspect_ratio` проекта» и «`i2v_prefix` проекта»: таких полей в проекте нет. Холст сцен прошит `assemble.DEFAULT_SCENE_CANVAS = (896, 512)` → `"16:9"`; `i2v_prefix` — поле проекта (решение после ревью) со значением по умолчанию `DEFAULT_I2V_PREFIX` = «The video begins exactly on the provided first frame and continues it seamlessly: same characters, setting, lighting and camera style.» (без метки `<Picture N>`), меняется через `PUT /api/projects/<id>/settings` и простым полем в модалке проекта. Строки 512×896 и 768×768 таблицы форматов достижимы только ручными задачами, проекты их не выбирают.
+7. MLX-префикс `SCENE_I2V_INSTRUCTION` («`<Picture 1>` … fully referenced» про кейфрейм) на sglang **не используется**: по коду сервера кейфрейм не получает метки, и `<Picture 1>` — первая картинка-референс. Промпты `chain_beach.py` (кейфрейм = `<Picture 1>`, референсы = `<Picture 2..4>`) с кодом сервера расходятся — 8/8 сцен прошли, но подписи в них, вероятно, были сдвинуты. Риск для владельца, не для плана; проба `picture_numbering` (задача 14) проверяет правило генерацией.
 8. §3.3.8: для статуса апскейла в `stages` добавлен этап `upscale` (старые проекты мигрируют в `draft`); спека этого не оговаривала.
 
 **Где что делается**
@@ -7669,20 +8182,24 @@ ssh alex-neuro 'cd /home/alex/Projects/h3-panel && docker compose run --rm --ent
 10. §3.5 раскладка `<H3_OUTDIR>/library/<tag>/`: каталог — тег без `@` (`library/alice/`), файлы версии — в `vN/`; старые версии не удаляются никогда (строже и проще, чем «пока ссылается проект»).
 11. §3.3.14: при идущем рендере `POST /release` делает **воркер** после остановки задачи (страница ставит `cancel_reason=released_by_user` и паузу и отвечает `releasing: true`) — чтобы освобождение не гонялось с опросом sglang.
 12. §4.1.1 «повтор через 30 с»: пока свой движок `starting`, опрос каждые 5 с; на `wait`/`wait_qwen` — 30 с.
-13. §4.2.3: результат LTX — PNG-кадры SaveImage из тома `ro` (не видео через `/view`); вход — `POST /upload/image`, потому что `ComfyUI/input/` в контейнер не смонтирован; готовность — опрос `/history` без websocket.
+13. §4.2.3: результат LTX — PNG-кадры SaveImage (не видео через `/view`); вход — `POST /upload/image`, потому что `ComfyUI/input/` в контейнер не смонтирован; готовность — опрос `/history` без websocket. Вывод ComfyUI смонтирован `ro`, **кроме своего подкаталога** `<output>/h3panel` (`rw`): после сборки `-ltx` части её PNG удаляются (решение после ревью).
 14. §3.2 `pip install --no-deps .` → `pip install --no-deps -e .`: `provider.system_prompt()` и `web.REPO_ROOT` читают файлы рядом с исходниками.
 15. §3.3.13 «освободится через 12 мин»: веб вычисляет время из последнего `finished_at` + `H3_IDLE_RELEASE_MIN`; это приближение отсчёта воркера (он считает от момента, когда увидел пустую очередь).
 
 **Содержательные**
 16. §6 «сумма снапнутых длительностей ≥ трека»: противоречит действующему правилу сборки «перебор не обрезается» (допуск 0,5 с, а ячейка сетки 0,708 с, `assemble.py:784-790`). План добавляет **только при sglang** обрезку картинки до длины трека (`_trim_video`); на Маке поведение прежнее.
-17. §4.1.3 «условий нет → `t2va`»: по коду sglang `t2va` относится к партиции `fl2va`, а сервер поднят с `VARIANT=ref2va`; работает ли `t2va` на нём — не установлено. Проба задачи 14, шаг 8; при отказе гейт должен требовать тег в каждой сцене (решение владельца).
-18. §6 проба (а) «нумерация `<Picture N>`» закрыта чтением кода сервера (`presentation.py:230-270`, `stages/text_encoding.py:385`): кейфрейм не нумеруется. Проба (б) «предел картинок»: в коде предела нет, картинки масштабируются до 2048 по короткой стороне; `H3_MAX_REF_IMAGES` по умолчанию 6, уточняется пробой `eight_references`.
+17. Пути условий — как в проверенных прогонах (`chain_beach.py`, `runner_clip.py`): картинки голым абсолютным путём, аудио — `file://`; `normalize_h3_conditions` перенесён, но для путей панели он ничего не меняет.
+18. §6 проба (а) «нумерация `<Picture N>`»: по коду сервера (`presentation.py:230-270`, `stages/text_encoding.py:385`) кейфрейм не нумеруется; по решению после ревью это ещё и подтверждается генерацией — проба `picture_numbering` (задача 14, шаг 8). Проба (б) «предел картинок»: в коде предела нет, картинки масштабируются до 2048 по короткой стороне; `H3_MAX_REF_IMAGES` по умолчанию 6, уточняется пробой `eight_references`.
 19. §3.3.10 «если длительностей нет — равные куски»: схема `SCENARIO_SCHEMA` требует длительности, поэтому «равные куски» — путь `procedural: true` при sglang (`_equal_scenario_scenes`).
 20. Длительность сцены: sglang принимает 3–15 с, схема сценария — 5–10 с; план держит 5–10, кроме последней сцены клипа, которая при добивании вверх может выйти до 15 с.
-21. §4.2.4 «черновая сборка из исходных остаётся»: понято как «при выключенном (или упавшем и выключенном) апскейле сборка идёт из исходных частей»; отдельной автоматической черновой сборки до апскейла план не делает. Уточнить у владельца.
+21. §4.2.4 «черновая сборка из исходных остаётся» (решение после ревью): черновая сборка из исходных частей доступна всегда отдельным действием «Черновая сборка» (`POST /api/projects/<id>/assembly/draft` → `assembly/draft.mp4`); при выключенном апскейле обычная сборка и так из исходных; финальная при включённом — из `-ltx`.
 22. §3.5 «полоска миниатюр под сценой», правка карточек на месте, фильтр и поиск — в волну 1 не входят (§10: в старый интерфейс — только простая форма); в план не включены.
-23. §3.3.15: из таблицы h3-bench исключены медианы 512/175 и 512/192 (прогоны beach с тремя 2048-px референсами, 2810/2980 с против 345–720 с у соседей).
+23. §3.3.15: в таблице оценок оставлены и строки ref2va-прогонов beach (512/175 → 2810 с, 512/192 → 2980 с): теперь все сцены — ref2va (решение после ревью).
 24. §3.4: установка systemd-юнита требует `sudo` — шаг владельца; логи движков диспетчер пишет как `serve-panel-*.log` / `comfy-panel-*.log` в те же каталоги `logs/`.
+25. §4.1.3 (обновлена 07.10): `t2va` убран полностью — `task` всегда `ref2va`, сцена без референса (нет `@`-тега и это не клип) отклоняется на гейте и в парсере для **каждой** сцены, не только сцепленной.
+26. Пересъёмка сцены после апскейла (`invalidate_scene_chain`) сбрасывает `stages.upscale` и `ltx_path` сброшенных сцен — спека этого не оговаривала, без этого сборка взяла бы старые `-ltx`.
+27. «Освободить карту», когда в работе сборка (ffmpeg, не GPU): движки освобождаются сразу, сборка не отменяется; подтверждение и отмена — только для `generate`/`upscale`. «Вернуть Qwen» при непустой очереди — `409 queue_busy` (спека: «после очереди»).
+28. «С какого времени держит карту» чужой процесс — диспетчер помнит `first_seen` в памяти (сбрасывается при его перезапуске), плашка показывает «уже N мин».
 
 ## Самопроверка плана (выполнена при написании)
 
