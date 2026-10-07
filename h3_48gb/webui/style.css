@@ -1608,7 +1608,10 @@ audio.proj-audio { width: 100%; margin-top: 8px; display: block; }
   * { animation: none !important; transition: none !important; }
 }
 
-.gpu-banner { padding: 2px 8px; border-radius: 4px; font-size: 0.8em; line-height: 1.25; max-width: 34ch; }
+.gpu-row { max-width: var(--shell); margin: 0 auto; padding: 0 var(--pad) 8px; display: flex;
+  flex-wrap: wrap; align-items: center; gap: 8px; }
+.gpu-row:not(:has(> :not([hidden]))) { display: none; }   /* mlx: ни одного элемента — строки нет */
+.gpu-banner { padding: 2px 8px; border-radius: 4px; font-size: 0.9em; }
 .gpu-banner[data-tone="wait"] { background: var(--warn-soft); }
 .gpu-banner[data-tone="own"] { background: var(--accent-soft); }
 .gpu-banner[data-tone="bad"] { background: var(--fail-soft); }

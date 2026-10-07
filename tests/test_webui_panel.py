@@ -1,6 +1,8 @@
 """The wave-1 UI minimum (spec §3.3.13-14, §3.5, §10): pure functions of app.js called through
 node with exact expected values, plus source checks for the DOM wiring that has no pure seam."""
 import json
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -149,11 +151,11 @@ def test_scene_tag_issues_and_suggestions():
 def test_project_route_html_is_one_checkbox_bound_to_the_project():
     html = _node_eval("console.log(JSON.stringify(app.projectRouteHtml("
                       "{id: 'p1', route: [{stage: 'scenes', enabled: true},"
-                      " {stage: 'upscale', enabled: false}]})));")
+                      " {stage: 'upscale', enabled: false}]}, 'sglang')));")
     assert html == ('<label class="route-upscale"><input type="checkbox" class="route-upscale-box" '
                     'data-id="p1"> Апскейл LTX после всех сцен</label>')
     on = _node_eval("console.log(JSON.stringify(app.projectRouteHtml("
-                    "{id: 'p1', route: [{stage: 'upscale', enabled: true}]})));")
+                    "{id: 'p1', route: [{stage: 'upscale', enabled: true}]}, 'sglang')));")
     assert on == ('<label class="route-upscale"><input type="checkbox" class="route-upscale-box" '
                   'data-id="p1" checked> Апскейл LTX после всех сцен</label>')
 
@@ -163,11 +165,11 @@ def test_project_tag_warnings_and_settings_html():
     warn = _node_eval("console.log(JSON.stringify(app.projectTagWarningsHtml({kind: 'video', "
                       "references: [{tag: '@alice', version: 1}], scenes: ["
                       "{idx: 0, prompt: '@alice runs'}, {idx: 1, prompt: 'a dog'}, "
-                      "{idx: 2, prompt: '@bob waves'}]})));")
+                      "{idx: 2, prompt: '@bob waves'}]}, 'sglang')));")
     assert warn == ('<ul class="tag-warnings"><li>Сцена 1: нужен хотя бы один референс (@тег) в сцене</li>'
                     '<li>Сцена 2: незнакомый тег @bob</li></ul>')
     assert _node_eval("console.log(JSON.stringify(app.projectTagWarningsHtml({kind: 'clip', "
-                      "references: [], scenes: [{idx: 0, prompt: 'a dog'}]})));") == ""
+                      "references: [], scenes: [{idx: 0, prompt: 'a dog'}]}, 'sglang')));") == ""
     settings = _node_eval("console.log(JSON.stringify(app.projectSettingsHtml("
                           "{id: 'p1', i2v_prefix: 'Go <on>.'})));")
     assert settings == ('<div class="project-settings" data-id="p1"><label>Начало сцепленной сцены '
@@ -241,3 +243,163 @@ def test_references_payload_keeps_pinned_versions_and_pins_new_ones_to_latest():
     payload = _node_eval("console.log(JSON.stringify(app.referencesPayload("
                          "['@alice', '@beach'], [{tag: '@alice', version: 2}])));")
     assert payload == [{"tag": "@alice", "version": 2}, {"tag": "@beach"}]
+
+
+# -- fix round 1 ----------------------------------------------------------------------------------
+
+
+@_needs_node
+def test_banner_when_the_panel_holds_the_card_and_nvidia_smi_is_down():
+    dispatcher = {**_dispatcher(own={"h3": {"pid": 1, "variant": "ref2va", "started_at": 1,
+                                            "log": "/l", "ready": True}}),
+                  "gpu": None, "gpu_error": "nvidia-smi недоступен"}
+    gpu = {"ok": True, "dispatcher_error": None, "idle_release_at": None, "dispatcher": dispatcher,
+           "queue": {"pending": 0, "paused": True, "running": None}}
+    assert _banner(gpu) == {
+        "visible": True, "tone": "own", "qwenUnload": False, "qwenRestore": False,
+        "text": "Карту держит панель: H3 (память GPU неизвестна: nvidia-smi недоступен) — "
+                "освободится кнопкой"}
+
+
+@_needs_node
+def test_mlx_shows_no_tag_demands_and_no_upscale_checkbox():
+    proj = ("{kind: 'video', references: [], route: [{stage: 'upscale', enabled: true}], "
+            "scenes: [{idx: 0, prompt: 'a dog'}]}")
+    for engine in ("mlx", "undefined"):
+        arg = "undefined" if engine == "undefined" else json.dumps(engine)
+        assert _node_eval(f"console.log(JSON.stringify(app.projectTagWarningsHtml({proj}, {arg})));") == ""
+        assert _node_eval(f"console.log(JSON.stringify(app.projectRouteHtml({proj}, {arg})));") == ""
+        assert _node_eval(f"console.log(JSON.stringify(app.projectUpscaleHtml({proj}, {arg})));") == ""
+        assert _node_eval("console.log(JSON.stringify(app.runCancelHtml({id: 'j1'}, "
+                          f"{arg})));") == ""
+
+
+@_needs_node
+def test_upscale_status_and_retry_button():
+    def html(status):
+        return _node_eval("console.log(JSON.stringify(app.projectUpscaleHtml({id: 'p1', "
+                          f"stages: {{upscale: '{status}'}}, "
+                          "route: [{stage: 'upscale', enabled: true}]}, 'sglang')));")
+    assert html("running") == '<div class="upscale-status" data-id="p1">Апскейл LTX: идёт</div>'
+    assert html("failed") == (
+        '<div class="upscale-status" data-id="p1">Апскейл LTX: упал <button type="button" '
+        'class="upscale-retry" data-id="p1">Повторить апскейл</button></div>')
+    assert _node_eval("console.log(JSON.stringify(app.projectUpscaleHtml({id: 'p1', "
+                      "stages: {upscale: 'failed'}, route: [{stage: 'upscale', enabled: false}]}, "
+                      "'sglang')));") == ""
+
+
+@_needs_node
+def test_cancel_button_and_library_edit_controls_and_request():
+    assert _node_eval("console.log(JSON.stringify(app.runCancelHtml({id: 'j<1'}, 'sglang')));") == (
+        ' <button type="button" data-act="cancel-run" data-id="j&lt;1">Отменить</button>')
+    cards = [{"tag": "@alice", "kind": "person", "version": 2, "description": 'a "red" coat',
+              "assets": []}]
+    html = _node_eval(f"console.log(JSON.stringify(app.libraryCardsHtml({json.dumps(cards)}, '/o')));")
+    assert html == ('<div class="lib-card"><b>@alice</b> <span class="muted">person, v2</span>'
+                    '<p>a &quot;red&quot; coat</p><input class="lib-edit-desc" '
+                    'value="a &quot;red&quot; coat"> <button type="button" class="lib-save" '
+                    'data-tag="@alice">Сохранить описание</button></div>')
+    assert _node_eval("console.log(JSON.stringify(app.libraryUpdateRequest('@alice', 'new')));") == {
+        "name": "alice", "body": {"description": "new"}}
+
+
+@_needs_node
+def test_chat_tags_are_sent_only_when_changed_and_bad_tags_are_reported():
+    def body(raw, known):
+        return _node_eval(f"console.log(JSON.stringify(app.chatTagsBody({json.dumps(raw)}, "
+                          f"{json.dumps(known)})));")
+    # untouched field (also empty and known-empty): nothing is sent, the session keeps its tags
+    assert body("", "") == {"body": {}, "error": None}
+    assert body("@alice @beach", "@alice @beach") == {"body": {}, "error": None}
+    assert body(" @alice  @beach ", "@alice") == {"body": {"tags": ["@alice", "@beach"]}, "error": None}
+    # cleared on purpose: an explicit empty list
+    assert body("", "@alice") == {"body": {"tags": []}, "error": None}
+    assert body("@alice @Bob", "") == {
+        "body": {}, "error": "тег @Bob: строчные a-z, 0-9 и «-», 2–32 символа, с «@» в начале"}
+    assert body("@a_b", "")["error"].startswith("тег @a_b:")
+    assert body("alice", "")["error"].startswith("тег alice:")
+
+
+_PANEL_UI = Path(__file__).resolve().parent / "_panel_ui_check.mjs"
+_APP_URL = (Path(__file__).resolve().parent.parent / "h3_48gb" / "webui" / "app.js").as_uri()
+
+
+def _ui(scenario: str):
+    import os
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if k != "NODE_OPTIONS"}
+    result = subprocess.run([shutil.which("node"), str(_PANEL_UI), _APP_URL, scenario],
+                            capture_output=True, text=True, timeout=60, env=env)
+    assert result.returncode == 0, f"{scenario}: {result.stderr}"
+    return json.loads(result.stdout)
+
+
+CONFIRM = "H3 считает сцену — освободить карту? Сцена будет потеряна"
+
+
+@_needs_node
+def test_release_asks_then_repeats_with_confirm():
+    assert _ui("release_confirmed") == {
+        "bodies": [{}, {"confirm": True}], "confirms": [CONFIRM], "alerts": [], "repolled": True}
+
+
+@_needs_node
+def test_release_declined_sends_no_second_request():
+    assert _ui("release_declined") == {
+        "bodies": [{}], "confirms": [CONFIRM], "alerts": [], "repolled": False}
+
+
+@_needs_node
+def test_release_second_request_failing_is_reported_and_repolled():
+    assert _ui("release_second_fails") == {
+        "bodies": [{}, {"confirm": True}], "confirms": [CONFIRM], "alerts": ["диспетчер лёг"],
+        "repolled": True}
+
+
+@_needs_node
+def test_notifications_first_snapshot_silent_then_project_ready_and_wait_not_repeated():
+    # 11 minutes of waiting is already over the threshold on the very first snapshot, which only
+    # primes `lastWaitNotifyMs`; carrying it over is what keeps the second poll quiet.
+    assert _ui("notify") == {"afterFirst": [], "afterSecond": [
+        {"title": "Проект готов", "body": "p2"}]}
+
+
+@_needs_node
+def test_a_render_exception_does_not_stop_notifications_or_the_poll():
+    assert _ui("render_throws") == {"afterFirst": [], "afterSecond": [
+        {"title": "Проект готов", "body": "p2"}]}
+
+
+@_needs_node
+def test_a_refused_route_change_goes_through_withproject_and_the_box_is_put_back():
+    assert _ui("route_error") == {
+        "puts": [["/api/projects/p1/route", {"upscale": True}]], "alerts": [],
+        "projectRereads": 1, "providerReloads": 0, "boxChecked": False}
+
+
+@_needs_node
+def test_upscale_retry_posts_to_the_retry_route():
+    assert _ui("upscale_retry") == {
+        "status": True, "posts": [["/api/projects/p1/upscale/retry", {}]]}
+
+
+@_needs_node
+def test_cancelling_the_running_job_shows_the_servers_message():
+    assert _ui("cancel_run") == {
+        "deletes": ["/api/jobs/j1"],
+        "alerts": ["H3 досчитает сцену впустую, следующая задача начнётся после"]}
+
+
+@_needs_node
+def test_saving_a_library_description_puts_it_to_the_card_route():
+    assert _ui("library_save") == {
+        "puts": [["/api/library/alice", {"description": "a woman in a green coat"}]]}
+
+
+@_needs_node
+def test_scene_prompt_input_demands_a_tag_on_sglang_and_stays_silent_on_mlx():
+    assert _ui("input_sglang") == {
+        "title": "нужен хотя бы один референс (@тег) в сцене",
+        "toggles": [["has-tag-issues", True]]}
+    assert _ui("input_mlx") == {"title": "", "toggles": []}

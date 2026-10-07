@@ -102,9 +102,12 @@ export function gpuBanner(gpu, nowMs) {
     const at = Date.parse(gpu.idle_release_at || "");
     const when = Number.isFinite(at)
       ? `через ${Math.max(0, Math.ceil((at - nowMs) / 60000))} мин или кнопкой` : "кнопкой";
+    // `gpu: null` + `gpu_error` — nvidia-smi на хосте недоступен: память не показываем, а
+    // причину называем (иначе плашка падала на `d.gpu.memory_used_mb` и роняла весь опрос).
+    const memory = d.gpu ? `, ${formatGb(d.gpu.memory_used_mb / 1024)}`
+      : ` (память GPU неизвестна: ${d.gpu_error || "нет данных"})`;
     return { visible: true, tone: "own", qwenUnload: false, qwenRestore,
-             text: `Карту держит панель: ${names}, ${formatGb(d.gpu.memory_used_mb / 1024)} `
-               + `— освободится ${when}` };
+             text: `Карту держит панель: ${names}${memory} — освободится ${when}` };
   }
   return { ...hidden, visible: qwenRestore, qwenRestore,
            text: qwenRestore ? "Qwen выгружен панелью — его можно вернуть" : "" };
@@ -166,7 +169,9 @@ const TAG_PROBLEM_TEXT = {
 };
 
 /** Сцены, которые гейт отклонит (спека §4.1.3, §3.5), — видно до нажатия «Утвердить». */
-export function projectTagWarningsHtml(proj) {
+export function projectTagWarningsHtml(proj, engine) {
+  // mlx не знает референсов: там сцена без @тега — норма, и страница не должна ничего требовать
+  if (engine !== "sglang") return "";
   const pinned = (proj.references || []).map((ref) => ref.tag);
   const needsTag = proj.kind !== "clip";
   const rows = [];
@@ -194,7 +199,8 @@ export function tagSuggestions(text, caret, cards) {
   return cards.filter((card) => card.tag.startsWith(`@${match[1]}`));
 }
 
-export function projectRouteHtml(proj) {
+export function projectRouteHtml(proj, engine) {
+  if (engine !== "sglang") return "";   // апскейл LTX живёт только на alex-neuro
   const entry = (proj.route || []).find((e) => e.stage === "upscale");
   if (!entry) return "";
   return `<label class="route-upscale"><input type="checkbox" class="route-upscale-box" `
@@ -217,6 +223,49 @@ export function projectReferencesHtml(proj, cards, pinned) {
     + rows + `</div>`;
 }
 
+const UPSCALE_WORD = { draft: "ещё не шёл", running: "идёт", done: "готов", failed: "упал",
+                       awaiting_approval: "ждёт", approved: "ждёт очереди" };
+
+/** Статус этапа апскейла в модалке проекта и «Повторить апскейл» при `failed` (спека §3.3.8). */
+export function projectUpscaleHtml(proj, engine) {
+  if (engine !== "sglang") return "";
+  const entry = (proj.route || []).find((e) => e.stage === "upscale");
+  if (!entry || !entry.enabled) return "";
+  const status = (proj.stages || {}).upscale || "draft";
+  const id = escapeHtml(proj.id);
+  const retry = status === "failed"
+    ? ` <button type="button" class="upscale-retry" data-id="${id}">Повторить апскейл</button>` : "";
+  return `<div class="upscale-status" data-id="${id}">Апскейл LTX: `
+    + `${escapeHtml(UPSCALE_WORD[status] || status)}${retry}</div>`;
+}
+
+/** «Отменить» у выполняемой задачи (только sglang: на mlx бежащую задачу не остановить). */
+export function runCancelHtml(job, engine) {
+  if (engine !== "sglang") return "";
+  return ` <button type="button" data-act="cancel-run" data-id="${escapeHtml(job.id)}">Отменить</button>`;
+}
+
+/** Запрос на правку карточки библиотеки: сервер сам заводит следующую версию (vN). */
+export function libraryUpdateRequest(tag, description) {
+  return { name: tag.replace(/^@/, ""), body: { description } };
+}
+
+const CHAT_TAG_OK = /^@[a-z0-9-]{2,32}$/;
+
+/** Что поле тегов чата добавляет к ходу. Не тронутое поле (равно тому, что сессия уже знает)
+ *  не шлёт ничего — иначе каждый ход затирал бы `session.tags` пустым списком. Невалидный тег —
+ *  сообщение, а не молчаливая потеря. */
+export function chatTagsBody(raw, known) {
+  const text = String(raw || "").trim();
+  if (text === String(known || "").trim()) return { body: {}, error: null };
+  const tokens = text.split(/\s+/).filter(Boolean);
+  const bad = tokens.find((token) => !CHAT_TAG_OK.test(token));
+  if (bad) {
+    return { body: {}, error: `тег ${bad}: строчные a-z, 0-9 и «-», 2–32 символа, с «@» в начале` };
+  }
+  return { body: { tags: tokens }, error: null };
+}
+
 /** Тело `PUT …/references`: уже закреплённая карточка сохраняет свою версию (снятие соседней
  *  галочки не должно молча обновить её до последней), новая уходит без `version`. */
 export function referencesPayload(checkedTags, pinned) {
@@ -232,7 +281,10 @@ export function libraryCardsHtml(cards, outdir) {
       ? `<img src="/media/${escapeHtml(first.slice(outdir.length + 1))}" alt="">` : "";
     return `<div class="lib-card">${thumb}<b>${escapeHtml(card.tag)}</b> `
       + `<span class="muted">${escapeHtml(card.kind)}, v${card.version}</span>`
-      + `<p>${escapeHtml(card.description)}</p></div>`;
+      + `<p>${escapeHtml(card.description)}</p>`
+      + `<input class="lib-edit-desc" value="${escapeHtml(card.description)}"> `
+      + `<button type="button" class="lib-save" data-tag="${escapeHtml(card.tag)}">`
+      + `Сохранить описание</button></div>`;
   }).join("");
 }
 
@@ -2591,8 +2643,10 @@ function startPage() {
   async function pollGpu() {
     if (!state || state.engine !== "sglang") { gpu = null; renderGpu(); return; }
     try { gpu = await api("GET", "/api/gpu"); } catch { gpu = null; }
-    renderGpu();
-    notifyFromState();
+    // The render and the notifier must never reject: `poll` awaits this, and one thrown error
+    // here used to stop every following tick of the whole page.
+    try { renderGpu(); } catch (err) { console.error("renderGpu", err); }
+    try { notifyFromState(); } catch (err) { console.error("notifyFromState", err); }
   }
 
   function renderGpu() {
@@ -2628,12 +2682,16 @@ function startPage() {
 
   async function releaseCard() {
     try {
-      await api("POST", "/api/gpu/release", {});
+      try {
+        await api("POST", "/api/gpu/release", {});
+      } catch (err) {
+        const code = err.payload && err.payload.error && err.payload.error.code;
+        if (code !== "release_needs_confirm") throw err;
+        if (!confirm(err.payload.error.message)) return;
+        await api("POST", "/api/gpu/release", { confirm: true });
+      }
     } catch (err) {
-      const code = err.payload && err.payload.error && err.payload.error.code;
-      if (code !== "release_needs_confirm") { alert(err.payload ? err.payload.error.message : String(err)); return; }
-      if (!confirm(err.payload.error.message)) return;
-      await api("POST", "/api/gpu/release", { confirm: true });
+      alert(err.payload ? err.payload.error.message : String(err));
     }
     await poll();
   }
@@ -2930,7 +2988,8 @@ function startPage() {
     $("project-body").innerHTML = projectScriptStageHtml(proj)
       + projectTrackStageHtml(proj, project.active_job, outdir)
       + projectScenarioStageHtml(proj, projectBusy)
-      + projectTagWarningsHtml(proj) + projectSettingsHtml(proj) + projectRouteHtml(proj)
+      + projectTagWarningsHtml(proj, state && state.engine) + projectSettingsHtml(proj)
+      + projectRouteHtml(proj, state && state.engine) + projectUpscaleHtml(proj, state && state.engine)
       + projectReferencesHtml(proj, libraryCards, proj.references || [])
       + projectScenesStageHtml(proj, outdir)
       + projectAssemblyStageHtml(proj, outdir);
@@ -3553,6 +3612,7 @@ function startPage() {
       `оценка <span class="num">${formatDuration(jobSeconds(job))}</span> · `,
       `<span class="mono">${escapeHtml(job.id)}</span> · `,
       `<span class="run-note">${escapeHtml(job.note)}</span>`,
+      runCancelHtml(job, state.engine),
       `</div>`,
       `</div>`,
     ].join("");
@@ -3923,6 +3983,9 @@ function startPage() {
       // ввода), но ещё не ушёл ходом — `null`, пока ничего не приложено; `sendChatMessage`
       // сбрасывает его в начале хода, а `attachmentBody` читает как `state.pendingImage`.
       pendingImage: null,
+      // What the server already knows as the session's tags: the field is filled from it and a
+      // turn carries `tags` only when the field differs (see `chatTagsBody`).
+      tagsKnown: (session.tags || []).join(" "),
       // A3: длительность сессии — редактируется прямо в шапке модалки (`chat-duration`) и
       // уходит каждым ходом (`sendChatMessage`); `chatDuration` отвечает за дефолт, если сессия
       // почему-то ничего не сказала.
@@ -3957,6 +4020,8 @@ function startPage() {
       // ещё не ответил проектом — кнопка «Сделать проектом» ниже остаётся disabled.
       project: (session.project && typeof session.project === "object") ? session.project : null,
     };
+    $("chat-tags").value = chat.tagsKnown;
+    $("chat-tags-error").hidden = true;
     $("chat-modal").hidden = false;
     $("chat-finish").textContent = FINISH_LABEL[chat.source.kind] || FINISH_LABEL.new;
     $("chat-source").textContent = chatSourceText(chat.source);
@@ -4047,6 +4112,10 @@ function startPage() {
     const text = typed.trim();
     const attachment = chat.pendingImage;
     if (!text && !attachment) return;
+    const tagsPart = chatTagsBody($("chat-tags").value, chat.tagsKnown);
+    $("chat-tags-error").hidden = !tagsPart.error;
+    $("chat-tags-error").textContent = tagsPart.error || "";
+    if (tagsPart.error) return;   // nothing is sent and nothing is lost: the field stays as typed
     const extra = attachmentBody({ text, pendingImage: attachment, mode: chat.mode });
     const outgoingText = extra.text !== undefined ? extra.text : text;
     const session = chat;
@@ -4072,12 +4141,13 @@ function startPage() {
                            // могла подвинуться в `chat-duration`.
                            duration: chatDuration(session),
                            image: extra.image, set_mode: extra.set_mode,
-                           tags: ($("chat-tags").value.match(/@[a-z0-9-]{2,32}/g) || []) });
+                           ...tagsPart.body });
     } catch (error) {
       failure = error;
     }
     session.sending = false;
     $("chat-send").disabled = false;
+    if (answer && tagsPart.body.tags) session.tagsKnown = tagsPart.body.tags.join(" ");
 
     if (answer) {
       if (!landTurn(chat, session, answer)) return;
@@ -4796,6 +4866,13 @@ function startPage() {
       return;
     }
     if (button.dataset.act === "reveal") { revealInFinder(id); return; }
+    if (button.dataset.act === "cancel-run") {
+      withQueue(async () => {
+        const answer = await api("DELETE", "/api/jobs/" + encodeURIComponent(id));
+        if (answer.message) alert(answer.message);
+      });
+      return;
+    }
     if (button.dataset.act === "del") {
       withQueue(async () => {
         await api("DELETE", "/api/jobs/" + encodeURIComponent(id));
@@ -4933,22 +5010,23 @@ function startPage() {
     }
   });
 
+  // Every action below goes through `withProject`: its own error banner, `projectBusy`, and a
+  // re-read of the panel -- which is also what puts a checkbox back when the server refused it
+  // (the refresh redraws from the server's state, not from the click).
   document.addEventListener("change", (event) => {
     const target = event.target;
     if (!project || !project.project) return;
     if (target.classList.contains("route-upscale-box")) {
-      api("PUT", `/api/projects/${encodeURIComponent(target.dataset.id)}/route`,
-          { upscale: target.checked }).then(() => openProjectModal(target.dataset.id))
-        .catch((err) => alert(err.payload ? err.payload.error.message : String(err)));
+      withProject(() => api("PUT", `/api/projects/${encodeURIComponent(target.dataset.id)}/route`,
+                            { upscale: target.checked }));
     }
     if (target.classList.contains("ref-pin")) {
       const box = target.closest(".project-refs");
       const refs = [...box.querySelectorAll(".ref-pin")].filter((el) => el.checked)
         .map((el) => el.dataset.tag);
       const refsBody = referencesPayload(refs, project.project.references || []);
-      api("PUT", `/api/projects/${encodeURIComponent(box.dataset.id)}/references`, { references: refsBody })
-        .then(() => openProjectModal(box.dataset.id))
-        .catch((err) => alert(err.payload ? err.payload.error.message : String(err)));
+      withProject(() => api("PUT", `/api/projects/${encodeURIComponent(box.dataset.id)}/references`,
+                            { references: refsBody }));
     }
   });
 
@@ -4956,30 +5034,50 @@ function startPage() {
     const field = event.target.closest(".i2v-prefix");
     if (!field || !project || !project.project) return;
     if (field.value === (project.project.i2v_prefix || "")) return;
-    api("PUT", `/api/projects/${encodeURIComponent(field.dataset.id)}/settings`, { i2v_prefix: field.value })
-      .then(() => openProjectModal(field.dataset.id))
-      .catch((err) => alert(err.payload ? err.payload.error.message : String(err)));
+    withProject(() => api("PUT", `/api/projects/${encodeURIComponent(field.dataset.id)}/settings`,
+                          { i2v_prefix: field.value }));
   });
 
   document.addEventListener("click", (event) => {
-    const button = event.target.closest(".draft-assembly");
-    if (!button) return;
-    api("POST", `/api/projects/${encodeURIComponent(button.dataset.id)}/assembly/draft`, {})
-      .then(() => poll())
-      .catch((err) => alert(err.payload ? err.payload.error.message : String(err)));
+    const draft = event.target.closest(".draft-assembly");
+    if (draft) {
+      withProject(() => api("POST", `/api/projects/${encodeURIComponent(draft.dataset.id)}/assembly/draft`, {}));
+      return;
+    }
+    const retry = event.target.closest(".upscale-retry");
+    if (retry) {
+      withProject(() => api("POST", `/api/projects/${encodeURIComponent(retry.dataset.id)}/upscale/retry`, {}));
+      return;
+    }
+    const save = event.target.closest(".lib-save");
+    if (save) saveLibraryDescription(save);
   });
+
+  async function saveLibraryDescription(button) {
+    const card = button.closest(".lib-card");
+    const request = libraryUpdateRequest(button.dataset.tag, card.querySelector(".lib-edit-desc").value.trim());
+    try {
+      await api("PUT", `/api/library/${encodeURIComponent(request.name)}`, request.body);
+      $("lib-error").hidden = true;
+      await loadLibrary();
+    } catch (err) {
+      $("lib-error").textContent = err.payload ? err.payload.error.message : String(err);
+      $("lib-error").hidden = false;
+    }
+  }
 
   document.addEventListener("input", (event) => {
     const el = event.target.closest(".scenario-prompt");
-    if (!el || !project || !project.project) return;
-      const pinned = (project.project.references || []).map((r) => r.tag);
-      const issues = sceneTagIssues(el.value, pinned, { needsTag: project.project.kind !== "clip" });
-      el.classList.toggle("has-tag-issues", issues.length > 0);
-      el.title = issues.map((i) => TAG_PROBLEM_TEXT[i.problem](i.tag)).join("; ");
-      const hint = tagSuggestions(el.value, el.selectionStart, libraryCards.filter((c) => pinned.includes(c.tag)));
-      let box = el.nextElementSibling && el.nextElementSibling.classList.contains("tag-hint") ? el.nextElementSibling : null;
-      if (!box) { box = document.createElement("div"); box.className = "tag-hint"; el.after(box); }
-      box.textContent = hint.length ? `теги: ${hint.map((c) => c.tag).join(" ")}` : "";
+    // mlx has no references: no highlight, no hint, no demand for a tag
+    if (!el || !project || !project.project || !state || state.engine !== "sglang") return;
+    const pinned = (project.project.references || []).map((r) => r.tag);
+    const issues = sceneTagIssues(el.value, pinned, { needsTag: project.project.kind !== "clip" });
+    el.classList.toggle("has-tag-issues", issues.length > 0);
+    el.title = issues.map((i) => TAG_PROBLEM_TEXT[i.problem](i.tag)).join("; ");
+    const hint = tagSuggestions(el.value, el.selectionStart, libraryCards.filter((c) => pinned.includes(c.tag)));
+    let box = el.nextElementSibling && el.nextElementSibling.classList.contains("tag-hint") ? el.nextElementSibling : null;
+    if (!box) { box = document.createElement("div"); box.className = "tag-hint"; el.after(box); }
+    box.textContent = hint.length ? `теги: ${hint.map((c) => c.tag).join(" ")}` : "";
   });
 
   // Правка сюжета сохраняется на блюре поля (task 5 brief: "PUT при blur/кнопке «Сохранить»")
