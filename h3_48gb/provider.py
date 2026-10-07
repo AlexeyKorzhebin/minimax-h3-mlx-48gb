@@ -602,6 +602,11 @@ def _allows_null(sub: dict) -> bool:
 
 def _fill_nullable(value, sub: dict):
     if isinstance(value, dict) and isinstance(sub.get("properties"), dict):
+        if sub.get("additionalProperties") is False:
+            # Strict object: keys outside `properties` (Sonnet adds `fresh_start`, `_note`) are
+            # dropped so the answer matches the schema. Only for an explicit `false`.
+            for key in [k for k in value if k not in sub["properties"]]:
+                del value[key]
         for key, child in sub["properties"].items():
             if key not in value:
                 if _allows_null(child):

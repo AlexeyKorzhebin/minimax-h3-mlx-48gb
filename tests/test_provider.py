@@ -1784,3 +1784,24 @@ def test_an_omitted_non_nullable_field_is_never_invented():
     assert out["prompt"]["instruction"] is None
     out2, _ = _chat_once(json.dumps({"prompt": None}))
     assert "reply" not in out2, "обязательное не-nullable `reply` не дописывается"
+
+
+def test_keys_outside_a_strict_schema_are_dropped_at_top_level_and_in_scenes():
+    scene = {"prompt": {"instruction": None, "integrated_multimodal_description": "d",
+                        "overall_soundscape": "s", "non_diegetic_music": "m"},
+             "duration": 5, "fresh_start": False}
+    reply = {"reply": "ok", "prompt": None, "slug": None, "_note": "x",
+             "project": {"kind": "video", "scenes": [scene], "lyrics": None, "caption": None,
+                         "extra": 1}}
+    out, _ = _chat_once(json.dumps(reply))
+    expect_scene = {k: v for k, v in scene.items() if k != "fresh_start"}
+    assert out == {"reply": "ok", "prompt": None, "slug": None,
+                   "project": {"kind": "video", "scenes": [expect_scene], "lyrics": None,
+                               "caption": None}}
+
+
+def test_keys_outside_a_schema_without_additional_properties_false_are_kept():
+    schema = {"schema": {"type": "object", "properties": {"a": {"type": "string"}}}}
+    assert provider._parse_model_json('{"a": "x", "b": 1}', schema) == {"a": "x", "b": 1}
+    schema["schema"]["additionalProperties"] = True
+    assert provider._parse_model_json('{"a": "x", "b": 1}', schema) == {"a": "x", "b": 1}
