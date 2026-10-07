@@ -57,6 +57,11 @@ CLASS_SOURCES = [
     "app.sceneRefsHtml({refs: ['@hero']}, 1, ['@hero', '@arena'])",
     "app.tagHintHtml('fight @a', 8, [{tag: '@arena'}])",
     "app.scenarioJsonHtml('p1')",
+    "app.projectUpscaleHtml({id: 'p1', stages: {upscale: 'failed'}, route: [{stage: 'upscale', enabled: true}], "
+    "scenes: [], upscale_report: {status: 'failed', error: 'x'}}, 'sglang')",
+    "app.projectAssemblyHtml({id: 'p1', title: 'T', created_at: '2026-10-05T10:00:00', "
+    "stages: {assembly: 'done'}, assembly: {final_path: '/o/projects/p1/assembly/final.mp4', v: 1}, "
+    "scenes: [{idx: 0, status: 'done'}]}, '/o')",
     "app.projectSettingsHtml({id: 'p1', i2v_prefix: '', seed: 3}, 'sglang', 'locked', 'seed')",
     "app.projectRouteHtml({id: 'p1', route: [{stage: 'upscale', enabled: true}]}, 'sglang', 'locked')",
     "app.retryPanelHtml({idx: 0, prompt: 'a', steps: null}, {id: 'p1', engine: 'sglang', "
@@ -82,6 +87,7 @@ HOOK_CLASSES = {
     "upscale-retry": "click handler (button look comes from .ghost)",
     "lib-save": "click handler",
     "scene-edit-prompt": "the scene prompt field (look comes from .inp)",
+    "draft-assembly": "click handler (button look comes from .ghost)",
     "project-seed": "the project seed field (look comes from .inp)",
     "retry-prompt": "the retry prompt field (look comes from .inp)",
     "retry-seed": "the retry seed field (look comes from .inp)",
@@ -948,3 +954,87 @@ def test_retry_panel_names_a_single_scene():
     assert '<p class="hint">Пересчитает сцену #5</p>' in _js(
         "app.retryPanelHtml({idx: 5, prompt: 'p', steps: null}, {id: 'p1', engine: 'mlx', "
         "effectiveSeed: 42, cascade: [5]})")
+
+
+@_needs_node
+def test_pipeline_notes_include_the_upscale():
+    assert _js("['upscale project 20261007-ab', 'project scene p #1', 'assemble project p', "
+               "'upscale projects x'].map((n) => app.isProjectPipelineNote(n))") == [True, True, False, False]
+
+
+UPSCALED = ("{id: 'p1', stages: {upscale: 'done'}, route: [{stage: 'upscale', enabled: true}], "
+            "scenes: [{idx: 0, ltx_path: '/a'}, {idx: 1, ltx_path: '/b'}, {idx: 2}], "
+            "upscale_report: {status: 'done', strength: 0.6, motion: 0.1, attempted: [0, 1, 2], error: null}}")
+
+
+@_needs_node
+def test_upscale_line_shows_strength_and_parts():
+    assert _js(f"app.projectUpscaleHtml({UPSCALED}, 'sglang')") == (
+        '<div class="upscale-status" data-id="p1">Апскейл LTX: готов · сила 0,6 · 2 из 3 частей</div>')
+
+
+@_needs_node
+def test_stale_upscale_report_is_not_shown():
+    running = UPSCALED.replace("stages: {upscale: 'done'}", "stages: {upscale: 'running'}")
+    assert _js(f"app.projectUpscaleHtml({running}, 'sglang')") == (
+        '<div class="upscale-status" data-id="p1">Апскейл LTX: идёт</div>')
+
+
+@_needs_node
+def test_failed_upscale_shows_its_error():
+    failed = ("{id: 'p1', stages: {upscale: 'failed'}, route: [{stage: 'upscale', enabled: true}], "
+              "scenes: [], upscale_report: {status: 'failed', strength: null, motion: null, "
+              "attempted: [], error: 'ComfyUI 500 <x>'}}")
+    assert _js(f"app.projectUpscaleHtml({failed}, 'sglang')") == (
+        '<div class="upscale-status" data-id="p1">Апскейл LTX: упал '
+        '<button type="button" class="upscale-retry" data-id="p1">Повторить апскейл</button>'
+        '<p class="why upscale-error">ComfyUI 500 &lt;x&gt;</p></div>')
+
+
+@_needs_node
+def test_download_name():
+    assert _js("app.downloadName({id: 'p1', title: 'Бой на арене', created_at: '2026-10-05T10:00:00', "
+               "assembly: {v: 1791374400}})") == "boy-na-arene-20261007-final.mp4"
+    assert _js("app.downloadName({id: 'p1', title: 'Бой на арене', created_at: '2026-10-05T10:00:00', "
+               "assembly: {}})") == "boy-na-arene-20261005-final.mp4"
+    assert _js("app.downloadName({id: 'p1', title: '!!!', created_at: '2026-10-05T10:00:00', "
+               "assembly: {}})") == "p1-20261005-final.mp4"
+
+
+@_needs_node
+def test_assembly_block_offers_download_and_draft_only_when_due():
+    done = ("{id: 'p1', title: 'Бой на арене', created_at: '2026-10-05T10:00:00', "
+            "stages: {assembly: 'done'}, assembly: {final_path: '/o/projects/p1/assembly/final.mp4', "
+            "v: 1791374400}, scenes: [{idx: 0, status: 'done'}]}")
+    url = "/media/projects/p1/assembly/final.mp4?v=1791374400"
+    assert _js(f"app.projectAssemblyHtml({done}, '/o')") == (
+        '<div class="proj-stage"><div class="proj-stage-head"><span class="t">Сборка</span>'
+        '<span class="proj-stage-status">готово</span><div class="spacer"></div></div>'
+        '<div class="proj-stage-body"><p class="proj-final">'
+        f'<a class="clip" href="{url}" target="_blank" rel="noopener">final.mp4</a> '
+        f'<a class="ghost" href="{url}" download="boy-na-arene-20261007-final.mp4">Скачать</a></p>'
+        '<button type="button" class="ghost draft-assembly" data-id="p1">Черновая сборка</button>'
+        '</div></div>')
+    pending = ("{id: 'p1', title: 'T', created_at: '2026-10-05T10:00:00', stages: {assembly: 'draft'}, "
+               "assembly: {}, scenes: [{idx: 0, status: 'done'}, {idx: 1, status: 'running'}]}")
+    assert _js(f"app.projectAssemblyHtml({pending}, '/o')") == ""
+    ready = pending.replace("{idx: 1, status: 'running'}", "{idx: 1, status: 'done'}")
+    assert _js(f"app.projectAssemblyHtml({ready}, '/o')") == (
+        '<div class="proj-stage"><div class="proj-stage-head"><span class="t">Сборка</span>'
+        '<span class="proj-stage-status">не начата</span><div class="spacer"></div></div>'
+        '<div class="proj-stage-body">'
+        '<button type="button" class="ghost draft-assembly" data-id="p1">Черновая сборка</button>'
+        '</div></div>')
+    running = ready.replace("stages: {assembly: 'draft'}", "stages: {assembly: 'running'}")
+    assert "draft-assembly" not in _js(f"app.projectAssemblyHtml({running}, '/o')")
+
+
+@_needs_node
+def test_a_project_assembly_tile_has_no_chat_or_copy():
+    job = ("{id: 'j9', kind: 'assemble', exit_code: 0, note: 'assemble project p1', "
+           "output_stem: '/o/projects/p1/assembly/job-final', estimate: {}, "
+           "started_at: '2026-10-07T12:00:00Z', finished_at: '2026-10-07T12:01:00Z'}")
+    html = _js(f"app.finishedRowHtml({job}, '/o', [], new Set(), 'Бой')")
+    assert re.search(r'<div class="acts">.*?</div>', html).group(0) == (
+        '<div class="acts"><button data-act="reveal" data-id="j9">Показать в Finder</button>'
+        '<button data-act="delrun" data-id="j9">Удалить</button></div>')

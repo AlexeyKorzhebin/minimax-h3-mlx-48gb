@@ -679,6 +679,44 @@ export function retryPanelHtml(scene, ctx) {
     + `<button type="button" class="ghost" data-act="retry-scene-cancel" data-idx="${idx}">Отмена</button></div>`;
 }
 
+/** Имя скачиваемого файла: `<слаг названия или id>-<ГГГГММДД>-final.mp4`; дата — локальная дата
+ *  `assembly.v` (mtime финала, секунды), без него — `created_at`. */
+export function downloadName(proj) {
+  const v = Number(proj.assembly && proj.assembly.v);
+  const date = Number.isFinite(v) && v > 0 ? new Date(v * 1000) : new Date(proj.created_at);
+  const stamp = Number.isNaN(date.getTime()) ? "" : String(date.getFullYear())
+    + String(date.getMonth() + 1).padStart(2, "0") + String(date.getDate()).padStart(2, "0");
+  return `${normalizeSlug(proj.title) || proj.id}-${stamp}-final.mp4`;
+}
+
+/** Этап «Сборка»: статус, финал со ссылкой и «Скачать», «Черновая сборка» — когда все сцены готовы. */
+export function projectAssemblyHtml(proj, outdir) {
+  if (proj.kind === "song") return "";
+  const status = proj.stages.assembly;
+  const scenes = proj.scenes || [];
+  const draftDue = scenes.length > 0 && scenes.every((scene) => scene.status === "done")
+    && status !== "running";
+  const finalUrl = proj.assembly.final_path
+    ? projectMediaUrl(proj.assembly.final_path, outdir, proj.assembly.v) : null;
+  if (status === "draft" && !finalUrl && !draftDue) return "";   // сборка ещё не начиналась
+  const statusWord = { draft: "не начата", running: "идёт", done: "готово", failed: "упала" }
+    [status] || status;
+  const id = escapeHtml(proj.id);
+  const retry = status === "failed"
+    ? `<button class="ghost" type="button" data-act="retry-assembly" data-id="${id}">`
+      + `Пересчитать сборку</button>` : "";
+  const link = finalUrl
+    ? `<p class="proj-final"><a class="clip" href="${escapeHtml(finalUrl)}" target="_blank" `
+      + `rel="noopener">final.mp4</a> <a class="ghost" href="${escapeHtml(finalUrl)}" `
+      + `download="${escapeHtml(downloadName(proj))}">Скачать</a></p>` : "";
+  const draft = draftDue
+    ? `<button type="button" class="ghost draft-assembly" data-id="${id}">Черновая сборка</button>` : "";
+  return `<div class="proj-stage"><div class="proj-stage-head"><span class="t">Сборка</span>`
+    + `<span class="proj-stage-status">${escapeHtml(statusWord)}</span>`
+    + `<div class="spacer"></div>${retry}</div>`
+    + `<div class="proj-stage-body">${link}${draft}</div></div>`;
+}
+
 /** Подсказка на `@`: карточки, чей тег начинается с набранного после последнего `@` до каретки. */
 export function tagSuggestions(text, caret, cards) {
   const head = String(text || "").slice(0, caret);
@@ -729,10 +767,21 @@ export function projectUpscaleHtml(proj, engine) {
   if (!entry || !entry.enabled) return "";
   const status = (proj.stages || {}).upscale || "draft";
   const id = escapeHtml(proj.id);
+  const report = proj.upscale_report || {};
   const retry = status === "failed"
     ? ` <button type="button" class="upscale-retry" data-id="${id}">Повторить апскейл</button>` : "";
+  // strength and parts only for a finished upscale: the report of an earlier attempt must not
+  // look like the current one while the stage is running or has been reset
+  let detail = "";
+  if (status === "done" && report.status === "done") {
+    const scenes = proj.scenes || [];
+    const parts = scenes.filter((scene) => scene.ltx_path).length;
+    detail = ` · сила ${escapeHtml(String(report.strength).replace(".", ","))} · ${parts} из ${scenes.length} частей`;
+  }
+  const error = status === "failed" && report.error
+    ? `<p class="why upscale-error">${escapeHtml(report.error)}</p>` : "";
   return `<div class="upscale-status" data-id="${id}">Апскейл LTX: `
-    + `${escapeHtml(UPSCALE_WORD[status] || status)}${retry}</div>`;
+    + `${escapeHtml(UPSCALE_WORD[status] || status)}${detail}${retry}${error}</div>`;
 }
 
 /** «Отменить» у выполняемой задачи (только sglang: на mlx бежащую задачу не остановить). */
@@ -1527,7 +1576,8 @@ export function pendingSummary(jobs, { now, runningSeconds = 0, workerState = "a
 export function isProjectPipelineNote(note) {
   const s = String(note || "");
   return /^project scene \S+ #\d+$/.test(s)
-    || /^project track \S+$/.test(s);
+    || /^project track \S+$/.test(s)
+    || /^upscale project \S+$/.test(s);
 }
 
 /** `id` проекта, чью финальную сборку описывает `note`, или `null` -- зеркало `assemble.
@@ -1767,9 +1817,9 @@ export function finishedRowHtml(job, outdir, runs, deadMedia, projectTitle) {
     + `<div class="link">${link}</div>`
     + (ok ? "" : `<div class="why">${escapeHtml(job.log_tail || "причина не записана")}</div>`)
     + `<div class="acts">`
-    + `<button data-act="chat" data-id="${id}">Обсудить</button>`
+    + (isAssemble ? "" : `<button data-act="chat" data-id="${id}">Обсудить</button>`)
     + `<button data-act="reveal" data-id="${id}">Показать в Finder</button>`
-    + `<button data-act="dup" data-id="${id}">Копия</button>`
+    + (isAssemble ? "" : `<button data-act="dup" data-id="${id}">Копия</button>`)
     + `<button data-act="delrun" data-id="${id}">Удалить</button>`
     + `</div>`
     + `</div>`
@@ -3574,7 +3624,7 @@ function startPage() {
       + projectUpscaleHtml(proj, state && state.engine)
       + projectReferencesHtml(proj, libraryCards, proj.references || [], locks.references)
       + projectScenesStageHtml(proj, outdir)
-      + projectAssemblyStageHtml(proj, outdir);
+      + projectAssemblyHtml(proj, outdir);
   }
 
   /** The scene editor replaces the read-only scene count while a video script can still be edited. */
@@ -4115,29 +4165,6 @@ function startPage() {
       + `<div class="adv-body proj-scenes-body">`
       + `<div class="proj-stage-body"><div class="scene-grid">${cards}</div></div>`
       + `</div></details></div>`;
-  }
-
-  function projectAssemblyStageHtml(proj, outdir) {
-    if (proj.kind === "song") return "";
-    const status = proj.stages.assembly;
-    if (status === "draft" && !proj.assembly.final_path) return "";  // сборка ещё не начиналась
-    const statusWord = { draft: "не начата", running: "идёт", done: "готово", failed: "упала" }
-      [status] || status;
-    const retry = status === "failed"
-      ? `<button class="ghost" type="button" data-act="retry-assembly" `
-        + `data-id="${escapeHtml(proj.id)}">Пересчитать сборку</button>` : "";
-    const finalUrl = proj.assembly.final_path
-      ? projectMediaUrl(proj.assembly.final_path, outdir, proj.assembly.v) : null;
-    const link = finalUrl
-      ? `<p class="proj-final"><a class="clip" href="${escapeHtml(finalUrl)}" target="_blank" `
-        + `rel="noopener">final.mp4</a></p>`
-      : `<p class="proj-stage-note">пока нечего собирать</p>`;
-    return `<div class="proj-stage">`
-      + `<div class="proj-stage-head">`
-      + `<span class="t">Сборка</span>`
-      + `<span class="proj-stage-status">${escapeHtml(statusWord)}</span>`
-      + `<div class="spacer"></div>${retry}</div>`
-      + `<div class="proj-stage-body">${link}</div></div>`;
   }
 
   /** Немедленная реакция на клик по одной из кнопок этапа «Сюжет» (находка 1, волна ux-фиксов
