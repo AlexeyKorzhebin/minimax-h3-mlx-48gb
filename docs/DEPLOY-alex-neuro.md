@@ -12,7 +12,7 @@
 | Кадры LTX панели | `/home/alex/Outputs/comfy/output/h3panel` (создать до `compose up`, иначе Docker создаст от root) |
 | Провайдеры чата | `/home/alex/Outputs/h3-panel/providers.json` |
 | Пробы §6 | `/home/alex/Outputs/h3-panel/probes/` (`*.jsonl`, ролики и кадры) |
-| Логи развёртывания и проб | `/home/alex/Projects/h3-panel/logs/`, `/home/alex/Outputs/h3-panel/logs/` |
+| Логи развёртывания и проб | `/home/alex/Projects/h3-panel/logs/` (в `.dockerignore`), `/home/alex/Outputs/h3-panel/logs/` |
 | Диспетчер GPU | systemd `h3-gpu-dispatcher`, `127.0.0.1:8790`; логи движков — `h3-bench/logs/serve-panel-*.log`, `comfy/logs/comfy-panel-*.log` |
 | Страница | `http://192.168.100.50:8765` (с Мака), контейнер `h3-panel-h3-panel-1`, `network_mode: host` |
 
@@ -74,7 +74,10 @@ docker compose run --rm \
   -v /home/alex/Projects/h3-bench/beach-jobs.json:/home/alex/Projects/h3-bench/beach-jobs.json:ro \
   --entrypoint python h3-panel tools/probes/sglang_probes.py --keep-h3 \
   keyframe_without_reference picture_numbering beach
-# затем references:3 references:6 references:9, --together для замера POST под нагрузкой
+# затем references:3 references:6 references:9, --together для замера POST под нагрузкой;
+# --duration 10 --steps 2 --ref-size 512x683 — пик на 10-секундной сцене и портретах.
+# Входные картинки — /home/alex/Outputs/h3-panel/probes/inputs/<запуск>/<проба>/; в каждой
+# строке *.jsonl — "args" (steps/duration/ref_size/together) и "request" (target, шаги, размеры).
 curl -s -X POST 127.0.0.1:8790/release && docker compose up -d
 ```
 
@@ -88,8 +91,14 @@ curl -s -X POST 127.0.0.1:8790/release && docker compose up -d
 - Память (512 px, `peak_memory_mb` сервера; карта 63,4 ГиБ): 10 с — 3 кв. реф. 58,0 ГБ, 6 кв.
   61,9, 7 кв. 63,6, 9 кв. — CUDA OOM; 6 портретных 3:4 — 63,6, 5 портретных — 62,2. Сервер
   растягивает каждый референс до 2048 px по короткой стороне **без ограничения площади**, так что
-  считать надо площадь, а не штуки. `H3_MAX_REF_IMAGES=6` — край для квадратных/портретных.
-- `POST /v1/videos` отвечает за 3–60 мс даже во время денойза (работа уходит в очередь);
+  считать надо площадь, а не штуки.
+- **`H3_MAX_REF_IMAGES=5`** (решение координатора 07.10; дефолт в `sglang_args.py` и в
+  `compose.yaml`): шесть портретных 3:4 на 10 с дали 63,6 ГБ из ~64,9 ГБ карты — запаса нет; пять
+  портретных — 62,2 ГБ. Горизонтальные 16:9 референсы (×1,78 площади квадрата) не проверены.
+- Числа пиков однократные. Наблюдение: один и тот же `picture_numbering` (seed 42) дал 55 378 МБ
+  первым запросом после подъёма H3 и 51 810 МБ через полчаса — разброс `peak_memory_mb` сервера
+  порядка 3,5 ГБ, сравнимый с запасами выше.
+- `POST /v1/videos` отвечает за 3–78 мс даже во время денойза (работа уходит в очередь);
   таймаут клиента 60 с с запасом в три порядка.
 
 ## Грабли
