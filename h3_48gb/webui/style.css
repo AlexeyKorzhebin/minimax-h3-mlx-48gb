@@ -1682,3 +1682,4 @@ body:not([data-platform="darwin"]) [data-act="reveal"] { display: none; }
 .start-thumb { height: 56px; width: auto; border-radius: 6px; border: 1px solid var(--hairline); }
 .scenario-json { margin-top: 10px; }
 .scenario-json textarea { margin: 8px 0; }
+.ref-missing { color: var(--fail-ink); font-size: 11.5px; }

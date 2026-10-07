@@ -296,7 +296,7 @@ export function moveScene(draft, idx, delta) {
 
 /** The first thing the server would refuse, with the scene it belongs to: `{idx, message}`. Seed
  *  and steps exist only on sglang (`web._scene_edit_fields`: seed integer >= 0, steps 2..100). */
-export function scenesClientIssue(draft, engine) {
+export function scenesClientIssue(draft, engine, pinnedTags) {
   const { min, max } = sceneBounds(engine);
   const sglang = engine === "sglang";
   const whole = (v) => typeof v === "number" && Number.isInteger(v);
@@ -309,6 +309,8 @@ export function scenesClientIssue(draft, engine) {
     const seed = scene.seed ?? null;
     const steps = scene.steps ?? null;
     if (sglang && seed !== null && !(whole(seed) && seed >= 0)) return issue("сид — целое число от 0");
+    const stray = sglang && pinnedTags ? (scene.refs || []).find((tag) => !pinnedTags.includes(tag)) : null;
+    if (stray) return issue(`референс ${stray} не подключён к проекту — снимите галочку или подключите карточку`);
     if (sglang && steps !== null && !(whole(steps) && steps >= 2 && steps <= 100)) {
       return issue("шаги — целое число от 2 до 100");
     }
@@ -316,8 +318,8 @@ export function scenesClientIssue(draft, engine) {
   return null;
 }
 
-export function scenesClientError(draft, engine) {
-  const issue = scenesClientIssue(draft, engine);
+export function scenesClientError(draft, engine, pinnedTags) {
+  const issue = scenesClientIssue(draft, engine, pinnedTags);
   return issue ? issue.message : null;
 }
 
@@ -472,12 +474,16 @@ export function startImageFieldHtml(current, pinnedCards_, outdir) {
 
 /** Референсы сцены без упоминания в тексте — только sglang и только если есть что выбрать. */
 export function sceneRefsHtml(scene, idx, pinnedTags) {
-  if (!pinnedTags.length) return "";
   const chosen = scene.refs || [];
+  // a ref the project no longer pins stays on the page, ticked: dropping it silently would lose it
+  const strays = chosen.filter((tag) => !pinnedTags.includes(tag));
+  if (!pinnedTags.length && !strays.length) return "";
+  const box = (tag, note) => `<label><input type="checkbox" data-scene-field="refs" `
+    + `data-idx="${idx}" data-tag="${escapeHtml(tag)}"${chosen.includes(tag) ? " checked" : ""}> `
+    + `${escapeHtml(tag)}${note}</label> `;
   return `<div class="scene-refs"><span class="scene-refs-label">Референсы без упоминания:</span> `
-    + pinnedTags.map((tag) => `<label><input type="checkbox" data-scene-field="refs" `
-      + `data-idx="${idx}" data-tag="${escapeHtml(tag)}"${chosen.includes(tag) ? " checked" : ""}> `
-      + `${escapeHtml(tag)}</label> `).join("")
+    + pinnedTags.map((tag) => box(tag, "")).join("")
+    + strays.map((tag) => box(tag, ` <span class="ref-missing">не подключён к проекту</span>`)).join("")
     + `<span class="hint">их картинки идут первыми: &lt;Picture 1…&gt;</span></div>`;
 }
 
@@ -500,10 +506,10 @@ export function scenarioReplaceConfirm(n) {
   return `Заменить ${n} ${plural(n, "сцену", "сцены", "сцен")} сценария?`;
 }
 
-export function scenarioJsonHtml(id) {
-  return `<details class="adv scenario-json"><summary>Вставить сценарий JSON</summary>`
+export function scenarioJsonHtml(id, text = "") {
+  return `<details class="adv scenario-json"${text ? " open" : ""}><summary>Вставить сценарий JSON</summary>`
     + `<textarea class="inp scenario-json-text" rows="6" placeholder='{"scenes": [{"prompt": "…", `
-    + `"duration": 5}]}'></textarea> `
+    + `"duration": 5}]}'>${escapeHtml(text)}</textarea> `
     + `<button type="button" class="ghost" data-act="scenario-json-load" data-id="${escapeHtml(id)}">`
     + `Загрузить сценарий</button></details>`;
 }
@@ -2857,6 +2863,7 @@ function startPage() {
   let sceneDraft = null;        // Draft[] of the open video project's scene editor, or null
   let sceneDraftDirty = false;  // the person changed something the server has not seen
   let draftEpoch = 0;           // version of the draft the editor DOM was drawn from
+  let scenarioJsonText = "";     // what is typed in «Вставить сценарий JSON»: survives redraws
   let sceneDraftError = null;   // {idx, message} of the last client-side refusal, shown by that scene
   let draftResetPending = false; // the next project read (opening the panel) replaces the draft with the server's scenes
   let projectBusy = false;     // идёт запрос, меняющий проект — та же роль, что `busy` у очереди
@@ -3266,6 +3273,7 @@ function startPage() {
   async function openProjectModal(id) {
     project = { id, project: null, active_job: null };
     draftResetPending = true;
+    scenarioJsonText = "";
     projectMp3 = null;
     scenarioProviderChoice = null;
     scenarioProviderTest = null;
@@ -3326,6 +3334,7 @@ function startPage() {
 
   function closeProjectModal() {
     project = null;
+    scenarioJsonText = "";
     sceneDraft = null;
     sceneDraftDirty = false;
     projectMp3 = null;
@@ -3417,7 +3426,8 @@ function startPage() {
    *  `withProject` shows it in the project error banner and nothing goes to the server. */
   async function saveSceneDraft(id) {
     const engine = state && state.engine;
-    const issue = scenesClientIssue(sceneDraft, engine);
+    const pinnedTags = ((project && project.project && project.project.references) || []).map((r) => r.tag);
+    const issue = scenesClientIssue(sceneDraft, engine, pinnedTags);
     sceneDraftError = issue;
     if (issue) {
       const error = new Error(issue.message);
@@ -3445,6 +3455,7 @@ function startPage() {
     if (saved > 0 && !window.confirm(scenarioReplaceConfirm(saved))) return;
     const answer = await api("PUT", `/api/projects/${encodeURIComponent(id)}/scenes`, parsed.body);
     if (answer && answer.project) resetSceneDraft(answer.project);
+    scenarioJsonText = "";
   }
 
   /** Кнопка подсказки: недописанный `@…` перед кареткой поля промпта заменяется тегом. */
@@ -3482,7 +3493,7 @@ function startPage() {
       body = sceneEditorHtml(sceneDraft, { id: proj.id, engine: state && state.engine,
         projectSeed: proj.seed ?? null, dirty: sceneDraftDirty, epoch: draftEpoch,
         error: sceneDraftError, pinned: pinnedCards(proj.references, libraryCards),
-        outdir: state && state.outdir }) + scenarioJsonHtml(proj.id);
+        outdir: state && state.outdir }) + scenarioJsonHtml(proj.id, scenarioJsonText);
     } else if (proj.kind === "video") {
       const n = proj.scenes.length;
       body = n
@@ -5630,6 +5641,8 @@ function startPage() {
   });
 
   document.addEventListener("input", (event) => {
+    const jsonField = event.target.closest(".scenario-json-text");
+    if (jsonField) { scenarioJsonText = jsonField.value; return; }
     const sceneField = event.target.closest("[data-scene-field]");
     if (sceneField) {
       syncDraftFromDom();

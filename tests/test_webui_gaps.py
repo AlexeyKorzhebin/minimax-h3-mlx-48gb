@@ -56,6 +56,7 @@ CLASS_SOURCES = [
     "app.sceneRefsHtml({refs: ['@hero']}, 1, ['@hero', '@arena'])",
     "app.tagHintHtml('fight @a', 8, [{tag: '@arena'}])",
     "app.scenarioJsonHtml('p1')",
+    "app.sceneRefsHtml({refs: ['@gone']}, 0, ['@hero'])",
 ]
 
 
@@ -481,6 +482,14 @@ EDITOR8_EXPECTED = {
     # picking «без кадра» drops the thumbnail at once: the select change redraws from the draft
     "start_image_select_redraws": {"selected": ['<option value="" selected>без кадра</option>'],
                                    "thumb": False},
+    # the typed JSON survives an unrelated redraw (the person adds a scene meanwhile)
+    "json_text_survives_redraw": {"text": '{"scenes": [{"prompt": "@a", "duration": 5}]}', "open": True},
+    # a ref the project no longer pins stays ticked, with a note, and the save is refused in Russian
+    "stray_ref_kept_and_refused": {"puts": [], "kept": '<label><input type="checkbox" '
+        'data-scene-field="refs" data-idx="1" data-tag="@gone" checked> @gone '
+        '<span class="ref-missing">не подключён к проекту</span></label>',
+        "inline": '<span class="hint bad scene-edit-error" data-idx="1">Сцена #1: референс @gone не '
+        'подключён к проекту — снимите галочку или подключите карточку</span>'},
     "refs_ride_along": {"refs": [None, ["@arena"]]},
     "json_load_bad": {"puts": [], "error": "<b>Запрос не прошёл</b><pre>Ожидается {&quot;scenes&quot;: […]} "
                                           "или список сцен</pre>"},
@@ -537,3 +546,38 @@ def test_scenario_json_block():
         '"duration": 5}]}\'></textarea> '
         '<button type="button" class="ghost" data-act="scenario-json-load" data-id="p1">'
         'Загрузить сценарий</button></details>')
+
+
+@_needs_node
+def test_scenario_json_block_keeps_the_typed_text():
+    html = _js("app.scenarioJsonHtml('p1', '[{\"prompt\": \"a <b>\"}]')")
+    assert html.startswith('<details class="adv scenario-json" open><summary>')
+    assert '" rows="6" placeholder=' in html
+    assert '></textarea>' not in html
+    assert html.count('[{&quot;prompt&quot;: &quot;a &lt;b&gt;&quot;}]</textarea>') == 1
+
+
+@_needs_node
+def test_a_ref_that_left_the_project_stays_visible_and_ticked():
+    assert _js("app.sceneRefsHtml({refs: ['@gone', '@hero']}, 1, ['@hero', '@arena'])") == (
+        '<div class="scene-refs"><span class="scene-refs-label">Референсы без упоминания:</span> '
+        '<label><input type="checkbox" data-scene-field="refs" data-idx="1" data-tag="@hero" checked> @hero</label> '
+        '<label><input type="checkbox" data-scene-field="refs" data-idx="1" data-tag="@arena"> @arena</label> '
+        '<label><input type="checkbox" data-scene-field="refs" data-idx="1" data-tag="@gone" checked> @gone '
+        '<span class="ref-missing">не подключён к проекту</span></label> '
+        '<span class="hint">их картинки идут первыми: &lt;Picture 1…&gt;</span></div>')
+    # nothing pinned at all: the stray ref is still shown
+    assert "@gone" in _js("app.sceneRefsHtml({refs: ['@gone']}, 0, [])")
+    assert _js("app.sceneRefsHtml({refs: []}, 0, [])") == ""
+
+
+@_needs_node
+def test_client_error_names_a_ref_that_is_not_pinned():
+    def err(refs, pinned, engine="sglang"):
+        return _js("app.scenesClientError([{prompt: 'x', duration: 8}, {prompt: 'y', duration: 8, "
+                   f"refs: {refs}}}], '{engine}', {pinned})")
+    assert err("['@gone']", "['@hero']") == (
+        "Сцена #1: референс @gone не подключён к проекту — снимите галочку или подключите карточку")
+    assert err("['@hero']", "['@hero']") is None
+    assert err("['@gone']", "['@hero']", "mlx") is None     # refs are never sent on mlx
+    assert err("['@gone']", "undefined") is None            # no pinned list given: not checked

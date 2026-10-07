@@ -299,6 +299,31 @@ const SCENARIOS = {
     return { selected: html.match(/<option value="[^"]*" selected>[^<]*<\/option>/g).slice(0, 1),
              thumb: html.includes("start-thumb") };
   },
+  async json_text_survives_redraw() {
+    await start(appUrl, draftRoutes());
+    await open();
+    const text = '{"scenes": [{"prompt": "@a", "duration": 5}]}';
+    const box = { value: text, closest(sel) { return sel === ".scenario-json-text" ? this : null; } };
+    fire("input", box);
+    await act("scene-add");               // an unrelated redraw of the whole modal
+    const html = getElementById("project-body").innerHTML;
+    const m = html.match(/<details class="adv scenario-json"( open)?>.*?<textarea[^>]*>([^<]*)<\/textarea>/);
+    return { text: m[2].replace(/&quot;/g, '"'), open: m[1] === " open" };
+  },
+  async stray_ref_kept_and_refused() {
+    const proj = PROJECT({ ...DRAFT_PROJECT.project, references: [{ tag: "@arena", version: 1 }],
+      scenes: DRAFT_PROJECT.project.scenes.map((s) => (s.idx === 1 ? { ...s, refs: ["@gone"] } : s)) });
+    const card = { tag: "@arena", kind: "environment", version: 1, latest_version: 1, description: "d",
+      assets: ["/o/library/arena/v1/01-o.png"], versions: [{ version: 1, kind: "environment",
+      assets: ["/o/library/arena/v1/01-o.png"] }] };
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1": ok(proj),
+      "GET /api/library": ok({ ok: true, cards: [card] }) }));
+    await open();
+    await act("scenes-save");
+    const html = getElementById("project-body").innerHTML;
+    return { puts: puts(), kept: html.match(/<label><input type="checkbox"[^>]*data-tag="@gone"[^>]*>.*?<\/label>/)[0],
+             inline: html.match(/<span class="hint bad scene-edit-error"[^>]*>[^<]*<\/span>/)[0] };
+  },
   async refs_ride_along() {
     const proj = PROJECT({ ...DRAFT_PROJECT.project, references: [{ tag: "@arena", version: 1 }] });
     const card = { tag: "@arena", kind: "environment", version: 1, latest_version: 1, description: "d",
