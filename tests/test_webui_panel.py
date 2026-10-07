@@ -120,6 +120,24 @@ def test_notifications_failed_ready_and_decision_fire_once():
 
 
 @_needs_node
+def test_a_scene_that_failed_without_a_job_notifies_once_and_shows_its_reason():
+    """Final review C2: a chained scene the worker could not submit has no failed job."""
+    projects = [{"id": "p1", "title": "Бой", "scene_errors": [{"idx": 4, "error": "нет кадра"}]},
+                {"id": "p2", "title": "Пусто"}]
+    keys = _node_eval(f"console.log(JSON.stringify(app.sceneFailureKeys({json.dumps(projects)})));")
+    assert keys == ["Бой, сцена 4: нет кадра"]
+    nxt = {**EMPTY, "failedSceneKeys": keys}
+    assert _events(EMPTY, nxt, 0)["events"] == [
+        {"kind": "failed", "title": "Сцена не поставлена", "body": "Бой, сцена 4: нет кадра"}]
+    assert _events(nxt, nxt, 1)["events"] == []
+    assert _node_eval("console.log(JSON.stringify(app.sceneErrorHtml("
+                      "{status: 'failed', error: 'a<b'})));") == \
+        '<div class="scene-error why">a&lt;b</div>'
+    assert _node_eval("console.log(JSON.stringify(app.sceneErrorHtml("
+                      "{status: 'pending', error: 'a'})));") == ""
+
+
+@_needs_node
 def test_the_first_snapshot_after_opening_the_tab_notifies_nothing():
     nxt = {**EMPTY, "failedIds": ["j9"], "readyProjectIds": ["p1"],
            "waitReason": "GPU занята", "waitingSinceMs": 0}
@@ -425,3 +443,9 @@ def test_scene_prompt_input_demands_a_tag_on_sglang_and_stays_silent_on_mlx():
         "title": "нужен хотя бы один референс (@тег) в сцене",
         "toggles": [["has-tag-issues", True]]}
     assert _ui("input_mlx") == {"title": "", "toggles": []}
+
+
+@_needs_node
+def test_a_scene_card_shows_why_the_scene_was_not_submitted():
+    assert _ui("scene_error") == {"errors": [
+        '<div class="scene-error why">сцена не поставлена: AssembleError: кадр &lt;залит&gt;</div>']}

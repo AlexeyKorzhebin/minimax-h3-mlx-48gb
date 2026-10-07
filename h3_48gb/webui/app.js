@@ -137,11 +137,25 @@ export function notificationEvents(prev, next, nowMs) {
       lastWait = nowMs;
     }
   }
-  const fresh = (key) => next[key].filter((id) => !prev[key].includes(id));
+  const fresh = (key) => (next[key] || []).filter((id) => !(prev[key] || []).includes(id));
   for (const id of fresh("failedIds")) events.push({ kind: "failed", title: "Сцена упала", body: `задача ${id}` });
+  for (const id of fresh("failedSceneKeys")) events.push({ kind: "failed", title: "Сцена не поставлена", body: id });
   for (const id of fresh("readyProjectIds")) events.push({ kind: "ready", title: "Проект готов", body: id });
   for (const id of fresh("awaitingProjectIds")) events.push({ kind: "decision", title: "Нужно решение", body: id });
   return { events, lastWaitNotifyMs: lastWait };
+}
+
+/** Сцены, упавшие без своей задачи (не удалось поставить, финальное ревью C2): ключ события
+ *  уведомления — он же его текст. */
+export function sceneFailureKeys(projects) {
+  return (projects || []).flatMap((p) => (p.scene_errors || [])
+    .map((e) => `${p.title || p.id}, сцена ${e.idx}: ${e.error}`));
+}
+
+/** Причина, по которой сцена упала без своей задачи, — под промптом на карточке сцены. */
+export function sceneErrorHtml(scene) {
+  if (scene.status !== "failed" || !scene.error) return "";
+  return `<div class="scene-error why">${escapeHtml(scene.error)}</div>`;
 }
 
 const TAG_IN_TEXT = /(?<![\w@.])@([A-Za-z0-9-]+)/g;
@@ -2668,6 +2682,7 @@ function startPage() {
     const run = gpu && gpu.queue && gpu.queue.running;
     const next = {
       failedIds: jobs.filter((j) => j.state === "failed").map((j) => j.id),
+      failedSceneKeys: sceneFailureKeys(state && state.projects),
       readyProjectIds: ((state && state.projects) || []).filter((p) => p.stages && p.stages.assembly === "done").map((p) => p.id),
       awaitingProjectIds: ((state && state.projects) || []).filter((p) => p.stages && Object.values(p.stages).includes("awaiting_approval")).map((p) => p.id),
       waitReason: run && run.wait_reason ? run.wait_reason : null,
@@ -3391,6 +3406,7 @@ function startPage() {
       + `<span class="sdur">${formatFine(scene.duration)}</span>`
       + `</div>`
       + `<div class="prompt">${escapeHtml(promptText)}</div>`
+      + sceneErrorHtml(scene)
       + `<div class="acts"><button type="button" data-act="retry-scene" `
       + `data-id="${escapeHtml(projId)}" data-idx="${scene.idx}">пересчитать</button></div>`
       + `</div></div>`;

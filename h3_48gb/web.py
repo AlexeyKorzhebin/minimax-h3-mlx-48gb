@@ -2189,6 +2189,10 @@ def project_summary(proj, jobs) -> dict:
         "scenes_total": len(scenes),
         "scenes_done": sum(1 for scene in scenes if scene.get("status") == "done"),
         "scenes_failed": any(scene.get("status") == "failed" for scene in scenes),
+        # C2 (final review 2026-10-07): a scene that failed without a job of its own (its
+        # submission failed) has no failed job to notify about -- the page notifies from this.
+        "scene_errors": [{"idx": scene["idx"], "error": scene["error"]} for scene in scenes
+                         if scene.get("error")],
         "track_status": proj.track.get("status"),
         "track_undersung": bool(proj.track.get("undersung")),
         "final_path": proj.assembly.get("final_path"),

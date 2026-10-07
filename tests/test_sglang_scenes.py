@@ -212,6 +212,49 @@ def test_the_chain_keyframe_uses_the_sglang_frame_check(tmp_path, monkeypatch):
                                   "refusing to chain the next scene off it")
 
 
+def test_a_chained_scene_the_worker_cannot_submit_fails_with_its_reason(chain, monkeypatch):
+    """Final review C2: the worker continues the chain with nobody watching -- a failed
+    submission must not leave the next scene silently `pending` with an empty queue."""
+    from types import SimpleNamespace
+
+    from h3_48gb import worker
+    out, proj = chain
+    scenes = proj.scenes
+    scenes[3]["status"] = "running"
+    proj.scenes = scenes
+    proj.save()
+    monkeypatch.setattr(assemble, "_frame_is_corrupt", lambda *a, **k: True)
+    clip = proj.scenes[3]["clip_path"]
+    job = SimpleNamespace(id="j3", note=assemble.scene_note(proj, 3),
+                          output_stem=clip[:-len(".mp4")])
+    worker._handle_project_scene_result(out / "queue", out, job, 0, run=_fake_run([]))
+    after = p.load_project(proj.path)
+    assert {k: after.scenes[4].get(k) for k in ("status", "job_id", "error")} == {
+        "status": "failed", "job_id": None,
+        "error": f"сцена не поставлена: AssembleError: the last frame of {clip} is filled with one "
+                 f"colour -- refusing to chain the next scene off it"}
+    assert (after.scenes[3]["status"], after.stages["scenes"]) == ("done", "failed")
+
+
+def test_a_new_status_clears_the_scene_error(chain):
+    out, proj = chain
+    proj.set_scene_status(4, "failed", error="сцена не поставлена: x")
+    assert p.load_project(proj.path).scenes[4]["error"] == "сцена не поставлена: x"
+    proj.invalidate_scene_chain(4)
+    assert "error" not in p.load_project(proj.path).scenes[4]
+    proj.set_scene_status(4, "failed", error="y")
+    proj.set_scene_status(4, "failed")
+    assert "error" not in p.load_project(proj.path).scenes[4]
+
+
+def test_the_project_summary_carries_scenes_that_failed_without_a_job(chain):
+    out, proj = chain
+    proj.set_scene_status(3, "failed")
+    proj.set_scene_status(4, "failed", error="сцена не поставлена: x")
+    assert web.project_summary(p.load_project(proj.path), [])["scene_errors"] == [
+        {"idx": 4, "error": "сцена не поставлена: x"}]
+
+
 def test_overlap_constant_is_the_same_in_web_and_assemble():
     assert web._SGLANG_OVERLAP_FRAMES == assemble.SGLANG_OVERLAP_FRAMES == 1
 

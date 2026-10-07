@@ -870,7 +870,9 @@ def _handle_project_scene_result(root, outdir, job, exit_code: int, *, run) -> N
             proj.set_scene_status(idx, "done", clip_path=clip_path)
         else:
             proj.set_scene_status(idx, "failed")
-        assemble.advance_project(proj, root, outdir, run=run)
+        # C2 (final review 2026-10-07): nobody watches the chain here -- a next scene that cannot
+        # be submitted becomes `failed` with its reason, not a silent `pending`.
+        assemble.advance_project(proj, root, outdir, run=run, fail_scene_on_error=True)
     except Exception as exc:  # noqa: BLE001 -- see docstring: bookkeeping for an already-filed job
         # must never take the worker down.
         print(f"h3 worker: project scene bookkeeping failed for job {job.id} "

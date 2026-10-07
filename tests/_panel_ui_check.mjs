@@ -152,6 +152,15 @@ async function main() {
     await sleep(80);
     out = { status: /<div class="upscale-status"[^>]*>Апскейл LTX: упал/.test(html),
             posts: calls.filter((c) => c.method === "POST").map((c) => [c.url, c.body]) };
+  } else if (scenario === "scene_error") {
+    // final review C2: the reason a chained scene could not be submitted is on its card
+    const scene = (idx, status, extra = {}) => ({ idx, prompt: "@a walks", duration: 8, status,
+      job_id: null, clip_path: null, keyframe_path: null, ...extra });
+    await start({ "GET /api/projects/p1": ok(PROJECT({ scenes: [scene(0, "done"),
+      scene(1, "failed", { error: "сцена не поставлена: AssembleError: кадр <залит>" })] })) });
+    fire("click", clickable({ dataset: { act: "open-project", id: "p1" }, match: (s) => s === "button[data-act]" }));
+    await sleep(80);
+    out = { errors: getElementById("project-body").innerHTML.match(/<div class="scene-error why">[^<]*<\/div>/g) };
   } else if (scenario === "input_sglang" || scenario === "input_mlx") {
     const engine = scenario === "input_mlx" ? "mlx" : "sglang";
     await start({ "GET /api/state": ok({ ...SGLANG, engine }), "GET /api/projects/p1": ok(PROJECT()) });

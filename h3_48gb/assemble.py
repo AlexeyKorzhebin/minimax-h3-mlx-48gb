@@ -1347,10 +1347,17 @@ def _scene_generate_args_sglang(scene: dict, *, keyframe, chained: bool, ref2va,
     return args, str(Path(scenes_dir) / f"h3-{tag}-{width}x{height}")
 
 
-def _submit_next_scene_sglang(proj, scene: dict, queue_root, *, submit, run) -> dict:
+def _submit_next_scene_sglang(proj, scene: dict, queue_root, *, submit, run,
+                              fail_on_error: bool = False) -> dict:
     """`_submit_next_scene`'s sglang twin: same claim-before-submit and rollback discipline (see
     that function's docstring), but the chain is keyframe-first -- there is no latent tail on
-    sglang, so there is no fallback and no `MAX_CONSECUTIVE_KEYFRAME_FALLBACKS` limit."""
+    sglang, so there is no fallback and no `MAX_CONSECUTIVE_KEYFRAME_FALLBACKS` limit.
+
+    `fail_on_error` (final review 2026-10-07, C2): the worker continues a chain with nobody
+    watching, so a submission that fails there must not roll back to a silent `pending` -- the
+    scene becomes `failed` with the reason in its `error`, and `stages.scenes` `failed`, which is
+    what the page shows and offers "пересчитать" for. A web route (approve) keeps the rollback:
+    it answers the error to the person who pressed the button, who can fix and press again."""
     idx = scene["idx"]
     claimed = proj.claim_next_scene(_SCENE_CLAIM_PLACEHOLDER_JOB_ID, expected_idx=idx)
     if claimed is None:
@@ -1385,8 +1392,13 @@ def _submit_next_scene_sglang(proj, scene: dict, queue_root, *, submit, run) -> 
                                                     frames=frames)
         job = submit(queue_root, args, scene_note(proj, idx), {"output_stem": output_stem},
                      estimate, kind=q.KIND_GENERATE)
-    except Exception:
-        proj.set_scene_status(idx, "pending", job_id=None)
+    except Exception as exc:
+        if fail_on_error:
+            proj.set_scene_status(idx, "failed", job_id=None,
+                                  error=f"сцена не поставлена: {type(exc).__name__}: {exc}")
+            proj.set_stage_status("scenes", "failed")
+        else:
+            proj.set_scene_status(idx, "pending", job_id=None)
         raise
     head_drop_frames = SGLANG_OVERLAP_FRAMES if chained else 0
     proj.set_scene_status(idx, "running", job_id=job.id,
@@ -1471,7 +1483,8 @@ def _consecutive_keyframe_fallbacks(scenes, idx: int) -> int:
     return count
 
 
-def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
+def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run,
+                       fail_on_error: bool = False) -> dict:
     """Claim scene `scene["idx"]` on the project *first*, then submit its `kind="generate"` job --
     task brief C1 (fix round 1, 2026-08-18 review).
 
@@ -1504,7 +1517,8 @@ def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
     accepted rather than closed in this round.
     """
     if engine.is_sglang():
-        return _submit_next_scene_sglang(proj, scene, queue_root, submit=submit, run=run)
+        return _submit_next_scene_sglang(proj, scene, queue_root, submit=submit, run=run,
+                                         fail_on_error=fail_on_error)
     idx = scene["idx"]
 
     claimed = proj.claim_next_scene(_SCENE_CLAIM_PLACEHOLDER_JOB_ID, expected_idx=idx)
@@ -1652,7 +1666,8 @@ def _submit_assembly(proj, queue_root, *, submit) -> dict:
     return {"action": "submitted_assembly", "job_id": job.id}
 
 
-def advance_project(project, queue_root, outdir, *, submit=q.submit, run=subprocess.run) -> dict:
+def advance_project(project, queue_root, outdir, *, submit=q.submit, run=subprocess.run,
+                    fail_scene_on_error: bool = False) -> dict:
     """Progress `project` by exactly one step, and return what it did (`{"action": ...}`, for tests
     and for a caller that wants to log it -- `h3_48gb.worker`, the only real caller, currently
     ignores the return value beyond that).
@@ -1713,7 +1728,8 @@ def advance_project(project, queue_root, outdir, *, submit=q.submit, run=subproc
 
     next_scene = proj.next_pending_scene()
     if next_scene is not None:
-        return _submit_next_scene(proj, next_scene, queue_root, submit=submit, run=run)
+        return _submit_next_scene(proj, next_scene, queue_root, submit=submit, run=run,
+                                  fail_on_error=fail_scene_on_error)
 
     if proj.scenes and all(scene.get("status") == "done" for scene in proj.scenes):
         # I2 (fix round 1, 2026-08-18 review): "живой лайфсайкл" -- stages.scenes moves to "done"

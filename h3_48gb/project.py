@@ -680,7 +680,8 @@ class Project:
 
     def set_scene_status(self, idx: int, status: str, *, job_id=_UNSET_JOB_ID,
                           clip_path: str | None = None, keyframe_path: str | None = None,
-                          head_drop_frames: int | None = None) -> "Project":
+                          head_drop_frames: int | None = None,
+                          error: str | None = None) -> "Project":
         """Set scene `idx`'s status, and any of `job_id`/`clip_path`/`keyframe_path`/
         `head_drop_frames` that are given. `clip_path`/`keyframe_path`/`head_drop_frames` left as
         `None` are left exactly as they already were on
@@ -708,6 +709,10 @@ class Project:
         status. `clip_path`/`keyframe_path` keep the plain "`None` means unchanged" convention --
         no caller has ever needed to clear either of them outside `invalidate_scene_chain`'s own
         bulk reset.
+
+        **`error` (final review 2026-10-07, C2) describes this transition only**: given, it is
+        written to the scene (why it failed without a job of its own -- its submission did); not
+        given, any earlier `error` is removed, so a scene never shows yesterday's reason.
         """
         if status not in SCENE_STATUSES:
             raise ProjectError(f"unknown scene status {status!r}, expected one of {SCENE_STATUSES}")
@@ -723,6 +728,10 @@ class Project:
                 scene["keyframe_path"] = keyframe_path
             if head_drop_frames is not None:
                 scene["head_drop_frames"] = int(head_drop_frames)
+            if error is not None:
+                scene["error"] = str(error)
+            else:
+                scene.pop("error", None)
             write_json_durably(self.path, data)
             self._apply(data)
         return self
@@ -795,6 +804,7 @@ class Project:
                 return None
             scene["status"] = "running"
             scene["job_id"] = job_id
+            scene.pop("error", None)
             write_json_durably(self.path, data)
             self._apply(data)
             return dict(scene)
@@ -852,6 +862,7 @@ class Project:
                 scene["clip_path"] = None
                 scene["keyframe_path"] = None
                 scene.pop("ltx_path", None)
+                scene.pop("error", None)
             data["stages"]["scenes"] = "draft"
             data["stages"]["assembly"] = "draft"
             data["stages"]["upscale"] = "draft"
