@@ -33,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import os
+import json
 import random
 import signal
 import subprocess
@@ -585,7 +586,10 @@ def make_gpu_gate(root, engine_name: str, *, client, sleep=time.sleep, clock=tim
                 reason = "ждём GPU: Qwen держит карту — выгрузите Qwen в панели"
                 seconds = ACQUIRE_RETRY_SECONDS
             else:
-                reason, seconds = f"ждём GPU: {answer.get('reason')}", ACQUIRE_RETRY_SECONDS
+                # triage of task 8: an answer without a reason is shown as it came, never "None"
+                said = answer.get("reason") or (
+                    f"непонятный ответ диспетчера {json.dumps(answer, ensure_ascii=False)[:200]}")
+                reason, seconds = f"ждём GPU: {said}", ACQUIRE_RETRY_SECONDS
             cancelled = wait(job, reason, seconds)
             if cancelled:
                 return cancelled

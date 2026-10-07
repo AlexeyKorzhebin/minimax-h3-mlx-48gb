@@ -492,3 +492,18 @@ def test_an_engine_that_was_already_up_has_no_start_time(running):
         fake.close()
     running_job = [j for j in q.scan(root)[0] if j.id == job.id][0]
     assert (running_job.gpu_wait_s, running_job.engine_start_s) == (0.5, None)
+
+
+def test_an_answer_without_a_reason_is_shown_as_it_came(running):
+    """Triage of task 8: the page said «ждём GPU: None»."""
+    root, job, _ = running
+    fake = FakeDispatcher(acquire=({"ok": True, "state": "busy", "engine": "h3"},
+                                   {"ok": True, "state": "ready", "engine": "h3"}))
+    seen = []
+    try:
+        worker.make_gpu_gate(root, "h3", client=dc.DispatcherClient(fake.url),
+                             sleep=_recording_sleep(root, job.id, seen))(job)
+    finally:
+        fake.close()
+    assert seen == ['ждём GPU: непонятный ответ диспетчера {"ok": true, "state": "busy", '
+                    '"engine": "h3"}']
