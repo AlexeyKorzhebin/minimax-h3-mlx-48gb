@@ -60,6 +60,7 @@ from h3_48gb.engines import dispatcher_client
 from h3_48gb.engines import estimate as sglang_estimate
 from h3_48gb.engines import sglang_args
 from h3_48gb.project import PROJECT_KINDS
+from h3_48gb.worker import _mark_upscale_failed
 from h3_48gb.worker import (WORKER_LOCK_NAME, align_job_wallclock_estimate_seconds,
                             song_job_wallclock_estimate_seconds)
 
@@ -3539,6 +3540,10 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(payload.get("upscale"), bool):
             raise CliError("args_invalid", "`upscale` must be true or false", {})
         proj.set_route_stage("upscale", payload["upscale"])
+        if proj.stages.get("assembly") in ("done", "failed"):
+            # the final was built for the old route: rebuild it for the new one
+            proj.set_stage_status("assembly", "draft")
+            proj.update_assembly(final_path=None)
         assemble_module.advance_project(proj, self.server.queue_root, self.server.outdir)
         return 200, "application/json", _json_bytes(
             {"ok": True, "project": _project_payload(project_module.load_project(proj.path))})
@@ -4040,6 +4045,9 @@ class _Handler(BaseHTTPRequestHandler):
         if pending:
             with queue_write_errors(self.server.queue_root, what="the job id"):
                 job = q.cancel(self.server.queue_root, job_id)
+            if job.kind == q.KIND_UPSCALE:
+                # a cancelled upscale must not leave its stage at `running` (retry takes `failed`)
+                _mark_upscale_failed(job)
             return 200, "application/json", _json_bytes({"ok": True, "job": job.as_dict()})
 
         if engine.is_sglang():
@@ -5117,6 +5125,18 @@ class _Handler(BaseHTTPRequestHandler):
             cancelled.append(job.id)
         return cancelled
 
+    def _cancel_project_upscale_jobs(self, proj) -> None:
+        """A re-shot scene makes a still-pending upscale of the old clips pointless."""
+        with queue_errors(self.server.queue_root):
+            jobs, _broken = q.scan(self.server.queue_root)
+        for job in jobs:
+            if (job.state == "pending" and job.kind == q.KIND_UPSCALE
+                    and str(proj.path) in job.args):
+                try:
+                    q.cancel(self.server.queue_root, job.id)
+                except q.JobNotPending:
+                    continue
+
     def _retry_project_scene(self, raw_id: str, raw_idx: str) -> tuple[int, str, bytes]:
         """`POST /api/projects/<id>/scenes/<idx>/retry`: "пересчёт отдельной сцены" (design spec,
         "Клипы") -- invalidates scene `idx` and every scene after it up to, but not including, the
@@ -5144,6 +5164,7 @@ class _Handler(BaseHTTPRequestHandler):
                 {"idx": raw_idx})
         proj = self._load_project(raw_id)
         self._cancel_project_scene_tail_jobs(proj, idx)
+        self._cancel_project_upscale_jobs(proj)
         try:
             proj.invalidate_scene_chain(idx)
         except project_module.UnknownScene as exc:

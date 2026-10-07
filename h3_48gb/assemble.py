@@ -774,6 +774,14 @@ def run(project_path, *, run=subprocess.run, log=None, draft: bool = False) -> P
         clip_path = scene.get(key)
         if not clip_path:
             raise AssembleError(f"scene {scene['idx']} of {proj.id!r} is done but has no {key}")
+        if use_ltx:
+            raw = Path(scene.get("clip_path") or "")
+            expected = str(raw.with_name(raw.stem + "-ltx.mp4"))
+            if clip_path != expected:
+                raise AssembleError(
+                    f"scene {scene['idx']} of {proj.id!r}: ltx_path {clip_path!r} is not the -ltx "
+                    f"part of the current clip ({expected!r}) -- the scene was re-shot after the "
+                    f"upscale, upscale it again")
         clip_paths.append(clip_path)
 
     assembly_dir = proj.path.parent / "assembly"

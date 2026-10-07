@@ -673,7 +673,27 @@ def _run_sglang_generate_job(root, outdir, job, *, gate=None) -> tuple[int, str]
     return result
 
 
+def _mark_upscale_failed(job) -> None:
+    """Every way out of an upscale job that did not finish the stage leaves it `failed` (the
+    retry button takes only `failed`) -- never stuck at the `running` `_submit_upscale` set."""
+    try:
+        from h3_48gb import project as project_module
+        proj = project_module.load_project(_project_arg(job.args))
+        if proj.stages.get("upscale") == "running":
+            proj.set_stage_status("upscale", "failed")
+    except Exception as exc:  # noqa: BLE001 -- bookkeeping must not take the worker down
+        print(f"h3 worker: could not mark upscale failed for job {job.id}: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
+
 def _run_upscale_job(root, outdir, job) -> tuple[int, str]:
+    result = _run_upscale_job_inner(root, outdir, job)
+    if result[0] != 0:
+        _mark_upscale_failed(job)
+    return result
+
+
+def _run_upscale_job_inner(root, outdir, job) -> tuple[int, str]:
     """spec §4.2: one job per project -- acquire ltx (the dispatcher stops our H3 and starts our
     ComfyUI), then every part with one strength."""
     from h3_48gb.engines import ltx

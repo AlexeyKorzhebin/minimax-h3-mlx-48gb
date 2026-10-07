@@ -308,3 +308,178 @@ def test_the_worker_passes_draft_to_assemble_run(tmp_path, monkeypatch, extra, e
     job = type("J", (), {"args": ["assemble", "--project", str(proj.path), *extra]})()
     assert worker._run_assemble_job(job)[0] == 0
     assert seen == [expected]
+
+
+# ---- fix round 1 -------------------------------------------------------------------------------
+
+def _fake_ltx(monkeypatch, on_part=None):
+    """`ltx.run_upscale` with the ComfyUI/ffmpeg parts faked: every part becomes its -ltx sibling."""
+    from h3_48gb.engines import ltx, motion
+    monkeypatch.setattr(motion, "clip_motion", lambda clips, run: 0.0)
+    monkeypatch.setattr(motion, "lora_for", lambda value: 0.3)
+
+    def part(clip, **kw):
+        if on_part:
+            on_part(clip)
+        return clip.with_name(f"{clip.stem}-ltx.mp4")
+
+    monkeypatch.setattr(ltx, "upscale_part", part)
+    return ltx
+
+
+def _run_upscale(ltx, proj):
+    return ltx.run_upscale(proj.path, client=None, comfy_output="x", run=None, attempt="a")
+
+
+def test_assembly_refuses_an_ltx_part_that_is_not_the_sibling_of_the_current_clip(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path, upscale_stage="done")
+    new = proj.path.parent / "scenes" / "s1-new.mp4"      # scene 1 re-shot, old s1-ltx.mp4 kept
+    new.write_bytes(b"raw2")
+    proj.set_scene_fields(1, ltx_path=proj.scenes[1]["ltx_path"])
+    data = json.loads(proj.path.read_text())
+    data["scenes"][1]["clip_path"] = str(new)
+    proj.path.write_text(json.dumps(data))
+    with pytest.raises(assemble.AssembleError, match="not the -ltx part of the current clip"):
+        _assembled_inputs(proj, monkeypatch)
+
+
+def test_a_reshoot_during_the_upscale_never_gets_the_old_ltx_part(tmp_path, monkeypatch):
+    """The repro: the upscale job holds the old clip list while the scene is re-shot."""
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path, upscale_stage="running")
+    for i in range(2):
+        proj.scenes[i].pop("ltx_path")
+    proj.save()
+
+    def reshoot(clip):
+        if clip.name == "s1.mp4":                         # while scene 1 is being upscaled
+            p.load_project(proj.path).invalidate_scene_chain(1)
+            new = proj.path.parent / "scenes" / "s1-new.mp4"
+            new.write_bytes(b"raw2")
+            p.load_project(proj.path).set_scene_status(1, "done", job_id=None, clip_path=str(new))
+
+    ltx = _fake_ltx(monkeypatch, reshoot)
+    code, log = _run_upscale(ltx, proj)
+    reloaded = p.load_project(proj.path)
+    assert code == 0 and "переснята во время апскейла" in log
+    assert reloaded.stages["upscale"] == "draft"
+    assert "ltx_path" not in reloaded.scenes[1]
+    calls, submit = _submits()
+    assert assemble.advance_project(reloaded, tmp_path / "q", tmp_path / "out",
+                                    submit=submit)["action"] == "submitted_upscale"
+
+
+def test_a_reshoot_after_the_last_part_still_keeps_the_stage_out_of_done(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path, upscale_stage="running")
+    for i in range(2):
+        proj.scenes[i].pop("ltx_path")
+    proj.save()
+
+    def reshoot(clip):
+        if clip.name == "s1.mp4":                         # the last part: reshoot lands after it
+            monkeypatch.setattr(
+                p.Project, "set_scene_ltx_if_current",
+                lambda self, idx, clip_path, ltx_path: (
+                    p.Project.set_scene_fields(self, idx, ltx_path=ltx_path),
+                    p.load_project(proj.path).invalidate_scene_chain(1))[0] or True)
+
+    ltx = _fake_ltx(monkeypatch, reshoot)
+    _run_upscale(ltx, proj)
+    assert p.load_project(proj.path).stages["upscale"] == "draft"
+
+
+def test_a_scene_reshoot_cancels_the_pending_upscale_job(live, tmp_path, monkeypatch):
+    proj = _done_project(tmp_path)
+    from h3_48gb import assemble as asm
+    asm.advance_project(proj, live.queue_root, tmp_path / "out")
+    # the fake clips cannot yield a keyframe for the resubmitted scene; this test is the cancel
+    monkeypatch.setattr(asm, "advance_project", lambda *a, **k: {"action": "nothing_to_do"})
+    assert [j.kind for j in q.scan(live.queue_root)[0]] == ["upscale"]
+    status, body = _call(live, "POST", f"/api/projects/{proj.id}/scenes/1/retry", {})
+    assert status == 200, body
+    assert [j.kind for j in q.scan(live.queue_root)[0] if j.state == "pending"] == []
+
+
+def _upscale_job(live, proj):
+    from h3_48gb import assemble as asm
+    asm.advance_project(proj, live.queue_root, live.outdir)
+    (job,) = [j for j in q.scan(live.queue_root)[0] if j.kind == "upscale"]
+    return job
+
+
+def test_cancelling_a_pending_upscale_job_fails_the_stage(live, tmp_path):
+    proj = _done_project(tmp_path)
+    job = _upscale_job(live, proj)
+    assert p.load_project(proj.path).stages["upscale"] == "running"
+    status, body = _call(live, "DELETE", f"/api/jobs/{job.id}")
+    assert status == 200, body
+    assert p.load_project(proj.path).stages["upscale"] == "failed"
+
+
+def test_early_exits_of_an_upscale_job_fail_the_stage(tmp_path, monkeypatch):
+    from h3_48gb import worker
+    proj = _done_project(tmp_path, upscale_stage="running")
+    job = type("J", (), {"id": "j", "args": ["upscale", "--project", str(proj.path)]})()
+    monkeypatch.setattr(worker, "make_gpu_gate", lambda *a, **k: (lambda j: "cancelled_by_user"))
+    code, log = worker._run_upscale_job(tmp_path / "q", tmp_path / "out", job)
+    assert code == 1 and "cancelled_by_user" in log
+    assert p.load_project(proj.path).stages["upscale"] == "failed"
+    proj.set_stage_status("upscale", "running")
+
+    def engine_down(j):
+        raise worker.GpuEngineFailed("no engine", "/log")
+
+    monkeypatch.setattr(worker, "make_gpu_gate", lambda *a, **k: engine_down)
+    assert worker._run_upscale_job(tmp_path / "q", tmp_path / "out", job)[0] == 1
+    assert p.load_project(proj.path).stages["upscale"] == "failed"
+
+
+def _final_done(proj):
+    proj.set_stage_status("assembly", "done")
+    proj.update_assembly(final_path=str(proj.path.parent / "assembly" / "final.mp4"))
+
+
+def test_switching_upscale_on_after_a_final_rebuilds_it_from_ltx(live, tmp_path):
+    proj = _done_project(tmp_path)
+    proj.set_route_stage("upscale", False)
+    _final_done(proj)
+    status, body = _call(live, "PUT", f"/api/projects/{proj.id}/route", {"upscale": True})
+    assert status == 200, body
+    reloaded = p.load_project(proj.path)
+    assert (reloaded.stages["assembly"], reloaded.assembly["final_path"]) == ("draft", None)
+    assert [j.kind for j in q.scan(live.queue_root)[0]] == ["upscale"]
+    reloaded.set_stage_status("upscale", "done")
+    from h3_48gb import assemble as asm
+    assert asm.advance_project(reloaded, live.queue_root, live.outdir)["action"] == \
+        "submitted_assembly"
+    assert _assembled_inputs(reloaded, None) == [[s["ltx_path"] for s in reloaded.scenes]]
+
+
+def test_switching_upscale_off_after_a_final_rebuilds_it_from_the_raw_parts(live, tmp_path):
+    proj = _done_project(tmp_path, upscale_stage="done")
+    _final_done(proj)
+    status, body = _call(live, "PUT", f"/api/projects/{proj.id}/route", {"upscale": False})
+    assert status == 200, body
+    assert [j.kind for j in q.scan(live.queue_root)[0]] == ["assemble"]
+    reloaded = p.load_project(proj.path)
+    assert reloaded.assembly["final_path"] is None
+    assert _assembled_inputs(reloaded, None) == [[s["clip_path"] for s in reloaded.scenes]]
+
+
+@pytest.mark.parametrize("route", [
+    [],
+    [{"stage": "scenario", "enabled": True}, {"stage": "scenes", "enabled": True},
+     {"stage": "assemble", "enabled": True}],                       # no upscale
+    [{"stage": "scenario", "enabled": True}, {"stage": "scenes", "enabled": True},
+     {"stage": "upscale", "enabled": True}, {"stage": "upscale", "enabled": True},
+     {"stage": "assemble", "enabled": True}],                       # duplicate
+    [{"stage": "scenes", "enabled": True}, {"stage": "scenario", "enabled": True},
+     {"stage": "upscale", "enabled": True}, {"stage": "assemble", "enabled": True}]])  # order
+def test_a_route_must_be_exactly_its_kinds_stages_in_order(tmp_path, route):
+    proj = p.create_project(tmp_path, "video", "Bad")
+    _rewrite(proj, lambda d: d.__setitem__("route", route))
+    with pytest.raises(p.ProjectNotFound):
+        p.load_project(proj.path)

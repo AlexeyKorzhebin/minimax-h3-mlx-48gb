@@ -180,6 +180,9 @@ def _check_route(path, kind, route) -> None:
         if entry["stage"] not in ROUTE_STAGES or entry["stage"] not in allowed:
             raise ProjectNotFound(f"{path}: route stage {entry['stage']!r} is unknown for "
                                   f"kind={kind!r} (known: {allowed})")
+    if tuple(entry["stage"] for entry in route) != allowed:
+        raise ProjectNotFound(f"{path}: route must list exactly {allowed} in that order for "
+                              f"kind={kind!r}, got {[entry['stage'] for entry in route]}")
 
 
 class ProjectError(Exception):
@@ -612,6 +615,35 @@ class Project:
             write_json_durably(self.path, data)
             self._apply(data)
         return self
+
+    def set_scene_ltx_if_current(self, idx: int, clip_path: str, ltx_path: str) -> bool:
+        """Write `ltx_path` on scene `idx` only if its `clip_path` is still the clip that was
+        upscaled -- checked under the project lock. A scene re-shot while the upscale job ran has a
+        new clip (or none); the -ltx part of the old take must not be attached to it."""
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            scene = _find_scene(data["scenes"], idx)
+            if scene.get("clip_path") != clip_path:
+                return False
+            scene["ltx_path"] = ltx_path
+            write_json_durably(self.path, data)
+            self._apply(data)
+        return True
+
+    def finish_upscale(self, clips: dict) -> bool:
+        """Close the upscale stage under the project lock: `done` only if every scene still has
+        exactly the clip (`clips`: idx -> clip_path) that was upscaled and an -ltx part; otherwise
+        the stage goes back to `draft` (the next advance upscales again) and False is returned."""
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            scenes = {scene["idx"]: scene for scene in data["scenes"]}
+            current = (set(scenes) == set(clips)
+                       and all(scenes[idx].get("clip_path") == clip
+                               and scenes[idx].get("ltx_path") for idx, clip in clips.items()))
+            data["stages"]["upscale"] = "done" if current else "draft"
+            write_json_durably(self.path, data)
+            self._apply(data)
+        return current
 
     def set_stage_status(self, name: str, status: str) -> "Project":
         """Set stage `name`'s status to any `STAGE_STATUSES` value -- the general form of

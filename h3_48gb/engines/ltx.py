@@ -193,6 +193,7 @@ def run_upscale(project_path, *, client, comfy_output, run, attempt: str, sleep=
         if not scenes:
             raise UpscaleError("в проекте нет сцен")
         clips = _scene_clips(scenes)
+        upscaled = {scene["idx"]: str(clip) for scene, clip in zip(scenes, clips)}
         strength = motion.lora_for(motion.clip_motion(clips, run=run))
         log.append(f"ltx: сила {strength:g} на весь клип ({len(clips)} частей)\n")
         for scene, clip in zip(scenes, clips):
@@ -201,7 +202,12 @@ def run_upscale(project_path, *, client, comfy_output, run, attempt: str, sleep=
                                prefix=f"{PREFIX_ROOT}/{proj.id}/{clip.stem}-{attempt}",
                                client=client, comfy_output=comfy_output, run=run, sleep=sleep,
                                cancelled=cancelled, log=log.append)
-            proj.set_scene_fields(scene["idx"], ltx_path=str(out))
+            # the scene may have been re-shot while this part was being upscaled: the check is
+            # under the project lock, a stale -ltx part is never attached to the new take
+            if not proj.set_scene_ltx_if_current(scene["idx"], str(clip), str(out)):
+                log.append(f"ltx: сцена {scene['idx']} переснята во время апскейла, "
+                           f"результат отброшен\n")
+                break
             log.append(f"ltx: сцена {scene['idx']} -> {out.name}\n")
     except (UpscaleError, motion.MotionError) as exc:
         proj.set_stage_status("upscale", "failed")
@@ -211,5 +217,7 @@ def run_upscale(project_path, *, client, comfy_output, run, attempt: str, sleep=
         proj.set_stage_status("upscale", "failed")
         log.append(f"ltx crashed: {type(exc).__name__}: {exc}\n")
         return 1, "".join(log)
-    proj.set_stage_status("upscale", "done")
+    if not proj.finish_upscale(upscaled):
+        log.append("ltx: сцены изменились во время апскейла, этап вернулся в draft и "
+                   "поставится заново\n")
     return 0, "".join(log)
