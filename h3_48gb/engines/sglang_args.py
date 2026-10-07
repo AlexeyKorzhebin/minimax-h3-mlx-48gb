@@ -174,6 +174,11 @@ def parse(argv, *, environ=None, check_files: bool = True) -> SglangSpec:
                               {"frames": frames, "next_grid_frames": nxt,
                                "next_grid_seconds": nxt / FPS})
 
+    # The spec carries the grid's own duration, not the typed one: 7.31 s snaps to 175 frames, and
+    # 175 frames are 175/24 s -- that exact value is what downstream cuts the track and drops head
+    # frames by, so it has to equal the mp4's length, not the user's rounding.
+    duration = frames / FPS
+
     steps = _number(values, "--steps", int, DEFAULT_STEPS)
     seed = _number(values, "--seed", int, DEFAULT_SEED)
     if steps < 1 or seed < 0:

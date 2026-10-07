@@ -144,3 +144,9 @@ def test_dry_run_report_and_output_stem(tmp_path):
         "dry_run": True, "engine": "sglang", "output_stem": f"{tmp_path}/h3-scene-0-ab12-896x512",
         "canvas": "896x512", "duration_seconds": 7.291666666666667, "frames": 175,
         "grid_points": 50, "task": "ref2va"}
+
+
+def test_the_duration_is_normalised_to_the_grid_frames(tmp_path):
+    spec = sa.parse(_argv(tmp_path, "--ref", _png(tmp_path / "a.png"), duration="7.31"))
+    assert (spec.frames, spec.duration) == (175, 175 / 24)
+    assert sa.grid_frames_up(spec.frames) == spec.frames

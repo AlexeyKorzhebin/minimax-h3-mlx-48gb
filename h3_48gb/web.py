@@ -2264,8 +2264,8 @@ def estimate(args, checkpoint, *, report=None) -> dict:
     `report` is a `generate --dry-run` report, and when it is given the canvas, the duration and
     the step count come from **it** rather than from `args`. That matters for exactly one case and
     it is the case this whole module is arranged around: with `--image` and no explicit
-    `--width/--height`, the canvas is derived from the keyframe by `resolve_canvas`, which imports
-    `minimax_h3_mlx.packing` and `mlx` with it. This process must never do that, so without a
+    `--width/--height`, the canvas is derived from the keyframe by the CLI's `resolve_canvas` (arithmetic in
+    `h3_48gb.canvas`, no mlx). The rules stay in the CLI so there is one source of them, so without a
     report the canvas falls back to `DEFAULT_CANVAS` -- right for the form, which posts explicit
     numbers, and approximate for a keyframe run until the subprocess has answered. On submission
     the report exists, so what gets stored on the job is the estimate for the real canvas.
@@ -2326,7 +2326,7 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 
 #: How long `generate --dry-run --json` may take. It builds a `RunSpec` and returns -- no weights,
 #: no checkpoint -- so it costs a fraction of a second; with `--image` it also opens the keyframe
-#: and imports `minimax_h3_mlx.packing`, which is the slow case and still seconds. The timeout is
+#: and decodes it, which is the slow case and still seconds. The timeout is
 #: here so that a subprocess wedged on an unreadable network mount cannot pin an HTTP thread for
 #: ever, not because the number is expected to matter.
 DRY_RUN_TIMEOUT = 120
@@ -2387,11 +2387,10 @@ def validate_args(args, python=sys.executable, timeout: float = DRY_RUN_TIMEOUT)
 
     On sglang there is no subprocess: `_validate_args_sglang` runs the adapter's own parser.
 
-    **The validation rules exist once, in the CLI, and are reached through a subprocess.** Not for
-    isolation's sake: `spec_from_args` calls `resolve_canvas`, which for `--image` without an
-    explicit canvas imports `minimax_h3_mlx.packing` and `mlx.core` with it, and this process sits
-    resident all day next to a 36 GB generation. A second copy of the MLX stack in here is memory
-    this machine does not have. Purity by construction, not by promise -- see
+    **The validation rules exist once, in the CLI, and are reached through a subprocess.** The canvas
+    arithmetic no longer needs mlx (`h3_48gb.canvas`), so this is not about keeping MLX out of the
+    process any more: it is that a second copy of the rules in here would drift from the CLI's.
+    Purity of this process is still pinned by
     `test_posting_a_job_with_an_image_never_pulls_mlx_into_the_server`.
 
     **`--dry-run --json` are inserted immediately after the subcommand, not appended.** Appended,
@@ -3897,8 +3896,8 @@ class _Handler(BaseHTTPRequestHandler):
         **The one exception is a keyframe run with no canvas** (`canvas_comes_from_the_image`),
         which the form now sends deliberately: «из кадра (авто)» omits `--width`/`--height` so the
         CLI derives the canvas from the frame, aspect intact. The formula cannot follow it there --
-        the derivation lives in `minimax_h3_mlx.packing`, which this process may never import (see
-        the module docstring and `test_web_module_does_not_import_mlx`) -- so without the dry run
+        the derivation is the CLI's `resolve_canvas` (arithmetic in `h3_48gb.canvas`) and this route
+        keeps the rules in one place rather than re-implementing it -- so without the dry run
         `estimate` would silently fall back to `DEFAULT_CANVAS`, i.e. price a vertical frame as a
         landscape video. Duplicating the arithmetic here instead would be the worse answer: two
         implementations of the same rule drift, and this one would drift towards *quietly wrong

@@ -87,3 +87,12 @@ def test_estimate_route_on_sglang(queue_server, monkeypatch):  # noqa: F811
                          {"args": _sglang_job_args(queue_server)})
     assert (status, body) == (200, {"ok": True, "estimate":
                                     {"seconds": 2810.0, "source": "table", "samples": 0}})
+
+
+def test_estimate_route_refuses_a_ref_outside_the_roots_on_sglang(queue_server, monkeypatch):  # noqa: F811
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    status, body = _call(queue_server, "POST", "/api/estimate",
+                         {"args": _sglang_job_args(queue_server, "--ref", "/etc/passwd")})
+    assert status == 400
+    assert (body["error"]["code"], body["error"]["message"]) == (
+        "path_outside_root", "path is outside every root this server may read: /etc/passwd")

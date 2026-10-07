@@ -1320,7 +1320,7 @@ def test_web_module_does_not_import_mlx():
 
 def test_serving_requests_never_imports_mlx(tmp_path):
     """Import-time purity is the easy half. A route that reached `spec_from_args` (which pulls in
-    `minimax_h3_mlx.packing` for `--image`) would leave the module import clean and still put the
+    the CLI's `resolve_canvas` for `--image`) would leave the module import clean and still put the
     whole stack in the server process on the first request.
     """
     script = f"""
@@ -1976,7 +1976,7 @@ def test_posting_a_job_with_an_image_never_pulls_mlx_into_the_server(tmp_path):
     """The one route where MLX could sneak in.
 
     `--image` without an explicit canvas is what makes `spec_from_args` call `resolve_canvas`,
-    which imports `minimax_h3_mlx.packing` and `mlx.core` with it. Checking only that the module
+    whose canvas arithmetic (`h3_48gb.canvas`) must stay mlx-free. Checking only that the module
     imports cleanly, or only that `/api/state` stays clean, misses it entirely -- the import
     happens on the first *submission*, inside whichever process validates it. The whole server is
     therefore run in a subprocess of its own and asked, after a real POST, what it has imported.
@@ -2468,8 +2468,8 @@ def test_the_estimate_of_a_keyframe_run_uses_the_canvas_derived_from_the_frame(q
     вертикальный кадр получал оценку чужого канваса: время и память считались не для того ролика,
     который поедет считаться.
 
-    Канвас из кадра знает только CLI (`resolve_canvas` -> `minimax_h3_mlx.packing`, который этому
-    процессу импортировать нельзя), поэтому здесь запускается тот же dry-run, что и при постановке,
+    Канвас из кадра знает только CLI (`resolve_canvas` в CLI; арифметика в `h3_48gb.canvas`, но правило
+    живёт в одном месте, поэтому процесс не дублирует его), поэтому здесь запускается тот же dry-run, что и при постановке,
     и оценка считается по его `canvas`. Подписи оценки этот же канвас нужен, чтобы показать его
     человеком, — оттого `width`/`height` в ответе.
     """
