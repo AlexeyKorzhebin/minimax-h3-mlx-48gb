@@ -82,6 +82,41 @@ def test_one_percent_of_mlx_zero_fill_colour_is_a_clean_clip_on_sglang(tmp_path)
     assert sg._flat_frames(path, FRAMES) == []
 
 
+def test_a_nonzero_start_time_does_not_duplicate_a_frame(tmp_path):
+    """Final re-review: rawvideo output is CFR by default, so an mp4 that starts at 0.1 s decoded
+    to FRAMES + 1 frames; `-fps_mode passthrough` keeps the count the file holds."""
+    path = tmp_path / "shifted.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "testsrc=size=320x240:rate=24", "-frames:v", str(FRAMES), "-output_ts_offset",
+                    "0.1", "-c:v", "libx264", "-crf", "0", "-pix_fmt", "yuv444p", str(path)],
+                   check=True)
+    start = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=start_time", "-of", "csv=p=0", str(path)],
+                           capture_output=True, text=True, check=True).stdout.strip()
+    assert float(start) == pytest.approx(0.1, abs=1e-3)
+    assert sg._flat_frames(path, FRAMES) == []
+
+
+def test_the_decode_asks_ffmpeg_for_every_frame_the_file_holds(tmp_path, monkeypatch):
+    """The reviewer's ffmpeg duplicated a frame in CFR rawvideo output (193 for 192); the ffmpeg
+    9.0.1 on this Mac does not, so the exact command is pinned: `-fps_mode passthrough` is an
+    output option, so it stands after `-i` and before `-f rawvideo`."""
+    path = tmp_path / "plain.mp4"
+    _mp4(path)
+    seen = []
+    real = subprocess.Popen
+
+    def spy(cmd, *args, **kwargs):
+        if cmd[0] == "ffmpeg":
+            seen.append(list(cmd))
+        return real(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    assert sg._flat_frames(path, FRAMES) == []
+    assert seen == [["ffmpeg", "-v", "error", "-i", str(path), "-fps_mode", "passthrough",
+                     "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]]
+
+
 def test_a_frame_count_other_than_requested_is_a_failed_check(tmp_path):
     _mp4(tmp_path / "short.mp4", frames=FRAMES - 1)
     with pytest.raises(OSError) as info:

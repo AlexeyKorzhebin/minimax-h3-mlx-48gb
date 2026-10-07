@@ -209,8 +209,8 @@ def _flat_frames(mp4: Path, expected_frames: int) -> list[int]:
         index = 0
         with tempfile.TemporaryFile() as errors:
             with subprocess.Popen(
-                    ["ffmpeg", "-v", "error", "-i", str(mp4), "-f", "rawvideo", "-pix_fmt",
-                     "rgb24", "-"], stdout=subprocess.PIPE, stderr=errors) as proc:
+                    ["ffmpeg", "-v", "error", "-i", str(mp4), "-fps_mode", "passthrough", "-f",
+                     "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE, stderr=errors) as proc:
                 while True:
                     raw = proc.stdout.read(size)
                     if not raw:
