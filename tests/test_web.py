@@ -656,8 +656,16 @@ def test_media_cannot_step_out_of_one_run_into_another(server, url):
     assert body["error"]["code"] == "path_outside_root"
 
 
+def _needs_case_insensitive_fs(tmp_path, spelling):
+    """The upper-case spellings only reach the queue on a case-insensitive volume (macOS)."""
+    probe = tmp_path / "CaseProbe"
+    probe.touch()
+    if spelling != "queue" and not (tmp_path / "caseprobe").exists():
+        pytest.skip("case-sensitive filesystem: this spelling names no directory")
+
+
 @pytest.mark.parametrize("spelling", ["queue", "QUEUE", "Queue", "QuEuE"])
-def test_media_does_not_serve_the_queue(server, spelling):
+def test_media_does_not_serve_the_queue(server, spelling, tmp_path):
     """`queue/` **is** a direct child of the outdir, so the direct-child rule alone lets this
     through. It is not a run: the page reads the queue over `/api/state`, which returns jobs, not
     whatever bytes happen to be sitting in `queue/logs/`.
@@ -667,6 +675,7 @@ def test_media_does_not_serve_the_queue(server, spelling):
     decided by how the request spelled the directory: `queue` was refused and `QUEUE` returned the
     job file. Comparison is now by inode.
     """
+    _needs_case_insensitive_fs(tmp_path, spelling)
     (server.queue_root / "pending" / "20260811-000000-x-0000.json").write_text('{"a": 1}')
     status, body = _json(server, f"/media/{spelling}/pending/20260811-000000-x-0000.json")
     assert status == 400, f"/media/{spelling}/… answered {status}"
@@ -679,11 +688,12 @@ def test_media_does_not_serve_the_queue(server, spelling):
 
 
 @pytest.mark.parametrize("spelling", ["queue", "QUEUE", "QuEuE"])
-def test_the_queue_is_refused_even_for_a_file_type_media_serves(server, spelling):
+def test_the_queue_is_refused_even_for_a_file_type_media_serves(server, spelling, tmp_path):
     """The allowlist would refuse `.json` and `.log` whatever directory they sat in, so it alone
     does not prove the queue is excluded. A `.jpg` inside the queue is the case that separates the
     two rules -- and it must still be refused, by identity.
     """
+    _needs_case_insensitive_fs(tmp_path, spelling)
     (server.queue_root / "logs").mkdir(exist_ok=True)
     (server.queue_root / "logs" / "sneak.jpg").write_bytes(b"\xff\xd8x")
     status, body = _json(server, f"/media/{spelling}/logs/sneak.jpg")
@@ -691,7 +701,7 @@ def test_the_queue_is_refused_even_for_a_file_type_media_serves(server, spelling
     assert body["error"]["code"] == "path_outside_root"
 
 
-def test_samefile_sees_through_case_where_path_equality_does_not(server):
+def test_samefile_sees_through_case_where_path_equality_does_not(server, tmp_path):
     """Documents the *primitive*, not the route: `_is_same_file` in isolation, and the fact that
     the obvious alternative disagrees with it on this volume.
 
@@ -700,6 +710,7 @@ def test_samefile_sees_through_case_where_path_equality_does_not(server):
     the call site stops using this helper -- a reader should not have to work out that this test
     is not that one.
     """
+    _needs_case_insensitive_fs(tmp_path, "QUEUE")
     upper = server.outdir / "QUEUE"
     assert upper.resolve() != server.queue_root.resolve(), "not a case-insensitive volume"
     assert web._is_same_file(upper, server.queue_root), "samefile did not see through the case"

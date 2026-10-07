@@ -1,0 +1,9 @@
+.git
+**/__pycache__
+*.egg-info
+.pytest_cache
+.claude
+.gstack
+.superpowers
+reference
+upstream

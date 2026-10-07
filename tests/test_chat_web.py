@@ -19,6 +19,7 @@ import fcntl
 import http.client
 import json
 import os
+import sys
 import threading
 import urllib.parse
 from dataclasses import dataclass
@@ -1581,6 +1582,7 @@ def test_duplicating_a_job_with_a_prompt_file_gets_its_own_snapshot_not_the_sour
 # -- показать в Finder ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="«Показать в Finder» only exists on macOS (reveal_unsupported elsewhere)")
 def test_revealing_a_finished_job_opens_finder_at_its_clip(_serve):
     """`POST /api/jobs/<id>/reveal`, happy path: a `done` job with its `.mp4` still on disk hands
     that exact file to `open -R` -- the one thing a person clicking "Показать в Finder" on a
@@ -1606,6 +1608,7 @@ def test_revealing_a_finished_job_opens_finder_at_its_clip(_serve):
         "the path handed to Finder must stay inside the outdir")
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="«Показать в Finder» only exists on macOS (reveal_unsupported elsewhere)")
 def test_revealing_a_failed_job_without_a_clip_falls_back_to_its_run_directory(_serve):
     """A `failed` job never got as far as writing an `.mp4` -- the route's second candidate is the
     job's own subdirectory (task A6), the only thing on disk left to look at: the partial
@@ -1625,6 +1628,7 @@ def test_revealing_a_failed_job_without_a_clip_falls_back_to_its_run_directory(_
     assert calls == [run_dir.resolve()]
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="«Показать в Finder» only exists on macOS (reveal_unsupported elsewhere)")
 def test_revealing_a_job_with_nothing_left_on_disk_is_a_named_404(_serve):
     """Neither the clip nor the run's own directory ever made it to disk (the worker died before
     `RunSpec.outdir.mkdir` -- see `test_cli.py`) -- there is nothing to select in Finder, and the
@@ -1642,6 +1646,7 @@ def test_revealing_a_job_with_nothing_left_on_disk_is_a_named_404(_serve):
     assert calls == [], "nothing on disk means the seam must never be called"
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="«Показать в Finder» only exists on macOS (reveal_unsupported elsewhere)")
 def test_revealing_a_pending_job_is_refused(_serve):
     """A `pending` job has not run yet -- there is no output directory, own subdirectory or not,
     and revealing it would either open nothing or (worse) open whatever `output_stem`'s parent
@@ -1655,6 +1660,7 @@ def test_revealing_a_pending_job_is_refused(_serve):
     assert answer["error"]["code"] == "not_found", answer
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="«Показать в Finder» only exists on macOS (reveal_unsupported elsewhere)")
 def test_revealing_an_unknown_job_is_a_named_404(_serve):
     srv = _serve()
     status, answer = srv.post_json_raw("/api/jobs/does-not-exist/reveal", None)

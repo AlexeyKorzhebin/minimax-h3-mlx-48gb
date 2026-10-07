@@ -1,0 +1,25 @@
+services:
+  h3-panel:
+    build: .
+    image: h3-panel:latest
+    network_mode: host
+    user: "1000:1000"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      TZ: Europe/Moscow
+      H3_ENGINE: sglang
+      H3_OUTDIR: /home/alex/Outputs/h3-panel
+      H3_ALLOWED_HOSTS: "192.168.100.50:8765,alex-neuro:8765"
+      H3_SGLANG_URL: http://127.0.0.1:30020
+      H3_COMFY_URL: http://127.0.0.1:8188
+      H3_DISPATCHER_URL: http://127.0.0.1:8790
+      H3_COMFY_OUTPUT_DIR: /home/alex/Outputs/comfy/output
+      H3_IDLE_RELEASE_MIN: "15"
+      H3_MAX_REF_IMAGES: "6"
+    volumes:
+      - /home/alex/Outputs/h3-panel:/home/alex/Outputs/h3-panel
+      - /home/alex/Outputs/comfy/output:/home/alex/Outputs/comfy/output:ro
+      # our own frames only, rw, so a finished -ltx part can remove its PNGs (task 10)
+      - /home/alex/Outputs/comfy/output/h3panel:/home/alex/Outputs/comfy/output/h3panel
+      - /home/alex/Projects/h3-bench/inputs:/home/alex/Projects/h3-bench/inputs:ro

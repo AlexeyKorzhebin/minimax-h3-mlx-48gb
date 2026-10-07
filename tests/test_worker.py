@@ -94,6 +94,7 @@ def _queued(root, tmp_path, tag="a"):
 # -- Step 3: the command, and that `run_job` actually uses it -----------------------------------
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_job_command_wraps_the_job_in_caffeinate_and_this_interpreter(tmp_path):
     root = tmp_path / "queue"
     job = _queued(root, tmp_path)
@@ -107,6 +108,7 @@ def test_job_command_wraps_the_job_in_caffeinate_and_this_interpreter(tmp_path):
         "the child must run in the worker's own virtualenv, not whichever python is on PATH")
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_run_job_launches_exactly_the_command_job_command_builds(tmp_path):
     """A correct `job_command` proves nothing if `run_job` builds its own line and skips
     caffeinate. On 2026-08-10 an idle sleep took the GPU firmware down mid-run.
@@ -720,6 +722,7 @@ def test_the_first_stop_signal_lets_the_running_job_finish_and_takes_no_new_one(
         "the worker took a new job after being asked to stop")
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_the_second_stop_signal_kills_the_grandchild_not_just_the_direct_child(tmp_path):
     """A signal to the direct child only would kill `caffeinate` and leave the nested Python --
     the process actually holding 36 GB -- orphaned, with no worker and no lease. This checks a
@@ -981,6 +984,7 @@ def _fake_song_result(track_dir: Path, *, undersung=False) -> sr.SongResult:
     )
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_run_job_dispatches_a_song_kind_to_songrun_run_song_and_gates_the_track(tmp_path,
                                                                                  monkeypatch):
     """`kind="song"` (design spec, "Трек"): the worker calls `songrun.run_song` in-process --
@@ -1244,6 +1248,7 @@ def test_i1_a_failed_song_job_after_a_retry_also_marks_stages_track_failed(tmp_p
     assert reloaded.stages["track"] == "failed"
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_run_job_treats_a_kind_less_job_as_generate(tmp_path):
     """Backward compatibility end to end (task 3 brief, mandatory), not just at the dataclass level
     (`test_queue.py` covers that half): a job claimed from a `pending/<id>.json` written before
@@ -1313,6 +1318,7 @@ def test_run_job_dispatches_an_assemble_kind_with_an_honest_failure_before_task_
     assert "Task 4" in log
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_run_job_dispatches_an_assemble_kind_to_h3_48gb_assemble_run(tmp_path, monkeypatch):
     """The worker's lazy import finds the real `h3_48gb.assemble` and calls `.run(project_path,
     run=...)` -- proven by monkeypatching `.run` directly on the real, already-imported module
@@ -2024,6 +2030,7 @@ def test_i3_a_broken_assemble_import_does_not_crash_run_job_for_a_generate_scene
 # -- M1 (fix round 1, 2026-08-18 review): the bare caffeinate is bound to the worker's own pid ----
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_m1_caffeinate_block_binds_to_the_workers_own_pid(tmp_path):
     """A `finally: proc.terminate()` never runs if the worker itself is taken down by `kill -9`
     (or the second-SIGTERM path, which sets `SIG_DFL` and re-signals itself -- indistinguishable
