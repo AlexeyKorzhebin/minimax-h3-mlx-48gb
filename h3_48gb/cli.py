@@ -263,6 +263,10 @@ from h3_48gb.engines.sglang_args import ERROR_CODES as _SGLANG_ERROR_CODES  # no
 
 ERROR_CODES.update(_SGLANG_ERROR_CODES)
 
+from h3_48gb.library import ERROR_CODES as _LIBRARY_ERROR_CODES  # noqa: E402
+
+ERROR_CODES.update(_LIBRARY_ERROR_CODES)
+
 
 class CliError(SystemExit):
     """A refusal with a stable code, alongside the human sentence `SystemExit` already carried.

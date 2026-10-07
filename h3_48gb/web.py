@@ -49,6 +49,7 @@ from pathlib import Path
 
 from h3_48gb import assemble as assemble_module
 from h3_48gb import engine
+from h3_48gb import library as library_module
 from h3_48gb import project as project_module
 from h3_48gb import provider
 from h3_48gb import queue as q
@@ -491,6 +492,8 @@ def _upload_stamp() -> str:
 #: rather than being wrong -- the job left `pending/` between the page's last poll and this
 #: request. It is mapped here *before* task 6 raises it, on purpose; see `PLANNED_CODES`.
 ERROR_STATUS = {
+    "library_card_not_found": 404,
+    "library_tag_exists": 409,
     "reveal_unsupported": 409,
     "host_not_allowed": 403,
     # A separate code from `host_not_allowed`, and separate on purpose: `Host` answers "which name
@@ -3283,6 +3286,10 @@ class _Handler(BaseHTTPRequestHandler):
                     _json_bytes(build_state(self.server.queue_root, self.server.outdir)))
         if path == "/api/projects":
             return self._list_projects()
+        if path == "/api/library":
+            return self._list_library()
+        if path.startswith("/api/projects/") and path.endswith("/references"):
+            return self._project_references(path[len("/api/projects/"):-len("/references")])
         if path.startswith("/api/projects/"):
             return self._read_project(path[len("/api/projects/"):])
         if path == "/api/prompts":
@@ -3304,6 +3311,8 @@ class _Handler(BaseHTTPRequestHandler):
         """Dispatch a POST. `unquote` first, for the same reason `_route_get` does it."""
         path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
 
+        if path == "/api/library":
+            return self._create_card()
         if path == "/api/jobs":
             return self._submit_job()
         if path == "/api/estimate":
@@ -3362,6 +3371,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _route_put(self) -> tuple[int, str, bytes]:
         path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
 
+        if path.startswith("/api/library/"):
+            return self._update_card(path[len("/api/library/"):])
+        if path.startswith("/api/projects/") and path.endswith("/references"):
+            return self._put_project_references(path[len("/api/projects/"):-len("/references")])
         if path.startswith("/api/jobs/"):
             return self._edit_job(path[len("/api/jobs/"):])
         if path.startswith("/api/prompts/"):
@@ -3948,6 +3961,64 @@ class _Handler(BaseHTTPRequestHandler):
                 {"id": raw_id, "resolved": str(target)},
             )
         return target
+
+    def _library_call(self, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except library_module.LibraryError as exc:
+            raise CliError(exc.code, exc.message, exc.detail) from exc
+
+    def _list_library(self) -> tuple[int, str, bytes]:
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "cards": library_module.list_cards(self.server.outdir)})
+
+    def _library_assets(self, payload) -> list[Path] | None:
+        raw = payload.get("assets")
+        if raw is None:
+            return None
+        if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+            raise CliError("args_invalid", "`assets` must be a list of paths", {})
+        return [resolve_within(item, {"outdir": Path(self.server.outdir)}, write=False)
+                for item in raw]
+
+    def _create_card(self) -> tuple[int, str, bytes]:
+        payload = self._json_request(allowed=("tag", "kind", "description", "assets"))
+        card = self._library_call(
+            library_module.create_card, self.server.outdir, tag=payload.get("tag"),
+            kind=payload.get("kind"), description=payload.get("description"),
+            assets=self._library_assets(payload) or [])
+        return 200, "application/json", _json_bytes({"ok": True, "card": card})
+
+    def _update_card(self, name: str) -> tuple[int, str, bytes]:
+        payload = self._json_request(allowed=("kind", "description", "assets"))
+        card = self._library_call(
+            library_module.update_card, self.server.outdir, "@" + name,
+            kind=payload.get("kind"), description=payload.get("description"),
+            assets=self._library_assets(payload))
+        return 200, "application/json", _json_bytes({"ok": True, "card": card})
+
+    def _resolved_references(self, proj) -> list[dict]:
+        return [self._library_call(library_module.get_card, self.server.outdir, ref["tag"],
+                                   ref["version"]) for ref in proj.references]
+
+    def _project_references(self, raw_id: str) -> tuple[int, str, bytes]:
+        proj = self._load_project(raw_id)
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "references": self._resolved_references(proj)})
+
+    def _put_project_references(self, raw_id: str) -> tuple[int, str, bytes]:
+        proj = self._load_project(raw_id)
+        payload = self._json_request(allowed=("references",))
+        raw = payload.get("references")
+        if not isinstance(raw, list) or not all(isinstance(r, dict) and "tag" in r for r in raw):
+            raise CliError("args_invalid", "`references` must be a list of {tag, version?}", {})
+        pinned = []
+        for ref in raw:
+            card = self._library_call(library_module.get_card, self.server.outdir, ref["tag"],
+                                      ref.get("version"))
+            pinned.append({"tag": card["tag"], "version": card["version"]})
+        proj.set_references(pinned)
+        return self._project_references(raw_id)
 
     def _load_project(self, raw_id: str):
         """The `project.Project` `raw_id` names, or `project_not_found` -- every project route

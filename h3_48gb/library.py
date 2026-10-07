@@ -1,0 +1,252 @@
+"""The reference library (spec §3.5): cards shared by every project, each project pinning a card
+at a version, and the deterministic Ref2VA prompt/conditions assembly from the @tags in a scene.
+
+On disk: `<outdir>/library/<name>/card.json`, assets of version N in `<outdir>/library/<name>/vN/`;
+`<name>` is the tag without its `@`. Old versions' files are never deleted (spec: "не удаляются,
+пока на неё ссылается хоть один проект" -- the cheapest correct reading is "never").
+
+Numbering follows the sglang server's own code, not the h3-bench prompts: the keyframe is a guide
+latent and gets no label; reference pictures are `<Picture 1..>` in condition order; audio
+references are `<Audio 1..>` (presentation.py:230-270 on alex-neuro).
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import re
+import shutil
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from h3_48gb.queue import write_json_durably
+
+TAG_RE = re.compile(r"^@[a-z0-9-]{2,32}$")
+_TAG_IN_TEXT_RE = re.compile(r"(?<![\w@.])@([A-Za-z0-9-]+)")
+KINDS = ("person", "object", "environment", "style", "voice")
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
+AUDIO_SUFFIXES = (".mp3", ".wav")
+MAX_IMAGES = 4
+MAX_DESCRIPTION = 400
+CARD_NAME = "card.json"
+
+ERROR_CODES = {
+    "library_tag_invalid": "a reference tag is not @ followed by 2-32 of [a-z0-9-]",
+    "library_tag_exists": "a reference card with this tag already exists",
+    "library_kind_invalid": "a reference card kind outside person/object/environment/style/voice",
+    "library_description_invalid": "a reference card description is empty or too long",
+    "library_assets_invalid": "a reference card needs 1-4 png/jpg pictures, or exactly one mp3/wav for a voice",
+    "library_card_not_found": "no reference card with this tag",
+    "library_version_not_found": "the reference card has no such version",
+    "tag_invalid": "an @tag in scene text is not lowercase [a-z0-9-]{2,32}",
+    "unknown_tag": "an @tag in scene text is not pinned to the project",
+}
+
+
+class LibraryError(ValueError):
+    def __init__(self, code: str, message: str, detail: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.detail = dict(detail or {})
+
+
+@dataclass(frozen=True)
+class Ref2VAScene:
+    prompt: str
+    images: tuple[str, ...]
+    audios: tuple[str, ...]
+    subjects: tuple[str, ...]
+
+
+def library_root(outdir) -> Path:
+    return Path(outdir) / "library"
+
+
+def _check_tag(tag) -> str:
+    if not isinstance(tag, str) or not TAG_RE.match(tag):
+        raise LibraryError("library_tag_invalid",
+                           f"тег {tag!r}: нужен @ и 2–32 символа из a-z, 0-9, -", {"tag": tag})
+    return tag
+
+
+def _card_dir(outdir, tag) -> Path:
+    return library_root(outdir) / _check_tag(tag)[1:]
+
+
+@contextmanager
+def _card_lock(card_dir: Path):
+    card_dir.mkdir(parents=True, exist_ok=True)
+    with open(card_dir / "card.lock", "a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _check_fields(kind, description, assets) -> list[Path]:
+    if kind not in KINDS:
+        raise LibraryError("library_kind_invalid", f"тип {kind!r}: можно {KINDS}", {"kind": kind})
+    if not isinstance(description, str) or not description.strip() \
+            or len(description) > MAX_DESCRIPTION:
+        raise LibraryError("library_description_invalid",
+                           f"описание: 1–{MAX_DESCRIPTION} символов по-английски", {})
+    paths = [Path(a) for a in assets]
+    suffixes = [path.suffix.lower() for path in paths]
+    if kind == "voice":
+        ok = len(paths) == 1 and suffixes[0] in AUDIO_SUFFIXES
+    else:
+        ok = 1 <= len(paths) <= MAX_IMAGES and all(s in IMAGE_SUFFIXES for s in suffixes)
+    if not ok or not all(path.is_file() for path in paths):
+        raise LibraryError("library_assets_invalid",
+                           "нужно 1–4 картинки png/jpg, а для голоса — ровно один mp3/wav",
+                           {"kind": kind, "assets": [str(p) for p in paths]})
+    return paths
+
+
+def _copy_assets(card_dir: Path, version: int, paths: list[Path]) -> list[str]:
+    version_dir = card_dir / f"v{version}"
+    version_dir.mkdir(parents=True, exist_ok=False)
+    relative = []
+    for index, src in enumerate(paths, start=1):
+        name = f"{index:02d}-{src.name}"
+        shutil.copyfile(src, version_dir / name)
+        relative.append(f"v{version}/{name}")
+    return relative
+
+
+def _read(card_dir: Path, tag: str) -> dict:
+    path = card_dir / CARD_NAME
+    if not path.is_file():
+        raise LibraryError("library_card_not_found", f"нет карточки {tag}", {"tag": tag})
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _view(card_dir: Path, card: dict, version: int) -> dict:
+    entry = card["versions"].get(str(version))
+    if entry is None:
+        raise LibraryError("library_version_not_found",
+                           f"у {card['tag']} нет версии {version}", {"tag": card["tag"],
+                                                                     "version": version})
+    return {"tag": card["tag"], "kind": entry["kind"], "description": entry["description"],
+            "version": version, "latest_version": card["version"],
+            "assets": [str(card_dir / rel) for rel in entry["assets"]]}
+
+
+def create_card(outdir, *, tag, kind, description, assets, now=None) -> dict:
+    card_dir = _card_dir(outdir, tag)
+    paths = _check_fields(kind, description, assets)
+    library_root(outdir).mkdir(parents=True, exist_ok=True)
+    try:
+        card_dir.mkdir()
+    except FileExistsError:
+        raise LibraryError("library_tag_exists", f"тег {tag} уже есть", {"tag": tag}) from None
+    stamp = now or _now()
+    with _card_lock(card_dir):
+        relative = _copy_assets(card_dir, 1, paths)
+        card = {"tag": tag, "version": 1, "created": stamp, "updated": stamp,
+                "versions": {"1": {"kind": kind, "description": description.strip(),
+                                   "assets": relative, "created": stamp}}}
+        write_json_durably(card_dir / CARD_NAME, card)
+    return _view(card_dir, card, 1)
+
+
+def update_card(outdir, tag, *, kind=None, description=None, assets=None, now=None) -> dict:
+    card_dir = _card_dir(outdir, tag)
+    _read(card_dir, tag)  # refuse an unknown tag before _card_lock creates its directory
+    with _card_lock(card_dir):
+        card = _read(card_dir, tag)
+        previous = card["versions"][str(card["version"])]
+        new_kind = kind if kind is not None else previous["kind"]
+        new_description = description if description is not None else previous["description"]
+        version = card["version"] + 1
+        if assets is None:
+            paths = [card_dir / rel for rel in previous["assets"]]
+            _check_fields(new_kind, new_description, paths)
+            relative = list(previous["assets"])
+        else:
+            paths = _check_fields(new_kind, new_description, assets)
+            relative = _copy_assets(card_dir, version, paths)
+        stamp = now or _now()
+        card["versions"][str(version)] = {"kind": new_kind, "description": new_description.strip(),
+                                          "assets": relative, "created": stamp}
+        card["version"] = version
+        card["updated"] = stamp
+        write_json_durably(card_dir / CARD_NAME, card)
+    return _view(card_dir, card, version)
+
+
+def get_card(outdir, tag, version=None) -> dict:
+    card_dir = _card_dir(outdir, tag)
+    card = _read(card_dir, tag)
+    return _view(card_dir, card, card["version"] if version is None else int(version))
+
+
+def list_cards(outdir) -> list[dict]:
+    root = library_root(outdir)
+    if not root.is_dir():
+        return []
+    cards = []
+    for entry in sorted(root.iterdir()):
+        if (entry / CARD_NAME).is_file():
+            try:
+                cards.append(get_card(outdir, "@" + entry.name))
+            except (LibraryError, ValueError, KeyError):
+                continue
+    return cards
+
+
+def scene_tags(text: str) -> list[str]:
+    seen: list[str] = []
+    for match in _TAG_IN_TEXT_RE.finditer(text or ""):
+        tag = "@" + match.group(1)
+        if not TAG_RE.match(tag):
+            raise LibraryError("tag_invalid",
+                               f"тег {tag}: пишется строчными, 2–32 символа из a-z, 0-9, -",
+                               {"tag": tag})
+        if tag not in seen:
+            seen.append(tag)
+    return seen
+
+
+def build_ref2va(scene_prompt: str, references, outdir) -> Ref2VAScene:
+    tags = scene_tags(scene_prompt)
+    if not tags:
+        return Ref2VAScene(scene_prompt, (), (), ())
+    pinned = {ref["tag"]: ref for ref in references}
+    unknown = [tag for tag in tags if tag not in pinned]
+    if unknown:
+        raise LibraryError("unknown_tag", f"теги не подключены к проекту: {', '.join(unknown)}",
+                           {"unknown": unknown})
+    images: list[str] = []
+    audios: list[str] = []
+    lines: list[str] = []
+    for number, tag in enumerate(tags, start=1):
+        card = get_card(outdir, tag, pinned[tag].get("version"))
+        description = card["description"].strip().rstrip(".")
+        if card["kind"] == "voice":
+            audios.append(card["assets"][0])
+            lines.append(f"<Subject {number}> is {description}, voice from <Audio {len(audios)}>.")
+        else:
+            labels = []
+            for asset in card["assets"]:
+                images.append(asset)
+                labels.append(f"<Picture {len(images)}>")
+            lines.append(f"<Subject {number}> is {description}, appearance from "
+                         f"{', '.join(labels)}.")
+    body = _TAG_IN_TEXT_RE.sub(lambda m: f"<Subject {tags.index('@' + m.group(1)) + 1}>",
+                               scene_prompt)
+    prompt = "subject_definitions:\n" + "\n".join(lines) + "\n\n" + body
+    return Ref2VAScene(prompt, tuple(images), tuple(audios), tuple(tags))
+
+
+def references_context(cards: list[dict]) -> str:
+    lines = [f"{card['tag']} ({card['kind']}): {card['description']}" for card in cards]
+    return ("## Reference tags\nEvery scene must name who and where is in frame with these tags, "
+            "written exactly as below; no other @tags exist.\n" + "\n".join(lines))

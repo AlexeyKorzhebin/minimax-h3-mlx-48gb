@@ -146,7 +146,8 @@ _REQUIRED_FIELDS = ("id", "kind", "title", "created_at", "stages", "scenes", "tr
 #: written before this task existed, see `STAGE_NAMES`'s own docstring on the same backward-
 #: compatibility concern for `stages["scenario"]`) but are still first-class, always-present-once-
 #: loaded `Project` attributes, exactly like `scenes` itself.
-_OWNED_TOP_LEVEL_FIELDS = _REQUIRED_FIELDS + ("scenario_scenes", "scenario_style_block")
+_OWNED_TOP_LEVEL_FIELDS = _REQUIRED_FIELDS + ("scenario_scenes", "scenario_style_block",
+                                              "references")
 
 
 class ProjectError(Exception):
@@ -481,6 +482,8 @@ class Project:
         # starts here, see `create_project`).
         self.scenario_scenes = [dict(scene) for scene in data.get("scenario_scenes") or []]
         self.scenario_style_block = data.get("scenario_style_block")
+        # Pinned reference-library cards, `[{tag, version}]` (spec §3.5); absent on older files.
+        self.references = [dict(ref) for ref in data.get("references") or []]
 
     def as_dict(self) -> dict:
         """This project as a plain dict, ready for `json.dumps` -- every field this module
@@ -508,6 +511,7 @@ class Project:
             "assembly": dict(self.assembly),
             "scenario_scenes": [dict(scene) for scene in self.scenario_scenes],
             "scenario_style_block": self.scenario_style_block,
+            "references": [dict(ref) for ref in self.references],
         })
         return result
 
@@ -838,6 +842,18 @@ class Project:
             self._apply(data)
         return self
 
+    def set_references(self, references: list[dict]) -> "Project":
+        """Replace the project's pinned reference cards (spec §3.5: `[{tag, version}]`). Storage
+        only -- `web` checks that each card and version exists before calling this. Same lock ->
+        re-read -> merge -> write -> `_apply` shape as every other locked mutator here."""
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            data["references"] = [{"tag": ref["tag"], "version": int(ref["version"])}
+                                  for ref in references]
+            write_json_durably(self.path, data)
+            self._apply(data)
+        return self
+
 
 def create_project(outdir, kind: str, title: str, now=None) -> Project:
     """Claim `<outdir>/projects/<YYYYMMDD-HHMM>-<slug>/`, write a fresh `project.json` into it,
@@ -893,6 +909,7 @@ def create_project(outdir, kind: str, title: str, now=None) -> Project:
         "assembly": {"audio_mode": _DEFAULT_AUDIO_MODE[kind], "final_path": None},
         "scenario_scenes": [],
         "scenario_style_block": None,
+        "references": [],
     }
     project = Project(project_dir / PROJECT_FILENAME, data)
     project.save()
