@@ -5220,16 +5220,21 @@ class _Handler(BaseHTTPRequestHandler):
         return cancelled
 
     def _cancel_project_upscale_jobs(self, proj) -> None:
-        """A re-shot scene makes a still-pending upscale of the old clips pointless."""
+        """A re-shot scene makes an upscale of the old clips pointless: a pending one is
+        cancelled, a running one is asked to stop -- the adapter then interrupts ComfyUI instead
+        of finishing a 3.5-minute part nobody will use (triage of tasks 10/11)."""
         with queue_errors(self.server.queue_root):
             jobs, _broken = q.scan(self.server.queue_root)
         for job in jobs:
-            if (job.state == "pending" and job.kind == q.KIND_UPSCALE
-                    and str(proj.path) in job.args):
-                try:
+            if job.kind != q.KIND_UPSCALE or str(proj.path) not in job.args:
+                continue
+            try:
+                if job.state == "pending":
                     q.cancel(self.server.queue_root, job.id)
-                except q.JobNotPending:
-                    continue
+                elif job.state == "running":
+                    q.request_cancel(self.server.queue_root, job.id, "сцена переснята")
+            except (q.JobNotPending, q.JobNotRunning):
+                continue
 
     def _retry_project_scene(self, raw_id: str, raw_idx: str) -> tuple[int, str, bytes]:
         """`POST /api/projects/<id>/scenes/<idx>/retry`: "пересчёт отдельной сцены" (design spec,

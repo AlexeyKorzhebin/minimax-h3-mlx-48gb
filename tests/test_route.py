@@ -403,6 +403,18 @@ def test_a_scene_reshoot_cancels_the_pending_upscale_job(live, tmp_path, monkeyp
     assert [j.kind for j in q.scan(live.queue_root)[0] if j.state == "pending"] == []
 
 
+def test_a_scene_reshoot_asks_the_running_upscale_job_to_stop(live, tmp_path, monkeypatch):
+    """Triage of tasks 10/11: the running part is interrupted, not finished for nothing."""
+    proj = _done_project(tmp_path)
+    from h3_48gb import assemble as asm
+    asm.advance_project(proj, live.queue_root, tmp_path / "out")
+    monkeypatch.setattr(asm, "advance_project", lambda *a, **k: {"action": "nothing_to_do"})
+    job = q.claim(live.queue_root)
+    status, body = _call(live, "POST", f"/api/projects/{proj.id}/scenes/1/retry", {})
+    assert status == 200, body
+    assert q.cancel_reason(live.queue_root, job.id) == "сцена переснята"
+
+
 def _upscale_job(live, proj):
     from h3_48gb import assemble as asm
     asm.advance_project(proj, live.queue_root, live.outdir)
