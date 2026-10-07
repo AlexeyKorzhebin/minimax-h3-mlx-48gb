@@ -4283,7 +4283,8 @@ class _Handler(BaseHTTPRequestHandler):
         scenario without the LLM -- `{"scenes": [{prompt, duration, fresh_start?, start_image?,
         seed?, steps?, refs?}], "references"?: [{tag, version?}]}`. Only before anything is
         queued (`stages.scenes` is `draft`, `stages.script` is `draft` or `awaiting_approval`); it
-        leaves the script waiting for "Утвердить", which snaps the durations and checks every scene as for a chat scenario.
+        leaves the script waiting for "Утвердить", which snaps the durations and checks every
+        scene as for a chat scenario.
 
         `start_image` (I6) only on scene 0: a path inside the outdir, or an @tag the project pins
         (its card's first picture). It is the keyframe of scene 0 -- `assemble.scene_start_image`.
