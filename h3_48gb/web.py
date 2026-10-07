@@ -5485,8 +5485,11 @@ class _Handler(BaseHTTPRequestHandler):
             finished = [job.finished_at for job in jobs if job.finished_at]
             if finished:
                 minutes = float(os.environ.get("H3_IDLE_RELEASE_MIN", "15"))
+                # Queue timestamps are naive local time; the offset makes the browser read the
+                # instant correctly whatever its own zone (the container runs on TZ=Europe/Moscow).
                 idle_release_at = (datetime.fromisoformat(max(finished))
-                                   + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+                                   + timedelta(minutes=minutes)).astimezone().isoformat(
+                                       timespec="seconds")
         return 200, "application/json", _json_bytes({
             "ok": True, "dispatcher": status, "dispatcher_error": error,
             "idle_release_at": idle_release_at,

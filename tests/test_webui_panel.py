@@ -2,6 +2,7 @@
 node with exact expected values, plus source checks for the DOM wiring that has no pure seam."""
 import json
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -65,7 +66,7 @@ def test_banner_offers_qwen_unload_when_qwen_is_the_reason():
 
 @_needs_node
 def test_banner_when_the_panel_holds_the_card_and_the_queue_is_empty():
-    gpu = {"ok": True, "dispatcher_error": None, "idle_release_at": "2026-10-07T12:42:00Z",
+    gpu = {"ok": True, "dispatcher_error": None, "idle_release_at": "2026-10-07T15:42:00+03:00",
            "dispatcher": _dispatcher(own={"h3": {"pid": 1, "variant": "ref2va", "started_at": 1,
                                                  "log": "/l", "ready": True}}),
            "queue": {"pending": 0, "paused": True, "running": None}}
@@ -227,13 +228,23 @@ def live(tmp_path, monkeypatch):
     disp.close()
 
 
-def test_gpu_state_reports_when_the_idle_card_will_be_released(live):
+@pytest.fixture
+def moscow(monkeypatch):
+    # the container's zone (compose TZ): the queue's naive local stamps get this offset
+    monkeypatch.setenv("TZ", "Europe/Moscow")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_gpu_state_reports_when_the_idle_card_will_be_released(live, moscow):
     server, root, tmp_path = live
     q.submit(root, ["generate", "--tag", "a"], "", {"output_stem": str(tmp_path / "h3-a")}, {})
     job = q.claim(root)
     q.finish(root, job.id, 0, "", finished_at="2026-10-07T10:00:00")
     status, body = _call(server, "GET", "/api/gpu")
-    assert body["idle_release_at"] == "2026-10-07T10:15:00"
+    assert body["idle_release_at"] == "2026-10-07T10:15:00+03:00"
 
 
 @_needs_node

@@ -1,5 +1,6 @@
 """LTX upscale (spec §4.2) against a fake ComfyUI, with real ffmpeg on tiny lavfi clips."""
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -340,6 +341,7 @@ def test_the_worker_survives_a_crash_in_the_upscale_job(tmp_path, monkeypatch):
     assert "ltx crashed: TypeError: bug in run_upscale" in job.log_tail
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root removes a 0o500 directory anyway")
 def test_a_frame_directory_that_cannot_be_removed_is_logged_not_fatal(tmp_path):
     clip = _clip(tmp_path / "scenes" / "s.mp4")
     out_dir = tmp_path / "comfy-out"
