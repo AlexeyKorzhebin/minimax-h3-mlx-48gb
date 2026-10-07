@@ -976,6 +976,14 @@ def _grid_frames_nearest(frames: int, *, remainder: int) -> int:
     return below if frames - below <= above - frames else above
 
 
+def _sglang_frame_bounds(chained: bool) -> tuple[int, int]:
+    """The *delivered* frame range sglang accepts for one scene (spec §4.1.5): requested 73..345
+    (3..15 s), a chained scene requests one frame more than it delivers. One source for the video
+    snap and the clip snap."""
+    overlap = _SGLANG_OVERLAP_FRAMES if chained else 0
+    return 73 - overlap, 345 - overlap
+
+
 def _snap_video_scenes_sglang(scenes: list[dict]) -> list[dict]:
     """Every video scene's *delivered* duration onto sglang's grid (spec §4.1.5), nearest point,
     kept inside what sglang accepts: the **requested** frames must be `17n+5` within 3..15 s, i.e.
@@ -988,7 +996,8 @@ def _snap_video_scenes_sglang(scenes: list[dict]) -> list[dict]:
         remainder = (_H3_LATENTS_PER_CHUNK - overlap) % _H3_FRAMES_PER_CHUNK
         frames = _grid_frames_nearest(round(float(scene["duration"]) * _H3_FPS),
                                       remainder=remainder)
-        frames = min(max(frames, 73 - overlap), 345 - overlap)
+        low, high = _sglang_frame_bounds(chained)
+        frames = min(max(frames, low), high)
         snapped.append({**scene, "duration": frames / _H3_FPS})
     return snapped
 
@@ -1018,7 +1027,8 @@ def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
 
 def _snap_scene_duration(seconds: float, carry: float, *, chained: bool = False,
                           overlap_frames: int = _SCENE_LATENT_OVERLAP_FRAMES,
-                          round_up: bool = False) -> tuple[float, float]:
+                          round_up: bool = False,
+                          frame_bounds: tuple[int, int] | None = None) -> tuple[float, float]:
     """One scene's own duration, snapped onto H3's frame grid (C1, final review), and the leftover
     `carry` the caller should fold into the *next* scene's own target.
 
@@ -1072,6 +1082,8 @@ def _snap_scene_duration(seconds: float, carry: float, *, chained: bool = False,
     **sglang** (`overlap_frames=_SGLANG_OVERLAP_FRAMES`, spec §4.1.5, §6): a chained scene repeats
     one frame, not 22, so it snaps onto the `17k + 4` grid; `round_up=True` (the clip's last scene)
     rounds *up* so the picture never ends before the song -- assembly trims the overshoot.
+    `frame_bounds` (sglang) replaces the mac 5..10 s clamp with sglang's own per-scene bounds
+    (`_sglang_frame_bounds`): the mac clamp starved middle scenes of a long track into the last.
     """
     remainder = ((_H3_LATENTS_PER_CHUNK - overlap_frames) % _H3_FRAMES_PER_CHUNK if chained
                  else _H3_LATENTS_PER_CHUNK)
@@ -1081,7 +1093,15 @@ def _snap_scene_duration(seconds: float, carry: float, *, chained: bool = False,
         snapped = _grid_frames_at_or_above(frames, remainder=remainder) / _H3_FPS
         return snapped, target - snapped
     snapped = _grid_frames_at_or_below(frames, remainder=remainder) / _H3_FPS
-    if snapped < SCENE_MIN_SECONDS:
+    if frame_bounds is not None:
+        low, high = frame_bounds
+        snapped_frames = round(snapped * _H3_FPS)
+        if snapped_frames < low:
+            snapped_frames = _grid_frames_at_or_above(low, remainder=remainder)
+        elif snapped_frames > high:
+            snapped_frames = _grid_frames_at_or_below(high, remainder=remainder)
+        snapped = snapped_frames / _H3_FPS
+    elif snapped < SCENE_MIN_SECONDS:
         snapped = _grid_frames_at_or_above(round(SCENE_MIN_SECONDS * _H3_FPS),
                                             remainder=remainder) / _H3_FPS
     elif snapped > SCENE_MAX_SECONDS:
@@ -1650,7 +1670,9 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None,
         chained = i > 0 and not seg.get("fresh_start", False)
         snapped, carry = _snap_scene_duration(seg["end"] - seg["start"], carry, chained=chained,
                                               overlap_frames=overlap,
-                                              round_up=sglang and i == len(expanded) - 1)
+                                              round_up=sglang and i == len(expanded) - 1,
+                                              frame_bounds=(_sglang_frame_bounds(chained)
+                                                            if sglang else None))
         # `fresh_start` (P0 fix, keyframe-chain defect 2026-08-25): present on `seg` only for the
         # `scenario_scenes=` path (`_scenario_segments`/`_split_long_segment`, see their own
         # docstrings) -- the procedural path's own segments never carry it, so `.get(..., False)`
@@ -1677,6 +1699,12 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None,
     else:
         ok = (duration - _SNAPPED_COVERAGE_SHORTFALL_SECONDS - _COVERAGE_TOLERANCE_SECONDS
               <= snapped_total <= duration + _COVERAGE_TOLERANCE_SECONDS)
+    if not ok and sglang:
+        raise ProjectSceneBuildError(
+            f"scene durations snapped to sglang's frame grid cover {snapped_total:.3f}s, track is "
+            f"{duration:.3f}s -- they must cover [{duration:.3f}s, "
+            f"{duration + _H3_FRAMES_PER_CHUNK / _H3_FPS:.3f}s) and the last scene may not exceed "
+            f"{sglang_args.MAX_SECONDS:g}s (it is {scenes[-1]['duration']:.3f}s)")
     if not ok:
         raise ProjectSceneBuildError(
             f"scene durations snapped to H3's frame grid cover {snapped_total:.3f}s, track is "

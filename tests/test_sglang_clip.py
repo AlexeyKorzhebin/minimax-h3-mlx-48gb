@@ -184,12 +184,12 @@ def test_track_pieces_follow_snapped_frames_and_the_one_frame_overlap(tmp_path):
     assert assemble._cut_track_piece(proj, 0, run=run) == pieces / "scene-000.wav"
     assemble._cut_track_piece(proj, 1, run=run)
     assert commands == [
-        ["ffmpeg", "-y", "-loglevel", "error", "-ss", "0.000000", "-t", f"{158 / 24:.6f}",
-         "-i", str(mp3), "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le",
-         str(pieces / "scene-000.wav")],
-        ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{157 / 24:.6f}", "-t", f"{175 / 24:.6f}",
-         "-i", str(mp3), "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le",
-         str(pieces / "scene-001.wav")]]
+        ["ffmpeg", "-y", "-loglevel", "error", "-ss", "0.000000",
+         "-i", str(mp3), "-vn", "-af", "apad", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le",
+         "-t", f"{158 / 24:.6f}", str(pieces / "scene-000.wav")],
+        ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{157 / 24:.6f}",
+         "-i", str(mp3), "-vn", "-af", "apad", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le",
+         "-t", f"{175 / 24:.6f}", str(pieces / "scene-001.wav")]]
 
 
 def test_a_real_piece_has_the_requested_length(tmp_path):
@@ -291,3 +291,73 @@ def test_a_scenario_that_sglang_would_refuse_is_refused_at_the_gate(live, monkey
     assert (status, body["error"]["code"]) == (400, "scene_references_invalid")
     assert _pending(live) == []
     assert p.load_project(proj.path).stages["scenario"] == "awaiting_approval"
+
+
+# == fix round 1 ====================================================================================
+
+@pytest.mark.parametrize("seconds", [60.0, 90.0, 120.0])
+def test_equal_pieces_of_a_long_track_snap_to_sglang_bounds_not_the_mac_ones(seconds, monkeypatch):
+    """Review 1: on sglang a scene is bounded by sglang's 73..345 requested frames, not by the
+    mac 5..10 s clamp -- that clamp starved the middle scenes and overflowed the last one."""
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    scenario = web._equal_scenario_scenes(seconds, "c")
+    scenes = web.build_clip_scenes({"duration": seconds}, style_block="",
+                                   scenario_scenes=scenario)
+    frames = [round(s["duration"] * 24) for s in scenes]
+    total = sum(frames) / 24
+    assert seconds <= total < seconds + 17 / 24
+    assert frames == EXPECTED_FRAMES[seconds]
+    assert all(f <= 344 for f in frames)
+
+
+EXPECTED_FRAMES = {
+    60.0: [226, 242, 242, 242, 242, 259],
+    90.0: [226] + [242] * 8,
+    120.0: [226] + [242] * 7 + [225, 242, 242, 259],
+}
+
+
+def test_a_scene_inside_the_grid_cell_is_trimmed_but_a_big_overshoot_is_not(tmp_path, monkeypatch):
+    """Review 2: only an overshoot of up to one grid step plus the tolerance is trimmed."""
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _assembly_case(tmp_path, 1.3)
+    assert abs(_probe(assemble.run(proj.path)) - 1.3) <= 0.1
+    big = _assembly_case(tmp_path / "b", 0.5)   # video 2.0 s, track 0.5 s: 1.5 s over
+    with pytest.raises(assemble.AssembleError):
+        assemble.run(big.path)
+
+
+def test_the_tail_piece_is_padded_with_silence_to_the_scene_length(tmp_path):
+    mp3 = _mp3(tmp_path / "song.mp3", 21.0)
+    proj = _clip_project_with_scenes(tmp_path, [158, 174, 157], mp3)
+    commands = []
+
+    def run(cmd, capture_output=True, text=True):
+        commands.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    assemble._cut_track_piece(proj, 2, run=run)
+    pieces = proj.path.parent / "track" / "pieces"
+    assert commands == [
+        ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{331 / 24:.6f}",
+         "-i", str(mp3), "-vn", "-af", "apad", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le",
+         "-t", f"{158 / 24:.6f}", str(pieces / "scene-002.wav")]]
+
+
+def test_a_piece_past_the_end_of_the_track_still_has_the_scene_length(tmp_path):
+    mp3 = _mp3(tmp_path / "song.mp3", 21.0)
+    # scenes run to 26 s, the track ends at 21 s
+    proj = _clip_project_with_scenes(tmp_path, [158, 174, 157, 135], mp3)
+    piece = assemble._cut_track_piece(proj, 3, run=subprocess.run)
+    assert abs(_probe(piece) - 136 / 24) < 0.03
+
+
+def test_the_sglang_coverage_error_speaks_sglang(monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    monkeypatch.setattr(web, "_snap_scene_duration", lambda *a, **k: (12.0, 0.0))
+    scenario = [{"tag": "a", "start": 0.0, "end": 5.0, "prompt": "a", "duration": 5.0}]
+    with pytest.raises(web.ProjectSceneBuildError) as err:
+        web.build_clip_scenes({"duration": 5.0}, style_block="", scenario_scenes=scenario)
+    assert str(err.value) == (
+        "scene durations snapped to sglang's frame grid cover 12.000s, track is 5.000s -- they "
+        "must cover [5.000s, 5.708s) and the last scene may not exceed 15s (it is 12.000s)")

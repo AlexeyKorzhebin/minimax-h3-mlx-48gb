@@ -227,6 +227,9 @@ DURATION_TOLERANCE_SECONDS = 0.5
 #: Below this, an unpadded video is already inside `DURATION_TOLERANCE_SECONDS` on its own -- no
 #: freeze-frame ffmpeg call is worth spending on a shortfall this small.
 _FREEZE_PAD_EPSILON_SECONDS = 0.05
+#: One sglang grid step (17 frames): the most the last scene's round-up can overshoot the track.
+#: A bigger overshoot is a desync and still fails, as on mlx.
+_SGLANG_GRID_STEP_SECONDS = 17 / ASSEMBLY_FPS
 
 #: P0-2 (боевые ворота 2026-08-19): a chaining scene's own frame 0 is *supposed* to duplicate the
 #: automatic keyframe the previous scene's clip already ended on (design spec, "Клипы": "кадр из
@@ -791,7 +794,9 @@ def run(project_path, *, run=subprocess.run, log=None) -> Path:
             video_only = _pad_with_freeze_frame(
                 video_only, shortfall, assembly_dir / "pad", run=run)
             video_duration = _ffprobe_duration(video_only, run=run)
-        if engine.is_sglang() and video_duration - track_duration > _FREEZE_PAD_EPSILON_SECONDS:
+        if (engine.is_sglang()
+                and _FREEZE_PAD_EPSILON_SECONDS < video_duration - track_duration
+                <= _SGLANG_GRID_STEP_SECONDS + DURATION_TOLERANCE_SECONDS):
             video_only = _trim_video(video_only, track_duration, assembly_dir / "pad", run=run)
             video_duration = _ffprobe_duration(video_only, run=run)
 
@@ -1255,9 +1260,11 @@ def _cut_track_piece(proj, idx: int, *, run) -> Path:
     track = proj.track.get("mastered_mp3") or proj.track.get("mp3")
     out_path = proj.path.parent / "track" / "pieces" / f"scene-{idx:03d}.wav"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # `-t` is an *output* option here: `apad` makes the stream endless, and the length caps it, so
+    # a slice running past the end of the track is padded with silence to the scene's length.
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{start / ASSEMBLY_FPS:.6f}",
-           "-t", f"{length / ASSEMBLY_FPS:.6f}", "-i", str(track), "-vn", "-ac", "2",
-           "-ar", "48000", "-c:a", "pcm_s16le", str(out_path)]
+           "-i", str(track), "-vn", "-af", "apad", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le",
+           "-t", f"{length / ASSEMBLY_FPS:.6f}", str(out_path)]
     _run_ffmpeg(cmd, run, f"ffmpeg track piece for scene {idx}")
     return out_path
 
