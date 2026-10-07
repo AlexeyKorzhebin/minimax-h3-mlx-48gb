@@ -678,9 +678,7 @@ def _mark_upscale_failed(job) -> None:
     retry button takes only `failed`) -- never stuck at the `running` `_submit_upscale` set."""
     try:
         from h3_48gb import project as project_module
-        proj = project_module.load_project(_project_arg(job.args))
-        if proj.stages.get("upscale") == "running":
-            proj.set_stage_status("upscale", "failed")
+        project_module.fail_running_upscale(_project_arg(job.args))
     except Exception as exc:  # noqa: BLE001 -- bookkeeping must not take the worker down
         print(f"h3 worker: could not mark upscale failed for job {job.id}: "
               f"{type(exc).__name__}: {exc}", file=sys.stderr)

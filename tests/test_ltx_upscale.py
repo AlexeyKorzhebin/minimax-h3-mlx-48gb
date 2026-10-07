@@ -167,6 +167,7 @@ def test_one_strength_for_the_whole_clip(tmp_path):
                     "job_id": f"j{i}", "clip_path": str(c), "keyframe_path": None}
                    for i, c in enumerate((still, busy))]
     proj.save()
+    proj.set_stage_status("upscale", "running")
     fake = FakeComfy(tmp_path / "comfy-out", frames=(25,))
     try:
         code, log = ltx.run_upscale(proj.path, client=ltx.ComfyClient(fake.url),
@@ -234,6 +235,7 @@ def test_the_upscale_job_asks_the_dispatcher_for_ltx(tmp_path, monkeypatch):
     proj.scenes = [{"idx": 0, "prompt": "x", "duration": 1.0, "status": "done", "job_id": "j",
                     "clip_path": str(clip), "keyframe_path": None}]
     proj.save()
+    proj.set_stage_status("upscale", "running")
     comfy = FakeComfy(tmp_path / "co", frames=(25,))
     monkeypatch.setenv("H3_DISPATCHER_URL", disp.url)
     monkeypatch.setenv("H3_COMFY_URL", comfy.url)
@@ -274,6 +276,7 @@ def _project_with_clips(tmp_path, clips_by_idx, **scene_extra):
                     "clip_path": c, "keyframe_path": None, **scene_extra}
                    for i, c in enumerate(clips_by_idx)]
     proj.save()
+    proj.set_stage_status("upscale", "running")     # as `_submit_upscale` leaves it
     return proj
 
 

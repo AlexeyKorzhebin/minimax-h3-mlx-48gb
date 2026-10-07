@@ -630,20 +630,34 @@ class Project:
             self._apply(data)
         return True
 
-    def finish_upscale(self, clips: dict) -> bool:
-        """Close the upscale stage under the project lock: `done` only if every scene still has
-        exactly the clip (`clips`: idx -> clip_path) that was upscaled and an -ltx part; otherwise
-        the stage goes back to `draft` (the next advance upscales again) and False is returned."""
+    def upscale_still_wanted(self) -> bool:
+        """Under the project lock: is the stage still `running`? A re-shot scene resets it to
+        `draft` (`invalidate_scene_chain`) -- an upscale job that was claimed before that and only
+        now starts (it waited at the GPU gate) works for a stage that no longer exists."""
+        with _project_lock(self.path.parent, exclusive=True):
+            return _read_data(self.path)["stages"].get("upscale") == "running"
+
+    def finish_upscale(self, clips: dict, ok: bool = True) -> bool:
+        """Close the upscale stage under the project lock. `clips` is idx -> clip_path as it was
+        when the job took the scenes. If every scene still has exactly that clip, the stage is
+        `done` (`ok`, and every scene has its -ltx part) or `failed` (not `ok`); if the clips are
+        no longer the current ones the stage goes back to `draft` (the next advance upscales
+        again, a failure of the old attempt is not the new takes' failure). Returns whether the
+        clips were still current and `ok`."""
         with _project_lock(self.path.parent, exclusive=True):
             data = _read_data(self.path)
             scenes = {scene["idx"]: scene for scene in data["scenes"]}
             current = (set(scenes) == set(clips)
                        and all(scenes[idx].get("clip_path") == clip
-                               and scenes[idx].get("ltx_path") for idx, clip in clips.items()))
-            data["stages"]["upscale"] = "done" if current else "draft"
+                               for idx, clip in clips.items()))
+            complete = current and all(scenes[idx].get("ltx_path") for idx in clips)
+            if not current or (ok and not complete):
+                data["stages"]["upscale"] = "draft"
+            else:
+                data["stages"]["upscale"] = "done" if ok else "failed"
             write_json_durably(self.path, data)
             self._apply(data)
-        return current
+        return current and ok
 
     def set_stage_status(self, name: str, status: str) -> "Project":
         """Set stage `name`'s status to any `STAGE_STATUSES` value -- the general form of
@@ -1111,3 +1125,11 @@ def list_projects(outdir) -> list[Project]:
             continue
         projects.append(project)
     return projects
+
+
+def fail_running_upscale(project_path) -> None:
+    """Leave an upscale stage that is `running` as `failed` (the retry button takes only `failed`);
+    any other state is left alone."""
+    proj = load_project(project_path)
+    if proj.stages.get("upscale") == "running":
+        proj.set_stage_status("upscale", "failed")

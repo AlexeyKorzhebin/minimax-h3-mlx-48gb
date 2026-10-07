@@ -60,7 +60,6 @@ from h3_48gb.engines import dispatcher_client
 from h3_48gb.engines import estimate as sglang_estimate
 from h3_48gb.engines import sglang_args
 from h3_48gb.project import PROJECT_KINDS
-from h3_48gb.worker import _mark_upscale_failed
 from h3_48gb.worker import (WORKER_LOCK_NAME, align_job_wallclock_estimate_seconds,
                             song_job_wallclock_estimate_seconds)
 
@@ -4047,7 +4046,9 @@ class _Handler(BaseHTTPRequestHandler):
                 job = q.cancel(self.server.queue_root, job_id)
             if job.kind == q.KIND_UPSCALE:
                 # a cancelled upscale must not leave its stage at `running` (retry takes `failed`)
-                _mark_upscale_failed(job)
+                with contextlib.suppress(Exception):   # bookkeeping after the cancel is filed
+                    project_module.fail_running_upscale(
+                        job.args[job.args.index("--project") + 1])
             return 200, "application/json", _json_bytes({"ok": True, "job": job.as_dict()})
 
         if engine.is_sglang():

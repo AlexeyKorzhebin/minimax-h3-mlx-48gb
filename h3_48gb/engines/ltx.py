@@ -187,13 +187,20 @@ def run_upscale(project_path, *, client, comfy_output, run, attempt: str, sleep=
                 cancelled=lambda: None) -> tuple[int, str]:
     proj = project_module.load_project(project_path)
     log: list[str] = []
+    # `_submit_upscale` set the stage to `running`. If it is anything else now, the stage was
+    # invalidated after this job was queued (a scene re-shot while the job waited at the GPU gate):
+    # write nothing, `advance_project` queues a fresh upscale once the scenes are done again.
+    if not proj.upscale_still_wanted():
+        return 0, "ltx: этап апскейла сброшен после постановки задачи (сцена переснята), " \
+                  "задача пропущена\n"
+    proj = project_module.load_project(project_path)
+    scenes = sorted(proj.scenes, key=lambda scene: scene["idx"])
+    # what this attempt works on, for the locked "still current?" check on every way out
+    upscaled = {scene["idx"]: scene.get("clip_path") for scene in scenes}
     try:
-        proj.set_stage_status("upscale", "running")
-        scenes = sorted(proj.scenes, key=lambda scene: scene["idx"])
         if not scenes:
             raise UpscaleError("в проекте нет сцен")
         clips = _scene_clips(scenes)
-        upscaled = {scene["idx"]: str(clip) for scene, clip in zip(scenes, clips)}
         strength = motion.lora_for(motion.clip_motion(clips, run=run))
         log.append(f"ltx: сила {strength:g} на весь клип ({len(clips)} частей)\n")
         for scene, clip in zip(scenes, clips):
@@ -210,11 +217,11 @@ def run_upscale(project_path, *, client, comfy_output, run, attempt: str, sleep=
                 break
             log.append(f"ltx: сцена {scene['idx']} -> {out.name}\n")
     except (UpscaleError, motion.MotionError) as exc:
-        proj.set_stage_status("upscale", "failed")
+        proj.finish_upscale(upscaled, ok=False)
         log.append(f"ltx: {exc}\n")
         return 1, "".join(log)
     except Exception as exc:  # noqa: BLE001 -- a bug here must fail the job, not kill the worker
-        proj.set_stage_status("upscale", "failed")
+        proj.finish_upscale(upscaled, ok=False)
         log.append(f"ltx crashed: {type(exc).__name__}: {exc}\n")
         return 1, "".join(log)
     if not proj.finish_upscale(upscaled):

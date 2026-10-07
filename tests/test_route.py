@@ -483,3 +483,56 @@ def test_a_route_must_be_exactly_its_kinds_stages_in_order(tmp_path, route):
     _rewrite(proj, lambda d: d.__setitem__("route", route))
     with pytest.raises(p.ProjectNotFound):
         p.load_project(proj.path)
+
+
+# ---- fix round 2 -------------------------------------------------------------------------------
+
+def test_a_job_claimed_before_a_reshoot_does_nothing_and_advance_requeues(tmp_path, monkeypatch):
+    """gate_race: the retry lands while the claimed upscale job waits at the GPU gate."""
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path, upscale_stage="running")
+    for i in range(2):
+        proj.scenes[i].pop("ltx_path")
+    proj.save()
+    p.load_project(proj.path).invalidate_scene_chain(1)
+    ltx = _fake_ltx(monkeypatch)
+    code, log = _run_upscale(ltx, proj)
+    assert code == 0 and "сброшен после постановки" in log
+    assert p.load_project(proj.path).stages["upscale"] == "draft"
+    new = proj.path.parent / "scenes" / "s1-new.mp4"
+    new.write_bytes(b"raw2")
+    p.load_project(proj.path).set_scene_status(1, "done", job_id=None, clip_path=str(new))
+    calls, submit = _submits()
+    assert assemble.advance_project(p.load_project(proj.path), tmp_path / "q", tmp_path / "out",
+                                    submit=submit)["action"] == "submitted_upscale"
+
+
+def test_a_failure_on_stale_clips_leaves_draft_not_failed(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path, upscale_stage="running")
+    for i in range(2):
+        proj.scenes[i].pop("ltx_path")
+    proj.save()
+
+    def reshoot_then_die(clip):
+        p.load_project(proj.path).invalidate_scene_chain(1)
+        raise ltx_module.UpscaleError("ComfyUI: OOM")
+
+    from h3_48gb.engines import ltx as ltx_module
+    ltx = _fake_ltx(monkeypatch, reshoot_then_die)
+    code, log = _run_upscale(ltx, proj)
+    assert code == 1 and "OOM" in log
+    assert p.load_project(proj.path).stages["upscale"] == "draft"
+
+
+def test_a_failure_on_current_clips_still_fails_the_stage(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path, upscale_stage="running")
+    from h3_48gb.engines import ltx as ltx_module
+
+    def die(clip):
+        raise ltx_module.UpscaleError("ComfyUI: OOM")
+
+    ltx = _fake_ltx(monkeypatch, die)
+    assert _run_upscale(ltx, proj)[0] == 1
+    assert p.load_project(proj.path).stages["upscale"] == "failed"
