@@ -3498,6 +3498,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._approve_project_stage(parts[0], parts[2])
             if len(parts) == 3 and parts[1] == "assembly" and parts[2] == "retry":
                 return self._retry_project_assembly(parts[0])
+            if len(parts) == 3 and parts[1] == "assembly" and parts[2] == "draft":
+                return self._draft_project_assembly(parts[0])
+            if len(parts) == 3 and parts[1] == "upscale" and parts[2] == "retry":
+                return self._retry_project_upscale(parts[0])
             if len(parts) == 3 and parts[1] == "track" and parts[2] == "retry":
                 return self._retry_project_track(parts[0])
             if len(parts) == 3 and parts[1] == "scenario" and parts[2] == "generate":
@@ -3514,6 +3518,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._update_card(path[len("/api/library/"):])
         if path.startswith("/api/projects/") and path.endswith("/references"):
             return self._put_project_references(path[len("/api/projects/"):-len("/references")])
+        if path.startswith("/api/projects/") and path.endswith("/route"):
+            return self._put_project_route(path[len("/api/projects/"):-len("/route")])
         if path.startswith("/api/projects/") and path.endswith("/settings"):
             return self._put_project_settings(path[len("/api/projects/"):-len("/settings")])
         if path.startswith("/api/jobs/"):
@@ -3526,6 +3532,41 @@ class _Handler(BaseHTTPRequestHandler):
             return self._edit_project_scenario(path[len("/api/projects/"):-len("/scenario")])
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for PUT {path}", {"path": path})
+
+    def _put_project_route(self, raw_id: str) -> tuple[int, str, bytes]:
+        proj = self._load_project(raw_id)
+        payload = self._json_request(allowed=("upscale",))
+        if not isinstance(payload.get("upscale"), bool):
+            raise CliError("args_invalid", "`upscale` must be true or false", {})
+        proj.set_route_stage("upscale", payload["upscale"])
+        assemble_module.advance_project(proj, self.server.queue_root, self.server.outdir)
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "project": _project_payload(project_module.load_project(proj.path))})
+
+    def _retry_project_upscale(self, raw_id: str) -> tuple[int, str, bytes]:
+        proj = self._load_project(raw_id)
+        self._json_request(allowed=())
+        if proj.stages.get("upscale") != "failed":
+            raise CliError("project_stage_not_ready",
+                           f"апскейл проекта {raw_id} не упал (сейчас "
+                           f"{proj.stages.get('upscale')!r})", {"id": raw_id})
+        proj.set_stage_status("upscale", "draft")
+        advance = assemble_module.advance_project(proj, self.server.queue_root, self.server.outdir)
+        return 200, "application/json", _json_bytes({"ok": True, "advance": advance})
+
+    def _draft_project_assembly(self, raw_id: str) -> tuple[int, str, bytes]:
+        proj = self._load_project(raw_id)
+        self._json_request(allowed=())
+        if not proj.scenes or any(scene.get("status") != "done" for scene in proj.scenes):
+            raise CliError("project_stage_not_ready",
+                           f"черновая сборка проекта {raw_id}: не все сцены готовы", {"id": raw_id})
+        output_stem = str(proj.path.parent / "assembly" / "job-draft")
+        with queue_write_errors(self.server.queue_root, what="the draft assembly"):
+            job = q.submit(self.server.queue_root,
+                           ["assemble", "--project", str(proj.path), "--draft"],
+                           f"draft assemble project {proj.id}", {"output_stem": output_stem}, {},
+                           kind=q.KIND_ASSEMBLE)
+        return 200, "application/json", _json_bytes({"ok": True, "job_id": job.id})
 
     def _put_project_settings(self, raw_id: str) -> tuple[int, str, bytes]:
         proj = self._load_project(raw_id)

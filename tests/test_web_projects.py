@@ -1520,7 +1520,7 @@ def test_project_assembly_carries_a_cache_buster_v_once_final_exists(_serve, mon
         code = worker.run_job(srv.queue_root, job, spawn=spawn, outdir=srv.root)
         assert code == 0
 
-    def fake_assemble_run(project_path, *, run=None, log=None):
+    def fake_assemble_run(project_path, *, run=None, log=None, draft=False):
         proj = project_module.load_project(project_path)
         final = proj.path.parent / "assembly" / "final.mp4"
         final.parent.mkdir(parents=True, exist_ok=True)
@@ -1570,7 +1570,7 @@ def test_video_project_full_lifecycle(_serve, monkeypatch):
 
     assembled = {}
 
-    def fake_assemble_run(project_path, *, run=None, log=None):
+    def fake_assemble_run(project_path, *, run=None, log=None, draft=False):
         proj = project_module.load_project(project_path)
         final = proj.path.parent / "assembly" / "final.mp4"
         final.parent.mkdir(parents=True, exist_ok=True)

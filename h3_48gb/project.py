@@ -107,7 +107,7 @@ ASSEMBLY_AUDIO_MODES = ("song", "mix", "clips")
 #: The fields `update_assembly(**fields)` accepts -- exactly `assembly`'s own two keys, see
 #: `create_project`. Kept as an explicit tuple, not derived from a live `assembly` dict, since
 #: there is no `_empty_assembly()` the way there is an `_empty_track()`.
-_ASSEMBLY_FIELDS = ("audio_mode", "final_path")
+_ASSEMBLY_FIELDS = ("audio_mode", "final_path", "draft_path")
 
 #: The fields `update_scenario(**fields)` accepts -- both top-level `Project` attributes
 #: (`_OWNED_TOP_LEVEL_FIELDS`), unlike `_TRACK_FIELDS`/`_ASSEMBLY_FIELDS` (nested inside `track`/
@@ -153,7 +153,33 @@ _REQUIRED_FIELDS = ("id", "kind", "title", "created_at", "stages", "scenes", "tr
 #: compatibility concern for `stages["scenario"]`) but are still first-class, always-present-once-
 #: loaded `Project` attributes, exactly like `scenes` itself.
 _OWNED_TOP_LEVEL_FIELDS = _REQUIRED_FIELDS + ("scenario_scenes", "scenario_style_block",
-                                              "references", "i2v_prefix")
+                                              "references", "i2v_prefix", "route")
+
+
+#: spec §3.3.8: the stages a project's pipeline may include, in order, each with an on/off flag.
+#: `track` exists only for clip/song. Only `upscale` may be switched off in v1.
+ROUTE_STAGES = ("scenario", "scenes", "upscale", "track", "assemble")
+OPTIONAL_ROUTE_STAGES = ("upscale",)
+_ROUTE_BY_KIND = {"video": ("scenario", "scenes", "upscale", "assemble"),
+                  "clip": ("scenario", "scenes", "upscale", "track", "assemble"),
+                  "song": ("track",)}
+
+
+def default_route(kind: str) -> list[dict]:
+    return [{"stage": stage, "enabled": True} for stage in _ROUTE_BY_KIND[kind]]
+
+
+def _check_route(path, kind, route) -> None:
+    allowed = _ROUTE_BY_KIND.get(kind, ())
+    if not isinstance(route, list):
+        raise ProjectNotFound(f"{path}: 'route' must be a list, got {type(route).__name__}")
+    for entry in route:
+        if (not isinstance(entry, dict) or set(entry) != {"stage", "enabled"}
+                or not isinstance(entry["enabled"], bool)):
+            raise ProjectNotFound(f"{path}: route entry {entry!r} is not {{stage, enabled}}")
+        if entry["stage"] not in ROUTE_STAGES or entry["stage"] not in allowed:
+            raise ProjectNotFound(f"{path}: route stage {entry['stage']!r} is unknown for "
+                                  f"kind={kind!r} (known: {allowed})")
 
 
 class ProjectError(Exception):
@@ -373,6 +399,8 @@ def _validate_shape(data, path) -> dict:
                 f"{type(data['scenario_scenes']).__name__}")
         if not all(isinstance(scene, dict) for scene in data["scenario_scenes"]):
             raise ProjectNotFound(f"{path}: every element of 'scenario_scenes' must be an object")
+    if "route" in data:
+        _check_route(path, data["kind"], data["route"])
     return data
 
 
@@ -494,6 +522,9 @@ class Project:
         # Pinned reference-library cards, `[{tag, version}]` (spec §3.5); absent on older files.
         self.references = [dict(ref) for ref in data.get("references") or []]
         self.i2v_prefix = data.get("i2v_prefix", DEFAULT_I2V_PREFIX)
+        # spec §3.3.8: absent on older files -- the kind's default route.
+        self.route = ([dict(entry) for entry in data["route"]] if "route" in data
+                      else default_route(self.kind))
 
     def as_dict(self) -> dict:
         """This project as a plain dict, ready for `json.dumps` -- every field this module
@@ -523,6 +554,7 @@ class Project:
             "scenario_style_block": self.scenario_style_block,
             "references": [dict(ref) for ref in self.references],
             "i2v_prefix": self.i2v_prefix,
+            "route": [dict(entry) for entry in self.route],
         })
         return result
 
@@ -755,6 +787,11 @@ class Project:
         nothing to say about either of those. (This stage/final_path reset fires even when the
         fresh_start boundary is immediately after `idx` and only one scene is actually reset -- the
         `scenes` stage still covered that one scene, and it just went back to `pending`.)
+
+        The -ltx parts of the reset scenes are stale as soon as the raw part is: the whole clip is
+        re-upscaled with one strength (spec §4.2.2), so `ltx_path` is dropped from every reset
+        scene and `stages.upscale` goes back to `draft` too -- the next assembly cannot pick up an
+        old -ltx part, the upscale has to run again.
         """
         with _project_lock(self.path.parent, exclusive=True):
             data = _read_data(self.path)
@@ -768,9 +805,31 @@ class Project:
                 scene["job_id"] = None
                 scene["clip_path"] = None
                 scene["keyframe_path"] = None
+                scene.pop("ltx_path", None)
             data["stages"]["scenes"] = "draft"
             data["stages"]["assembly"] = "draft"
+            data["stages"]["upscale"] = "draft"
             data["assembly"]["final_path"] = None
+            if data["assembly"].get("draft_path"):
+                data["assembly"]["draft_path"] = None
+            write_json_durably(self.path, data)
+            self._apply(data)
+        return self
+
+    def route_enabled(self, stage: str) -> bool:
+        return any(entry["stage"] == stage and entry["enabled"] for entry in self.route)
+
+    def set_route_stage(self, stage: str, enabled: bool) -> "Project":
+        if stage not in OPTIONAL_ROUTE_STAGES:
+            raise ProjectError(f"route stage {stage!r} cannot be switched in v1; only "
+                               f"{OPTIONAL_ROUTE_STAGES}")
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            route = data.get("route") or default_route(data["kind"])
+            for entry in route:
+                if entry["stage"] == stage:
+                    entry["enabled"] = bool(enabled)
+            data["route"] = route
             write_json_durably(self.path, data)
             self._apply(data)
         return self
@@ -946,6 +1005,7 @@ def create_project(outdir, kind: str, title: str, now=None) -> Project:
         "scenario_style_block": None,
         "references": [],
         "i2v_prefix": DEFAULT_I2V_PREFIX,
+        "route": default_route(kind),
     }
     project = Project(project_dir / PROJECT_FILENAME, data)
     project.save()

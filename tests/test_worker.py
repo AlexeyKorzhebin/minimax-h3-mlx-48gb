@@ -1322,7 +1322,7 @@ def test_run_job_dispatches_an_assemble_kind_to_h3_48gb_assemble_run(tmp_path, m
     """
     calls = []
 
-    def fake_run(project_path, *, run, log=None):
+    def fake_run(project_path, *, run, log=None, draft=False):
         calls.append((Path(project_path), run))
         if log is not None:
             log("fake cleanup: removed 0 item(s), freed 0 bytes")
@@ -1362,7 +1362,7 @@ def test_i1a_a_failed_assemble_job_marks_stages_assembly_failed(tmp_path, monkey
     assembly stage that is not `"draft"`, so the project looked permanently in-flight with no job
     actually working on it.
     """
-    def boom(project_path, *, run, log=None):
+    def boom(project_path, *, run, log=None, draft=False):
         raise RuntimeError("ffmpeg exploded")
 
     monkeypatch.setattr(assemble, "run", boom)
@@ -1452,7 +1452,7 @@ def test_i1b_a_finished_assemble_job_also_calls_advance_project(tmp_path, monkey
         advance_calls.append(project.id)
         return {"action": "nothing_to_do"}
 
-    def fake_run(project_path, *, run, log=None):
+    def fake_run(project_path, *, run, log=None, draft=False):
         return Path(project_path).parent / "final.mp4"
 
     monkeypatch.setattr(assemble, "run", fake_run)
@@ -1753,7 +1753,7 @@ def test_task4_assemble_jobs_own_subprocess_is_a_tracked_child_while_it_runs(tmp
 
     monkeypatch.setattr(_FakeTrackedChild, "communicate", spying_communicate)
 
-    def fake_assemble_run(project_path, *, run, log=None):
+    def fake_assemble_run(project_path, *, run, log=None, draft=False):
         result = run(["ffprobe", "fake"], capture_output=True, text=True)
         seen["result_returncode"] = result.returncode
         seen["result_stdout"] = result.stdout

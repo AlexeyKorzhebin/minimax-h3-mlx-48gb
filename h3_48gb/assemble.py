@@ -691,7 +691,7 @@ def _mux_mixed_audio(video_path, clip_audio_path, track_audio_path, out_path: Pa
 # -- run(): the assemble job body -----------------------------------------------------------------
 
 
-def run(project_path, *, run=subprocess.run, log=None) -> Path:
+def run(project_path, *, run=subprocess.run, log=None, draft: bool = False) -> Path:
     """Assemble every `done` scene's clip into `<project>/assembly/final.mp4` and return its path.
     This *is* the `kind="assemble"` job body -- `h3_48gb.worker._run_assemble_job` calls it, under
     the same lease/caffeinate wrapping every other job kind gets (see `worker.py`'s own docstrings).
@@ -758,17 +758,28 @@ def run(project_path, *, run=subprocess.run, log=None) -> Path:
     not_done = [scene["idx"] for scene in scenes if scene.get("status") != "done"]
     if not_done:
         raise AssembleError(f"project {proj.id!r} has scenes not yet done: {not_done}")
+    # spec §4.2.4: the final assembly takes the -ltx parts, and only once the upscale stage is
+    # `done` -- a failed retry leaves -ltx parts of an earlier attempt (maybe another strength) on
+    # some scenes, those must never be glued to new ones. An enabled upscale that is not done
+    # means no final assembly at all. The draft always takes the raw parts.
+    upscale_on = engine.is_sglang() and proj.route_enabled("upscale")
+    if upscale_on and not draft and proj.stages.get("upscale") != "done":
+        raise AssembleError(
+            f"project {proj.id!r}: upscale is on and not done "
+            f"(stages.upscale={proj.stages.get('upscale')!r}) -- no final assembly from -ltx parts")
+    use_ltx = upscale_on and not draft
     clip_paths = []
     for scene in scenes:
-        clip_path = scene.get("clip_path")
+        key = "ltx_path" if use_ltx else "clip_path"
+        clip_path = scene.get(key)
         if not clip_path:
-            raise AssembleError(f"scene {scene['idx']} of {proj.id!r} is done but has no clip_path")
+            raise AssembleError(f"scene {scene['idx']} of {proj.id!r} is done but has no {key}")
         clip_paths.append(clip_path)
 
     assembly_dir = proj.path.parent / "assembly"
     assembly_dir.mkdir(parents=True, exist_ok=True)
     audio_mode = proj.assembly.get("audio_mode", "clips")
-    final_path = assembly_dir / "final.mp4"
+    final_path = assembly_dir / ("draft.mp4" if draft else "final.mp4")
 
     # P0-2 (боевые ворота 2026-08-19): every concat call below that touches the *picture* uses
     # `video_clip_paths`, not the scenes' own raw `clip_paths` -- a chaining scene's own clip has
@@ -831,6 +842,11 @@ def run(project_path, *, run=subprocess.run, log=None) -> Path:
     else:
         _concat(video_clip_paths, final_path, run=run, video=True, audio=True)
 
+    if draft:
+        # A draft is a side product: no stage change, no project artifact sweep.
+        proj.update_assembly(draft_path=str(final_path))
+        _cleanup_intermediate_assembly_files(assembly_dir)
+        return final_path
     proj.update_assembly(final_path=str(final_path))
     proj.set_stage_status("assembly", "done")
     # Minor fix (review round 1): every intermediate file `run` wrote on the way to `final.mp4` is
@@ -1590,6 +1606,19 @@ def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
             "head_drop_frames": head_drop_frames}
 
 
+def _submit_upscale(proj, queue_root, *, submit) -> dict:
+    """spec §4.2: one upscale job per project, once every scene is done and the route has it on.
+    Idempotent on `stages.upscale` exactly like `_submit_assembly` is on `stages.assembly`."""
+    if proj.stages.get("upscale") != "draft":
+        return {"action": "nothing_to_do"}
+    output_stem = str(proj.path.parent / "upscale" / "job-upscale")
+    job = submit(queue_root, ["upscale", "--project", str(proj.path)],
+                 f"upscale project {proj.id}", {"output_stem": output_stem}, {},
+                 kind=q.KIND_UPSCALE)
+    proj.set_stage_status("upscale", "running")
+    return {"action": "submitted_upscale", "job_id": job.id}
+
+
 def _submit_assembly(proj, queue_root, *, submit) -> dict:
     """Submit the `kind="assemble"` job once every scene is `done` -- idempotent by
     `stages.assembly`: only fires from `"draft"` (a fresh project that has never had one queued),
@@ -1679,6 +1708,13 @@ def advance_project(project, queue_root, outdir, *, submit=q.submit, run=subproc
         # scenes still "running" next to an assembly already underway.
         if proj.stages.get("scenes") != "done":
             proj.set_stage_status("scenes", "done")
+        # Only on sglang: a Mac has no ComfyUI and no GPU dispatcher, an upscale queued there
+        # would wait for the gate forever.
+        if engine.is_sglang() and proj.route_enabled("upscale"):
+            if proj.stages.get("upscale") == "draft":
+                return _submit_upscale(proj, queue_root, submit=submit)
+            if proj.stages.get("upscale") != "done":
+                return {"action": "nothing_to_do"}
         return _submit_assembly(proj, queue_root, submit=submit)
 
     return {"action": "nothing_to_do"}

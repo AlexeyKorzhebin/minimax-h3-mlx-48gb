@@ -738,6 +738,8 @@ def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
     `assemble.run`'s stderr default, which nothing here captures.
     """
     log_lines: list[str] = []
+    # A draft assembly is a side product: its failure must not touch `stages.assembly`.
+    draft = "--draft" in job.args
     try:
         project_path = _project_arg(job.args)
     except Exception as exc:  # noqa: BLE001 -- malformed args, nothing to mark; fail the job.
@@ -751,7 +753,8 @@ def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
             log_lines.append(
                 f"assemble job failed: h3_48gb.assemble ещё не реализован (появится в Task 4): "
                 f"{exc}")
-            _mark_assembly_failed(project_path)
+            if not draft:
+                _mark_assembly_failed(project_path)
             return 1, "\n".join(log_lines) + "\n"
 
         run = _tracked_child_run(spawn)
@@ -760,12 +763,13 @@ def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
             # (checkpoints/previews/keyframes) reports "removed N, freed M bytes" through this
             # `log` callback -- routing it into `log_lines` puts it on the job's own log record
             # (`q.finish`'s `log_tail`) instead of `assemble.run`'s stderr default.
-            assemble.run(project_path, run=run, log=log_lines.append)
+            assemble.run(project_path, run=run, log=log_lines.append, draft=draft)
         log_lines.append("assemble job done")
         return 0, "\n".join(log_lines) + "\n"
     except Exception as exc:  # noqa: BLE001 -- same reasoning as `_run_song_job`.
         log_lines.append(f"assemble job failed: {type(exc).__name__}: {exc}")
-        _mark_assembly_failed(project_path)
+        if not draft:
+            _mark_assembly_failed(project_path)
         return 1, "\n".join(log_lines) + "\n"
 
 

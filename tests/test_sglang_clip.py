@@ -238,6 +238,8 @@ def _assembly_case(tmp_path, overshoot_track_seconds):
                     "clip_path": str(c), "keyframe_path": None, "head_drop_frames": 0}
                    for i, c in enumerate(clips)]
     proj.save()
+    # these tests are about trimming the raw parts, not about the upscale stage (tests/test_route.py)
+    proj.set_route_stage("upscale", False)
     return proj
 
 
