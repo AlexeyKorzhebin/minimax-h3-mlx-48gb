@@ -575,6 +575,45 @@ def _read_sse(r) -> tuple[str, str | None]:
         "поток оборвался раньше [DONE] -- провайдер закрыл соединение посреди ответа")
 
 
+_FENCE_RE = re.compile(r"\A\s*```(?:json)?[ \t]*\r?\n?(.*?)\r?\n?```\s*\Z", re.S)
+
+
+def _parse_model_json(raw, schema: dict):
+    """`json.loads` of the model's text, with the two repairs CAILA's non-OpenAI routes need.
+
+    1. The whole text is one ```json ...``` (or bare ``` ...```) block, whitespace around it
+       allowed: the fence is stripped. Prose with JSON somewhere inside is NOT searched -- that
+       stays a parse failure (`bad_model_json` upstream).
+    2. Properties the schema allows to be null (`"null"` in `type`) that the object omits are
+       added as null. Required non-nullable properties are never invented.
+    """
+    text = raw
+    if isinstance(text, str):
+        m = _FENCE_RE.match(text)
+        if m:
+            text = m.group(1)
+    return _fill_nullable(json.loads(text), schema.get("schema", schema))
+
+
+def _allows_null(sub: dict) -> bool:
+    t = sub.get("type")
+    return t == "null" or (isinstance(t, list) and "null" in t)
+
+
+def _fill_nullable(value, sub: dict):
+    if isinstance(value, dict) and isinstance(sub.get("properties"), dict):
+        for key, child in sub["properties"].items():
+            if key not in value:
+                if _allows_null(child):
+                    value[key] = None
+            else:
+                _fill_nullable(value[key], child)
+    elif isinstance(value, list) and isinstance(sub.get("items"), dict):
+        for item in value:
+            _fill_nullable(item, sub["items"])
+    return value
+
+
 def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
                retry_reminder: str) -> dict:
     """One turn of the OpenAI chat protocol, response shaped by `schema`.
@@ -802,14 +841,14 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
     if finish_reason == "length":
         raise _truncated()
     try:
-        return json.loads(raw)
+        return _parse_model_json(raw, schema)
     except (json.JSONDecodeError, TypeError):
         reminder = {"role": "system", "content": retry_reminder}
         raw2, finish_reason2 = ask([reminder, *messages])
         if finish_reason2 == "length":
             raise _truncated()
         try:
-            return json.loads(raw2)
+            return _parse_model_json(raw2, schema)
         except (json.JSONDecodeError, TypeError):
             raise ProviderError("bad_model_json",
                                f"модель не удержала формат: {(raw2 or '')[:400]}")

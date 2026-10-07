@@ -1719,3 +1719,68 @@ def test_system_prompt_demands_an_explicit_pose_and_support_for_every_character(
         "the spec's own cradle example is missing or reworded"
     assert "the mother rendered inside the cradle" in section, \
         "the defect this rule was paid for is no longer named beside it"
+
+
+# --- CAILA Anthropic route: fenced JSON and omitted nullable fields -------------------------
+
+def _content_payload(text):
+    return {"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}
+
+
+def _chat_once(text):
+    fake = _FakeLlama(chat_payload=_content_payload(text))
+    try:
+        return provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}]), fake
+    finally:
+        fake.close()
+
+
+_FULL = {"reply": "ok", "prompt": None, "slug": None,
+         "project": {"kind": "video", "scenes": [], "lyrics": None, "caption": None}}
+
+
+@pytest.mark.parametrize("wrap", [
+    "```json\n{body}\n```", "```\n{body}\n```", "  \n```json\n{body}\n```  \n", "```json {body}```"])
+def test_a_single_fenced_block_is_unwrapped_before_parsing(wrap):
+    out, fake = _chat_once(wrap.replace("{body}", json.dumps(_FULL)))
+    assert out == _FULL
+    assert len(fake.requests) == 1, "обёртка снята без повтора запроса"
+
+
+@pytest.mark.parametrize("text", [
+    "Вот ответ:\n```json\n" + json.dumps(_FULL) + "\n```\nНадеюсь, подойдёт.",
+    "```json\n" + json.dumps(_FULL) + "\n```\nНадеюсь, подойдёт.",
+    "Вот ответ:\n```json\n" + json.dumps(_FULL) + "\n```",
+    "Вот ответ: " + json.dumps(_FULL)])
+def test_prose_with_json_inside_is_still_bad_model_json(text):
+    fake = _FakeLlama(chat_payload=_content_payload(text))
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_model_json"
+        assert len(fake.requests) == 2
+    finally:
+        fake.close()
+
+
+def test_omitted_nullable_fields_are_added_as_null_at_every_depth():
+    partial = {"reply": "ok",
+               "prompt": {"integrated_multimodal_description": "d", "overall_soundscape": "s",
+                          "non_diegetic_music": "m"},
+               "project": {"kind": "clip", "scenes": []}}
+    out, _ = _chat_once(json.dumps(partial))
+    assert out == {"reply": "ok",
+                   "prompt": {"instruction": None, "integrated_multimodal_description": "d",
+                              "overall_soundscape": "s", "non_diegetic_music": "m"},
+                   "slug": None,
+                   "project": {"kind": "clip", "scenes": [], "lyrics": None, "caption": None}}
+
+
+def test_an_omitted_non_nullable_field_is_never_invented():
+    partial = {"reply": "ok",
+               "prompt": {"integrated_multimodal_description": "d", "non_diegetic_music": "m"}}
+    out, _ = _chat_once(json.dumps(partial))
+    assert "overall_soundscape" not in out["prompt"]
+    assert out["prompt"]["instruction"] is None
+    out2, _ = _chat_once(json.dumps({"prompt": None}))
+    assert "reply" not in out2, "обязательное не-nullable `reply` не дописывается"
