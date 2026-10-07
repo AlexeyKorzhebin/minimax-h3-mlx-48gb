@@ -48,6 +48,23 @@ systemctl is-active h3-gpu-dispatcher && curl -s 127.0.0.1:8790/status
 Юнит запускает `dispatcher.py` прямо из клона: после обновления кода — `sudo systemctl restart
 h3-gpu-dispatcher` (движки переживают рестарт, `KillMode=process`).
 
+С финальной волны правок (07.10) у каждого `/acquire` и `/release` есть клиент — тело без
+`"client"` получает 400 `client_required`:
+
+```bash
+curl -s -X POST 127.0.0.1:8790/acquire -d '{"engine": "h3", "client": "probes"}'
+curl -s -X POST 127.0.0.1:8790/release -d '{"client": "probes"}'          # только свои движки
+curl -s -X POST 127.0.0.1:8790/release -d '{"client": "me", "all": true}' # всё своё диспетчера
+```
+Воркер панели — `panel-worker`, кнопки страницы — `panel-web`, пробы — `probes`.
+`/status` показывает `owner` у каждого движка.
+
+Журнал переключений движков: `~/.local/state/h3-gpu-dispatcher/events.jsonl` (рядом со
+`state.json`) и `journalctl -u h3-gpu-dispatcher` — строки `gpu-dispatcher: {"ts", "event",
+"engine", "client", "pid", "seconds", ...}`: `starting`, `ready` (секунды подъёма), `stopping`,
+`stopped` (секунды до смерти группы, `sigkill`), `failed`, `release`, `qwen_unload`,
+`qwen_restore`.
+
 ## providers.json
 
 Qwen на этой машине (`/home/alex/Projects/qwen`, `--served-model-name qwen3.8-27b`, порт 8000).
@@ -67,9 +84,11 @@ Qwen на этой машине (`/home/alex/Projects/qwen`, `--served-model-nam
 
 ## Пробы §6
 
+Пробы — клиент `probes`: idle-release воркера их H3 не гасит, а их `release` не гасит H3 панели.
+Пока H3 у проб, задачи панели ждут с причиной «H3 занят клиентом probes», и наоборот.
+
 ```bash
 cd /home/alex/Projects/h3-panel
-docker compose stop        # см. «Грабли»: idle-release воркера погасит H3 пробы через 15 мин
 docker compose run --rm \
   -v /home/alex/Projects/h3-bench/beach-jobs.json:/home/alex/Projects/h3-bench/beach-jobs.json:ro \
   --entrypoint python h3-panel tools/probes/sglang_probes.py --keep-h3 \
@@ -78,7 +97,7 @@ docker compose run --rm \
 # --duration 10 --steps 2 --ref-size 512x683 — пик на 10-секундной сцене и портретах.
 # Входные картинки — /home/alex/Outputs/h3-panel/probes/inputs/<запуск>/<проба>/; в каждой
 # строке *.jsonl — "args" (steps/duration/ref_size/together) и "request" (target, шаги, размеры).
-curl -s -X POST 127.0.0.1:8790/release && docker compose up -d
+curl -s -X POST 127.0.0.1:8790/release -d '{"client": "probes"}'   # после --keep-h3
 ```
 
 ## Что пробы показали (2026-10-07)
@@ -101,12 +120,71 @@ curl -s -X POST 127.0.0.1:8790/release && docker compose up -d
 - `POST /v1/videos` отвечает за 3–78 мс даже во время денойза (работа уходит в очередь);
   таймаут клиента 60 с с запасом в три порядка.
 
+## Готовый сценарий без LLM (видеопроект)
+
+`PUT /api/projects/<id>/scenes` (спека §4.1, «Готовый сценарий без LLM»): сцены с промптами,
+длительностями, `@`-тегами референсов и стартовым кадром сцены 0 — без чата. Работает, пока в
+проекте ничего не поставлено; после него проект ждёт «Утвердить», как сценарий из чата.
+
+```bash
+P=http://127.0.0.1:8765
+OUT=/home/alex/Outputs/h3-panel
+# 1. картинки — внутрь outdir (карточки берут файлы только оттуда)
+mkdir -p $OUT/uploads/battle
+cp face.png opening.png $OUT/uploads/battle/
+# 2. карточки библиотеки
+curl -s -X POST $P/api/library -H 'Content-Type: application/json' -d '{"tag": "@amazon",
+  "kind": "person", "description": "a woman in dark armor", "assets":
+  ["/home/alex/Outputs/h3-panel/uploads/battle/face.png"]}'
+curl -s -X POST $P/api/library -H 'Content-Type: application/json' -d '{"tag": "@arena",
+  "kind": "environment", "description": "a sand arena under open sky", "assets":
+  ["/home/alex/Outputs/h3-panel/uploads/battle/opening.png"]}'
+# 3. пустой видеопроект -> id
+ID=$(curl -s -X POST $P/api/projects -H 'Content-Type: application/json' \
+  -d '{"kind": "video", "title": "fight-armored-40"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+# 4. сценарий: 5 сцен по 8 с, сцена 0 стартует с кадра @arena
+curl -s -X PUT $P/api/projects/$ID/scenes -H 'Content-Type: application/json' -d '{
+  "references": [{"tag": "@amazon"}, {"tag": "@arena"}],
+  "scenes": [
+    {"prompt": "@amazon walks into @arena ...", "duration": 8, "start_image": "@arena"},
+    {"prompt": "@amazon ... on @arena ...", "duration": 8},
+    {"prompt": "...", "duration": 8},
+    {"prompt": "...", "duration": 8},
+    {"prompt": "...", "duration": 8}]}'
+# 5. утвердить: снап длительностей к сетке, проверка тегов, сцена 0 в очередь
+curl -s -X POST $P/api/projects/$ID/approve/script -H 'Content-Type: application/json' -d '{}'
+```
+- `start_image` — только у сцены 0: `@тег` закреплённой карточки (берётся её первая картинка)
+  или путь внутри `/home/alex/Outputs/h3-panel`. Это кейфрейм сцены 0 (`role: keyframe`).
+- Длительность 3–15 с; «Утвердить» снапает к сетке: сцена 0 — 192 кадра (8,000 с), сцепленные
+  — 191 доставленный (запрос 192).
+- Каждая сцена обязана назвать хотя бы один `@тег` (ref2va без референса сервер не берёт).
+- Свой блок `subject_definitions:` в промпте панель не дублирует (спека §3.5, п. 5), но `@`-теги
+  в нём и в тексте всё равно становятся `<Subject N>` в порядке первого упоминания, картинки —
+  `<Picture k>` в том же порядке (кейфрейм не нумеруется). Свой блок пишется под эту нумерацию.
+- Ответ — проект целиком; ошибка — `{"error": {"code", "message"}}` (409
+  `project_stage_not_ready`, если сцены уже ставились).
+
+## Отчёт боевого прогона
+
+```bash
+cd /home/alex/Projects/h3-panel
+TZ=Europe/Moscow python3 tools/battle_report.py /home/alex/Outputs/h3-panel/projects/<id> \
+  --out docs/BATTLE-$(date +%F).md
+```
+Только stdlib, на хосте. Читает `project.json` (`stage_times`, сцены), очередь
+(`/home/alex/Outputs/h3-panel/queue`: `gpu_wait_s`, `engine_start_s`, начало/конец задач),
+`<stem>.json` сцен (wall/inference/peak/сервер/скачивание/проверка), `upscale/report.json` и
+`events.jsonl` диспетчера (`--events`, по умолчанию `~/.local/state/h3-gpu-dispatcher/`).
+`TZ` — как у контейнера: метки очереди наивные московские, события диспетчера — epoch.
+
 ## Грабли
 
-- **Idle-release воркера гасит любой движок диспетчера.** Воркер панели через
-  `H3_IDLE_RELEASE_MIN` минут пустой очереди шлёт `/release`, а диспетчер не различает, кто
-  поднял H3 — панель или скрипт проб. Пока работает контейнер панели, пробы и любые ручные
-  `/acquire` живут не дольше 15 минут от старта воркера. Пробы — при остановленном контейнере.
+- **Idle-release гасит только своё** (с финальной волны 07.10; раньше гасил любой движок
+  диспетчера, и пробы приходилось гонять при остановленном контейнере). Воркер шлёт `/release`
+  от имени `panel-worker` и только если сам брал карту; срок на плашке — его собственный отсчёт
+  (`queue/idle-since`). Движок, поднятый до этой версии диспетчера (без `owner`), гасит только
+  кнопка «Освободить карту» или его усыновит первый `acquire`.
 - `validate_workflow.py` для `ltx_workflow.json` даёт `VALID: False` только из-за файла-заглушки
   `input-pad.mp4` в `LoadVideo` (его нет в `ComfyUI/input`); с подставленным существующим
   роликом — `VALID: True`, `nodes with unknown inputs: 0`.
