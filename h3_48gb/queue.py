@@ -417,6 +417,13 @@ def layout(root) -> dict[str, Path]:
     return paths
 
 
+def has_active_jobs(root) -> bool:
+    """Anything in pending/ or running/ -- the idle-release countdown (spec §3.4) runs only while
+    this is False. A directory listing, not a parse: cheap enough for every loop pass."""
+    root = Path(root)
+    return any(any((root / state).glob("*.json")) for state in ("pending", "running"))
+
+
 def is_paused(root) -> bool:
     """Whether the queue at `root` is paused: does `<root>/paused` exist.
 

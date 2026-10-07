@@ -44,6 +44,7 @@ from pathlib import Path
 
 from h3_48gb import engine, provider
 from h3_48gb import queue as q
+from h3_48gb.engines import dispatcher_client
 
 #: The file whose `flock` means "a worker is running on this machine". Probed by the web server
 #: (`worker.state` in the design spec) and taken exclusively, non-blocking, by `hold_worker_lock`.
@@ -501,16 +502,138 @@ def _mark_assembly_failed(project_path) -> None:
         pass
 
 
-def _run_sglang_generate_job(root, outdir, job, *, gate=None) -> tuple[int, str]:
-    """spec §3.3.3: on sglang a generate job runs in this process through the adapter, under the
-    lease `run_job` already holds -- no subprocess, no caffeinate, no MLX."""
+ACQUIRE_RETRY_SECONDS = 30.0
+STARTING_POLL_SECONDS = 5.0
+HOT_C = 80
+COOL_C = 72
+
+
+class GpuEngineFailed(Exception):
+    def __init__(self, reason: str, log: str | None):
+        super().__init__(reason)
+        self.reason = reason
+        self.log = log
+
+
+def make_gpu_gate(root, engine_name: str, *, client, sleep=time.sleep):
+    """spec §4.1.1-2: ask the dispatcher for `engine_name` until it is ready, every 30 s (5 s while
+    our own engine is starting), writing why into the job (`wait_reason`) for the page; no
+    timeout -- only a cancel ends the wait. Once ready, a card at ≥ 80 °C is waited down to 72 °C.
+    Returns None when the card is ours and cool (or its temperature is unknown), or the cancel
+    reason."""
     from h3_48gb.engines import sglang as sglang_engine
 
+    def wait(job, reason: str, seconds: float) -> str | None:
+        q.set_running_fields(root, job.id, wait_reason=reason)
+        return sglang_engine._sleep_unless_cancelled(root, job.id, seconds, sleep)
+
+    def temperature() -> int | None:
+        # Unknown temperature (dispatcher down, or `gpu: null` because nvidia-smi is down on the
+        # host) never blocks the job: a thermal wait with no number to wait on would hang for ever.
+        try:
+            return client.status()["gpu"]["temperature_c"]
+        except (dispatcher_client.DispatcherUnavailable, KeyError, TypeError):
+            return None
+
+    def gate(job) -> str | None:
+        while True:
+            cancelled = q.cancel_reason(root, job.id)
+            if cancelled:
+                return cancelled
+            try:
+                answer = client.acquire(engine_name)
+            except dispatcher_client.DispatcherUnavailable as exc:
+                cancelled = wait(job, f"ждём GPU: диспетчер недоступен ({exc})",
+                                 ACQUIRE_RETRY_SECONDS)
+                if cancelled:
+                    return cancelled
+                continue
+            state = answer.get("state")
+            if state == "failed":
+                raise GpuEngineFailed(answer.get("reason") or "движок не поднялся",
+                                      answer.get("log"))
+            if state == "ready":
+                temp = temperature()
+                if temp is None or temp < HOT_C:
+                    q.set_running_fields(root, job.id, wait_reason=None)
+                    return None
+                while temp is not None and temp > COOL_C:
+                    cancelled = wait(job, f"остываем, {temp} °C", ACQUIRE_RETRY_SECONDS)
+                    if cancelled:
+                        return cancelled
+                    temp = temperature()
+                continue
+            if state == "starting":
+                reason, seconds = f"ждём GPU: поднимается {engine_name}", STARTING_POLL_SECONDS
+            elif state == "wait_qwen":
+                reason = "ждём GPU: Qwen держит карту — выгрузите Qwen в панели"
+                seconds = ACQUIRE_RETRY_SECONDS
+            else:
+                reason, seconds = f"ждём GPU: {answer.get('reason')}", ACQUIRE_RETRY_SECONDS
+            cancelled = wait(job, reason, seconds)
+            if cancelled:
+                return cancelled
+    return gate
+
+
+class _IdleRelease:
+    """spec §3.4 (б): POST /release once the panel's queue has held no job at all -- neither
+    pending nor running -- for H3_IDLE_RELEASE_MIN minutes. Counted from an empty queue, not
+    from an idle GPU: while a project renders, the card is never given away."""
+
+    def __init__(self, minutes: float, client, clock=time.monotonic):
+        self.limit = float(minutes) * 60.0
+        self.client = client
+        self.clock = clock
+        self.since: float | None = None
+        self.released = False
+
+    def tick(self, root) -> None:
+        if q.has_active_jobs(root):
+            self.since, self.released = None, False
+            return
+        now = self.clock()
+        if self.since is None:
+            self.since = now
+        if not self.released and now - self.since >= self.limit:
+            try:
+                self.client.release()
+                self.released = True
+            except dispatcher_client.DispatcherUnavailable as exc:
+                print(f"h3 worker: idle release failed: {exc}", file=sys.stderr)
+
+
+def _wait_for_engine_start_to_settle(client, *, sleep=time.sleep) -> None:
+    """spec §9 (22 GB host RAM): an assembly's ffmpeg must not run next to an engine that is
+    still loading. Waits while any of our own engines reports `ready: false`."""
+    while True:
+        try:
+            own = client.status().get("own") or {}
+        except dispatcher_client.DispatcherUnavailable:
+            return
+        if all(record.get("ready") for record in own.values()):
+            return
+        sleep(ACQUIRE_RETRY_SECONDS)
+
+def _run_sglang_generate_job(root, outdir, job, *, gate=None) -> tuple[int, str]:
+    from h3_48gb.engines import sglang as sglang_engine
+
+    dispatcher = dispatcher_client.DispatcherClient()
+    if gate is None:
+        gate = make_gpu_gate(root, "h3", client=dispatcher)
     client = sglang_engine.SglangClient(os.environ.get("H3_SGLANG_URL", sglang_engine.DEFAULT_URL))
     try:
-        return sglang_engine.run_generate(job, root=root, outdir=outdir, client=client, gate=gate)
+        result = sglang_engine.run_generate(job, root=root, outdir=outdir, client=client, gate=gate)
+    except GpuEngineFailed as exc:
+        result = (1, f"движок не поднялся: {exc.reason}; лог: {exc.log}\n")
     except Exception as exc:  # noqa: BLE001 -- a bug here must fail the job, not kill the worker
-        return 1, f"sglang adapter crashed: {type(exc).__name__}: {exc}\n"
+        result = (1, f"sglang adapter crashed: {type(exc).__name__}: {exc}\n")
+    if q.cancel_reason(root, job.id) == "released_by_user":
+        try:
+            dispatcher.release()
+        except dispatcher_client.DispatcherUnavailable as exc:
+            result = (result[0], result[1] + f"не удалось освободить карту: {exc}\n")
+    return result
 
 
 def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
@@ -759,6 +882,8 @@ def run_job(root, job, spawn=subprocess.Popen, outdir=None) -> int:
             elif job.kind == q.KIND_SONG:
                 exit_code, log_text = _run_song_job(job, spawn=spawn)
             elif job.kind == q.KIND_ASSEMBLE:
+                if engine.is_sglang():
+                    _wait_for_engine_start_to_settle(dispatcher_client.DispatcherClient())
                 exit_code, log_text = _run_assemble_job(job, spawn=spawn)
             else:
                 exit_code, log_text = 1, f"unknown job kind {job.kind!r}\n"
@@ -990,6 +1115,11 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir
     stop = stop if stop is not None else threading.Event()
     ran = 0
 
+    idle = None
+    if engine.is_sglang():
+        idle = _IdleRelease(float(os.environ.get("H3_IDLE_RELEASE_MIN", "15")),
+                            dispatcher_client.DispatcherClient())
+
     with hold_worker_lock(root), _stop_signals(stop):
         while not stop.is_set():
             state = q.reconcile(root)
@@ -1003,6 +1133,8 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir
                 run_job(root, state.resumable[0], spawn=spawn, outdir=outdir)
                 ran += 1
                 continue
+            if idle is not None:
+                idle.tick(root)
             if q.is_paused(root):
                 if stop.wait(poll):
                     break

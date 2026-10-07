@@ -5,6 +5,7 @@ import pytest
 from h3_48gb import queue as q
 from h3_48gb import worker
 from h3_48gb.engines import sglang as sg
+from _fake_dispatcher import FakeDispatcher
 from _fake_sglang import FakeSglang
 from test_web import _call, _serve
 from test_worker import _stop_after
@@ -25,6 +26,9 @@ class _Crash(BaseException):
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("H3_ENGINE", "sglang")
+    # the worker now asks the host dispatcher for the card before every scene (task 8)
+    dispatcher = FakeDispatcher()
+    monkeypatch.setenv("H3_DISPATCHER_URL", dispatcher.url)
     monkeypatch.setattr(sg, "POLL_SECONDS", 0.0)
     monkeypatch.setattr(sg, "LOST_RETRY_SECONDS", 0.0)
     root = q.layout(tmp_path / "queue")["root"]
@@ -34,7 +38,8 @@ def env(tmp_path, monkeypatch):
     args = ["generate", "p", "--width", "896", "--height", "512", "--duration", str(175 / 24),
             "--tag", "t", "--outdir", str(tmp_path / "scenes"), "--ref", str(ref)]
     q.submit(root, args, "", {"output_stem": str(tmp_path / "scenes" / "h3-t-896x512")}, {})
-    return root, tmp_path
+    yield root, tmp_path
+    dispatcher.close()
 
 
 def _crash_after_post(monkeypatch):

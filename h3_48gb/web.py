@@ -56,6 +56,7 @@ from h3_48gb import queue as q
 from h3_48gb import runs as runs_module
 from h3_48gb import songrun
 from h3_48gb.cli import DEFAULT_CANVAS, ERROR_CODES, CliError, build_parser
+from h3_48gb.engines import dispatcher_client
 from h3_48gb.engines import estimate as sglang_estimate
 from h3_48gb.engines import sglang_args
 from h3_48gb.project import PROJECT_KINDS
@@ -533,6 +534,13 @@ ERROR_STATUS = {
     # mistake a page could tell someone to fix, and not 404: `_media` already resolved a real file
     # before this triggers.
     "range_not_satisfiable": 416,
+    # GPU routes (task 8). 409 for the three that are the page's state refusing a valid request;
+    # 502 because the dispatcher is a separate process this server proxies to.
+    "engine_not_sglang": 409,
+    "dispatcher_unavailable": 502,
+    "release_needs_confirm": 409,
+    "qwen_was_not_running": 409,
+    "queue_busy": 409,
 }
 
 #: Codes `ERROR_STATUS` maps ahead of the commit that raises them, so that the failure mode
@@ -3352,6 +3360,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._providers()
         if path == "/api/llm":
             return self._llm_status()
+        if path == "/api/gpu":
+            return self._gpu_state()
         if path.startswith("/api/chat/"):
             return self._read_chat(path[len("/api/chat/"):])
         if path.startswith("/media/"):
@@ -3379,6 +3389,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._create_chat()
         if path == "/api/llm/unload":
             return self._llm_unload()
+        if path == "/api/gpu/release":
+            return self._gpu_release()
+        if path == "/api/qwen/unload":
+            return self._qwen_unload()
+        if path == "/api/qwen/restore":
+            return self._qwen_restore()
         if path == "/api/queue/pause":
             return self._queue_pause()
         if path == "/api/queue/start":
@@ -5284,6 +5300,85 @@ class _Handler(BaseHTTPRequestHandler):
             pname, pcfg = by_port[port]
             provider.LlamaLocal(pname, pcfg, self.server.outdir).shutdown()
         return 200, "application/json", _json_bytes({"ok": True, "status": "down"})
+
+    def _require_sglang(self) -> None:
+        if not engine.is_sglang():
+            raise CliError("engine_not_sglang", "это есть только на сервере с sglang (H3_ENGINE=sglang)",
+                           {"engine": engine.current()})
+
+    def _running_job(self):
+        jobs, _ = q.scan(self.server.queue_root)
+        running = [job for job in jobs if job.state == "running"]
+        return (running[0] if running else None), sum(1 for job in jobs if job.state == "pending")
+
+    def _gpu_state(self) -> tuple[int, str, bytes]:
+        self._require_sglang()
+        try:
+            status, error = dispatcher_client.DispatcherClient().status(), None
+        except dispatcher_client.DispatcherUnavailable as exc:
+            status, error = None, str(exc)
+        running, pending = self._running_job()
+        return 200, "application/json", _json_bytes({
+            "ok": True, "dispatcher": status, "dispatcher_error": error,
+            "queue": {"pending": pending, "paused": q.is_paused(self.server.queue_root),
+                      "running": None if running is None else {
+                          "id": running.id, "kind": running.kind, "note": running.note,
+                          "started_at": running.started_at, "wait_reason": running.wait_reason}}})
+
+    def _gpu_release(self) -> tuple[int, str, bytes]:
+        self._require_sglang()
+        payload = self._json_request(allowed=("confirm",))
+        root = self.server.queue_root
+        running, _pending = self._running_job()
+        if running is not None and running.kind in (q.KIND_GENERATE, "upscale"):
+            # only GPU work is cancelled; an assembly (ffmpeg, no GPU) keeps running
+            if payload.get("confirm") is not True:
+                raise CliError("release_needs_confirm",
+                               f"H3 считает {running.note or running.id} — освободить карту? "
+                               f"Сцена будет потеряна", {"job": running.id})
+            try:
+                with queue_write_errors(root, what="the job id"):
+                    q.request_cancel(root, running.id, "released_by_user")
+                    q.set_paused(root, True)
+                return 200, "application/json", _json_bytes(
+                    {"ok": True, "paused": True, "releasing": True, "job": running.id})
+            except q.JobNotRunning:
+                pass  # finished between the scan and the click: nothing to cancel, free the card
+        try:
+            answer = dispatcher_client.DispatcherClient().release()
+        except dispatcher_client.DispatcherUnavailable as exc:
+            raise CliError("dispatcher_unavailable", f"диспетчер GPU не отвечает: {exc}", {}) from exc
+        with queue_errors(root):
+            q.set_paused(root, True)
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "paused": True, "releasing": False, "released": answer.get("stopped", [])})
+
+    def _qwen_call(self, name: str) -> tuple[int, str, bytes]:
+        self._require_sglang()
+        self._json_request(allowed=())
+        try:
+            status, body = getattr(dispatcher_client.DispatcherClient(timeout=600.0), name)()
+        except dispatcher_client.DispatcherUnavailable as exc:
+            raise CliError("dispatcher_unavailable", f"диспетчер GPU не отвечает: {exc}", {}) from exc
+        if status != 200:
+            error = body.get("error") or {}
+            message = error.get("message") or f"диспетчер ответил {status}"
+            if error.get("code") == "qwen_was_not_running":
+                raise CliError("qwen_was_not_running", message, {})
+            # any other refusal is a dispatcher this panel does not understand: say so honestly
+            raise CliError("dispatcher_unavailable", message, {"dispatcher_status": status})
+        return 200, "application/json", _json_bytes(body)
+
+    def _qwen_unload(self):
+        return self._qwen_call("qwen_unload")
+
+    def _qwen_restore(self):
+        # spec §2: «вернуть Qwen» is offered *after* the queue -- never under a running scene
+        running, pending = self._running_job()
+        if running is not None or pending:
+            raise CliError("queue_busy", "вернуть Qwen можно после очереди: в ней ещё есть задачи",
+                           {"running": running.id if running else None, "pending": pending})
+        return self._qwen_call("qwen_restore")
 
     def _queue_pause(self) -> tuple[int, str, bytes]:
         """`POST /api/queue/pause`: mark the queue paused, so `main_loop`'s gate stops claiming.

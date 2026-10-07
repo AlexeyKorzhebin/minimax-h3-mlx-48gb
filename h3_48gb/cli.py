@@ -257,6 +257,11 @@ ERROR_CODES = {
     "method_not_implemented": "this server has no handler for that HTTP method",
     "bad_request": "the request itself could not be served -- malformed, or too large to accept",
     "scene_references_invalid": "one or more scenes name @tags or references sglang would refuse",
+    "engine_not_sglang": "a GPU/Qwen route was called on a panel whose engine is not sglang",
+    "dispatcher_unavailable": "the host gpu-dispatcher did not answer",
+    "release_needs_confirm": "«Освободить карту» while a scene renders needs an explicit confirm",
+    "qwen_was_not_running": "«вернуть Qwen» was asked, but Qwen was not running before the panel unloaded it",
+    "queue_busy": "«вернуть Qwen» was asked while the panel's queue still holds jobs",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 
