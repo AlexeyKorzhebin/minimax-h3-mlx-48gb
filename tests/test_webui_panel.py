@@ -499,3 +499,10 @@ def test_scene_prompt_input_demands_a_tag_on_sglang_and_stays_silent_on_mlx():
 def test_a_scene_card_shows_why_the_scene_was_not_submitted():
     assert _ui("scene_error") == {"errors": [
         '<div class="scene-error why">сцена не поставлена: AssembleError: кадр &lt;залит&gt;</div>']}
+
+
+@_needs_node
+def test_the_mac_form_is_hidden_on_sglang_and_never_estimated():
+    """Final review I3: its MLX defaults made /api/estimate answer 400 on every page load."""
+    assert _ui("form_sglang") == {"formHidden": True, "noteHidden": False, "estimates": 0}
+    assert _ui("form_mlx") == {"formHidden": False, "noteHidden": True, "estimates": 1}

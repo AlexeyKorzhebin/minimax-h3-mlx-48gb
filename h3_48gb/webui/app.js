@@ -2635,6 +2635,11 @@ function startPage() {
       failures = 0;
       lastOkAt = new Date();
       document.body.dataset.platform = state.platform;
+      // финальное ревью I3: форма ручной задачи — маковская (t2va, чекпойнт, 8 шагов); на
+      // sglang её аргументы сервер отвергает, ручные задачи там — через проекты (волна 2)
+      const sglangEngine = state.engine === "sglang";
+      $("form").hidden = sglangEngine;
+      $("form-sglang-note").hidden = !sglangEngine;
       if (!$("outdir").value) $("outdir").value = defaultOutdir(state);
     } catch {
       failures += 1;
@@ -3758,6 +3763,7 @@ function startPage() {
   }
 
   async function requestEstimate() {
+    if (state && state.engine === "sglang") return;   // I3: формы на sglang нет
     const form = readForm();
     // Оценка проверяет пути, поэтому пустой каталог — не «ноль», а отказ
     // `path_outside_root`, показанный до того, как человек хоть что-то ввёл.

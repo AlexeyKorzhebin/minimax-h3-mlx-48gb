@@ -152,6 +152,17 @@ async function main() {
     await sleep(80);
     out = { status: /<div class="upscale-status"[^>]*>Апскейл LTX: упал/.test(html),
             posts: calls.filter((c) => c.method === "POST").map((c) => [c.url, c.body]) };
+  } else if (scenario === "form_sglang" || scenario === "form_mlx") {
+    // final review I3: on sglang the Mac form is hidden and /api/estimate is never asked
+    const engine = scenario === "form_mlx" ? "mlx" : "sglang";
+    // a filled form: without these readForm() alone would skip the estimate on either engine
+    Object.entries({ width: "1024", height: "576", outdir: "/o", ckpt: "/c" })
+      .forEach(([id, value]) => { getElementById(id).value = value; });
+    await start({ "GET /api/state": ok({ ...SGLANG, engine }),
+                  "POST /api/estimate": ok({ ok: true, estimate: {} }) });
+    out = { formHidden: getElementById("form").hidden,
+            noteHidden: getElementById("form-sglang-note").hidden,
+            estimates: countCalls("POST", "/api/estimate") };
   } else if (scenario === "scene_error") {
     // final review C2: the reason a chained scene could not be submitted is on its card
     const scene = (idx, status, extra = {}) => ({ idx, prompt: "@a walks", duration: 8, status,
