@@ -274,6 +274,18 @@ export function runCancelHtml(job, engine) {
 }
 
 /** Запрос на правку карточки библиотеки: сервер сам заводит следующую версию (vN). */
+/** Название нового проекта по умолчанию: «Ролик ДД.ММ ЧЧ:ММ» по локальному времени. */
+export function defaultProjectTitle(date) {
+  const two = (n) => String(n).padStart(2, "0");
+  return `Ролик ${two(date.getDate())}.${two(date.getMonth() + 1)} `
+    + `${two(date.getHours())}:${two(date.getMinutes())}`;
+}
+
+/** Тело POST /api/projects для пустого видеопроекта; пустое имя заменяется датой. */
+export function newVideoRequest(title, now) {
+  return { kind: "video", title: title.trim() || defaultProjectTitle(now) };
+}
+
 export function libraryUpdateRequest(tag, description) {
   return { name: tag.replace(/^@/, ""), body: { description } };
 }
@@ -5223,6 +5235,20 @@ function startPage() {
   });
 
   // -- подписки модалки -------------------------------------------------------------------
+
+  $("project-new-video").addEventListener("click", async () => {
+    const title = window.prompt("Название проекта (пусто — по дате):", "");
+    if (title === null) return;
+    try {
+      const created = await api("POST", "/api/projects", newVideoRequest(title, new Date()));
+      await poll();
+      await openProjectModal(created.id);
+    } catch (error) {
+      showError(error.payload || { error: { message: "сервер не ответил" } });
+    }
+  });
+  $("project-new-chat").addEventListener("click", () =>
+    openChatModal({ kind: "new" }, { prompt: "", mode: "", image: "", endImage: "", duration: 10 }));
 
   $("chat-new").addEventListener("click", () => {
     const mode = $("mode").value;
