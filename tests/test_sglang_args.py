@@ -113,8 +113,10 @@ def test_more_refs_than_the_limit_is_refused(tmp_path):
         ("too_many_reference_images", {"count": 3, "limit": 2})
 
 
-def test_the_default_ref_limit_is_six():
-    assert sa.max_ref_images({}) == 6
+def test_the_default_ref_limit_is_five():
+    """Probe 2026-10-07 (task 14): at 10 s / 512 px six 3:4 portraits peaked at 63.6 GB of the
+    card's ~64.9 GB and nine squares ran out of memory; five portraits left ~2.7 GB."""
+    assert sa.max_ref_images({}) == 5
 
 
 def test_a_missing_condition_file_is_refused_unless_files_are_not_checked(tmp_path):

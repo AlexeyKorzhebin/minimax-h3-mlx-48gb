@@ -27,7 +27,7 @@ services:
       H3_DISPATCHER_URL: http://127.0.0.1:8790
       H3_COMFY_OUTPUT_DIR: /home/alex/Outputs/comfy/output
       H3_IDLE_RELEASE_MIN: "15"
-      H3_MAX_REF_IMAGES: "6"
+      H3_MAX_REF_IMAGES: "5"
     volumes:
       - /home/alex/Outputs/h3-panel:/home/alex/Outputs/h3-panel
       - /home/alex/Outputs/comfy/output:/home/alex/Outputs/comfy/output:ro

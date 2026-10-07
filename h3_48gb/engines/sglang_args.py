@@ -19,7 +19,7 @@ MIN_SECONDS = 3.0
 MAX_SECONDS = 15.0
 DEFAULT_STEPS = 50
 DEFAULT_SEED = 42
-DEFAULT_MAX_REF_IMAGES = 6
+DEFAULT_MAX_REF_IMAGES = 5   # probe 2026-10-07: 6 portraits at 10 s = 63.6 of ~64.9 GB
 
 #: Panel canvas -> (short_edge, aspect_ratio) (spec §4.1.4). The delivered frame size is read from
 #: the mp4, not from this table: sglang picks its own frame for a short edge and an aspect.

@@ -38,7 +38,7 @@ def test_compose_mounts_host_paths_at_the_same_paths_and_sets_the_spec_env():
             "H3_SGLANG_URL: http://127.0.0.1:30020", "H3_COMFY_URL: http://127.0.0.1:8188",
             "H3_DISPATCHER_URL: http://127.0.0.1:8790",
             "H3_COMFY_OUTPUT_DIR: /home/alex/Outputs/comfy/output",
-            'H3_IDLE_RELEASE_MIN: "15"'):
+            'H3_IDLE_RELEASE_MIN: "15"', 'H3_MAX_REF_IMAGES: "5"'):
         assert expected in lines, expected
 
 
@@ -55,7 +55,7 @@ def test_dockerignore_keeps_the_context_small_but_keeps_what_the_panel_reads():
     ignored = set(_lines(".dockerignore"))
     # upstream/ is the MLX reference checkout: the package imports without it (task 2)
     assert {".git", "**/__pycache__", "*.egg-info", ".pytest_cache", "reference",
-            "upstream"} <= ignored
+            "upstream", "logs"} <= ignored
     assert not ({"docs", "prompts", "tests", "h3_48gb"} & ignored)
 
 
