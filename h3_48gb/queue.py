@@ -1222,6 +1222,9 @@ def reconcile(root) -> Reconciled:
                 if job.engine_ref:
                     resumable.append(job)
                     continue
+                if job.cancel_reason:
+                    changed.append(_finish_locked(root, job.id, 1, "отменена до начала"))
+                    continue
                 changed.append(_return_to_pending_locked(root, job.id))
             except QueueError as exc:
                 conflicted.append(Broken(path=str(file), error=f"{type(exc).__name__}: {exc}"))

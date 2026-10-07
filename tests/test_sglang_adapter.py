@@ -9,6 +9,13 @@ from h3_48gb.engines import sglang as sg
 from h3_48gb.engines import sglang_args as sa
 from _fake_sglang import FakeSglang
 
+@pytest.fixture(autouse=True)
+def _no_real_frame_decode(monkeypatch):
+    """The fake serves placeholder bytes, not a decodable mp4; the real zero-fill check is
+    exercised in test_sglang_framecheck.py."""
+    monkeypatch.setattr(sg, "_zero_filled_frames", lambda mp4: [])
+
+
 COMMON = {"model": "MiniMaxAI/MiniMax-H3", "num_outputs_per_prompt": 1,
           "num_inference_steps": 50, "flow_shift": 12.0, "audio_flow_shift": 3.0,
           "seed": 42, "quality": "lossless"}
@@ -326,3 +333,27 @@ def test_a_worker_killed_mid_download_leaves_no_mp4(tmp_path, monkeypatch):
     finally:
         fake.close()
     assert not Path(dest).exists()
+
+
+def test_a_job_cancelled_before_the_post_never_posts(queued, tmp_path):
+    root, job = queued
+    q.request_cancel(root, job.id, "cancelled_by_user")
+    fake = FakeSglang()
+    try:
+        code, log = _run(job, root, tmp_path, fake)
+    finally:
+        fake.close()
+    assert (code, log, fake.posts) == (1, "sglang: cancelled_by_user — отменена до начала\n", [])
+
+
+def test_a_non_404_4xx_on_a_poll_fails_at_once_with_the_body(queued, tmp_path):
+    root, job = queued
+    fake = FakeSglang(get_error=(422, {"detail": "bad id"}))
+    try:
+        code, log = _run(job, root, tmp_path, fake)
+    finally:
+        fake.close()
+    assert (code, log) == (1, "sglang: id=vid-1\nsglang отказал (422): bad id\n")
+    assert fake.gets == ["vid-1"]   # one poll, no retry
+    report = _report(job)
+    assert (report["status"], report["http_status"], report["detail"]) == ("rejected", 422, "bad id")

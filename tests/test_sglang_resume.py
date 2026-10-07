@@ -10,6 +10,13 @@ from test_web import _call, _serve
 from test_worker import _stop_after
 
 
+@pytest.fixture(autouse=True)
+def _no_real_frame_decode(monkeypatch):
+    """The fake serves placeholder bytes, not a decodable mp4; the real zero-fill check is
+    exercised in test_sglang_framecheck.py."""
+    monkeypatch.setattr(sg, "_zero_filled_frames", lambda mp4: [])
+
+
 class _Crash(BaseException):
     """A worker dying mid-poll (a signal, an OOM kill). BaseException on purpose: the worker's
     own `except Exception` safety net around the adapter must not swallow it."""
@@ -118,3 +125,32 @@ def test_on_mlx_a_running_job_still_cannot_be_cancelled(env, monkeypatch):
         live.httpd.shutdown()
         live.httpd.server_close()
     assert body["error"]["code"] == "job_not_pending"
+
+
+def test_a_cancelled_job_that_never_posted_fails_on_restart_instead_of_pending(env):
+    root, tmp_path = env
+    job = q.claim(root)
+    q.request_cancel(root, job.id, "cancelled_by_user")
+    state = q.reconcile(root)
+    assert state.resumable == []
+    (failed,) = [j for j in q.scan(root)[0] if j.id == job.id]
+    assert (failed.state, failed.exit_code, failed.log_tail) == \
+        ("failed", 1, "отменена до начала")
+
+
+def test_a_job_finishing_under_the_cancel_click_answers_job_not_pending(env, monkeypatch):
+    root, tmp_path = env
+    job = q.claim(root)
+
+    def finished_meanwhile(*args, **kwargs):
+        raise q.JobNotRunning("gone")
+
+    monkeypatch.setattr(q, "request_cancel", finished_meanwhile)
+    live = _serve(root, tmp_path)
+    try:
+        status, body = _call(live, "DELETE", f"/api/jobs/{job.id}")
+    finally:
+        live.httpd.shutdown()
+        live.httpd.server_close()
+    assert status == 409, body
+    assert (body["error"]["code"], body["error"]["detail"]) == ("job_not_pending", {"id": job.id})

@@ -11,10 +11,14 @@ import http.client
 import json
 import os
 import shutil
+import subprocess
 import time
 import urllib.parse
 from pathlib import Path
 
+import numpy as np
+
+from h3_48gb import framecheck
 from h3_48gb import queue as q
 from h3_48gb.engines import estimate as sglang_estimate
 from h3_48gb.engines import sglang_args
@@ -179,6 +183,39 @@ def _sleep_unless_cancelled(root, job_id: str, seconds: float, sleep) -> str | N
         remaining -= step
 
 
+def _zero_filled_frames(mp4: Path) -> list[int]:
+    """Decode `mp4` frame by frame through ffmpeg and return the indices `framecheck` calls
+    zero-filled (spec §4.1.7). Zero-fill only: the seam detector is tuned to the MLX VAE's tiling.
+    Raises `OSError` when the file cannot be decoded at all (a broken mp4 is a failed scene)."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=width,height", "-of", "csv=p=0:s=x", str(mp4)],
+            capture_output=True, text=True, check=True)
+        width, height = (int(x) for x in probe.stdout.strip().split("x"))
+        size = width * height * 3
+        bad: list[int] = []
+        index = 0
+        with subprocess.Popen(
+                ["ffmpeg", "-v", "error", "-i", str(mp4), "-f", "rawvideo", "-pix_fmt", "rgb24",
+                 "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+            while True:
+                raw = proc.stdout.read(size)
+                if not raw:
+                    break
+                if len(raw) != size:
+                    raise OSError(f"обрезанный кадр {index}: {len(raw)} из {size} байт")
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+                bad.extend([index] if framecheck.find_zero_fill_frames([frame]) else [])
+                index += 1
+            err = proc.stderr.read().decode("utf-8", "replace").strip()
+        if proc.returncode != 0 or index == 0:
+            raise OSError(err or "ни одного кадра")
+        return bad
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError) as exc:
+        raise OSError(f"не удалось декодировать {mp4}: {exc}") from exc
+
+
 def _write_report(job, report: dict) -> None:
     q.write_json_durably(Path(job.output_stem + ".json"), report)
 
@@ -197,6 +234,10 @@ def run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep,
         return code, "".join(log)
 
     if video_id is None:
+        reason = q.cancel_reason(root, job.id)
+        if reason:
+            return done(1, f"sglang: {reason} — отменена до начала\n",
+                        {"status": "cancelled", "id": None, "reason": reason})
         if gate is not None:
             reason = gate(job)
             if reason:
@@ -241,6 +282,10 @@ def run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep,
                                f"неизвестен серверу)\n",
                             {"status": "lost", "id": video_id,
                              "error": "задача потеряна при рестарте H3"})
+            if exc.status < 500:
+                return done(1, f"sglang отказал ({exc.status}): {exc.detail}\n",
+                            {"status": "rejected", "id": video_id, "http_status": exc.status,
+                             "detail": exc.detail})
             status = None
         except SglangUnavailable:
             status = None
@@ -253,6 +298,15 @@ def run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep,
             _sleep_unless_cancelled(root, job.id, LOST_RETRY_SECONDS, sleep)
             continue
         if status.get("status") == "completed":
+            try:
+                bad_frames = _zero_filled_frames(Path(job.output_stem + ".mp4"))
+            except OSError as exc:
+                return done(1, f"sglang: mp4 не прошёл проверку кадров: {exc}\n",
+                            {"status": "corrupt", "id": video_id, "error": str(exc)})
+            if bad_frames:
+                shown = ", ".join(str(i) for i in bad_frames[:20])
+                return done(1, f"sglang: битые кадры (zero-fill): {shown}\n",
+                            {"status": "corrupt", "id": video_id, "frames": bad_frames})
             wall = round(clock() - started, 1)
             sglang_estimate.record(outdir, width=spec.width, height=spec.height,
                                    frames=spec.frames, wall_s=wall)

@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class FakeSglang:
     def __init__(self, *, statuses=("completed",), content=b"MP4-BYTES", post_status=200,
-                 post_body=None, error=None, drop_gets=0, truncate_contents=0):
+                 post_body=None, error=None, drop_gets=0, truncate_contents=0, get_error=None):
         self.posts: list[dict] = []
         self.gets: list[str] = []
         self.deletes: list[str] = []
@@ -25,6 +25,7 @@ class FakeSglang:
         self.post_body = post_body
         self.error = error
         self.drop_gets = drop_gets
+        self.get_error = get_error          # (status, body) answered to every status GET
         self.truncate_contents = truncate_contents
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.port = self.httpd.server_address[1]
@@ -92,6 +93,8 @@ class FakeSglang:
                     self.wfile.write(fake.content)
                     return
                 fake.gets.append(video_id)
+                if fake.get_error:
+                    return self._send_json(*fake.get_error)
                 if fake.drop_gets > 0:
                     fake.drop_gets -= 1
                     self.close_connection = True

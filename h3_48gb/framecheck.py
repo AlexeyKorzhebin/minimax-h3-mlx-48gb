@@ -249,5 +249,14 @@ def find_corrupt_frames(frames: np.ndarray) -> list[FrameCorruption]:
     return bad
 
 
+def find_zero_fill_frames(frames) -> list[int]:
+    """Indices of the frames in `frames` (an iterable of (H, W, 3) uint8) that trip the zero-fill
+    detector ONLY. For a clip decoded by another VAE (sglang's): `TILE_SEAM_*` is calibrated to
+    the MLX port's tiling and would reject clean frames there. Takes an iterable so a caller can
+    stream a long clip frame by frame."""
+    return [i for i, frame in enumerate(frames)
+            if zero_fill_fraction(frame) > ZERO_FILL_FRACTION_THRESHOLD]
+
+
 class CorruptFramesError(RuntimeError):
     """Raised when one or more frames fail `is_frame_corrupt`/`find_corrupt_frames` validation."""
