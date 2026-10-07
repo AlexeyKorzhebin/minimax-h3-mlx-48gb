@@ -30,7 +30,7 @@ test = ["pytest>=8.0"]
 h3 = "h3_48gb.cli:main"
 
 [tool.setuptools]
-packages = ["h3_48gb"]
+packages = ["h3_48gb", "h3_48gb.engines"]
 
 # The page is served off disk from inside the package (`h3_48gb/webui/`), so an installed wheel
 # needs the files, not just the modules. There is no build step on purpose: a localhost tool must

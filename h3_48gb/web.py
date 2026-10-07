@@ -55,6 +55,8 @@ from h3_48gb import queue as q
 from h3_48gb import runs as runs_module
 from h3_48gb import songrun
 from h3_48gb.cli import DEFAULT_CANVAS, ERROR_CODES, CliError, build_parser
+from h3_48gb.engines import estimate as sglang_estimate
+from h3_48gb.engines import sglang_args
 from h3_48gb.project import PROJECT_KINDS
 from h3_48gb.worker import (WORKER_LOCK_NAME, align_job_wallclock_estimate_seconds,
                             song_job_wallclock_estimate_seconds)
@@ -609,7 +611,7 @@ def resolve_within(path, roots: dict[str, Path], *, write: bool) -> Path:
     )
 
 
-def check_path_flags(args: list[str], roots: dict[str, Path]) -> list[str]:
+def check_path_flags(args: list[str], roots: dict[str, Path], flags=PATH_FLAGS) -> list[str]:
     """`args` with every path flag's value replaced by the checked, absolute path -- or a refusal.
 
     **It returns the argument list, and the caller must use what it returns.** Checking one string
@@ -640,7 +642,7 @@ def check_path_flags(args: list[str], roots: dict[str, Path]) -> list[str]:
     while index < len(normalised):
         token = normalised[index]
         flag, equals, inline = token.partition("=")
-        if flag not in PATH_FLAGS:
+        if flag not in flags:
             index += 1
             continue
         if equals:
@@ -651,7 +653,7 @@ def check_path_flags(args: list[str], roots: dict[str, Path]) -> list[str]:
         else:
             index += 1
             continue
-        resolved = resolve_within(value, roots, write=PATH_FLAGS[flag] == "write")
+        resolved = resolve_within(value, roots, write=flags[flag] == "write")
         normalised[value_index] = f"{flag}={resolved}" if equals else str(resolved)
         index += 1
     return normalised
@@ -2354,8 +2356,36 @@ def _check_command_allowed(parsed: argparse.Namespace) -> None:
         )
 
 
+def _validate_args_sglang(args) -> dict:
+    """spec §3.3.4: on sglang validation is the adapter's own parser, in process -- known flags,
+    the format table, the frame grid -- not a `generate --dry-run` subprocess."""
+    try:
+        spec = sglang_args.parse(args)
+    except sglang_args.SglangArgsError as exc:
+        raise CliError(exc.code, exc.message, exc.detail) from exc
+    return sglang_args.dry_run_report(spec)
+
+
+def _prepare_submission_sglang(args, roots) -> dict:
+    args = [str(item) for item in args]
+    if not args or args[0] != ALLOWED_COMMAND:
+        raise CliError("command_not_allowed",
+                       f"only `h3 {ALLOWED_COMMAND}` may be queued",
+                       {"command": args[0] if args else None, "allowed": ALLOWED_COMMAND})
+    argv = check_path_flags(args, roots, flags=sglang_args.PATH_FLAGS)
+    report = validate_args(argv)
+    resolve_within(report["output_stem"], roots, write=True)
+    spec = sglang_args.parse(argv, check_files=False)
+    cost = sglang_estimate.estimate_seconds(roots["outdir"], width=spec.width, height=spec.height,
+                                            frames=spec.frames)
+    return {"args": argv, "report": report, "estimate": cost,
+            "prompt_text": None, "prompt_source": None}
+
+
 def validate_args(args, python=sys.executable, timeout: float = DRY_RUN_TIMEOUT) -> dict:
     """The `generate --dry-run --json` report for `args`, or the CLI's own refusal, as a `CliError`.
+
+    On sglang there is no subprocess: `_validate_args_sglang` runs the adapter's own parser.
 
     **The validation rules exist once, in the CLI, and are reached through a subprocess.** Not for
     isolation's sake: `spec_from_args` calls `resolve_canvas`, which for `--image` without an
@@ -2385,6 +2415,8 @@ def validate_args(args, python=sys.executable, timeout: float = DRY_RUN_TIMEOUT)
     not a way to make relative paths work: every path flag has already been rewritten absolute by
     `check_path_flags`, because the worker's working directory is not this one.
     """
+    if engine.is_sglang():
+        return _validate_args_sglang(args)
     args = [str(item) for item in args]
     if not args:
         raise CliError("args_invalid", "an empty argument list names no subcommand", {"args": args})
@@ -2501,6 +2533,8 @@ def prepare_submission(args, roots: dict[str, Path], *, python=sys.executable) -
     untouched. Adding `--tag` to the flag list would fix this one flag; judging the path the run
     will actually write fixes every flag that composes a path, including ones not yet written.
     """
+    if engine.is_sglang():
+        return _prepare_submission_sglang(args, roots)
     _check_command_allowed(_parse_args(args))
     argv = check_path_flags(args, roots)
     report = validate_args(argv, python=python)
@@ -3877,6 +3911,15 @@ class _Handler(BaseHTTPRequestHandler):
         """
         payload = self._json_request(allowed=("args",))
         args = self._args_of(payload)
+        if engine.is_sglang():
+            argv = check_path_flags(args, self.server.roots, flags=sglang_args.PATH_FLAGS)
+            try:
+                spec = sglang_args.parse(argv, check_files=False)
+            except sglang_args.SglangArgsError as exc:
+                raise CliError(exc.code, exc.message, exc.detail) from exc
+            return 200, "application/json", _json_bytes({"ok": True, "estimate":
+                sglang_estimate.estimate_seconds(self.server.outdir, width=spec.width,
+                                                 height=spec.height, frames=spec.frames)})
         _check_command_allowed(_parse_args(args))
         # The *normalised* list, for the same reason submission uses it: `--checkpoint
         # ~/models/h3-8bit` reaches `quant_bits` as a directory literally named `~` otherwise, and
