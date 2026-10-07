@@ -848,10 +848,12 @@ def test_banner_run_notes():
                    "id": "j1", "note": note, "started_at": "2026-10-07T12:29:00Z", "wait_reason": None}}}
         return _js(f"app.gpuBanner({json.dumps(gpu)}, Date.parse('2026-10-07T12:30:00Z'), {projects})")["text"]
     titles = "[{id: 'p1', title: 'Бой'}]"
-    assert text("upscale project p1", titles) == "Карту держит панель: H3 считает апскейл «Бой» — 1 мин"
-    assert text("assemble project p1", titles) == "Карту держит панель: H3 считает сборка «Бой» — 1 мин"
+    assert text("upscale project p1", titles) == "Карту держит панель: LTX апскейлит «Бой» — 1 мин"
+    assert text("assemble project p1", titles) == "Карту держит панель: сборка «Бой» — 1 мин"
+    assert text("project track p1", titles) == "Карту держит панель: H3 считает трек «Бой» — 1 мин"
     assert text("project scene p9 #0") == "Карту держит панель: H3 считает «p9», сцена #0 — 1 мин"
-    assert text("some other job") == "Карту держит панель: H3 считает some other job — 1 мин"
+    # a note the page does not know is never printed raw
+    assert text("some other job") == "Карту держит панель: H3 считает задачу — 1 мин"
 
 
 @_needs_node
@@ -940,6 +942,12 @@ RUN_EXPECTED = {
     "seed_saved": {"puts": [["/api/projects/p1/settings", {"seed": 305}]], "mark": True},
     "seed_cleared": {"puts": [["/api/projects/p1/settings", {"seed": None}]]},
     "retry_panel_keeps_typing": {"prompt": "@a walks far", "seed": "9"},
+    # a refusal keeps the panel open with what was typed, and says why next to it
+    "retry_refused_keeps_panel": {"open": True, "prompt": "@a walks far", "seed": "9",
+        "error": "Проект считается — референсы меняются после конца прогона."},
+    # the dead-clip mark of a retried scene comes off once the server took the retry
+    "retry_clears_dead_clip_marks": {"deadBefore": True, "videoAfter": True, "deadAfter": False},
+    "saved_mark_fades_on_edit": {"markRemoved": True, "after": True},
 }
 
 
@@ -1038,3 +1046,20 @@ def test_a_project_assembly_tile_has_no_chat_or_copy():
     assert re.search(r'<div class="acts">.*?</div>', html).group(0) == (
         '<div class="acts"><button data-act="reveal" data-id="j9">Показать в Finder</button>'
         '<button data-act="delrun" data-id="j9">Удалить</button></div>')
+
+
+@_needs_node
+def test_retry_panel_shows_its_error():
+    scene = "{idx: 0, prompt: 'p', steps: null}"
+    html = _js(f"app.retryPanelHtml({scene}, {{id: 'p1', engine: 'mlx', effectiveSeed: 42, cascade: [0], "
+               "error: 'Проект считается'})")
+    assert html.endswith('<p class="hint">Пересчитает сцену #0</p>'
+                         '<p class="why retry-error">Проект считается</p>'
+                         '<button type="button" class="inverse" data-act="retry-scene-go" data-id="p1" '
+                         'data-idx="0">Пересчитать</button>'
+                         '<button type="button" class="ghost" data-act="retry-scene-cancel" data-idx="0">Отмена</button></div>')
+
+
+def test_retry_number_fields_show_the_whole_placeholder():
+    css = re.sub(r"\s+", " ", _page_text("style.css"))
+    assert ".scene-edit-row input.retry-seed, .scene-edit-row input.retry-steps { width: calc(20ch + 24px); }" in css

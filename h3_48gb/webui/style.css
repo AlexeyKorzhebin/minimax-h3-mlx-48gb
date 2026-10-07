@@ -1705,7 +1705,8 @@ body:not([data-platform="darwin"]) [data-act="reveal"] { display: none; }
 }
 .retry-prompt { resize: vertical; min-height: 5.5em; }
 .retry-panel button { align-self: flex-start; }
-.scene-edit-row input.retry-seed, .scene-edit-row input.retry-steps { width: 130px; }
+.scene-edit-row input.retry-seed, .scene-edit-row input.retry-steps { width: calc(20ch + 24px); }
 .project-settings textarea:disabled, .project-settings input:disabled { opacity: .55; cursor: not-allowed; }
 .upscale-error { margin: 6px 0 0; }
 .proj-final { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 8px; }
+.retry-error { margin: 0; }

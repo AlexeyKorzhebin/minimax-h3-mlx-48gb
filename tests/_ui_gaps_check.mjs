@@ -528,6 +528,64 @@ const SCENARIOS = {
     const seed = html.match(/<input class="inp num retry-seed"[^>]* value="([^"]*)"/)[1];
     return { prompt, seed };
   },
+  async retry_refused_keeps_panel() {
+    await start(appUrl, { "GET /api/projects/p1": ok(DONE_PROJECT),
+      "POST /api/projects/p1/scenes/0/retry": err(409, "project_running",
+        "Проект считается — референсы меняются после конца прогона.") });
+    await open();
+    await act("retry-scene", { idx: "0" });
+    const fields = { ".retry-prompt": { value: "@a walks far" }, ".retry-seed": { value: "9" },
+                     ".retry-steps": { value: "" } };
+    queryOne['#project-body .retry-panel[data-idx="0"]'] = {
+      querySelector: (sel) => (Object.hasOwn(fields, sel) ? fields[sel] : null) };
+    await act("retry-scene-go", { idx: "0" });
+    const html = getElementById("project-body").innerHTML;
+    const prompt = html.match(/<textarea class="inp retry-prompt"[^>]*>([^<]*)<\/textarea>/);
+    const seed = html.match(/<input class="inp num retry-seed"[^>]* value="([^"]*)"/);
+    const error = html.match(/<p class="why retry-error">([^<]*)<\/p>/);
+    return { open: Boolean(prompt), prompt: prompt && prompt[1], seed: seed && seed[1], error: error && error[1] };
+  },
+  async retry_clears_dead_clip_marks() {
+    await start(appUrl, { "GET /api/projects/p1": ok(DONE_PROJECT),
+      "POST /api/projects/p1/scenes/0/retry": ok({ ok: true, project: DONE_PROJECT.project }) });
+    await open();
+    // the browser reports scene 0's clip as a 404: the page remembers it and draws a placeholder
+    fire("error", { dataset: { mediaUrl: "/media/projects/p1/scenes/a.mp4" }, tagName: "VIDEO" });
+    await act("retry-scene", { idx: "0" });
+    const deadBefore = getElementById("project-body").innerHTML.includes("клип удалён");
+    const fields = { ".retry-prompt": { value: "@a walks" }, ".retry-seed": { value: "7" },
+                     ".retry-steps": { value: "" } };
+    queryOne['#project-body .retry-panel[data-idx="0"]'] = {
+      querySelector: (sel) => (Object.hasOwn(fields, sel) ? fields[sel] : null) };
+    await act("retry-scene-go", { idx: "0" });
+    const html = getElementById("project-body").innerHTML;
+    return { deadBefore, videoAfter: html.includes('<video src="/media/projects/p1/scenes/a.mp4"'),
+             deadAfter: html.includes("клип удалён") };
+  },
+  async saved_mark_fades_on_edit() {
+    const app = await start(appUrl, { "GET /api/projects/p1": ok(DONE_PROJECT),
+      "PUT /api/projects/p1/settings": ok({ ok: true, project: DONE_PROJECT.project }),
+      "PUT /api/projects/p1/references": ok({ ok: true, references: [] }) });
+    await open();
+    const prefix = { value: "Go on.", dataset: { id: "p1" }, classList: { contains: (c) => c === "i2v-prefix" } };
+    prefix.closest = (sel) => (sel === ".i2v-prefix" ? prefix : null);
+    fire("focusout", prefix);
+    await sleep(120);
+    // typing again: the mark goes out at once ...
+    const mark = { removed: false, remove() { this.removed = true; } };
+    queryOne["#project-body .saved-mark"] = mark;
+    const typing = { value: "Go on, now", dataset: { id: "p1" },
+      closest(sel) { return sel === ".i2v-prefix, .project-seed" ? this : null; } };
+    fire("input", typing);
+    // ... and a later redraw does not bring it back
+    const pin = { checked: true, dataset: { tag: "@a" }, classList: { contains: (c) => c === "ref-pin" } };
+    const box = { dataset: { id: "p1" }, querySelectorAll: (sel) => (sel === ".ref-pin" ? [pin] : []) };
+    pin.closest = (sel) => (sel === ".project-refs" ? box : null);
+    fire("change", pin);
+    await sleep(120);
+    return { markRemoved: mark.removed,
+             after: block("project-settings") === app.projectSettingsHtml(DONE_PROJECT.project, "sglang", null, null) };
+  },
   async locked_while_a_scene_runs() {
     const running = { ...DONE_PROJECT, active_job: { kind: "scene", idx: 1, job: { id: "j1" } } };
     const app = await start(appUrl, { "GET /api/projects/p1": ok(running),

@@ -100,14 +100,14 @@ export function gpuBanner(gpu, nowMs, projects = []) {
   if (run) {
     const since = Date.parse(run.started_at);
     const took = formatDuration(Number.isFinite(since) ? Math.max(0, (nowMs - since) / 1000) : 0);
-    const what = runWhat(run.note, projects);
+    const named = runWhat(run.note, projects);
     if (!own.length) {
       return { visible: true, tone: "own", qwenUnload: false, qwenRestore,
-               text: `H3 поднимается для ${what}` };
+               text: `H3 поднимается для ${named.what}` };
     }
     const memory = d.gpu ? `, ${formatGb(d.gpu.memory_used_mb / 1024)}` : "";
     return { visible: true, tone: "own", qwenUnload: false, qwenRestore,
-             text: `Карту держит панель: H3 считает ${what} — ${took}${memory}` };
+             text: `Карту держит панель: ${named.active} — ${took}${memory}` };
   }
   if (own.length && !run) {
     // финальное ревью C3: у движка есть владелец; «панель» — воркер (и запись до владельцев)
@@ -132,7 +132,8 @@ export function gpuBanner(gpu, nowMs, projects = []) {
            text: qwenRestore ? "Qwen выгружен панелью — его можно вернуть" : "" };
 }
 
-/** «Что считается» по `job.note`: сцена, апскейл и сборка проекта называются его названием. */
+/** Что считается по `job.note`: `{what}` — для «H3 поднимается для …», `{active}` — для «Карту
+ *  держит панель: …». Заметка, которую страница не знает, сырой не выводится. */
 function runWhat(note, projects) {
   const title = (id) => {
     const found = (projects || []).find((p) => p.id === id);
@@ -140,12 +141,14 @@ function runWhat(note, projects) {
   };
   const text = String(note || "");
   let m = text.match(/^project scene (\S+) #(\d+)$/);
-  if (m) return `«${title(m[1])}», сцена #${m[2]}`;
+  if (m) { const what = `«${title(m[1])}», сцена #${m[2]}`; return { what, active: `H3 считает ${what}` }; }
   m = text.match(/^upscale project (\S+)$/);
-  if (m) return `апскейл «${title(m[1])}»`;
+  if (m) return { what: `апскейл «${title(m[1])}»`, active: `LTX апскейлит «${title(m[1])}»` };
   m = text.match(/^assemble project (\S+)$/);
-  if (m) return `сборка «${title(m[1])}»`;
-  return text;
+  if (m) { const what = `сборка «${title(m[1])}»`; return { what, active: what }; }
+  m = text.match(/^project track (\S+)$/);
+  if (m) { const what = `трек «${title(m[1])}»`; return { what, active: `H3 считает ${what}` }; }
+  return { what: "задача", active: "H3 считает задачу" };
 }
 
 /** Цифры прогона на sglang из аргументов и оценки задачи: проходов нет, есть время и доля. */
@@ -675,6 +678,7 @@ export function retryPanelHtml(scene, ctx) {
   return `<div class="retry-panel" data-idx="${idx}">`
     + `<textarea class="inp retry-prompt" rows="4">${escapeHtml(e.prompt ?? scene.prompt)}</textarea>${row}`
     + `<p class="hint">Пересчитает ${ctx.cascade.length === 1 ? "сцену" : "сцены"} ${escapeHtml(list)}</p>`
+    + (ctx.error ? `<p class="why retry-error">${escapeHtml(ctx.error)}</p>` : "")
     + `<button type="button" class="inverse" data-act="retry-scene-go" data-id="${escapeHtml(ctx.id)}" data-idx="${idx}">Пересчитать</button>`
     + `<button type="button" class="ghost" data-act="retry-scene-cancel" data-idx="${idx}">Отмена</button></div>`;
 }
@@ -3102,6 +3106,7 @@ function startPage() {
   let scenarioJsonText = "";     // what is typed in «Вставить сценарий JSON»: survives redraws
   let retryOpen = null;        // idx of the scene whose retry panel is open
   let retryEdits = null;       // what is typed in it, kept across redraws
+  let retryError = null;       // why the server refused the retry, shown in the panel
   let settingsSaved = null;    // which project setting was saved last: "i2v_prefix" | "seed"
   let sceneDraftError = null;   // {idx, message} of the last client-side refusal, shown by that scene
   let draftResetPending = false; // the next project read (opening the panel) replaces the draft with the server's scenes
@@ -3524,6 +3529,7 @@ function startPage() {
     scenarioJsonText = "";
     retryOpen = null;
     retryEdits = null;
+    retryError = null;
     settingsSaved = null;
     projectMp3 = null;
     scenarioProviderChoice = null;
@@ -3587,6 +3593,7 @@ function startPage() {
     project = null;
     retryOpen = null;
     retryEdits = null;
+    retryError = null;
     scenarioJsonText = "";
     sceneDraft = null;
     sceneDraftDirty = false;
@@ -4156,7 +4163,7 @@ function startPage() {
           engine: state && state.engine, projectSeed: proj.seed ?? null })
         + (retryOpen === scene.idx ? retryPanelHtml(scene, { id: proj.id, engine: state && state.engine,
           effectiveSeed: scene.seed ?? proj.seed ?? 42, cascade: retryCascade(proj.scenes, scene.idx),
-          edits: retryEdits }) : "")).join("");
+          edits: retryEdits, error: retryError }) : "")).join("");
     return `<div class="proj-stage">`
       + `<details class="adv proj-scenes-block"${retryOpen !== null ? " open" : ""}>`
       + `<summary class="proj-stage-head"><span class="t">Сцены (${total})</span>`
@@ -5772,10 +5779,15 @@ function startPage() {
       // opens the panel (prompt, seed, steps); the cascade it names is what the server resets
       retryOpen = Number(button.dataset.idx);
       retryEdits = null;
+      retryError = null;
       renderProjectModal();
       return;
     }
-    if (button.dataset.act === "retry-scene-cancel") { retryOpen = null; retryEdits = null; renderProjectModal(); return; }
+    if (button.dataset.act === "retry-scene-cancel") {
+      retryOpen = null; retryEdits = null; retryError = null;
+      renderProjectModal();
+      return;
+    }
     if (button.dataset.act === "retry-seed-random") {
       const field = document.querySelector(
         `#project-body .retry-panel[data-idx="${Number(button.dataset.idx)}"] .retry-seed`);
@@ -5790,19 +5802,30 @@ function startPage() {
       const scene = scenes.find((item) => item.idx === idx) || { prompt: "" };
       const body = retryBody(scene, { prompt: read(".retry-prompt"), seed: read(".retry-seed"),
                                       steps: read(".retry-steps") });
-      // `deadMediaUrls`: the retry resets this scene and the chained ones after it -- their
-      // clips get new files, so the dead-clip marks come off all of them
-      const outdir = state && state.outdir;
-      scenes.forEach((item) => {
-        if (item.idx >= idx && item.clip_path) {
-          const url = projectMediaUrl(item.clip_path, outdir);
-          if (url) deadMediaUrls.delete(url);
+      // the panel and what is typed in it stay until the server took the retry: a refusal
+      // (409 project_running, 400) must not eat the text
+      retryEdits = { prompt: read(".retry-prompt"), seed: read(".retry-seed"), steps: read(".retry-steps") };
+      retryError = null;
+      withProject(async () => {
+        try {
+          await api("POST", `/api/projects/${encodeURIComponent(id)}/scenes/${encodeURIComponent(idx)}/retry`, body);
+        } catch (error) {
+          const reason = error.payload ? errorText(error.payload) : null;
+          retryError = reason ? (reason.pre || reason.title) : "сервер не ответил";
+          throw error;
         }
+        // the retry resets this scene and the chained ones after it: their clips get new files,
+        // so the dead-clip marks come off all of them
+        const outdir = state && state.outdir;
+        scenes.forEach((item) => {
+          if (item.idx >= idx && item.clip_path) {
+            const url = projectMediaUrl(item.clip_path, outdir);
+            if (url) deadMediaUrls.delete(url);
+          }
+        });
+        retryOpen = null;
+        retryEdits = null;
       });
-      retryOpen = null;
-      retryEdits = null;
-      withProject(() => api(
-        "POST", `/api/projects/${encodeURIComponent(id)}/scenes/${encodeURIComponent(idx)}/retry`, body));
       return;
     }
     if (button.dataset.act === "project-seed-save") {
@@ -5969,6 +5992,13 @@ function startPage() {
   });
 
   document.addEventListener("input", (event) => {
+    if (event.target.closest(".i2v-prefix, .project-seed")) {
+      // a field being edited again is no longer «сохранено ✓»
+      settingsSaved = null;
+      const mark = document.querySelector("#project-body .saved-mark");
+      if (mark) mark.remove();
+      return;
+    }
     const jsonField = event.target.closest(".scenario-json-text");
     if (jsonField) { scenarioJsonText = jsonField.value; return; }
     const sceneField = event.target.closest("[data-scene-field]");
