@@ -42,13 +42,16 @@ def _battle(tmp_path):
     pj = pdir / "project.json"
     queue = out / "queue"
     scenes = []
-    for idx, (job, start, end, wait, engine) in enumerate([
-            ("j0", "10:00:10", "10:20:10", 95.0, 92.0), ("j1", "10:20:12", "10:38:12", 0.4, None)]):
+    for idx, (job, start, end, wait, engine, ready, submitted) in enumerate([
+            ("j0", "10:00:10", "10:20:10", 95.0, 92.0, "10:01:42.250", "10:01:43.500"),
+            ("j1", "10:20:12", "10:38:12", 0.4, None, "10:20:12.400", "10:20:12.600")]):
         stem = str(pdir / "scenes" / f"h3-scene-{idx}-896x512")
         _write(queue / "done" / f"{job}.json", {
             "id": job, "kind": "generate", "args": ["generate", "p"], "output_stem": stem,
             "started_at": f"2026-10-08T{start}", "finished_at": f"2026-10-08T{end}",
-            "gpu_wait_s": wait, "engine_start_s": engine})
+            "gpu_wait_s": wait, "engine_start_s": engine,
+            "gpu_ready_at": _epoch("2026-10-08T" + ready),
+            "engine_submitted_at": _epoch("2026-10-08T" + submitted)})
         _write(Path(stem + ".json"), {
             "engine": "sglang", "status": "completed", "wall_s": 1100.0 + idx,
             "inference_time_s": 1060.5, "peak_memory_mb": 61440.0, "server_s": 1080.0,
@@ -98,10 +101,10 @@ EXPECTED = """# Боевой прогон: Бой
 
 ## Сцены H3
 
-| # | задача | длит., с | статус | ожидание GPU, с | подъём H3, с | H3 wall, с | inference, с | сервер, с | скачивание, с | проверка, с | peak, ГБ | задача целиком |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | `j0` | 8.000 | done | 95.0 | 92.0 | 1100.0 | 1060.5 | 1080.0 | 3.0 | 17.0 | 60.00 | 20 мин 00 с |
-| 1 | `j1` | 7.958 | done | 0.4 | — | 1101.0 | 1060.5 | 1080.0 | 3.0 | 17.0 | 60.00 | 18 мин 00 с |
+| # | задача | длит., с | статус | ожидание GPU, с | подъём H3, с | карта готова | в H3 поставлено | H3 wall, с | inference, с | сервер, с | скачивание, с | проверка, с | peak, ГБ | wall очереди, с | задача целиком |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | `j0` | 8.000 | done | 95.0 | 92.0 | 10:01:42 | 10:01:43 | 1100.0 | 1060.5 | 1080.0 | 3.0 | 17.0 | 60.00 | 1106.5 | 20 мин 00 с |
+| 1 | `j1` | 7.958 | done | 0.4 | — | 10:20:12 | 10:20:12 | 1101.0 | 1060.5 | 1080.0 | 3.0 | 17.0 | 60.00 | 1079.4 | 18 мин 00 с |
 
 Итого H3 wall 36 мин 41 с, ожидание GPU 1 мин 35 с (из него подъём H3 1 мин 32 с).
 
@@ -151,3 +154,44 @@ def test_the_cli_finds_the_queue_next_to_the_projects_and_writes_the_file(tmp_pa
     assert br.main([str(pdir), "--events", str(events), "--out", str(out)]) == 0
     assert out.read_text(encoding="utf-8") == br.build_report(pdir, queue=queue,
                                                               events_path=events)
+
+
+def _row(text: str, idx: int) -> str:
+    return next(line for line in text.splitlines() if line.startswith(f"| {idx} | `j"))
+
+
+def test_a_scene_without_a_readable_sidecar_is_marked_and_warned_about(tmp_path, moscow, capsys):
+    pdir, queue, events = _battle(tmp_path)
+    sidecar = pdir / "scenes" / "h3-scene-1-896x512.json"
+    sidecar.unlink()
+    text = br.build_report(pdir, queue=queue, events_path=events)
+    assert _row(text, 1) == ("| 1 | `j1` | 7.958 | done | 0.4 | — | 10:20:12 | 10:20:12 | нет sidecar "
+                             "| — | — | — | — | — | 1079.4 | 18 мин 00 с |")
+    assert "| 1100.0 |" in _row(text, 0)
+    assert capsys.readouterr().err == f"предупреждение: нет sidecar сцены 1: {sidecar}\n"
+
+
+def test_root_map_rewrites_server_paths_so_a_copy_reads_on_another_machine(tmp_path, moscow, capsys):
+    pdir, queue, events = _battle(tmp_path)
+    server = "/home/alex/Outputs/h3-panel"
+    local = str(tmp_path / "h3-panel")
+    for path in (queue / "done").glob("*.json"):
+        path.write_text(path.read_text(encoding="utf-8").replace(local, server), encoding="utf-8")
+    plain = br.build_report(pdir, queue=queue, events_path=events)
+    assert plain.count("нет sidecar") == 2
+    mapped = br.build_report(pdir, queue=queue, events_path=events,
+                             root_map=[(server, local)])
+    assert mapped == EXPECTED.format(pj=pdir / "project.json", final=pdir / "assembly" / "final.mp4")
+    assert capsys.readouterr().err.count("предупреждение") == 2  # only the unmapped run warned
+
+
+def test_the_cli_takes_root_map_as_server_equals_local(tmp_path, moscow):
+    pdir, queue, events = _battle(tmp_path)
+    for path in (queue / "done").glob("*.json"):
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            str(tmp_path / "h3-panel"), "/home/alex/Outputs/h3-panel"), encoding="utf-8")
+    out = tmp_path / "B.md"
+    br.main([str(pdir), "--events", str(events), "--out", str(out),
+             "--root-map", f"/home/alex/Outputs/h3-panel={tmp_path / 'h3-panel'}"])
+    assert out.read_text(encoding="utf-8") == EXPECTED.format(
+        pj=pdir / "project.json", final=pdir / "assembly" / "final.mp4")
