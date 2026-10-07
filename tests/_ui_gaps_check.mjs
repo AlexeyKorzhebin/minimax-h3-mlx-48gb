@@ -324,6 +324,85 @@ const SCENARIOS = {
     return { puts: puts(), kept: html.match(/<label><input type="checkbox"[^>]*data-tag="@gone"[^>]*>.*?<\/label>/)[0],
              inline: html.match(/<span class="hint bad scene-edit-error"[^>]*>[^<]*<\/span>/)[0] };
   },
+  async refs_order_kept() {
+    const refsOf = (tags) => tags.map((tag) => ({ tag, version: 1 }));
+    const proj = PROJECT({ ...DRAFT_PROJECT.project, references: refsOf(["@a", "@b", "@c"]),
+      scenes: DRAFT_PROJECT.project.scenes.map((s) => (s.idx === 0 ? { ...s, refs: ["@b", "@a"] } : s)) });
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1": ok(proj) }));
+    await open();
+    // the DOM lists the project's tags in its own order; @c was just ticked
+    const box = (tag) => ({ checked: true, dataset: { sceneField: "refs", idx: "0", tag } });
+    queryAll[FIELDS] = [box("@a"), box("@b"), box("@c")];
+    await act("scenes-save");
+    return { refs: puts()[0][1].scenes[0].refs };
+  },
+  async json_load_asks_for_unsaved_draft() {
+    await start(appUrl, draftRoutes());
+    await open();
+    await act("scene-add");                       // the draft now has 3 scenes, the saved project 2
+    answers.confirm = false;
+    queryOne["#project-body .scenario-json-text"] = { value: '{"scenes": [{"prompt": "@a", "duration": 5}]}' };
+    await act("scenario-json-load");
+    return { confirms, puts: puts() };
+  },
+  async json_load_asks_for_unsaved_in_empty_project() {
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1": ok(PROJECT({ ...DRAFT_PROJECT.project, scenes: [] })) }));
+    await open();
+    queryAll[FIELDS] = [field("prompt", 0, "@a typed")];
+    answers.confirm = false;
+    queryOne["#project-body .scenario-json-text"] = { value: '{"scenes": [{"prompt": "@a", "duration": 5}]}' };
+    await act("scenario-json-load");
+    return { confirms, puts: puts() };
+  },
+  async prompt_tag_issues_highlight() {
+    const proj = PROJECT({ ...DRAFT_PROJECT.project, references: [{ tag: "@amazon", version: 1 }] });
+    const card = { tag: "@amazon", kind: "person", version: 1, latest_version: 1, description: "d",
+      assets: ["/o/library/amazon/v1/01-x.png"], versions: [{ version: 1 }] };
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1": ok(proj),
+      "GET /api/library": ok({ ok: true, cards: [card] }) }));
+    await open();
+    const typeInto = (value) => {
+      const toggled = [];
+      const el = { value, selectionStart: value.length, title: "x", dataset: { sceneField: "prompt", idx: "0" },
+        classList: { toggle: (cls, on) => toggled.push([cls, on]), contains: () => false },
+        closest(sel) { return sel === "[data-scene-field]" ? this : null; } };
+      fire("input", el);
+      return { toggled, title: el.title };
+    };
+    const unknown = typeInto("@gone walks");
+    const clean = typeInto("@amazon walks");
+    return { unknown: unknown.toggled, unknownTitle: unknown.title, clean: clean.toggled, cleanTitle: clean.title };
+  },
+  async refs_known_when_library_down() {
+    const proj = PROJECT({ ...DRAFT_PROJECT.project, references: [{ tag: "@a", version: 1 }],
+      scenes: DRAFT_PROJECT.project.scenes.map((s) => (s.idx === 0 ? { ...s, refs: ["@a"] } : s)) });
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1": ok(proj),
+      "GET /api/library": err(500, "boom", "down") }));
+    await open();
+    const html = getElementById("project-body").innerHTML;
+    return { box: html.match(/<label><input type="checkbox" data-scene-field="refs"[^>]*data-tag="@a"[^>]*>[^<]*(?:<span[^>]*>[^<]*<\/span>)?<\/label>/)[0] };
+  },
+  async scene0_wrong_extension() {
+    await start(appUrl, draftRoutes({ "POST /api/uploads": ok({ ok: true, path: "/o/uploads/x.mp3" }) }));
+    await open();
+    const file = getElementById("scene0-file");
+    file.files = [{ name: "x.mp3" }];
+    file.__listeners.change[0]();
+    await sleep(80);
+    return { uploads: calls.filter((c) => c.url === "/api/uploads").map((c) => c.url),
+             error: getElementById("project-err").innerHTML };
+  },
+  async scene0_upload_after_close() {
+    await start(appUrl, draftRoutes({ "POST /api/uploads": () => sleep(60).then(() => ({ status: 500,
+      body: { error: { code: "boom", message: "late" } } })) }));
+    await open();
+    const file = getElementById("scene0-file");
+    file.files = [{ name: "open.png" }];
+    file.__listeners.change[0]();
+    getElementById("project-close").__listeners.click[0]();   // closed while the file is still going up
+    await sleep(120);
+    return { errHidden: getElementById("project-err").hidden };
+  },
   async refs_ride_along() {
     const proj = PROJECT({ ...DRAFT_PROJECT.project, references: [{ tag: "@arena", version: 1 }] });
     const card = { tag: "@arena", kind: "environment", version: 1, latest_version: 1, description: "d",

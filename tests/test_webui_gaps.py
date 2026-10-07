@@ -462,8 +462,11 @@ def test_parse_scenario_json(text, expected):
 
 @_needs_node
 def test_replace_confirm_counts_scenes():
-    assert _js("[1, 2, 5].map(app.scenarioReplaceConfirm)") == [
+    assert _js("[1, 2, 5].map((n) => app.scenarioReplaceConfirm(n))") == [
         "Заменить 1 сцену сценария?", "Заменить 2 сцены сценария?", "Заменить 5 сцен сценария?"]
+    assert _js("[app.scenarioReplaceConfirm(2, true), app.scenarioReplaceConfirm(0, true)]") == [
+        "Заменить 2 сцены сценария? Несохранённые правки пропадут.",
+        "Заменить несохранённый сценарий? Правки пропадут."]
 
 
 PICK = ('<div class="tag-hint">'
@@ -494,8 +497,21 @@ EDITOR8_EXPECTED = {
         '<span class="ref-missing">не подключён к проекту</span></label>',
         "inline": '<span class="hint bad scene-edit-error" data-idx="1">Сцена #1: референс @gone не '
         'подключён к проекту — снимите галочку или подключите карточку</span>'},
+    # the saved order of refs numbers <Picture k>: opening and saving must not reorder it
+    "refs_order_kept": {"refs": ["@b", "@a", "@c"]},
+    "json_load_asks_for_unsaved_draft": {"confirms": ["Заменить 2 сцены сценария? Несохранённые правки пропадут."],
+                                         "puts": []},
+    "json_load_asks_for_unsaved_in_empty_project": {
+        "confirms": ["Заменить несохранённый сценарий? Правки пропадут."], "puts": []},
+    "prompt_tag_issues_highlight": {"unknown": [["has-tag-issues", True]], "unknownTitle": "незнакомый тег @gone",
+                                    "clean": [["has-tag-issues", False]], "cleanTitle": ""},
+    "refs_known_when_library_down": {"box": '<label><input type="checkbox" data-scene-field="refs" '
+        'data-idx="0" data-tag="@a" checked> @a</label>'},
+    "scene0_wrong_extension": {"uploads": [], "error": "<b>Кадр не загружен</b><pre>Стартовый кадр — "
+                                                       "только png или jpg</pre>"},
+    "scene0_upload_after_close": {"errHidden": True},
     "refs_ride_along": {"refs": [None, ["@arena"]]},
-    "json_load_bad": {"puts": [], "error": "<b>Запрос не прошёл</b><pre>Ожидается {&quot;scenes&quot;: […]} "
+    "json_load_bad": {"puts": [], "error": "<b>Сценарий не разобран</b><pre>Ожидается {&quot;scenes&quot;: […]} "
                                           "или список сцен</pre>"},
 }
 
@@ -523,9 +539,12 @@ def test_start_image_thumb_never_leaves_the_media_root():
     # the project-level start_image is not checked by the server: no URL for what is not an image
     # under the outdir, nor for a path that climbs out of it
     for bad in ("/etc/passwd.png", "/o/../etc/x.png", "/o/uploads/notes.txt", "/other/x.png"):
-        html = _js(f"app.startImageFieldHtml({json.dumps(bad)}, [], '/o')")
-        assert "<img" not in html, bad
-        assert f'<option value="{bad}" selected>' in html
+        assert _js(f"app.startImageFieldHtml({json.dumps(bad)}, [], '/o')") == (
+            '<div class="start-image"><label>Стартовый кадр '
+            '<select class="inp" data-scene-field="start_image" data-idx="0">'
+            f'<option value="">без кадра</option><option value="{bad}" selected>{bad.split("/")[-1]}</option>'
+            '</select></label> '
+            '<button type="button" class="ghost" data-act="scene0-upload">Загрузить кадр…</button></div>'), bad
 
 
 @_needs_node
@@ -537,9 +556,40 @@ def test_editor_html_with_pinned_cards_and_refs():
             '<label><input type="checkbox" data-scene-field="refs" data-idx="0" data-tag="@hero" checked> @hero</label> '
             '<label><input type="checkbox" data-scene-field="refs" data-idx="0" data-tag="@arena"> @arena</label> '
             '<span class="hint">их картинки идут первыми: &lt;Picture 1…&gt;</span></div>')
-    assert ('<div class="tag-hint-slot" data-idx="0"></div>' + refs + '<div class="scene-edit-row">') in html
-    assert '<option value="@arena" selected>@arena — кадр карточки</option>' in html
-    assert '<img class="start-thumb" src="/media/library/arena/v1/01-o.png" alt="">' in html
+    assert html == (
+        '<div class="scene-editor" data-id="p1" data-epoch="0">'
+        '<p class="hint scene-editor-note">Шаги: по умолчанию 50; 25 — черновик, вдвое быстрее, '
+        'мягче лица и руки.</p>'
+        '<div class="scene-edit" data-idx="0"><div class="scene-edit-head">'
+        '<span class="idx">#0</span><div class="spacer"></div>'
+        '<button type="button" class="ghost" data-act="scene-up" data-idx="0" disabled>↑</button>'
+        '<button type="button" class="ghost" data-act="scene-down" data-idx="0" disabled>↓</button>'
+        '</div>'
+        '<textarea class="inp scene-edit-prompt" data-scene-field="prompt" data-idx="0" rows="4">a</textarea>'
+        '<div class="tag-hint-slot" data-idx="0"></div>' + refs +
+        '<div class="scene-edit-row">'
+        '<label>Длительность <input class="inp num" type="number" step="0.5" min="3" max="15" '
+        'data-scene-field="duration" data-idx="0" value="8"> с</label>'
+        '<span class="hint grid-hint" data-idx="0">на сетке: 8 с</span>'
+        '<label>Сид <input class="inp num" type="number" min="0" data-scene-field="seed" '
+        'data-idx="0" value="" placeholder="по умолчанию: 42"></label>'
+        '<button type="button" class="ghost" data-act="scene-seed-random" data-idx="0">случайный</button>'
+        '<label>Шаги <input class="inp num" type="number" min="2" max="100" '
+        'data-scene-field="steps" data-idx="0" value="" placeholder="50"></label>'
+        '</div>'
+        '<div class="start-image"><label>Стартовый кадр '
+        '<select class="inp" data-scene-field="start_image" data-idx="0">'
+        '<option value="">без кадра</option>'
+        '<option value="@hero">@hero — кадр карточки</option>'
+        '<option value="@arena" selected>@arena — кадр карточки</option></select></label> '
+        '<button type="button" class="ghost" data-act="scene0-upload">Загрузить кадр…</button>'
+        '<img class="start-thumb" src="/media/library/arena/v1/01-o.png" alt=""></div>'
+        '</div>'
+        '<div class="scene-editor-acts">'
+        '<button type="button" class="ghost" data-act="scene-add" data-id="p1">+ Сцена</button>'
+        '<button type="button" class="inverse" data-act="scenes-save" data-id="p1">Сохранить сценарий</button>'
+        '<span class="dirty-note" hidden>не сохранено</span>'
+        '</div></div>')
 
 
 @_needs_node
@@ -554,21 +604,23 @@ def test_scenario_json_block():
 
 @_needs_node
 def test_scenario_json_block_keeps_the_typed_text():
-    html = _js("app.scenarioJsonHtml('p1', '[{\"prompt\": \"a <b>\"}]')")
-    assert html.startswith('<details class="adv scenario-json" open><summary>')
-    assert '" rows="6" placeholder=' in html
-    assert '></textarea>' not in html
-    assert html.count('[{&quot;prompt&quot;: &quot;a &lt;b&gt;&quot;}]</textarea>') == 1
+    assert _js("app.scenarioJsonHtml('p1', '[{\"prompt\": \"a <b>\"}]')") == (
+        '<details class="adv scenario-json" open><summary>Вставить сценарий JSON</summary>'
+        '<textarea class="inp scenario-json-text" rows="6" placeholder=\'{"scenes": [{"prompt": "…", '
+        '"duration": 5}]}\'>[{&quot;prompt&quot;: &quot;a &lt;b&gt;&quot;}]</textarea> '
+        '<button type="button" class="ghost" data-act="scenario-json-load" data-id="p1">'
+        'Загрузить сценарий</button></details>')
 
 
 @_needs_node
 def test_a_ref_that_left_the_project_stays_visible_and_ticked():
+    # the scene's own order first (it numbers <Picture k>), the unticked ones after it
     assert _js("app.sceneRefsHtml({refs: ['@gone', '@hero']}, 1, ['@hero', '@arena'])") == (
         '<div class="scene-refs"><span class="scene-refs-label">Референсы без упоминания:</span> '
-        '<label><input type="checkbox" data-scene-field="refs" data-idx="1" data-tag="@hero" checked> @hero</label> '
-        '<label><input type="checkbox" data-scene-field="refs" data-idx="1" data-tag="@arena"> @arena</label> '
         '<label><input type="checkbox" data-scene-field="refs" data-idx="1" data-tag="@gone" checked> @gone '
         '<span class="ref-missing">не подключён к проекту</span></label> '
+        '<label><input type="checkbox" data-scene-field="refs" data-idx="1" data-tag="@hero" checked> @hero</label> '
+        '<label><input type="checkbox" data-scene-field="refs" data-idx="1" data-tag="@arena"> @arena</label> '
         '<span class="hint">их картинки идут первыми: &lt;Picture 1…&gt;</span></div>')
     # nothing pinned at all: the stray ref is still shown
     assert "@gone" in _js("app.sceneRefsHtml({refs: ['@gone']}, 0, [])")
@@ -663,3 +715,17 @@ LIB_EXPECTED = {
 @pytest.mark.parametrize("scenario", sorted(LIB_EXPECTED))
 def test_library_wiring(scenario):
     assert _gaps(scenario) == LIB_EXPECTED[scenario]
+
+
+@_needs_node
+def test_refs_keep_the_saved_order_and_unknown_is_judged_by_the_project():
+    both = ('<div class="scene-refs"><span class="scene-refs-label">Референсы без упоминания:</span> '
+            '<label><input type="checkbox" data-scene-field="refs" data-idx="0" data-tag="@arena" checked> @arena</label> '
+            '<label><input type="checkbox" data-scene-field="refs" data-idx="0" data-tag="@hero" checked> @hero</label> '
+            '<span class="hint">их картинки идут первыми: &lt;Picture 1…&gt;</span></div>')
+    assert _js("app.sceneRefsHtml({refs: ['@arena', '@hero']}, 0, ['@hero', '@arena'])") == both
+    # a voice tag or a card the library lost is still pinned by the project: ticked, no note
+    voice = ('<div class="scene-refs"><span class="scene-refs-label">Референсы без упоминания:</span> '
+             '<label><input type="checkbox" data-scene-field="refs" data-idx="0" data-tag="@voice" checked> @voice</label> '
+             '<span class="hint">их картинки идут первыми: &lt;Picture 1…&gt;</span></div>')
+    assert _js("app.sceneRefsHtml({refs: ['@voice']}, 0, [], ['@voice'])") == voice

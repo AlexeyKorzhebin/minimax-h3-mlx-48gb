@@ -380,7 +380,7 @@ function sceneEditHtml(scene, idx, total, ctx) {
     + `<textarea class="inp scene-edit-prompt" data-scene-field="prompt" data-idx="${idx}" rows="4">`
     + `${escapeHtml(scene.prompt)}</textarea>`
     + (sglang ? `<div class="tag-hint-slot" data-idx="${idx}"></div>`
-      + sceneRefsHtml(scene, idx, pinnedTags) : "")
+      + sceneRefsHtml(scene, idx, pinnedTags, ctx.refTags || pinnedTags) : "")
     + `<div class="scene-edit-row">${row.join("")}</div>`
     + (idx === 0 ? startImageFieldHtml(scene.start_image, ctx.pinned || [], ctx.outdir) : "")
     + (ctx.error && ctx.error.idx === idx
@@ -473,17 +473,18 @@ export function startImageFieldHtml(current, pinnedCards_, outdir) {
 }
 
 /** Референсы сцены без упоминания в тексте — только sglang и только если есть что выбрать. */
-export function sceneRefsHtml(scene, idx, pinnedTags) {
+export function sceneRefsHtml(scene, idx, pinnedTags, knownTags = pinnedTags) {
   const chosen = scene.refs || [];
-  // a ref the project no longer pins stays on the page, ticked: dropping it silently would lose it
-  const strays = chosen.filter((tag) => !pinnedTags.includes(tag));
-  if (!pinnedTags.length && !strays.length) return "";
-  const box = (tag, note) => `<label><input type="checkbox" data-scene-field="refs" `
+  // The scene's own order first: it numbers <Picture k>, and the server keeps it. A ref the
+  // project does not pin (`knownTags` = the project's references) stays, ticked, with a note.
+  const order = [...chosen, ...pinnedTags.filter((tag) => !chosen.includes(tag))];
+  if (!order.length) return "";
+  const box = (tag) => `<label><input type="checkbox" data-scene-field="refs" `
     + `data-idx="${idx}" data-tag="${escapeHtml(tag)}"${chosen.includes(tag) ? " checked" : ""}> `
-    + `${escapeHtml(tag)}${note}</label> `;
+    + `${escapeHtml(tag)}${knownTags.includes(tag) ? "" : ` <span class="ref-missing">не подключён к проекту</span>`}`
+    + `</label> `;
   return `<div class="scene-refs"><span class="scene-refs-label">Референсы без упоминания:</span> `
-    + pinnedTags.map((tag) => box(tag, "")).join("")
-    + strays.map((tag) => box(tag, ` <span class="ref-missing">не подключён к проекту</span>`)).join("")
+    + order.map(box).join("")
     + `<span class="hint">их картинки идут первыми: &lt;Picture 1…&gt;</span></div>`;
 }
 
@@ -502,8 +503,10 @@ export function parseScenarioJson(text) {
   return { error: JSON_SHAPE_ERROR };
 }
 
-export function scenarioReplaceConfirm(n) {
-  return `Заменить ${n} ${plural(n, "сцену", "сцены", "сцен")} сценария?`;
+export function scenarioReplaceConfirm(n, dirty = false) {
+  if (!n && dirty) return "Заменить несохранённый сценарий? Правки пропадут.";
+  return `Заменить ${n} ${plural(n, "сцену", "сцены", "сцен")} сценария?`
+    + (dirty ? " Несохранённые правки пропадут." : "");
 }
 
 export function scenarioJsonHtml(id, text = "") {
@@ -1830,6 +1833,8 @@ export function offlineNotice(failures, lastOkAt, now) {
  *  любой заглушки. */
 export function errorText(payload) {
   const error = (payload && payload.error) || {};
+  // a refusal the page itself made, before any request: it names its own heading
+  if (error.clientTitle) return { title: error.clientTitle, pre: error.message };
   const detail = error.detail || {};
   switch (error.code) {
     // Один код на два непохожих отказа: командная строка задачи, которую разобрал argparse
@@ -3430,9 +3435,12 @@ function startPage() {
       else scene[field] = el.value;
       if (JSON.stringify(scene[field]) !== before) sceneDraftDirty = true;
     });
-    for (const [idx, list] of refsByScene) {
-      if (JSON.stringify(sceneDraft[idx].refs) !== JSON.stringify(list)) {
-        sceneDraft[idx].refs = list;
+    for (const [idx, ticked] of refsByScene) {
+      // the saved order stays (it numbers <Picture k>); newly ticked tags go to the end
+      const old = sceneDraft[idx].refs || [];
+      const next = [...old.filter((tag) => ticked.includes(tag)), ...ticked.filter((tag) => !old.includes(tag))];
+      if (JSON.stringify(old) !== JSON.stringify(next)) {
+        sceneDraft[idx].refs = next;
         sceneDraftDirty = true;
       }
     }
@@ -3475,11 +3483,13 @@ function startPage() {
     const parsed = parseScenarioJson(field ? field.value : "");
     if (parsed.error) {
       const error = new Error(parsed.error);
-      error.payload = { error: { message: parsed.error } };
+      error.payload = { error: { message: parsed.error, clientTitle: "Сценарий не разобран" } };
       throw error;
     }
+    // the number is of the saved scenes; unsaved edits count as something to lose even in an empty project
     const saved = ((project && project.project && project.project.scenes) || []).length;
-    if (saved > 0 && !window.confirm(scenarioReplaceConfirm(saved))) return;
+    const unsaved = Boolean(sceneDraft && sceneDraftDirty);
+    if ((saved > 0 || unsaved) && !window.confirm(scenarioReplaceConfirm(saved, unsaved))) return;
     const answer = await api("PUT", `/api/projects/${encodeURIComponent(id)}/scenes`, parsed.body);
     if (answer && answer.project) resetSceneDraft(answer.project);
     scenarioJsonText = "";
@@ -3520,6 +3530,7 @@ function startPage() {
       body = sceneEditorHtml(sceneDraft, { id: proj.id, engine: state && state.engine,
         projectSeed: proj.seed ?? null, dirty: sceneDraftDirty, epoch: draftEpoch,
         error: sceneDraftError, pinned: pinnedCards(proj.references, libraryCards),
+        refTags: (proj.references || []).map((r) => r.tag),
         outdir: state && state.outdir }) + scenarioJsonHtml(proj.id, scenarioJsonText);
     } else if (proj.kind === "video") {
       const n = proj.scenes.length;
@@ -5899,10 +5910,17 @@ function startPage() {
     const file = input.files && input.files[0];
     if (!file || !sceneDraft) return;
     try {
+      if (!/\.(png|jpe?g)$/i.test(file.name)) {
+        showProjectError({ error: { clientTitle: "Кадр не загружен",
+          message: "Стартовый кадр — только png или jpg" } });
+        return;
+      }
       const path = await uploadToServer(file);
+      if (!project || !sceneDraft) return;     // the panel was closed while the file went up
       clearProjectError();
       changeSceneDraft((draft) => draft.map((scene, i) => (i === 0 ? { ...scene, start_image: path } : scene)));
     } catch (error) {
+      if (!project) return;
       showProjectError(error.payload ? error.payload : { error: { message: "сервер не ответил" } });
     } finally {
       input.value = "";
