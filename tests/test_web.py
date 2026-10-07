@@ -1366,10 +1366,20 @@ def test_the_default_port_is_the_modules_default():
     assert build_parser().parse_args(["web"]).port == web.DEFAULT_PORT
 
 
-def test_h3_web_has_no_host_flag():
-    """A bind-address flag is the one way this server could stop being loopback-only."""
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["web", "--host", "0.0.0.0"])
+def test_h3_web_beyond_the_loopback_needs_an_allow_list(tmp_path, monkeypatch):
+    """A bind-address flag is the one way this server could stop being loopback-only, so
+    `--host` beyond 127.0.0.1 is refused unless H3_ALLOWED_HOSTS names the page's host:port."""
+    from h3_48gb import cli
+
+    def _must_not_serve(self):
+        raise AssertionError("a server bound to 0.0.0.0 reached serve_forever with no allow-list")
+
+    monkeypatch.setattr(web.ThreadingHTTPServer, "serve_forever", _must_not_serve)
+    monkeypatch.delenv("H3_ALLOWED_HOSTS", raising=False)
+    (tmp_path / "out").mkdir()
+    with pytest.raises(CliError) as excinfo:
+        cli.run_web(tmp_path / "out", 0, "0.0.0.0")
+    assert excinfo.value.code == "external_bind_without_allowed_hosts"
 
 
 def test_h3_web_refuses_an_outdir_that_does_not_exist(tmp_path, monkeypatch):

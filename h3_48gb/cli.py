@@ -171,6 +171,8 @@ ERROR_CODES = {
     "adaln_cache_unreadable": "--adaln-cache exists but is not a readable AdaLN table",
     "checkpoint_without_adaln": "the checkpoint has no readable transformer/adaln_cache.safetensors and no --adaln-cache was given; this build cannot build the table itself",
     "upstream_patch_missing": "a keyframe was given but the vendored upstream/ checkout is unpatched",
+    "external_bind_without_allowed_hosts": "`h3 web --host` names a non-loopback address but H3_ALLOWED_HOSTS is empty",
+    "allowed_hosts_invalid": "an H3_ALLOWED_HOSTS entry is not host:port",
     "outdir_not_found": "--outdir does not exist or cannot be read",
     "prompt_file_not_found": "--prompt-file points at a file that does not exist",
     "prompt_file_unreadable": "--prompt-file exists but could not be read as UTF-8",
@@ -615,13 +617,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="seconds between checks of an empty queue (default 5)")
     wk.add_argument("--json", action="store_true", help="emit a machine-readable report")
 
-    # No `--host`: the server binds the loopback and only the loopback (`web.LOOPBACK`), and a flag
-    # that could hold `0.0.0.0` is a flag someone eventually sets on a machine with no auth in
-    # front of it.
-    wb = _subcommand(sub, "web", help="serve the queue page on 127.0.0.1 until stopped")
+    # `--host` beyond the loopback is refused unless H3_ALLOWED_HOSTS names the exact host:port
+    # the page is opened by (`web.make_server`): the panel has no password (spec §2, "Доступ"),
+    # so the allow-list is what keeps a DNS-rebinding page from driving it.
+    wb = _subcommand(sub, "web", help="serve the queue page until stopped")
     wb.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
+    wb.add_argument("--host", default="127.0.0.1",
+                    help="address to bind (default 127.0.0.1); anything else needs H3_ALLOWED_HOSTS")
     wb.add_argument("--port", type=int, default=8765,
-                    help="port on 127.0.0.1 (default 8765); 0 asks the kernel for a free one")
+                    help="port (default 8765); 0 asks the kernel for a free one")
 
     doc = _subcommand(sub, "doctor", help="verify a converted checkpoint")
     doc.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
@@ -1506,7 +1510,7 @@ def run_worker(outdir: Path, poll: float = 5.0) -> dict:
     return {"ok": True, "queue": str(root), "jobs_run": ran}
 
 
-def run_web(outdir: Path, port: int = 8765) -> dict:
+def run_web(outdir: Path, port: int = 8765, host: str = "127.0.0.1") -> dict:
     """Serve the queue page on `127.0.0.1:<port>` until the process is stopped.
 
     Imported lazily for the same reason `run_worker` imports its module lazily: `h3 --help` has no
@@ -1521,18 +1525,19 @@ def run_web(outdir: Path, port: int = 8765) -> dict:
     `Ctrl-C` is the documented way to stop it, so `KeyboardInterrupt` is a normal exit rather than
     a traceback: the socket is closed and the report is returned.
     """
-    from h3_48gb.web import LOOPBACK, make_server
+    from h3_48gb import web
 
     outdir = Path(outdir)
     if not outdir.is_dir():
         raise CliError("outdir_not_found", f"--outdir does not exist: {outdir}",
                        {"outdir": str(outdir)})
     root = queue_root(outdir)
-    httpd = make_server(root, outdir, port=port, verbose=True)
+    httpd = web.make_server(root, outdir, port=port, verbose=True, host=host,
+                            allowed_hosts=web.allowed_hosts_from_env())
     # Not `port`: with `--port 0` the kernel picks, and the number a human has to type is the one
     # the socket actually got.
     bound = httpd.server_address[1]
-    url = f"http://{LOOPBACK}:{bound}/"
+    url = f"http://{host}:{bound}/"
     print(f"страница на {url} — очередь в {root}; остановить: Ctrl-C", flush=True)
     try:
         httpd.serve_forever()
@@ -2054,7 +2059,7 @@ def main(argv: list[str] | None = None) -> int:
             ok = True
             human = f"работник остановлен, задач выполнено: {report['jobs_run']}"
         elif args.command == "web":
-            report = run_web(args.outdir, args.port)
+            report = run_web(args.outdir, args.port, args.host)
             ok = True
             human = "сервер остановлен"
         elif args.command == "doctor":

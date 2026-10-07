@@ -3112,7 +3112,7 @@ class _Handler(BaseHTTPRequestHandler):
         stop -- and a `curl` or `nc` by hand can pass one.
         """
         host = self._sole_header("Host", "host_not_allowed")
-        if host not in self.server.allowed_hosts:
+        if host is None or host.strip().lower() not in self.server.allowed_hosts:
             raise CliError(
                 "host_not_allowed",
                 f"Host {host!r} is not this server's address; expected one of "
@@ -5797,9 +5797,27 @@ class _Server(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+_ALLOWED_HOST_RE = re.compile(r"^[a-z0-9.-]+:\d{1,5}$")
+
+
+def allowed_hosts_from_env(environ=None) -> tuple[str, ...]:
+    """`H3_ALLOWED_HOSTS` as a tuple of lowercase `host:port` names, empty when unset. A name
+    without a port is refused: Host always carries the port here, so a portless entry could only
+    ever be a typo that silently matches nothing."""
+    raw = (os.environ if environ is None else environ).get("H3_ALLOWED_HOSTS", "")
+    names = tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+    bad = [name for name in names if not _ALLOWED_HOST_RE.match(name)]
+    if bad:
+        raise CliError("allowed_hosts_invalid",
+                       f"H3_ALLOWED_HOSTS entries must be host:port, these are not: {bad}",
+                       {"invalid": bad})
+    return names
+
+
 def make_server(queue_root, outdir, repo=None, models=None, webui=None, port=DEFAULT_PORT,
-                verbose=False, reveal=None) -> ThreadingHTTPServer:
-    """A server bound to the loopback, ready for `serve_forever()`.
+                verbose=False, reveal=None, host=LOOPBACK,
+                allowed_hosts=()) -> ThreadingHTTPServer:
+    """A server bound to `host` (the loopback by default), ready for `serve_forever()`.
 
     `port=0` asks the kernel for a free one; the actual number is in `server_address[1]`, which is
     how the tests reach it without racing over a fixed port.
@@ -5813,14 +5831,21 @@ def make_server(queue_root, outdir, repo=None, models=None, webui=None, port=DEF
     A test that wants to assert *what* would be revealed, without a real Finder or a real macOS
     box, passes its own here (see `tests/test_chat_web.py`'s `_serve`).
     """
-    httpd = _Server((LOOPBACK, port), _Handler)
+    allowed_hosts = tuple(str(name).strip().lower() for name in allowed_hosts if str(name).strip())
+    if host != LOOPBACK and not allowed_hosts:
+        raise CliError(
+            "external_bind_without_allowed_hosts",
+            f"--host {host} binds beyond the loopback; set H3_ALLOWED_HOSTS to the exact "
+            f"host:port names the page is opened by (e.g. 192.168.100.50:8765)",
+            {"host": host})
+    httpd = _Server((host, port), _Handler)
     # Built from the port the socket actually got, not from `port`: with `port=0` the kernel picks,
     # and a set built from the request would reject every request the server then received.
     bound = httpd.server_address[1]
-    httpd.allowed_hosts = frozenset({f"{LOOPBACK}:{bound}", f"localhost:{bound}"})
-    # The same two names as an origin, for the write routes. Built from `allowed_hosts` so the two
+    httpd.allowed_hosts = frozenset({f"{LOOPBACK}:{bound}", f"localhost:{bound}", *allowed_hosts})
+    # The same names as an origin, for the write routes. Built from `allowed_hosts` so the two
     # sets cannot drift apart, and `http://` because this server has no TLS and never will.
-    httpd.allowed_origins = frozenset(f"http://{host}" for host in httpd.allowed_hosts)
+    httpd.allowed_origins = frozenset(f"http://{name}" for name in httpd.allowed_hosts)
     httpd.queue_root = Path(queue_root)
     httpd.outdir = Path(outdir)
     httpd.webui = Path(webui) if webui is not None else WEBUI_ROOT
