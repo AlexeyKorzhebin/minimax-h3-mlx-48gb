@@ -647,6 +647,15 @@ def test_a_group_whose_members_are_not_the_engine_is_left_alone(tmp_path, host):
     assert host.killed == []
 
 
+def test_a_zombie_leader_with_an_empty_cmdline_is_a_dead_leader(tmp_path, host):
+    # The dispatcher is the engine's parent, so a leader that died stays a zombie until reaped,
+    # and /proc/<pid>/cmdline of a zombie reads "" -- not an error (final re-review, I9).
+    d = _orphan_h3(tmp_path, host)
+    host.cmdlines[4242] = ""
+    assert d.release("w") == {"ok": True, "stopped": ["h3"]}
+    assert host.killed == [(4242, signal.SIGTERM)]
+
+
 def test_a_reused_leader_pid_is_not_an_orphaned_group(tmp_path, host):
     d = _orphan_h3(tmp_path, host)
     host.cmdlines[4242] = "/usr/bin/vim notes.txt"

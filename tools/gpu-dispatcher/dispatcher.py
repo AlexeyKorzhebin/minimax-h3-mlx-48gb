@@ -334,8 +334,9 @@ class Dispatcher:
         sglang's scheduler holds the 50 GB, not the leader. The group is still ours when the
         leader's pid is gone entirely (Linux never hands out a pid still in use as a pgid, so the
         group can only be the one we started) and a member carries the engine's first marker."""
-        if self.host.cmdline(record["pid"]) is not None:
-            return False                     # the pid lives on as something else: not ours
+        if self.host.cmdline(record["pid"]):
+            return False        # the pid lives on as something else: not ours. An empty cmdline
+                                # is a zombie (we are its parent) -- dead, like a missing one
         marker = self.specs[name].markers[0]
         return any(marker in (self.host.cmdline(pid) or "")
                    for pid in self.host.group_members(record["pgid"]))
