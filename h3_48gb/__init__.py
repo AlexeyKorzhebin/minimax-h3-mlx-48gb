@@ -36,7 +36,6 @@ refused rather than silently continued. ``preview_every=0`` (the default) disabl
 
 from __future__ import annotations
 
-from ._upstream import UPSTREAM, ensure_on_path
 from .cli import main
 
 # Lazy imports: these modules require mlx, so they're imported only when needed
@@ -68,7 +67,17 @@ _LAZY_IMPORTS = {
 
 
 def __getattr__(name: str):
-    """Lazy load heavy modules that require mlx.core."""
+    """Lazy load heavy modules that require mlx.core.
+
+    `UPSTREAM` and `ensure_on_path` are lazy too: importing `_upstream` puts the vendored checkout
+    on `sys.path` and raises FileNotFoundError when there is none, and the panel (web, worker, cli,
+    assemble, queue, project) must import where `upstream/` does not exist -- the Docker image and
+    a fresh `git pull` on alex-neuro.
+    """
+    if name in ("UPSTREAM", "ensure_on_path"):
+        from . import _upstream
+
+        return getattr(_upstream, name)
     if name in _LAZY_IMPORTS:
         module_name, attr_name = _LAZY_IMPORTS[name]
         module = __import__(f"h3_48gb.{module_name}", fromlist=[attr_name])
