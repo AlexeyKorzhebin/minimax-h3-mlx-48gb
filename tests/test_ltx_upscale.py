@@ -16,7 +16,7 @@ TEMPLATE = json.loads((Path(ltx.__file__).with_name("ltx_workflow.json")).read_t
 
 TESTSRC = "testsrc=size=64x64:rate=24:duration=1"
 STILL = "color=c=gray:size=64x64:rate=24:duration=1"
-BUSY = "color=c=gray:size=64x64:rate=24:duration=1,noise=alls=100:allf=t"
+BUSY = "color=c=gray:size=64x64:rate=24:duration=1,noise=alls=40:allf=t"
 
 
 def _clip(path: Path, video: str = TESTSRC) -> Path:
@@ -85,14 +85,15 @@ def test_template_graph_is_well_formed_and_matches_the_source_inputs():
 
 def test_motion_is_measured_over_all_parts_together():
     px = 32 * 24
-    still = bytes(3 * px)
-    moving = (bytes(px) + bytes([8]) * px + bytes(px))
+    still = bytes(2 * px)                                   # 2 frames -> 1 diff block of 0
+    moving = (bytes(px) + bytes([8]) * px + bytes(px))      # 3 frames -> 2 diff blocks of 8
     answers = {"a.mp4": still, "b.mp4": moving}
 
     def run(cmd, capture_output=True):
         return subprocess.CompletedProcess(cmd, 0, answers[Path(cmd[cmd.index("-i") + 1]).name], b"")
 
-    assert motion.clip_motion([Path("a.mp4"), Path("b.mp4")], run=run) == 4.0
+    # weighted by frames (16 px of difference over 3 blocks), not the mean of means (4.0)
+    assert motion.clip_motion([Path("a.mp4"), Path("b.mp4")], run=run) == 16 / 3
     assert (motion.clip_motion([Path("a.mp4")], run=run),
             motion.clip_motion([Path("b.mp4")], run=run)) == (0.0, 8.0)
     assert [motion.lora_for(m) for m in (0.0, 2.99, 3.0, 7.49, 7.5, 8.0)] == \
@@ -161,7 +162,7 @@ def test_one_strength_for_the_whole_clip(tmp_path):
     still = _clip(pdir / "scenes" / "still.mp4", STILL)
     busy = _clip(pdir / "scenes" / "busy.mp4", BUSY)
     per_part = [motion.lora_for(motion.clip_motion([c], run=subprocess.run)) for c in (still, busy)]
-    assert per_part[0] != per_part[1], "fixture must make a per-scene choice differ"
+    assert per_part == [0.6, 0.15]       # alone: the still part is 0.0, the busy one > 7.5
     proj.scenes = [{"idx": i, "prompt": f"scene {i}", "duration": 1.0, "status": "done",
                     "job_id": f"j{i}", "clip_path": str(c), "keyframe_path": None}
                    for i, c in enumerate((still, busy))]
@@ -175,8 +176,8 @@ def test_one_strength_for_the_whole_clip(tmp_path):
         fake.close()
     assert code == 0, log
     strengths = [wf["2"]["inputs"]["strength_model"] for wf in fake.prompts]
-    combined = motion.lora_for(motion.clip_motion([still, busy], run=subprocess.run))
-    assert strengths == [combined, combined]
+    # together the mean falls in [3.0, 7.5) -- a strength neither part would pick on its own
+    assert strengths == [0.3, 0.3]
     assert [wf["20"]["inputs"]["text"] for wf in fake.prompts] == ["scene 0", "scene 1"]
     assert [wf["42"]["inputs"]["filename_prefix"] for wf in fake.prompts] == \
         [f"h3panel/{proj.id}/still-up1/f", f"h3panel/{proj.id}/busy-up1/f"]
@@ -265,3 +266,138 @@ def test_project_active_job_sees_a_pending_upscale_job(tmp_path):
     active = web._project_active_job(proj, jobs)
     assert (active["kind"], active["job"]["kind"], active["job"]["args"]) == \
         ("upscale", "upscale", ["upscale", "--project", str(proj.path)])
+
+
+def _project_with_clips(tmp_path, clips_by_idx, **scene_extra):
+    proj = p.create_project(tmp_path / "out", "video", "Up")
+    proj.scenes = [{"idx": i, "prompt": "x", "duration": 1.0, "status": "done", "job_id": f"j{i}",
+                    "clip_path": c, "keyframe_path": None, **scene_extra}
+                   for i, c in enumerate(clips_by_idx)]
+    proj.save()
+    return proj
+
+
+def test_a_scene_without_a_clip_fails_the_stage_with_a_message(tmp_path):
+    proj = _project_with_clips(tmp_path, [None])
+    code, log = ltx.run_upscale(proj.path, client=None, comfy_output=tmp_path, run=subprocess.run,
+                                attempt="a")
+    assert code == 1
+    assert log == "ltx: сцена 0 не готова к апскейлу (статус 'done', clip_path None)\n"
+    assert p.load_project(proj.path).stages["upscale"] == "failed"
+
+
+def test_a_scene_that_is_not_done_fails_the_stage(tmp_path):
+    clip = _clip(tmp_path / "s.mp4")
+    proj = _project_with_clips(tmp_path, [str(clip)], status="running")
+    code, log = ltx.run_upscale(proj.path, client=None, comfy_output=tmp_path, run=subprocess.run,
+                                attempt="a")
+    assert (code, log) == (1, "ltx: сцена 0 не готова к апскейлу (статус 'running', "
+                              f"clip_path {str(clip)!r})\n")
+    assert p.load_project(proj.path).stages["upscale"] == "failed"
+
+
+def test_an_unexpected_exception_fails_the_job_and_the_stage(tmp_path):
+    clip = _clip(tmp_path / "s.mp4")
+    proj = _project_with_clips(tmp_path, [str(clip)])
+
+    def boom(cmd, **kw):
+        raise RuntimeError("kaboom")
+
+    code, log = ltx.run_upscale(proj.path, client=None, comfy_output=tmp_path, run=boom,
+                                attempt="a")
+    assert (code, log) == (1, "ltx crashed: RuntimeError: kaboom\n")
+    assert p.load_project(proj.path).stages["upscale"] == "failed"
+
+
+def test_the_worker_survives_a_crash_in_the_upscale_job(tmp_path, monkeypatch):
+    from h3_48gb import queue as q
+    from h3_48gb import worker
+    from _fake_dispatcher import FakeDispatcher
+
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    disp = FakeDispatcher(acquire=({"ok": True, "state": "ready", "engine": "ltx"},))
+    monkeypatch.setenv("H3_DISPATCHER_URL", disp.url)
+
+    def bug(*a, **kw):
+        raise TypeError("bug in run_upscale")
+
+    monkeypatch.setattr(ltx, "run_upscale", bug)
+    out = tmp_path / "out"
+    proj = p.create_project(out, "video", "Up")
+    root = q.layout(out / "queue")["root"]
+    q.submit(root, ["upscale", "--project", str(proj.path)], "", {"output_stem": str(out / "u")},
+             {}, kind=q.KIND_UPSCALE)
+    try:
+        code = worker.run_job(root, q.claim(root), outdir=out)
+    finally:
+        disp.close()
+    assert code == 1
+    (job,) = q.scan(root)[0]
+    assert job.state == "failed"
+    assert "ltx crashed: TypeError: bug in run_upscale" in job.log_tail
+
+
+def test_a_frame_directory_that_cannot_be_removed_is_logged_not_fatal(tmp_path):
+    clip = _clip(tmp_path / "scenes" / "s.mp4")
+    out_dir = tmp_path / "comfy-out"
+    fake = FakeComfy(out_dir, frames=(25,))
+    frames_dir = out_dir / "h3panel" / "proj" / "s-a1"
+    lines: list[str] = []
+
+    class LockingClient(ltx.ComfyClient):
+        def history(self, prompt_id):
+            answer = super().history(prompt_id)
+            if answer is not None:
+                frames_dir.chmod(0o500)      # frames are written; make them undeletable
+            return answer
+
+    try:
+        result = ltx.upscale_part(clip, prompt="x", strength=0.3, prefix="h3panel/proj/s-a1",
+                                  client=LockingClient(fake.url), comfy_output=out_dir,
+                                  run=subprocess.run, sleep=lambda s: None, log=lines.append)
+    finally:
+        frames_dir.chmod(0o700)
+        fake.close()
+    assert result.exists() and _frames(result) == 24
+    assert len(lines) == 1
+    assert lines[0].startswith(f"ltx: не удалось удалить кадры {frames_dir}: [Errno 13]")
+
+
+def test_an_unreadable_clip_is_an_error_not_zero_motion(tmp_path):
+    bad = tmp_path / "bad.mp4"
+    bad.write_bytes(b"not a video")
+    with pytest.raises(motion.MotionError) as excinfo:
+        motion.clip_motion([bad], run=subprocess.run)
+    assert str(excinfo.value).startswith(f"ffmpeg не прочитал {bad}: ")
+    one = _clip(tmp_path / "one.mp4")
+    single = tmp_path / "single.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(one), "-frames:v", "1",
+                    str(single)], check=True)
+    with pytest.raises(motion.MotionError) as excinfo:
+        motion.clip_motion([single], run=subprocess.run)
+    assert str(excinfo.value) == f"в {single} меньше двух кадров (1), движение не измерить"
+
+
+def test_a_history_entry_without_a_final_status_does_not_poll_forever(tmp_path):
+    clip = _clip(tmp_path / "s.mp4")
+
+    class Odd:
+        polls = 0
+
+        def upload(self, path, name):
+            return name
+
+        def prompt(self, workflow):
+            return "p1"
+
+        def history(self, prompt_id):
+            self.polls += 1
+            return {"outputs": {}}          # an entry, but no "status" at all
+
+    client = Odd()
+    with pytest.raises(ltx.UpscaleError) as excinfo:
+        ltx.upscale_part(clip, prompt="x", strength=0.3, prefix="h3panel/p/s-a1", client=client,
+                         comfy_output=tmp_path, run=subprocess.run, sleep=lambda s: None)
+    assert str(excinfo.value) == ("ComfyUI: запись /history без итогового статуса после 12 "
+                                  "опросов ({})")
+    assert client.polls == 12

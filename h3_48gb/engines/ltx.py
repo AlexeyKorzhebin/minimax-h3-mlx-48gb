@@ -25,6 +25,10 @@ SEED = 42
 STEPS = 4
 FPS = 24
 PREFIX_ROOT = "h3panel"
+#: ComfyUI writes a /history entry only once a prompt has finished, with a `status`. An entry
+#: that is there but is neither "success" nor "error" is not "still running" (that is *no* entry);
+#: tolerate a few polls in case of a half-written read, then fail instead of polling forever.
+MAX_ODD_HISTORY_POLLS = 12
 FALLBACK_PROMPT = ("Amateur handheld phone video in natural daylight, sharp and highly detailed, "
                    "real skin texture, real fabric texture, natural light.")
 _TEMPLATE_PATH = Path(__file__).with_name("ltx_workflow.json")
@@ -107,7 +111,8 @@ def _ffmpeg(cmd, *, run, what) -> None:
 
 
 def upscale_part(clip, *, prompt, strength, prefix, client, comfy_output, run,
-                 sleep=time.sleep, cancelled=lambda: None, poll_seconds: float = 5.0) -> Path:
+                 sleep=time.sleep, cancelled=lambda: None, poll_seconds: float = 5.0,
+                 log=lambda line: None) -> Path:
     clip = Path(clip)
     src_n = _count_frames(clip, run=run)
     pad_n = pad_frames(src_n)
@@ -124,6 +129,7 @@ def upscale_part(clip, *, prompt, strength, prefix, client, comfy_output, run,
     name = client.upload(padded, padded.name)
     prompt_id = client.prompt(build_workflow(input_name=name, prompt=prompt, strength=strength,
                                              prefix=prefix))
+    odd_polls = 0
     while True:
         reason = cancelled()
         if reason:
@@ -136,6 +142,12 @@ def upscale_part(clip, *, prompt, strength, prefix, client, comfy_output, run,
             message = next((m[1].get("exception_message") for m in status.get("messages", [])
                             if m and m[0] == "execution_error"), "ошибка исполнения")
             raise UpscaleError(f"ComfyUI: {message}")
+        if entry is not None:
+            odd_polls += 1
+            if odd_polls >= MAX_ODD_HISTORY_POLLS:
+                raise UpscaleError(
+                    f"ComfyUI: запись /history без итогового статуса после {odd_polls} опросов "
+                    f"({json.dumps(status)[:200]})")
         sleep(poll_seconds)
     frames_dir = Path(comfy_output) / prefix
     frames = sorted(frames_dir.glob("f_*.png"))
@@ -151,31 +163,53 @@ def upscale_part(clip, *, prompt, strength, prefix, client, comfy_output, run,
     os.replace(part, out)
     # The frames were only an intermediate; the -ltx part now holds them. They live in our own
     # rw subdirectory of ComfyUI's output (compose.yaml mounts <output>/h3panel rw, the rest ro).
-    shutil.rmtree(frames_dir, ignore_errors=True)
+    try:
+        shutil.rmtree(frames_dir)
+    except OSError as exc:
+        # the -ltx part is already good; a leftover directory is a disk-space problem to be told
+        # about, not a reason to fail the upscale
+        log(f"ltx: не удалось удалить кадры {frames_dir}: {exc}\n")
     padded.unlink(missing_ok=True)
     return out
+
+
+def _scene_clips(scenes) -> list[Path]:
+    clips = []
+    for scene in scenes:
+        if scene.get("status") != "done" or not scene.get("clip_path"):
+            raise UpscaleError(f"сцена {scene.get('idx')} не готова к апскейлу "
+                               f"(статус {scene.get('status')!r}, clip_path {scene.get('clip_path')!r})")
+        clips.append(Path(scene["clip_path"]))
+    return clips
 
 
 def run_upscale(project_path, *, client, comfy_output, run, attempt: str, sleep=time.sleep,
                 cancelled=lambda: None) -> tuple[int, str]:
     proj = project_module.load_project(project_path)
-    scenes = sorted(proj.scenes, key=lambda scene: scene["idx"])
-    clips = [Path(scene["clip_path"]) for scene in scenes]
-    proj.set_stage_status("upscale", "running")
-    strength = motion.lora_for(motion.clip_motion(clips, run=run))
-    log = [f"ltx: сила {strength:g} на весь клип ({len(clips)} частей)\n"]
+    log: list[str] = []
     try:
+        proj.set_stage_status("upscale", "running")
+        scenes = sorted(proj.scenes, key=lambda scene: scene["idx"])
+        if not scenes:
+            raise UpscaleError("в проекте нет сцен")
+        clips = _scene_clips(scenes)
+        strength = motion.lora_for(motion.clip_motion(clips, run=run))
+        log.append(f"ltx: сила {strength:g} на весь клип ({len(clips)} частей)\n")
         for scene, clip in zip(scenes, clips):
             out = upscale_part(clip, prompt=scene.get("prompt") or FALLBACK_PROMPT,
                                strength=strength,
                                prefix=f"{PREFIX_ROOT}/{proj.id}/{clip.stem}-{attempt}",
                                client=client, comfy_output=comfy_output, run=run, sleep=sleep,
-                               cancelled=cancelled)
+                               cancelled=cancelled, log=log.append)
             proj.set_scene_fields(scene["idx"], ltx_path=str(out))
             log.append(f"ltx: сцена {scene['idx']} -> {out.name}\n")
-    except UpscaleError as exc:
+    except (UpscaleError, motion.MotionError) as exc:
         proj.set_stage_status("upscale", "failed")
         log.append(f"ltx: {exc}\n")
+        return 1, "".join(log)
+    except Exception as exc:  # noqa: BLE001 -- a bug here must fail the job, not kill the worker
+        proj.set_stage_status("upscale", "failed")
+        log.append(f"ltx crashed: {type(exc).__name__}: {exc}\n")
         return 1, "".join(log)
     proj.set_stage_status("upscale", "done")
     return 0, "".join(log)

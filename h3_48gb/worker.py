@@ -695,6 +695,8 @@ def _run_upscale_job(root, outdir, job) -> tuple[int, str]:
             # and its second attempt must never read frames the first attempt left behind
             attempt=f"{job.id}-{time.time_ns()}",
             cancelled=lambda: q.cancel_reason(root, job.id))
+    except Exception as exc:  # noqa: BLE001 -- a bug here must fail the job, not kill the worker
+        return 1, f"ltx crashed: {type(exc).__name__}: {exc}\n"
     finally:
         if q.cancel_reason(root, job.id) == "released_by_user":
             try:
