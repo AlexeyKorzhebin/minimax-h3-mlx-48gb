@@ -76,6 +76,10 @@ def engine_specs() -> dict[str, EngineSpec]:
     }
 
 
+class HostError(Exception):
+    """The machine could not tell us something we must not guess (nvidia-smi is down)."""
+
+
 def parse_compute_apps(text: str) -> list[dict]:
     apps = []
     for line in text.splitlines():
@@ -87,8 +91,11 @@ def parse_compute_apps(text: str) -> list[dict]:
 
 
 def parse_gpu_stats(text: str) -> dict:
-    first = text.strip().splitlines()[0]
-    temperature, used, total = (int(float(part.strip())) for part in first.split(","))
+    try:
+        first = text.strip().splitlines()[0]
+        temperature, used, total = (int(float(part.strip())) for part in first.split(","))
+    except (IndexError, ValueError) as exc:
+        raise HostError(f"nvidia-smi: непонятный ответ {text.strip()[:80]!r}") from exc
     return {"temperature_c": temperature, "memory_used_mb": used, "memory_total_mb": total}
 
 
@@ -122,8 +129,17 @@ class GenerationLock:
 class Host:
     """Everything that touches the real machine. Tests replace it whole."""
 
+    def __init__(self):
+        self._procs: dict[int, subprocess.Popen] = {}
+
     def _run(self, *cmd) -> str:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout
+        try:
+            done = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise HostError(f"{cmd[0]} недоступен: {exc}") from exc
+        if done.returncode != 0:
+            raise HostError(f"{cmd[0]} вернул код {done.returncode}: {done.stderr.strip()[:200]}")
+        return done.stdout
 
     def gpu_apps(self) -> list[dict]:
         return parse_compute_apps(self._run("nvidia-smi", "--query-compute-apps=pid,process_name,"
@@ -146,6 +162,7 @@ class Host:
             proc = subprocess.Popen(list(spec.cmd), cwd=spec.cwd, env={**os.environ, **spec.env},
                                     stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     start_new_session=True, pass_fds=tuple(pass_fds))
+        self._procs[proc.pid] = proc     # we are its parent: it must be reaped, or it stays a zombie
         return proc.pid, os.getpgid(proc.pid)
 
     def cmdline(self, pid: int) -> str | None:
@@ -167,6 +184,12 @@ class Host:
             pass
 
     def group_alive(self, pgid: int) -> bool:
+        # A dead leader that nobody waited for is a zombie, and killpg(pgid, 0) succeeds on a
+        # zombie -- reap our own child first so "dead" is reported as dead.
+        proc = self._procs.get(pgid)
+        if proc is not None:
+            if proc.poll() is not None:
+                del self._procs[pgid]
         try:
             os.killpg(pgid, 0)
             return True
@@ -257,11 +280,12 @@ class Dispatcher:
                    if self.host.pgid_of(app["pid"]) not in own_pgids]
         now = self.host.wall()
         seen = {app["pid"] for app in foreign}
-        for pid in list(self._first_seen):
-            if pid not in seen:
-                del self._first_seen[pid]
-        return [{**app, "first_seen": self._first_seen.setdefault(app["pid"], now)}
-                for app in foreign]
+        with self._state:      # /status and acquire both land here from different threads
+            for pid in list(self._first_seen):
+                if pid not in seen:
+                    self._first_seen.pop(pid, None)
+            return [{**app, "first_seen": self._first_seen.setdefault(app["pid"], now)}
+                    for app in foreign]
 
     def _stop(self, name: str, record: dict) -> None:
         """Called with `_ops` held and `_state` free: kill our group, wait, then forget it."""
@@ -274,6 +298,11 @@ class Dispatcher:
             if self.host.group_alive(pgid):
                 self.host.killpg(pgid, signal.SIGKILL)
         self._update(lambda state: state["engines"].pop(name, None))
+
+    def _release_lock_if_idle(self) -> None:
+        """No live engine of ours left means nobody inherited the lock fd: let go of it."""
+        if not self._own_records(self._snapshot()):
+            self.lock.release()
 
     def _release_all(self) -> list[str]:
         state = self._snapshot()
@@ -291,12 +320,25 @@ class Dispatcher:
             own[name] = {"pid": record["pid"], "variant": record.get("variant"),
                          "started_at": record["started_at"], "log": record["log"],
                          "ready": self.host.url_ok(self.specs[name].ready_url)}
-        return {"ok": True, "own": own, "foreign": self._foreign(self._own_records(state)),
-                "qwen": {"running": self.host.url_ok(QWEN_HEALTH),
-                         "unloaded_by_us": bool(state["qwen_was_running"])},
-                "lock": {"held_by_us": bool(own) or self.lock.held, "path": str(self.lock.path)},
-                "gpu": self.host.gpu_stats(),
-                "server_outputs_bytes": self.host.dir_size(self.server_outputs)}
+        errors = []
+        try:
+            foreign = self._foreign(self._own_records(state))
+        except HostError as exc:
+            foreign = []
+            errors.append(str(exc))
+        try:
+            gpu = self.host.gpu_stats()
+        except HostError as exc:
+            gpu = None
+            errors.append(str(exc))
+        answer = {"ok": True, "own": own, "foreign": foreign,
+                  "qwen": {"running": self.host.url_ok(QWEN_HEALTH),
+                           "unloaded_by_us": bool(state["qwen_was_running"])},
+                  "lock": {"held_by_us": bool(own) or self.lock.held, "path": str(self.lock.path)},
+                  "gpu": gpu, "server_outputs_bytes": self.host.dir_size(self.server_outputs)}
+        if errors:
+            answer["gpu_error"] = "; ".join(errors)
+        return answer
 
     def acquire(self, engine: str) -> dict:
         with self._ops:
@@ -305,6 +347,7 @@ class Dispatcher:
             record = state["engines"].get(engine)
             if record and not self._alive(engine, record):
                 self._update(lambda st: st["engines"].pop(engine, None))
+                self._release_lock_if_idle()
                 if not record.get("ready"):
                     return {"ok": True, "state": "failed", "engine": engine, "log": record["log"],
                             "reason": "движок не поднялся, смотрите лог"}
@@ -315,12 +358,17 @@ class Dispatcher:
                     return {"ok": True, "state": "ready", "engine": engine}
                 if self.host.wall() - record["started_at"] > spec.start_timeout:
                     self._stop(engine, record)
+                    self._release_lock_if_idle()
                     return {"ok": True, "state": "failed", "engine": engine, "log": record["log"],
                             "reason": f"движок не поднялся за {spec.start_timeout:g} с, "
                                       f"смотрите лог"}
                 return {"ok": True, "state": "starting", "engine": engine, "log": record["log"]}
             own = self._own_records(state)
-            foreign = self._foreign(own)
+            try:
+                foreign = self._foreign(own)
+            except HostError as exc:
+                return {"ok": True, "state": "wait", "engine": engine,
+                        "reason": f"nvidia-smi недоступен: {exc}", "foreign": []}
             if self.host.url_ok(QWEN_HEALTH):
                 return {"ok": True, "state": "wait_qwen", "engine": engine,
                         "reason": "Qwen держит карту", "foreign": foreign}
@@ -363,6 +411,9 @@ class Dispatcher:
             if not self._snapshot()["qwen_was_running"]:
                 return 409, {"ok": False, "error": {"code": "qwen_was_not_running",
                                                     "message": "Qwen не был запущен до выгрузки"}}
+            if self.host.url_ok(QWEN_HEALTH):      # someone already brought it back
+                self._update(lambda st: st.__setitem__("qwen_was_running", False))
+                return 200, {"ok": True, "state": "already_running"}
             self._release_all()
             self.host.start_qwen()
             self._update(lambda st: st.__setitem__("qwen_was_running", False))
@@ -389,12 +440,33 @@ def make_server(dispatcher: Dispatcher, host: str = "127.0.0.1", port: int = 879
             data = json.loads(self.rfile.read(length))
             return data if isinstance(data, dict) else {}
 
+        def _forbidden(self) -> bool:
+            # A browser page on this very machine can reach 127.0.0.1; ours never sends Origin.
+            if self.headers.get("Origin") is None:
+                return False
+            self._send(403, {"ok": False, "error": {"code": "forbidden",
+                                                    "message": "запросы из браузера не принимаются"}})
+            return True
+
         def do_GET(self):
-            if self.path == "/status":
-                return self._send(200, dispatcher.status())
-            self._send(404, {"ok": False, "error": {"code": "not_found", "message": self.path}})
+            if self._forbidden():
+                return
+            try:
+                if self.path == "/status":
+                    return self._send(200, dispatcher.status())
+                self._send(404, {"ok": False, "error": {"code": "not_found", "message": self.path}})
+            except Exception as exc:  # noqa: BLE001 -- answer JSON, do not drop the connection
+                self._send(500, {"ok": False, "error": {"code": "internal", "message": str(exc)}})
 
         def do_POST(self):
+            if self._forbidden():
+                return
+            try:
+                self._post()
+            except Exception as exc:  # noqa: BLE001
+                self._send(500, {"ok": False, "error": {"code": "internal", "message": str(exc)}})
+
+        def _post(self):
             try:
                 body = self._body()
             except ValueError:

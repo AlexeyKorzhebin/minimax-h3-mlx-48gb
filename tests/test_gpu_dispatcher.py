@@ -32,14 +32,19 @@ class FakeHost:
         self.t = 1000.0
         self.next_pid = 4242
         self.die_on_term = True
+        self.smi_down = None
         self.stats = {"temperature_c": 44, "memory_used_mb": 15, "memory_total_mb": 65536}
         self.exec_cmdlines = {"h3": "/home/alex/Projects/h3-lab/.venv312/bin/python3 /home/alex/Projects/h3-lab/.venv312/bin/sglang serve --model-type diffusion --model-path /home/alex/Models/Video/MiniMax-H3/model-package --model-id minimax-h3 --model-variant ref2va --num-gpus 1 --host 127.0.0.1 --port 30020",
                               "ltx": "/home/alex/Projects/comfy/.venv/bin/python main.py --port 8188 --output-directory /home/alex/Outputs/comfy/output --listen 127.0.0.1"}
 
     def gpu_apps(self):
+        if self.smi_down:
+            raise gd.HostError(self.smi_down)
         return [dict(app) for app in self.apps]
 
     def gpu_stats(self):
+        if self.smi_down:
+            raise gd.HostError(self.smi_down)
         return dict(self.stats)
 
     def url_ok(self, url):
@@ -239,6 +244,12 @@ def test_acquiring_ltx_stops_our_h3_first(tmp_path, host):
     assert answer["state"] == "starting"
     assert host.killed == [(4242, signal.SIGTERM)]
     assert [s[0] for s in host.spawned] == ["h3", "ltx"]
+    assert host.spawned[1][:4] == (
+        "ltx", ("/home/alex/Projects/comfy/.venv/bin/python", "main.py", "--port", "8188",
+                "--output-directory", "/home/alex/Outputs/comfy/output", "--listen", "127.0.0.1",
+                "--fast-disk", "--disable-auto-launch"),
+        "/home/alex/Projects/comfy/ComfyUI", {})
+    assert host.spawned[1][5] == 1
 
 
 def test_an_engine_that_died_before_ready_is_failed_with_its_log(tmp_path, host):
@@ -248,6 +259,7 @@ def test_an_engine_that_died_before_ready_is_failed_with_its_log(tmp_path, host)
     host.cmdlines.clear()
     assert d.acquire("h3") == {"ok": True, "state": "failed", "engine": "h3", "log": log,
                                "reason": "движок не поднялся, смотрите лог"}
+    assert _lock_is_free(tmp_path / "generation.lock")
 
 
 def test_an_engine_not_ready_in_time_is_killed_and_failed(tmp_path, host):
@@ -257,6 +269,7 @@ def test_an_engine_not_ready_in_time_is_killed_and_failed(tmp_path, host):
     assert d.acquire("h3") == {"ok": True, "state": "failed", "engine": "h3", "log": log,
                                "reason": "движок не поднялся за 450 с, смотрите лог"}
     assert host.killed[0] == (4242, signal.SIGTERM)
+    assert _lock_is_free(tmp_path / "generation.lock")
 
 
 def test_restarted_dispatcher_still_owns_its_engine(tmp_path, host):
@@ -376,3 +389,158 @@ def test_after_a_restart_switching_engines_frees_the_inherited_lock_first(tmp_pa
     finally:
         if holder.poll() is None:
             holder.kill()
+
+
+def test_a_comfy_on_another_port_at_our_ltx_pid_is_not_ours(tmp_path, host):
+    _dispatcher(tmp_path, host).acquire("ltx")
+    host.cmdlines[4242] = host.exec_cmdlines["ltx"].replace("--port 8188", "--port 8189")
+    reborn = _dispatcher(tmp_path, host)
+    assert reborn.release() == {"ok": True, "stopped": []}
+    assert host.killed == []
+
+
+def test_nvidia_smi_down_is_wait_not_a_free_card(tmp_path, host):
+    host.smi_down = "nvidia-smi вернул код 9"
+    answer = _dispatcher(tmp_path, host).acquire("h3")
+    assert answer == {"ok": True, "state": "wait", "engine": "h3", "foreign": [],
+                      "reason": "nvidia-smi недоступен: nvidia-smi вернул код 9"}
+    assert host.spawned == []
+
+
+def test_status_with_nvidia_smi_down_has_null_gpu_and_the_error(tmp_path, host):
+    host.smi_down = "nvidia-smi вернул код 9"
+    status = _dispatcher(tmp_path, host).status()
+    assert status["gpu"] is None
+    assert status["foreign"] == []
+    assert status["gpu_error"] == "nvidia-smi вернул код 9; nvidia-smi вернул код 9"
+
+
+def test_empty_nvidia_smi_answer_is_an_error_not_an_index_error():
+    with pytest.raises(gd.HostError):
+        gd.parse_gpu_stats("")
+
+
+def test_real_host_run_turns_failures_into_host_error(tmp_path):
+    h = gd.Host()
+    with pytest.raises(gd.HostError):
+        h._run("/nonexistent/nvidia-smi")
+    with pytest.raises(gd.HostError):
+        h._run(sys.executable, "-c", "import sys; sys.exit(3)")
+
+
+def test_http_unexpected_exception_is_a_500_json(tmp_path, host):
+    d = _dispatcher(tmp_path, host)
+    d.status = lambda: (_ for _ in ()).throw(RuntimeError('boom'))
+    server = gd.make_server(d, host="127.0.0.1", port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(f"http://127.0.0.1:{server.server_address[1]}/status", timeout=5)
+        assert caught.value.code == 500
+        assert json.loads(caught.value.read())["error"] == {"code": "internal", "message": "boom"}
+        d.acquire = lambda engine: (_ for _ in ()).throw(RuntimeError("bang"))
+        request = urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}/acquire",
+                                         data=b'{"engine":"h3"}', method="POST")
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5)
+        assert (caught.value.code, json.loads(caught.value.read())["error"]["message"]) == (500, "bang")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_request_with_an_origin_header_is_403(tmp_path, host):
+    server = gd.make_server(_dispatcher(tmp_path, host), host="127.0.0.1", port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        for method, path, data in (("GET", "/status", None), ("POST", "/acquire", b'{"engine":"h3"}')):
+            request = urllib.request.Request(base + path, data=data, method=method,
+                                             headers={"Origin": "http://evil.example"})
+            with pytest.raises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=5)
+            assert caught.value.code == 403
+        assert host.spawned == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_qwen_restore_when_qwen_is_already_healthy_does_not_start_it(tmp_path, host):
+    d = _dispatcher(tmp_path, host)
+    host.ok_urls.add(gd.QWEN_HEALTH)
+    d.qwen_unload()
+    assert d.qwen_restore() == (200, {"ok": True, "state": "already_running"})
+    assert host.qwen_calls == ["stop"]
+    assert d.status()["qwen"]["unloaded_by_us"] is False
+
+
+def test_first_seen_bookkeeping_happens_under_the_state_lock(tmp_path, host):
+    d = _dispatcher(tmp_path, host)
+
+    class Guarded(dict):
+        def _check(self):
+            assert d._state.locked(), "_first_seen touched without _state"
+
+        def setdefault(self, *a):
+            self._check()
+            return super().setdefault(*a)
+
+        def pop(self, *a):
+            self._check()
+            return super().pop(*a)
+
+    d._first_seen = Guarded({1: 1.0})
+    host.apps = [{"pid": 777, "name": "x", "memory_mb": 1}]
+    host.pgids[777] = 777
+    d.status()
+    assert dict(d._first_seen) == {777: 1000.0}
+
+
+def test_real_host_reaps_our_stopped_engine_instead_of_waiting_for_sigkill(tmp_path, monkeypatch):
+    """Our engine is the dispatcher's own child; after SIGTERM it is a zombie until waited for,
+    and killpg(pgid, 0) succeeds on a zombie. _stop used to sit out all 120 s and SIGKILL."""
+    import time as _time
+    monkeypatch.setattr(gd, "STOP_GRACE_SECONDS", 3.0)
+
+    class RealHost(gd.Host):
+        sent = []
+
+        def gpu_apps(self):
+            return []
+
+        def gpu_stats(self):
+            return {}
+
+        def url_ok(self, url):
+            return False
+
+        def cmdline(self, pid):
+            proc = self._procs.get(pid)
+            return "sleep 1000" if proc is not None and proc.poll() is None else None
+
+        def killpg(self, pgid, sig):
+            self.sent.append(sig)
+            try:
+                super().killpg(pgid, sig)
+            except PermissionError:      # macOS: killpg on a zombie group
+                pass
+
+    spec = gd.EngineSpec(name="h3", cmd=("sleep", "1000"), cwd=tmp_path, markers=("sleep",),
+                         log_dir=tmp_path, log_prefix="t", variant="ref2va", label="H3")
+    real = RealHost()
+    d = gd.Dispatcher(host=real, specs={"h3": spec}, state_path=tmp_path / "s.json",
+                      lock_path=tmp_path / "generation.lock", server_outputs=tmp_path / "so")
+    assert d.acquire("h3")["state"] == "starting"
+    pid = d.status()["own"]["h3"]["pid"]
+    started = _time.monotonic()
+    try:
+        assert d.release() == {"ok": True, "stopped": ["h3"]}
+        assert _time.monotonic() - started < 2.5
+        assert RealHost.sent == [signal.SIGTERM]
+    finally:
+        try:
+            import os as _os
+            _os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):   # already reaped / zombie
+            pass
