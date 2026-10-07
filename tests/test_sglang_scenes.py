@@ -12,6 +12,9 @@ from h3_48gb import queue as q
 from h3_48gb import web
 from h3_48gb.engines import sglang_args as sa
 
+#: Before conftest's autouse fixture replaces it with "never corrupt" for every test.
+_REAL_FRAME_IS_CORRUPT = assemble._frame_is_corrupt
+
 
 class _Submitted:
     def __init__(self, job_id):
@@ -180,6 +183,33 @@ def test_a_corrupt_last_frame_stops_the_chain(chain, monkeypatch):
         assemble.advance_project(proj, out / "queue", out,
                                  submit=lambda *a, **k: _Submitted("x"), run=_fake_run([]))
     assert p.load_project(proj.path).scenes[4]["status"] == "pending"
+
+
+def _clip(path, *, last_color=None):
+    """24 testsrc frames, 320x240, with a 32x24 box of the MLX zero-fill colour (1 % of the frame,
+    twice the MLX floor) on every frame; `last_color` paints the last frame flat."""
+    filters = ["drawbox=x=10:y=10:w=32:h=24:color=0x7c7468:t=fill"]
+    if last_color:
+        filters.append(f"drawbox=x=0:y=0:w=iw:h=ih:color={last_color}:t=fill:enable='eq(n,23)'")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "testsrc=size=320x240:rate=24", "-frames:v", "24", "-vf", ",".join(filters),
+                    "-c:v", "libx264", "-crf", "0", "-pix_fmt", "yuv444p", str(path)], check=True)
+    return path
+
+
+@pytest.mark.skipif(subprocess.run(["which", "ffmpeg"], capture_output=True).returncode != 0,
+                    reason="needs ffmpeg")
+def test_the_chain_keyframe_uses_the_sglang_frame_check(tmp_path, monkeypatch):
+    """Final review M1: sand-grey content over the MLX zero-fill floor chains; a flat frame not."""
+    monkeypatch.setattr(assemble, "_frame_is_corrupt", _REAL_FRAME_IS_CORRUPT)
+    sandy = _clip(tmp_path / "sandy.mp4")
+    out = assemble._extract_last_frame(sandy, tmp_path / "kf", 0, run=subprocess.run)
+    assert out == tmp_path / "kf" / "keyframe-000.png"
+    flat = _clip(tmp_path / "flat.mp4", last_color="0x204060")
+    with pytest.raises(assemble.AssembleError) as excinfo:
+        assemble._extract_last_frame(flat, tmp_path / "kf2", 1, run=subprocess.run)
+    assert str(excinfo.value) == (f"the last frame of {flat} is filled with one colour -- "
+                                  "refusing to chain the next scene off it")
 
 
 def test_overlap_constant_is_the_same_in_web_and_assemble():

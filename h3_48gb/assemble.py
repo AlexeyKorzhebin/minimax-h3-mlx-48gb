@@ -570,7 +570,7 @@ def _read_frame_rgb(image_path, *, run, workdir: Path) -> np.ndarray:
     return np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3)
 
 
-def _frame_is_corrupt(image_path, *, run, workdir: Path) -> bool:
+def _frame_is_corrupt(image_path, *, run, workdir: Path, engine: str = "mlx") -> bool:
     """`framecheck.is_frame_corrupt` on the still image at `image_path` -- `_extract_keyframe`'s
     and `_extract_valid_last_frame`'s own seam/zero-fill check, factored out to its own function so
     a test can monkeypatch corruption detection directly. `_read_frame_rgb` needs a real decodable
@@ -579,8 +579,14 @@ def _frame_is_corrupt(image_path, *, run, workdir: Path) -> bool:
     they never touch the filesystem -- so every test that does not care about this specific check
     monkeypatches this function to a fixed answer instead of trying to fake pixel bytes through
     `run`.
+
+    `engine="sglang"` (final review 2026-10-07, M1): only "the frame is filled with one colour"
+    (`framecheck.is_flat_frame`) -- the MLX zero-fill colour and tile seams are calibrations of the
+    MLX VAE, and the zero-fill one rejects clean sglang frames with sand-grey content.
     """
     frame = _read_frame_rgb(image_path, run=run, workdir=workdir)
+    if engine == "sglang":
+        return framecheck.is_flat_frame(frame)
     return framecheck.is_frame_corrupt(frame)
 
 
@@ -1260,8 +1266,8 @@ def _extract_last_frame(clip_path, dest_dir: Path, source_idx: int, *, run) -> P
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-sseof", "-1", "-i", str(clip_path),
            "-update", "1", "-q:v", "1", str(out_path)]
     _run_ffmpeg(cmd, run, "ffmpeg last-frame extraction")
-    if _frame_is_corrupt(out_path, run=run, workdir=dest_dir):
-        raise AssembleError(f"the last frame of {clip_path} reads as corrupt (zero-fill/tile-seam)"
+    if _frame_is_corrupt(out_path, run=run, workdir=dest_dir, engine="sglang"):
+        raise AssembleError(f"the last frame of {clip_path} is filled with one colour"
                             " -- refusing to chain the next scene off it")
     return out_path
 
