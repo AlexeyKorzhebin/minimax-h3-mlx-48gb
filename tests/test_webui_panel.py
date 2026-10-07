@@ -299,7 +299,8 @@ def test_cancel_button_and_library_edit_controls_and_request():
     assert html == ('<div class="lib-card"><b>@alice</b> <span class="muted">person, v2</span>'
                     '<p>a &quot;red&quot; coat</p><input class="lib-edit-desc" '
                     'value="a &quot;red&quot; coat"> <button type="button" class="lib-save" '
-                    'data-tag="@alice">Сохранить описание</button></div>')
+                    'data-tag="@alice">Сохранить описание</button>'
+                    '<p class="why lib-card-error" hidden></p></div>')
     assert _node_eval("console.log(JSON.stringify(app.libraryUpdateRequest('@alice', 'new')));") == {
         "name": "alice", "body": {"description": "new"}}
 
@@ -374,8 +375,10 @@ def test_a_render_exception_does_not_stop_notifications_or_the_poll():
 @_needs_node
 def test_a_refused_route_change_goes_through_withproject_and_the_box_is_put_back():
     assert _ui("route_error") == {
-        "puts": [["/api/projects/p1/route", {"upscale": True}]], "alerts": [],
-        "projectRereads": 1, "providerReloads": 0, "boxChecked": False}
+        "puts": [["/api/projects/p1/route", {"upscale": False}]], "alerts": [],
+        "projectRereads": 1, "providerReloads": 0, "boxChecked": True,
+        "errorHidden": False,
+        "errorHtml": '<b>Отказ: route_locked</b><pre>маршрут нельзя менять</pre>'}
 
 
 @_needs_node
@@ -394,7 +397,15 @@ def test_cancelling_the_running_job_shows_the_servers_message():
 @_needs_node
 def test_saving_a_library_description_puts_it_to_the_card_route():
     assert _ui("library_save") == {
-        "puts": [["/api/library/alice", {"description": "a woman in a green coat"}]]}
+        "puts": [["/api/library/alice", {"description": "a woman in a green coat"}]],
+        "cardError": {"hidden": True, "textContent": ""}, "addFormError": False}
+
+
+@_needs_node
+def test_a_refused_card_edit_is_shown_on_that_card_not_in_the_add_form():
+    assert _ui("library_save_error") == {
+        "cardError": {"hidden": False, "textContent": "карточка занята"},
+        "addFormErrorHidden": False}
 
 
 @_needs_node

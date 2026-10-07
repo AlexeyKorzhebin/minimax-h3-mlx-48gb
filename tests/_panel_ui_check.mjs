@@ -123,21 +123,24 @@ async function main() {
     // snapshot, so it must NOT fire again within the hour
     out = { afterFirst, afterSecond: notifications.splice(0) };
   } else if (scenario === "route_error") {
-    // the server refuses the tick: its own state keeps the upscale OFF, and the redraw after
-    // the refusal is what must put the checkbox back
-    await start({ "GET /api/projects/p1": ok(PROJECT({ route: [{ stage: "upscale", enabled: false }] })),
+    // the server has the upscale ON, the user unticks it, the server refuses: only a redraw from
+    // the server's state puts the tick back (the body is blanked first so a missing redraw shows)
+    await start({ "GET /api/projects/p1": ok(PROJECT({ route: [{ stage: "upscale", enabled: true }] })),
       "PUT /api/projects/p1/route": err(409, "route_locked", "маршрут нельзя менять") });
     fire("click", clickable({ dataset: { act: "open-project", id: "p1" }, match: (s) => s === "button[data-act]" }));
     await sleep(80);
     const before = { project: countCalls("GET", "/api/projects/p1"), providers: countCalls("GET", "/api/providers") };
-    const box = { checked: true, dataset: { id: "p1" }, classList: { contains: (c) => c === "route-upscale-box" },
+    getElementById("project-body").innerHTML = "STALE";
+    const box = { checked: false, dataset: { id: "p1" }, classList: { contains: (c) => c === "route-upscale-box" },
                   closest: () => null };
     fire("change", box);
     await sleep(120);
     out = { puts: calls.filter((c) => c.method === "PUT").map((c) => [c.url, c.body]), alerts,
             projectRereads: countCalls("GET", "/api/projects/p1") - before.project,
             providerReloads: countCalls("GET", "/api/providers") - before.providers,
-            boxChecked: /class="route-upscale-box"[^>]*checked/.test(getElementById("project-body").innerHTML) };
+            boxChecked: /class="route-upscale-box"[^>]*checked/.test(getElementById("project-body").innerHTML),
+            errorHidden: getElementById("project-err").hidden,
+            errorHtml: getElementById("project-err").innerHTML };
   } else if (scenario === "upscale_retry") {
     await start({ "GET /api/projects/p1": ok(PROJECT({ stages: { script: "approved", scenes: "done",
       upscale: "failed", assembly: "draft", scenario: "approved", track: "approved" } })),
@@ -168,12 +171,21 @@ async function main() {
     out = { deletes: calls.filter((c) => c.method === "DELETE").map((c) => c.url), alerts };
   } else if (scenario === "library_save") {
     await start({ "PUT /api/library/alice": ok({ ok: true, card: {} }) });
-    const card = { querySelector: () => ({ value: "  a woman in a green coat " }) };
+    const cardError = { hidden: true, textContent: "" };
+    const card = { querySelector: (sel) => (sel === ".lib-card-error" ? cardError : { value: "  a woman in a green coat " }) };
     // the card is found through `closest(".lib-card")` on the button
     const button = { dataset: { tag: "@alice" }, closest(sel) { return sel === ".lib-save" ? this : sel === ".lib-card" ? card : null; } };
     fire("click", button);
     await sleep(80);
-    out = { puts: calls.filter((c) => c.method === "PUT").map((c) => [c.url, c.body]) };
+    out = { puts: calls.filter((c) => c.method === "PUT").map((c) => [c.url, c.body]),
+            cardError, addFormError: getElementById("lib-error").hidden };
+  } else if (scenario === "library_save_error") {
+    await start({ "PUT /api/library/alice": err(409, "library_busy", "карточка занята") });
+    const cardError = { hidden: true, textContent: "" };
+    const card = { querySelector: (sel) => (sel === ".lib-card-error" ? cardError : { value: "x" }) };
+    fire("click", { dataset: { tag: "@alice" }, closest(sel) { return sel === ".lib-save" ? this : sel === ".lib-card" ? card : null; } });
+    await sleep(80);
+    out = { cardError, addFormErrorHidden: getElementById("lib-error").hidden };
   } else {
     fail(`unknown scenario ${scenario}`);
   }

@@ -284,7 +284,7 @@ export function libraryCardsHtml(cards, outdir) {
       + `<p>${escapeHtml(card.description)}</p>`
       + `<input class="lib-edit-desc" value="${escapeHtml(card.description)}"> `
       + `<button type="button" class="lib-save" data-tag="${escapeHtml(card.tag)}">`
-      + `Сохранить описание</button></div>`;
+      + `Сохранить описание</button><p class="why lib-card-error" hidden></p></div>`;
   }).join("");
 }
 
@@ -2953,14 +2953,16 @@ function startPage() {
    *  первом открытии (`openProjectModal`). Отказ на РЕфреше (сеть моргнула после действия,
    *  которое само уже прошло) не стирает то, что уже отрисовано, — только на самом первом
    *  открытии тело остаётся пустым под плашкой ошибки, потому что рисовать ещё нечего. */
-  async function refreshProjectDetail() {
+  async function refreshProjectDetail(keepError = false) {
     if (!project) return;
     const hadData = Boolean(project.project);
     try {
       const answer = await api("GET", "/api/projects/" + encodeURIComponent(project.id));
       if (!project || project.id !== answer.project.id) return;  // окно закрыли/сменили, пока шёл запрос
       project = { id: project.id, project: answer.project, active_job: answer.active_job };
-      clearProjectError();
+      // `keepError`: the refresh that follows a refused action must redraw the panel from the
+      // server's state without wiping the very message that explains the refusal.
+      if (!keepError) clearProjectError();
     } catch (error) {
       if (error.payload) showProjectError(error.payload);
       else showProjectError({ error: { message: "сервер не ответил" } });
@@ -3482,16 +3484,18 @@ function startPage() {
    *  открытую панель, если она есть). */
   async function withProject(action) {
     projectBusy = true;
+    let failed = false;
     try {
       await action();
       clearProjectError();
     } catch (error) {
+      failed = true;
       if (error.payload) showProjectError(error.payload);
       else showProjectError({ error: { message: "сервер не ответил" } });
     } finally {
       projectBusy = false;
       await poll();
-      if (project) await refreshProjectDetail();
+      if (project) await refreshProjectDetail(failed);
     }
   }
 
@@ -5055,14 +5059,15 @@ function startPage() {
 
   async function saveLibraryDescription(button) {
     const card = button.closest(".lib-card");
+    const cardError = card.querySelector(".lib-card-error");
     const request = libraryUpdateRequest(button.dataset.tag, card.querySelector(".lib-edit-desc").value.trim());
     try {
       await api("PUT", `/api/library/${encodeURIComponent(request.name)}`, request.body);
-      $("lib-error").hidden = true;
       await loadLibrary();
     } catch (err) {
-      $("lib-error").textContent = err.payload ? err.payload.error.message : String(err);
-      $("lib-error").hidden = false;
+      // next to the card being edited, not in the add form's own `#lib-error`
+      cardError.textContent = err.payload ? err.payload.error.message : String(err);
+      cardError.hidden = false;
     }
   }
 

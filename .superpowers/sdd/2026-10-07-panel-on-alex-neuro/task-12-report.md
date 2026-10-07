@@ -58,3 +58,10 @@ GREEN: tests/test_webui_panel.py 16 passed. Полный прогон: 1797 pass
 7. mlx: projectTagWarningsHtml/projectRouteHtml/projectUpscaleHtml/runCancelHtml принимают engine и на не-sglang возвращают ""; обработчик input на .scenario-prompt молчит на mlx. Тесты test_mlx_shows_no_tag_demands_and_no_upscale_checkbox, test_scene_prompt_input_demands_a_tag_on_sglang_and_stays_silent_on_mlx. Мутации: убрать engine-проверку в warnings -> assert '<ul class="t...ене</li></ul>' == ''; в route -> assert '<label class... сцен</label>' == ''; в runCancelHtml -> assert ' <button typ...нить</button>' == ''; в input-обработчике -> assert {'title': 'ну...sues', True]]} == {'title': '', 'toggles': []}.
 8. Второй POST release внутри try: ошибка -> alert + poll (тест release_second_fails_..., мутация п.6).
 Часовой пояс не трогал. Литерал-регэксп test_the_page_asks_for_its_own_routes: libraryUpdateRequest отдаёт `name`, путь собирается литералом в api(...).
+
+# Fix round 2
+
+Полный прогон: 1813 passed, 150 skipped, 0 failed.
+1. Ошибка withProject переживает перерисовку: refreshProjectDetail(keepError) не вызывает clearProjectError, withProject передаёт failed. Тест route_error: errorHidden False, errorHtml '<b>Отказ: route_locked</b><pre>маршрут нельзя менять</pre>'. Мутации: `clearProjectError();` безусловно -> `{'errorHidden': True} != {'errorHidden': False}`; без refresh после отказа -> `{'projectRereads': 0} != {'projectRereads': 1}`.
+2. route_error: сервер отдаёт upscale ON, пользователь снимает галочку (PUT {upscale:false}), сервер отказывает; #project-body перед кликом забит "STALE", поэтому boxChecked True означает именно перерисовку из состояния сервера.
+3. Ошибка правки карточки — в `<p class="why lib-card-error">` самой карточки (libraryCardsHtml, тест на точный HTML обновлён), #lib-error формы добавления не трогается. Тест test_a_refused_card_edit_is_shown_on_that_card_not_in_the_add_form; мутация (писать в $("lib-error")) -> `{'cardError': {'hidden': False, 'textContent': ''}} != {... 'карточка занята'}`.
