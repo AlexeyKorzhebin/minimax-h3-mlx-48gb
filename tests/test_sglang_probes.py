@@ -16,7 +16,9 @@ sys.modules["sglang_probes"] = probes
 _spec.loader.exec_module(probes)
 
 
-def test_beach_payload_is_chain_beach_head_scene_with_one_step():
+def test_beach_payload_is_chain_beach_head_scene_with_two_steps():
+    """Two, not one: the live server fails a 1-step H3 job ("requires num_inference_steps >= 2
+    because its video/audio sigma schedules include both interval endpoints", 2026-10-07)."""
     job = {"name": "beach-01", "duration": 7.0, "seed": 42, "short_edge": 512,
            "keyframe": "/home/alex/h3-bench/inputs/pano/beach-h.png",
            "refs": ["/home/alex/h3-bench/inputs/angelina/face_small.jpg"], "prompt": "P"}
@@ -28,7 +30,7 @@ def test_beach_payload_is_chain_beach_head_scene_with_one_step():
             {"type": "image", "uri": "/home/alex/Projects/h3-bench/inputs/angelina/face_small.jpg",
              "role": "reference"}],
         "target": {"short_edge": 512, "aspect_ratio": "16:9", "duration_seconds": 7.0},
-        "num_outputs_per_prompt": 1, "num_inference_steps": 1, "flow_shift": 12.0,
+        "num_outputs_per_prompt": 1, "num_inference_steps": 2, "flow_shift": 12.0,
         "audio_flow_shift": 3.0, "seed": 42, "quality": "lossless"}
 
 
@@ -148,3 +150,15 @@ def test_named_payload_steps_override_touches_only_the_step_count(tmp_path):
     plain = probes.named_payload("picture_numbering", tmp_path, beach_jobs=None, steps=None)
     more = probes.named_payload("picture_numbering", tmp_path, beach_jobs=None, steps=20)
     assert more == {**plain, "num_inference_steps": 20}
+
+
+def test_mirrored_numbering_differs_from_the_plain_one_only_by_the_sides(tmp_path):
+    """The control for spec §6 (a): if the red square follows <Subject 1> to the right edge when
+    the prompt swaps the sides, the placement comes from the numbering, not from the order."""
+    plain = probes.named_payload("picture_numbering", tmp_path, beach_jobs=None, steps=None)
+    mirrored = probes.named_payload("picture_numbering_mirrored", tmp_path, beach_jobs=None,
+                                    steps=None)
+    assert mirrored == {**plain, "prompt": plain["prompt"].replace(
+        "<Subject 1> stands at the left edge and <Subject 2> at the right edge",
+        "<Subject 1> stands at the right edge and <Subject 2> at the left edge")}
+    assert mirrored["prompt"] != plain["prompt"]

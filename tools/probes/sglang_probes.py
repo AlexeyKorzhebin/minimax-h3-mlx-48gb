@@ -4,7 +4,7 @@
 with a free GPU: it asks the dispatcher for H3 and gives up -- never waits -- if anything
 foreign holds the card. Results go to /home/alex/Outputs/h3-panel/probes/*.jsonl.
 
-Names: picture_numbering | keyframe_without_reference | eight_references | references:N | beach.
+Names: picture_numbering | picture_numbering_mirrored | keyframe_without_reference | eight_references | references:N | beach.
 `--together` posts every named probe back to back before polling any, so every POST after the
 first is timed while the server is already rendering (the adapter's 60 s timeout question)."""
 from __future__ import annotations
@@ -31,14 +31,15 @@ _PROBE_STEPS = 8
 
 
 def beach_payload(job: dict) -> dict:
-    """chain_beach.py:render's head-scene payload (keyframe + refs, 16:9), steps cut to 1."""
+    """chain_beach.py:render's head-scene payload (keyframe + refs, 16:9), steps cut to 2 (the
+    server's floor for H3: both sigma endpoints are in the schedule)."""
     conditions = [{"type": "image", "uri": job["keyframe"], "role": "keyframe", "frame_index": 0}]
     conditions += [{"type": "image", "uri": ref, "role": "reference"} for ref in job.get("refs", [])]
     return {"model": sg.MODEL, "prompt": job["prompt"], "task": "ref2va",
             "conditions": sg.normalize_h3_conditions(conditions),
             "target": {"short_edge": job["short_edge"], "aspect_ratio": "16:9",
                        "duration_seconds": float(job["duration"])},
-            "num_outputs_per_prompt": 1, "num_inference_steps": 1, "flow_shift": 12.0,
+            "num_outputs_per_prompt": 1, "num_inference_steps": 2, "flow_shift": 12.0,
             "audio_flow_shift": 3.0, "seed": int(job["seed"]), "quality": "lossless"}
 
 
@@ -104,6 +105,11 @@ def named_payload(name: str, workdir: Path, *, beach_jobs, steps) -> dict:
         payload = beach_payload(next(j for j in jobs if j["name"] == "beach-01"))
     elif name.startswith("references:"):
         payload = references_payload(workdir, int(name.split(":", 1)[1]))
+    elif name == "picture_numbering_mirrored":
+        plain = probe_payloads(workdir)["picture_numbering"]
+        payload = {**plain, "prompt": plain["prompt"].replace(
+            "<Subject 1> stands at the left edge and <Subject 2> at the right edge",
+            "<Subject 1> stands at the right edge and <Subject 2> at the left edge")}
     else:
         payload = probe_payloads(workdir)[name]
     return payload if steps is None else {**payload, "num_inference_steps": int(steps)}
@@ -190,7 +196,7 @@ def main(argv=None) -> int:
                                     steps=args.steps) for name in args.names}
 
     def finish(result: dict) -> None:
-        if result.get("result") == "completed" and result["probe"] == "picture_numbering":
+        if result.get("result") == "completed" and result["probe"].startswith("picture_numbering"):
             _frames(client, result, stem)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         with out_path.open("a", encoding="utf-8") as stream:
