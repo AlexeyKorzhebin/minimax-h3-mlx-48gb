@@ -1113,3 +1113,27 @@ CHAT_EXPECTED = {
 @pytest.mark.parametrize("scenario", sorted(CHAT_EXPECTED))
 def test_chat_wiring(scenario):
     assert _gaps(scenario) == CHAT_EXPECTED[scenario]
+
+
+DRAFT_JOB = ("{id: 'j9', kind: 'assemble', exit_code: 0, note: 'draft assemble project p1', "
+             "output_stem: '/o/projects/p1/assembly/job-draft', estimate: {}, "
+             "started_at: '2026-10-07T12:00:00Z', finished_at: '2026-10-07T12:01:00Z'}")
+
+
+@_needs_node
+def test_the_draft_assembly_tile_points_at_its_own_file():
+    final = DRAFT_JOB.replace("draft assemble project p1", "assemble project p1").replace("job-draft", "job-final")
+    assert _js(f"[app.assembleFinalUrl({DRAFT_JOB}, '/o'), app.assembleFinalUrl({final}, '/o')]") == [
+        "/media/projects%2Fp1%2Fassembly/draft.mp4?v=2026-10-07T12%3A01%3A00Z",
+        "/media/projects%2Fp1%2Fassembly/final.mp4?v=2026-10-07T12%3A01%3A00Z"]
+    html = _js(f"app.finishedRowHtml({DRAFT_JOB}, '/o', [], new Set(), undefined)")
+    assert re.search(r'<div class="link">.*?</div>', html).group(0) == (
+        '<div class="link"><a class="clip" href="/media/projects%2Fp1%2Fassembly/draft.mp4'
+        '?v=2026-10-07T12%3A01%3A00Z">job-draft.mp4</a></div>')
+
+
+@_needs_node
+def test_an_assembly_outside_the_outdir_gets_no_link():
+    outside = DRAFT_JOB.replace("/o/projects", "/elsewhere/projects")
+    assert _js(f"app.assembleFinalUrl({outside}, '/o')") is None
+    assert 'href="/media' not in _js(f"app.finishedRowHtml({outside}, '/o', [], new Set(), undefined)")

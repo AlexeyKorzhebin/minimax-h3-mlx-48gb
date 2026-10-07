@@ -979,7 +979,9 @@ export function assembleFinalUrl(job, outdir) {
   const stem = String(job.output_stem || "");
   const lastSlash = stem.lastIndexOf("/");
   if (lastSlash < 0) return null;
-  const finalStem = `${stem.slice(0, lastSlash)}/final`;
+  // the draft assembly (`--draft`) writes its own `draft.mp4` beside `final.mp4`
+  const file = /^draft assemble project /.test(String(job.note || "")) ? "draft" : "final";
+  const finalStem = `${stem.slice(0, lastSlash)}/${file}`;
   const parts = mediaParts(finalStem, outdir);
   if (!parts) return null;
   const url = `/media/${encodeURIComponent(parts.run)}/${encodeURIComponent(parts.stem + ".mp4")}`;
