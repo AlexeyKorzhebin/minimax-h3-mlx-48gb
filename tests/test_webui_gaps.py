@@ -1185,6 +1185,12 @@ H3_EXPECTED = {
     "h3_prompt_refused": {"shown": False, "errorHidden": False,
                           "error": "<b>Запрос не прошёл</b><pre>scene 0: 190 frames is off sglang's grid</pre>"},
     "h3_prompt_goes_out_on_edit": {"removed": 1, "shownAfterRedraw": False},
+    # a field moved while the GET was in flight: its answer is stale and is never drawn
+    "h3_prompt_late_answer_dropped": {"shown": False},
+    "h3_prompt_dropped_by_reference_change": {"shown": False},
+    "h3_prompt_answer_kept_when_nothing_moved": {"shown": True},
+    "h3_prompt_refused_off_grid": {"error": "<b>Длительность сцены не на сетке H3</b><pre>Сохраните "
+                                            "сценарий заново: длительность подгонится под сетку.</pre>"},
 }
 
 
@@ -1192,3 +1198,23 @@ H3_EXPECTED = {
 @pytest.mark.parametrize("scenario", sorted(H3_EXPECTED))
 def test_h3_prompt_wiring(scenario):
     assert _gaps(scenario) == H3_EXPECTED[scenario]
+
+
+@_needs_node
+def test_error_text_for_the_h3_prompt_refusals():
+    assert _js("[app.errorText({error: {code: 'duration_off_grid', message: \"scene 0: 190 frames is off sglang's 17n+5 grid\"}}), "
+               "app.errorText({error: {code: 'project_scene_not_found', message: 'scene 9'}})]") == [
+        {"title": "Длительность сцены не на сетке H3",
+         "pre": "Сохраните сценарий заново: длительность подгонится под сетку."},
+        {"title": "Такой сцены нет в сохранённом проекте",
+         "pre": "Сохраните сценарий и повторите."}]
+
+
+@_needs_node
+def test_h3_prompt_lists_its_audio():
+    answer = ("{idx: 0, prompt: 'P', pictures: [], audios: ['/o/library/v/v1/01-v.mp3', '/o/t.wav'], "
+              "keyframe: {kind: null, path: null}, duration: 8, seed: 1, steps: 50}")
+    assert _js(f"app.h3PromptHtml({answer}, '/o')") == (
+        '<div class="h3-prompt" data-idx="0">'
+        '<p class="hint">доставляется 8 с · сид 1 · 50 шагов · без первого кадра</p><pre>P</pre>'
+        '<p class="hint">аудио: 01-v.mp3, t.wav</p></div>')

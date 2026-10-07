@@ -717,6 +717,54 @@ const SCENARIOS = {
     return { shown: /<div class="h3-prompt"/.test(getElementById("project-body").innerHTML),
              errorHidden: getElementById("project-err").hidden, error: getElementById("project-err").innerHTML };
   },
+  async h3_prompt_late_answer_dropped() {
+    const answer = { ok: true, idx: 0, prompt: "P", pictures: [], audios: [],
+                     keyframe: { kind: null, path: null }, duration: 8, seed: 42, steps: 50 };
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1/scenes/0/h3-prompt":
+      () => sleep(80).then(() => ok(answer)) }));
+    await open();
+    fire("click", clickable({ dataset: { act: "scene-h3-prompt", id: "p1", idx: "0" },
+      match: (sel) => sel === "button[data-act]" }));
+    await sleep(30);                       // the GET is in flight: the person types
+    queryAll[FIELDS] = [field("prompt", 0, "@a jumps far")];
+    fire("input", { value: "@a jumps far", selectionStart: 0, title: "", dataset: { sceneField: "prompt", idx: "0" },
+      classList: { toggle() {}, contains: () => false },
+      closest(sel) { return sel === "[data-scene-field]" ? this : null; } });
+    await sleep(200);
+    return { shown: /<div class="h3-prompt"/.test(getElementById("project-body").innerHTML) };
+  },
+  async h3_prompt_dropped_by_reference_change() {
+    const answer = { ok: true, idx: 0, prompt: "P", pictures: [], audios: [],
+                     keyframe: { kind: null, path: null }, duration: 8, seed: 42, steps: 50 };
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1/scenes/0/h3-prompt":
+      () => sleep(80).then(() => ok(answer)), "PUT /api/projects/p1/references": ok({ ok: true, references: [] }) }));
+    await open();
+    fire("click", clickable({ dataset: { act: "scene-h3-prompt", id: "p1", idx: "0" },
+      match: (sel) => sel === "button[data-act]" }));
+    await sleep(30);                       // the GET is in flight: a reference is ticked
+    const pin = { checked: true, dataset: { tag: "@a" }, classList: { contains: (c) => c === "ref-pin" } };
+    const box = { dataset: { id: "p1" }, querySelectorAll: (sel) => (sel === ".ref-pin" ? [pin] : []) };
+    pin.closest = (sel) => (sel === ".project-refs" ? box : null);
+    fire("change", pin);
+    await sleep(250);
+    return { shown: /<div class="h3-prompt"/.test(getElementById("project-body").innerHTML) };
+  },
+  async h3_prompt_answer_kept_when_nothing_moved() {
+    const answer = { ok: true, idx: 0, prompt: "P", pictures: [], audios: [],
+                     keyframe: { kind: null, path: null }, duration: 8, seed: 42, steps: 50 };
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1/scenes/0/h3-prompt":
+      () => sleep(80).then(() => ok(answer)) }));
+    await open();
+    await act("scene-h3-prompt", { idx: "0" });
+    return { shown: /<div class="h3-prompt"/.test(getElementById("project-body").innerHTML) };
+  },
+  async h3_prompt_refused_off_grid() {
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1/scenes/0/h3-prompt": { status: 400,
+      body: { ok: false, error: { code: "duration_off_grid", message: "scene 0: 190 frames is off sglang's 17n+5 grid" } } } }));
+    await open();
+    await act("scene-h3-prompt", { idx: "0" });
+    return { error: getElementById("project-err").innerHTML };
+  },
   async h3_prompt_goes_out_on_edit() {
     const answer = { ok: true, idx: 0, prompt: "P", pictures: [], audios: [],
                      keyframe: { kind: null, path: null }, duration: 8, seed: 42, steps: 50 };

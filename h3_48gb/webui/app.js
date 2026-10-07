@@ -749,6 +749,9 @@ export function h3PromptHtml(answer, outdir) {
   }).join("");
   return `<div class="h3-prompt" data-idx="${answer.idx}"><p class="hint">${escapeHtml(hint)}</p>`
     + `<pre>${escapeHtml(answer.prompt)}</pre>`
+    + ((answer.audios || []).length
+      ? `<p class="hint">аудио: ${escapeHtml(answer.audios.map((path) => String(path).split("/").pop()).join(", "))}</p>`
+      : "")
     + (figures ? `<div class="h3-pictures">${figures}</div>` : "") + `</div>`;
 }
 
@@ -2203,6 +2206,12 @@ export function errorText(payload) {
       // единственная причина: неизвестное имя параметра лимита вывода).
       return { title: "У провайдера в настройках неизвестный параметр лимита вывода",
                pre: error.message };
+    // `GET .../h3-prompt`: the server's own words are English (an `AssembleError` text) or terse
+    case "duration_off_grid":
+      return { title: "Длительность сцены не на сетке H3",
+               pre: "Сохраните сценарий заново: длительность подгонится под сетку." };
+    case "project_scene_not_found":
+      return { title: "Такой сцены нет в сохранённом проекте", pre: "Сохраните сценарий и повторите." };
     case "chat_truncated":
       // Не то же, что `bad_model_json`: там модель ответила текстом не той формы, тут её
       // оборвали по лимиту вывода раньше, чем она вообще договорила — повтор с тем же лимитом
@@ -3143,6 +3152,7 @@ function startPage() {
   let sceneDraftDirty = false;  // the person changed something the server has not seen
   let draftEpoch = 0;           // version of the draft the editor DOM was drawn from
   let scenarioJsonText = "";     // what is typed in «Вставить сценарий JSON»: survives redraws
+  let draftVersion = 0;        // bumped by anything that makes a «Промпт для H3» answer stale
   let h3Prompts = {};          // idx -> answer of GET .../h3-prompt; any edit of the draft drops them
   let retryOpen = null;        // idx of the scene whose retry panel is open
   let retryEdits = null;       // what is typed in it, kept across redraws
@@ -3687,14 +3697,20 @@ function startPage() {
     sceneDraft = draft.length ? draft : addScene([]);
     sceneDraftDirty = false;
     sceneDraftError = null;
-    h3Prompts = {};
+    invalidateH3Prompts();
     draftEpoch += 1;
   }
 
   /** The draft changed: unsaved, and any shown «Промпт для H3» is stale. */
   function touchDraft() {
     sceneDraftDirty = true;
+    invalidateH3Prompts();
+  }
+
+  /** A shown or in-flight «Промпт для H3» no longer matches what would be built now. */
+  function invalidateH3Prompts() {
     h3Prompts = {};
+    draftVersion += 1;
   }
 
   /** Reads the editor fields into the draft -- but only when the DOM was drawn from the current
@@ -5722,9 +5738,11 @@ function startPage() {
       withProject(async () => {
         // what goes to sglang is built from the saved scene: unsaved edits are saved first
         if (sceneDraft && sceneDraftDirty) await saveSceneDraft(id);
+        const version = draftVersion;
         const answer = await api("GET",
           `/api/projects/${encodeURIComponent(id)}/scenes/${encodeURIComponent(idx)}/h3-prompt`);
-        h3Prompts = { ...h3Prompts, [idx]: answer };
+        // an edit (a field, a reference, a setting) while the answer was on its way makes it stale
+        if (version === draftVersion) h3Prompts = { ...h3Prompts, [idx]: answer };
       });
       return;
     }
@@ -5911,6 +5929,7 @@ function startPage() {
         showProjectError({ error: { clientTitle: "Сид не сохранён", message: "Сид — целое число от 0" } });
         return;
       }
+      invalidateH3Prompts();    // the seed is part of what «Промпт для H3» shows
       withProject(async () => {
         settingsSaved = null;
         await api("PUT", `/api/projects/${encodeURIComponent(id)}/settings`, { seed });
@@ -5940,6 +5959,7 @@ function startPage() {
       const chosen = {};
       for (const select of box.querySelectorAll(".ref-version")) chosen[select.dataset.tag] = Number(select.value);
       const refsBody = referencesPayload(refs, project.project.references || [], chosen);
+      invalidateH3Prompts();    // references decide <Picture k> and the subject definitions
       withProject(() => api("PUT", `/api/projects/${encodeURIComponent(box.dataset.id)}/references`,
                             { references: refsBody }));
     }
@@ -5949,6 +5969,7 @@ function startPage() {
     const field = event.target.closest(".i2v-prefix");
     if (!field || !project || !project.project) return;
     if (field.value === (project.project.i2v_prefix || "")) return;
+    invalidateH3Prompts();      // i2v_prefix is part of a chained scene's prompt
     withProject(async () => {
       settingsSaved = null;
       await api("PUT", `/api/projects/${encodeURIComponent(field.dataset.id)}/settings`,
