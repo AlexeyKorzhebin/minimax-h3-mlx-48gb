@@ -42,12 +42,15 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from h3_48gb import provider
+from h3_48gb import engine, provider
 from h3_48gb import queue as q
 
 #: The file whose `flock` means "a worker is running on this machine". Probed by the web server
 #: (`worker.state` in the design spec) and taken exclusively, non-blocking, by `hold_worker_lock`.
 WORKER_LOCK_NAME = "worker.lock"
+
+#: `sys.platform`, as a module attribute so a test can pretend to be Linux on the Mac.
+_PLATFORM = sys.platform
 
 #: The one subprocess this worker is currently waiting on, or `None`. Written by `run_job` and read
 #: only by the signal handler, which needs to reach the child from a context that is given no
@@ -70,7 +73,7 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def job_command(job, python: str = sys.executable) -> list[str]:
+def job_command(job, python: str = sys.executable, *, platform: str | None = None) -> list[str]:
     """The exact argv for a job: `caffeinate -dimsu <python> -m h3_48gb <job.args...>`.
 
     `job.args` is passed through untranslated -- it is already the literal argument list `h3`
@@ -79,8 +82,14 @@ def job_command(job, python: str = sys.executable) -> list[str]:
     `python` defaults to the interpreter running the worker so the child lands in the same
     virtualenv, with the same MLX build, without depending on `PATH` or on the `h3` console script
     being installed.
+
+    `caffeinate` exists only on macOS; on alex-neuro the job runs bare -- nothing there idle-sleeps
+    a server.
     """
-    return ["caffeinate", "-dimsu", python, "-m", "h3_48gb", *job.args]
+    command = [python, "-m", "h3_48gb", *job.args]
+    if (platform or _PLATFORM) == "darwin":
+        return ["caffeinate", "-dimsu", *command]
+    return command
 
 
 #: How long `hold_worker_lock` waits before its one retry. Long enough to outlast the web server's
@@ -168,7 +177,7 @@ def _project_arg(args: list[str]) -> Path:
 
 
 @contextlib.contextmanager
-def _caffeinate_block(spawn=subprocess.Popen):
+def _caffeinate_block(spawn=subprocess.Popen, *, platform: str | None = None):
     """Hold the machine awake (`caffeinate -dimsu`, no target command) for the duration of the
     block -- the in-process equivalent of what a `KIND_GENERATE` job gets for free by putting
     `caffeinate` in front of the spawned child's own argv (`job_command`). `KIND_SONG`/
@@ -200,7 +209,12 @@ def _caffeinate_block(spawn=subprocess.Popen):
     for the `finally` (a `caffeinate` that already believes the "normal" case's `terminate()` reached
     it will simply see its watched process gone one instruction later and exit anyway), it is what
     closes the gap the `finally` cannot.
+
+    Off macOS there is no `caffeinate` and nothing to hold awake: the block just yields.
     """
+    if (platform or _PLATFORM) != "darwin":
+        yield
+        return
     proc = spawn(["caffeinate", "-dimsu", "-w", str(os.getpid())])
     try:
         yield
@@ -973,7 +987,7 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir
                 if stop.wait(poll):
                     break
                 continue
-            if _llm_holds_gpu(outdir):
+            if not engine.is_sglang() and _llm_holds_gpu(outdir):
                 if stop.wait(poll):
                     break
                 continue

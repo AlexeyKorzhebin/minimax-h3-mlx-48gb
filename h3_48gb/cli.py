@@ -146,6 +146,8 @@ def baked_grid_points(checkpoint: Path) -> int | None:
 #: MCP wrapper needs is here: match on `error.code`, never on `error.message` — the sentence can
 #: be reworded for clarity at any time; the code cannot, without a deliberate, documented break.
 ERROR_CODES = {
+    "engine_unknown": "H3_ENGINE names an engine other than mlx or sglang",
+    "reveal_unsupported": "reveal-in-Finder was asked for on a machine that is not macOS",
     "geometry_not_multiple_of_32": "--width or --height is not a multiple of 32; the port cannot pack it",
     "schedule_not_baked": "--steps does not equal the one grid size the baked AdaLN table covers",
     "checkpoint_not_found": "`resume` was asked for, but no checkpoint matches this run's identity; "
@@ -1473,6 +1475,15 @@ def queue_root(outdir) -> Path:
     return Path(outdir) / "queue"
 
 
+def _require_known_engine() -> str:
+    from h3_48gb import engine
+
+    try:
+        return engine.current()
+    except engine.UnknownEngine as exc:
+        raise CliError("engine_unknown", str(exc), {}) from exc
+
+
 def run_worker(outdir: Path, poll: float = 5.0) -> dict:
     """Run the queue worker until it is asked to stop, and report how many jobs it got through.
 
@@ -1491,6 +1502,7 @@ def run_worker(outdir: Path, poll: float = 5.0) -> dict:
     that. Relying on the default (`Path(root).parent`) would happen to work today only because the
     two calls agree by construction -- passing it here says so instead of leaving it implicit.
     """
+    _require_known_engine()
     from h3_48gb.worker import WorkerAlreadyRunning, main_loop
 
     outdir = Path(outdir)
@@ -1525,6 +1537,7 @@ def run_web(outdir: Path, port: int = 8765, host: str = "127.0.0.1") -> dict:
     `Ctrl-C` is the documented way to stop it, so `KeyboardInterrupt` is a normal exit rather than
     a traceback: the socket is closed and the report is returned.
     """
+    _require_known_engine()
     from h3_48gb import web
 
     outdir = Path(outdir)

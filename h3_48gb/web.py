@@ -48,6 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from h3_48gb import assemble as assemble_module
+from h3_48gb import engine
 from h3_48gb import project as project_module
 from h3_48gb import provider
 from h3_48gb import queue as q
@@ -70,6 +71,9 @@ _log = logging.getLogger(__name__)
 #: could hold `0.0.0.0` is a flag someone eventually sets, and this server has no authentication of
 #: any kind behind which that would be survivable.
 LOOPBACK = "127.0.0.1"
+
+#: `sys.platform`, as a module attribute so a test can pretend to be Linux on the Mac.
+_PLATFORM = sys.platform
 
 #: Default port for `h3 web`. High, fixed, and unprivileged so the page can be bookmarked.
 DEFAULT_PORT = 8765
@@ -485,6 +489,7 @@ def _upload_stamp() -> str:
 #: rather than being wrong -- the job left `pending/` between the page's last poll and this
 #: request. It is mapped here *before* task 6 raises it, on purpose; see `PLANNED_CODES`.
 ERROR_STATUS = {
+    "reveal_unsupported": 409,
     "host_not_allowed": 403,
     # A separate code from `host_not_allowed`, and separate on purpose: `Host` answers "which name
     # did you arrive by", `Origin` answers "which page started this", and the two need different
@@ -795,6 +800,8 @@ def build_state(queue_root, outdir) -> dict:
 
     return {
         "ok": True,
+        "engine": engine.current(),
+        "platform": _PLATFORM,
         "worker": {"state": state},
         "paused": paused,
         "outdir": str(Path(outdir).resolve()),
@@ -3737,6 +3744,10 @@ class _Handler(BaseHTTPRequestHandler):
         `self.server.reveal` is the seam a test replaces (`make_server(..., reveal=...)`); in
         production it is `_reveal_in_finder`, which shells out to `open -R`.
         """
+        if _PLATFORM != "darwin":
+            raise CliError("reveal_unsupported",
+                           "«Показать в Finder» есть только на macOS; файл лежит на сервере",
+                           {"platform": _PLATFORM})
         jobs, _broken = q.scan(self.server.queue_root)
         job = next((candidate for candidate in jobs if candidate.id == raw_id
                    and candidate.state in ("done", "failed")), None)

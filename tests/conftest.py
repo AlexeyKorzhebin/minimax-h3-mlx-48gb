@@ -27,3 +27,16 @@ def _frame_is_corrupt_default(monkeypatch):
     from h3_48gb import assemble
 
     monkeypatch.setattr(assemble, "_frame_is_corrupt", lambda *a, **k: False)
+
+
+#: Every environment variable the panel reads. Cleared before each test so that a test run inside
+#: the Docker image (where H3_ENGINE=sglang is baked in) exercises the same defaults as one on the
+#: Mac; a test that needs sglang sets it explicitly with monkeypatch.setenv.
+_PANEL_ENV = ("H3_ENGINE", "H3_ALLOWED_HOSTS", "H3_MAX_REF_IMAGES", "H3_SGLANG_URL", "H3_COMFY_URL",
+              "H3_DISPATCHER_URL", "H3_IDLE_RELEASE_MIN", "H3_COMFY_OUTPUT_DIR")
+
+
+@pytest.fixture(autouse=True)
+def _panel_env_cleared(monkeypatch):
+    for name in _PANEL_ENV:
+        monkeypatch.delenv(name, raising=False)
