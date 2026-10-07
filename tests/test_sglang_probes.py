@@ -162,3 +162,12 @@ def test_mirrored_numbering_differs_from_the_plain_one_only_by_the_sides(tmp_pat
         "<Subject 1> stands at the left edge and <Subject 2> at the right edge",
         "<Subject 1> stands at the right edge and <Subject 2> at the left edge")}
     assert mirrored["prompt"] != plain["prompt"]
+
+
+def test_named_payload_duration_override_touches_only_the_duration(tmp_path):
+    """Peak memory grows with the clip: the reference-count probe is also run at 10 s."""
+    plain = probes.named_payload("references:6", tmp_path, beach_jobs=None, steps=None)
+    longer = probes.named_payload("references:6", tmp_path, beach_jobs=None, steps=2,
+                                  duration=10.0)
+    assert longer == {**plain, "num_inference_steps": 2,
+                      "target": {**plain["target"], "duration_seconds": 10.0}}

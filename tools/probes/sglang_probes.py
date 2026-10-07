@@ -99,7 +99,7 @@ def probe_payloads(workdir: Path) -> dict[str, dict]:
     }
 
 
-def named_payload(name: str, workdir: Path, *, beach_jobs, steps) -> dict:
+def named_payload(name: str, workdir: Path, *, beach_jobs, steps, duration=None) -> dict:
     if name == "beach":
         jobs = json.loads(Path(beach_jobs).read_text(encoding="utf-8"))["jobs"]
         payload = beach_payload(next(j for j in jobs if j["name"] == "beach-01"))
@@ -112,6 +112,8 @@ def named_payload(name: str, workdir: Path, *, beach_jobs, steps) -> dict:
             "<Subject 1> stands at the right edge and <Subject 2> at the left edge")}
     else:
         payload = probe_payloads(workdir)[name]
+    if duration is not None:
+        payload = {**payload, "target": {**payload["target"], "duration_seconds": float(duration)}}
     return payload if steps is None else {**payload, "num_inference_steps": int(steps)}
 
 
@@ -183,6 +185,7 @@ def main(argv=None) -> int:
     parser.add_argument("--together", action="store_true",
                         help="post all probes first, then poll (POST timed under load)")
     parser.add_argument("--steps", type=int, default=None, help="override num_inference_steps")
+    parser.add_argument("--duration", type=float, default=None, help="override seconds")
     parser.add_argument("--beach-jobs", type=Path, default=BEACH_JOBS)
     args = parser.parse_args(argv)
     dispatcher = DispatcherClient()
@@ -193,7 +196,8 @@ def main(argv=None) -> int:
     stem = f"{datetime.now():%Y%m%d-%H%M%S}"
     out_path = OUT_DIR / f"{stem}.jsonl"
     payloads = {name: named_payload(name, OUT_DIR / "inputs", beach_jobs=args.beach_jobs,
-                                    steps=args.steps) for name in args.names}
+                                    steps=args.steps, duration=args.duration)
+                for name in args.names}
 
     def finish(result: dict) -> None:
         if result.get("result") == "completed" and result["probe"].startswith("picture_numbering"):
