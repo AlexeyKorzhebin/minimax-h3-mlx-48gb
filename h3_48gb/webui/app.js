@@ -176,7 +176,7 @@ const TAG_IN_TEXT = /(?<![\w@.])@([A-Za-z0-9-]+)/g;
 const TAG_OK = /^@[a-z0-9-]{2,32}$/;
 
 /** @-теги сцены, которые не уйдут в H3 (спека §3.5): незнакомые проекту и написанные не так. */
-export function sceneTagIssues(text, pinnedTags, { needsTag = false } = {}) {
+export function sceneTagIssues(text, pinnedTags, { needsTag = false, refs = [] } = {}) {
   const issues = [];
   const seen = new Set();
   for (const match of String(text || "").matchAll(TAG_IN_TEXT)) {
@@ -186,7 +186,8 @@ export function sceneTagIssues(text, pinnedTags, { needsTag = false } = {}) {
     if (!TAG_OK.test(tag)) issues.push({ tag, problem: "invalid" });
     else if (!pinnedTags.includes(tag)) issues.push({ tag, problem: "unknown" });
   }
-  if (needsTag && seen.size === 0) issues.push({ tag: null, problem: "missing" });
+  // a scene with refs needs no tag in its text: the refs carry the pictures (626db48d)
+  if (needsTag && seen.size === 0 && !(refs && refs.length)) issues.push({ tag: null, problem: "missing" });
   return issues;
 }
 
@@ -204,7 +205,7 @@ export function projectTagWarningsHtml(proj, engine) {
   const needsTag = proj.kind !== "clip";
   const rows = [];
   for (const scene of proj.scenes || []) {
-    for (const issue of sceneTagIssues(scene.prompt, pinned, { needsTag })) {
+    for (const issue of sceneTagIssues(scene.prompt, pinned, { needsTag, refs: scene.refs || [] })) {
       rows.push(`<li>Сцена ${scene.idx}: ${escapeHtml(TAG_PROBLEM_TEXT[issue.problem](issue.tag))}</li>`);
     }
   }
@@ -351,6 +352,7 @@ function sceneEditHtml(scene, idx, total, ctx) {
   const sglang = ctx.engine === "sglang";
   const { min, max } = sceneBounds(ctx.engine);
   const chained = idx > 0 && !scene.fresh_start;
+  const pinnedTags = (ctx.pinned || []).filter((card) => card.kind !== "voice").map((card) => card.tag);
   const num = (value) => (value === null || value === undefined || Number.isNaN(value) ? "" : value);
   const button = (act, label, disabled) => `<button type="button" class="ghost" data-act="${act}" `
     + `data-idx="${idx}"${disabled ? " disabled" : ""}>${label}</button>`;
@@ -374,7 +376,11 @@ function sceneEditHtml(scene, idx, total, ctx) {
     + button("scene-up", "↑", idx === 0) + button("scene-down", "↓", idx === total - 1)
     + (total > 1 ? button("scene-del", "Удалить", false) : "") + `</div>`
     + `<textarea class="inp scene-edit-prompt" data-scene-field="prompt" data-idx="${idx}" rows="4">`
-    + `${escapeHtml(scene.prompt)}</textarea><div class="scene-edit-row">${row.join("")}</div>`
+    + `${escapeHtml(scene.prompt)}</textarea>`
+    + (sglang ? `<div class="tag-hint-slot" data-idx="${idx}"></div>`
+      + sceneRefsHtml(scene, idx, pinnedTags) : "")
+    + `<div class="scene-edit-row">${row.join("")}</div>`
+    + (idx === 0 ? startImageFieldHtml(scene.start_image, ctx.pinned || [], ctx.outdir) : "")
     + (ctx.error && ctx.error.idx === idx
       ? `<span class="hint bad scene-edit-error" data-idx="${idx}">${escapeHtml(ctx.error.message)}</span>` : "")
     + `</div>`;
@@ -391,6 +397,115 @@ export function sceneEditorHtml(draft, ctx) {
     + `<button type="button" class="ghost" data-act="scene-add" data-id="${id}">+ Сцена</button>`
     + `<button type="button" class="inverse" data-act="scenes-save" data-id="${id}">Сохранить сценарий</button>`
     + `<span class="dirty-note"${ctx.dirty ? "" : " hidden"}>не сохранено</span></div></div>`;
+}
+
+/** Подключённые к проекту карточки в подключённой версии (`card.versions` из списка библиотеки,
+ *  иначе текущая): `[{tag, kind, assets}]`. Карточки, которых в библиотеке уже нет, пропускаются. */
+export function pinnedCards(references, cards) {
+  const byTag = new Map((cards || []).map((card) => [card.tag, card]));
+  const out = [];
+  for (const ref of references || []) {
+    const card = byTag.get(ref.tag);
+    if (!card) continue;
+    const version = (card.versions || []).find((v) => v.version === ref.version);
+    out.push({ tag: card.tag, kind: (version && version.kind) || card.kind,
+      assets: (version && version.assets) || card.assets || [] });
+  }
+  return out;
+}
+
+const TAG_BEFORE_CARET = /(?:^|[^\w@.])@([a-z0-9-]*)$/;
+
+/** Подставляет `tag` вместо недописанного `@…` перед кареткой; пробел после тега — только если
+ *  дальше не пробельный символ, каретка — после этого пробела. */
+export function insertTagAt(text, caret, tag) {
+  const value = String(text || "");
+  const head = value.slice(0, caret);
+  const rest = value.slice(caret);
+  const match = head.match(TAG_BEFORE_CARET);
+  let before = head;
+  let lead = "";
+  if (match) before = head.slice(0, head.length - match[1].length - 1);
+  else if (head && !/\s$/.test(head)) lead = " ";
+  const needSpace = !/^\s/.test(rest);
+  const inserted = `${lead}${tag}${needSpace ? " " : ""}`;
+  const out = `${before}${inserted}${rest}`;
+  return { text: out, caret: before.length + inserted.length + (needSpace ? 0 : 1) };
+}
+
+export function tagHintHtml(text, caret, cards) {
+  const matches = tagSuggestions(text, caret, cards);
+  if (!matches.length) return "";
+  return `<div class="tag-hint">` + matches.map((card) => `<button type="button" class="tag-pick" `
+    + `data-act="tag-pick" data-tag="${escapeHtml(card.tag)}">${escapeHtml(card.tag)}</button>`).join("")
+    + `</div>`;
+}
+
+/** `/media/…` для кадра в поле сцены 0: только картинка внутри `outdir` и без `.`/`..` в пути —
+ *  верхнеуровневый `start_image` проекта сервер не проверяет, ему адрес не доверяем. */
+function startImageUrl(path, outdir) {
+  const p = String(path || "");
+  if (!/\.(png|jpe?g)$/i.test(p) || !outdir || !p.startsWith(`${outdir}/`)) return null;
+  if (p.slice(outdir.length + 1).split("/").some((part) => part === "." || part === ".." || part === "")) {
+    return null;
+  }
+  return projectMediaUrl(p, outdir);
+}
+
+export function startImageFieldHtml(current, pinnedCards_, outdir) {
+  const cur = current || "";
+  const cards = (pinnedCards_ || []).filter((card) => card.kind !== "voice");
+  const option = (value, label, selected) => `<option value="${escapeHtml(value)}"`
+    + `${selected ? " selected" : ""}>${escapeHtml(label)}</option>`;
+  let options = option("", "без кадра", cur === "")
+    + cards.map((card) => option(card.tag, `${card.tag} — кадр карточки`, card.tag === cur)).join("");
+  if (cur && !cards.some((card) => card.tag === cur)) {
+    options += option(cur, cur.startsWith("@") ? cur : cur.split("/").pop(), true);
+  }
+  const card = cards.find((c) => c.tag === cur);
+  const url = startImageUrl(card ? (card.assets || [])[0] : cur, outdir);
+  return `<div class="start-image"><label>Стартовый кадр `
+    + `<select class="inp" data-scene-field="start_image" data-idx="0">${options}</select></label> `
+    + `<button type="button" class="ghost" data-act="scene0-upload">Загрузить кадр…</button>`
+    + (url ? `<img class="start-thumb" src="${escapeHtml(url)}" alt="">` : "") + `</div>`;
+}
+
+/** Референсы сцены без упоминания в тексте — только sglang и только если есть что выбрать. */
+export function sceneRefsHtml(scene, idx, pinnedTags) {
+  if (!pinnedTags.length) return "";
+  const chosen = scene.refs || [];
+  return `<div class="scene-refs"><span class="scene-refs-label">Референсы без упоминания:</span> `
+    + pinnedTags.map((tag) => `<label><input type="checkbox" data-scene-field="refs" `
+      + `data-idx="${idx}" data-tag="${escapeHtml(tag)}"${chosen.includes(tag) ? " checked" : ""}> `
+      + `${escapeHtml(tag)}</label> `).join("")
+    + `<span class="hint">их картинки идут первыми: &lt;Picture 1…&gt;</span></div>`;
+}
+
+const JSON_SHAPE_ERROR = 'Ожидается {"scenes": […]} или список сцен';
+
+/** Вставленный человеком сценарий → тело `PUT /scenes` как есть (только `scenes` и `references`). */
+export function parseScenarioJson(text) {
+  let data;
+  try { data = JSON.parse(text); } catch { return { error: "JSON не разобрался — проверьте запятые и кавычки" }; }
+  if (Array.isArray(data)) return { body: { scenes: data } };
+  if (data && typeof data === "object" && Array.isArray(data.scenes)) {
+    const body = { scenes: data.scenes };
+    if ("references" in data) body.references = data.references;
+    return { body };
+  }
+  return { error: JSON_SHAPE_ERROR };
+}
+
+export function scenarioReplaceConfirm(n) {
+  return `Заменить ${n} ${plural(n, "сцену", "сцены", "сцен")} сценария?`;
+}
+
+export function scenarioJsonHtml(id) {
+  return `<details class="adv scenario-json"><summary>Вставить сценарий JSON</summary>`
+    + `<textarea class="inp scenario-json-text" rows="6" placeholder='{"scenes": [{"prompt": "…", `
+    + `"duration": 5}]}'></textarea> `
+    + `<button type="button" class="ghost" data-act="scenario-json-load" data-id="${escapeHtml(id)}">`
+    + `Загрузить сценарий</button></details>`;
 }
 
 /** Подсказка на `@`: карточки, чей тег начинается с набранного после последнего `@` до каретки. */
@@ -2935,18 +3050,27 @@ function startPage() {
     $("library-cards").innerHTML = libraryCardsHtml(libraryCards, state && state.outdir);
   }
 
+  /** Сырые байты файла на `POST /api/uploads` (заголовок `X-Filename`) → путь на диске сервера. */
+  async function uploadToServer(file) {
+    const response = await fetch("/api/uploads", { method: "POST", body: file,
+      headers: { "Content-Type": "application/octet-stream",
+                 "X-Filename": encodeURIComponent(file.name) } });
+    const body = await response.json();
+    if (!response.ok) {
+      const error = new Error("upload");
+      error.payload = body;
+      throw error;
+    }
+    return body.path;
+  }
+
   async function addLibraryCard(event) {
     event.preventDefault();
     $("lib-error").hidden = true;
     try {
       const assets = [];
       for (const file of $("lib-files").files) {
-        const response = await fetch("/api/uploads", { method: "POST", body: file,
-          headers: { "Content-Type": "application/octet-stream",
-                     "X-Filename": encodeURIComponent(file.name) } });
-        const body = await response.json();
-        if (!response.ok) throw { payload: body };
-        assets.push(body.path);
+        assets.push(await uploadToServer(file));
       }
       await api("POST", "/api/library", { tag: $("lib-tag").value.trim(),
         kind: $("lib-kind").value, description: $("lib-desc").value.trim(), assets });
@@ -3251,17 +3375,31 @@ function startPage() {
     if (!sceneDraft) return;
     const editor = document.querySelector("#project-body .scene-editor");
     if (!editor || editor.dataset.epoch !== String(draftEpoch)) return;
+    const refsByScene = new Map();   // a scene with any refs checkbox in the DOM: its refs = the ticked ones
     document.querySelectorAll("#project-body [data-scene-field]").forEach((el) => {
       const scene = sceneDraft[Number(el.dataset.idx)];
       if (!scene) return;
       const field = el.dataset.sceneField;
+      if (field === "refs") {
+        const list = refsByScene.get(Number(el.dataset.idx)) || [];
+        refsByScene.set(Number(el.dataset.idx), list);
+        if (el.checked) list.push(el.dataset.tag);
+        return;
+      }
       const before = JSON.stringify(scene[field]);
-      if (field === "fresh_start") scene.fresh_start = Boolean(el.checked);
+      if (field === "start_image") scene.start_image = el.value === "" ? null : el.value;
+      else if (field === "fresh_start") scene.fresh_start = Boolean(el.checked);
       else if (field === "duration") scene.duration = Number(String(el.value).replace(",", "."));
       else if (field === "seed" || field === "steps") scene[field] = el.value === "" ? null : Number(el.value);
       else scene[field] = el.value;
       if (JSON.stringify(scene[field]) !== before) sceneDraftDirty = true;
     });
+    for (const [idx, list] of refsByScene) {
+      if (JSON.stringify(sceneDraft[idx].refs) !== JSON.stringify(list)) {
+        sceneDraft[idx].refs = list;
+        sceneDraftDirty = true;
+      }
+    }
   }
 
   /** Any change of the draft that does not come from the fields: take the fields first, write,
@@ -3294,6 +3432,38 @@ function startPage() {
     else sceneDraftDirty = false;
   }
 
+  /** «Вставить сценарий JSON»: тело как есть в `PUT /scenes`, черновик — из ответа этого PUT. */
+  async function loadScenarioJson(id) {
+    const field = document.querySelector("#project-body .scenario-json-text");
+    const parsed = parseScenarioJson(field ? field.value : "");
+    if (parsed.error) {
+      const error = new Error(parsed.error);
+      error.payload = { error: { message: parsed.error } };
+      throw error;
+    }
+    const saved = ((project && project.project && project.project.scenes) || []).length;
+    if (saved > 0 && !window.confirm(scenarioReplaceConfirm(saved))) return;
+    const answer = await api("PUT", `/api/projects/${encodeURIComponent(id)}/scenes`, parsed.body);
+    if (answer && answer.project) resetSceneDraft(answer.project);
+  }
+
+  /** Кнопка подсказки: недописанный `@…` перед кареткой поля промпта заменяется тегом. */
+  function pickTag(button) {
+    syncDraftFromDom();
+    const slot = button.closest(".tag-hint-slot");
+    const idx = Number(button.dataset.idx ?? (slot && slot.dataset.idx));
+    const field = document.querySelector(`#project-body [data-scene-field="prompt"][data-idx="${idx}"]`);
+    if (!field || !sceneDraft || !sceneDraft[idx]) return;
+    const result = insertTagAt(field.value, field.selectionStart, button.dataset.tag);
+    field.value = result.text;
+    field.focus();
+    field.setSelectionRange(result.caret, result.caret);
+    sceneDraft[idx].prompt = result.text;
+    sceneDraftDirty = true;
+    showDirtyNote();
+    if (slot) slot.innerHTML = "";
+  }
+
   function requestCloseProject() {
     syncDraftFromDom();
     if (sceneDraft && sceneDraftDirty && !window.confirm("Закрыть без сохранения сценария?")) return;
@@ -3311,7 +3481,8 @@ function startPage() {
     if (sceneDraft && sceneEditorActive(proj)) {
       body = sceneEditorHtml(sceneDraft, { id: proj.id, engine: state && state.engine,
         projectSeed: proj.seed ?? null, dirty: sceneDraftDirty, epoch: draftEpoch,
-        error: sceneDraftError });
+        error: sceneDraftError, pinned: pinnedCards(proj.references, libraryCards),
+        outdir: state && state.outdir }) + scenarioJsonHtml(proj.id);
     } else if (proj.kind === "video") {
       const n = proj.scenes.length;
       body = n
@@ -5213,6 +5384,13 @@ function startPage() {
       return;
     }
     // -- редактор сцен видеопроекта (Task 7): каждое действие сначала снимает поля в черновик ----
+    if (button.dataset.act === "tag-pick") { pickTag(button); return; }
+    if (button.dataset.act === "scene0-upload") { $("scene0-file").click(); return; }
+    if (button.dataset.act === "scenario-json-load") {
+      syncDraftFromDom();
+      withProject(() => loadScenarioJson(id));
+      return;
+    }
     if (button.dataset.act === "scene-add") { changeSceneDraft(addScene); return; }
     if (button.dataset.act === "scene-up" || button.dataset.act === "scene-down") {
       const idx = Number(button.dataset.idx);
@@ -5415,11 +5593,31 @@ function startPage() {
     hint.textContent = gridHint(sglangGridSeconds(duration, chained));
   }
 
+  /** sglang prompt of the scene editor: tag problems like `.scenario-prompt`, and the `@` hint buttons. */
+  function promptTyped(el) {
+    if (!project || !project.project || !state || state.engine !== "sglang") return;
+    const idx = Number(el.dataset.idx);
+    const cards = pinnedCards(project.project.references, libraryCards);
+    const refs = (sceneDraft && sceneDraft[idx] && sceneDraft[idx].refs) || [];
+    const issues = sceneTagIssues(el.value, cards.map((c) => c.tag),
+      { needsTag: project.project.kind !== "clip", refs });
+    el.classList.toggle("has-tag-issues", issues.length > 0);
+    el.title = issues.map((i) => TAG_PROBLEM_TEXT[i.problem](i.tag)).join("; ");
+    const slot = document.querySelector(`#project-body .tag-hint-slot[data-idx="${idx}"]`);
+    if (slot) slot.innerHTML = tagHintHtml(el.value, el.selectionStart, cards);
+  }
+
   /** «не сохранено» appears as soon as a field changes, without waiting for a redraw. */
   function showDirtyNote() {
     const note = document.querySelector("#project-body .dirty-note");
     if (note) note.hidden = !sceneDraftDirty;
   }
+
+  // The frame of scene 0 changed: redraw from the draft, so the thumbnail follows the pick.
+  document.addEventListener("change", (event) => {
+    if (!event.target.closest('[data-scene-field="start_image"]') || !sceneDraft) return;
+    changeSceneDraft((draft) => draft);
+  });
 
   // Ticking «начать с чистого листа» changes whether the scene is chained, hence its grid.
   document.addEventListener("change", (event) => {
@@ -5439,6 +5637,7 @@ function startPage() {
       if (sceneField.dataset.sceneField === "duration") {
         updateGridHint(Number(sceneField.dataset.idx), Number(String(sceneField.value).replace(",", ".")));
       }
+      if (sceneField.dataset.sceneField === "prompt") promptTyped(sceneField);
       return;
     }
     const el = event.target.closest(".scenario-prompt");
@@ -5616,6 +5815,20 @@ function startPage() {
   // -- проекты (Task 7) --------------------------------------------------------------------
   $("project-close").addEventListener("click", requestCloseProject);
   $("project-delete").addEventListener("click", deleteProject);
+  $("scene0-file").addEventListener("change", async () => {
+    const input = $("scene0-file");
+    const file = input.files && input.files[0];
+    if (!file || !sceneDraft) return;
+    try {
+      const path = await uploadToServer(file);
+      clearProjectError();
+      changeSceneDraft((draft) => draft.map((scene, i) => (i === 0 ? { ...scene, start_image: path } : scene)));
+    } catch (error) {
+      showProjectError(error.payload ? error.payload : { error: { message: "сервер не ответил" } });
+    } finally {
+      input.value = "";
+    }
+  });
 
   /** «Сделать проектом», шапка чат-модалки — активна только когда `chat.project` реально есть
    *  (design spec: "активна при наличии project-поля в сессии"). Раскрывает `#chat-project-

@@ -178,7 +178,8 @@ const SCENARIOS = {
     const note = { hidden: true };
     queryOne["#project-body .dirty-note"] = note;
     const hiddenBefore = note.hidden;
-    const input = { value: "@a jumps", dataset: { sceneField: "prompt", idx: "0" },
+    const input = { value: "@a jumps", selectionStart: 8, title: "", classList: { toggle() {}, contains: () => false },
+      dataset: { sceneField: "prompt", idx: "0" },
       closest(sel) { return sel === "[data-scene-field]" ? this : null; } };
     queryAll[FIELDS] = [input];
     fire("input", input);
@@ -212,6 +213,104 @@ const SCENARIOS = {
     getElementById("project-delete").__listeners.click[0]();
     await sleep(80);
     return { confirms };
+  },
+  async tag_hint_on_input() {
+    const proj = PROJECT({ ...DRAFT_PROJECT.project, references: [{ tag: "@amazon", version: 1 }, { tag: "@arena", version: 1 }] });
+    const card = (tag) => ({ tag, kind: "person", version: 1, latest_version: 1, description: "d",
+                            assets: [`/o/library/${tag.slice(1)}/v1/01-x.png`], versions: [{ version: 1 }] });
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1": ok(proj),
+      "GET /api/library": ok({ ok: true, cards: [card("@amazon"), card("@arena"), card("@bob")] }) }));
+    await open();
+    const slot = { innerHTML: "" };
+    queryOne['#project-body .tag-hint-slot[data-idx="0"]'] = slot;
+    fire("input", { value: "fight @a", selectionStart: 8, title: "",
+      dataset: { sceneField: "prompt", idx: "0" }, classList: { toggle() {}, contains: () => false },
+      closest(sel) { return sel === "[data-scene-field]" ? this : null; } });
+    return { slot: slot.innerHTML };
+  },
+  async tag_pick() {
+    await start(appUrl, draftRoutes());
+    await open();
+    const prompt = { value: "fight @a", selectionStart: 8, dataset: { sceneField: "prompt", idx: "0" },
+                     focus() {}, setSelectionRange() {} };
+    queryOne['#project-body [data-scene-field="prompt"][data-idx="0"]'] = prompt;
+    await act("tag-pick", { tag: "@amazon", idx: "0" });
+    queryAll[FIELDS] = [prompt];
+    await act("scenes-save");
+    return { value: prompt.value, prompt0: puts()[0][1].scenes[0].prompt };
+  },
+  async scene0_upload() {
+    await start(appUrl, draftRoutes({ "POST /api/uploads": ok({ ok: true, path: "/o/uploads/open.png" }) }));
+    await open();
+    const file = getElementById("scene0-file");
+    file.files = [{ name: "open.png" }];
+    file.__listeners.change[0]();
+    await sleep(120);
+    await act("scenes-save");
+    const upload = calls.find((c) => c.url === "/api/uploads");
+    return { upload: { url: upload.url, headers: upload.headers, body: upload.body },
+             start_image: puts().at(-1)[1].scenes[0].start_image };
+  },
+  async json_load() {
+    await start(appUrl, draftRoutes());
+    await open();
+    queryOne["#project-body .scenario-json-text"] = { value: '{"scenes": [{"prompt": "@a", "duration": 5}]}' };
+    answers.confirm = true;
+    await act("scenario-json-load");
+    return { confirms, puts: puts() };
+  },
+  async json_load_not_clobbered() {
+    const loaded = PROJECT({ ...DRAFT_PROJECT.project, scenes: [{ idx: 0, prompt: "@a", duration: 5,
+      status: "pending", job_id: null, clip_path: null, keyframe_path: null }] });
+    await start(appUrl, draftRoutes({ "PUT /api/projects/p1/scenes": ok({ ok: true, project: loaded.project }) }));
+    await open();
+    // fields of the two old scenes, still in the DOM when the JSON answer redraws the modal
+    queryAll[FIELDS] = [field("prompt", 0, "@a walks"), field("prompt", 1, "@a runs")];
+    queryOne["#project-body .scenario-json-text"] = { value: '{"scenes": [{"prompt": "@a", "duration": 5}]}' };
+    answers.confirm = true;
+    fire("click", clickable({ dataset: { act: "scenario-json-load", id: "p1" }, match: (s) => s === "button[data-act]" }));
+    await sleep(120);
+    await act("scenes-save");
+    return { puts: puts() };
+  },
+  async json_load_bad() {
+    await start(appUrl, draftRoutes());
+    await open();
+    queryOne["#project-body .scenario-json-text"] = { value: "42" };
+    await act("scenario-json-load");
+    return { puts: puts(), error: getElementById("project-err").innerHTML };
+  },
+  async start_image_select_redraws() {
+    const proj = PROJECT({ ...DRAFT_PROJECT.project, references: [{ tag: "@arena", version: 1 }] });
+    const card = { tag: "@arena", kind: "environment", version: 1, latest_version: 1, description: "d",
+      assets: ["/o/library/arena/v1/01-o.png"], versions: [{ version: 1, kind: "environment",
+      assets: ["/o/library/arena/v1/01-o.png"] }] };
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1": ok(proj),
+      "GET /api/library": ok({ ok: true, cards: [card] }) }));
+    await open();
+    // the person picks no frame; the redraw must show the pick (and its thumbnail) at once
+    const select = { value: "", dataset: { sceneField: "start_image", idx: "0" },
+      classList: { contains: () => false },
+      closest(sel) { return sel === '[data-scene-field="start_image"]' ? this : null; } };
+    queryAll[FIELDS] = [select];
+    fire("change", select);
+    await sleep(40);
+    const html = getElementById("project-body").innerHTML;
+    return { selected: html.match(/<option value="[^"]*" selected>[^<]*<\/option>/g).slice(0, 1),
+             thumb: html.includes("start-thumb") };
+  },
+  async refs_ride_along() {
+    const proj = PROJECT({ ...DRAFT_PROJECT.project, references: [{ tag: "@arena", version: 1 }] });
+    const card = { tag: "@arena", kind: "environment", version: 1, latest_version: 1, description: "d",
+      assets: ["/o/library/arena/v1/01-o.png"], versions: [{ version: 1, kind: "environment",
+      assets: ["/o/library/arena/v1/01-o.png"] }] };
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1": ok(proj),
+      "GET /api/library": ok({ ok: true, cards: [card] }) }));
+    await open();
+    const box = (idx, checked) => ({ checked, value: "on", dataset: { sceneField: "refs", idx: String(idx), tag: "@arena" } });
+    queryAll[FIELDS] = [box(0, false), box(1, true)];
+    await act("scenes-save");
+    return { refs: puts()[0][1].scenes.map((s) => s.refs ?? null) };
   },
 };
 

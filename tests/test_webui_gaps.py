@@ -51,6 +51,11 @@ CLASS_SOURCES = [
     "app.sceneEditorHtml([{prompt: 'a', duration: 8, fresh_start: false, seed: -1, steps: null, "
     "start_image: null, refs: []}], {id: 'p1', engine: 'sglang', projectSeed: null, dirty: true, "
     "epoch: 0, error: {idx: 0, message: 'm'}})",
+    "app.startImageFieldHtml('@arena', [{tag: '@arena', kind: 'environment', "
+    "assets: ['/o/library/arena/v1/01-o.png']}], '/o')",
+    "app.sceneRefsHtml({refs: ['@hero']}, 1, ['@hero', '@arena'])",
+    "app.tagHintHtml('fight @a', 8, [{tag: '@arena'}])",
+    "app.scenarioJsonHtml('p1')",
 ]
 
 
@@ -65,6 +70,7 @@ HOOK_CLASSES = {
     "upscale-retry": "click handler (button look comes from .ghost)",
     "lib-save": "click handler",
     "scene-edit-prompt": "the scene prompt field (look comes from .inp)",
+    "scenario-json-text": "the pasted JSON field (look comes from .inp)",
     "grid-hint": "address of the in-place update of the grid hint (look comes from .hint)",
 }
 
@@ -260,6 +266,7 @@ def test_editor_html_for_one_scene_on_sglang():
         '</div>'
         '<textarea class="inp scene-edit-prompt" data-scene-field="prompt" data-idx="0" rows="4">'
         'a &lt;b&gt;</textarea>'
+        '<div class="tag-hint-slot" data-idx="0"></div>'
         '<div class="scene-edit-row">'
         '<label>Длительность <input class="inp num" type="number" step="0.5" min="3" max="15" '
         'data-scene-field="duration" data-idx="0" value="5"> с</label>'
@@ -269,7 +276,12 @@ def test_editor_html_for_one_scene_on_sglang():
         '<button type="button" class="ghost" data-act="scene-seed-random" data-idx="0">случайный</button>'
         '<label>Шаги <input class="inp num" type="number" min="2" max="100" '
         'data-scene-field="steps" data-idx="0" value="" placeholder="50"></label>'
-        '</div></div>'
+        '</div>'
+        '<div class="start-image"><label>Стартовый кадр '
+        '<select class="inp" data-scene-field="start_image" data-idx="0">'
+        '<option value="" selected>без кадра</option></select></label> '
+        '<button type="button" class="ghost" data-act="scene0-upload">Загрузить кадр…</button></div>'
+        '</div>'
         '<div class="scene-editor-acts">'
         '<button type="button" class="ghost" data-act="scene-add" data-id="p1">+ Сцена</button>'
         '<button type="button" class="inverse" data-act="scenes-save" data-id="p1">Сохранить сценарий</button>'
@@ -296,7 +308,12 @@ def test_editor_html_on_mlx():
         '<div class="scene-edit-row">'
         '<label>Длительность <input class="inp num" type="number" step="0.5" min="5" max="10" '
         'data-scene-field="duration" data-idx="0" value="8"> с</label>'
-        '</div></div>'
+        '</div>'
+        '<div class="start-image"><label>Стартовый кадр '
+        '<select class="inp" data-scene-field="start_image" data-idx="0">'
+        '<option value="" selected>без кадра</option></select></label> '
+        '<button type="button" class="ghost" data-act="scene0-upload">Загрузить кадр…</button></div>'
+        '</div>'
         '<div class="scene-edit" data-idx="1"><div class="scene-edit-head">'
         '<span class="idx">#1</span><div class="spacer"></div>'
         '<button type="button" class="ghost" data-act="scene-up" data-idx="1">↑</button>'
@@ -361,3 +378,162 @@ EDITOR_EXPECTED = {
 @pytest.mark.parametrize("scenario", sorted(EDITOR_EXPECTED))
 def test_editor_wiring(scenario):
     assert _gaps(scenario) == EDITOR_EXPECTED[scenario]
+
+
+@_needs_node
+def test_insert_tag_at_the_caret():
+    assert _js("app.insertTagAt('@ama walks', 4, '@amazon')") == {"text": "@amazon walks", "caret": 8}
+    assert _js("app.insertTagAt('walks ', 6, '@amazon')") == {"text": "walks @amazon ", "caret": 14}
+    assert _js("app.insertTagAt('fight @a', 8, '@amazon')") == {"text": "fight @amazon ", "caret": 14}
+
+
+@_needs_node
+def test_tag_hint_html_lists_pinned_matches_as_buttons():
+    cards = "[{tag: '@amazon'}, {tag: '@arena'}, {tag: '@bob'}]"
+    assert _js(f"app.tagHintHtml('fight @a', 8, {cards})") == (
+        '<div class="tag-hint">'
+        '<button type="button" class="tag-pick" data-act="tag-pick" data-tag="@amazon">@amazon</button>'
+        '<button type="button" class="tag-pick" data-act="tag-pick" data-tag="@arena">@arena</button>'
+        '</div>')
+    assert _js(f"app.tagHintHtml('fight', 5, {cards})") == ""
+
+
+@_needs_node
+def test_a_scene_with_refs_needs_no_tag_in_the_text():
+    assert _js("app.sceneTagIssues('a cat', ['@a'], {needsTag: true, refs: ['@a']})") == []
+    assert _js("app.sceneTagIssues('a cat', ['@a'], {needsTag: true})") == [
+        {"tag": None, "problem": "missing"}]
+
+
+PINNED = ("[{tag: '@hero', kind: 'person', assets: ['/o/library/hero/v1/01-h.png']}, "
+          "{tag: '@arena', kind: 'environment', assets: ['/o/library/arena/v1/01-o.png']}, "
+          "{tag: '@voice', kind: 'voice', assets: ['/o/library/voice/v1/01-v.mp3']}]")
+
+
+@_needs_node
+def test_start_image_field():
+    head = ('<div class="start-image"><label>Стартовый кадр '
+            '<select class="inp" data-scene-field="start_image" data-idx="0">')
+    tail = ('</select></label> '
+            '<button type="button" class="ghost" data-act="scene0-upload">Загрузить кадр…</button>')
+    assert _js(f"app.startImageFieldHtml(null, {PINNED}, '/o')") == (
+        head + '<option value="" selected>без кадра</option>'
+        '<option value="@hero">@hero — кадр карточки</option>'
+        '<option value="@arena">@arena — кадр карточки</option>' + tail + '</div>')
+    assert _js(f"app.startImageFieldHtml('@arena', {PINNED}, '/o')") == (
+        head + '<option value="">без кадра</option>'
+        '<option value="@hero">@hero — кадр карточки</option>'
+        '<option value="@arena" selected>@arena — кадр карточки</option>' + tail
+        + '<img class="start-thumb" src="/media/library/arena/v1/01-o.png" alt=""></div>')
+    assert _js(f"app.startImageFieldHtml('/o/uploads/open.png', {PINNED}, '/o')") == (
+        head + '<option value="">без кадра</option>'
+        '<option value="@hero">@hero — кадр карточки</option>'
+        '<option value="@arena">@arena — кадр карточки</option>'
+        '<option value="/o/uploads/open.png" selected>open.png</option>' + tail
+        + '<img class="start-thumb" src="/media/uploads/open.png" alt=""></div>')
+
+
+@_needs_node
+def test_scene_refs_field():
+    assert _js("app.sceneRefsHtml({refs: ['@hero']}, 1, ['@hero', '@arena'])") == (
+        '<div class="scene-refs"><span class="scene-refs-label">Референсы без упоминания:</span> '
+        '<label><input type="checkbox" data-scene-field="refs" data-idx="1" data-tag="@hero" checked> @hero</label> '
+        '<label><input type="checkbox" data-scene-field="refs" data-idx="1" data-tag="@arena"> @arena</label> '
+        '<span class="hint">их картинки идут первыми: &lt;Picture 1…&gt;</span></div>')
+
+
+@_needs_node
+@pytest.mark.parametrize("text, expected", [
+    ('[{"prompt": "@a", "duration": 5}]', {"body": {"scenes": [{"prompt": "@a", "duration": 5}]}}),
+    ('{"scenes": [{"prompt": "@a", "duration": 5}], "references": [{"tag": "@a", "version": 1}], "x": 1}',
+     {"body": {"scenes": [{"prompt": "@a", "duration": 5}], "references": [{"tag": "@a", "version": 1}]}}),
+    ('42', {"error": 'Ожидается {"scenes": […]} или список сцен'}),
+    ('{"scenes": 3}', {"error": 'Ожидается {"scenes": […]} или список сцен'}),
+    ('{"scenes": [', {"error": "JSON не разобрался — проверьте запятые и кавычки"}),
+])
+def test_parse_scenario_json(text, expected):
+    assert _js(f"app.parseScenarioJson({json.dumps(text)})") == expected
+
+
+@_needs_node
+def test_replace_confirm_counts_scenes():
+    assert _js("[1, 2, 5].map(app.scenarioReplaceConfirm)") == [
+        "Заменить 1 сцену сценария?", "Заменить 2 сцены сценария?", "Заменить 5 сцен сценария?"]
+
+
+PICK = ('<div class="tag-hint">'
+        '<button type="button" class="tag-pick" data-act="tag-pick" data-tag="@amazon">@amazon</button>'
+        '<button type="button" class="tag-pick" data-act="tag-pick" data-tag="@arena">@arena</button></div>')
+EDITOR8_EXPECTED = {
+    "tag_hint_on_input": {"slot": PICK},
+    "tag_pick": {"value": "fight @amazon ", "prompt0": "fight @amazon "},
+    "scene0_upload": {"upload": {"url": "/api/uploads",
+                                 "headers": {"Content-Type": "application/octet-stream",
+                                             "X-Filename": "open.png"},
+                                 "body": {"raw": "open.png"}},
+                      "start_image": "/o/uploads/open.png"},
+    "json_load": {"confirms": ["Заменить 2 сцены сценария?"],
+                  "puts": [["/api/projects/p1/scenes", {"scenes": [{"prompt": "@a", "duration": 5}]}]]},
+    # Н1: the redraw after the JSON answer must not pour the old scenes' fields back into the draft
+    "json_load_not_clobbered": {"puts": [
+        ["/api/projects/p1/scenes", {"scenes": [{"prompt": "@a", "duration": 5}]}],
+        ["/api/projects/p1/scenes", {"scenes": [{"prompt": "@a", "duration": 5}]}]]},
+    # picking «без кадра» drops the thumbnail at once: the select change redraws from the draft
+    "start_image_select_redraws": {"selected": ['<option value="" selected>без кадра</option>'],
+                                   "thumb": False},
+    "refs_ride_along": {"refs": [None, ["@arena"]]},
+    "json_load_bad": {"puts": [], "error": "<b>Запрос не прошёл</b><pre>Ожидается {&quot;scenes&quot;: […]} "
+                                          "или список сцен</pre>"},
+}
+
+
+@_needs_node
+@pytest.mark.parametrize("scenario", sorted(EDITOR8_EXPECTED))
+def test_editor_refs_and_json_wiring(scenario):
+    assert _gaps(scenario) == EDITOR8_EXPECTED[scenario]
+
+
+@_needs_node
+def test_pinned_cards_take_the_pinned_version():
+    cards = ("[{tag: '@a', kind: 'person', assets: ['/o/library/a/v2/x.png'], versions: ["
+             "{version: 1, kind: 'person', assets: ['/o/library/a/v1/x.png']}, "
+             "{version: 2, kind: 'person', assets: ['/o/library/a/v2/x.png']}]}, "
+             "{tag: '@b', kind: 'voice', assets: ['/o/library/b/v1/v.mp3']}]")
+    assert _js(f"app.pinnedCards([{{tag: '@a', version: 1}}, {{tag: '@gone', version: 1}}, "
+               f"{{tag: '@b', version: 1}}], {cards})") == [
+        {"tag": "@a", "kind": "person", "assets": ["/o/library/a/v1/x.png"]},
+        {"tag": "@b", "kind": "voice", "assets": ["/o/library/b/v1/v.mp3"]}]
+
+
+@_needs_node
+def test_start_image_thumb_never_leaves_the_media_root():
+    # the project-level start_image is not checked by the server: no URL for what is not an image
+    # under the outdir, nor for a path that climbs out of it
+    for bad in ("/etc/passwd.png", "/o/../etc/x.png", "/o/uploads/notes.txt", "/other/x.png"):
+        html = _js(f"app.startImageFieldHtml({json.dumps(bad)}, [], '/o')")
+        assert "<img" not in html, bad
+        assert f'<option value="{bad}" selected>' in html
+
+
+@_needs_node
+def test_editor_html_with_pinned_cards_and_refs():
+    html = _js("app.sceneEditorHtml([{prompt: 'a', duration: 8, fresh_start: false, seed: null, "
+               "steps: null, start_image: '@arena', refs: ['@hero']}], {id: 'p1', engine: 'sglang', "
+               f"projectSeed: null, dirty: false, epoch: 0, pinned: {PINNED}, outdir: '/o'}})")
+    refs = ('<div class="scene-refs"><span class="scene-refs-label">Референсы без упоминания:</span> '
+            '<label><input type="checkbox" data-scene-field="refs" data-idx="0" data-tag="@hero" checked> @hero</label> '
+            '<label><input type="checkbox" data-scene-field="refs" data-idx="0" data-tag="@arena"> @arena</label> '
+            '<span class="hint">их картинки идут первыми: &lt;Picture 1…&gt;</span></div>')
+    assert ('<div class="tag-hint-slot" data-idx="0"></div>' + refs + '<div class="scene-edit-row">') in html
+    assert '<option value="@arena" selected>@arena — кадр карточки</option>' in html
+    assert '<img class="start-thumb" src="/media/library/arena/v1/01-o.png" alt="">' in html
+
+
+@_needs_node
+def test_scenario_json_block():
+    assert _js("app.scenarioJsonHtml('p1')") == (
+        '<details class="adv scenario-json"><summary>Вставить сценарий JSON</summary>'
+        '<textarea class="inp scenario-json-text" rows="6" placeholder=\'{"scenes": [{"prompt": "…", '
+        '"duration": 5}]}\'></textarea> '
+        '<button type="button" class="ghost" data-act="scenario-json-load" data-id="p1">'
+        'Загрузить сценарий</button></details>')
