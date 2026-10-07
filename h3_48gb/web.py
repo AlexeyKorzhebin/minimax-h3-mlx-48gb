@@ -1015,7 +1015,8 @@ def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
     for scene in scenes:
         chained = scene["idx"] > 0 and not scene.get("fresh_start", False)
         try:
-            ref2va = library_module.build_ref2va(scene["prompt"], proj.references, outdir)
+            ref2va = library_module.build_ref2va(scene["prompt"], proj.references, outdir,
+                                                 extra_refs=scene.get("refs") or ())
             # I6: scene 0's start image is resolved here exactly as the submission resolves it
             start = assemble_module.scene_start_image(proj, scene, outdir)
             if start is not None and not start.is_file():
@@ -4276,7 +4277,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _put_project_scenes(self, raw_id: str) -> tuple[int, str, bytes]:
         """`PUT /api/projects/<id>/scenes` (final review 2026-10-07, I1): a ready-made video
-        scenario without the LLM -- `{"scenes": [{prompt, duration, fresh_start?, start_image?}],
+        scenario without the LLM -- `{"scenes": [{prompt, duration, fresh_start?, start_image?, seed?, steps?, refs?}],
         "references"?: [{tag, version?}]}`. Only before anything is queued (`stages.scenes` is
         `draft`, `stages.script` is `draft` or `awaiting_approval`); it leaves the script waiting
         for "Утвердить", which snaps the durations and checks every scene as for a chat scenario.
@@ -4308,7 +4309,7 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(raw, dict):
                 raise CliError("args_invalid", f"`scenes[{i}]` must be an object", {"index": i})
             extra = set(raw) - {"prompt", "duration", "fresh_start", "start_image", "seed",
-                                "steps"}
+                                "steps", "refs"}
             if extra:
                 raise CliError("args_invalid", f"`scenes[{i}]`: unknown field(s) {sorted(extra)}",
                                {"index": i, "fields": sorted(extra)})
@@ -4344,6 +4345,19 @@ class _Handler(BaseHTTPRequestHandler):
                     raise CliError("args_invalid", f"`scenes[{i}].steps` is only for the sglang "
                                    "engine", {"index": i})
                 scene["steps"] = raw["steps"]
+            if "refs" in raw:
+                refs = raw["refs"]
+                if not isinstance(refs, list) or not all(isinstance(tag, str) for tag in refs):
+                    raise CliError("args_invalid", f"`scenes[{i}].refs` must be a list of @tags",
+                                   {"index": i})
+                for tag in refs:
+                    if not library_module.TAG_RE.match(tag):
+                        raise CliError("args_invalid", f"`scenes[{i}].refs`: {tag} is not a tag",
+                                       {"index": i, "tag": tag})
+                    if tag not in pinned_tags:
+                        raise CliError("unknown_tag", f"refs {tag}: тег не подключён к проекту",
+                                       {"index": i, "unknown": [tag]})
+                scene["refs"] = list(refs)
             start = raw.get("start_image")
             if start is not None:
                 if i != 0 or not isinstance(start, str) or not start:

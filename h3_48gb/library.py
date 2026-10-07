@@ -225,42 +225,56 @@ def scene_tags(text: str) -> list[str]:
 _OWN_DEFINITIONS_RE = re.compile(r"(?m)^\s*subject_definitions\s*:")
 
 
-def build_ref2va(scene_prompt: str, references, outdir) -> Ref2VAScene:
+def build_ref2va(scene_prompt: str, references, outdir, extra_refs=()) -> Ref2VAScene:
     """The scene as sglang's Ref2VA takes it: each @tag, in order of first mention, becomes
-    `<Subject N>` in the text and its card's pictures `<Picture k>` (audio `<Audio k>`) in the
-    same order; the panel puts its own `subject_definitions:` block in front.
+    `<Subject N>` in the text and its card's pictures `<Picture k>` (audio `<Audio k>`); the panel
+    puts its own `subject_definitions:` block in front.
+
+    `extra_refs` (UI-gap API 2): the scene's explicit `refs` -- cards connected as conditions
+    without a mention in the text and without a `<Subject N>`. Conditions go in this order: the
+    explicit refs, then the tags the text mentions, each card once -- so `<Picture k>` counts the
+    explicit refs' pictures first, and a text tag that is also in `extra_refs` points at the
+    pictures it already brought. The keyframe is not a reference and is never numbered.
 
     I5 (coordinator's ruling): a prompt that already has its own `subject_definitions:` section
     gets no second block -- the owner's definitions stand as written. The @tags in it still
     become `<Subject N>` and still bring their pictures as conditions, numbered exactly as above,
     so the owner's block has to follow that numbering."""
     tags = scene_tags(scene_prompt)
-    if not tags:
+    extra = list(dict.fromkeys(extra_refs))
+    if not tags and not extra:
         return Ref2VAScene(scene_prompt, (), (), ())
     pinned = {ref["tag"]: ref for ref in references}
-    unknown = [tag for tag in tags if tag not in pinned]
+    unknown = [tag for tag in [*extra, *tags] if tag not in pinned]
     if unknown:
         raise LibraryError("unknown_tag", f"теги не подключены к проекту: {', '.join(unknown)}",
-                           {"unknown": unknown})
+                           {"unknown": list(dict.fromkeys(unknown))})
     images: list[str] = []
     audios: list[str] = []
-    lines: list[str] = []
-    for number, tag in enumerate(tags, start=1):
+    cards: dict[str, dict] = {}     # tag -> {"card", "pictures": [k...], "audio": k | None}
+    for tag in [*extra, *(tag for tag in tags if tag not in extra)]:
         card = get_card(outdir, tag, pinned[tag].get("version"))
-        description = card["description"].strip().rstrip(".")
+        entry = {"card": card, "pictures": [], "audio": None}
         if card["kind"] == "voice":
             audios.append(card["assets"][0])
-            lines.append(f"<Subject {number}> is {description}, voice from <Audio {len(audios)}>.")
+            entry["audio"] = len(audios)
         else:
-            labels = []
             for asset in card["assets"]:
                 images.append(asset)
-                labels.append(f"<Picture {len(images)}>")
-            lines.append(f"<Subject {number}> is {description}, appearance from "
-                         f"{', '.join(labels)}.")
+                entry["pictures"].append(len(images))
+        cards[tag] = entry
+    lines: list[str] = []
+    for number, tag in enumerate(tags, start=1):
+        entry = cards[tag]
+        description = entry["card"]["description"].strip().rstrip(".")
+        if entry["audio"] is not None:
+            lines.append(f"<Subject {number}> is {description}, voice from <Audio {entry['audio']}>.")
+        else:
+            labels = ", ".join(f"<Picture {k}>" for k in entry["pictures"])
+            lines.append(f"<Subject {number}> is {description}, appearance from {labels}.")
     body = _TAG_IN_TEXT_RE.sub(lambda m: f"<Subject {tags.index('@' + m.group(1)) + 1}>",
                                scene_prompt)
-    if _OWN_DEFINITIONS_RE.search(scene_prompt):
+    if not tags or _OWN_DEFINITIONS_RE.search(scene_prompt):
         prompt = body
     else:
         prompt = "subject_definitions:\n" + "\n".join(lines) + "\n\n" + body

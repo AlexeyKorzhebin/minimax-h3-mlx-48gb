@@ -1406,7 +1406,8 @@ def _submit_next_scene_sglang(proj, scene: dict, queue_root, *, submit, run,
                                            run=run)
         else:
             keyframe = scene_start_image(proj, scene, outdir)
-        ref2va = library.build_ref2va(scene["prompt"], proj.references, outdir)
+        ref2va = library.build_ref2va(scene["prompt"], proj.references, outdir,
+                                      extra_refs=scene.get("refs") or ())
         track_piece = _cut_track_piece(proj, idx, run=run) if proj.kind == "clip" else None
         scenes_dir = proj.path.parent / "scenes"
         args, output_stem = _scene_generate_args_sglang(
