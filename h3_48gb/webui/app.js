@@ -597,6 +597,17 @@ export function scenarioReplaceConfirm(n, dirty = false) {
     + (dirty ? " Несохранённые правки пропадут." : "");
 }
 
+/** Тело `PUT /scenes` из проекта диалога: только промпт и длительность каждой сцены. */
+export function chatApplyBody(chatProject) {
+  return { scenes: (chatProject.scenes || []).map((scene) => ({ prompt: scene.prompt, duration: scene.duration })) };
+}
+
+/** Вопрос перед заменой сцен проекта сценами диалога; `null`, когда заменять нечего. */
+export function chatApplyConfirm(current, incoming) {
+  if (!current) return null;
+  return `Заменить ${current} ${plural(current, "сцену", "сцены", "сцен")} проекта на ${incoming} из диалога?`;
+}
+
 export function scenarioJsonHtml(id, text = "") {
   return `<details class="adv scenario-json"${text ? " open" : ""}><summary>Вставить сценарий JSON</summary>`
     + `<textarea class="inp scenario-json-text" rows="6" placeholder='{"scenes": [{"prompt": "…", `
@@ -2848,8 +2859,14 @@ const LLM_TEXT = {
  * `busy` — GPU занят прогоном; остаток берётся из того же прогресса работника, что печатается
  * в приборной строке. Прогон без оценки молчит, а не обещает «~0 мин».
  */
-export function llmPlateText(status, { external = false, runningSeconds = 0 } = {}) {
-  if (external) return "внешний провайдер — память этой машины не занимает";
+export function llmPlateText(status, { external = false, sharesGpu = null, runningSeconds = 0 } = {}) {
+  // a local model (`llama-local`): the old words about its own state; every other provider is
+  // named by where it computes, as the provider's `shares_gpu` says -- unknown stays unknown
+  if (external) {
+    if (sharesGpu === true) return "делит видеокарту с H3: пока модель поднята, рендер ждёт";
+    if (sharesGpu === false) return "внешний провайдер — память этой машины не занимает";
+    return "где считает провайдер, не указано (shares_gpu в providers.json)";
+  }
   if (status === "busy") {
     const left = Number(runningSeconds) || 0;
     return "идёт прогон — модель поднимется после него"
@@ -3766,6 +3783,9 @@ function startPage() {
     const gate = status === "awaiting_approval"
       ? `<button class="inverse" type="button" data-act="approve-script" `
         + `data-id="${escapeHtml(proj.id)}">Утвердить сценарий</button>` : "";
+    const chatButton = sceneDraft && sceneEditorActive(proj)
+      ? `<button type="button" class="ghost" data-act="project-chat" data-id="${escapeHtml(proj.id)}">`
+        + `Чат по сценарию</button>` : "";
     let body;
     if (sceneDraft && sceneEditorActive(proj)) {
       body = sceneEditorHtml(sceneDraft, { id: proj.id, engine: state && state.engine,
@@ -3790,7 +3810,7 @@ function startPage() {
       + `<div class="proj-stage-head">`
       + `<span class="t">Сценарий</span>`
       + `<span class="proj-stage-status">${escapeHtml(statusWord)}</span>`
-      + `<div class="spacer"></div>${gate}</div>`
+      + `<div class="spacer"></div>${chatButton}${gate}</div>`
       + `<div class="proj-stage-body">${body}</div></div>`;
   }
 
@@ -4585,6 +4605,7 @@ function startPage() {
     if (it.kind === "prompt") return `промпт ${it.name || "?"}`;
     if (it.kind === "job") return `задача ${it.id || "?"}`;
     if (it.kind === "clip") return `ролик ${it.id || "?"}`;
+    if (it.kind === "project") return `проект ${it.id || "?"}`;
     return "новый промпт";
   }
 
@@ -4599,6 +4620,7 @@ function startPage() {
     const status = (chat && chat.llmStatus) || "";
     $("chat-llm").textContent = llmPlateText(status, {
       external: Boolean(row) && row.type !== "llama-local",
+      sharesGpu: row ? row.shares_gpu : null,
       runningSeconds: runningLeft,
     });
     /* Точка рядом со словом — форма макета. Янтарь достаётся только `busy`, то есть ровно
@@ -4783,7 +4805,7 @@ function startPage() {
     $("chat-finish").textContent = FINISH_LABEL[chat.source.kind] || FINISH_LABEL.new;
     $("chat-source").textContent = chatSourceText(chat.source);
     $("chat-duration").value = chat.duration;
-    $("chat-make-project").disabled = !chat.project;
+    renderChatMakeProject();
     $("chat-project-panel").hidden = true;   // панель создания — не состояние прошлой сессии
     renderChatPrompt();
     renderChatLog();
@@ -4792,6 +4814,13 @@ function startPage() {
                                // последнем состоянии (открытая/ошибочная загрузка).
     await loadProviders();
     $("chat-input").focus();
+  }
+
+  /** «Сделать проектом» — или «Применить к проекту» у диалога по сценарию уже созданного проекта. */
+  function renderChatMakeProject() {
+    $("chat-make-project").disabled = !chat.project;
+    $("chat-make-project").textContent = chat.source.kind === "project" ? "Применить к проекту"
+                                                                       : "Сделать проектом";
   }
 
   function closeChat() {
@@ -4931,7 +4960,7 @@ function startPage() {
     // Task 7: этот самый ход мог быть первым, ответившим полем `project` (`applyTurn` уже
     // положил его в `chat.project`, если да) — кнопка «Сделать проектом» обязана ожить тем же
     // кадром, без ожидания следующего действия.
-    $("chat-make-project").disabled = !chat.project;
+    renderChatMakeProject();
   }
 
   /** Промпт поставленной задачи, насколько его вообще видно странице.
@@ -5657,6 +5686,10 @@ function startPage() {
       return;
     }
     // -- редактор сцен видеопроекта (Task 7): каждое действие сначала снимает поля в черновик ----
+    if (button.dataset.act === "project-chat") {
+      openChatModal({ kind: "project", id }, { prompt: "", mode: "", image: "", endImage: "", duration: 10 });
+      return;
+    }
     if (button.dataset.act === "lib-new-version") { newLibraryVersion(button); return; }
     if (button.dataset.act === "lib-delete") { deleteLibraryCard(button); return; }
     if (button.dataset.act === "tag-pick") { pickTag(button); return; }
@@ -6316,7 +6349,30 @@ function startPage() {
     });
   }
 
-  $("chat-make-project").addEventListener("click", openProjectCreatePanel);
+  /** «Применить к проекту»: сцены диалога заменяют все сцены проекта (с вопросом, если они есть). */
+  async function applyChatToProject() {
+    if (!chat || !chat.project) return;
+    const id = chat.source.id;
+    clearChatProjectError();
+    try {
+      const current = await api("GET", `/api/projects/${encodeURIComponent(id)}`);
+      const question = chatApplyConfirm(((current.project || {}).scenes || []).length,
+                                        (chat.project.scenes || []).length);
+      if (question !== null && !window.confirm(question)) return;
+      await api("PUT", `/api/projects/${encodeURIComponent(id)}/scenes`, chatApplyBody(chat.project));
+      closeChat();
+      await poll();
+      await openProjectModal(id);
+    } catch (error) {
+      $("chat-project-panel").hidden = false;     // the error is shown in the panel
+      showChatProjectError(error.payload ? error.payload : { error: { message: "сервер не ответил" } });
+    }
+  }
+
+  $("chat-make-project").addEventListener("click", () => {
+    if (chat && chat.source.kind === "project") applyChatToProject();
+    else openProjectCreatePanel();
+  });
   $("chat-project-cancel").addEventListener("click", closeProjectCreatePanel);
   $("chat-project-create").addEventListener("click", async () => {
     if (!chat || !chat.project) return;

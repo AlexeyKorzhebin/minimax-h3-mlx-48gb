@@ -1063,3 +1063,53 @@ def test_retry_panel_shows_its_error():
 def test_retry_number_fields_show_the_whole_placeholder():
     css = re.sub(r"\s+", " ", _page_text("style.css"))
     assert ".scene-edit-row input.retry-seed, .scene-edit-row input.retry-steps { width: calc(20ch + 24px); }" in css
+
+
+@_needs_node
+def test_plate_text_for_each_gpu_sharing_answer():
+    assert _js("[app.llmPlateText('down', {external: false, sharesGpu: true}), "
+               "app.llmPlateText('busy', {external: false, sharesGpu: true, runningSeconds: 300}), "
+               "app.llmPlateText('down', {external: true, sharesGpu: true}), "
+               "app.llmPlateText('down', {external: true, sharesGpu: false}), "
+               "app.llmPlateText('down', {external: true, sharesGpu: null}), "
+               "app.llmPlateText('down', {external: true})]") == [
+        "модель не поднята — поднимется при первом сообщении",
+        "идёт прогон — модель поднимется после него (~5 мин)",
+        "делит видеокарту с H3: пока модель поднята, рендер ждёт",
+        "внешний провайдер — память этой машины не занимает",
+        "где считает провайдер, не указано (shares_gpu в providers.json)",
+        "где считает провайдер, не указано (shares_gpu в providers.json)"]
+
+
+@_needs_node
+def test_chat_apply_body_and_confirm():
+    assert _js("app.chatApplyBody({kind: 'video', scenes: [{prompt: '@a', duration: 7, extra: 1}]})") \
+        == {"scenes": [{"prompt": "@a", "duration": 7}]}
+    assert _js("[[0, 3], [1, 3], [2, 3], [5, 1]].map(([c, i]) => app.chatApplyConfirm(c, i))") == [
+        None, "Заменить 1 сцену проекта на 3 из диалога?", "Заменить 2 сцены проекта на 3 из диалога?",
+        "Заменить 5 сцен проекта на 1 из диалога?"]
+
+
+CHAT_EXPECTED = {
+    "project_chat_opens": {"posts": [["/api/chat", {
+        "source": {"kind": "project", "id": "p1"}, "prompt": "", "mode": "", "image": "",
+        "end_image": "", "duration": 10}]]},
+    "chat_apply_to_project": {
+        "label": "Применить к проекту",
+        "confirms": ["Заменить 2 сцены проекта на 3 из диалога?"],
+        "puts": [["/api/projects/p1/scenes", {"scenes": [
+            {"prompt": "@a jumps", "duration": 6}, {"prompt": "@a lands", "duration": 4},
+            {"prompt": "@a bows", "duration": 3}]}]],
+        "posts": []},
+    "chat_apply_declined": {"puts": []},
+    "chat_button_in_the_script_stage": {"button": '<button type="button" class="ghost" '
+        'data-act="project-chat" data-id="p1">Чат по сценарию</button>'},
+    "chat_apply_refused": {"error": "<b>Запрос не прошёл</b><pre>плохая сцена</pre>", "panelHidden": False},
+    "chat_plain_keeps_its_label": {"label": "Сделать проектом"},
+}
+
+
+@_needs_node
+@pytest.mark.parametrize("scenario", sorted(CHAT_EXPECTED))
+def test_chat_wiring(scenario):
+    assert _gaps(scenario) == CHAT_EXPECTED[scenario]

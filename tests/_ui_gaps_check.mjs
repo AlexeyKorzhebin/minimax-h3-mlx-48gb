@@ -61,6 +61,10 @@ const block = (cls) => {
   return null;
 };
 
+const CHAT_SESSION = { ok: true, id: "c1", source: { kind: "project", id: "p1" }, mode: "t2va",
+  image: "", end_image: "", duration: 10, messages: [], prompt: "", kind: "video", tags: ["@a"],
+  project: { kind: "video", scenes: [{ prompt: "@a jumps", duration: 6 },
+    { prompt: "@a lands", duration: 4 }, { prompt: "@a bows", duration: 3 }] } };
 const SCENARIOS = {
   async new_video() {
     answers.prompt = "Бой";
@@ -633,6 +637,56 @@ const SCENARIOS = {
     queryOne["#project-body .project-seed"] = { value: "" };
     await act("project-seed-save");
     return { puts: puts() };
+  },
+  async project_chat_opens() {
+    await start(appUrl, draftRoutes({ "POST /api/chat": ok({ ok: true, id: "c1" }),
+                                      "GET /api/chat/c1": ok(CHAT_SESSION) }));
+    await open();
+    await act("project-chat");
+    return { posts: posts() };
+  },
+  async chat_button_in_the_script_stage() {
+    await start(appUrl, draftRoutes());
+    await open();
+    const m = getElementById("project-body").innerHTML.match(/<button type="button" class="ghost" data-act="project-chat"[^>]*>[^<]*<\/button>/);
+    return { button: m && m[0] };
+  },
+  async chat_apply_to_project() {
+    globalThis.window.location.hash = "#chat/c1";
+    await start(appUrl, draftRoutes({ "GET /api/chat/c1": ok(CHAT_SESSION) }));
+    await sleep(120);
+    const label = getElementById("chat-make-project").textContent;
+    answers.confirm = true;
+    getElementById("chat-make-project").__listeners.click[0]();
+    await sleep(160);
+    return { label, confirms, puts: puts(), posts: posts() };
+  },
+  async chat_apply_declined() {
+    globalThis.window.location.hash = "#chat/c1";
+    await start(appUrl, draftRoutes({ "GET /api/chat/c1": ok(CHAT_SESSION) }));
+    await sleep(120);
+    answers.confirm = false;
+    getElementById("chat-make-project").__listeners.click[0]();
+    await sleep(160);
+    return { puts: puts() };
+  },
+  async chat_apply_refused() {
+    globalThis.window.location.hash = "#chat/c1";
+    await start(appUrl, draftRoutes({ "GET /api/chat/c1": ok(CHAT_SESSION),
+      "PUT /api/projects/p1/scenes": { status: 400, body: { error: { message: "плохая сцена" } } } }));
+    await sleep(120);
+    answers.confirm = true;
+    getElementById("chat-make-project").__listeners.click[0]();
+    await sleep(160);
+    return { error: getElementById("chat-project-err").innerHTML,
+             panelHidden: getElementById("chat-project-panel").hidden };
+  },
+  async chat_plain_keeps_its_label() {
+    globalThis.window.location.hash = "#chat/c2";
+    await start(appUrl, draftRoutes({ "GET /api/chat/c2": ok({ ...CHAT_SESSION, id: "c2",
+      source: { kind: "new" } }) }));
+    await sleep(120);
+    return { label: getElementById("chat-make-project").textContent };
   },
 };
 
