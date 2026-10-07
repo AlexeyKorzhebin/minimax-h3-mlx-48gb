@@ -254,7 +254,7 @@ def run_upscale(project_path, *, client, comfy_output, run, attempt: str, sleep=
                            f"результат отброшен\n")
                 break
             log.append(f"ltx: сцена {scene['idx']} -> {out.name} (ComfyUI "
-                       f"{timings['comfy_s']:.1f} с, часть {timings['wall_s']:.1f} с)\n")
+                       f"{timings.get('comfy_s', '—')} с, часть {timings.get('wall_s', '—')} с)\n")
     except (UpscaleError, motion.MotionError) as exc:
         proj.finish_upscale(upscaled, ok=False)
         log.append(f"ltx: {exc}\n")
