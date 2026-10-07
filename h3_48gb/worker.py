@@ -603,17 +603,39 @@ class _IdleRelease:
                 print(f"h3 worker: idle release failed: {exc}", file=sys.stderr)
 
 
-def _wait_for_engine_start_to_settle(client, *, sleep=time.sleep) -> None:
+#: How long an assembly waits for our own engine to finish starting. Counted from the engine's
+#: own `started_at` in the dispatcher's /status (the dispatcher enforces its start_timeout only
+#: inside /acquire, which an assembly never calls), so a restarted worker does not restart the
+#: count and an engine that hangs in `ready: false` cannot hold an assembly for ever.
+ASSEMBLY_START_WAIT_LIMIT = 900.0
+
+
+def _wait_for_engine_start_to_settle(root, job, client, *, sleep=time.sleep,
+                                     clock=time.time) -> str | None:
     """spec §9 (22 GB host RAM): an assembly's ffmpeg must not run next to an engine that is
-    still loading. Waits while any of our own engines reports `ready: false`."""
+    still loading. Waits while any of our own engines reports `ready: false`, showing why
+    (`wait_reason`), for at most ASSEMBLY_START_WAIT_LIMIT since the engine started. Returns the
+    cancel reason if the job was cancelled while waiting, else None."""
+    from h3_48gb.engines import sglang as sglang_engine
+
     while True:
+        reason = q.cancel_reason(root, job.id)
+        if reason:
+            return reason
         try:
             own = client.status().get("own") or {}
         except dispatcher_client.DispatcherUnavailable:
-            return
-        if all(record.get("ready") for record in own.values()):
-            return
-        sleep(ACQUIRE_RETRY_SECONDS)
+            return None
+        starting = [r for r in own.values() if not r.get("ready")]
+        if not starting or all(clock() - (r.get("started_at") or clock()) > ASSEMBLY_START_WAIT_LIMIT
+                               for r in starting):
+            q.set_running_fields(root, job.id, wait_reason=None)
+            return None
+        q.set_running_fields(root, job.id, wait_reason="ждём: поднимается h3, сборка после")
+        reason = sglang_engine._sleep_unless_cancelled(root, job.id, ACQUIRE_RETRY_SECONDS, sleep)
+        if reason:
+            return reason
+
 
 def _run_sglang_generate_job(root, outdir, job, *, gate=None) -> tuple[int, str]:
     from h3_48gb.engines import sglang as sglang_engine
@@ -882,9 +904,14 @@ def run_job(root, job, spawn=subprocess.Popen, outdir=None) -> int:
             elif job.kind == q.KIND_SONG:
                 exit_code, log_text = _run_song_job(job, spawn=spawn)
             elif job.kind == q.KIND_ASSEMBLE:
+                cancelled = None
                 if engine.is_sglang():
-                    _wait_for_engine_start_to_settle(dispatcher_client.DispatcherClient())
-                exit_code, log_text = _run_assemble_job(job, spawn=spawn)
+                    cancelled = _wait_for_engine_start_to_settle(
+                        root, job, dispatcher_client.DispatcherClient())
+                if cancelled:
+                    exit_code, log_text = 1, f"сборка отменена: {cancelled}\n"
+                else:
+                    exit_code, log_text = _run_assemble_job(job, spawn=spawn)
             else:
                 exit_code, log_text = 1, f"unknown job kind {job.kind!r}\n"
             with open(q.log_path(root, job.id), "ab") as stream:

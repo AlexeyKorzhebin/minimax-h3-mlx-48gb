@@ -141,3 +141,12 @@ def test_an_unknown_dispatcher_refusal_is_a_502_not_a_made_up_code(setup):
     status, body = _call(live, "POST", "/api/qwen/restore", {})
     assert (status, body["error"]["code"], body["error"]["message"]) == \
         (502, "dispatcher_unavailable", "что-то своё")
+
+
+def test_release_pauses_the_queue_before_asking_the_dispatcher(setup):
+    live, disp, root, tmp_path = setup
+    q.set_paused(root, False)
+    seen = []
+    disp.on_release = lambda: seen.append(q.is_paused(root))
+    status, _ = _call(live, "POST", "/api/gpu/release", {})
+    assert (status, seen) == (200, [True])

@@ -52,20 +52,37 @@ def test_gate_waits_for_foreign_then_qwen_then_returns_ready(running):
     assert [c[2] for c in fake.calls if c[1] == "/acquire"] == [{"engine": "h3"}] * 4
 
 
-def test_retry_intervals_are_thirty_and_five_seconds(running):
+def test_retry_intervals_are_thirty_and_five_seconds(running, monkeypatch):
     root, job, _ = running
     fake = FakeDispatcher(acquire=(
         {"ok": True, "state": "wait", "engine": "h3", "reason": "x"},
         {"ok": True, "state": "starting", "engine": "h3", "log": "/l"},
         {"ok": True, "state": "ready", "engine": "h3"}))
-    sleeps = []
+    waits = []
+
+    def record(root_, job_id, seconds, sleep):
+        waits.append(([j for j in q.scan(root_)[0] if j.id == job_id][0].wait_reason, seconds))
+
+    monkeypatch.setattr(sg, "_sleep_unless_cancelled", record)
     try:
-        gate = worker.make_gpu_gate(root, "h3", client=dc.DispatcherClient(fake.url),
-                                    sleep=sleeps.append)
+        gate = worker.make_gpu_gate(root, "h3", client=dc.DispatcherClient(fake.url))
         assert gate(job) is None
     finally:
         fake.close()
-    assert sleeps == [1.0] * 30 + [1.0] * 5
+    assert waits == [("ждём GPU: x", 30.0), ("ждём GPU: поднимается h3", 5.0)]
+
+
+def test_the_threshold_itself_is_hot(running):
+    root, job, _ = running
+    fake = FakeDispatcher(temps=(80, 72))
+    seen = []
+    try:
+        gate = worker.make_gpu_gate(root, "h3", client=dc.DispatcherClient(fake.url),
+                                    sleep=_recording_sleep(root, job.id, seen))
+        assert gate(job) is None
+    finally:
+        fake.close()
+    assert seen == ["остываем, 80 °C"]
 
 
 def test_a_hot_card_is_waited_down_to_72(running):
@@ -210,18 +227,66 @@ def test_main_loop_never_talks_to_a_dispatcher_on_mlx(tmp_path, monkeypatch):
     assert disp.calls == []
 
 
-def test_assembly_waits_while_our_engine_is_still_starting(tmp_path):
-    class _Status:
-        def __init__(self):
-            self.answers = [{"own": {"h3": {"ready": False}}}, {"own": {"h3": {"ready": False}}},
-                            {"own": {}}]
+class _Status:
+    def __init__(self, answers):
+        self.answers = list(answers)
 
+    def status(self):
+        return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+
+def _assembly(tmp_path):
+    root = q.layout(tmp_path / "queue")["root"]
+    q.submit(root, ["assemble", "--project", str(tmp_path / "p.json")], "assemble P",
+             {"output_stem": str(tmp_path / "job-final")}, {}, kind=q.KIND_ASSEMBLE)
+    return root, q.claim(root)
+
+
+def test_assembly_waits_while_our_engine_is_still_starting_and_says_why(tmp_path):
+    root, job = _assembly(tmp_path)
+    seen = []
+    client = _Status([{"own": {"h3": {"ready": False, "started_at": 1000.0}}},
+                      {"own": {"h3": {"ready": False, "started_at": 1000.0}}},
+                      {"own": {"h3": {"ready": True, "started_at": 1000.0}}}])
+    assert worker._wait_for_engine_start_to_settle(
+        root, job, client, sleep=_recording_sleep(root, job.id, seen), clock=lambda: 1001.0) is None
+    assert seen == ["ждём: поднимается h3, сборка после"]
+    assert [j for j in q.scan(root)[0] if j.id == job.id][0].wait_reason is None
+
+
+def test_assembly_wait_is_cancellable(tmp_path):
+    root, job = _assembly(tmp_path)
+    client = _Status([{"own": {"h3": {"ready": False, "started_at": 1000.0}}}])
+    got = worker._wait_for_engine_start_to_settle(
+        root, job, client, clock=lambda: 1001.0,
+        sleep=lambda s: q.request_cancel(root, job.id, "cancelled_by_user"))
+    assert got == "cancelled_by_user"
+
+
+def test_assembly_cancelled_before_the_wait_does_not_even_ask_the_dispatcher(tmp_path):
+    root, job = _assembly(tmp_path)
+    q.request_cancel(root, job.id, "cancelled_by_user")
+
+    class _Boom:
         def status(self):
-            return self.answers.pop(0)
+            raise AssertionError("must not ask")
 
+    assert worker._wait_for_engine_start_to_settle(root, job, _Boom()) == "cancelled_by_user"
+
+
+def test_assembly_wait_gives_up_fifteen_minutes_after_the_engine_started(tmp_path):
+    root, job = _assembly(tmp_path)
+    client = _Status([{"own": {"h3": {"ready": False, "started_at": 1000.0}}}])
     sleeps = []
-    worker._wait_for_engine_start_to_settle(_Status(), sleep=sleeps.append)
-    assert sleeps == [worker.ACQUIRE_RETRY_SECONDS] * 2
+    now = [1000.0 + 900.0]            # exactly at the limit: still waiting
+    clock = lambda: now[0]            # noqa: E731
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += 1.0                 # every slice moves the clock on
+
+    assert worker._wait_for_engine_start_to_settle(root, job, client, sleep=sleep, clock=clock) is None
+    assert sleeps == [1.0] * 30      # one 30 s retry period, then past the limit
 
 
 def test_unknown_temperature_does_not_block_the_gate(running):

@@ -8,7 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class FakeDispatcher:
     def __init__(self, *, acquire=({"ok": True, "state": "ready", "engine": "h3"},),
-                 temps=(44,), own=None, restore_status=200, gpu_null=False):
+                 temps=(44,), own=None, restore_status=200, gpu_null=False,
+                 on_release=None):
         self.headers: list[dict] = []
         self.calls: list[tuple[str, str, dict]] = []
         self._acquire = list(acquire)
@@ -16,6 +17,7 @@ class FakeDispatcher:
         self.own = own if own is not None else {}
         self.restore_status = restore_status
         self.gpu_null = gpu_null
+        self.on_release = on_release
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -66,6 +68,8 @@ class FakeDispatcher:
                 if self.path == "/acquire":
                     return self._send(200, fake._next(fake._acquire))
                 if self.path == "/release":
+                    if fake.on_release:
+                        fake.on_release()
                     return self._send(200, {"ok": True, "stopped": ["h3"]})
                 if self.path == "/qwen/unload":
                     return self._send(200, {"ok": True, "was_running": True, "exit_code": 0})

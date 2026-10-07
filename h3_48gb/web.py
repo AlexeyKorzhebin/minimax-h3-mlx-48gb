@@ -5338,18 +5338,23 @@ class _Handler(BaseHTTPRequestHandler):
                                f"Сцена будет потеряна", {"job": running.id})
             try:
                 with queue_write_errors(root, what="the job id"):
-                    q.request_cancel(root, running.id, "released_by_user")
+                    # the pause goes up *before* the cancel: the worker must not claim the next
+                    # job the moment this one stops
                     q.set_paused(root, True)
+                    q.request_cancel(root, running.id, "released_by_user")
                 return 200, "application/json", _json_bytes(
                     {"ok": True, "paused": True, "releasing": True, "job": running.id})
             except q.JobNotRunning:
                 pass  # finished between the scan and the click: nothing to cancel, free the card
+        # Pause first, release second: /release may hold this request for up to 120 s while the
+        # dispatcher stops its engine, and a worker that is not paused claims the next job in
+        # that window, whose acquire raises H3 again right behind the release.
+        with queue_errors(root):
+            q.set_paused(root, True)
         try:
             answer = dispatcher_client.DispatcherClient().release()
         except dispatcher_client.DispatcherUnavailable as exc:
             raise CliError("dispatcher_unavailable", f"диспетчер GPU не отвечает: {exc}", {}) from exc
-        with queue_errors(root):
-            q.set_paused(root, True)
         return 200, "application/json", _json_bytes(
             {"ok": True, "paused": True, "releasing": False, "released": answer.get("stopped", [])})
 
