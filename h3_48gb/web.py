@@ -486,6 +486,16 @@ def _upload_stamp() -> str:
     """
     return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
 
+#: Wave 1.5, spec §5.5: why an edit of a running project is refused. The page shows the same
+#: text before the click (`app.PROJECT_LOCK_TEXT`, pinned equal by a test).
+PROJECT_LOCK_TEXT = {
+    "references": "Проект считается — референсы меняются после конца прогона. Чтобы поменять "
+                  "для части сцен: дождитесь конца и пересчитайте с нужной сцены.",
+    "settings": "Проект считается — начало сцепленной сцены и сид меняются после конца прогона. "
+                "Чтобы поменять для части сцен: дождитесь конца и пересчитайте с нужной сцены.",
+    "route": "Идёт апскейл или сборка — галочку апскейла можно поменять после них.",
+}
+
 #: HTTP status for each `CliError` code that is not a plain refusal of the request. Everything
 #: absent from here is 400: the caller asked for something this server will not do.
 #:
@@ -3555,8 +3565,28 @@ class _Handler(BaseHTTPRequestHandler):
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for PUT {path}", {"path": path})
 
+    def _refuse_while_running(self, proj, what: str) -> None:
+        """Wave 1.5, spec §5.5: `project_running` (409) with `PROJECT_LOCK_TEXT[what]` while the
+        project has work in the queue (`route`: only an upscale or an assembly). Called right after
+        `_load_project`, before `_json_request`, so the refusal does not depend on the body; the
+        body is left unread on purpose -- the server is HTTP/1.0 (closes the connection) and the
+        bodies are small."""
+        with queue_errors(self.server.queue_root):
+            jobs, _broken = q.scan(self.server.queue_root)
+        if what == "route":
+            busy = (_project_job_by_args(jobs, proj.path, q.KIND_UPSCALE)
+                    or _project_job_by_args(jobs, proj.path, q.KIND_ASSEMBLE))
+            active = "upscale" if busy and busy.kind == q.KIND_UPSCALE else "assembly"
+        else:
+            busy = _project_active_job(proj, jobs)
+            active = (busy or {}).get("kind")
+        if busy:
+            raise CliError("project_running", PROJECT_LOCK_TEXT[what],
+                           {"id": proj.id, "active": active})
+
     def _put_project_route(self, raw_id: str) -> tuple[int, str, bytes]:
         proj = self._load_project(raw_id)
+        self._refuse_while_running(proj, "route")
         payload = self._json_request(allowed=("upscale",))
         if not isinstance(payload.get("upscale"), bool):
             raise CliError("args_invalid", "`upscale` must be true or false", {})
@@ -3596,6 +3626,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _put_project_settings(self, raw_id: str) -> tuple[int, str, bytes]:
         proj = self._load_project(raw_id)
+        self._refuse_while_running(proj, "settings")
         payload = self._json_request(allowed=("i2v_prefix", "seed"))
         if not payload:
             raise CliError("args_invalid", "settings: pass `i2v_prefix` and/or `seed`", {})
@@ -4254,6 +4285,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _put_project_references(self, raw_id: str) -> tuple[int, str, bytes]:
         proj = self._load_project(raw_id)
+        self._refuse_while_running(proj, "references")
         payload = self._json_request(allowed=("references",))
         proj.set_references(self._pinned_references(payload.get("references")))
         return self._project_references(raw_id)
