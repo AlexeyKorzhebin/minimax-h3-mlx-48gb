@@ -85,7 +85,8 @@ def test_too_many_pictures_is_refused(live, monkeypatch):
     monkeypatch.setenv("H3_MAX_REF_IMAGES", "0")
     proj = _video(live, ["@alice"], [7.0])
     status, body = _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})
-    assert body["error"]["detail"]["scenes"][0]["code"] == "sglang_args_invalid"
+    assert body["error"]["detail"] == {"scenes": [
+        {"idx": 0, "code": "sglang_args_invalid", "message": "H3_MAX_REF_IMAGES должен быть ≥ 1"}]}
 
 
 def test_on_mlx_nothing_is_snapped_or_checked(live, monkeypatch):
@@ -108,3 +109,47 @@ def test_the_picture_limit_counts_card_assets(live, monkeypatch):
     assert body["error"]["detail"] == {"scenes": [
         {"idx": 0, "code": "too_many_reference_images",
          "message": "картинок-референсов 2, а можно не больше 1"}]}
+
+
+def _durations(proj):
+    return [s["duration"] for s in p.load_project(proj.path).scenes]
+
+
+def test_the_ends_of_the_range_snap_inside_what_sglang_accepts(live):
+    """15.0 s -> 345 frames (not 362); a chained 2.5 s -> delivers 72 frames (requests 73)."""
+    proj = _video(live, ["@alice sits", "@alice waves"], [15.0, 2.5])
+    status, body = _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})
+    assert status == 200, body
+    assert _durations(proj) == [345 / 24, 72 / 24]
+    (job,) = _pending(live)
+    assert sa.parse(job.args, check_files=False).frames == 345
+
+
+def test_a_first_scene_of_2_5_seconds_snaps_to_73_frames(live):
+    proj = _video(live, ["@alice sits"], [2.5])
+    status, body = _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})
+    assert status == 200, body
+    assert _durations(proj) == [73 / 24]
+
+
+def test_a_refusal_at_the_gate_leaves_the_durations_on_disk_untouched(live):
+    proj = _video(live, ["@alice sits", "@bob waves"], [7.0, 7.0])
+    status, body = _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})
+    assert status == 400
+    assert body["error"]["detail"] == {"scenes": [
+        {"idx": 1, "code": "unknown_tag", "message": "теги не подключены к проекту: @bob"}]}
+    assert _durations(proj) == [7.0, 7.0]
+    assert _pending(live) == []
+
+
+def test_an_error_from_advance_project_is_400_and_restores_the_durations(live, monkeypatch):
+    proj = _video(live, ["@alice sits"], [7.0])
+
+    def boom(*a, **k):
+        raise sa.SglangArgsError("sglang_args_invalid", "boom", {})
+    monkeypatch.setattr("h3_48gb.assemble.advance_project", boom)
+    status, body = _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})
+    assert status == 400
+    assert (body["error"]["code"], body["error"]["message"]) == ("sglang_args_invalid", "boom")
+    assert _durations(proj) == [7.0]
+    assert p.load_project(proj.path).stages["script"] == "awaiting_approval"

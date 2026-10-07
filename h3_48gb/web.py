@@ -969,50 +969,42 @@ def _grid_frames_nearest(frames: int, *, remainder: int) -> int:
 
 
 def _snap_video_scenes_sglang(scenes: list[dict]) -> list[dict]:
-    """Every video scene's *delivered* duration onto sglang's grid (spec §4.1.5), nearest point:
-    `17n+5` for scene 0 and every `fresh_start` scene, `17n+4` for a chained one (it requests one
-    frame more, the repeated keyframe, and H3 renders `17j+5`)."""
+    """Every video scene's *delivered* duration onto sglang's grid (spec §4.1.5), nearest point,
+    kept inside what sglang accepts: the **requested** frames must be `17n+5` within 3..15 s, i.e.
+    73..345. Scene 0 and every `fresh_start` scene deliver what they request (73..345, 17n+5); a
+    chained one requests one frame more (the repeated keyframe) and delivers 72..344 (17n+4)."""
     snapped = []
     for scene in scenes:
         chained = scene["idx"] > 0 and not scene.get("fresh_start", False)
-        remainder = ((_H3_LATENTS_PER_CHUNK - _SGLANG_OVERLAP_FRAMES) % _H3_FRAMES_PER_CHUNK
-                     if chained else _H3_LATENTS_PER_CHUNK)
+        overlap = _SGLANG_OVERLAP_FRAMES if chained else 0
+        remainder = (_H3_LATENTS_PER_CHUNK - overlap) % _H3_FRAMES_PER_CHUNK
         frames = _grid_frames_nearest(round(float(scene["duration"]) * _H3_FPS),
                                       remainder=remainder)
+        frames = min(max(frames, 73 - overlap), 345 - overlap)
         snapped.append({**scene, "duration": frames / _H3_FPS})
     return snapped
 
 
 def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
-    """spec §3.5/§4.1.3, checked at the gate so nothing is queued that sglang would refuse: every
-    @tag well-formed and pinned to the project, pictures within H3_MAX_REF_IMAGES, and **every**
-    scene names at least one reference -- the server serves only ref2va. A clip scene is exempt
-    from the last rule: its track piece is an audio reference."""
-    pinned = {ref["tag"]: ref for ref in proj.references}
+    """spec §3.5/§4.1.3: the gate runs the very path the submission runs -- `build_ref2va`, the
+    argv `assemble` builds (a chained scene with a stand-in keyframe path) and the adapter's own
+    `sglang_args.parse` -- so nothing is queued that sglang would refuse and there is one source of
+    truth for the rules. A clip scene gets a stand-in track piece: its audio reference."""
     errors: list[dict] = []
     for scene in scenes:
-        idx = scene["idx"]
+        chained = scene["idx"] > 0 and not scene.get("fresh_start", False)
         try:
-            limit = sglang_args.max_ref_images()
-            tags = library_module.scene_tags(scene["prompt"])
-            unknown = [tag for tag in tags if tag not in pinned]
-            if unknown:
-                errors.append({"idx": idx, "code": "unknown_tag",
-                               "message": f"теги не подключены к проекту: {', '.join(unknown)}"})
-                continue
-            images = sum(len(card["assets"]) for card in
-                         (library_module.get_card(outdir, tag, pinned[tag]["version"])
-                          for tag in tags) if card["kind"] != "voice")
+            ref2va = library_module.build_ref2va(scene["prompt"], proj.references, outdir)
+            args, _ = assemble_module._scene_generate_args_sglang(
+                scene, keyframe=Path("keyframe.png") if chained else None, chained=chained,
+                ref2va=ref2va,
+                track_piece=Path("track-piece.wav") if proj.kind == "clip" else None,
+                scenes_dir=Path("scenes"), i2v_prefix=proj.i2v_prefix)
+            sglang_args.parse(args, check_files=False)
         except (library_module.LibraryError, sglang_args.SglangArgsError) as exc:
-            errors.append({"idx": idx, "code": exc.code, "message": exc.message})
-            continue
-        if images > limit:
-            errors.append({"idx": idx, "code": "too_many_reference_images",
-                           "message": f"картинок-референсов {images}, а можно не больше {limit}"})
-            continue
-        if not tags and proj.kind != "clip":
-            errors.append({"idx": idx, "code": "ref2va_needs_reference",
-                           "message": "нужен хотя бы один референс (@тег) в сцене"})
+            errors.append({"idx": scene["idx"], "code": exc.code, "message": exc.message})
+        except assemble_module.AssembleError as exc:
+            errors.append({"idx": scene["idx"], "code": "duration_off_grid", "message": str(exc)})
     return errors
 
 
@@ -4364,6 +4356,16 @@ class _Handler(BaseHTTPRequestHandler):
                            estimate, kind=q.KIND_SONG)
         return {"job_id": job.id}
 
+    @staticmethod
+    def _restore_durations(proj, original) -> None:
+        """A refused approval leaves no snapped duration on disk."""
+        if original is None:
+            return
+        fresh = project_module.load_project(proj.path)
+        fresh.scenes = [{**s, "duration": original.get(s["idx"], s["duration"])}
+                        for s in fresh.scenes]
+        fresh.save()
+
     def _refuse_bad_scene_references(self, proj, scenes) -> None:
         errors = _scene_reference_errors(proj, scenes, self.server.outdir)
         if errors:
@@ -4477,10 +4479,20 @@ class _Handler(BaseHTTPRequestHandler):
                 if engine.is_sglang():
                     snapped = _snap_video_scenes_sglang(proj.scenes)
                     self._refuse_bad_scene_references(proj, snapped)
+                    original = {s["idx"]: s["duration"] for s in proj.scenes}
                     proj.scenes = snapped
                     proj.save()
-                result["advance"] = assemble_module.advance_project(
-                    proj, self.server.queue_root, self.server.outdir)
+                else:
+                    original = None
+                try:
+                    result["advance"] = assemble_module.advance_project(
+                        proj, self.server.queue_root, self.server.outdir)
+                except (library_module.LibraryError, sglang_args.SglangArgsError) as exc:
+                    self._restore_durations(proj, original)
+                    raise CliError(exc.code, exc.message, getattr(exc, "detail", {})) from exc
+                except Exception:
+                    self._restore_durations(proj, original)
+                    raise
             elif proj.kind in ("clip", "song"):
                 result["submit"] = self._submit_project_song_job(proj)
         elif stage == "track" and proj.kind == "clip":
