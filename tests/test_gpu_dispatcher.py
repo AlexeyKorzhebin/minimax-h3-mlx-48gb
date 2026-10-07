@@ -326,7 +326,7 @@ def test_status_shape(tmp_path, host):
         "foreign": [], "qwen": {"running": False, "unloaded_by_us": False},
         "lock": {"held_by_us": True, "path": str(tmp_path / "generation.lock")},
         "gpu": {"temperature_c": 44, "memory_used_mb": 15, "memory_total_mb": 65536},
-        "server_outputs_bytes": 123}
+        "server_outputs_bytes": 123, "events_path": str(tmp_path / "events.jsonl")}
 
 
 def test_http_layer(tmp_path, host):
@@ -663,3 +663,40 @@ def test_real_host_finds_group_members_in_proc_stat(tmp_path, monkeypatch):
     (proc / "self").mkdir()
     monkeypatch.setattr(gd, "PROC", proc)
     assert sorted(gd.Host().group_members(4242)) == [4242, 4300]
+
+
+# -- the record of every engine switch (final review 2026-10-07, M3/I7) ------------------------------
+
+def test_every_engine_switch_is_on_the_record(tmp_path, host, capsys):
+    d = _dispatcher(tmp_path, host)
+    d.acquire("h3", "panel-worker")                       # t=1000: spawned
+    host.t = 1092.0
+    host.ok_urls.add(H3_READY)
+    d.acquire("h3", "panel-worker")                       # ready after 92 s
+    d.acquire("h3", "panel-worker")                       # already ready: nothing new
+    host.die_on_term = False
+    real_group_alive = host.group_alive
+    host.group_alive = lambda pgid: real_group_alive(pgid) and host.t < 1100.0
+    d.acquire("ltx", "panel-worker")                      # H3 takes 8 s to go after SIGTERM
+    d.release("panel-worker")
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    h3_log, ltx_log = host.spawned[0][4], host.spawned[1][4]
+    assert events == [
+        {"ts": 1000.0, "event": "starting", "engine": "h3", "client": "panel-worker", "pid": 4242,
+         "log": h3_log},
+        {"ts": 1092.0, "event": "ready", "engine": "h3", "client": "panel-worker", "pid": 4242,
+         "seconds": 92.0},
+        {"ts": 1092.0, "event": "stopping", "engine": "h3", "client": "panel-worker", "pid": 4242},
+        {"ts": 1100.0, "event": "stopped", "engine": "h3", "client": "panel-worker", "pid": 4242,
+         "seconds": 8.0, "sigkill": False},
+        {"ts": 1100.0, "event": "starting", "engine": "ltx", "client": "panel-worker", "pid": 4243,
+         "log": ltx_log},
+        {"ts": 1100.0, "event": "stopping", "engine": "ltx", "client": "panel-worker", "pid": 4243},
+        {"ts": 1100.0, "event": "stopped", "engine": "ltx", "client": "panel-worker", "pid": 4243,
+         "seconds": 0.0, "sigkill": False},
+        {"ts": 1100.0, "event": "release", "engine": None, "client": "panel-worker", "all": False,
+         "stopped": ["ltx"]}]
+    journal = [line for line in capsys.readouterr().out.splitlines()
+               if line.startswith("gpu-dispatcher: ")]
+    assert [json.loads(line[len("gpu-dispatcher: "):]) for line in journal] == events
+    assert json.loads((tmp_path / "state.json").read_text())["engines"] == {}

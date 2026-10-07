@@ -286,6 +286,25 @@ class Dispatcher:
             mutate(self.state)
             self._save_state()
 
+    @property
+    def events_path(self) -> Path:
+        return self.state_path.with_name("events.jsonl")
+
+    def _event(self, event: str, engine: str | None, **fields) -> None:
+        """Final review 2026-10-07, M3/I7: every engine switch on the record -- one JSON line in
+        `events.jsonl` next to state.json (survives the engine and the dispatcher) and the same
+        line on stdout for the journal. `ts` is wall-clock epoch seconds; `seconds` is how long
+        the step took (start -> ready, SIGTERM -> group gone)."""
+        line = json.dumps({"ts": round(self.host.wall(), 3), "event": event, "engine": engine,
+                           **fields}, ensure_ascii=False)
+        print(f"gpu-dispatcher: {line}", flush=True)
+        try:
+            self.events_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.events_path, "a", encoding="utf-8") as out:
+                out.write(line + "\n")
+        except OSError:
+            pass                              # the journal still has the line
+
     def _alive(self, name: str, record: dict) -> bool:
         """Ours = the pid recorded in state.json AND its /proc cmdline carries every marker of
         the engine. serve.sh `exec`s `sglang serve ...` (serve.sh:12), so the pid Popen returned
@@ -325,12 +344,17 @@ class Dispatcher:
         """Called with `_ops` held and `_state` free: kill our group, wait, then forget it."""
         if self._alive(name, record) or self._orphaned_group(name, record):
             pgid = record["pgid"]
+            began = self.host.monotonic()
+            self._event("stopping", name, client=record.get("owner"), pid=record["pid"])
             self.host.killpg(pgid, signal.SIGTERM)
-            deadline = self.host.monotonic() + STOP_GRACE_SECONDS
+            deadline = began + STOP_GRACE_SECONDS
             while self.host.group_alive(pgid) and self.host.monotonic() < deadline:
                 self.host.sleep(1.0)
-            if self.host.group_alive(pgid):
+            killed = self.host.group_alive(pgid)
+            if killed:
                 self.host.killpg(pgid, signal.SIGKILL)
+            self._event("stopped", name, client=record.get("owner"), pid=record["pid"],
+                        seconds=round(self.host.monotonic() - began, 1), sigkill=killed)
         self._update(lambda state: state["engines"].pop(name, None))
 
     def _release_lock_if_idle(self) -> None:
@@ -382,7 +406,8 @@ class Dispatcher:
                   "qwen": {"running": self.host.url_ok(QWEN_HEALTH),
                            "unloaded_by_us": bool(state["qwen_was_running"])},
                   "lock": {"held_by_us": bool(own) or self.lock.held, "path": str(self.lock.path)},
-                  "gpu": gpu, "server_outputs_bytes": self.host.dir_size(self.server_outputs)}
+                  "gpu": gpu, "server_outputs_bytes": self.host.dir_size(self.server_outputs),
+                  "events_path": str(self.events_path)}
         if errors:
             answer["gpu_error"] = "; ".join(errors)
         return answer
@@ -396,6 +421,8 @@ class Dispatcher:
                 self._stop(engine, record)        # kills an orphaned group (I9), then forgets
                 self._release_lock_if_idle()
                 if not record.get("ready"):
+                    self._event("failed", engine, client=record.get("owner"), pid=record["pid"],
+                                reason="died before ready", log=record["log"])
                     return {"ok": True, "state": "failed", "engine": engine, "log": record["log"],
                             "reason": "движок не поднялся, смотрите лог"}
                 record = None
@@ -406,9 +433,18 @@ class Dispatcher:
                 if record.get("owner") is None:      # written before owners existed: adopt it
                     self._update(lambda st: st["engines"][engine].__setitem__("owner", client))
                 if self.host.url_ok(spec.ready_url):
-                    self._update(lambda st: st["engines"][engine].__setitem__("ready", True))
+                    if not record.get("ready"):
+                        now = self.host.wall()
+
+                        def mark_ready(st):
+                            st["engines"][engine].update(ready=True, ready_at=now)
+                        self._update(mark_ready)
+                        self._event("ready", engine, client=client, pid=record["pid"],
+                                    seconds=round(now - record["started_at"], 1))
                     return {"ok": True, "state": "ready", "engine": engine}
                 if self.host.wall() - record["started_at"] > spec.start_timeout:
+                    self._event("failed", engine, client=record.get("owner"), pid=record["pid"],
+                                reason=f"not ready in {spec.start_timeout:g} s", log=record["log"])
                     self._stop(engine, record)
                     self._release_lock_if_idle()
                     return {"ok": True, "state": "failed", "engine": engine, "log": record["log"],
@@ -449,21 +485,25 @@ class Dispatcher:
             new = {"pid": pid, "pgid": pgid, "variant": spec.variant, "owner": client,
                    "started_at": self.host.wall(), "log": str(log_path), "ready": False}
             self._update(lambda st: st["engines"].__setitem__(engine, new))
+            self._event("starting", engine, client=client, pid=pid, log=str(log_path))
             return {"ok": True, "state": "starting", "engine": engine, "log": str(log_path)}
 
     def release(self, client: str, everything: bool = False) -> dict:
         """`everything` is the human's "Освободить карту"; otherwise only `client`'s engines."""
         with self._ops:
-            if everything:
-                return {"ok": True, "stopped": self._release_all()}
-            return {"ok": True, "stopped": self._release_client(client)}
+            stopped = self._release_all() if everything else self._release_client(client)
+            self._event("release", None, client=client, all=everything, stopped=stopped)
+            return {"ok": True, "stopped": stopped}
 
     def qwen_unload(self) -> tuple[int, dict]:
         with self._ops:
             if not self.host.url_ok(QWEN_HEALTH):
                 return 200, {"ok": True, "was_running": False}
             self._update(lambda st: st.__setitem__("qwen_was_running", True))
+            began = self.host.monotonic()
             code = self.host.run_qwen("stop")
+            self._event("qwen_unload", None, exit_code=code,
+                        seconds=round(self.host.monotonic() - began, 1))
             return 200, {"ok": code == 0, "was_running": True, "exit_code": code}
 
     def qwen_restore(self) -> tuple[int, dict]:
@@ -476,6 +516,7 @@ class Dispatcher:
                 return 200, {"ok": True, "state": "already_running"}
             self._release_all()
             self.host.start_qwen()
+            self._event("qwen_restore", None)
             self._update(lambda st: st.__setitem__("qwen_was_running", False))
             return 200, {"ok": True, "state": "starting"}
 
