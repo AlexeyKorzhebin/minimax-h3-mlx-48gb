@@ -112,6 +112,27 @@ def test_build_ref2va_two_tags_one_with_two_pictures(out):
         audios=(), subjects=("@beach", "@alice"))
 
 
+def test_a_prompt_with_its_own_subject_definitions_gets_no_second_block(out):
+    """Final review I5: the fight-armored-40 prompts carry their own block; a second one put
+    two different `<Subject 1>` in one prompt."""
+    refs = _two_tag_library(out)
+    own = ("subject_definitions:\n"
+           "<Subject 1> is the arena from @beach, first frame <Picture 1>.\n"
+           "<Subject 2> is @alice, face from <Picture 2>.\n\n"
+           "@alice fights on @beach.")
+    scene = lib.build_ref2va(own, refs, out)
+    lib_dir = out / "library"
+    assert scene == Ref2VAScene(
+        prompt=("subject_definitions:\n"
+                "<Subject 1> is the arena from <Subject 1>, first frame <Picture 1>.\n"
+                "<Subject 2> is <Subject 2>, face from <Picture 2>.\n\n"
+                "<Subject 2> fights on <Subject 1>."),
+        images=(str(lib_dir / "beach" / "v1" / "01-pano.png"),
+                str(lib_dir / "alice" / "v1" / "01-face.png"),
+                str(lib_dir / "alice" / "v1" / "02-back.png")),
+        audios=(), subjects=("@beach", "@alice"))
+
+
 def test_build_ref2va_voice_card_is_an_audio_subject(out):
     lib.create_card(out, tag="@narrator", kind="voice", description="a calm low male voice",
                     assets=[_img(out / "uploads" / "v.mp3", b"ID3")])

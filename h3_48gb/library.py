@@ -220,7 +220,19 @@ def scene_tags(text: str) -> list[str]:
     return seen
 
 
+#: A scene prompt that writes its own `subject_definitions:` section (final review 2026-10-07, I5).
+_OWN_DEFINITIONS_RE = re.compile(r"(?m)^\s*subject_definitions\s*:")
+
+
 def build_ref2va(scene_prompt: str, references, outdir) -> Ref2VAScene:
+    """The scene as sglang's Ref2VA takes it: each @tag, in order of first mention, becomes
+    `<Subject N>` in the text and its card's pictures `<Picture k>` (audio `<Audio k>`) in the
+    same order; the panel puts its own `subject_definitions:` block in front.
+
+    I5 (coordinator's ruling): a prompt that already has its own `subject_definitions:` section
+    gets no second block -- the owner's definitions stand as written. The @tags in it still
+    become `<Subject N>` and still bring their pictures as conditions, numbered exactly as above,
+    so the owner's block has to follow that numbering."""
     tags = scene_tags(scene_prompt)
     if not tags:
         return Ref2VAScene(scene_prompt, (), (), ())
@@ -247,7 +259,10 @@ def build_ref2va(scene_prompt: str, references, outdir) -> Ref2VAScene:
                          f"{', '.join(labels)}.")
     body = _TAG_IN_TEXT_RE.sub(lambda m: f"<Subject {tags.index('@' + m.group(1)) + 1}>",
                                scene_prompt)
-    prompt = "subject_definitions:\n" + "\n".join(lines) + "\n\n" + body
+    if _OWN_DEFINITIONS_RE.search(scene_prompt):
+        prompt = body
+    else:
+        prompt = "subject_definitions:\n" + "\n".join(lines) + "\n\n" + body
     return Ref2VAScene(prompt, tuple(images), tuple(audios), tuple(tags))
 
 
