@@ -43,8 +43,8 @@ def beach_payload(job: dict) -> dict:
             "audio_flow_shift": 3.0, "seed": int(job["seed"]), "quality": "lossless"}
 
 
-def _card(path: Path, colour) -> str:
-    Image.new("RGB", (512, 512), colour).save(path)
+def _card(path: Path, colour, size=(512, 512)) -> str:
+    Image.new("RGB", tuple(size), colour).save(path)
     return str(path)
 
 
@@ -56,10 +56,10 @@ def _shape(path: Path, colour, *, ball: bool) -> str:
     return str(path)
 
 
-def references_payload(workdir: Path, n: int) -> dict:
+def references_payload(workdir: Path, n: int, size=(512, 512)) -> dict:
     """n plain colour cards as references, each named in order -- the memory probe (spec §6 b)."""
     workdir.mkdir(parents=True, exist_ok=True)
-    refs = [_card(workdir / f"r{i}.png", ((i * 30) % 255, 80, 160)) for i in range(n)]
+    refs = [_card(workdir / f"r{i}.png", ((i * 30) % 255, 80, 160), size) for i in range(n)]
     return {**_COMMON, "num_inference_steps": _PROBE_STEPS, "task": "ref2va",
             "prompt": "subject_definitions:\n" + "\n".join(
                 f"<Subject {i + 1}> is the colour card in <Picture {i + 1}>." for i in range(n))
@@ -99,12 +99,13 @@ def probe_payloads(workdir: Path) -> dict[str, dict]:
     }
 
 
-def named_payload(name: str, workdir: Path, *, beach_jobs, steps, duration=None) -> dict:
+def named_payload(name: str, workdir: Path, *, beach_jobs, steps, duration=None,
+                  ref_size=(512, 512)) -> dict:
     if name == "beach":
         jobs = json.loads(Path(beach_jobs).read_text(encoding="utf-8"))["jobs"]
         payload = beach_payload(next(j for j in jobs if j["name"] == "beach-01"))
     elif name.startswith("references:"):
-        payload = references_payload(workdir, int(name.split(":", 1)[1]))
+        payload = references_payload(workdir, int(name.split(":", 1)[1]), ref_size)
     elif name == "picture_numbering_mirrored":
         plain = probe_payloads(workdir)["picture_numbering"]
         payload = {**plain, "prompt": plain["prompt"].replace(
@@ -186,6 +187,7 @@ def main(argv=None) -> int:
                         help="post all probes first, then poll (POST timed under load)")
     parser.add_argument("--steps", type=int, default=None, help="override num_inference_steps")
     parser.add_argument("--duration", type=float, default=None, help="override seconds")
+    parser.add_argument("--ref-size", default="512x512", help="references:N card size, WxH")
     parser.add_argument("--beach-jobs", type=Path, default=BEACH_JOBS)
     args = parser.parse_args(argv)
     dispatcher = DispatcherClient()
@@ -196,7 +198,8 @@ def main(argv=None) -> int:
     stem = f"{datetime.now():%Y%m%d-%H%M%S}"
     out_path = OUT_DIR / f"{stem}.jsonl"
     payloads = {name: named_payload(name, OUT_DIR / "inputs", beach_jobs=args.beach_jobs,
-                                    steps=args.steps, duration=args.duration)
+                                    steps=args.steps, duration=args.duration,
+                                    ref_size=tuple(int(v) for v in args.ref_size.split("x")))
                 for name in args.names}
 
     def finish(result: dict) -> None:

@@ -171,3 +171,13 @@ def test_named_payload_duration_override_touches_only_the_duration(tmp_path):
                                   duration=10.0)
     assert longer == {**plain, "num_inference_steps": 2,
                       "target": {**plain["target"], "duration_seconds": 10.0}}
+
+
+def test_reference_cards_can_be_portraits(tmp_path):
+    """The server scales every reference to a 2048 px short edge with no area cap, so a portrait
+    photo costs more tokens than a square card: the memory probe must be able to send one."""
+    payload = probes.named_payload("references:2", tmp_path, beach_jobs=None, steps=None,
+                                   ref_size=(512, 683))
+    assert [Image.open(c["uri"]).size for c in payload["conditions"]] == [(512, 683)] * 2
+    square = probes.named_payload("references:2", tmp_path / "sq", beach_jobs=None, steps=None)
+    assert [Image.open(c["uri"]).size for c in square["conditions"]] == [(512, 512)] * 2
