@@ -1689,6 +1689,28 @@ def _submit_assembly(proj, queue_root, *, submit) -> dict:
     return {"action": "submitted_assembly", "job_id": job.id}
 
 
+def _submit_stage_or_fail(proj, stage: str, label: str, submit_stage, queue_root, submit,
+                          fail_on_error: bool) -> dict:
+    """`_submit_upscale` / `_submit_assembly`, with the C2 rule applied to stages (final re-review
+    2026-10-07): when `fail_on_error` (the worker -- nobody watches its chain) a submission that
+    raises makes the stage `failed` with the reason in `assembly["upscale_error"]` / `["error"]`,
+    which the page notifies from; the exception still propagates, so the worker logs it too. A web
+    caller leaves the stage as it was and answers the error to whoever pressed the button."""
+    try:
+        result = submit_stage(proj, queue_root, submit=submit)
+    except Exception as exc:
+        if fail_on_error:
+            proj.set_stage_status(stage, "failed")
+            proj.update_assembly(**{"upscale_error" if stage == "upscale" else "error":
+                                    f"{label} не поставлен{'' if stage == 'upscale' else 'а'}: "
+                                    f"{type(exc).__name__}: {exc}"})
+        raise
+    key = "upscale_error" if stage == "upscale" else "error"
+    if proj.assembly.get(key):
+        proj.update_assembly(**{key: None})
+    return result
+
+
 def advance_project(project, queue_root, outdir, *, submit=q.submit, run=subprocess.run,
                     fail_scene_on_error: bool = False) -> dict:
     """Progress `project` by exactly one step, and return what it did (`{"action": ...}`, for tests
@@ -1765,9 +1787,11 @@ def advance_project(project, queue_root, outdir, *, submit=q.submit, run=subproc
         # would wait for the gate forever.
         if engine.is_sglang() and proj.route_enabled("upscale"):
             if proj.stages.get("upscale") == "draft":
-                return _submit_upscale(proj, queue_root, submit=submit)
+                return _submit_stage_or_fail(proj, "upscale", "апскейл", _submit_upscale,
+                                             queue_root, submit, fail_scene_on_error)
             if proj.stages.get("upscale") != "done":
                 return {"action": "nothing_to_do"}
-        return _submit_assembly(proj, queue_root, submit=submit)
+        return _submit_stage_or_fail(proj, "assembly", "сборка", _submit_assembly,
+                                     queue_root, submit, fail_scene_on_error)
 
     return {"action": "nothing_to_do"}

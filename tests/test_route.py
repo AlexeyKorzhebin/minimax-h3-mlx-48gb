@@ -8,6 +8,7 @@ import pytest
 from h3_48gb import assemble
 from h3_48gb import project as p
 from h3_48gb import queue as q
+from h3_48gb import web
 from test_web import _call, _serve
 
 
@@ -106,6 +107,66 @@ def test_on_sglang_done_scenes_submit_one_upscale_job_then_assembly(tmp_path, mo
     assert assemble.advance_project(proj, tmp_path / "q", tmp_path / "out",
                                     submit=submit)["action"] == "submitted_assembly"
     assert calls[-1][1] == q.KIND_ASSEMBLE
+
+
+def _refusing_submit(root, args, note, report, estimate, kind):
+    raise OSError("диск очереди недоступен")
+
+
+def test_a_worker_that_cannot_submit_the_upscale_fails_the_stage_with_its_reason(tmp_path, monkeypatch):
+    """Final re-review: the same class as C2, for stages -- nobody watches the worker's chain, so
+    the stage must say what happened instead of staying `draft` with an empty queue."""
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path)
+    with pytest.raises(OSError):
+        assemble.advance_project(proj, tmp_path / "q", tmp_path / "out", submit=_refusing_submit,
+                                 fail_scene_on_error=True)
+    after = p.load_project(proj.path)
+    assert after.stages["upscale"] == "failed"
+    assert after.assembly["upscale_error"] == "апскейл не поставлен: OSError: диск очереди недоступен"
+    assert after.stages["assembly"] == "draft"
+    summary = web.project_summary(after, [])
+    assert summary["stage_errors"] == [
+        {"stage": "upscale", "error": "апскейл не поставлен: OSError: диск очереди недоступен"}]
+
+
+def test_a_worker_that_cannot_submit_the_assembly_fails_the_stage_with_its_reason(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path)
+    proj.set_route_stage("upscale", False)
+    with pytest.raises(OSError):
+        assemble.advance_project(proj, tmp_path / "q", tmp_path / "out", submit=_refusing_submit,
+                                 fail_scene_on_error=True)
+    after = p.load_project(proj.path)
+    assert after.stages["assembly"] == "failed"
+    assert after.assembly["error"] == "сборка не поставлена: OSError: диск очереди недоступен"
+
+
+def test_a_web_caller_keeps_the_stage_as_it_was_when_the_submit_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path)
+    with pytest.raises(OSError):
+        assemble.advance_project(proj, tmp_path / "q", tmp_path / "out", submit=_refusing_submit)
+    after = p.load_project(proj.path)
+    assert (after.stages["upscale"], "upscale_error" in after.assembly) == ("draft", False)
+
+
+def test_a_successful_submit_clears_the_old_reason(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path)
+    proj.update_assembly(upscale_error="апскейл не поставлен: x")
+    calls, submit = _submits()
+    assert assemble.advance_project(proj, tmp_path / "q", tmp_path / "out",
+                                    submit=submit)["action"] == "submitted_upscale"
+    assert p.load_project(proj.path).assembly.get("upscale_error") is None
+
+
+def test_re_shooting_a_scene_clears_the_stage_errors(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    proj = _done_project(tmp_path)
+    proj.update_assembly(error="x", upscale_error="y")
+    proj.invalidate_scene_chain(0)
+    assert {"error", "upscale_error"} & set(p.load_project(proj.path).assembly) == set()
 
 
 def test_on_mlx_an_enabled_upscale_is_skipped(tmp_path, monkeypatch):

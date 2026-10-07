@@ -107,7 +107,9 @@ ASSEMBLY_AUDIO_MODES = ("song", "mix", "clips")
 #: The fields `update_assembly(**fields)` accepts -- exactly `assembly`'s own two keys, see
 #: `create_project`. Kept as an explicit tuple, not derived from a live `assembly` dict, since
 #: there is no `_empty_assembly()` the way there is an `_empty_track()`.
-_ASSEMBLY_FIELDS = ("audio_mode", "final_path", "draft_path")
+#: `error` / `upscale_error`: why the worker could not submit the assembly / upscale job (final
+#: re-review 2026-10-07) -- the stage is `failed` and this is its reason.
+_ASSEMBLY_FIELDS = ("audio_mode", "final_path", "draft_path", "error", "upscale_error")
 
 #: The fields `update_scenario(**fields)` accepts -- both top-level `Project` attributes
 #: (`_OWNED_TOP_LEVEL_FIELDS`), unlike `_TRACK_FIELDS`/`_ASSEMBLY_FIELDS` (nested inside `track`/
@@ -877,6 +879,8 @@ class Project:
             data["stages"]["assembly"] = "draft"
             data["stages"]["upscale"] = "draft"
             data["assembly"]["final_path"] = None
+            data["assembly"].pop("error", None)
+            data["assembly"].pop("upscale_error", None)
             if data["assembly"].get("draft_path"):
                 data["assembly"]["draft_path"] = None
             write_json_durably(self.path, data)

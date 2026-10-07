@@ -141,6 +141,19 @@ def test_a_scene_that_failed_without_a_job_notifies_once_and_shows_its_reason():
 
 
 @_needs_node
+def test_a_stage_the_worker_could_not_submit_notifies_once():
+    """Final re-review: an upscale / assembly that failed to be submitted has no failed job."""
+    projects = [{"id": "p1", "title": "Бой", "stage_errors": [
+        {"stage": "upscale", "error": "апскейл не поставлен: OSError: диск"}]}, {"id": "p2"}]
+    keys = _node_eval(f"console.log(JSON.stringify(app.stageFailureKeys({json.dumps(projects)})));")
+    assert keys == ["Бой: апскейл не поставлен: OSError: диск"]
+    nxt = {**EMPTY, "failedStageKeys": keys}
+    assert _events(EMPTY, nxt, 0)["events"] == [
+        {"kind": "failed", "title": "Этап не запущен", "body": "Бой: апскейл не поставлен: OSError: диск"}]
+    assert _events(nxt, nxt, 1)["events"] == []
+
+
+@_needs_node
 def test_the_first_snapshot_after_opening_the_tab_notifies_nothing():
     nxt = {**EMPTY, "failedIds": ["j9"], "readyProjectIds": ["p1"],
            "waitReason": "GPU занята", "waitingSinceMs": 0}

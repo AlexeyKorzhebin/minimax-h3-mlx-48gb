@@ -2198,6 +2198,11 @@ def project_summary(proj, jobs) -> dict:
         # submission failed) has no failed job to notify about -- the page notifies from this.
         "scene_errors": [{"idx": scene["idx"], "error": scene["error"]} for scene in scenes
                          if scene.get("error")],
+        # Final re-review 2026-10-07: an upscale / assembly the worker could not submit has no job
+        # to notify about either.
+        "stage_errors": [{"stage": stage, "error": proj.assembly[key]}
+                         for stage, key in (("upscale", "upscale_error"), ("assembly", "error"))
+                         if proj.assembly.get(key)],
         "track_status": proj.track.get("status"),
         "track_undersung": bool(proj.track.get("undersung")),
         "final_path": proj.assembly.get("final_path"),

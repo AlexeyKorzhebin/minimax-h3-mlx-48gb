@@ -147,6 +147,7 @@ export function notificationEvents(prev, next, nowMs) {
   const fresh = (key) => (next[key] || []).filter((id) => !(prev[key] || []).includes(id));
   for (const id of fresh("failedIds")) events.push({ kind: "failed", title: "Сцена упала", body: `задача ${id}` });
   for (const id of fresh("failedSceneKeys")) events.push({ kind: "failed", title: "Сцена не поставлена", body: id });
+  for (const id of fresh("failedStageKeys")) events.push({ kind: "failed", title: "Этап не запущен", body: id });
   for (const id of fresh("readyProjectIds")) events.push({ kind: "ready", title: "Проект готов", body: id });
   for (const id of fresh("awaitingProjectIds")) events.push({ kind: "decision", title: "Нужно решение", body: id });
   return { events, lastWaitNotifyMs: lastWait };
@@ -157,6 +158,12 @@ export function notificationEvents(prev, next, nowMs) {
 export function sceneFailureKeys(projects) {
   return (projects || []).flatMap((p) => (p.scene_errors || [])
     .map((e) => `${p.title || p.id}, сцена ${e.idx}: ${e.error}`));
+}
+
+/** Апскейл или сборка, которые воркер не смог поставить: ключ события = его текст. */
+export function stageFailureKeys(projects) {
+  return (projects || []).flatMap((p) => (p.stage_errors || [])
+    .map((e) => `${p.title || p.id}: ${e.error}`));
 }
 
 /** Причина, по которой сцена упала без своей задачи, — под промптом на карточке сцены. */
@@ -2695,6 +2702,7 @@ function startPage() {
     const next = {
       failedIds: jobs.filter((j) => j.state === "failed").map((j) => j.id),
       failedSceneKeys: sceneFailureKeys(state && state.projects),
+      failedStageKeys: stageFailureKeys(state && state.projects),
       readyProjectIds: ((state && state.projects) || []).filter((p) => p.stages && p.stages.assembly === "done").map((p) => p.id),
       awaitingProjectIds: ((state && state.projects) || []).filter((p) => p.stages && Object.values(p.stages).includes("awaiting_approval")).map((p) => p.id),
       waitReason: run && run.wait_reason ? run.wait_reason : null,
