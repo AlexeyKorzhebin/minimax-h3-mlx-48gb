@@ -9,6 +9,8 @@ from pathlib import Path
 
 HISTORY_NAME = "sglang-history.jsonl"
 HISTORY_WINDOW = 10
+#: the step count the bench table and every history row written before `steps` was recorded ran at
+DEFAULT_STEPS = 50
 
 #: short edge -> {frames: median wall_s}. Counts behind each median: 512/124 ×21, 512/175 ×4,
 #: 512/192 ×4, 512/243 ×6, 512/277 ×1, 768/124 ×1, 768/192 ×2, 768/209 ×10. The 512/175 and
@@ -18,11 +20,12 @@ FALLBACK_SECONDS = {512: {124: 345.0, 175: 2810.0, 192: 2980.0, 243: 580.0, 277:
                     768: {124: 1140.0, 192: 1793.0, 209: 2820.0}}
 
 
-def record(outdir, *, width: int, height: int, frames: int, wall_s: float) -> None:
+def record(outdir, *, width: int, height: int, frames: int, wall_s: float,
+           steps: int = DEFAULT_STEPS) -> None:
     path = Path(outdir) / HISTORY_NAME
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps({"width": width, "height": height, "frames": frames,
-                                 "wall_s": float(wall_s)}) + "\n")
+                                 "steps": steps, "wall_s": float(wall_s)}) + "\n")
 
 
 def _history(outdir) -> list[dict]:
@@ -40,9 +43,13 @@ def _history(outdir) -> list[dict]:
     return rows
 
 
-def estimate_seconds(outdir, *, width: int, height: int, frames: int) -> dict:
+def estimate_seconds(outdir, *, width: int, height: int, frames: int,
+                     steps: int = DEFAULT_STEPS) -> dict:
+    """History is keyed by canvas, frames *and steps* (a row without `steps` ran at 50); the
+    table fallback is a 50-step measurement and is scaled by `steps / 50`."""
     same = [row["wall_s"] for row in _history(outdir)
-            if (row.get("width"), row.get("height"), row.get("frames")) == (width, height, frames)]
+            if (row.get("width"), row.get("height"), row.get("frames"),
+                row.get("steps", DEFAULT_STEPS)) == (width, height, frames, steps)]
     same = same[-HISTORY_WINDOW:]
     if same:
         return {"seconds": float(statistics.median(same)), "source": "history", "samples": len(same)}
@@ -50,4 +57,4 @@ def estimate_seconds(outdir, *, width: int, height: int, frames: int) -> dict:
     edge = short if short in FALLBACK_SECONDS else min(FALLBACK_SECONDS, key=lambda e: abs(e - short))
     table = FALLBACK_SECONDS[edge]
     nearest = min(table, key=lambda n: (abs(n - frames), n))
-    return {"seconds": table[nearest], "source": "table", "samples": 0}
+    return {"seconds": table[nearest] * steps / DEFAULT_STEPS, "source": "table", "samples": 0}

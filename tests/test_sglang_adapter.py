@@ -162,7 +162,7 @@ def test_completed_downloads_and_reports(queued, tmp_path):
     import json
     history = (tmp_path / "sglang-history.jsonl").read_text(encoding="utf-8").splitlines()
     assert [json.loads(line) for line in history] == \
-        [{"width": 896, "height": 512, "frames": 175, "wall_s": 100.0}]
+        [{"width": 896, "height": 512, "frames": 175, "steps": 50, "wall_s": 100.0}]
 
 
 def test_a_4xx_fails_at_once_and_keeps_the_body(queued, tmp_path):
@@ -360,3 +360,24 @@ def test_a_non_404_4xx_on_a_poll_fails_at_once_with_the_body(queued, tmp_path):
     assert fake.gets == ["vid-1"]   # one poll, no retry
     report = _report(job)
     assert (report["status"], report["http_status"], report["detail"]) == ("rejected", 422, "bad id")
+
+
+def test_a_completed_scene_is_recorded_with_its_own_steps(tmp_path):
+    import json
+    root = q.layout(tmp_path / "queue")["root"]
+    (tmp_path / "scenes").mkdir()
+    ref = tmp_path / "ref.png"
+    ref.write_bytes(b"\x89PNG\r\n\x1a\n")
+    args = ["generate", "p", "--width", "896", "--height", "512", "--duration", str(175 / 24),
+            "--steps", "20", "--tag", "t", "--outdir", str(tmp_path / "scenes"), "--ref", str(ref)]
+    q.submit(root, args, "", {"output_stem": str(tmp_path / "scenes" / "h3-t-896x512")}, {})
+    job = q.claim(root)
+    fake = FakeSglang(statuses=("queued", "completed"))
+    try:
+        code, _ = _run(job, root, tmp_path, fake, clock=_Clock(10.0, 80.0, 95.0, 110.0))
+    finally:
+        fake.close()
+    assert code == 0
+    rows = (tmp_path / "sglang-history.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(r) for r in rows] == \
+        [{"width": 896, "height": 512, "frames": 175, "steps": 20, "wall_s": 100.0}]

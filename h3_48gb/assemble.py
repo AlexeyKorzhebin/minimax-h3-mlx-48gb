@@ -1419,7 +1419,9 @@ def _submit_next_scene_sglang(proj, scene: dict, queue_root, *, submit, run,
         width, height = DEFAULT_SCENE_CANVAS
         frames = round(scene["duration"] * ASSEMBLY_FPS) + (SGLANG_OVERLAP_FRAMES if chained else 0)
         estimate = sglang_estimate.estimate_seconds(outdir, width=width, height=height,
-                                                    frames=frames)
+                                                    frames=frames,
+                                                    steps=scene.get("steps")
+                                                    or sglang_args.DEFAULT_STEPS)
         job = submit(queue_root, args, scene_note(proj, idx), {"output_stem": output_stem},
                      estimate, kind=q.KIND_GENERATE)
     except Exception as exc:

@@ -329,7 +329,7 @@ def run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep,
             checked_at = clock()
             wall = round(checked_at - started, 1)
             sglang_estimate.record(outdir, width=spec.width, height=spec.height,
-                                   frames=spec.frames, wall_s=wall)
+                                   frames=spec.frames, wall_s=wall, steps=spec.steps)
             # I7: `wall_s` runs from the POST to a checked mp4; its parts are split out so the
             # battle report can tell the server's time from the download and the frame check.
             # `server_s` is as fine as the poll (20 s): the first GET that saw `completed`.
