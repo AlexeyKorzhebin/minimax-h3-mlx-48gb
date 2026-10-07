@@ -1048,33 +1048,48 @@ def _scene_edit_fields(raw: dict, i: int, *, sglang: bool) -> dict:
     return out
 
 
+def _scene_sglang_args(proj, scene: dict, outdir) -> list[str]:
+    """The sglang argv for one scene, built by the very path the submission runs: `build_ref2va`,
+    scene 0's start image, the argv `assemble` builds (a chained scene with a stand-in keyframe
+    path) and the adapter's own `sglang_args.parse`. A clip scene gets a stand-in track piece: its
+    audio reference. Raises `LibraryError`, `SglangArgsError` or `AssembleError`; the gate and the
+    «Промпт для H3» route both catch them."""
+    chained = scene["idx"] > 0 and not scene.get("fresh_start", False)
+    ref2va = library_module.build_ref2va(scene["prompt"], proj.references, outdir,
+                                         extra_refs=scene.get("refs") or ())
+    # I6: scene 0's start image is resolved here exactly as the submission resolves it
+    start = assemble_module.scene_start_image(proj, scene, outdir)
+    if start is not None and not start.is_file():
+        raise library_module.LibraryError("start_image_invalid",
+                                          f"нет файла start_image {start}", {})
+    args, _ = assemble_module._scene_generate_args_sglang(
+        scene, keyframe=Path("keyframe.png") if chained else start, chained=chained,
+        ref2va=ref2va,
+        track_piece=Path("track-piece.wav") if proj.kind == "clip" else None,
+        scenes_dir=Path("scenes"), i2v_prefix=proj.i2v_prefix,
+        default_seed=proj.seed)
+    sglang_args.parse(args, check_files=False)
+    return args
+
+
+def _scene_args_error(idx: int, exc: Exception) -> dict:
+    """One gate entry for a failed `_scene_sglang_args`: the library/adapter code and text, or
+    `duration_off_grid` for a scene that was never snapped onto sglang's grid."""
+    if isinstance(exc, assemble_module.AssembleError):
+        return {"idx": idx, "code": "duration_off_grid", "message": str(exc)}
+    return {"idx": idx, "code": exc.code, "message": exc.message}
+
+
 def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
-    """spec §3.5/§4.1.3: the gate runs the very path the submission runs -- `build_ref2va`, the
-    argv `assemble` builds (a chained scene with a stand-in keyframe path) and the adapter's own
-    `sglang_args.parse` -- so nothing is queued that sglang would refuse and there is one source of
-    truth for the rules. A clip scene gets a stand-in track piece: its audio reference."""
+    """spec §3.5/§4.1.3: the gate runs the very path the submission runs (`_scene_sglang_args`), so
+    nothing is queued that sglang would refuse and there is one source of truth for the rules."""
     errors: list[dict] = []
     for scene in scenes:
-        chained = scene["idx"] > 0 and not scene.get("fresh_start", False)
         try:
-            ref2va = library_module.build_ref2va(scene["prompt"], proj.references, outdir,
-                                                 extra_refs=scene.get("refs") or ())
-            # I6: scene 0's start image is resolved here exactly as the submission resolves it
-            start = assemble_module.scene_start_image(proj, scene, outdir)
-            if start is not None and not start.is_file():
-                raise library_module.LibraryError("start_image_invalid",
-                                                  f"нет файла start_image {start}", {})
-            args, _ = assemble_module._scene_generate_args_sglang(
-                scene, keyframe=Path("keyframe.png") if chained else start, chained=chained,
-                ref2va=ref2va,
-                track_piece=Path("track-piece.wav") if proj.kind == "clip" else None,
-                scenes_dir=Path("scenes"), i2v_prefix=proj.i2v_prefix,
-                default_seed=proj.seed)
-            sglang_args.parse(args, check_files=False)
-        except (library_module.LibraryError, sglang_args.SglangArgsError) as exc:
-            errors.append({"idx": scene["idx"], "code": exc.code, "message": exc.message})
-        except assemble_module.AssembleError as exc:
-            errors.append({"idx": scene["idx"], "code": "duration_off_grid", "message": str(exc)})
+            _scene_sglang_args(proj, scene, outdir)
+        except (library_module.LibraryError, sglang_args.SglangArgsError,
+                assemble_module.AssembleError) as exc:
+            errors.append(_scene_args_error(scene["idx"], exc))
     return errors
 
 
@@ -3504,6 +3519,9 @@ class _Handler(BaseHTTPRequestHandler):
             return self._list_library()
         if path.startswith("/api/projects/") and path.endswith("/references"):
             return self._project_references(path[len("/api/projects/"):-len("/references")])
+        scene_prompt = re.fullmatch(r"/api/projects/([^/]+)/scenes/([^/]+)/h3-prompt", path)
+        if scene_prompt:
+            return self._scene_h3_prompt(*scene_prompt.groups())
         if path.startswith("/api/projects/"):
             return self._read_project(path[len("/api/projects/"):])
         if path == "/api/prompts":
@@ -4505,6 +4523,48 @@ class _Handler(BaseHTTPRequestHandler):
         except project_module.ProjectNotFound as exc:
             raise CliError("project_not_found", f"нет проекта {raw_id}: {exc}",
                            {"id": raw_id}) from exc
+
+    def _scene_h3_prompt(self, raw_id: str, raw_idx: str) -> tuple[int, str, bytes]:
+        """`GET /api/projects/<id>/scenes/<idx>/h3-prompt` (spec §5.2.1): what sglang will get for
+        the saved scene -- the argv `_scene_sglang_args` builds, the same one the approval gate and
+        the submission use -- shown before approval. sglang only."""
+        if not engine.is_sglang():
+            raise CliError("args_invalid", "Промпт для H3 есть только на sglang", {})
+        try:
+            idx = int(raw_idx)
+        except ValueError:
+            raise CliError("args_invalid", f"a scene index must be an integer, and {raw_idx!r} "
+                           "is not", {"idx": raw_idx}) from None
+        proj = self._load_project(raw_id)
+        scene = next((s for s in proj.scenes if s["idx"] == idx), None)
+        if scene is None:
+            raise CliError("project_scene_not_found", f"нет сцены {idx} в проекте {raw_id}",
+                           {"id": raw_id, "idx": idx})
+        scene = _snap_video_scenes_sglang([scene])[0]
+        try:
+            args = _scene_sglang_args(proj, scene, self.server.outdir)
+        except (library_module.LibraryError, sglang_args.SglangArgsError,
+                assemble_module.AssembleError) as exc:
+            error = _scene_args_error(idx, exc)
+            raise CliError(error["code"], error["message"], {"idx": idx}) from exc
+
+        def values(flag: str) -> list[str]:
+            return [args[i + 1] for i, a in enumerate(args[:-1]) if a == flag]
+
+        chained = idx > 0 and not scene.get("fresh_start", False)
+        if chained:
+            keyframe = {"kind": "previous_scene", "path": None}
+        else:
+            start = assemble_module.scene_start_image(proj, scene, self.server.outdir)
+            keyframe = ({"kind": "start_image", "path": str(start)} if start is not None
+                        else {"kind": None, "path": None})
+        return 200, "application/json", _json_bytes({
+            "ok": True, "idx": idx, "prompt": args[1],
+            "pictures": [{"label": f"<Picture {k}>", "path": path}
+                         for k, path in enumerate(values("--ref"), 1)],
+            "audios": values("--audio"), "keyframe": keyframe,
+            "duration": scene["duration"], "seed": int(values("--seed")[0]),
+            "steps": int(values("--steps")[0])})
 
     def _list_projects(self) -> tuple[int, str, bytes]:
         """`GET /api/projects`: every project under `<outdir>/projects/`, summarised -- design
