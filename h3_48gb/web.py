@@ -43,7 +43,7 @@ import shutil
 import subprocess
 import sys
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -5479,8 +5479,17 @@ class _Handler(BaseHTTPRequestHandler):
         except dispatcher_client.DispatcherUnavailable as exc:
             status, error = None, str(exc)
         running, pending = self._running_job()
+        idle_release_at = None
+        if running is None and pending == 0 and status and status.get("own"):
+            jobs, _ = q.scan(self.server.queue_root)
+            finished = [job.finished_at for job in jobs if job.finished_at]
+            if finished:
+                minutes = float(os.environ.get("H3_IDLE_RELEASE_MIN", "15"))
+                idle_release_at = (datetime.fromisoformat(max(finished))
+                                   + timedelta(minutes=minutes)).isoformat(timespec="seconds")
         return 200, "application/json", _json_bytes({
             "ok": True, "dispatcher": status, "dispatcher_error": error,
+            "idle_release_at": idle_release_at,
             "queue": {"pending": pending, "paused": q.is_paused(self.server.queue_root),
                       "running": None if running is None else {
                           "id": running.id, "kind": running.kind, "note": running.note,

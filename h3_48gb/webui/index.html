@@ -64,6 +64,11 @@
 
     <div class="rail-clock">
       <!-- Три состояния по кругу (system -> dark -> light -> ...), см. nextTheme в app.js. -->
+      <span class="gpu-banner" id="gpu-banner" role="status" hidden></span>
+      <button class="ghost" type="button" id="gpu-release" hidden>Освободить карту</button>
+      <button class="ghost" type="button" id="qwen-unload" hidden>Выгрузить Qwen</button>
+      <button class="ghost" type="button" id="qwen-restore" hidden>Вернуть Qwen</button>
+      <button class="ghost" type="button" id="notify-enable" hidden>Уведомления</button>
       <button class="ghost theme-toggle" id="theme-toggle" type="button"
               title="Переключить тему">Тема: <span id="theme-toggle-label">Системная</span></button>
       <span class="clock" id="clock">--:--</span>
@@ -402,6 +407,7 @@
   <p class="empty pad" id="finished-empty" hidden>Ещё ничего не закончилось</p>
 </section>
 
+<section id="library"><h2>Референсы</h2><div id="library-cards"></div><form id="library-form"><input id="lib-tag" placeholder="@tag" required> <select id="lib-kind"><option>person</option><option>object</option><option>environment</option><option>style</option><option>voice</option></select> <input id="lib-desc" placeholder="description (English)" required> <input id="lib-files" type="file" multiple accept=".png,.jpg,.jpeg,.mp3,.wav"> <button type="submit">Добавить</button><p id="lib-error" class="why" hidden></p></form></section>
 </main>
 
 <!-- ===================================================================
@@ -512,6 +518,7 @@
           <form id="chat-form" class="box">
             <textarea id="chat-input" rows="2"
             placeholder="Опиши идею или попроси переделать…"></textarea>
+            <input id="chat-tags" class="inp" placeholder="теги для сценария: @alice @beach">
             <div class="bottom">
               <button type="button" class="iconbtn chat-attach" id="chat-attach"
                       aria-label="Приложить кадр" title="Приложить кадр">📎</button>

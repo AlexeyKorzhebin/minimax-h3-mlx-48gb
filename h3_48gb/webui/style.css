@@ -1607,3 +1607,11 @@ audio.proj-audio { width: 100%; margin-top: 8px; display: block; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+.gpu-banner { padding: 2px 8px; border-radius: 4px; font-size: 0.8em; line-height: 1.25; max-width: 34ch; }
+.gpu-banner[data-tone="wait"] { background: var(--warn-soft); }
+.gpu-banner[data-tone="own"] { background: var(--accent-soft); }
+.gpu-banner[data-tone="bad"] { background: var(--fail-soft); }
+.scenario-prompt.has-tag-issues { outline: 2px solid var(--fail); }
+.tag-hint { font-size: 0.85em; }
+body:not([data-platform="darwin"]) [data-act="reveal"] { display: none; }

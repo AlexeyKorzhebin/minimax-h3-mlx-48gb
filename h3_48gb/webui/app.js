@@ -69,6 +69,173 @@ export function formatGb(x) {
   return (Number(x) || 0).toFixed(1).replace(".", ",") + " ГБ";
 }
 
+/** Плашка GPU (спека §3.3.13–14): что сказать сверху на любой вкладке. */
+export function gpuBanner(gpu, nowMs) {
+  const hidden = { visible: false, text: "", tone: "", qwenUnload: false, qwenRestore: false };
+  if (!gpu || !gpu.ok) return hidden;
+  const d = gpu.dispatcher;
+  if (!d) {
+    return { ...hidden, visible: true, tone: "bad",
+             text: `Диспетчер GPU не отвечает: ${gpu.dispatcher_error}` };
+  }
+  const run = gpu.queue && gpu.queue.running;
+  // spec §2: «вернуть Qwen» only after the queue -- never while anything is queued or running
+  const queueEmpty = !run && !(gpu.queue && gpu.queue.pending);
+  const qwenRestore = Boolean(d.qwen && d.qwen.unloaded_by_us && !d.qwen.running && queueEmpty);
+  if (run && run.wait_reason) {
+    const since = Date.parse(run.started_at);
+    const waited = Number.isFinite(since) ? Math.max(0, (nowMs - since) / 1000) : 0;
+    const holders = (d.foreign || []).map((a) => {
+      const held = Number.isFinite(a.first_seen)
+        ? `, уже ${formatDuration(Math.max(0, nowMs / 1000 - a.first_seen))}` : "";
+      return `${a.name} (pid ${a.pid}, ${formatGb(a.memory_mb / 1024)}${held})`;
+    }).join(", ");
+    const reason = run.wait_reason.replace(/^ждём GPU: /, "");
+    return { visible: true, tone: "wait", qwenRestore,
+             qwenUnload: run.wait_reason.includes("Qwen"),
+             text: `Очередь стоит ${formatDuration(waited)}: ${reason}`
+               + (holders ? ` — карту держит ${holders}` : "") };
+  }
+  const own = Object.keys(d.own || {});
+  if (own.length && !run) {
+    const names = own.map((n) => (n === "h3" ? "H3" : "ComfyUI")).join(", ");
+    const at = Date.parse(gpu.idle_release_at || "");
+    const when = Number.isFinite(at)
+      ? `через ${Math.max(0, Math.ceil((at - nowMs) / 60000))} мин или кнопкой` : "кнопкой";
+    return { visible: true, tone: "own", qwenUnload: false, qwenRestore,
+             text: `Карту держит панель: ${names}, ${formatGb(d.gpu.memory_used_mb / 1024)} `
+               + `— освободится ${when}` };
+  }
+  return { ...hidden, visible: qwenRestore, qwenRestore,
+           text: qwenRestore ? "Qwen выгружен панелью — его можно вернуть" : "" };
+}
+
+const WAIT_NOTIFY_AFTER_MS = 10 * 60_000;
+const WAIT_NOTIFY_EVERY_MS = 60 * 60_000;
+
+/** Браузерные уведомления (спека §3.3.13): ожидание > 10 мин (повтор раз в час), сцена упала,
+ *  проект готов, нужно решение. Каждое событие — один раз на переход. */
+export function notificationEvents(prev, next, nowMs) {
+  // The first snapshot after the tab opens only primes the state: everything already failed or
+  // finished before the page was opened is not news.
+  if (prev === null) {
+    const primed = next.waitReason && next.waitingSinceMs !== null ? nowMs : next.lastWaitNotifyMs;
+    return { events: [], lastWaitNotifyMs: primed };
+  }
+  const events = [];
+  let lastWait = next.lastWaitNotifyMs;
+  if (next.waitReason && next.waitingSinceMs !== null) {
+    const waited = nowMs - next.waitingSinceMs;
+    const due = lastWait === null ? waited >= WAIT_NOTIFY_AFTER_MS
+                                  : nowMs - lastWait >= WAIT_NOTIFY_EVERY_MS;
+    if (due) {
+      events.push({ kind: "wait", title: `Очередь стоит ${formatDuration(waited / 1000)}`,
+                    body: next.waitReason });
+      lastWait = nowMs;
+    }
+  }
+  const fresh = (key) => next[key].filter((id) => !prev[key].includes(id));
+  for (const id of fresh("failedIds")) events.push({ kind: "failed", title: "Сцена упала", body: `задача ${id}` });
+  for (const id of fresh("readyProjectIds")) events.push({ kind: "ready", title: "Проект готов", body: id });
+  for (const id of fresh("awaitingProjectIds")) events.push({ kind: "decision", title: "Нужно решение", body: id });
+  return { events, lastWaitNotifyMs: lastWait };
+}
+
+const TAG_IN_TEXT = /(?<![\w@.])@([A-Za-z0-9-]+)/g;
+const TAG_OK = /^@[a-z0-9-]{2,32}$/;
+
+/** @-теги сцены, которые не уйдут в H3 (спека §3.5): незнакомые проекту и написанные не так. */
+export function sceneTagIssues(text, pinnedTags, { needsTag = false } = {}) {
+  const issues = [];
+  const seen = new Set();
+  for (const match of String(text || "").matchAll(TAG_IN_TEXT)) {
+    const tag = `@${match[1]}`;
+    if (seen.has(tag)) continue;
+    seen.add(tag);
+    if (!TAG_OK.test(tag)) issues.push({ tag, problem: "invalid" });
+    else if (!pinnedTags.includes(tag)) issues.push({ tag, problem: "unknown" });
+  }
+  if (needsTag && seen.size === 0) issues.push({ tag: null, problem: "missing" });
+  return issues;
+}
+
+const TAG_PROBLEM_TEXT = {
+  missing: () => "нужен хотя бы один референс (@тег) в сцене",
+  unknown: (tag) => `незнакомый тег ${tag}`,
+  invalid: (tag) => `тег ${tag} — только строчные`,
+};
+
+/** Сцены, которые гейт отклонит (спека §4.1.3, §3.5), — видно до нажатия «Утвердить». */
+export function projectTagWarningsHtml(proj) {
+  const pinned = (proj.references || []).map((ref) => ref.tag);
+  const needsTag = proj.kind !== "clip";
+  const rows = [];
+  for (const scene of proj.scenes || []) {
+    for (const issue of sceneTagIssues(scene.prompt, pinned, { needsTag })) {
+      rows.push(`<li>Сцена ${scene.idx}: ${escapeHtml(TAG_PROBLEM_TEXT[issue.problem](issue.tag))}</li>`);
+    }
+  }
+  return rows.length ? `<ul class="tag-warnings">${rows.join("")}</ul>` : "";
+}
+
+export function projectSettingsHtml(proj) {
+  const id = escapeHtml(proj.id);
+  return `<div class="project-settings" data-id="${id}"><label>Начало сцепленной сцены `
+    + `(i2v_prefix) <textarea class="i2v-prefix" data-id="${id}" rows="2">`
+    + `${escapeHtml(proj.i2v_prefix || "")}</textarea></label> `
+    + `<button type="button" class="draft-assembly" data-id="${id}">Черновая сборка</button></div>`;
+}
+
+/** Подсказка на `@`: карточки, чей тег начинается с набранного после последнего `@` до каретки. */
+export function tagSuggestions(text, caret, cards) {
+  const head = String(text || "").slice(0, caret);
+  const match = head.match(/(?:^|[^\w@.])@([a-z0-9-]*)$/);
+  if (!match) return [];
+  return cards.filter((card) => card.tag.startsWith(`@${match[1]}`));
+}
+
+export function projectRouteHtml(proj) {
+  const entry = (proj.route || []).find((e) => e.stage === "upscale");
+  if (!entry) return "";
+  return `<label class="route-upscale"><input type="checkbox" class="route-upscale-box" `
+    + `data-id="${escapeHtml(proj.id)}"${entry.enabled ? " checked" : ""}> `
+    + `Апскейл LTX после всех сцен</label>`;
+}
+
+export function projectReferencesHtml(proj, cards, pinned) {
+  const byTag = new Map(pinned.map((ref) => [ref.tag, ref.version]));
+  const rows = cards.map((card) => {
+    const version = byTag.get(card.tag);
+    const note = version === undefined ? escapeHtml(card.kind)
+      : `${escapeHtml(card.kind)}, v${version}`
+        + (version < card.latest_version ? ` (есть v${card.latest_version})` : "");
+    return `<label><input type="checkbox" class="ref-pin" data-tag="${escapeHtml(card.tag)}"`
+      + `${version === undefined ? "" : " checked"}> ${escapeHtml(card.tag)} `
+      + `<span class="muted">${note}</span></label>`;
+  }).join("");
+  return `<div class="project-refs" data-id="${escapeHtml(proj.id)}"><h4>Референсы проекта</h4>`
+    + rows + `</div>`;
+}
+
+/** Тело `PUT …/references`: уже закреплённая карточка сохраняет свою версию (снятие соседней
+ *  галочки не должно молча обновить её до последней), новая уходит без `version`. */
+export function referencesPayload(checkedTags, pinned) {
+  const byTag = new Map(pinned.map((ref) => [ref.tag, ref.version]));
+  return checkedTags.map((tag) => (byTag.has(tag) ? { tag, version: byTag.get(tag) } : { tag }));
+}
+
+export function libraryCardsHtml(cards, outdir) {
+  if (!cards.length) return '<p class="empty">Библиотека пуста</p>';
+  return cards.map((card) => {
+    const first = card.assets[0] || "";
+    const thumb = first && /\.(png|jpe?g)$/i.test(first) && outdir && first.startsWith(`${outdir}/`)
+      ? `<img src="/media/${escapeHtml(first.slice(outdir.length + 1))}" alt="">` : "";
+    return `<div class="lib-card">${thumb}<b>${escapeHtml(card.tag)}</b> `
+      + `<span class="muted">${escapeHtml(card.kind)}, v${card.version}</span>`
+      + `<p>${escapeHtml(card.description)}</p></div>`;
+  }).join("");
+}
+
 export function plural(n, one, few, many) {
   const a = Math.abs(n) % 100;
   const b = a % 10;
@@ -2394,6 +2561,7 @@ function startPage() {
       state = await api("GET", "/api/state");
       failures = 0;
       lastOkAt = new Date();
+      document.body.dataset.platform = state.platform;
       if (!$("outdir").value) $("outdir").value = defaultOutdir(state);
     } catch {
       failures += 1;
@@ -2413,6 +2581,97 @@ function startPage() {
     renderConnection();
     renderQueue();
     renderProjects();
+    await pollGpu();
+  }
+
+  let gpu = null;
+  let notifySnapshot = null;   // null until the first poll: opening the tab is not an event
+  let libraryCards = [];
+
+  async function pollGpu() {
+    if (!state || state.engine !== "sglang") { gpu = null; renderGpu(); return; }
+    try { gpu = await api("GET", "/api/gpu"); } catch { gpu = null; }
+    renderGpu();
+    notifyFromState();
+  }
+
+  function renderGpu() {
+    const sglang = Boolean(state && state.engine === "sglang");
+    const banner = gpuBanner(gpu, Date.now());
+    $("gpu-banner").hidden = !banner.visible;
+    $("gpu-banner").textContent = banner.text;
+    $("gpu-banner").title = banner.text;
+    $("gpu-banner").dataset.tone = banner.tone;
+    $("gpu-release").hidden = !sglang;
+    $("qwen-unload").hidden = !banner.qwenUnload;
+    $("qwen-restore").hidden = !banner.qwenRestore;
+    $("notify-enable").hidden = !sglang || typeof Notification === "undefined"
+      || Notification.permission !== "default";
+  }
+
+  function notifyFromState() {
+    const jobs = allQueueJobs();
+    const run = gpu && gpu.queue && gpu.queue.running;
+    const next = {
+      failedIds: jobs.filter((j) => j.state === "failed").map((j) => j.id),
+      readyProjectIds: ((state && state.projects) || []).filter((p) => p.stages && p.stages.assembly === "done").map((p) => p.id),
+      awaitingProjectIds: ((state && state.projects) || []).filter((p) => p.stages && Object.values(p.stages).includes("awaiting_approval")).map((p) => p.id),
+      waitReason: run && run.wait_reason ? run.wait_reason : null,
+      waitingSinceMs: run && run.wait_reason ? Date.parse(run.started_at) : null,
+      lastWaitNotifyMs: run && run.wait_reason && notifySnapshot ? notifySnapshot.lastWaitNotifyMs : null,
+    };
+    const { events, lastWaitNotifyMs } = notificationEvents(notifySnapshot, next, Date.now());
+    notifySnapshot = { ...next, lastWaitNotifyMs };
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    for (const e of events) new Notification(e.title, { body: e.body });
+  }
+
+  async function releaseCard() {
+    try {
+      await api("POST", "/api/gpu/release", {});
+    } catch (err) {
+      const code = err.payload && err.payload.error && err.payload.error.code;
+      if (code !== "release_needs_confirm") { alert(err.payload ? err.payload.error.message : String(err)); return; }
+      if (!confirm(err.payload.error.message)) return;
+      await api("POST", "/api/gpu/release", { confirm: true });
+    }
+    await poll();
+  }
+
+  async function qwenAction(unload) {
+    try {
+      if (unload) await api("POST", "/api/qwen/unload", {});
+      else await api("POST", "/api/qwen/restore", {});
+    } catch (err) { alert(err.payload ? err.payload.error.message : String(err)); }
+    await pollGpu();
+  }
+
+  async function loadLibrary() {
+    try { libraryCards = (await api("GET", "/api/library")).cards; } catch { libraryCards = []; }
+    $("library-cards").innerHTML = libraryCardsHtml(libraryCards, state && state.outdir);
+  }
+
+  async function addLibraryCard(event) {
+    event.preventDefault();
+    $("lib-error").hidden = true;
+    try {
+      const assets = [];
+      for (const file of $("lib-files").files) {
+        const response = await fetch("/api/uploads", { method: "POST", body: file,
+          headers: { "Content-Type": "application/octet-stream",
+                     "X-Filename": encodeURIComponent(file.name) } });
+        const body = await response.json();
+        if (!response.ok) throw { payload: body };
+        assets.push(body.path);
+      }
+      await api("POST", "/api/library", { tag: $("lib-tag").value.trim(),
+        kind: $("lib-kind").value, description: $("lib-desc").value.trim(), assets });
+      $("library-form").reset();
+      await loadLibrary();
+    } catch (err) {
+      $("lib-error").textContent = err.payload ? err.payload.error.message : String(err);
+      $("lib-error").hidden = false;
+    }
   }
 
   // -- отрисовка --------------------------------------------------------------------------
@@ -2671,6 +2930,8 @@ function startPage() {
     $("project-body").innerHTML = projectScriptStageHtml(proj)
       + projectTrackStageHtml(proj, project.active_job, outdir)
       + projectScenarioStageHtml(proj, projectBusy)
+      + projectTagWarningsHtml(proj) + projectSettingsHtml(proj) + projectRouteHtml(proj)
+      + projectReferencesHtml(proj, libraryCards, proj.references || [])
       + projectScenesStageHtml(proj, outdir)
       + projectAssemblyStageHtml(proj, outdir);
   }
@@ -3810,7 +4071,8 @@ function startPage() {
                            // расходиться с сессией с самого открытия, а с этого хода и сама
                            // могла подвинуться в `chat-duration`.
                            duration: chatDuration(session),
-                           image: extra.image, set_mode: extra.set_mode });
+                           image: extra.image, set_mode: extra.set_mode,
+                           tags: ($("chat-tags").value.match(/@[a-z0-9-]{2,32}/g) || []) });
     } catch (error) {
       failure = error;
     }
@@ -4671,6 +4933,55 @@ function startPage() {
     }
   });
 
+  document.addEventListener("change", (event) => {
+    const target = event.target;
+    if (!project || !project.project) return;
+    if (target.classList.contains("route-upscale-box")) {
+      api("PUT", `/api/projects/${encodeURIComponent(target.dataset.id)}/route`,
+          { upscale: target.checked }).then(() => openProjectModal(target.dataset.id))
+        .catch((err) => alert(err.payload ? err.payload.error.message : String(err)));
+    }
+    if (target.classList.contains("ref-pin")) {
+      const box = target.closest(".project-refs");
+      const refs = [...box.querySelectorAll(".ref-pin")].filter((el) => el.checked)
+        .map((el) => el.dataset.tag);
+      const refsBody = referencesPayload(refs, project.project.references || []);
+      api("PUT", `/api/projects/${encodeURIComponent(box.dataset.id)}/references`, { references: refsBody })
+        .then(() => openProjectModal(box.dataset.id))
+        .catch((err) => alert(err.payload ? err.payload.error.message : String(err)));
+    }
+  });
+
+  document.addEventListener("focusout", (event) => {
+    const field = event.target.closest(".i2v-prefix");
+    if (!field || !project || !project.project) return;
+    if (field.value === (project.project.i2v_prefix || "")) return;
+    api("PUT", `/api/projects/${encodeURIComponent(field.dataset.id)}/settings`, { i2v_prefix: field.value })
+      .then(() => openProjectModal(field.dataset.id))
+      .catch((err) => alert(err.payload ? err.payload.error.message : String(err)));
+  });
+
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest(".draft-assembly");
+    if (!button) return;
+    api("POST", `/api/projects/${encodeURIComponent(button.dataset.id)}/assembly/draft`, {})
+      .then(() => poll())
+      .catch((err) => alert(err.payload ? err.payload.error.message : String(err)));
+  });
+
+  document.addEventListener("input", (event) => {
+    const el = event.target.closest(".scenario-prompt");
+    if (!el || !project || !project.project) return;
+      const pinned = (project.project.references || []).map((r) => r.tag);
+      const issues = sceneTagIssues(el.value, pinned, { needsTag: project.project.kind !== "clip" });
+      el.classList.toggle("has-tag-issues", issues.length > 0);
+      el.title = issues.map((i) => TAG_PROBLEM_TEXT[i.problem](i.tag)).join("; ");
+      const hint = tagSuggestions(el.value, el.selectionStart, libraryCards.filter((c) => pinned.includes(c.tag)));
+      let box = el.nextElementSibling && el.nextElementSibling.classList.contains("tag-hint") ? el.nextElementSibling : null;
+      if (!box) { box = document.createElement("div"); box.className = "tag-hint"; el.after(box); }
+      box.textContent = hint.length ? `теги: ${hint.map((c) => c.tag).join(" ")}` : "";
+  });
+
   // Правка сюжета сохраняется на блюре поля (task 5 brief: "PUT при blur/кнопке «Сохранить»")
   // -- `focusout`, не `blur`: `blur` не всплывает, а поля создаются заново при каждой перерисовке
   // панели (делегировать некому кроме документа). Сохраняет, только если значение действительно
@@ -4721,6 +5032,11 @@ function startPage() {
   });
 
   $("submit").addEventListener("click", submit);
+  $("gpu-release").addEventListener("click", releaseCard);
+  $("qwen-unload").addEventListener("click", () => qwenAction(true));
+  $("qwen-restore").addEventListener("click", () => qwenAction(false));
+  $("notify-enable").addEventListener("click", () => Notification.requestPermission().then(renderGpu));
+  $("library-form").addEventListener("submit", addLibraryCard);
   $("unload-banner-go").addEventListener("click", unloadAndStart);
   $("unload-banner-wait").addEventListener("click", dismissUnloadBanner);
   $("queue-pause-toggle").addEventListener("click", toggleQueuePause);
@@ -5001,6 +5317,7 @@ function startPage() {
   renderPrompt();
   renderConnection();
   poll().then(() => { requestEstimate(); syncChatFromHash(); });
+  loadLibrary();
   setInterval(poll, POLL_MS);
   setInterval(renderConnection, 1000);
 }

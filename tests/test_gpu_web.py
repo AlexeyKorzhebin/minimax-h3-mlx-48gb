@@ -34,6 +34,7 @@ def test_gpu_state_combines_dispatcher_and_queue(setup):
     status, body = _call(live, "GET", "/api/gpu")
     assert status == 200
     assert body == {"ok": True, "dispatcher": disp.status_body(), "dispatcher_error": None,
+                    "idle_release_at": None,
                     "queue": {"pending": 0, "paused": True,
                               "running": {"id": job.id, "kind": "generate",
                                           "note": "project scene P #3",
