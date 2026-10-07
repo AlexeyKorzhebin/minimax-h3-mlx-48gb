@@ -289,6 +289,40 @@ def test_assembly_wait_gives_up_fifteen_minutes_after_the_engine_started(tmp_pat
     assert sleeps == [1.0] * 30      # one 30 s retry period, then past the limit
 
 
+def test_assembly_wait_without_started_at_is_still_bounded(tmp_path):
+    root, job = _assembly(tmp_path)
+    client = _Status([{"own": {"h3": {"ready": False}}}])
+    now = [5000.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += 1.0                 # one-second slices
+
+    assert worker._wait_for_engine_start_to_settle(
+        root, job, client, sleep=sleep, clock=lambda: now[0]) is None
+    # checked once per 30 s period: 900 s is still waiting, the next check (930 s) is past it
+    assert len(sleeps) == 930
+
+
+def test_assembly_wait_clears_the_reason_when_the_dispatcher_vanishes(tmp_path):
+    root, job = _assembly(tmp_path)
+
+    class _Flaky:
+        def __init__(self):
+            self.calls = 0
+
+        def status(self):
+            self.calls += 1
+            if self.calls == 1:
+                return {"own": {"h3": {"ready": False, "started_at": 1000.0}}}
+            raise dc.DispatcherUnavailable("GET /status: down")
+
+    assert worker._wait_for_engine_start_to_settle(
+        root, job, _Flaky(), sleep=lambda s: None, clock=lambda: 1001.0) is None
+    assert [j for j in q.scan(root)[0] if j.id == job.id][0].wait_reason is None
+
+
 def test_unknown_temperature_does_not_block_the_gate(running):
     root, job, _ = running
     fake = FakeDispatcher(gpu_null=True)

@@ -618,23 +618,38 @@ def _wait_for_engine_start_to_settle(root, job, client, *, sleep=time.sleep,
     cancel reason if the job was cancelled while waiting, else None."""
     from h3_48gb.engines import sglang as sglang_engine
 
-    while True:
-        reason = q.cancel_reason(root, job.id)
-        if reason:
-            return reason
-        try:
-            own = client.status().get("own") or {}
-        except dispatcher_client.DispatcherUnavailable:
-            return None
-        starting = [r for r in own.values() if not r.get("ready")]
-        if not starting or all(clock() - (r.get("started_at") or clock()) > ASSEMBLY_START_WAIT_LIMIT
-                               for r in starting):
+    entered = clock()
+
+    def past_limit(record) -> bool:
+        # counted from the engine's own start, but never from later than our entry: a record
+        # without `started_at` (or one stamped in the future by a skewed clock) must not make
+        # the wait unbounded
+        started = record.get("started_at")
+        began = entered if started is None else min(started, entered)
+        return clock() - began > ASSEMBLY_START_WAIT_LIMIT
+
+    try:
+        while True:
+            reason = q.cancel_reason(root, job.id)
+            if reason:
+                return reason
+            try:
+                own = client.status().get("own") or {}
+            except dispatcher_client.DispatcherUnavailable:
+                return None
+            starting = [r for r in own.values() if not r.get("ready")]
+            if not starting or all(past_limit(r) for r in starting):
+                return None
+            q.set_running_fields(root, job.id, wait_reason="ждём: поднимается h3, сборка после")
+            reason = sglang_engine._sleep_unless_cancelled(root, job.id, ACQUIRE_RETRY_SECONDS,
+                                                           sleep)
+            if reason:
+                return reason
+    finally:
+        # on every way out -- ready, gave up, cancelled, dispatcher gone -- the page must not keep
+        # saying we are waiting
+        with contextlib.suppress(q.JobNotRunning):
             q.set_running_fields(root, job.id, wait_reason=None)
-            return None
-        q.set_running_fields(root, job.id, wait_reason="ждём: поднимается h3, сборка после")
-        reason = sglang_engine._sleep_unless_cancelled(root, job.id, ACQUIRE_RETRY_SECONDS, sleep)
-        if reason:
-            return reason
 
 
 def _run_sglang_generate_job(root, outdir, job, *, gate=None) -> tuple[int, str]:
