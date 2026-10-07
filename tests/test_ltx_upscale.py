@@ -251,7 +251,7 @@ def test_the_upscale_job_asks_the_dispatcher_for_ltx(tmp_path, monkeypatch):
         disp.close()
         comfy.close()
     assert code == 0
-    assert [c[2] for c in disp.calls if c[1] == "/acquire"] == [{"engine": "ltx"}]
+    assert [c[2] for c in disp.calls if c[1] == "/acquire"] == [{"engine": "ltx", "client": "panel-worker"}]
     assert p.load_project(proj.path).scenes[0]["ltx_path"] == str(clip.with_name("s-ltx.mp4"))
     (prefix,) = [wf["42"]["inputs"]["filename_prefix"] for wf in comfy.prompts]
     import re
@@ -406,3 +406,57 @@ def test_a_history_entry_without_a_final_status_does_not_poll_forever(tmp_path):
     assert str(excinfo.value) == ("ComfyUI: запись /history без итогового статуса после 12 "
                                   "опросов ({})")
     assert client.polls == 12
+
+
+class _Clock:
+    """Each call is the next value; the last one repeats."""
+    def __init__(self, *values):
+        self.values = list(values)
+
+    def __call__(self):
+        return self.values.pop(0) if len(self.values) > 1 else self.values[0]
+
+
+def test_the_upscale_writes_how_long_each_part_took(tmp_path):
+    """Final review I7: `<project>/upscale/report.json` and the same numbers in the log."""
+    out = tmp_path / "out"
+    proj = p.create_project(out, "video", "Up")
+    pdir = proj.path.parent
+    clip = _clip(pdir / "scenes" / "s0.mp4")
+    proj.scenes = [{"idx": 0, "prompt": "scene 0", "duration": 1.0, "status": "done",
+                    "job_id": "j0", "clip_path": str(clip), "keyframe_path": None}]
+    proj.save()
+    proj.set_stage_status("upscale", "running")
+    fake = FakeComfy(tmp_path / "comfy-out", frames=(25,))
+    # started, motion from/to, part: began, padded, uploaded, comfy done, muxed, finished
+    clock = _Clock(1000.0, 1001.0, 1004.0, 1004.0, 1006.0, 1007.0, 1207.0, 1219.0, 1220.0)
+    try:
+        code, log = ltx.run_upscale(proj.path, client=ltx.ComfyClient(fake.url),
+                                    comfy_output=tmp_path / "comfy-out", run=subprocess.run,
+                                    attempt="up1", sleep=lambda s: None, clock=clock)
+    finally:
+        fake.close()
+    assert code == 0, log
+    report = json.loads((pdir / "upscale" / "report.json").read_text(encoding="utf-8"))
+    assert {k: v for k, v in report.items() if k != "motion"} == {
+        "attempt": "up1", "started_at": 1000.0, "strength": 0.6, "motion_s": 3.0,
+        "parts": [{"idx": 0, "clip": str(clip), "src_frames": 24, "pad_frames": 25,
+                   "pad_s": 2.0, "upload_s": 1.0, "comfy_s": 200.0, "mux_s": 12.0,
+                   "wall_s": 215.0}],
+        "status": "done", "finished_at": 1220.0}
+    assert log.splitlines()[1] == "ltx: сцена 0 -> s0-ltx.mp4 (ComfyUI 200.0 с, часть 215.0 с)"
+
+
+def test_a_cancelled_part_interrupts_comfy(tmp_path):
+    """Triage of task 10/11: without /interrupt the cancelled part runs to its end."""
+    clip = _clip(tmp_path / "s.mp4")
+    fake = FakeComfy(tmp_path / "o", history_pending=5)
+    try:
+        with pytest.raises(ltx.UpscaleError) as excinfo:
+            ltx.upscale_part(clip, prompt="x", strength=0.3, prefix="h3panel/p/s-a1",
+                             client=ltx.ComfyClient(fake.url), comfy_output=tmp_path / "o",
+                             run=subprocess.run, sleep=lambda s: None,
+                             cancelled=lambda: "cancelled_by_user" if fake.history_calls else None)
+    finally:
+        fake.close()
+    assert (str(excinfo.value), fake.interrupts) == ("cancelled_by_user", 1)

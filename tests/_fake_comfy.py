@@ -17,6 +17,7 @@ class FakeComfy:
         self.uploads: list[tuple[str, bytes]] = []
         self.prompts: list[dict] = []
         self.history_calls: list[str] = []
+        self.interrupts = 0
         self._frames = list(frames)
         self.history_pending = history_pending
         self.fail = fail
@@ -66,6 +67,9 @@ class FakeComfy:
                         fake._write_frames(workflow["42"]["inputs"]["filename_prefix"])
                     return self._send(200, {"prompt_id": prompt_id, "number": len(fake.prompts),
                                             "node_errors": {}})
+                if self.path == "/interrupt":
+                    fake.interrupts += 1
+                    return self._send(200, {})
                 self._send(404, {})
 
             def do_GET(self):
