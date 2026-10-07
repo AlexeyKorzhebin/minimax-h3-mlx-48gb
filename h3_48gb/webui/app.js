@@ -531,19 +531,26 @@ export function projectRouteHtml(proj, engine) {
     + `Апскейл LTX после всех сцен</label>`;
 }
 
-export function projectReferencesHtml(proj, cards, pinned) {
+export function projectReferencesHtml(proj, cards, pinned, lock = null) {
   const byTag = new Map(pinned.map((ref) => [ref.tag, ref.version]));
+  const off = lock ? " disabled" : "";
   const rows = cards.map((card) => {
     const version = byTag.get(card.tag);
     const note = version === undefined ? escapeHtml(card.kind)
       : `${escapeHtml(card.kind)}, v${version}`
         + (version < card.latest_version ? ` (есть v${card.latest_version})` : "");
+    const numbers = (card.versions || []).map((v) => v.version);
+    if (!numbers.length) numbers.push(card.latest_version ?? card.version);
+    const chosen = version === undefined ? (card.latest_version ?? numbers[numbers.length - 1]) : version;
+    const options = numbers.map((n) => `<option value="${n}"${n === chosen ? " selected" : ""}>v${n}</option>`)
+      .join("");
     return `<label><input type="checkbox" class="ref-pin" data-tag="${escapeHtml(card.tag)}"`
-      + `${version === undefined ? "" : " checked"}> ${escapeHtml(card.tag)} `
-      + `<span class="muted">${note}</span></label>`;
+      + `${version === undefined ? "" : " checked"}${off}> ${escapeHtml(card.tag)} `
+      + `<span class="muted">${note}</span></label> `
+      + `<select class="inp ref-version" data-tag="${escapeHtml(card.tag)}"${off}>${options}</select>`;
   }).join("");
   return `<div class="project-refs" data-id="${escapeHtml(proj.id)}"><h4>Референсы проекта</h4>`
-    + rows + `</div>`;
+    + rows + (lock ? `<p class="why lock-note">${escapeHtml(lock)}</p>` : "") + `</div>`;
 }
 
 const UPSCALE_WORD = { draft: "ещё не шёл", running: "идёт", done: "готов", failed: "упал",
@@ -603,23 +610,34 @@ export function chatTagsBody(raw, known) {
 
 /** Тело `PUT …/references`: уже закреплённая карточка сохраняет свою версию (снятие соседней
  *  галочки не должно молча обновить её до последней), новая уходит без `version`. */
-export function referencesPayload(checkedTags, pinned) {
+export function referencesPayload(checkedTags, pinned, chosen = {}) {
   const byTag = new Map(pinned.map((ref) => [ref.tag, ref.version]));
-  return checkedTags.map((tag) => (byTag.has(tag) ? { tag, version: byTag.get(tag) } : { tag }));
+  return checkedTags.map((tag) => {
+    if (typeof chosen[tag] === "number") return { tag, version: chosen[tag] };
+    return byTag.has(tag) ? { tag, version: byTag.get(tag) } : { tag };
+  });
 }
 
 export function libraryCardsHtml(cards, outdir) {
   if (!cards.length) return '<p class="empty">Библиотека пуста</p>';
   return cards.map((card) => {
-    const first = card.assets[0] || "";
-    const thumb = first && /\.(png|jpe?g)$/i.test(first) && outdir && first.startsWith(`${outdir}/`)
-      ? `<img src="/media/${escapeHtml(first.slice(outdir.length + 1))}" alt="">` : "";
-    return `<div class="lib-card">${thumb}<b>${escapeHtml(card.tag)}</b> `
-      + `<span class="muted">${escapeHtml(card.kind)}, v${card.version}</span>`
+    const first = (card.assets || [])[0] || "";
+    const url = startImageUrl(first, outdir);
+    const thumb = url ? `<img class="lib-thumb" src="${escapeHtml(url)}" alt="">` : "";
+    // the number of pictures decides the <Picture k> numbering of a scene, so it is on the card
+    const count = card.kind === "voice" ? "аудио" : `картинок: ${(card.assets || []).length}`;
+    const versions = (card.versions || []).length > 1 ? ` · версий: ${card.versions.length}` : "";
+    const tag = escapeHtml(card.tag);
+    return `<div class="lib-card">${thumb}<b>${tag}</b> `
+      + `<span class="muted">${escapeHtml(card.kind)}, v${card.version}, ${count}${versions}</span>`
       + `<p>${escapeHtml(card.description)}</p>`
       + `<input class="lib-edit-desc" value="${escapeHtml(card.description)}"> `
-      + `<button type="button" class="lib-save" data-tag="${escapeHtml(card.tag)}">`
-      + `Сохранить описание</button><p class="why lib-card-error" hidden></p></div>`;
+      + `<button type="button" class="lib-save" data-tag="${tag}">`
+      + `Сохранить описание</button>`
+      + `<input class="lib-new-files" type="file" multiple accept=".png,.jpg,.jpeg,.mp3,.wav"> `
+      + `<button type="button" class="ghost" data-act="lib-new-version" data-tag="${tag}">Новая версия</button> `
+      + `<button type="button" class="ghost" data-act="lib-delete" data-tag="${tag}">Удалить</button>`
+      + `<p class="why lib-card-error" hidden></p></div>`;
   }).join("");
 }
 
@@ -2961,6 +2979,8 @@ function startPage() {
       $("form").hidden = sglangEngine;
       $("form-sglang-note").hidden = !sglangEngine;
       if (!$("outdir").value) $("outdir").value = defaultOutdir(state);
+      // thumbnails need the outdir: the cards may have arrived before the first state did
+      if (state.outdir !== libraryOutdir) renderLibrary();
     } catch {
       failures += 1;
     }
@@ -3052,9 +3072,16 @@ function startPage() {
     await pollGpu();
   }
 
+  let libraryOutdir = null;    // the outdir the library cards were last drawn with
+
+  function renderLibrary() {
+    libraryOutdir = state ? state.outdir : null;
+    $("library-cards").innerHTML = libraryCardsHtml(libraryCards, libraryOutdir);
+  }
+
   async function loadLibrary() {
     try { libraryCards = (await api("GET", "/api/library")).cards; } catch { libraryCards = []; }
-    $("library-cards").innerHTML = libraryCardsHtml(libraryCards, state && state.outdir);
+    renderLibrary();
   }
 
   /** Сырые байты файла на `POST /api/uploads` (заголовок `X-Filename`) → путь на диске сервера. */
@@ -3356,7 +3383,7 @@ function startPage() {
       + projectScenarioStageHtml(proj, projectBusy)
       + projectTagWarningsHtml(proj, state && state.engine) + projectSettingsHtml(proj)
       + projectRouteHtml(proj, state && state.engine) + projectUpscaleHtml(proj, state && state.engine)
-      + projectReferencesHtml(proj, libraryCards, proj.references || [])
+      + projectReferencesHtml(proj, libraryCards, proj.references || [], null)
       + projectScenesStageHtml(proj, outdir)
       + projectAssemblyStageHtml(proj, outdir);
   }
@@ -5395,6 +5422,8 @@ function startPage() {
       return;
     }
     // -- редактор сцен видеопроекта (Task 7): каждое действие сначала снимает поля в черновик ----
+    if (button.dataset.act === "lib-new-version") { newLibraryVersion(button); return; }
+    if (button.dataset.act === "lib-delete") { deleteLibraryCard(button); return; }
     if (button.dataset.act === "tag-pick") { pickTag(button); return; }
     if (button.dataset.act === "scene0-upload") { $("scene0-file").click(); return; }
     if (button.dataset.act === "scenario-json-load") {
@@ -5548,11 +5577,13 @@ function startPage() {
       withProject(() => api("PUT", `/api/projects/${encodeURIComponent(target.dataset.id)}/route`,
                             { upscale: target.checked }));
     }
-    if (target.classList.contains("ref-pin")) {
+    if (target.classList.contains("ref-pin") || target.classList.contains("ref-version")) {
       const box = target.closest(".project-refs");
       const refs = [...box.querySelectorAll(".ref-pin")].filter((el) => el.checked)
         .map((el) => el.dataset.tag);
-      const refsBody = referencesPayload(refs, project.project.references || []);
+      const chosen = {};
+      for (const select of box.querySelectorAll(".ref-version")) chosen[select.dataset.tag] = Number(select.value);
+      const refsBody = referencesPayload(refs, project.project.references || [], chosen);
       withProject(() => api("PUT", `/api/projects/${encodeURIComponent(box.dataset.id)}/references`,
                             { references: refsBody }));
     }
@@ -5580,6 +5611,41 @@ function startPage() {
     const save = event.target.closest(".lib-save");
     if (save) saveLibraryDescription(save);
   });
+
+  function showCardError(card, err) {
+    const box = card.querySelector(".lib-card-error");
+    box.textContent = err.payload ? err.payload.error.message : String(err);
+    box.hidden = false;
+  }
+
+  /** «Новая версия»: файлы на `/api/uploads`, затем `PUT /api/library/<имя>` с описанием и путями. */
+  async function newLibraryVersion(button) {
+    const card = button.closest(".lib-card");
+    card.querySelector(".lib-card-error").hidden = true;
+    try {
+      const files = [...(card.querySelector(".lib-new-files").files || [])];
+      if (!files.length) throw new Error("Выберите файлы новой версии");
+      const assets = [];
+      for (const file of files) assets.push(await uploadToServer(file));
+      const request = libraryUpdateRequest(button.dataset.tag, card.querySelector(".lib-edit-desc").value.trim());
+      await api("PUT", `/api/library/${encodeURIComponent(request.name)}`, { ...request.body, assets });
+      await loadLibrary();
+    } catch (err) {
+      showCardError(card, err);
+    }
+  }
+
+  async function deleteLibraryCard(button) {
+    const tag = button.dataset.tag;
+    if (!window.confirm(`Удалить карточку ${tag}? Файлы уйдут в library/.trash.`)) return;
+    const card = button.closest(".lib-card");
+    try {
+      await api("DELETE", `/api/library/${encodeURIComponent(tag.replace(/^@/, ""))}`);
+      await loadLibrary();
+    } catch (err) {
+      showCardError(card, err);
+    }
+  }
 
   async function saveLibraryDescription(button) {
     const card = button.closest(".lib-card");

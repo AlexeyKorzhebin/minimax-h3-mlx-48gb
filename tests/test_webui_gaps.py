@@ -56,6 +56,10 @@ CLASS_SOURCES = [
     "app.sceneRefsHtml({refs: ['@hero']}, 1, ['@hero', '@arena'])",
     "app.tagHintHtml('fight @a', 8, [{tag: '@arena'}])",
     "app.scenarioJsonHtml('p1')",
+    "app.libraryCardsHtml([{tag: '@a', kind: 'person', version: 1, latest_version: 1, "
+    "description: 'd', assets: ['/o/library/a/v1/01-a.png'], versions: [{version: 1}, {version: 2}]}], '/o')",
+    "app.projectReferencesHtml({id: 'p1'}, [{tag: '@a', kind: 'person', version: 1, latest_version: 1, "
+    "versions: [{version: 1}]}], [], 'locked')",
     "app.sceneRefsHtml({refs: ['@gone']}, 0, ['@hero'])",
 ]
 
@@ -581,3 +585,81 @@ def test_client_error_names_a_ref_that_is_not_pinned():
     assert err("['@hero']", "['@hero']") is None
     assert err("['@gone']", "['@hero']", "mlx") is None     # refs are never sent on mlx
     assert err("['@gone']", "undefined") is None            # no pinned list given: not checked
+
+
+@_needs_node
+def test_references_payload_takes_the_chosen_version():
+    assert _js("app.referencesPayload(['@a', '@b', '@c'], [{tag: '@a', version: 1}, {tag: '@b', version: 2}], {'@b': 1})") \
+        == [{"tag": "@a", "version": 1}, {"tag": "@b", "version": 1}, {"tag": "@c"}]
+    assert _js("app.referencesPayload(['@a'], [{tag: '@a', version: 1}])") == [{"tag": "@a", "version": 1}]
+
+
+@_needs_node
+def test_library_card_html_has_thumb_versions_and_actions():
+    html = _js("app.libraryCardsHtml([{tag: '@alice', kind: 'person', version: 2, latest_version: 2, "
+               "description: 'a woman', assets: ['/o/library/alice/v1/01-a.png'], "
+               "versions: [{version: 1}, {version: 2}]}], '/o')")
+    assert html == (
+        '<div class="lib-card"><img class="lib-thumb" src="/media/library/alice/v1/01-a.png" alt="">'
+        '<b>@alice</b> <span class="muted">person, v2, картинок: 1 · версий: 2</span><p>a woman</p>'
+        '<input class="lib-edit-desc" value="a woman"> '
+        '<button type="button" class="lib-save" data-tag="@alice">Сохранить описание</button>'
+        '<input class="lib-new-files" type="file" multiple accept=".png,.jpg,.jpeg,.mp3,.wav"> '
+        '<button type="button" class="ghost" data-act="lib-new-version" data-tag="@alice">Новая версия</button> '
+        '<button type="button" class="ghost" data-act="lib-delete" data-tag="@alice">Удалить</button>'
+        '<p class="why lib-card-error" hidden></p></div>')
+
+
+@_needs_node
+def test_library_card_caption_for_voice_and_one_version():
+    html = _js("app.libraryCardsHtml([{tag: '@v', kind: 'voice', version: 1, description: '', "
+               "assets: ['/o/library/v/v1/01-v.mp3'], versions: [{version: 1}]}], '/o')")
+    assert '<span class="muted">voice, v1, аудио</span>' in html
+    assert "<img" not in html
+
+
+REF_CARDS = ("[{tag: '@a', kind: 'person', version: 2, latest_version: 2, "
+             "versions: [{version: 1}, {version: 2}]}]")
+
+
+@_needs_node
+def test_project_references_html_with_versions_and_lock():
+    assert _js(f"app.projectReferencesHtml({{id: 'p1'}}, {REF_CARDS}, [{{tag: '@a', version: 1}}], null)") == (
+        '<div class="project-refs" data-id="p1"><h4>Референсы проекта</h4>'
+        '<label><input type="checkbox" class="ref-pin" data-tag="@a" checked> @a '
+        '<span class="muted">person, v1 (есть v2)</span></label> '
+        '<select class="inp ref-version" data-tag="@a"><option value="1" selected>v1</option>'
+        '<option value="2">v2</option></select></div>')
+    lock = web.PROJECT_LOCK_TEXT["references"]
+    assert _js(f"app.projectReferencesHtml({{id: 'p1'}}, {REF_CARDS}, [], {json.dumps(lock)})") == (
+        '<div class="project-refs" data-id="p1"><h4>Референсы проекта</h4>'
+        '<label><input type="checkbox" class="ref-pin" data-tag="@a" disabled> @a '
+        '<span class="muted">person</span></label> '
+        '<select class="inp ref-version" data-tag="@a" disabled><option value="1">v1</option>'
+        '<option value="2" selected>v2</option></select>'
+        f'<p class="why lock-note">{lock}</p></div>')
+
+
+LIB_EXPECTED = {
+    "library_preview_after_late_state": {
+        "img": '<img class="lib-thumb" src="/media/library/alice/v1/01-a.png" alt="">'},
+    "library_delete_in_use": {
+        "confirms": ["Удалить карточку @alice? Файлы уйдут в library/.trash."],
+        "cardError": {"hidden": False, "textContent": "@alice подключена к проектам: «Бой» (p1) — "
+                      "отключите её там или удалите проекты"},
+        "deletes": ["/api/library/alice"]},
+    "library_delete_declined": {"confirms": ["Удалить карточку @alice? Файлы уйдут в library/.trash."],
+                                "deletes": []},
+    "library_new_version": {"uploads": ["b.png"],
+                            "puts": [["/api/library/alice", {"description": "a woman",
+                                                             "assets": ["/o/uploads/b.png"]}]],
+                            "cardError": {"hidden": True, "textContent": ""}},
+    "refs_version_change": {"puts": [["/api/projects/p1/references",
+                                      {"references": [{"tag": "@a", "version": 1}]}]]},
+}
+
+
+@_needs_node
+@pytest.mark.parametrize("scenario", sorted(LIB_EXPECTED))
+def test_library_wiring(scenario):
+    assert _gaps(scenario) == LIB_EXPECTED[scenario]

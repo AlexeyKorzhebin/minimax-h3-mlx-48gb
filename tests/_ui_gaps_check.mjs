@@ -1,5 +1,5 @@
 // Wave 1.5 DOM wiring scenarios; usage: node _ui_gaps_check.mjs <appUrl> <scenario>
-import { routes, calls, alerts, prompts, answers, getElementById, start, ok, err, PROJECT, sleep, queryAll, queryOne,
+import { SGLANG, routes, calls, alerts, prompts, answers, getElementById, start, ok, err, PROJECT, sleep, queryAll, queryOne,
   fire, clickable, confirms } from "./_ui_harness.mjs";
 
 const [, , appUrl, scenario] = process.argv;
@@ -336,6 +336,63 @@ const SCENARIOS = {
     queryAll[FIELDS] = [box(0, false), box(1, true)];
     await act("scenes-save");
     return { refs: puts()[0][1].scenes.map((s) => s.refs ?? null) };
+  },
+  async library_preview_after_late_state() {
+    routes["GET /api/state"] = () => sleep(40).then(() => ok(SGLANG));
+    await start(appUrl, { "GET /api/library": ok({ ok: true, cards: [{ tag: "@alice", kind: "person",
+      version: 1, latest_version: 1, description: "a woman", assets: ["/o/library/alice/v1/01-a.png"],
+      versions: [{ version: 1 }] }] }) });
+    await sleep(120);
+    const m = getElementById("library-cards").innerHTML.match(/<img [^>]*>/);
+    return { img: m ? m[0] : null };
+  },
+  async library_delete_in_use() {
+    answers.confirm = true;
+    const message = "@alice подключена к проектам: «Бой» (p1) — отключите её там или удалите проекты";
+    await start(appUrl, { "DELETE /api/library/alice": err(409, "library_card_in_use", message) });
+    const cardError = { hidden: true, textContent: "" };
+    const card = { querySelector: (sel) => (sel === ".lib-card-error" ? cardError : null) };
+    fire("click", { dataset: { act: "lib-delete", tag: "@alice" },
+      closest(sel) { return sel === "button[data-act]" ? this : sel === ".lib-card" ? card : null; } });
+    await sleep(80);
+    return { confirms, cardError,
+             deletes: calls.filter((c) => c.method === "DELETE").map((c) => c.url) };
+  },
+  async library_delete_declined() {
+    answers.confirm = false;
+    await start(appUrl, { "DELETE /api/library/alice": ok({ ok: true }) });
+    const card = { querySelector: () => null };
+    fire("click", { dataset: { act: "lib-delete", tag: "@alice" },
+      closest(sel) { return sel === "button[data-act]" ? this : sel === ".lib-card" ? card : null; } });
+    await sleep(80);
+    return { confirms, deletes: calls.filter((c) => c.method === "DELETE").map((c) => c.url) };
+  },
+  async library_new_version() {
+    await start(appUrl, { "POST /api/uploads": ok({ ok: true, path: "/o/uploads/b.png" }),
+      "PUT /api/library/alice": ok({ ok: true, card: {} }) });
+    const cardError = { hidden: true, textContent: "" };
+    const parts = { ".lib-new-files": { files: [{ name: "b.png" }] },
+                    ".lib-edit-desc": { value: "a woman" }, ".lib-card-error": cardError };
+    const card = { querySelector: (sel) => (Object.hasOwn(parts, sel) ? parts[sel] : null) };
+    fire("click", { dataset: { act: "lib-new-version", tag: "@alice" },
+      closest(sel) { return sel === "button[data-act]" ? this : sel === ".lib-card" ? card : null; } });
+    await sleep(120);
+    return { uploads: calls.filter((c) => c.url === "/api/uploads").map((c) => c.headers["X-Filename"]),
+             puts: puts(), cardError };
+  },
+  async refs_version_change() {
+    const proj = PROJECT({ references: [{ tag: "@a", version: 2 }] });
+    await start(appUrl, { "GET /api/projects/p1": ok(proj),
+      "PUT /api/projects/p1/references": ok({ ok: true, references: [] }) });
+    await open();
+    const pin = { checked: true, dataset: { tag: "@a" } };
+    const select = { value: "1", dataset: { tag: "@a" }, classList: { contains: (c) => c === "ref-version" } };
+    const box = { dataset: { id: "p1" },
+      querySelectorAll: (sel) => (sel === ".ref-pin" ? [pin] : sel === ".ref-version" ? [select] : []) };
+    select.closest = (sel) => (sel === ".project-refs" ? box : null);
+    fire("change", select);
+    await sleep(120);
+    return { puts: puts() };
   },
 };
 

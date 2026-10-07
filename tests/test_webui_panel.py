@@ -215,23 +215,31 @@ def test_project_tag_warnings_and_settings_html():
 
 @_needs_node
 def test_project_references_html_marks_pinned_versions():
-    cards = [{"tag": "@alice", "kind": "person", "version": 3, "latest_version": 3},
-             {"tag": "@beach", "kind": "environment", "version": 1, "latest_version": 1}]
+    # Task 9: every card also gets a version select built from `versions`
+    cards = [{"tag": "@alice", "kind": "person", "version": 3, "latest_version": 3,
+              "versions": [{"version": 1}, {"version": 2}, {"version": 3}]},
+             {"tag": "@beach", "kind": "environment", "version": 1, "latest_version": 1,
+              "versions": [{"version": 1}]}]
     pinned = [{"tag": "@alice", "version": 2}, {"tag": "@beach", "version": 1}]
     html = _node_eval("console.log(JSON.stringify(app.projectReferencesHtml("
                       f"{{id: 'p1'}}, {json.dumps(cards)}, {json.dumps(pinned)})));")
     assert html == (
         '<div class="project-refs" data-id="p1"><h4>Референсы проекта</h4>'
         '<label><input type="checkbox" class="ref-pin" data-tag="@alice" checked> '
-        '@alice <span class="muted">person, v2 (есть v3)</span></label>'
+        '@alice <span class="muted">person, v2 (есть v3)</span></label> '
+        '<select class="inp ref-version" data-tag="@alice"><option value="1">v1</option>'
+        '<option value="2" selected>v2</option><option value="3">v3</option></select>'
         '<label><input type="checkbox" class="ref-pin" data-tag="@beach" checked> '
-        '@beach <span class="muted">environment, v1</span></label></div>')
+        '@beach <span class="muted">environment, v1</span></label> '
+        '<select class="inp ref-version" data-tag="@beach"><option value="1" selected>v1</option></select></div>')
     # a card nobody pinned shows only its kind
     free = _node_eval("console.log(JSON.stringify(app.projectReferencesHtml("
                       f"{{id: 'p1'}}, {json.dumps(cards[1:])}, [])));")
     assert free == ('<div class="project-refs" data-id="p1"><h4>Референсы проекта</h4>'
                     '<label><input type="checkbox" class="ref-pin" data-tag="@beach"> '
-                    '@beach <span class="muted">environment</span></label></div>')
+                    '@beach <span class="muted">environment</span></label> '
+                    '<select class="inp ref-version" data-tag="@beach">'
+                    '<option value="1" selected>v1</option></select></div>')
 
 
 def test_new_routes_are_literal_same_origin_paths():
@@ -388,10 +396,15 @@ def test_cancel_button_and_library_edit_controls_and_request():
     cards = [{"tag": "@alice", "kind": "person", "version": 2, "description": 'a "red" coat',
               "assets": []}]
     html = _node_eval(f"console.log(JSON.stringify(app.libraryCardsHtml({json.dumps(cards)}, '/o')));")
-    assert html == ('<div class="lib-card"><b>@alice</b> <span class="muted">person, v2</span>'
+    # Task 9: caption counts the pictures; the card gets the new-file input and two actions
+    assert html == ('<div class="lib-card"><b>@alice</b> <span class="muted">person, v2, картинок: 0</span>'
                     '<p>a &quot;red&quot; coat</p><input class="lib-edit-desc" '
                     'value="a &quot;red&quot; coat"> <button type="button" class="lib-save" '
                     'data-tag="@alice">Сохранить описание</button>'
+                    '<input class="lib-new-files" type="file" multiple accept=".png,.jpg,.jpeg,.mp3,.wav"> '
+                    '<button type="button" class="ghost" data-act="lib-new-version" data-tag="@alice">'
+                    'Новая версия</button> '
+                    '<button type="button" class="ghost" data-act="lib-delete" data-tag="@alice">Удалить</button>'
                     '<p class="why lib-card-error" hidden></p></div>')
     assert _node_eval("console.log(JSON.stringify(app.libraryUpdateRequest('@alice', 'new')));") == {
         "name": "alice", "body": {"description": "new"}}
