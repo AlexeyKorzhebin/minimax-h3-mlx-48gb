@@ -763,8 +763,7 @@ def resolve_canvas(image: Path | None, latent: Path | None, width: int | None,
 
         from PIL import Image, ImageOps, UnidentifiedImageError
 
-        from h3_48gb._upstream import ensure_on_path  # noqa: F401  (puts upstream on sys.path)
-        from minimax_h3_mlx.packing import resolve_canvas_size
+        from h3_48gb.canvas import resolve_canvas_size  # pure arithmetic, no mlx
 
         # `RunSpec.__post_init__` refuses a missing keyframe with `image_not_found`, but it only
         # runs once the canvas is known — so these three failures reach the user from here, and

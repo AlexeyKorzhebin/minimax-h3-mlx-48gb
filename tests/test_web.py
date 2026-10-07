@@ -1972,7 +1972,6 @@ def test_the_estimate_is_stored_on_the_job(queue_server):
     assert stored == answer["estimate"]
 
 
-@pytest.mark.mlx
 def test_posting_a_job_with_an_image_never_pulls_mlx_into_the_server(tmp_path):
     """The one route where MLX could sneak in.
 
@@ -1989,6 +1988,8 @@ def test_posting_a_job_with_an_image_never_pulls_mlx_into_the_server(tmp_path):
     models = bake_adaln_table(tmp_path / "models" / "ckpt")
     image = outdir / "frame.png"
     _write_png(image)
+    lora = tmp_path / "models" / "turbo.safetensors"
+    lora.write_bytes(b"\x00")
 
     script = f"""
 import json, sys, threading, urllib.request
@@ -2003,7 +2004,9 @@ httpd = web.make_server(root, outdir, repo=Path({str(repo)!r}),
 threading.Thread(target=httpd.serve_forever, daemon=True).start()
 body = json.dumps({{"args": ["generate", "кадр", "--image", {str(image)!r},
                              "--tag", "i", "--outdir", str(outdir),
-                             "--checkpoint", {str(models)!r}], "note": ""}}).encode()
+                             "--checkpoint", {str(models)!r}, "--turbo-lora", {str(lora)!r},
+                             "--adaln-cache", {str(models / "transformer" / "adaln_cache.safetensors")!r},
+                             "--steps", {str(BAKED_GRID_POINTS)!r}], "note": ""}}).encode()
 request = urllib.request.Request(f"http://127.0.0.1:{{httpd.server_address[1]}}/api/jobs",
                                  data=body, method="POST",
                                  headers={{"Content-Type": "application/json"}})
@@ -2437,6 +2440,18 @@ def test_the_estimate_route_answers_without_starting_a_subprocess(queue_server, 
     assert _pending(queue_server) == [], "/api/estimate must not queue anything"
 
 
+def _stub_lora(live: _Live):
+    """A `--turbo-lora` file that exists, as the argument pair a keyframe test passes.
+
+    `RunSpec` refuses a missing LoRA and the CLI defaults `--turbo-lora` to a real file under
+    `~/models` (`DEFAULT_TURBO_LORA`) -- a keyframe test that leaves it implicit passes only on a
+    machine that has those weights. The dry run reads the path's existence, not its bytes.
+    """
+    lora = live.models / "turbo.safetensors"
+    lora.write_bytes(b"\x00")
+    return ["--turbo-lora", str(lora)]
+
+
 def _vertical_frame(live: _Live, width=768, height=1024, name="kadr.png") -> Path:
     """A real image inside the outdir, because `resolve_canvas` opens it: the canvas derived from
     a keyframe is a fact about the file's pixels, and a stub path proves nothing about it.
@@ -2448,7 +2463,6 @@ def _vertical_frame(live: _Live, width=768, height=1024, name="kadr.png") -> Pat
     return path
 
 
-@pytest.mark.mlx
 def test_the_estimate_of_a_keyframe_run_uses_the_canvas_derived_from_the_frame(queue_server):
     """Без `--width/--height` формула брала `DEFAULT_CANVAS` — 896x512, горизонтальный, — и
     вертикальный кадр получал оценку чужого канваса: время и память считались не для того ролика,
@@ -2461,7 +2475,7 @@ def test_the_estimate_of_a_keyframe_run_uses_the_canvas_derived_from_the_frame(q
     """
     frame = _vertical_frame(queue_server)
     status, answer = _call(queue_server, "POST", "/api/estimate",
-                           {"args": _job_args(queue_server, "--image", str(frame),
+                           {"args": _job_args(queue_server, "--image", str(frame), *_stub_lora(queue_server),
                                               "--mode", "i2v", "--duration", "10")})
     assert status == 200, answer
     got = (answer["estimate"]["width"], answer["estimate"]["height"])
@@ -2469,7 +2483,6 @@ def test_the_estimate_of_a_keyframe_run_uses_the_canvas_derived_from_the_frame(q
     assert got != web.DEFAULT_CANVAS
 
 
-@pytest.mark.mlx
 def test_the_keyframe_estimate_works_without_a_prompt_because_estimates_have_none(queue_server):
     """Оценка промпт не носит намеренно: `requestEstimate` строит аргументы с `withPrompt: false`,
     чтобы не слать килобайты текста на каждое нажатие клавиши.
@@ -2480,7 +2493,7 @@ def test_the_keyframe_estimate_works_without_a_prompt_because_estimates_have_non
     подставить недостающий на время dry-run — честно; отказать — нет.
     """
     frame = _vertical_frame(queue_server, name="bez-prompta.png")
-    args = [a for a in _job_args(queue_server, "--image", str(frame), "--mode", "i2v")
+    args = [a for a in _job_args(queue_server, "--image", str(frame), *_stub_lora(queue_server), "--mode", "i2v")
             if a != "котик на подоконнике"]
     assert not any(a == "--prompt-file" for a in args), args
 
@@ -2504,7 +2517,6 @@ def test_an_estimate_with_explicit_numbers_still_starts_no_subprocess(queue_serv
     assert (answer["estimate"]["width"], answer["estimate"]["height"]) == (896, 576)
 
 
-@pytest.mark.mlx
 def test_a_keyframe_job_queued_without_a_canvas_carries_the_derived_one(queue_server):
     """Постановка без `--width/--height` обязана доезжать до очереди, а задача — нести выведенный
     канвас: иначе «из кадра (авто)» в форме ставит задачу, про которую потом нельзя сказать, в
@@ -2512,7 +2524,7 @@ def test_a_keyframe_job_queued_without_a_canvas_carries_the_derived_one(queue_se
     """
     frame = _vertical_frame(queue_server, width=1024, height=768, name="gorizont.png")
     status, answer = _call(queue_server, "POST", "/api/jobs",
-                           {"args": _job_args(queue_server, "--image", str(frame),
+                           {"args": _job_args(queue_server, "--image", str(frame), *_stub_lora(queue_server),
                                               "--mode", "i2v")})
     assert status == 200, answer
     job = answer["job"]
