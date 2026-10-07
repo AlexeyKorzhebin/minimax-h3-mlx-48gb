@@ -141,6 +141,7 @@ def test_spec_carries_every_field_that_identifies_a_run(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_prompt_file_matches_the_shell(tmp_path):
     """`$(cat file)` strips every trailing newline, and every measured run to date was launched
     that way. Leaving one on would change the prompt by a character, change identity_digest, and
@@ -1103,6 +1104,7 @@ def test_previews_disabled_explicitly_pass_no_stem(tmp_path, monkeypatch):
     assert seen["preview_every"] == 0 and seen["preview_stem"] is None
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_negative_preview_interval_is_refused_with_a_code():
     args = build_parser().parse_args(["generate", "a cat", "--preview-every", "-1"])
     try:
@@ -1113,6 +1115,7 @@ def test_negative_preview_interval_is_refused_with_a_code():
         raise AssertionError("a negative preview cadence must be refused, not passed through")
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_previews_are_on_by_default_and_use_tae(tmp_path):
     """The two defaults are one decision: previews can only be on because TAE made them cheap.
 
@@ -1125,6 +1128,7 @@ def test_previews_are_on_by_default_and_use_tae(tmp_path):
     assert (spec.preview_every, spec.preview_decoder) == (5, "tae")
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_the_real_vae_is_still_reachable_for_an_exact_preview(tmp_path):
     """TAE is an approximation for watching progress; a preview that must be exact needs the VAE."""
     spec = spec_from_args(build_parser().parse_args(
@@ -1132,6 +1136,7 @@ def test_the_real_vae_is_still_reachable_for_an_exact_preview(tmp_path):
     assert spec.preview_decoder == "vae"
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_the_preview_decoder_can_be_chosen(tmp_path):
     spec = spec_from_args(build_parser().parse_args(
         ["generate", "a cat", "--preview-decoder", "tae", "--outdir", str(tmp_path)]))
@@ -1227,6 +1232,7 @@ def test_mode_refuses_flags_that_contradict_it(tmp_path, mode, argv_extra, expec
     assert excinfo.value.code == expected
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_mode_does_not_change_the_identity(tmp_path):
     """It is fully derivable from flags already in the identity, so it must not enter it.
 
@@ -1254,6 +1260,7 @@ def test_mode_does_not_change_the_identity(tmp_path):
     assert without_i2v == with_i2v
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_mode_t2va_is_accepted_as_a_synonym_for_t2v(tmp_path):
     """`t2va` (text-to-video-with-audio) is what a text-only run actually produces; it must not be
     refused as a mismatch against the `t2v` the flags imply."""
@@ -1261,6 +1268,7 @@ def test_mode_t2va_is_accepted_as_a_synonym_for_t2v(tmp_path):
         ["generate", "a cat", "--mode", "t2va", "--outdir", str(tmp_path)]))
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_mode_accepts_flags_that_match_it(tmp_path):
     img = _png(tmp_path / "a.png", size=(512, 512))
     end = _png(tmp_path / "b.png", size=(512, 512), colour=(30, 30, 200))
@@ -1654,6 +1662,7 @@ def test_main_doctor_json_reports_failure_with_nonzero_exit(tmp_path, capsys):
 # while still sharing the one, real set of validation rules with a live run.
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_dry_run_reports_what_would_run_without_loading_weights(tmp_path, capsys):
     """`--dry-run` reports the request `run_generate` would act on, without acting on it.
 
@@ -1805,6 +1814,7 @@ def _chatty_pipeline_factory(checkpoint, verbose=True, **kwargs):
     return pipe
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_main_json_output_stays_parseable_with_a_chatty_pipeline(tmp_path, monkeypatch, capsys):
     """Regression for the reviewer-reproduced bug: progress lines interleaved with the JSON report
     made `json.loads(stdout)` raise `JSONDecodeError`. `verbose` must reach both writers."""
@@ -1929,6 +1939,7 @@ def _canvas(tmp_path, argv):
     return spec.width, spec.height
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_a_text_only_run_gets_the_default_canvas(tmp_path):
     """Not the released 1344x768: that is 31 min of diffusion for 2.4 s and nobody asked for it.
 
@@ -1956,6 +1967,7 @@ def test_the_canvas_follows_the_keyframe(tmp_path):
     assert abs((width / height) - (896 / 1152)) < 0.02
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_an_explicit_canvas_still_wins_over_the_keyframe(tmp_path):
     portrait = tmp_path / "portrait.png"
     Image.new("RGB", (896, 1152), (200, 40, 40)).save(portrait)
@@ -2077,6 +2089,7 @@ def test_half_a_canvas_with_a_keyframe_is_refused(tmp_path):
     assert excinfo.value.code == "partial_canvas_with_image"
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_half_a_canvas_without_a_keyframe_still_works(tmp_path):
     """Text-only runs keep the old behaviour: one axis given, the other defaults."""
     spec = spec_from_args(build_parser().parse_args(
@@ -2271,6 +2284,7 @@ def test_output_does_not_default_into_the_weights_directory():
         f"H3_OUTDIR was ignored; got {result.stdout.strip()!r}")
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_an_alternate_adaln_cache_decides_the_step_count(tmp_path):
     """`--adaln-cache` is what makes few-step runs reachable without a symlink tree.
 

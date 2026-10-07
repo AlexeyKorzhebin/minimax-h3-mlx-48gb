@@ -1767,6 +1767,7 @@ def _fake_python(tmp_path, body: str, name="fake-python") -> Path:
 # -- Step 3: posting a job ------------------------------------------------------------------------
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_posting_a_job_queues_it_with_a_snapshot_of_the_prompt(queue_server):
     """The snapshot is the whole reason prompts are files: an edit between queueing and running
     must not change what runs. The server passes the *text*; `queue.submit` writes the copy,
@@ -1815,6 +1816,7 @@ def test_a_body_field_this_route_does_not_take_is_refused_rather_than_ignored(qu
     assert _pending(queue_server) == []
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_the_snapshot_text_comes_from_the_file(queue_server):
     """The other half of the test above: with the field refused, the only source left is the file,
     and the snapshot has to be byte-identical to it.
@@ -1867,6 +1869,7 @@ def test_only_generate_with_a_checkpoint_may_be_queued(queue_server, args):
     assert _pending(queue_server) == []
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_a_tag_that_builds_a_path_out_of_the_outdir_is_refused(queue_server, tmp_path):
     """`--tag` takes no path and yet composes one: the output name is
     `outdir / f"h3-{tag}-{W}x{H}"`. It has no `type=Path`, so neither `PATH_FLAGS` nor the test
@@ -1885,6 +1888,7 @@ def test_a_tag_that_builds_a_path_out_of_the_outdir_is_refused(queue_server, tmp
     assert _pending(queue_server) == []
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_a_tag_that_stays_inside_the_outdir_is_still_accepted(queue_server):
     """The other half: refusing every tag would satisfy the test above."""
     status, answer = _call(queue_server, "POST", "/api/jobs",
@@ -1906,6 +1910,7 @@ def test_a_path_flag_outside_the_roots_never_reaches_a_subprocess(queue_server, 
     assert spawned == [], "the dry-run subprocess started for a path outside every root"
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_the_job_stores_the_resolved_paths_not_what_the_browser_sent(queue_server):
     """`resolve()` anchors a relative value at *this* process's working directory, and the worker
     runs from another one. Checking one path and queueing a different one is the bug; storing what
@@ -1941,6 +1946,7 @@ def test_check_path_flags_returns_the_argument_list_it_checked(tmp_path, monkeyp
     assert got[:3] == ["generate", "x", "--outdir"] and got[5:] == ["--tag", "a"]
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_the_estimate_is_stored_on_the_job(queue_server):
     """The page sums the pending jobs' estimates to answer "when will the night be over". That sum
     only exists if each job carries its own.
@@ -2110,6 +2116,7 @@ def _queue_a_job(live: _Live, *extra, tag="ночь", note=""):
     return answer["job"]
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_editing_a_pending_job_replaces_it(queue_server):
     source = queue_server.repo / "prompts" / "scene.txt"
     source.write_text("первый", encoding="utf-8")
@@ -2130,6 +2137,7 @@ def test_editing_a_pending_job_replaces_it(queue_server):
     assert len(_pending(queue_server)) == 1
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_editing_a_job_the_worker_took_is_a_conflict(queue_server):
     """409 rather than 400: the request was valid and lost a race. The job left `pending/` between
     the page's last poll and this click, and the only honest answer is to say so.
@@ -2143,6 +2151,7 @@ def test_editing_a_job_the_worker_took_is_a_conflict(queue_server):
     assert answer["error"]["code"] == "job_not_pending", answer
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_posting_a_job_whose_output_name_is_taken_is_refused(queue_server):
     """The output name carries no seed, so two jobs with one tag write the same `.mp4`, `.wav`,
     `.npz` and report -- and the second silently overwrites the first.
@@ -2157,6 +2166,7 @@ def test_posting_a_job_whose_output_name_is_taken_is_refused(queue_server):
     assert len(_pending(queue_server)) == 1
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_editing_a_job_into_a_name_another_job_holds_is_refused(queue_server):
     """Task A6: `submit` gives every job its own output subdirectory, so two jobs no longer share
     one just by sharing a tag (`_job_args` always names a fresh `--outdir`, and `update` never
@@ -2176,6 +2186,7 @@ def test_editing_a_job_into_a_name_another_job_holds_is_refused(queue_server):
     assert answer["error"]["detail"]["output_stem"] == first["output_stem"]
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_editing_a_job_without_renaming_it_is_not_a_conflict(queue_server):
     """The paired case, and the common one: changing a seed or a note leaves the output name where
     it was, and a conflict check that did not exclude the job being edited would refuse it.
@@ -2195,6 +2206,7 @@ def test_editing_a_job_without_renaming_it_is_not_a_conflict(queue_server):
     assert answer["job"]["output_stem"] == job["output_stem"]
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_deleting_and_promoting_work_only_while_pending(queue_server):
     first = _queue_a_job(queue_server, tag="первая")
     second = _queue_a_job(queue_server, tag="вторая")
@@ -2218,6 +2230,7 @@ def test_deleting_and_promoting_work_only_while_pending(queue_server):
         assert answer["error"]["code"] == "job_not_pending", answer
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_deleting_a_job_removes_its_prompt_snapshot(queue_server):
     source = queue_server.repo / "prompts" / "scene.txt"
     source.write_text("текст", encoding="utf-8")
@@ -2379,6 +2392,7 @@ def test_deleting_a_flat_job_honours_an_explicit_checkpoint_dir(queue_server):
     assert not checkpoint.exists()
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_deleting_a_running_job_is_refused_and_touches_nothing(queue_server):
     """The worker is mid-generation; stopping it is a different feature. The refusal is the same
     `job_not_pending` this route already answered before this button existed, and nothing about
@@ -2619,6 +2633,7 @@ def test_a_write_asked_for_by_another_site_is_refused(queue_server, headers):
     {"Sec-Fetch-Site": "none"},
     {},
 ])
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_a_write_from_this_page_or_from_a_terminal_is_accepted(queue_server, headers):
     """The other half. A check that refused everything satisfies the test above; this one says the
     page still works -- and that `curl`, which sends neither header and cannot be a cross-site
@@ -2712,6 +2727,7 @@ def test_the_planned_code_exemption_is_now_empty():
     assert web.ERROR_STATUS["job_not_pending"] == 409
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_a_job_that_does_not_name_an_outdir_at_all_is_refused(queue_server):
     """`--outdir` left out means argparse's default, `H3_OUTDIR` or `~/video-out` -- a directory
     the running server was never pointed at. No token exists for `check_path_flags` to inspect, so
@@ -2724,6 +2740,7 @@ def test_a_job_that_does_not_name_an_outdir_at_all_is_refused(queue_server):
     assert _pending(queue_server) == []
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_submitting_when_the_servers_own_outdir_looks_like_a_job_subdirectory_nests_inside_it(
         tmp_path):
     """Fix round 1 (I2, review round 1, Important) taught `queue._base_outdir` to strip a trailing
@@ -2784,6 +2801,7 @@ def test_the_estimate_route_reads_the_bit_width_through_the_resolved_checkpoint(
     assert answer["estimate"]["bits"] == 8, answer
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_two_browsers_posting_the_same_tag_at_once_produce_one_job(queue_server):
     """A race checked by racing, as the design spec requires -- two real threads, not "submit,
     then submit again".
@@ -4616,6 +4634,7 @@ def test_editing_a_queued_job_restores_its_adaln_cache_flag():
     assert '$("adaln").value = argValue(job.args, "--adaln-cache") || "";' in body, body
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_a_job_posted_through_the_api_is_in_the_next_state_the_page_polls(queue_server):
     """The whole loop the page runs on: post, poll, see it. Without this the page could be
     posting into a queue `/api/state` never reads and nothing would say so.
@@ -4666,6 +4685,7 @@ def test_validate_args_names_which_argument_carried_the_nul():
     assert excinfo.value.detail["position"] == 3
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_a_tag_too_long_for_a_filename_does_not_blame_the_queue_directory(queue_server):
     """The job id is built from the tag and never truncated, so a 240-character tag makes
     `queue/pending/<id>.json` longer than the 255 bytes the filesystem allows. `ENAMETOOLONG` used
@@ -4682,6 +4702,7 @@ def test_a_tag_too_long_for_a_filename_does_not_blame_the_queue_directory(queue_
     assert (queue_server.queue_root / "pending").is_dir(), "the queue itself is fine"
 
 
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_a_queue_that_really_cannot_be_written_is_still_a_500(queue_server, monkeypatch):
     """The other side of the test above, and the reason its guard is narrowed to one `errno`
     rather than "any `OSError` from the queue is the caller's fault". A permission failure really
@@ -4799,6 +4820,7 @@ def _one_job_on_disk(live: _Live):
 
 
 @pytest.mark.parametrize("operation", ["edit", "top", "cancel"])
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_a_page_action_racing_the_worker_leaves_exactly_one_job(queue_server, operation):
     """Races checked by racing, as the design spec requires -- two real threads on one job, not
     "claim, then edit".
@@ -4888,6 +4910,7 @@ def test_two_sec_fetch_site_headers_are_refused_as_well(queue_server):
     ("PUT", "/api/jobs/{job}", {"args": "{args}", "note": "", "prompt_text": "подложенный"},
      "prompt_text"),
 ])
+@pytest.mark.mlx(reason="mlx: needs local MLX weights under ~/models")
 def test_every_body_route_refuses_a_field_it_does_not_take(queue_server, method, url, body,
                                                             unknown):
     """Found twice by green mutations, on two routes, for the same reason both times: the only

@@ -27,15 +27,16 @@ def _missing(modules) -> bool:
 
 def pytest_runtest_setup(item):
     for marker, (modules, reason) in _MODULE_MARKERS.items():
-        if item.get_closest_marker(marker) is not None and _missing(modules):
-            pytest.skip(reason)
+        mark = item.get_closest_marker(marker)
+        if mark is not None and _missing(modules):
+            pytest.skip(mark.kwargs.get("reason", reason))
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     skipped_reports = terminalreporter.stats.get("skipped", [])
     for marker, (_modules, reason) in _MODULE_MARKERS.items():
         count = sum(1 for report in skipped_reports
-                    if reason in str(getattr(report, "longrepr", "")))
+                    if reason.split(" ")[0] + " needs" in str(getattr(report, "longrepr", "")))
         if count:
             terminalreporter.write_sep("=", f"{count} skipped: {reason}", yellow=True)
     if CHECKPOINT.exists():
