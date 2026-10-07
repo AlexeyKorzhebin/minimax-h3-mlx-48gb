@@ -155,7 +155,7 @@ _REQUIRED_FIELDS = ("id", "kind", "title", "created_at", "stages", "scenes", "tr
 #: compatibility concern for `stages["scenario"]`) but are still first-class, always-present-once-
 #: loaded `Project` attributes, exactly like `scenes` itself.
 _OWNED_TOP_LEVEL_FIELDS = _REQUIRED_FIELDS + ("scenario_scenes", "scenario_style_block",
-                                              "references", "i2v_prefix", "route")
+                                              "references", "i2v_prefix", "seed", "route")
 
 
 #: spec §3.3.8: the stages a project's pipeline may include, in order, each with an on/off flag.
@@ -534,6 +534,8 @@ class Project:
         # Pinned reference-library cards, `[{tag, version}]` (spec §3.5); absent on older files.
         self.references = [dict(ref) for ref in data.get("references") or []]
         self.i2v_prefix = data.get("i2v_prefix", DEFAULT_I2V_PREFIX)
+        # UI-gap API: the project's default seed (a scene's own wins, 42 when neither is set)
+        self.seed = data.get("seed")
         # spec §3.3.8: absent on older files -- the kind's default route.
         self.route = ([dict(entry) for entry in data["route"]] if "route" in data
                       else default_route(self.kind))
@@ -566,6 +568,7 @@ class Project:
             "scenario_style_block": self.scenario_style_block,
             "references": [dict(ref) for ref in self.references],
             "i2v_prefix": self.i2v_prefix,
+            "seed": self.seed,
             "route": [dict(entry) for entry in self.route],
         })
         return result
@@ -1023,12 +1026,22 @@ class Project:
             self._apply(data)
         return self
 
-    def update_settings(self, *, i2v_prefix: str) -> "Project":
-        if not isinstance(i2v_prefix, str):
+    def update_settings(self, **fields) -> "Project":
+        """`i2v_prefix` (str) and/or `seed` (int >= 0, or `None` to clear), under the lock."""
+        unknown = set(fields) - {"i2v_prefix", "seed"}
+        if unknown:
+            raise ProjectError(f"unknown setting(s) {sorted(unknown)}")
+        if "i2v_prefix" in fields and not isinstance(fields["i2v_prefix"], str):
             raise ProjectError("i2v_prefix must be a string")
+        seed = fields.get("seed")
+        if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool) or seed < 0):
+            raise ProjectError("seed must be an integer >= 0 or None")
         with _project_lock(self.path.parent, exclusive=True):
             data = _read_data(self.path)
-            data["i2v_prefix"] = i2v_prefix.strip()
+            if "i2v_prefix" in fields:
+                data["i2v_prefix"] = fields["i2v_prefix"].strip()
+            if "seed" in fields:
+                data["seed"] = seed
             write_json_durably(self.path, data)
             self._apply(data)
         return self
@@ -1090,6 +1103,7 @@ def create_project(outdir, kind: str, title: str, now=None) -> Project:
         "scenario_style_block": None,
         "references": [],
         "i2v_prefix": DEFAULT_I2V_PREFIX,
+        "seed": None,
         "route": default_route(kind),
     }
     project = Project(project_dir / PROJECT_FILENAME, data)

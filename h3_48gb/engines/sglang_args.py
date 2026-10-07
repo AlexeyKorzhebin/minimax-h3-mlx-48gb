@@ -18,6 +18,8 @@ FRAME_REMAINDER = 5
 MIN_SECONDS = 3.0
 MAX_SECONDS = 15.0
 DEFAULT_STEPS = 50
+MIN_STEPS = 2      # the server refuses fewer (MiniMaxH3Scheduler needs >= 2)
+MAX_STEPS = 100    # the panel's own cap: nothing above 50 was ever measured, 100 is a typo guard
 DEFAULT_SEED = 42
 DEFAULT_MAX_REF_IMAGES = 5   # probe 2026-10-07: 6 portraits at 10 s = 63.6 of ~64.9 GB
 
@@ -181,8 +183,8 @@ def parse(argv, *, environ=None, check_files: bool = True) -> SglangSpec:
 
     steps = _number(values, "--steps", int, DEFAULT_STEPS)
     seed = _number(values, "--seed", int, DEFAULT_SEED)
-    if steps < 1 or seed < 0:
-        raise SglangArgsError("sglang_args_invalid", "--steps ≥ 1 и --seed ≥ 0",
+    if not MIN_STEPS <= steps <= MAX_STEPS or seed < 0:
+        raise SglangArgsError("sglang_args_invalid", f"--steps {MIN_STEPS}..{MAX_STEPS} и --seed ≥ 0",
                               {"steps": steps, "seed": seed})
     tag = _one(values, "--tag", required=True)
     outdir = _one(values, "--outdir", required=True)

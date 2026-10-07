@@ -984,6 +984,10 @@ def _sglang_frame_bounds(chained: bool) -> tuple[int, int]:
     return 73 - overlap, 345 - overlap
 
 
+def _is_seed(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def _snap_video_scenes_sglang(scenes: list[dict]) -> list[dict]:
     """Every video scene's *delivered* duration onto sglang's grid (spec §4.1.5), nearest point,
     kept inside what sglang accepts: the **requested** frames must be `17n+5` within 3..15 s, i.e.
@@ -1021,7 +1025,8 @@ def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
                 scene, keyframe=Path("keyframe.png") if chained else start, chained=chained,
                 ref2va=ref2va,
                 track_piece=Path("track-piece.wav") if proj.kind == "clip" else None,
-                scenes_dir=Path("scenes"), i2v_prefix=proj.i2v_prefix)
+                scenes_dir=Path("scenes"), i2v_prefix=proj.i2v_prefix,
+                default_seed=proj.seed)
             sglang_args.parse(args, check_files=False)
         except (library_module.LibraryError, sglang_args.SglangArgsError) as exc:
             errors.append({"idx": scene["idx"], "code": exc.code, "message": exc.message})
@@ -3590,10 +3595,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _put_project_settings(self, raw_id: str) -> tuple[int, str, bytes]:
         proj = self._load_project(raw_id)
-        payload = self._json_request(allowed=("i2v_prefix",))
-        if not isinstance(payload.get("i2v_prefix"), str):
+        payload = self._json_request(allowed=("i2v_prefix", "seed"))
+        if not payload:
+            raise CliError("args_invalid", "settings: pass `i2v_prefix` and/or `seed`", {})
+        if "i2v_prefix" in payload and not isinstance(payload["i2v_prefix"], str):
             raise CliError("args_invalid", "`i2v_prefix` must be a string", {})
-        proj.update_settings(i2v_prefix=payload["i2v_prefix"])
+        if "seed" in payload and payload["seed"] is not None and not _is_seed(payload["seed"]):
+            raise CliError("args_invalid", "`seed` must be an integer >= 0", {})
+        proj.update_settings(**payload)
         return 200, "application/json", _json_bytes(
             {"ok": True, "project": _project_payload(project_module.load_project(proj.path))})
 
@@ -4298,7 +4307,8 @@ class _Handler(BaseHTTPRequestHandler):
         for i, raw in enumerate(raw_scenes):
             if not isinstance(raw, dict):
                 raise CliError("args_invalid", f"`scenes[{i}]` must be an object", {"index": i})
-            extra = set(raw) - {"prompt", "duration", "fresh_start", "start_image"}
+            extra = set(raw) - {"prompt", "duration", "fresh_start", "start_image", "seed",
+                                "steps"}
             if extra:
                 raise CliError("args_invalid", f"`scenes[{i}]`: unknown field(s) {sorted(extra)}",
                                {"index": i, "fields": sorted(extra)})
@@ -4319,6 +4329,21 @@ class _Handler(BaseHTTPRequestHandler):
                     raise CliError("args_invalid", f"`scenes[{i}].fresh_start` must be true/false",
                                    {"index": i})
                 scene["fresh_start"] = raw["fresh_start"]
+            if "seed" in raw:
+                if not _is_seed(raw["seed"]):
+                    raise CliError("args_invalid", f"`scenes[{i}].seed` must be an integer >= 0",
+                                   {"index": i})
+                scene["seed"] = raw["seed"]
+            if "steps" in raw:
+                steps_low, steps_high = sglang_args.MIN_STEPS, sglang_args.MAX_STEPS
+                if (not isinstance(raw["steps"], int) or isinstance(raw["steps"], bool)
+                        or not steps_low <= raw["steps"] <= steps_high):
+                    raise CliError("args_invalid", f"`scenes[{i}].steps` must be an integer "
+                                   f"between {steps_low} and {steps_high}", {"index": i})
+                if not engine.is_sglang():
+                    raise CliError("args_invalid", f"`scenes[{i}].steps` is only for the sglang "
+                                   "engine", {"index": i})
+                scene["steps"] = raw["steps"]
             start = raw.get("start_image")
             if start is not None:
                 if i != 0 or not isinstance(start, str) or not start:

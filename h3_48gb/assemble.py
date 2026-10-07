@@ -1310,9 +1310,15 @@ def _trim_video(video_path, seconds: float, workdir: Path, *, run) -> Path:
     return out_path
 
 
+def _first_set(*values):
+    """The first value that is not `None` (a seed of 0 is a seed)."""
+    return next(value for value in values if value is not None)
+
+
 def _scene_generate_args_sglang(scene: dict, *, keyframe, chained: bool, ref2va,
                                 track_piece, scenes_dir: Path,
-                                i2v_prefix: str = "") -> tuple[list[str], str]:
+                                i2v_prefix: str = "",
+                                default_seed: int | None = None) -> tuple[list[str], str]:
     """spec §3.3.2: the sglang argv -- prompt (already Ref2VA-assembled from the scene's @tags),
     canvas, duration, steps, seed, tag, outdir, task, keyframe, reference pictures, audio
     references (voice cards, then the clip's own track piece). A chained scene requests one frame
@@ -1333,8 +1339,8 @@ def _scene_generate_args_sglang(scene: dict, *, keyframe, chained: bool, ref2va,
     task = "ref2va"   # the only task the ref2va server serves (spec §4.1.3)
     args = ["generate", prompt, "--width", str(width), "--height", str(height),
             "--duration", str(requested / ASSEMBLY_FPS),
-            "--steps", str(sglang_args.DEFAULT_STEPS),
-            "--seed", str(scene.get("seed", SGLANG_DEFAULT_SEED)),
+            "--steps", str(scene.get("steps") or sglang_args.DEFAULT_STEPS),
+            "--seed", str(_first_set(scene.get("seed"), default_seed, SGLANG_DEFAULT_SEED)),
             "--tag", tag, "--outdir", str(scenes_dir), "--task", task]
     if keyframe is not None:
         args += ["--image", str(keyframe)]
@@ -1405,7 +1411,7 @@ def _submit_next_scene_sglang(proj, scene: dict, queue_root, *, submit, run,
         scenes_dir = proj.path.parent / "scenes"
         args, output_stem = _scene_generate_args_sglang(
             scene, keyframe=keyframe, chained=chained, ref2va=ref2va, track_piece=track_piece,
-            scenes_dir=scenes_dir, i2v_prefix=proj.i2v_prefix)
+            scenes_dir=scenes_dir, i2v_prefix=proj.i2v_prefix, default_seed=proj.seed)
         # What the adapter would refuse (too many pictures, no reference, off-grid duration) is
         # refused here, before anything is queued -- never trimmed to fit.
         sglang_args.parse(args, check_files=False)
