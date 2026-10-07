@@ -1016,6 +1016,36 @@ def _snap_video_scenes_sglang(scenes: list[dict]) -> list[dict]:
     return snapped
 
 
+def _scene_edit_fields(raw: dict, i: int, *, sglang: bool) -> dict:
+    """The checked `prompt`/`seed`/`steps` of `raw` (only those present): one rule for
+    `PUT .../scenes` and `POST .../scenes/<idx>/retry`. seed/steps are sglang-only and the engine
+    is refused before the value is looked at."""
+    out: dict = {}
+    if "prompt" in raw:
+        prompt = raw["prompt"]
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise CliError("args_invalid", f"`scenes[{i}].prompt` must be a non-empty string",
+                           {"index": i})
+        out["prompt"] = prompt
+    for field in ("seed", "steps"):
+        if field in raw and not sglang:
+            raise CliError("args_invalid", f"`scenes[{i}].{field}` is only for the sglang "
+                           "engine", {"index": i})
+    if "seed" in raw:
+        if not _is_seed(raw["seed"]):
+            raise CliError("args_invalid", f"`scenes[{i}].seed` must be an integer >= 0",
+                           {"index": i})
+        out["seed"] = raw["seed"]
+    if "steps" in raw:
+        steps_low, steps_high = sglang_args.MIN_STEPS, sglang_args.MAX_STEPS
+        if (not isinstance(raw["steps"], int) or isinstance(raw["steps"], bool)
+                or not steps_low <= raw["steps"] <= steps_high):
+            raise CliError("args_invalid", f"`scenes[{i}].steps` must be an integer "
+                           f"between {steps_low} and {steps_high}", {"index": i})
+        out["steps"] = raw["steps"]
+    return out
+
+
 def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
     """spec §3.5/§4.1.3: the gate runs the very path the submission runs -- `build_ref2va`, the
     argv `assemble` builds (a chained scene with a stand-in keyframe path) and the adapter's own
@@ -4349,10 +4379,12 @@ class _Handler(BaseHTTPRequestHandler):
             if extra:
                 raise CliError("args_invalid", f"`scenes[{i}]`: unknown field(s) {sorted(extra)}",
                                {"index": i, "fields": sorted(extra)})
-            prompt, duration = raw.get("prompt"), raw.get("duration")
-            if not isinstance(prompt, str) or not prompt.strip():
+            edit = _scene_edit_fields({k: v for k, v in raw.items() if k == "prompt"}, i,
+                                      sglang=engine.is_sglang())
+            if "prompt" not in edit:
                 raise CliError("args_invalid", f"`scenes[{i}].prompt` must be a non-empty string",
                                {"index": i})
+            prompt, duration = edit["prompt"], raw.get("duration")
             if (not isinstance(duration, (int, float)) or isinstance(duration, bool)
                     or not low <= duration <= high):
                 raise CliError("args_invalid", f"`scenes[{i}].duration` must be a number between "
@@ -4366,22 +4398,12 @@ class _Handler(BaseHTTPRequestHandler):
                     raise CliError("args_invalid", f"`scenes[{i}].fresh_start` must be true/false",
                                    {"index": i})
                 scene["fresh_start"] = raw["fresh_start"]
-            for field in ("seed", "steps", "refs"):
-                if field in raw and not engine.is_sglang():
-                    raise CliError("args_invalid", f"`scenes[{i}].{field}` is only for the sglang "
-                                   "engine", {"index": i})
-            if "seed" in raw:
-                if not _is_seed(raw["seed"]):
-                    raise CliError("args_invalid", f"`scenes[{i}].seed` must be an integer >= 0",
-                                   {"index": i})
-                scene["seed"] = raw["seed"]
-            if "steps" in raw:
-                steps_low, steps_high = sglang_args.MIN_STEPS, sglang_args.MAX_STEPS
-                if (not isinstance(raw["steps"], int) or isinstance(raw["steps"], bool)
-                        or not steps_low <= raw["steps"] <= steps_high):
-                    raise CliError("args_invalid", f"`scenes[{i}].steps` must be an integer "
-                                   f"between {steps_low} and {steps_high}", {"index": i})
-                scene["steps"] = raw["steps"]
+            if "refs" in raw and not engine.is_sglang():
+                raise CliError("args_invalid", f"`scenes[{i}].refs` is only for the sglang "
+                               "engine", {"index": i})
+            scene.update(_scene_edit_fields({k: v for k, v in raw.items()
+                                             if k in ("seed", "steps")}, i,
+                                            sglang=engine.is_sglang()))
             if "refs" in raw:
                 refs = raw["refs"]
                 if not isinstance(refs, list) or not all(isinstance(tag, str) for tag in refs):
@@ -5355,10 +5377,26 @@ class _Handler(BaseHTTPRequestHandler):
                 "args_invalid", f"a scene index must be an integer, and {raw_idx!r} is not",
                 {"idx": raw_idx})
         proj = self._load_project(raw_id)
+        payload = self._json_request(allowed=("prompt", "seed", "steps"))
+        sglang = engine.is_sglang()
+        edits = _scene_edit_fields(payload, idx, sglang=sglang)
+        scene = next((s for s in proj.scenes if s["idx"] == idx), None)
+        if scene is None:
+            raise CliError(
+                "project_scene_not_found", f"нет сцены {idx} в проекте {raw_id}",
+                {"id": raw_id, "idx": idx})
+        if scene["status"] == "pending":
+            raise CliError(
+                "project_stage_not_ready", f"сцена #{idx} ещё не снималась — пересчитывать нечего",
+                {"id": raw_id, "idx": idx})
+        if "prompt" in edits and sglang:
+            errors = _scene_reference_errors(proj, [{**scene, **edits}], self.server.outdir)
+            if errors:
+                raise CliError(errors[0]["code"], errors[0]["message"], {"idx": idx})
         self._cancel_project_scene_tail_jobs(proj, idx)
         self._cancel_project_upscale_jobs(proj)
         try:
-            proj.invalidate_scene_chain(idx)
+            proj.invalidate_scene_chain(idx, edits=edits)
         except project_module.UnknownScene as exc:
             raise CliError(
                 "project_scene_not_found", f"нет сцены {idx} в проекте {raw_id}: {exc}",

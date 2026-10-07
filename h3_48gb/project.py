@@ -824,7 +824,7 @@ class Project:
             self._apply(data)
             return dict(scene)
 
-    def invalidate_scene_chain(self, idx: int) -> "Project":
+    def invalidate_scene_chain(self, idx: int, *, edits: dict | None = None) -> "Project":
         """Reset scene `idx` and every scene after it *up to, but not including, the next
         `fresh_start` scene* to `pending`, clearing each reset scene's `job_id`, `clip_path` and
         `keyframe_path`. This is the "пересчёт отдельной сцены" button (design spec, "Клипы"): a
@@ -863,10 +863,17 @@ class Project:
         re-upscaled with one strength (spec §4.2.2), so `ltx_path` is dropped from every reset
         scene and `stages.upscale` goes back to `draft` too -- the next assembly cannot pick up an
         old -ltx part, the upscale has to run again.
+
+        `edits` (`prompt`/`seed`/`steps`, already checked by the caller) are written into scene
+        `idx` under the same lock and in the same write as the reset.
         """
         with _project_lock(self.path.parent, exclusive=True):
             data = _read_data(self.path)
             _find_scene(data["scenes"], idx)  # raises UnknownScene if idx does not exist
+            if edits:
+                target = _find_scene(data["scenes"], idx)
+                target.update({key: edits[key] for key in ("prompt", "seed", "steps")
+                               if key in edits})
             for scene in sorted(data["scenes"], key=lambda scene: scene["idx"]):
                 if scene["idx"] < idx:
                     continue
