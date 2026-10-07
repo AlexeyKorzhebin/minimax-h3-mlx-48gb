@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.parse
 from pathlib import Path
@@ -89,9 +90,10 @@ class SglangClient:
         self.timeout = timeout
 
     def _open(self, method: str, path: str, payload=None):
-        """One request, answered by an `http.client.HTTPResponse` that is still open. http.client
-        and not urllib: a body cut short must surface as a short read at once, and urllib's
-        wrapper left the reader waiting out its timeout on a closed connection."""
+        """One request, answered by `(connection, response)` with the response still open; the
+        caller closes both. http.client and not urllib: a body cut short must surface as a short
+        read at once, and urllib's wrapper left the reader waiting out its timeout on a closed
+        connection."""
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         headers = {"Content-Type": "application/json"} if data is not None else {}
         parts = urllib.parse.urlsplit(self.base_url)
@@ -111,15 +113,17 @@ class SglangClient:
             finally:
                 connection.close()
             raise SglangHTTPError(response.status, _detail(raw), raw.decode("utf-8", "replace"))
-        return response
+        return connection, response
 
     def _json(self, method: str, path: str, payload=None) -> dict:
-        response = self._open(method, path, payload)
+        connection, response = self._open(method, path, payload)
         try:
             with response:
                 return json.loads(response.read())
         except (http.client.HTTPException, OSError, ValueError) as exc:
             raise SglangUnavailable(f"{method} {path}: {exc}") from None
+        finally:
+            connection.close()
 
     def create(self, payload: dict) -> dict:
         return self._json("POST", "/v1/videos", payload)
@@ -133,7 +137,7 @@ class SglangClient:
     def download(self, video_id: str, dest: Path) -> None:
         dest = Path(dest)
         part = dest.with_name(dest.name + ".part")
-        response = self._open("GET", f"/v1/videos/{video_id}/content")
+        connection, response = self._open("GET", f"/v1/videos/{video_id}/content")
         # A queued job's stem may live in a per-job subdirectory that nothing has created yet.
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -148,6 +152,8 @@ class SglangClient:
             if isinstance(exc, SglangUnavailable):
                 raise
             raise SglangUnavailable(f"download {video_id}: {exc}") from None
+        finally:
+            connection.close()
         os.replace(part, dest)
 
 
@@ -183,10 +189,15 @@ def _sleep_unless_cancelled(root, job_id: str, seconds: float, sleep) -> str | N
         remaining -= step
 
 
-def _zero_filled_frames(mp4: Path) -> list[int]:
-    """Decode `mp4` frame by frame through ffmpeg and return the indices `framecheck` calls
-    zero-filled (spec §4.1.7). Zero-fill only: the seam detector is tuned to the MLX VAE's tiling.
-    Raises `OSError` when the file cannot be decoded at all (a broken mp4 is a failed scene)."""
+def _flat_frames(mp4: Path, expected_frames: int) -> list[int]:
+    """spec §4.1.7 on sglang (final review C1, coordinator's ruling): the mp4 decodes, holds
+    exactly `expected_frames` frames (what was requested, 17n+5), and no frame is filled with one
+    colour (`framecheck.is_flat_frame`). Returns the indices of the flat frames. Raises `OSError`
+    when the file cannot be decoded or the frame count is off -- either is a failed scene. The MLX
+    zero-fill/tile-seam detectors are not run: both are calibrations of the MLX VAE.
+
+    ffmpeg's stderr goes to a file, not a pipe: a pipe nobody reads while stdout is drained fills
+    up and stalls the decoder for good."""
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
@@ -194,24 +205,29 @@ def _zero_filled_frames(mp4: Path) -> list[int]:
             capture_output=True, text=True, check=True)
         width, height = (int(x) for x in probe.stdout.strip().split("x"))
         size = width * height * 3
-        bad: list[int] = []
+        flat: list[int] = []
         index = 0
-        with subprocess.Popen(
-                ["ffmpeg", "-v", "error", "-i", str(mp4), "-f", "rawvideo", "-pix_fmt", "rgb24",
-                 "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
-            while True:
-                raw = proc.stdout.read(size)
-                if not raw:
-                    break
-                if len(raw) != size:
-                    raise OSError(f"обрезанный кадр {index}: {len(raw)} из {size} байт")
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
-                bad.extend([index] if framecheck.find_zero_fill_frames([frame]) else [])
-                index += 1
-            err = proc.stderr.read().decode("utf-8", "replace").strip()
+        with tempfile.TemporaryFile() as errors:
+            with subprocess.Popen(
+                    ["ffmpeg", "-v", "error", "-i", str(mp4), "-f", "rawvideo", "-pix_fmt",
+                     "rgb24", "-"], stdout=subprocess.PIPE, stderr=errors) as proc:
+                while True:
+                    raw = proc.stdout.read(size)
+                    if not raw:
+                        break
+                    if len(raw) != size:
+                        raise OSError(f"обрезанный кадр {index}: {len(raw)} из {size} байт")
+                    frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+                    if framecheck.is_flat_frame(frame):
+                        flat.append(index)
+                    index += 1
+            errors.seek(0)
+            err = errors.read().decode("utf-8", "replace").strip()
         if proc.returncode != 0 or index == 0:
             raise OSError(err or "ни одного кадра")
-        return bad
+        if index != expected_frames:
+            raise OSError(f"в mp4 {index} кадров, запрошено {expected_frames}")
+        return flat
     except (subprocess.CalledProcessError, ValueError, FileNotFoundError) as exc:
         raise OSError(f"не удалось декодировать {mp4}: {exc}") from exc
 
@@ -299,13 +315,13 @@ def run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep,
             continue
         if status.get("status") == "completed":
             try:
-                bad_frames = _zero_filled_frames(Path(job.output_stem + ".mp4"))
+                bad_frames = _flat_frames(Path(job.output_stem + ".mp4"), spec.frames)
             except OSError as exc:
                 return done(1, f"sglang: mp4 не прошёл проверку кадров: {exc}\n",
                             {"status": "corrupt", "id": video_id, "error": str(exc)})
             if bad_frames:
                 shown = ", ".join(str(i) for i in bad_frames[:20])
-                return done(1, f"sglang: битые кадры (zero-fill): {shown}\n",
+                return done(1, f"sglang: кадры залиты одним цветом: {shown}\n",
                             {"status": "corrupt", "id": video_id, "frames": bad_frames})
             wall = round(clock() - started, 1)
             sglang_estimate.record(outdir, width=spec.width, height=spec.height,

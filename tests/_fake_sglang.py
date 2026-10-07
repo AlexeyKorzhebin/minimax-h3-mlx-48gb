@@ -12,7 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class FakeSglang:
     def __init__(self, *, statuses=("completed",), content=b"MP4-BYTES", post_status=200,
-                 post_body=None, error=None, drop_gets=0, truncate_contents=0, get_error=None):
+                 post_body=None, error=None, drop_gets=0, truncate_contents=0, get_error=None,
+                 keep_alive=False):
         self.posts: list[dict] = []
         self.gets: list[str] = []
         self.deletes: list[str] = []
@@ -27,6 +28,9 @@ class FakeSglang:
         self.drop_gets = drop_gets
         self.get_error = get_error          # (status, body) answered to every status GET
         self.truncate_contents = truncate_contents
+        # uvicorn (the real sglang) answers HTTP/1.1 and keeps the connection open; the stdlib
+        # default HTTP/1.0 closes it, which hides a client that never closes its own end.
+        self.keep_alive = keep_alive
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.port = self.httpd.server_address[1]
         self.url = f"http://127.0.0.1:{self.port}"
@@ -41,6 +45,8 @@ class FakeSglang:
 
     def _handler(fake):  # noqa: N805 -- closes over the fake, not a method of the handler
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1" if fake.keep_alive else "HTTP/1.0"
+
             def log_message(self, *args):
                 pass
 

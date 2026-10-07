@@ -249,13 +249,28 @@ def find_corrupt_frames(frames: np.ndarray) -> list[FrameCorruption]:
     return bad
 
 
-def find_zero_fill_frames(frames) -> list[int]:
-    """Indices of the frames in `frames` (an iterable of (H, W, 3) uint8) that trip the zero-fill
-    detector ONLY. For a clip decoded by another VAE (sglang's): `TILE_SEAM_*` is calibrated to
-    the MLX port's tiling and would reject clean frames there. Takes an iterable so a caller can
-    stream a long clip frame by frame."""
-    return [i for i, frame in enumerate(frames)
-            if zero_fill_fraction(frame) > ZERO_FILL_FRACTION_THRESHOLD]
+#: sglang (spec §4.1.7, final review 2026-10-07 C1): a frame counts as broken only when ONE colour
+#: -- any colour, not `FILL_COLOR` -- covers at least this share of it. Both MLX detectors are
+#: calibrations of the MLX port's VAE and do not transfer: `FILL_COLOR` is an ordinary sand-grey
+#: pixel on sglang (597 of 9475 frames of 60 clean h3-bench clips were over the 0.5 % zero-fill
+#: floor, the fight-armored-40 arena at 0.0040 of 0.005), and the seam detector is tuned to the MLX
+#: tiling. "Filled entirely" is the coordinator's ruling: an unwritten frame is flat end to end,
+#: and a night scene or a sky must not come anywhere near this line.
+FLAT_FRAME_FRACTION_THRESHOLD = 0.95
+
+
+def dominant_color_fraction(frame: np.ndarray) -> float:
+    """Share of `frame`'s (H, W, 3) pixels within `FILL_TOLERANCE` of the frame's own per-channel
+    median colour. When one colour covers more than half of the frame the median *is* that colour
+    (to within the tolerance), so a flat frame of any colour reads close to 1.0."""
+    pixels = frame.reshape(-1, 3).astype(np.int16)
+    median = np.median(pixels, axis=0).round().astype(np.int16)
+    return float((np.abs(pixels - median) <= FILL_TOLERANCE).all(axis=-1).mean())
+
+
+def is_flat_frame(frame: np.ndarray) -> bool:
+    """The sglang check: the frame is filled with one colour (`FLAT_FRAME_FRACTION_THRESHOLD`)."""
+    return dominant_color_fraction(frame) >= FLAT_FRAME_FRACTION_THRESHOLD
 
 
 class CorruptFramesError(RuntimeError):

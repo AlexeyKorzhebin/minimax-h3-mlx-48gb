@@ -15,7 +15,7 @@ from test_worker import _stop_after
 def _no_real_frame_decode(monkeypatch):
     """The fake serves placeholder bytes, not a decodable mp4; the real zero-fill check is
     exercised in test_sglang_framecheck.py."""
-    monkeypatch.setattr(sg, "_zero_filled_frames", lambda mp4: [])
+    monkeypatch.setattr(sg, "_flat_frames", lambda mp4, expected: [])
 
 
 class _Crash(BaseException):
