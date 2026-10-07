@@ -1005,6 +1005,20 @@ class Project:
             self._apply(data)
         return self
 
+    def replace_scenes(self, scenes: list[dict]) -> "Project":
+        """A ready-made video scenario loaded without the LLM (final review 2026-10-07, I1): the
+        whole `scenes` list at once and `stages.script -> awaiting_approval`, under the lock.
+        Shape is the web route's job; this only stores it. The caller has checked that nothing
+        has been submitted yet (`stages.scenes == "draft"`)."""
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            data["scenes"] = [dict(scene) for scene in scenes]
+            data["stages"]["script"] = "awaiting_approval"
+            _stamp_stage(data, "script", "awaiting_approval")
+            write_json_durably(self.path, data)
+            self._apply(data)
+        return self
+
     def update_settings(self, *, i2v_prefix: str) -> "Project":
         if not isinstance(i2v_prefix, str):
             raise ProjectError("i2v_prefix must be a string")

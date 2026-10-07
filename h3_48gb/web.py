@@ -1012,8 +1012,13 @@ def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
         chained = scene["idx"] > 0 and not scene.get("fresh_start", False)
         try:
             ref2va = library_module.build_ref2va(scene["prompt"], proj.references, outdir)
+            # I6: scene 0's start image is resolved here exactly as the submission resolves it
+            start = assemble_module.scene_start_image(proj, scene, outdir)
+            if start is not None and not start.is_file():
+                raise library_module.LibraryError("start_image_missing",
+                                                  f"нет файла start_image {start}", {})
             args, _ = assemble_module._scene_generate_args_sglang(
-                scene, keyframe=Path("keyframe.png") if chained else None, chained=chained,
+                scene, keyframe=Path("keyframe.png") if chained else start, chained=chained,
                 ref2va=ref2va,
                 track_piece=Path("track-piece.wav") if proj.kind == "clip" else None,
                 scenes_dir=Path("scenes"), i2v_prefix=proj.i2v_prefix)
@@ -3524,6 +3529,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._put_project_references(path[len("/api/projects/"):-len("/references")])
         if path.startswith("/api/projects/") and path.endswith("/route"):
             return self._put_project_route(path[len("/api/projects/"):-len("/route")])
+        if path.startswith("/api/projects/") and path.endswith("/scenes"):
+            return self._put_project_scenes(path[len("/api/projects/"):-len("/scenes")])
         if path.startswith("/api/projects/") and path.endswith("/settings"):
             return self._put_project_settings(path[len("/api/projects/"):-len("/settings")])
         if path.startswith("/api/jobs/"):
@@ -4230,7 +4237,12 @@ class _Handler(BaseHTTPRequestHandler):
     def _put_project_references(self, raw_id: str) -> tuple[int, str, bytes]:
         proj = self._load_project(raw_id)
         payload = self._json_request(allowed=("references",))
-        raw = payload.get("references")
+        proj.set_references(self._pinned_references(payload.get("references")))
+        return self._project_references(raw_id)
+
+    def _pinned_references(self, raw) -> list[dict]:
+        """`[{tag, version?}]` checked against the library: each card (and version) exists, no
+        tag twice; a missing version pins the card's latest."""
         if not isinstance(raw, list) or not all(isinstance(r, dict) and "tag" in r for r in raw):
             raise CliError("args_invalid", "`references` must be a list of {tag, version?}", {})
         tags = [ref["tag"] for ref in raw]
@@ -4246,8 +4258,85 @@ class _Handler(BaseHTTPRequestHandler):
             card = self._library_call(library_module.get_card, self.server.outdir, ref["tag"],
                                       version)
             pinned.append({"tag": card["tag"], "version": card["version"]})
-        proj.set_references(pinned)
-        return self._project_references(raw_id)
+        return pinned
+
+    def _put_project_scenes(self, raw_id: str) -> tuple[int, str, bytes]:
+        """`PUT /api/projects/<id>/scenes` (final review 2026-10-07, I1): a ready-made video
+        scenario without the LLM -- `{"scenes": [{prompt, duration, fresh_start?, start_image?}],
+        "references"?: [{tag, version?}]}`. Only before anything is queued (`stages.scenes` is
+        `draft`, `stages.script` is `draft` or `awaiting_approval`); it leaves the script waiting
+        for "Утвердить", which snaps the durations and checks every scene as for a chat scenario.
+
+        `start_image` (I6) only on scene 0: a path inside the outdir, or an @tag the project pins
+        (its card's first picture). It is the keyframe of scene 0 -- `assemble.scene_start_image`.
+        Durations: sglang's 3..15 s on sglang, `SCENE_MIN/MAX_SECONDS` on MLX."""
+        proj = self._load_project(raw_id)
+        payload = self._json_request(allowed=("scenes", "references"))
+        if proj.kind != "video":
+            raise CliError("args_invalid", f"сцены загружаются только в kind='video', а этот "
+                           f"проект kind={proj.kind!r}", {"kind": proj.kind})
+        if (proj.stages.get("script") not in ("draft", "awaiting_approval")
+                or proj.stages.get("scenes") != "draft"):
+            raise CliError("project_stage_not_ready",
+                           f"проект {raw_id} уже ставит сцены (script={proj.stages.get('script')!r}, "
+                           f"scenes={proj.stages.get('scenes')!r})",
+                           {"id": raw_id, "stages": dict(proj.stages)})
+        references = (self._pinned_references(payload["references"])
+                      if "references" in payload else proj.references)
+        pinned_tags = {ref["tag"] for ref in references}
+        low, high = ((sglang_args.MIN_SECONDS, sglang_args.MAX_SECONDS) if engine.is_sglang()
+                     else (SCENE_MIN_SECONDS, SCENE_MAX_SECONDS))
+        raw_scenes = payload.get("scenes")
+        if not isinstance(raw_scenes, list) or not raw_scenes:
+            raise CliError("args_invalid", "`scenes` must be a non-empty list", {})
+        scenes = []
+        for i, raw in enumerate(raw_scenes):
+            if not isinstance(raw, dict):
+                raise CliError("args_invalid", f"`scenes[{i}]` must be an object", {"index": i})
+            extra = set(raw) - {"prompt", "duration", "fresh_start", "start_image"}
+            if extra:
+                raise CliError("args_invalid", f"`scenes[{i}]`: unknown field(s) {sorted(extra)}",
+                               {"index": i, "fields": sorted(extra)})
+            prompt, duration = raw.get("prompt"), raw.get("duration")
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise CliError("args_invalid", f"`scenes[{i}].prompt` must be a non-empty string",
+                               {"index": i})
+            if (not isinstance(duration, (int, float)) or isinstance(duration, bool)
+                    or not low <= duration <= high):
+                raise CliError("args_invalid", f"`scenes[{i}].duration` must be a number between "
+                               f"{low:g} and {high:g} seconds", {"index": i, "duration": duration,
+                                                                 "min": low, "max": high})
+            scene = {"idx": i, "prompt": prompt, "duration": float(duration),
+                     "status": "pending", "job_id": None, "clip_path": None,
+                     "keyframe_path": None}
+            if "fresh_start" in raw:
+                if not isinstance(raw["fresh_start"], bool):
+                    raise CliError("args_invalid", f"`scenes[{i}].fresh_start` must be true/false",
+                                   {"index": i})
+                scene["fresh_start"] = raw["fresh_start"]
+            start = raw.get("start_image")
+            if start is not None:
+                if i != 0 or not isinstance(start, str) or not start:
+                    raise CliError("args_invalid", "`start_image` is a non-empty string, and only "
+                                   "scene 0 has one", {"index": i})
+                if start.startswith("@"):
+                    if start not in pinned_tags:
+                        raise CliError("unknown_tag", f"start_image {start}: тег не подключён к "
+                                       f"проекту", {"index": i, "unknown": [start]})
+                else:
+                    resolved = resolve_within(start, {"outdir": Path(self.server.outdir)},
+                                              write=False)
+                    if not resolved.is_file():
+                        raise CliError("args_invalid", f"нет файла start_image {start}",
+                                       {"index": i, "path": start})
+                    start = str(resolved)
+                scene["start_image"] = start
+            scenes.append(scene)
+        if "references" in payload:
+            proj.set_references(references)
+        proj.replace_scenes(scenes)
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "project": _project_payload(project_module.load_project(proj.path))})
 
     def _load_project(self, raw_id: str):
         """The `project.Project` `raw_id` names, or `project_not_found` -- every project route

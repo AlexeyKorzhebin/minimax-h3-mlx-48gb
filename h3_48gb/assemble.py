@@ -1347,6 +1347,29 @@ def _scene_generate_args_sglang(scene: dict, *, keyframe, chained: bool, ref2va,
     return args, str(Path(scenes_dir) / f"h3-{tag}-{width}x{height}")
 
 
+def scene_start_image(proj, scene: dict, outdir) -> Path | None:
+    """Scene 0's keyframe (final review 2026-10-07, I6): the scene's own `start_image` -- a path,
+    or an @tag whose pinned card's first picture is used -- else the project's older top-level
+    `start_image`. `None` for every other scene and when neither is set. Raises `LibraryError`
+    for a tag the project does not pin, or a voice card."""
+    if scene["idx"] != 0:
+        return None
+    raw = scene.get("start_image") or proj.as_dict().get("start_image")
+    if not raw:
+        return None
+    if not str(raw).startswith("@"):
+        return Path(raw)
+    pinned = {ref["tag"]: ref for ref in proj.references}
+    if raw not in pinned:
+        raise library.LibraryError("unknown_tag", f"start_image {raw}: тег не подключён к проекту",
+                                   {"unknown": [raw]})
+    card = library.get_card(outdir, raw, pinned[raw].get("version"))
+    if card["kind"] == "voice":
+        raise library.LibraryError("start_image_not_picture",
+                                   f"start_image {raw}: это голос, а нужен кадр", {"tag": raw})
+    return Path(card["assets"][0])
+
+
 def _submit_next_scene_sglang(proj, scene: dict, queue_root, *, submit, run,
                               fail_on_error: bool = False) -> dict:
     """`_submit_next_scene`'s sglang twin: same claim-before-submit and rollback discipline (see
@@ -1375,8 +1398,8 @@ def _submit_next_scene_sglang(proj, scene: dict, queue_root, *, submit, run,
                 raise AssembleError(f"scene {idx}: the previous scene has no clip to chain from")
             keyframe = _extract_last_frame(prev_clip, proj.path.parent / "keyframes", idx - 1,
                                            run=run)
-        elif idx == 0 and proj.as_dict().get("start_image"):
-            keyframe = Path(proj.as_dict()["start_image"])
+        else:
+            keyframe = scene_start_image(proj, scene, outdir)
         ref2va = library.build_ref2va(scene["prompt"], proj.references, outdir)
         track_piece = _cut_track_piece(proj, idx, run=run) if proj.kind == "clip" else None
         scenes_dir = proj.path.parent / "scenes"
