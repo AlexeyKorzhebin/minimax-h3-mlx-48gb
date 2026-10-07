@@ -87,3 +87,39 @@ def test_get_project_references(live):
     status, body = _call(live, "GET", f"/api/projects/{proj.id}/references")
     assert status == 200
     assert [ref["tag"] for ref in body["references"]] == ["@alice"]
+
+
+@pytest.mark.parametrize("version", ["abc", [1], 1.9, True])
+def test_a_non_integer_version_is_args_invalid(live, version):
+    _create(live)
+    proj = p.create_project(live.outdir, "video", "T")
+    status, body = _call(live, "PUT", f"/api/projects/{proj.id}/references",
+                         {"references": [{"tag": "@alice", "version": version}]})
+    assert (status, body["error"]["code"], body["error"]["message"]) == (
+        400, "args_invalid", "`version` must be an integer or omitted")
+    assert p.load_project(proj.path).references == []
+
+
+@pytest.mark.parametrize("versions", [(1, 1), (1, 2)])
+def test_a_tag_pinned_twice_is_args_invalid(live, versions):
+    _create(live)
+    _call(live, "PUT", "/api/library/alice", {"description": "v2"})
+    proj = p.create_project(live.outdir, "video", "T")
+    status, body = _call(live, "PUT", f"/api/projects/{proj.id}/references", {
+        "references": [{"tag": "@alice", "version": v} for v in versions]})
+    assert (status, body["error"]["code"], body["error"]["detail"]) == (
+        400, "args_invalid", {"tags": ["@alice"]})
+    assert p.load_project(proj.path).references == []
+
+
+def test_get_references_serves_the_pinned_version_not_the_latest(live):
+    _create(live)
+    proj = p.create_project(live.outdir, "video", "T")
+    _call(live, "PUT", f"/api/projects/{proj.id}/references",
+          {"references": [{"tag": "@alice", "version": 1}]})
+    _call(live, "PUT", "/api/library/alice", {"description": "v2"})
+    status, body = _call(live, "GET", f"/api/projects/{proj.id}/references")
+    assert (status, body) == (200, {"ok": True, "references": [{
+        "tag": "@alice", "kind": "person", "description": "a young woman", "version": 1,
+        "latest_version": 2,
+        "assets": [str(live.outdir / "library" / "alice" / "v1" / "01-face.png")]}]})

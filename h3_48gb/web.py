@@ -4012,10 +4012,18 @@ class _Handler(BaseHTTPRequestHandler):
         raw = payload.get("references")
         if not isinstance(raw, list) or not all(isinstance(r, dict) and "tag" in r for r in raw):
             raise CliError("args_invalid", "`references` must be a list of {tag, version?}", {})
+        tags = [ref["tag"] for ref in raw]
+        if len(set(tags)) != len(tags):
+            raise CliError("args_invalid", "`references` names a tag more than once",
+                           {"tags": sorted({t for t in tags if tags.count(t) > 1})})
         pinned = []
         for ref in raw:
+            version = ref.get("version")
+            if version is not None and (isinstance(version, bool) or not isinstance(version, int)):
+                raise CliError("args_invalid", "`version` must be an integer or omitted",
+                               {"tag": ref["tag"], "version": version})
             card = self._library_call(library_module.get_card, self.server.outdir, ref["tag"],
-                                      ref.get("version"))
+                                      version)
             pinned.append({"tag": card["tag"], "version": card["version"]})
         proj.set_references(pinned)
         return self._project_references(raw_id)

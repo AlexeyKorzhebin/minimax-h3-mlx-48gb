@@ -29,6 +29,7 @@ IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
 AUDIO_SUFFIXES = (".mp3", ".wav")
 MAX_IMAGES = 4
 MAX_DESCRIPTION = 400
+_DESCRIPTION_FORBIDDEN = ("\n", "\r", "<", ">", "@")
 CARD_NAME = "card.json"
 
 ERROR_CODES = {
@@ -94,9 +95,13 @@ def _check_fields(kind, description, assets) -> list[Path]:
     if kind not in KINDS:
         raise LibraryError("library_kind_invalid", f"тип {kind!r}: можно {KINDS}", {"kind": kind})
     if not isinstance(description, str) or not description.strip() \
-            or len(description) > MAX_DESCRIPTION:
+            or len(description) > MAX_DESCRIPTION \
+            or any(ch in description for ch in _DESCRIPTION_FORBIDDEN):
+        # The description is pasted into `subject_definitions` as-is, so a newline, an angle
+        # bracket or an @ would let it forge a `<Subject N>` line or a tag of its own.
         raise LibraryError("library_description_invalid",
-                           f"описание: 1–{MAX_DESCRIPTION} символов по-английски", {})
+                           f"описание: 1–{MAX_DESCRIPTION} символов по-английски, одной строкой, "
+                           "без < > @", {})
     paths = [Path(a) for a in assets]
     suffixes = [path.suffix.lower() for path in paths]
     if kind == "voice":
