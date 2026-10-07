@@ -125,11 +125,14 @@ def test_the_client_closes_its_connection_after_every_call():
     fake = FakeSglang(statuses=("queued",), keep_alive=True)
     try:
         client = sg.SglangClient(fake.url)
+        gc.collect()          # sockets other tests leaked must not be counted against this one
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             video_id = client.create({"prompt": "p"})["id"]
             client.get(video_id)
             gc.collect()
-        assert [str(w.message) for w in caught if w.category is ResourceWarning] == []
+        ours = f"raddr=('127.0.0.1', {fake.port})"
+        assert [str(w.message) for w in caught
+                if w.category is ResourceWarning and ours in str(w.message)] == []
     finally:
         fake.close()
