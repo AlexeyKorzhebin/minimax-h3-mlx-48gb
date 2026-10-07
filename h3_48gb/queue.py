@@ -153,6 +153,13 @@ class Job:
     cancel_reason: str | None = None
     #: Wall-clock time of the accepted POST, so `wall_s` after a resume still counts from it.
     engine_submitted_at: float | None = None
+    #: Final review 2026-10-07, I7: how long the GPU gate held this job before the card was ours
+    #: and cool (`gpu_wait_s`, from the gate's first ask), how much of that our own engine spent
+    #: starting (`engine_start_s`, from the first `starting` to `ready`; None if it was up), and
+    #: when the gate let the job through (`gpu_ready_at`, epoch seconds).
+    gpu_wait_s: float | None = None
+    engine_start_s: float | None = None
+    gpu_ready_at: float | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -994,7 +1001,8 @@ class JobNotRunning(QueueError):
     """A running-only mutation was asked of a job that is not in `running/`."""
 
 
-RUNNING_FIELDS = ("engine_ref", "engine_submitted_at", "wait_reason")
+RUNNING_FIELDS = ("engine_ref", "engine_submitted_at", "wait_reason", "gpu_wait_s",
+                  "engine_start_s", "gpu_ready_at")
 
 
 def _mutate_running(root, job_id: str, fields: dict) -> Job:

@@ -277,6 +277,7 @@ def run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep,
         log.append(f"sglang: продолжаю опрос id={video_id} после рестарта\n")
 
     misses = 0
+    completed_at = downloaded_at = None
     while True:
         reason = q.cancel_reason(root, job.id)
         if reason:
@@ -290,7 +291,9 @@ def run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep,
         try:
             status = client.get(video_id)
             if status.get("status") == "completed":
+                completed_at = clock()
                 client.download(video_id, Path(job.output_stem + ".mp4"))
+                downloaded_at = clock()
             misses = 0
         except SglangHTTPError as exc:
             if exc.status == 404:
@@ -323,13 +326,21 @@ def run_generate(job, *, root, outdir, client, gate=None, sleep=time.sleep,
                 shown = ", ".join(str(i) for i in bad_frames[:20])
                 return done(1, f"sglang: кадры залиты одним цветом: {shown}\n",
                             {"status": "corrupt", "id": video_id, "frames": bad_frames})
-            wall = round(clock() - started, 1)
+            checked_at = clock()
+            wall = round(checked_at - started, 1)
             sglang_estimate.record(outdir, width=spec.width, height=spec.height,
                                    frames=spec.frames, wall_s=wall)
+            # I7: `wall_s` runs from the POST to a checked mp4; its parts are split out so the
+            # battle report can tell the server's time from the download and the frame check.
+            # `server_s` is as fine as the poll (20 s): the first GET that saw `completed`.
             return done(0, f"sglang: готово, {wall:.1f} с\n",
                         {"status": "completed", "id": video_id, "wall_s": wall,
                          "inference_time_s": status.get("inference_time_s"),
-                         "peak_memory_mb": status.get("peak_memory_mb")})
+                         "peak_memory_mb": status.get("peak_memory_mb"),
+                         "post_at": round(started, 3), "completed_at": round(completed_at, 3),
+                         "server_s": round(completed_at - started, 1),
+                         "download_s": round(downloaded_at - completed_at, 1),
+                         "framecheck_s": round(checked_at - downloaded_at, 1)})
         if status.get("status") == "failed":
             message = (status.get("error") or {}).get("message") or "без текста"
             return done(1, f"sglang: сцена упала: {message}\n",

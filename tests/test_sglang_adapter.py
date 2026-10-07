@@ -142,7 +142,8 @@ def test_completed_downloads_and_reports(queued, tmp_path):
     root, job = queued
     fake = FakeSglang(statuses=("queued", "completed"))
     try:
-        code, log = _run(job, root, tmp_path, fake)
+        # POST at 10, `completed` seen at 80, downloaded at 95, frames checked at 110
+        code, log = _run(job, root, tmp_path, fake, clock=_Clock(10.0, 80.0, 95.0, 110.0))
     finally:
         fake.close()
     from pathlib import Path
@@ -154,7 +155,9 @@ def test_completed_downloads_and_reports(queued, tmp_path):
     assert fake.gets == ["vid-1", "vid-1"]
     assert _report(job) == {"engine": "sglang", "status": "completed", "id": "vid-1",
                             "wall_s": 100.0, "inference_time_s": 300.5,
-                            "peak_memory_mb": 47000.0, "payload": payload}
+                            "peak_memory_mb": 47000.0, "post_at": 10.0, "completed_at": 80.0,
+                            "server_s": 70.0, "download_s": 15.0, "framecheck_s": 15.0,
+                            "payload": payload}
     assert [j for j in q.scan(root)[0] if j.id == job.id][0].engine_ref == "vid-1"
     import json
     history = (tmp_path / "sglang-history.jsonl").read_text(encoding="utf-8").splitlines()

@@ -520,7 +520,7 @@ class GpuEngineFailed(Exception):
         self.log = log
 
 
-def make_gpu_gate(root, engine_name: str, *, client, sleep=time.sleep):
+def make_gpu_gate(root, engine_name: str, *, client, sleep=time.sleep, clock=time.time):
     """spec §4.1.1-2: ask the dispatcher for `engine_name` until it is ready, every 30 s (5 s while
     our own engine is starting), writing why into the job (`wait_reason`) for the page; no
     timeout -- only a cancel ends the wait. Once ready, a card at ≥ 80 °C is waited down to 72 °C.
@@ -541,6 +541,8 @@ def make_gpu_gate(root, engine_name: str, *, client, sleep=time.sleep):
             return None
 
     def gate(job) -> str | None:
+        asked = clock()
+        starting_since = None
         while True:
             cancelled = q.cancel_reason(root, job.id)
             if cancelled:
@@ -561,7 +563,13 @@ def make_gpu_gate(root, engine_name: str, *, client, sleep=time.sleep):
                 _GPU_ACQUIRED.set()
                 temp = temperature()
                 if temp is None or temp < HOT_C:
-                    q.set_running_fields(root, job.id, wait_reason=None)
+                    # I7: what the battle report reads for "ожидание GPU" and "подъём движка"
+                    now = clock()
+                    q.set_running_fields(
+                        root, job.id, wait_reason=None, gpu_ready_at=round(now, 3),
+                        gpu_wait_s=round(now - asked, 1),
+                        engine_start_s=(None if starting_since is None
+                                        else round(now - starting_since, 1)))
                     return None
                 while temp is not None and temp > COOL_C:
                     cancelled = wait(job, f"остываем, {temp} °C", ACQUIRE_RETRY_SECONDS)
@@ -570,6 +578,8 @@ def make_gpu_gate(root, engine_name: str, *, client, sleep=time.sleep):
                     temp = temperature()
                 continue
             if state == "starting":
+                if starting_since is None:
+                    starting_since = clock()
                 reason, seconds = f"ждём GPU: поднимается {engine_name}", STARTING_POLL_SECONDS
             elif state == "wait_qwen":
                 reason = "ждём GPU: Qwen держит карту — выгрузите Qwen в панели"

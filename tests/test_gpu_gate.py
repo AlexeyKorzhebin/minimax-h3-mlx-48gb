@@ -457,3 +457,38 @@ def test_client_timeouts_cover_the_dispatcher_stopping_its_engine(monkeypatch):
         ("status", 10.0), ("acquire", 130.0), ("release", 130.0),
         ("unload", 130.0), ("restore", 130.0)]
     assert all("origin" not in headers for _, _, headers in seen)
+
+
+def test_the_gate_records_the_gpu_wait_and_the_engine_start_on_the_job(running):
+    """Final review I7: the battle report reads these off the finished job."""
+    root, job, _ = running
+    fake = FakeDispatcher(acquire=(
+        {"ok": True, "state": "wait", "engine": "h3", "reason": "x"},
+        {"ok": True, "state": "starting", "engine": "h3", "log": "/l"},
+        {"ok": True, "state": "starting", "engine": "h3", "log": "/l"},
+        {"ok": True, "state": "ready", "engine": "h3"}))
+    ticks = [100.0, 130.0, 222.0]   # asked, first `starting`, ready (the last value repeats)
+    try:
+        gate = worker.make_gpu_gate(root, "h3", client=dc.DispatcherClient(fake.url),
+                                    sleep=lambda s: None,
+                                    clock=lambda: ticks.pop(0) if len(ticks) > 1 else ticks[0])
+        assert gate(job) is None
+    finally:
+        fake.close()
+    q.finish(root, job.id, 0, "")
+    done = [j for j in q.scan(root)[0] if j.id == job.id][0]
+    assert (done.state, done.gpu_wait_s, done.engine_start_s, done.gpu_ready_at) == (
+        "done", 122.0, 92.0, 222.0)
+
+
+def test_an_engine_that_was_already_up_has_no_start_time(running):
+    root, job, _ = running
+    fake = FakeDispatcher()
+    ticks = iter([100.0, 100.5])
+    try:
+        worker.make_gpu_gate(root, "h3", client=dc.DispatcherClient(fake.url),
+                             sleep=lambda s: None, clock=lambda: next(ticks))(job)
+    finally:
+        fake.close()
+    running_job = [j for j in q.scan(root)[0] if j.id == job.id][0]
+    assert (running_job.gpu_wait_s, running_job.engine_start_s) == (0.5, None)
