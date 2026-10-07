@@ -505,6 +505,7 @@ PROJECT_LOCK_TEXT = {
 ERROR_STATUS = {
     "library_card_not_found": 404,
     "library_tag_exists": 409,
+    "library_card_in_use": 409,
     "reveal_unsupported": 409,
     "host_not_allowed": 403,
     # A separate code from `host_not_allowed`, and separate on purpose: `Host` answers "which name
@@ -3679,6 +3680,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._delete_chat(path[len("/api/chat/"):])
         if path.startswith("/api/projects/"):
             return self._delete_project(path[len("/api/projects/"):])
+        if path.startswith("/api/library/"):
+            return self._delete_card(path[len("/api/library/"):])
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for DELETE {path}", {"path": path})
 
@@ -4303,6 +4306,22 @@ class _Handler(BaseHTTPRequestHandler):
             kind=payload.get("kind"), description=payload.get("description"),
             assets=self._library_assets(payload))
         return 200, "application/json", _json_bytes({"ok": True, "card": card})
+
+    def _delete_card(self, name: str) -> tuple[int, str, bytes]:
+        """`DELETE /api/library/<name>`: refused while any project -- finished ones too -- names
+        the tag in its references, a scene's `refs` or a scene's `@tag` start image."""
+        tag = "@" + name
+        pinned_by = []
+        for proj in project_module.list_projects(self.server.outdir):
+            named = {ref["tag"] for ref in proj.references}
+            for scene in proj.scenes:
+                named.update(scene.get("refs") or ())
+                named.add(scene.get("start_image"))
+            if tag in named:
+                pinned_by.append({"id": proj.id, "title": proj.title})
+        trashed = self._library_call(library_module.delete_card, self.server.outdir, tag,
+                                     pinned_by=pinned_by)
+        return 200, "application/json", _json_bytes({"ok": True, "trashed": str(trashed)})
 
     def _resolved_references(self, proj) -> list[dict]:
         return [self._library_call(library_module.get_card, self.server.outdir, ref["tag"],

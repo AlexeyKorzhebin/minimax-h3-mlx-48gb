@@ -39,6 +39,7 @@ ERROR_CODES = {
     "library_description_invalid": "a reference card description is empty or too long",
     "library_assets_invalid": "a reference card needs 1-4 png/jpg pictures, or exactly one mp3/wav for a voice",
     "library_card_not_found": "no reference card with this tag",
+    "library_card_in_use": "a reference card is pinned by at least one project (finished ones included) and is not deleted",
     "library_version_not_found": "the reference card has no such version",
     "tag_invalid": "an @tag in scene text is not lowercase [a-z0-9-]{2,32}",
     "unknown_tag": "an @tag in scene text is not pinned to the project",
@@ -194,6 +195,34 @@ def get_card(outdir, tag, version=None) -> dict:
     return _view(card_dir, card, card["version"] if version is None else int(version))
 
 
+def card_history(outdir, tag) -> list[dict]:
+    """Every version of the card, oldest first, with absolute asset paths."""
+    card_dir = _card_dir(outdir, tag)
+    card = _read(card_dir, tag)
+    return [{"version": int(number), "kind": entry["kind"], "description": entry["description"],
+             "assets": [str(card_dir / rel) for rel in entry["assets"]],
+             "created": entry["created"]}
+            for number, entry in sorted(card["versions"].items(), key=lambda kv: int(kv[0]))]
+
+
+def delete_card(outdir, tag, *, pinned_by: list[dict], now: str | None = None) -> Path:
+    """Move the card's directory to `library/.trash/<name>-<stamp>`; never erase it. A card some
+    project pins is refused: `pinned_by` lists those projects as `{"id", "title"}`."""
+    card_dir = _card_dir(outdir, tag)
+    _read(card_dir, tag)
+    if pinned_by:
+        listed = ", ".join(f"«{item['title']}» ({item['id']})" for item in pinned_by)
+        raise LibraryError("library_card_in_use",
+                           f"{tag} подключена к проектам: {listed} — отключите её там или "
+                           "удалите проекты", {"tag": tag, "projects": pinned_by})
+    trash = library_root(outdir) / ".trash"
+    target = trash / f"{card_dir.name}-{now or datetime.now().strftime('%Y%m%d%H%M%S')}"
+    with _card_lock(card_dir):
+        trash.mkdir(exist_ok=True)
+        card_dir.rename(target)
+    return target
+
+
 def list_cards(outdir) -> list[dict]:
     root = library_root(outdir)
     if not root.is_dir():
@@ -202,7 +231,8 @@ def list_cards(outdir) -> list[dict]:
     for entry in sorted(root.iterdir()):
         if (entry / CARD_NAME).is_file():
             try:
-                cards.append(get_card(outdir, "@" + entry.name))
+                cards.append({**get_card(outdir, "@" + entry.name),
+                              "versions": card_history(outdir, "@" + entry.name)})
             except (LibraryError, ValueError, KeyError):
                 continue
     return cards
