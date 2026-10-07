@@ -34,7 +34,7 @@ def test_gpu_state_combines_dispatcher_and_queue(setup):
     status, body = _call(live, "GET", "/api/gpu")
     assert status == 200
     assert body == {"ok": True, "dispatcher": disp.status_body(), "dispatcher_error": None,
-                    "idle_release_at": None,
+                    "idle_release_at": None, "worker_alive": False,
                     "queue": {"pending": 0, "paused": True,
                               "running": {"id": job.id, "kind": "generate",
                                           "note": "project scene P #3",
@@ -57,7 +57,7 @@ def test_release_with_an_empty_queue_releases_now_and_pauses(setup):
     assert (status, body) == (200, {"ok": True, "paused": True, "releasing": False,
                                     "released": ["h3"]})
     assert q.is_paused(root) is True
-    assert [c[1] for c in disp.calls] == ["/release"]
+    assert [c[1:] for c in disp.calls] == [("/release", {"client": "panel-web", "all": True})]
 
 
 def test_release_while_rendering_needs_confirmation(setup):
@@ -91,7 +91,7 @@ def test_release_during_an_assembly_frees_the_card_now_and_leaves_the_assembly(s
     assert (status, body) == (200, {"ok": True, "paused": True, "releasing": False,
                                     "released": ["h3"]})
     assert q.cancel_reason(root, job.id) is None
-    assert [c[1] for c in disp.calls] == ["/release"]
+    assert [c[1:] for c in disp.calls] == [("/release", {"client": "panel-web", "all": True})]
 
 
 def test_qwen_restore_is_refused_while_the_queue_is_busy(setup):

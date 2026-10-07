@@ -508,6 +508,11 @@ HOT_C = 80
 COOL_C = 72
 
 
+#: Set by the gate when the dispatcher hands this worker its engine; cleared by the idle release
+#: (final review 2026-10-07, C3): a worker that took nothing since its last release asks for none.
+_GPU_ACQUIRED = threading.Event()
+
+
 class GpuEngineFailed(Exception):
     def __init__(self, reason: str, log: str | None):
         super().__init__(reason)
@@ -553,6 +558,7 @@ def make_gpu_gate(root, engine_name: str, *, client, sleep=time.sleep):
                 raise GpuEngineFailed(answer.get("reason") or "движок не поднялся",
                                       answer.get("log"))
             if state == "ready":
+                _GPU_ACQUIRED.set()
                 temp = temperature()
                 if temp is None or temp < HOT_C:
                     q.set_running_fields(root, job.id, wait_reason=None)
@@ -576,29 +582,62 @@ def make_gpu_gate(root, engine_name: str, *, client, sleep=time.sleep):
     return gate
 
 
+#: `<queue>/idle-since`: when the worker's idle-release countdown started (see `_IdleRelease`).
+IDLE_SINCE_NAME = "idle-since"
+
+
 class _IdleRelease:
     """spec §3.4 (б): POST /release once the panel's queue has held no job at all -- neither
     pending nor running -- for H3_IDLE_RELEASE_MIN minutes. Counted from an empty queue, not
-    from an idle GPU: while a project renders, the card is never given away."""
+    from an idle GPU: while a project renders, the card is never given away.
 
-    def __init__(self, minutes: float, client, clock=time.monotonic):
+    Final review 2026-10-07, C3: the release names this worker as the client, so the dispatcher
+    stops only what this worker acquired; and it is sent only if the gate took the card since the
+    last release (`acquired`). A restarted worker does not know that yet: once, at the deadline, it
+    asks /status whether an engine of its own is still up.
+
+    Final review 2026-10-07, I2: the moment the countdown starts is written to `<queue>/idle-since`
+    (ISO with offset) and removed on any activity or after the release, so the page shows the same
+    deadline this timer keeps -- not one derived from queue timestamps."""
+
+    def __init__(self, minutes: float, client, clock=time.monotonic, acquired=None):
         self.limit = float(minutes) * 60.0
         self.client = client
         self.clock = clock
+        self.acquired = acquired if acquired is not None else _GPU_ACQUIRED
         self.since: float | None = None
-        self.released = False
+        self._asked_status = False
+
+    def _owns_an_engine(self) -> bool:
+        if not self._asked_status:
+            self._asked_status = True
+            try:
+                own = self.client.status().get("own") or {}
+            except dispatcher_client.DispatcherUnavailable:
+                return False
+            if any(record.get("owner") == self.client.client for record in own.values()):
+                self.acquired.set()
+        return self.acquired.is_set()
 
     def tick(self, root) -> None:
+        marker = Path(root) / IDLE_SINCE_NAME
         if q.has_active_jobs(root):
-            self.since, self.released = None, False
+            if self.since is not None:
+                marker.unlink(missing_ok=True)
+            self.since = None
             return
         now = self.clock()
         if self.since is None:
             self.since = now
-        if not self.released and now - self.since >= self.limit:
+            tmp = marker.with_name(marker.name + ".tmp")
+            tmp.write_text(datetime.now().astimezone().isoformat(timespec="seconds"),
+                           encoding="utf-8")
+            os.replace(tmp, marker)
+        if now - self.since >= self.limit and self._owns_an_engine():
             try:
                 self.client.release()
-                self.released = True
+                self.acquired.clear()
+                marker.unlink(missing_ok=True)
             except dispatcher_client.DispatcherUnavailable as exc:
                 print(f"h3 worker: idle release failed: {exc}", file=sys.stderr)
 
@@ -667,7 +706,7 @@ def _run_sglang_generate_job(root, outdir, job, *, gate=None) -> tuple[int, str]
         result = (1, f"sglang adapter crashed: {type(exc).__name__}: {exc}\n")
     if q.cancel_reason(root, job.id) == "released_by_user":
         try:
-            dispatcher.release()
+            dispatcher.release(everything=True)
         except dispatcher_client.DispatcherUnavailable as exc:
             result = (result[0], result[1] + f"не удалось освободить карту: {exc}\n")
     return result
@@ -718,7 +757,7 @@ def _run_upscale_job_inner(root, outdir, job) -> tuple[int, str]:
     finally:
         if q.cancel_reason(root, job.id) == "released_by_user":
             try:
-                dispatcher.release()
+                dispatcher.release(everything=True)
             except dispatcher_client.DispatcherUnavailable:
                 pass
 

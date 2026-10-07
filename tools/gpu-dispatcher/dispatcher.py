@@ -7,6 +7,13 @@ It is the only thing that starts or stops the panel's engines (H3 on sglang :300
 SIGTERM to its own process group, up to 120 s, then SIGKILL -- never `pkill -f`, which would take
 down a foreign ComfyUI/H3. Everything else on the GPU is foreign: waited for, never touched.
 Qwen is stopped and restarted only on an explicit request (a button press).
+
+Ownership (final review 2026-10-07, C3): every /acquire names its client (`panel-worker`,
+`probes`, ...), and the engine record keeps it as `owner`. /release stops only the caller's own
+engines; `{"all": true}` -- the panel's "Освободить карту" button -- stops all of ours. An engine
+owned by a live other client is never taken over: the second client waits. A record written
+before owners existed (`owner` absent) is adopted by the next client that acquires it and is
+stopped only by a release-all.
 """
 from __future__ import annotations
 
@@ -312,12 +319,23 @@ class Dispatcher:
         self.lock.release()
         return stopped
 
+    def _release_client(self, client: str) -> list[str]:
+        state = self._snapshot()
+        mine = {name: record for name, record in state["engines"].items()
+                if record.get("owner") == client}
+        stopped = sorted(name for name, record in mine.items() if self._alive(name, record))
+        for name, record in mine.items():
+            self._stop(name, record)
+        self._release_lock_if_idle()
+        return stopped
+
     # -- handles ----------------------------------------------------------------------------
     def status(self) -> dict:
         state = self._snapshot()
         own = {}
         for name, record in self._own_records(state).items():
             own[name] = {"pid": record["pid"], "variant": record.get("variant"),
+                         "owner": record.get("owner"),
                          "started_at": record["started_at"], "log": record["log"],
                          "ready": self.host.url_ok(self.specs[name].ready_url)}
         errors = []
@@ -340,7 +358,7 @@ class Dispatcher:
             answer["gpu_error"] = "; ".join(errors)
         return answer
 
-    def acquire(self, engine: str) -> dict:
+    def acquire(self, engine: str, client: str) -> dict:
         with self._ops:
             spec = self.specs[engine]
             state = self._snapshot()
@@ -352,7 +370,12 @@ class Dispatcher:
                     return {"ok": True, "state": "failed", "engine": engine, "log": record["log"],
                             "reason": "движок не поднялся, смотрите лог"}
                 record = None
+            if record and record.get("owner") not in (None, client):
+                return {"ok": True, "state": "wait", "engine": engine, "foreign": [],
+                        "reason": f"{spec.label} занят клиентом {record['owner']}"}
             if record:
+                if record.get("owner") is None:      # written before owners existed: adopt it
+                    self._update(lambda st: st["engines"][engine].__setitem__("owner", client))
                 if self.host.url_ok(spec.ready_url):
                     self._update(lambda st: st["engines"][engine].__setitem__("ready", True))
                     return {"ok": True, "state": "ready", "engine": engine}
@@ -381,6 +404,11 @@ class Dispatcher:
                 return {"ok": True, "state": "wait", "engine": engine,
                         "reason": f"чужой {spec.label} на :{spec.port}", "foreign": []}
             for other, other_record in own.items():
+                if other != engine and other_record.get("owner") not in (None, client):
+                    return {"ok": True, "state": "wait", "engine": engine, "foreign": [],
+                            "reason": f"карту держит {self.specs[other].label} клиента "
+                                      f"{other_record['owner']}"}
+            for other, other_record in own.items():
                 if other != engine:
                     self._stop(other, other_record)
             if not self.lock.try_acquire():
@@ -389,14 +417,17 @@ class Dispatcher:
             stamp = datetime.fromtimestamp(self.host.wall()).strftime("%Y%m%d-%H%M%S")
             log_path = spec.log_dir / f"{spec.log_prefix}-{stamp}.log"
             pid, pgid = self.host.spawn(spec, log_path, pass_fds=(self.lock.fd,))
-            new = {"pid": pid, "pgid": pgid, "variant": spec.variant,
+            new = {"pid": pid, "pgid": pgid, "variant": spec.variant, "owner": client,
                    "started_at": self.host.wall(), "log": str(log_path), "ready": False}
             self._update(lambda st: st["engines"].__setitem__(engine, new))
             return {"ok": True, "state": "starting", "engine": engine, "log": str(log_path)}
 
-    def release(self) -> dict:
+    def release(self, client: str, everything: bool = False) -> dict:
+        """`everything` is the human's "Освободить карту"; otherwise only `client`'s engines."""
         with self._ops:
-            return {"ok": True, "stopped": self._release_all()}
+            if everything:
+                return {"ok": True, "stopped": self._release_all()}
+            return {"ok": True, "stopped": self._release_client(client)}
 
     def qwen_unload(self) -> tuple[int, dict]:
         with self._ops:
@@ -472,14 +503,19 @@ def make_server(dispatcher: Dispatcher, host: str = "127.0.0.1", port: int = 879
             except ValueError:
                 return self._send(400, {"ok": False, "error": {"code": "bad_json",
                                                                "message": "тело не JSON"}})
+            client = body.get("client")
+            if self.path in ("/acquire", "/release") and (
+                    not isinstance(client, str) or not client.strip()):
+                return self._send(400, {"ok": False, "error": {
+                    "code": "client_required", "message": "нужно поле client: кто просит карту"}})
             if self.path == "/acquire":
                 engine = body.get("engine")
                 if engine not in dispatcher.specs:
                     return self._send(400, {"ok": False, "error": {
                         "code": "unknown_engine", "message": f"движок {engine!r}: h3 или ltx"}})
-                return self._send(200, dispatcher.acquire(engine))
+                return self._send(200, dispatcher.acquire(engine, client))
             if self.path == "/release":
-                return self._send(200, dispatcher.release())
+                return self._send(200, dispatcher.release(client, body.get("all") is True))
             if self.path == "/qwen/unload":
                 return self._send(*dispatcher.qwen_unload())
             if self.path == "/qwen/restore":

@@ -126,7 +126,7 @@ def test_parse_nvidia_smi_outputs():
 
 def test_acquire_on_a_free_card_starts_our_h3_with_the_pipeline_command(tmp_path, host):
     d = _dispatcher(tmp_path, host)
-    answer = d.acquire("h3")
+    answer = d.acquire("h3", "w")
     spec = gd.engine_specs()["h3"]
     assert answer == {"ok": True, "state": "starting", "engine": "h3", "log": host.spawned[0][4]}
     assert host.spawned[0][:4] == (
@@ -136,13 +136,13 @@ def test_acquire_on_a_free_card_starts_our_h3_with_the_pipeline_command(tmp_path
     assert host.spawned[0][5] == 1            # the lock fd is handed to the engine
     assert not _lock_is_free(tmp_path / "generation.lock")
     host.ok_urls.add(H3_READY)
-    assert d.acquire("h3") == {"ok": True, "state": "ready", "engine": "h3"}
+    assert d.acquire("h3", "w") == {"ok": True, "state": "ready", "engine": "h3"}
 
 
 def test_qwen_holding_the_card_is_wait_qwen_and_nothing_is_touched(tmp_path, host):
     host.ok_urls.add(gd.QWEN_HEALTH)
     host.apps = [{"pid": 900, "name": "python3", "memory_mb": 59000}]
-    answer = _dispatcher(tmp_path, host).acquire("h3")
+    answer = _dispatcher(tmp_path, host).acquire("h3", "w")
     assert (answer["state"], answer["reason"]) == ("wait_qwen", "Qwen держит карту")
     assert (host.spawned, host.killed, host.qwen_calls) == ([], [], [])
 
@@ -150,7 +150,7 @@ def test_qwen_holding_the_card_is_wait_qwen_and_nothing_is_touched(tmp_path, hos
 def test_a_foreign_gpu_process_means_wait_and_is_named(tmp_path, host):
     host.apps = [{"pid": 777, "name": "comfy-python", "memory_mb": 30000}]
     host.pgids[777] = 777
-    answer = _dispatcher(tmp_path, host).acquire("ltx")
+    answer = _dispatcher(tmp_path, host).acquire("ltx", "w")
     assert answer == {"ok": True, "state": "wait", "engine": "ltx",
                       "reason": "GPU занята: comfy-python (pid 777, 30000 МБ)",
                       "foreign": [{"pid": 777, "name": "comfy-python", "memory_mb": 30000,
@@ -162,24 +162,24 @@ def test_first_seen_of_a_foreign_process_is_kept_across_calls(tmp_path, host):
     host.apps = [{"pid": 777, "name": "comfy-python", "memory_mb": 30000}]
     host.pgids[777] = 777
     d = _dispatcher(tmp_path, host)
-    d.acquire("ltx")
+    d.acquire("ltx", "w")
     host.t += 600
     assert d.status()["foreign"] == [{"pid": 777, "name": "comfy-python", "memory_mb": 30000,
                                       "first_seen": 1000.0}]
 
 
 def test_an_h3_with_another_variant_at_our_pid_is_not_ours(tmp_path, host):
-    _dispatcher(tmp_path, host).acquire("h3")
+    _dispatcher(tmp_path, host).acquire("h3", "w")
     host.cmdlines[4242] = host.exec_cmdlines["h3"].replace("ref2va", "fl2va")
     reborn = _dispatcher(tmp_path, host)
-    assert reborn.release() == {"ok": True, "stopped": []}
+    assert reborn.release("w") == {"ok": True, "stopped": []}
     assert host.killed == []
 
 
 def test_status_answers_while_a_release_is_waiting_for_a_group_to_die(tmp_path, host):
     import time as _time
     d = _dispatcher(tmp_path, host)
-    d.acquire("h3")
+    d.acquire("h3", "w")
     entered, finish = threading.Event(), threading.Event()
     real_kill = host.killpg
 
@@ -189,7 +189,7 @@ def test_status_answers_while_a_release_is_waiting_for_a_group_to_die(tmp_path, 
         real_kill(pgid, sig)
 
     host.killpg = slow_kill
-    worker = threading.Thread(target=d.release)
+    worker = threading.Thread(target=d.release, args=("w",))
     worker.start()
     assert entered.wait(5)
     started = _time.monotonic()
@@ -202,25 +202,25 @@ def test_status_answers_while_a_release_is_waiting_for_a_group_to_die(tmp_path, 
 
 def test_a_foreign_h3_on_its_port_is_not_ours(tmp_path, host):
     host.ok_urls.add(H3_READY)
-    answer = _dispatcher(tmp_path, host).acquire("h3")
+    answer = _dispatcher(tmp_path, host).acquire("h3", "w")
     assert (answer["state"], answer["reason"]) == ("wait", "чужой H3 на :30020")
     assert host.spawned == []
 
 
 def test_a_busy_generation_lock_means_wait(tmp_path, host):
     with _external_lock(tmp_path, "LOCK_EX", name="generation.lock"):
-        answer = _dispatcher(tmp_path, host).acquire("h3")
+        answer = _dispatcher(tmp_path, host).acquire("h3", "w")
     assert (answer["state"], answer["reason"]) == ("wait", "generation.lock занят")
     assert host.spawned == []
 
 
 def test_release_kills_only_our_exact_group(tmp_path, host):
     d = _dispatcher(tmp_path, host)
-    d.acquire("h3")
+    d.acquire("h3", "w")
     host.apps = [{"pid": 4242, "name": "sglang", "memory_mb": 47000},
                  {"pid": 777, "name": "comfy-python", "memory_mb": 3000}]
     host.pgids[777] = 777
-    assert d.release() == {"ok": True, "stopped": ["h3"]}
+    assert d.release("w") == {"ok": True, "stopped": ["h3"]}
     assert host.killed == [(4242, signal.SIGTERM)]
     assert all(pgid != 777 for pgid, _ in host.killed)
     assert _lock_is_free(tmp_path / "generation.lock")
@@ -228,19 +228,19 @@ def test_release_kills_only_our_exact_group(tmp_path, host):
 
 def test_a_group_that_ignores_sigterm_gets_sigkill_after_120_s(tmp_path, host):
     d = _dispatcher(tmp_path, host)
-    d.acquire("h3")
+    d.acquire("h3", "w")
     host.die_on_term = False
     start = host.t
-    d.release()
+    d.release("w")
     assert host.killed == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
     assert host.t - start >= 120
 
 
 def test_acquiring_ltx_stops_our_h3_first(tmp_path, host):
     d = _dispatcher(tmp_path, host)
-    d.acquire("h3")
+    d.acquire("h3", "w")
     host.apps = [{"pid": 4242, "name": "sglang", "memory_mb": 47000}]
-    answer = d.acquire("ltx")
+    answer = d.acquire("ltx", "w")
     assert answer["state"] == "starting"
     assert host.killed == [(4242, signal.SIGTERM)]
     assert [s[0] for s in host.spawned] == ["h3", "ltx"]
@@ -254,19 +254,19 @@ def test_acquiring_ltx_stops_our_h3_first(tmp_path, host):
 
 def test_an_engine_that_died_before_ready_is_failed_with_its_log(tmp_path, host):
     d = _dispatcher(tmp_path, host)
-    log = d.acquire("h3")["log"]
+    log = d.acquire("h3", "w")["log"]
     host.alive_groups.clear()
     host.cmdlines.clear()
-    assert d.acquire("h3") == {"ok": True, "state": "failed", "engine": "h3", "log": log,
+    assert d.acquire("h3", "w") == {"ok": True, "state": "failed", "engine": "h3", "log": log,
                                "reason": "движок не поднялся, смотрите лог"}
     assert _lock_is_free(tmp_path / "generation.lock")
 
 
 def test_an_engine_not_ready_in_time_is_killed_and_failed(tmp_path, host):
     d = _dispatcher(tmp_path, host)
-    log = d.acquire("h3")["log"]
+    log = d.acquire("h3", "w")["log"]
     host.t += 451
-    assert d.acquire("h3") == {"ok": True, "state": "failed", "engine": "h3", "log": log,
+    assert d.acquire("h3", "w") == {"ok": True, "state": "failed", "engine": "h3", "log": log,
                                "reason": "движок не поднялся за 450 с, смотрите лог"}
     assert host.killed[0] == (4242, signal.SIGTERM)
     assert _lock_is_free(tmp_path / "generation.lock")
@@ -274,19 +274,19 @@ def test_an_engine_not_ready_in_time_is_killed_and_failed(tmp_path, host):
 
 def test_restarted_dispatcher_still_owns_its_engine(tmp_path, host):
     """Review Focus 1."""
-    _dispatcher(tmp_path, host).acquire("h3")
+    _dispatcher(tmp_path, host).acquire("h3", "w")
     host.ok_urls.add(H3_READY)
     reborn = _dispatcher(tmp_path, host)
-    assert reborn.acquire("h3") == {"ok": True, "state": "ready", "engine": "h3"}
+    assert reborn.acquire("h3", "w") == {"ok": True, "state": "ready", "engine": "h3"}
     assert len(host.spawned) == 1
     assert reborn.status()["own"]["h3"]["pid"] == 4242
 
 
 def test_a_reused_pid_is_not_ours_and_is_never_killed(tmp_path, host):
-    _dispatcher(tmp_path, host).acquire("h3")
+    _dispatcher(tmp_path, host).acquire("h3", "w")
     host.cmdlines[4242] = "vim notes.txt"
     reborn = _dispatcher(tmp_path, host)
-    assert reborn.release() == {"ok": True, "stopped": []}
+    assert reborn.release("w") == {"ok": True, "stopped": []}
     assert host.killed == []
 
 
@@ -297,7 +297,7 @@ def test_qwen_unload_and_restore_only_on_request(tmp_path, host):
     host.ok_urls.add(gd.QWEN_HEALTH)
     assert d.qwen_unload() == (200, {"ok": True, "was_running": True, "exit_code": 0})
     host.ok_urls.discard(gd.QWEN_HEALTH)
-    d.acquire("h3")
+    d.acquire("h3", "w")
     assert d.qwen_restore() == (200, {"ok": True, "state": "starting"})
     assert host.qwen_calls == ["stop", "start-shared32"]
     assert host.killed == [(4242, signal.SIGTERM)]       # our H3 released before Qwen returns
@@ -311,13 +311,13 @@ def test_qwen_unload_when_it_is_not_running_does_nothing(tmp_path, host):
 
 def test_status_shape(tmp_path, host):
     d = _dispatcher(tmp_path, host)
-    d.acquire("h3")
+    d.acquire("h3", "w")
     host.ok_urls.add(H3_READY)
     host.apps = [{"pid": 4242, "name": "sglang", "memory_mb": 47000}]
     status = d.status()
     assert status == {
         "ok": True,
-        "own": {"h3": {"pid": 4242, "variant": "ref2va", "started_at": 1000.0,
+        "own": {"h3": {"pid": 4242, "variant": "ref2va", "owner": "w", "started_at": 1000.0,
                        "log": host.spawned[0][4], "ready": True}},
         "foreign": [], "qwen": {"running": False, "unloaded_by_us": False},
         "lock": {"held_by_us": True, "path": str(tmp_path / "generation.lock")},
@@ -340,8 +340,11 @@ def test_http_layer(tmp_path, host):
             return exc.code, json.loads(exc.read())
 
     try:
-        assert post("/acquire", {"engine": "h3"})[1]["state"] == "starting"
-        assert post("/acquire", {"engine": "sd"})[0] == 400
+        assert post("/acquire", {"engine": "h3"}) == (400, {"ok": False, "error": {
+            "code": "client_required", "message": "нужно поле client: кто просит карту"}})
+        assert post("/release", {"client": " "})[0] == 400
+        assert post("/acquire", {"engine": "h3", "client": "w"})[1]["state"] == "starting"
+        assert post("/acquire", {"engine": "sd", "client": "w"})[0] == 400
         assert post("/qwen/restore", {})[0] == 409
         with urllib.request.urlopen(base + "/status", timeout=5) as response:
             assert json.loads(response.read())["own"]["h3"]["pid"] == 4242
@@ -367,7 +370,7 @@ def test_after_a_restart_switching_engines_frees_the_inherited_lock_first(tmp_pa
     """After a dispatcher restart the lock is held only by our own H3 (it inherited the fd).
     Switching to ltx must stop our H3 *before* trying the lock, or the panel waits on itself."""
     first = _dispatcher(tmp_path, host)
-    first.acquire("h3")
+    first.acquire("h3", "w")
     first.lock.release()                    # the old dispatcher process is gone ...
     holder = subprocess.Popen([sys.executable, "-c", _HOLD, str(tmp_path / "generation.lock")],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -384,7 +387,7 @@ def test_after_a_restart_switching_engines_frees_the_inherited_lock_first(tmp_pa
     host.killpg = kill
     try:
         reborn = _dispatcher(tmp_path, host)
-        assert reborn.acquire("ltx")["state"] == "starting"
+        assert reborn.acquire("ltx", "w")["state"] == "starting"
         assert host.killed == [(4242, signal.SIGTERM)]
     finally:
         if holder.poll() is None:
@@ -392,16 +395,16 @@ def test_after_a_restart_switching_engines_frees_the_inherited_lock_first(tmp_pa
 
 
 def test_a_comfy_on_another_port_at_our_ltx_pid_is_not_ours(tmp_path, host):
-    _dispatcher(tmp_path, host).acquire("ltx")
+    _dispatcher(tmp_path, host).acquire("ltx", "w")
     host.cmdlines[4242] = host.exec_cmdlines["ltx"].replace("--port 8188", "--port 8189")
     reborn = _dispatcher(tmp_path, host)
-    assert reborn.release() == {"ok": True, "stopped": []}
+    assert reborn.release("w") == {"ok": True, "stopped": []}
     assert host.killed == []
 
 
 def test_nvidia_smi_down_is_wait_not_a_free_card(tmp_path, host):
     host.smi_down = "nvidia-smi вернул код 9"
-    answer = _dispatcher(tmp_path, host).acquire("h3")
+    answer = _dispatcher(tmp_path, host).acquire("h3", "w")
     assert answer == {"ok": True, "state": "wait", "engine": "h3", "foreign": [],
                       "reason": "nvidia-smi недоступен: nvidia-smi вернул код 9"}
     assert host.spawned == []
@@ -438,9 +441,9 @@ def test_http_unexpected_exception_is_a_500_json(tmp_path, host):
             urllib.request.urlopen(f"http://127.0.0.1:{server.server_address[1]}/status", timeout=5)
         assert caught.value.code == 500
         assert json.loads(caught.value.read())["error"] == {"code": "internal", "message": "boom"}
-        d.acquire = lambda engine: (_ for _ in ()).throw(RuntimeError("bang"))
+        d.acquire = lambda engine, client: (_ for _ in ()).throw(RuntimeError("bang"))
         request = urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}/acquire",
-                                         data=b'{"engine":"h3"}', method="POST")
+                                         data=b'{"engine":"h3","client":"w"}', method="POST")
         with pytest.raises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(request, timeout=5)
         assert (caught.value.code, json.loads(caught.value.read())["error"]["message"]) == (500, "bang")
@@ -531,11 +534,11 @@ def test_real_host_reaps_our_stopped_engine_instead_of_waiting_for_sigkill(tmp_p
     real = RealHost()
     d = gd.Dispatcher(host=real, specs={"h3": spec}, state_path=tmp_path / "s.json",
                       lock_path=tmp_path / "generation.lock", server_outputs=tmp_path / "so")
-    assert d.acquire("h3")["state"] == "starting"
+    assert d.acquire("h3", "w")["state"] == "starting"
     pid = d.status()["own"]["h3"]["pid"]
     started = _time.monotonic()
     try:
-        assert d.release() == {"ok": True, "stopped": ["h3"]}
+        assert d.release("w") == {"ok": True, "stopped": ["h3"]}
         assert _time.monotonic() - started < 2.5
         assert RealHost.sent == [signal.SIGTERM]
     finally:
@@ -544,3 +547,59 @@ def test_real_host_reaps_our_stopped_engine_instead_of_waiting_for_sigkill(tmp_p
             _os.killpg(pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):   # already reaped / zombie
             pass
+
+
+# -- ownership (final review 2026-10-07, C3) --------------------------------------------------------
+
+def test_a_client_release_never_stops_another_clients_engine(tmp_path, host):
+    d = _dispatcher(tmp_path, host)
+    d.acquire("h3", "probes")
+    host.ok_urls.add(H3_READY)
+    assert d.release("panel-worker") == {"ok": True, "stopped": []}
+    assert host.killed == []
+    assert d.status()["own"]["h3"]["owner"] == "probes"
+    assert d.release("probes") == {"ok": True, "stopped": ["h3"]}
+    assert host.killed == [(4242, signal.SIGTERM)]
+    assert _lock_is_free(tmp_path / "generation.lock")
+
+
+def test_another_client_waits_for_an_engine_it_does_not_own(tmp_path, host):
+    d = _dispatcher(tmp_path, host)
+    d.acquire("h3", "probes")
+    host.ok_urls.add(H3_READY)
+    assert d.acquire("h3", "panel-worker") == {
+        "ok": True, "state": "wait", "engine": "h3", "foreign": [],
+        "reason": "H3 занят клиентом probes"}
+    assert d.acquire("ltx", "panel-worker") == {
+        "ok": True, "state": "wait", "engine": "ltx", "foreign": [],
+        "reason": "карту держит H3 клиента probes"}
+    assert (host.killed, len(host.spawned)) == ([], 1)
+    assert d.acquire("h3", "probes") == {"ok": True, "state": "ready", "engine": "h3"}
+
+
+def test_the_owner_swaps_its_own_engines(tmp_path, host):
+    d = _dispatcher(tmp_path, host)
+    d.acquire("h3", "panel-worker")
+    assert d.acquire("ltx", "panel-worker")["state"] == "starting"
+    assert host.killed == [(4242, signal.SIGTERM)]
+    assert d.status()["own"]["ltx"]["owner"] == "panel-worker"
+
+
+def test_release_all_is_the_button_and_stops_every_owner(tmp_path, host):
+    d = _dispatcher(tmp_path, host)
+    d.acquire("h3", "probes")
+    assert d.release("panel-web", everything=True) == {"ok": True, "stopped": ["h3"]}
+    assert host.killed == [(4242, signal.SIGTERM)]
+
+
+def test_a_record_from_before_owners_is_adopted_and_not_stopped_by_a_client_release(tmp_path, host):
+    _dispatcher(tmp_path, host).acquire("h3", "w")
+    state = json.loads((tmp_path / "state.json").read_text())
+    del state["engines"]["h3"]["owner"]
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    reborn = _dispatcher(tmp_path, host)
+    assert reborn.release("panel-worker") == {"ok": True, "stopped": []}
+    assert host.killed == []
+    host.ok_urls.add(H3_READY)
+    assert reborn.acquire("h3", "panel-worker") == {"ok": True, "state": "ready", "engine": "h3"}
+    assert reborn.status()["own"]["h3"]["owner"] == "panel-worker"

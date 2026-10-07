@@ -1,4 +1,7 @@
 """The worker's side of the GPU (spec §4.1.1-2, §3.4 /release, §3.3.14)."""
+import json
+import threading
+
 import pytest
 
 from h3_48gb import queue as q
@@ -49,7 +52,8 @@ def test_gate_waits_for_foreign_then_qwen_then_returns_ready(running):
                     "ждём GPU: Qwen держит карту — выгрузите Qwen в панели",
                     "ждём GPU: поднимается h3"]
     assert [j for j in q.scan(root)[0] if j.id == job.id][0].wait_reason is None
-    assert [c[2] for c in fake.calls if c[1] == "/acquire"] == [{"engine": "h3"}] * 4
+    assert [c[2] for c in fake.calls if c[1] == "/acquire"] == [
+        {"engine": "h3", "client": "panel-worker"}] * 4
 
 
 def test_retry_intervals_are_thirty_and_five_seconds(running, monkeypatch):
@@ -145,17 +149,33 @@ def test_released_by_user_releases_the_card_after_the_job_stops(running, monkeyp
         disp.close()
         h3.close()
     assert code == 1
-    assert [c[1] for c in disp.calls if c[0] == "POST"] == ["/acquire", "/release"]
+    assert [c[1:] for c in disp.calls if c[0] == "POST"] == [
+        ("/acquire", {"engine": "h3", "client": "panel-worker"}),
+        ("/release", {"client": "panel-worker", "all": True})]
     assert h3.deletes == ["vid-1"]
 
 
 class _FakeClient:
-    def __init__(self):
+    client = "panel-worker"
+
+    def __init__(self, own=None):
         self.released = 0
+        self.statuses = 0
+        self.own = own or {}
+
+    def status(self):
+        self.statuses += 1
+        return {"ok": True, "own": self.own}
 
     def release(self):
         self.released += 1
         return {"ok": True, "stopped": ["h3"]}
+
+
+def _taken():
+    acquired = threading.Event()
+    acquired.set()
+    return acquired
 
 
 class _Clock:
@@ -169,7 +189,7 @@ class _Clock:
 def test_idle_release_fires_once_after_15_minutes_of_an_empty_queue(tmp_path):
     root = q.layout(tmp_path / "queue")["root"]
     client, clock = _FakeClient(), _Clock()
-    idle = worker._IdleRelease(15, client, clock=clock)
+    idle = worker._IdleRelease(15, client, clock=clock, acquired=_taken())
     idle.tick(root)
     clock.t = 899.0
     idle.tick(root)
@@ -184,7 +204,8 @@ def test_idle_release_fires_once_after_15_minutes_of_an_empty_queue(tmp_path):
 def test_idle_countdown_restarts_while_anything_is_queued(tmp_path):
     root = q.layout(tmp_path / "queue")["root"]
     client, clock = _FakeClient(), _Clock()
-    idle = worker._IdleRelease(15, client, clock=clock)
+    acquired = _taken()
+    idle = worker._IdleRelease(15, client, clock=clock, acquired=acquired)
     idle.tick(root)
     q.submit(root, ["generate", "--tag", "a"], "", {"output_stem": str(tmp_path / "h3-a")}, {})
     clock.t = 1000.0
@@ -193,6 +214,7 @@ def test_idle_countdown_restarts_while_anything_is_queued(tmp_path):
     for job in q.scan(root)[0]:
         q.cancel(root, job.id)
     clock.t = 1001.0
+    acquired.set()                                    # the cancelled job had taken the card
     idle.tick(root)
     clock.t = 1001.0 + 899.0
     idle.tick(root)
@@ -203,16 +225,43 @@ def test_idle_countdown_restarts_while_anything_is_queued(tmp_path):
 
 
 def test_main_loop_releases_an_idle_card_on_sglang(tmp_path, monkeypatch):
+    """A just-started worker has taken nothing yet: it asks /status once whether an engine of its
+    own is still up (left by its previous run) and releases only as itself."""
     monkeypatch.setenv("H3_ENGINE", "sglang")
     monkeypatch.setenv("H3_IDLE_RELEASE_MIN", "0")
-    disp = FakeDispatcher()
+    monkeypatch.setattr(worker, "_GPU_ACQUIRED", threading.Event())
+    disp = FakeDispatcher(own={"h3": {"pid": 1, "owner": "panel-worker", "ready": True}})
     monkeypatch.setenv("H3_DISPATCHER_URL", disp.url)
     root = q.layout(tmp_path / "queue")["root"]
     try:
         worker.main_loop(root, poll=0.01, stop=_stop_after(0.5), outdir=tmp_path)
     finally:
         disp.close()
-    assert [c[1] for c in disp.calls] == ["/release"]
+    assert [c[1:] for c in disp.calls] == [
+        ("/status", {}), ("/release", {"client": "panel-worker", "all": False})]
+
+
+def test_idle_release_is_not_sent_for_a_card_this_worker_never_took(tmp_path):
+    """Final review C3: the probes' H3 is not the worker's to give away."""
+    root = q.layout(tmp_path / "queue")["root"]
+    client, clock = _FakeClient(own={"h3": {"pid": 1, "owner": "probes", "ready": True}}), _Clock()
+    idle = worker._IdleRelease(15, client, clock=clock, acquired=threading.Event())
+    idle.tick(root)
+    clock.t = 5000.0
+    idle.tick(root)
+    idle.tick(root)
+    assert (client.released, client.statuses) == (0, 1)
+
+
+def test_the_gate_marks_the_card_as_taken_once_it_is_ready(running, monkeypatch):
+    root, job, _ = running
+    monkeypatch.setattr(worker, "_GPU_ACQUIRED", threading.Event())
+    fake = FakeDispatcher()
+    try:
+        assert worker.make_gpu_gate(root, "h3", client=dc.DispatcherClient(fake.url))(job) is None
+    finally:
+        fake.close()
+    assert worker._GPU_ACQUIRED.is_set()
 
 
 def test_main_loop_never_talks_to_a_dispatcher_on_mlx(tmp_path, monkeypatch):
@@ -386,7 +435,11 @@ def test_client_timeouts_cover_the_dispatcher_stopping_its_engine(monkeypatch):
         def read(self):
             return b"{}"
 
+    bodies = []
+
     def fake_urlopen(request, timeout=None):
+        if request.data and not request.full_url.endswith(("unload", "restore")):
+            bodies.append(json.loads(request.data))
         seen.append((request.full_url.rsplit("/", 1)[1], timeout,
                      {k.lower() for k in request.headers}))
         return _Resp()
@@ -396,6 +449,8 @@ def test_client_timeouts_cover_the_dispatcher_stopping_its_engine(monkeypatch):
     client.status()
     client.acquire("h3")
     client.release()
+    assert bodies == [{"engine": "h3", "client": "panel-worker"},
+                      {"client": "panel-worker", "all": False}]
     client.qwen_unload()
     client.qwen_restore()
     assert [(name, timeout) for name, timeout, _ in seen] == [

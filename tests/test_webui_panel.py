@@ -3,11 +3,14 @@ node with exact expected values, plus source checks for the DOM wiring that has 
 import json
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from h3_48gb import queue as q
+from h3_48gb import worker
+from test_queue import _external_lock
 from test_web import _call, _needs_node, _node_eval, _page_text, _serve
 from _fake_dispatcher import FakeDispatcher
 
@@ -246,23 +249,70 @@ def live(tmp_path, monkeypatch):
     disp.close()
 
 
-@pytest.fixture
-def moscow(monkeypatch):
-    # the container's zone (compose TZ): the queue's naive local stamps get this offset
-    monkeypatch.setenv("TZ", "Europe/Moscow")
-    time.tzset()
-    yield
-    monkeypatch.undo()
-    time.tzset()
-
-
-def test_gpu_state_reports_when_the_idle_card_will_be_released(live, moscow):
+def test_gpu_state_reports_the_workers_own_idle_deadline(live):
+    """Final review I2: the deadline is the worker's countdown (`idle-since`), not one derived
+    from queue timestamps -- and there is none without a live worker."""
     server, root, tmp_path = live
+    (root / "idle-since").write_text("2026-10-07T10:00:00+03:00", encoding="utf-8")
+    with _external_lock(root, "LOCK_EX", "worker.lock"):
+        _, alive = _call(server, "GET", "/api/gpu")
+    _, dead = _call(server, "GET", "/api/gpu")
+    assert [(b["idle_release_at"], b["worker_alive"]) for b in (alive, dead)] == [
+        ("2026-10-07T10:15:00+03:00", True), (None, False)]
+
+
+def test_no_idle_deadline_for_an_engine_someone_else_owns(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    disp = FakeDispatcher(own={"h3": {"pid": 1, "owner": "probes", "ready": True}})
+    monkeypatch.setenv("H3_DISPATCHER_URL", disp.url)
+    root = q.layout(tmp_path / "queue")["root"]
+    (root / "idle-since").write_text("2026-10-07T10:00:00+03:00", encoding="utf-8")
+    server = _serve(root, tmp_path)
+    try:
+        with _external_lock(root, "LOCK_EX", "worker.lock"):
+            _, body = _call(server, "GET", "/api/gpu")
+    finally:
+        server.httpd.shutdown()
+        server.httpd.server_close()
+        disp.close()
+    assert (body["idle_release_at"], body["worker_alive"]) == (None, True)
+
+
+def test_the_idle_countdown_is_written_for_the_page_and_removed_on_activity(tmp_path):
+    from test_gpu_gate import _Clock, _FakeClient, _taken
+    root = q.layout(tmp_path / "queue")["root"]
+    marker = root / "idle-since"
+    client, clock = _FakeClient(), _Clock()
+    idle = worker._IdleRelease(15, client, clock=clock, acquired=_taken())
+    before = datetime.now().astimezone().replace(microsecond=0)
+    idle.tick(root)
+    written = datetime.fromisoformat(marker.read_text(encoding="utf-8"))
+    assert before <= written <= datetime.now().astimezone()
+    assert written.utcoffset() is not None
     q.submit(root, ["generate", "--tag", "a"], "", {"output_stem": str(tmp_path / "h3-a")}, {})
-    job = q.claim(root)
-    q.finish(root, job.id, 0, "", finished_at="2026-10-07T10:00:00")
-    status, body = _call(server, "GET", "/api/gpu")
-    assert body["idle_release_at"] == "2026-10-07T10:15:00+03:00"
+    idle.tick(root)
+    assert not marker.exists()
+    for job in q.scan(root)[0]:
+        q.cancel(root, job.id)
+    idle.tick(root)
+    assert marker.exists()
+    clock.t = 900.0
+    idle.tick(root)
+    assert (client.released, marker.exists()) == (1, False)
+
+
+@_needs_node
+def test_banner_names_a_foreign_owner_and_a_missing_worker():
+    own = {"h3": {"pid": 1, "variant": "ref2va", "owner": "probes", "started_at": 1, "log": "/l",
+                  "ready": True}}
+    gpu = {"ok": True, "dispatcher_error": None, "idle_release_at": None, "worker_alive": True,
+           "dispatcher": _dispatcher(own=own),
+           "queue": {"pending": 0, "paused": True, "running": None}}
+    assert _banner(gpu)["text"] == "Карту держит панель: H3 (probes), 40,0 ГБ — освободится кнопкой"
+    mine = {"h3": {**own["h3"], "owner": "panel-worker"}}
+    dead = {**gpu, "worker_alive": False, "dispatcher": _dispatcher(own=mine)}
+    assert _banner(dead)["text"] == ("Карту держит панель: H3, 40,0 ГБ — освободится кнопкой "
+                                     "(воркер не запущен)")
 
 
 @_needs_node

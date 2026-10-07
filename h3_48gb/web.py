@@ -5483,20 +5483,24 @@ class _Handler(BaseHTTPRequestHandler):
         except dispatcher_client.DispatcherUnavailable as exc:
             status, error = None, str(exc)
         running, pending = self._running_job()
+        worker_alive = worker_state(self.server.queue_root) == "alive"
         idle_release_at = None
-        if running is None and pending == 0 and status and status.get("own"):
-            jobs, _ = q.scan(self.server.queue_root)
-            finished = [job.finished_at for job in jobs if job.finished_at]
-            if finished:
+        # Final review 2026-10-07, I2: the deadline is the worker's own countdown (`idle-since`,
+        # written by `worker._IdleRelease`), and only for engines the worker owns (C3) -- the
+        # probes' H3 is not the worker's to give away.
+        workers_own = [record for record in ((status or {}).get("own") or {}).values()
+                       if record.get("owner") in (None, dispatcher_client.PANEL_WORKER)]
+        if running is None and pending == 0 and workers_own and worker_alive:
+            try:
+                since = (self.server.queue_root / "idle-since").read_text(encoding="utf-8")
                 minutes = float(os.environ.get("H3_IDLE_RELEASE_MIN", "15"))
-                # Queue timestamps are naive local time; the offset makes the browser read the
-                # instant correctly whatever its own zone (the container runs on TZ=Europe/Moscow).
-                idle_release_at = (datetime.fromisoformat(max(finished))
-                                   + timedelta(minutes=minutes)).astimezone().isoformat(
-                                       timespec="seconds")
+                idle_release_at = (datetime.fromisoformat(since.strip())
+                                   + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+            except (OSError, ValueError):
+                idle_release_at = None
         return 200, "application/json", _json_bytes({
             "ok": True, "dispatcher": status, "dispatcher_error": error,
-            "idle_release_at": idle_release_at,
+            "idle_release_at": idle_release_at, "worker_alive": worker_alive,
             "queue": {"pending": pending, "paused": q.is_paused(self.server.queue_root),
                       "running": None if running is None else {
                           "id": running.id, "kind": running.kind, "note": running.note,
@@ -5529,7 +5533,8 @@ class _Handler(BaseHTTPRequestHandler):
         with queue_errors(root):
             q.set_paused(root, True)
         try:
-            answer = dispatcher_client.DispatcherClient().release()
+            answer = dispatcher_client.DispatcherClient(
+                client=dispatcher_client.PANEL_WEB).release(everything=True)
         except dispatcher_client.DispatcherUnavailable as exc:
             raise CliError("dispatcher_unavailable", f"диспетчер GPU не отвечает: {exc}", {}) from exc
         return 200, "application/json", _json_bytes(

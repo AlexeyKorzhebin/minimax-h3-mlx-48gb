@@ -339,3 +339,22 @@ def test_a_mixed_run_keeps_each_probes_own_pictures_and_logs_its_parameters(out_
         "roles": ["keyframe", "reference", "reference"],
         "reference_sizes": ["512x512", "512x512"]}
     assert dispatcher.calls == [("acquire", "h3"), ("release",)]
+
+
+def test_the_probes_ask_for_the_card_as_their_own_client(out_dir, monkeypatch):
+    """Final review C3: the probes' `finally: release()` stops only what the probes raised."""
+    made = []
+
+    class _Recorder:
+        def __init__(self, *args, **kwargs):
+            made.append(kwargs)
+
+        def acquire(self, engine):
+            return {"ok": True, "state": "failed", "reason": "x", "log": "/l"}
+
+        def release(self):
+            return {"ok": True, "stopped": []}
+
+    monkeypatch.setattr(probes, "DispatcherClient", _Recorder)
+    probes.main(["picture_numbering"], client=_Server(), sleep=_no_sleep)
+    assert made == [{"client": "probes"}]

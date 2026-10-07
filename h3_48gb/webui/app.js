@@ -98,10 +98,17 @@ export function gpuBanner(gpu, nowMs) {
   }
   const own = Object.keys(d.own || {});
   if (own.length && !run) {
-    const names = own.map((n) => (n === "h3" ? "H3" : "ComfyUI")).join(", ");
+    // финальное ревью C3: у движка есть владелец; «панель» — воркер (и запись до владельцев)
+    const whose = (n) => {
+      const owner = (d.own[n] || {}).owner;
+      return owner && owner !== "panel-worker" ? ` (${owner})` : "";
+    };
+    const names = own.map((n) => (n === "h3" ? "H3" : "ComfyUI") + whose(n)).join(", ");
     const at = Date.parse(gpu.idle_release_at || "");
+    // I2: таймер — это отсчёт самого воркера; нет воркера — нет и автоосвобождения
     const when = Number.isFinite(at)
-      ? `через ${Math.max(0, Math.ceil((at - nowMs) / 60000))} мин или кнопкой` : "кнопкой";
+      ? `через ${Math.max(0, Math.ceil((at - nowMs) / 60000))} мин или кнопкой`
+      : (gpu.worker_alive === false ? "кнопкой (воркер не запущен)" : "кнопкой");
     // `gpu: null` + `gpu_error` — nvidia-smi на хосте недоступен: память не показываем, а
     // причину называем (иначе плашка падала на `d.gpu.memory_used_mb` и роняла весь опрос).
     const memory = d.gpu ? `, ${formatGb(d.gpu.memory_used_mb / 1024)}`

@@ -20,7 +20,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from h3_48gb.engines import sglang as sg
-from h3_48gb.engines.dispatcher_client import DispatcherClient
+from h3_48gb.engines.dispatcher_client import PROBES, DispatcherClient
 
 OUT_DIR = Path("/home/alex/Outputs/h3-panel/probes")
 BEACH_JOBS = Path("/home/alex/Projects/h3-bench/beach-jobs.json")
@@ -267,7 +267,8 @@ def main(argv=None, *, dispatcher=None, client=None, sleep=time.sleep, clock=tim
                 for name in args.names}
     run_args = {"steps": args.steps, "duration": args.duration,
                 "ref_size": "x".join(map(str, args.ref_size)), "together": args.together}
-    dispatcher = dispatcher if dispatcher is not None else DispatcherClient()
+    # "probes" owns what it raises: its `finally: release()` stops only that, never the panel's.
+    dispatcher = dispatcher if dispatcher is not None else DispatcherClient(client=PROBES)
     client = client if client is not None else sg.SglangClient(sg.DEFAULT_URL)
     out_path = OUT_DIR / f"{stem}.jsonl"
 

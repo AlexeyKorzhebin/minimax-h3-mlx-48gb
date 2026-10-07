@@ -17,14 +17,23 @@ LONG_TIMEOUT = 130.0
 STATUS_TIMEOUT = 10.0
 
 
+#: Who asks for the card (final review 2026-10-07, C3): the dispatcher stops on /release only the
+#: engines the same client acquired; "everything" is reserved for the human's button.
+PANEL_WORKER = "panel-worker"
+PANEL_WEB = "panel-web"
+PROBES = "probes"
+
+
 class DispatcherUnavailable(Exception):
     pass
 
 
 class DispatcherClient:
-    def __init__(self, base_url: str | None = None, timeout: float = LONG_TIMEOUT):
+    def __init__(self, base_url: str | None = None, timeout: float = LONG_TIMEOUT, *,
+                 client: str = PANEL_WORKER):
         self.base_url = (base_url or os.environ.get("H3_DISPATCHER_URL") or DEFAULT_URL).rstrip("/")
         self.timeout = timeout
+        self.client = client
 
     def _call(self, method: str, path: str, payload=None, *, timeout: float | None = None
               ) -> tuple[int, dict]:
@@ -55,10 +64,11 @@ class DispatcherClient:
         return self._ok("GET", "/status", timeout=min(self.timeout, STATUS_TIMEOUT))
 
     def acquire(self, engine: str) -> dict:
-        return self._ok("POST", "/acquire", {"engine": engine})
+        return self._ok("POST", "/acquire", {"engine": engine, "client": self.client})
 
-    def release(self) -> dict:
-        return self._ok("POST", "/release", {})
+    def release(self, everything: bool = False) -> dict:
+        """Stop this client's engines; `everything=True` only for "Освободить карту"."""
+        return self._ok("POST", "/release", {"client": self.client, "all": everything})
 
     def qwen_unload(self) -> tuple[int, dict]:
         return self._call("POST", "/qwen/unload", {})
