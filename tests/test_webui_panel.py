@@ -209,8 +209,7 @@ def test_project_tag_warnings_and_settings_html():
                           "{id: 'p1', i2v_prefix: 'Go <on>.'})));")
     assert settings == ('<div class="project-settings" data-id="p1"><label>Начало сцепленной сцены '
                         '(i2v_prefix) <textarea class="i2v-prefix" data-id="p1" rows="2">Go &lt;on&gt;.'
-                        '</textarea></label> <button type="button" class="draft-assembly" '
-                        'data-id="p1">Черновая сборка</button></div>')
+                        '</textarea></label></div>')   # Task 10: no assembly button here (Task 11)
 
 
 @_needs_node

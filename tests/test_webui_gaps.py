@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from h3_48gb import project as project_module
 from h3_48gb import web
 
 from test_web import _needs_node, _node_eval, _page_text
@@ -56,6 +57,13 @@ CLASS_SOURCES = [
     "app.sceneRefsHtml({refs: ['@hero']}, 1, ['@hero', '@arena'])",
     "app.tagHintHtml('fight @a', 8, [{tag: '@arena'}])",
     "app.scenarioJsonHtml('p1')",
+    "app.projectSettingsHtml({id: 'p1', i2v_prefix: '', seed: 3}, 'sglang', 'locked', 'seed')",
+    "app.projectRouteHtml({id: 'p1', route: [{stage: 'upscale', enabled: true}]}, 'sglang', 'locked')",
+    "app.retryPanelHtml({idx: 0, prompt: 'a', steps: null}, {id: 'p1', engine: 'sglang', "
+    "effectiveSeed: 42, cascade: [0]})",
+    "app.sceneCardHtml({idx: 0, prompt: 'x'.repeat(300), duration: 8, status: 'done', seed: 1, steps: 30, "
+    "clip_path: '/o/p/a.mp4', ltx_path: '/o/p/b.mp4'}, {projId: 'p1', outdir: '/o', deadMedia: new Set(), "
+    "engine: 'sglang', projectSeed: null})",
     "app.libraryCardsHtml([{tag: '@a', kind: 'person', version: 1, latest_version: 1, "
     "description: 'd', assets: ['/o/library/a/v1/01-a.png'], versions: [{version: 1}, {version: 2}]}], '/o')",
     "app.projectReferencesHtml({id: 'p1'}, [{tag: '@a', kind: 'person', version: 1, latest_version: 1, "
@@ -71,10 +79,13 @@ HOOK_CLASSES = {
     "ref-pin": "change handler of the reference checkbox",
     "lib-edit-desc": "read by saveLibraryDescription",
     "route-upscale-box": "change handler of the upscale tick",
-    "draft-assembly": "click handler (button look comes from .ghost)",
     "upscale-retry": "click handler (button look comes from .ghost)",
     "lib-save": "click handler",
     "scene-edit-prompt": "the scene prompt field (look comes from .inp)",
+    "project-seed": "the project seed field (look comes from .inp)",
+    "retry-prompt": "the retry prompt field (look comes from .inp)",
+    "retry-seed": "the retry seed field (look comes from .inp)",
+    "retry-steps": "the retry steps field (look comes from .inp)",
     "scenario-json-text": "the pasted JSON field (look comes from .inp)",
     "grid-hint": "address of the in-place update of the grid hint (look comes from .hint)",
 }
@@ -729,3 +740,211 @@ def test_refs_keep_the_saved_order_and_unknown_is_judged_by_the_project():
              '<label><input type="checkbox" data-scene-field="refs" data-idx="0" data-tag="@voice" checked> @voice</label> '
              '<span class="hint">их картинки идут первыми: &lt;Picture 1…&gt;</span></div>')
     assert _js("app.sceneRefsHtml({refs: ['@voice']}, 0, [], ['@voice'])") == voice
+
+
+@_needs_node
+def test_lock_texts_are_the_same_on_both_sides():
+    assert _js("app.PROJECT_LOCK_TEXT") == web.PROJECT_LOCK_TEXT
+
+
+@_needs_node
+def test_project_locks():
+    assert _js("app.projectLocks({}, null)") == {"references": None, "settings": None, "route": None}
+    assert _js("app.projectLocks({}, {kind: 'scene'})") == {
+        "references": web.PROJECT_LOCK_TEXT["references"],
+        "settings": web.PROJECT_LOCK_TEXT["settings"], "route": None}
+    assert _js("app.projectLocks({}, {kind: 'upscale'})")["route"] == web.PROJECT_LOCK_TEXT["route"]
+
+
+SG_JOB = ("{id: 'j1', args: ['generate', 'p', '--width', '896', '--height', '576', '--duration', "
+          "'5.166666666666667', '--steps', '50', '--seed', '305'], started_at: '2026-10-07T12:30:00Z', "
+          "estimate: {seconds: 540, source: 'history', samples: 3}, note: 'project scene p1 #2'}")
+
+
+@_needs_node
+def test_sglang_run_view_has_no_zeros():
+    now = "Date.parse('2026-10-07T12:33:10Z')"
+    assert _js(f"app.sglangRunView({SG_JOB}, {now})") == {
+        "spec": "896×576 · 5,17 с · сид 305 · 50 шагов", "elapsed": "3 мин", "total": "≈9 мин",
+        "share": 35, "leftSeconds": 350, "waiting": False}
+    late = "Date.parse('2026-10-07T12:45:00Z')"          # past the estimate: never 100 % while running
+    assert _js(f"app.sglangRunView({SG_JOB}, {late})")["share"] == 99
+    assert _js(f"app.sglangRunView({SG_JOB}, {late})")["leftSeconds"] == 0
+    chained = SG_JOB.replace("'--seed', '305']", "'--seed', '305', '--aspect', 'auto']")
+    assert _js(f"app.sglangRunView({chained}, {now})")["spec"] == "896×576 · 5,13 с · сид 305 · 50 шагов"
+    no_estimate = SG_JOB.replace("estimate: {seconds: 540, source: 'history', samples: 3}", "estimate: {}")
+    assert _js(f"app.sglangRunView({no_estimate}, {now})")["share"] == 0
+
+
+@_needs_node
+def test_project_settings_html():
+    proj = "{id: 'p1', i2v_prefix: 'Go.', seed: 305}"
+    lock = web.PROJECT_LOCK_TEXT["settings"]
+    assert _js(f"app.projectSettingsHtml({proj}, 'sglang', null, 'seed')") == (
+        '<div class="project-settings" data-id="p1">'
+        '<label>Начало сцепленной сцены (i2v_prefix) '
+        '<textarea class="i2v-prefix" data-id="p1" rows="2">Go.</textarea></label>'
+        '<label>Сид проекта <input class="inp num project-seed" type="number" min="0" data-id="p1" '
+        'value="305" placeholder="по умолчанию: 42"></label> '
+        '<button type="button" class="ghost" data-act="project-seed-save" data-id="p1">Сохранить сид</button>'
+        '<span class="saved-mark">сохранено ✓</span></div>')
+    assert _js(f"app.projectSettingsHtml({proj}, 'mlx', null, 'i2v_prefix')") == (
+        '<div class="project-settings" data-id="p1">'
+        '<label>Начало сцепленной сцены (i2v_prefix) '
+        '<textarea class="i2v-prefix" data-id="p1" rows="2">Go.</textarea></label>'
+        '<span class="saved-mark">сохранено ✓</span></div>')
+    assert _js(f"app.projectSettingsHtml({proj}, 'sglang', {json.dumps(lock)}, null)") == (
+        '<div class="project-settings" data-id="p1">'
+        '<label>Начало сцепленной сцены (i2v_prefix) '
+        '<textarea class="i2v-prefix" data-id="p1" rows="2" disabled>Go.</textarea></label>'
+        '<label>Сид проекта <input class="inp num project-seed" type="number" min="0" data-id="p1" '
+        'value="305" placeholder="по умолчанию: 42" disabled></label> '
+        '<button type="button" class="ghost" data-act="project-seed-save" data-id="p1" disabled>Сохранить сид</button>'
+        f'<p class="why lock-note">{lock}</p></div>')
+
+
+@_needs_node
+def test_route_html_with_a_lock():
+    proj = "{id: 'p1', route: [{stage: 'upscale', enabled: true}]}"
+    lock = web.PROJECT_LOCK_TEXT["route"]
+    assert _js(f"app.projectRouteHtml({proj}, 'sglang', {json.dumps(lock)})") == (
+        '<label class="route-upscale"><input type="checkbox" class="route-upscale-box" data-id="p1" '
+        'checked disabled> Апскейл LTX после всех сцен</label>'
+        f'<p class="why lock-note">{lock}</p>')
+
+
+@_needs_node
+def test_banner_names_what_the_card_is_doing_during_a_run():
+    gpu = {"ok": True, "dispatcher_error": None, "idle_release_at": None,
+           "dispatcher": {"own": {"h3": {"owner": "panel-worker"}}, "foreign": [],
+                          "qwen": {"running": False, "unloaded_by_us": False},
+                          "gpu": {"memory_used_mb": 41984, "memory_total_mb": 65536}},
+           "queue": {"pending": 1, "paused": False, "running": {
+               "id": "j1", "kind": "generate", "note": "project scene p1 #2",
+               "started_at": "2026-10-07T12:26:00Z", "wait_reason": None}}}
+    projects = [{"id": "p1", "title": "Бой"}]
+    assert _js(f"app.gpuBanner({json.dumps(gpu)}, Date.parse('2026-10-07T12:30:00Z'), "
+               f"{json.dumps(projects)})") == {
+        "visible": True, "tone": "own", "qwenUnload": False, "qwenRestore": False,
+        "text": "Карту держит панель: H3 считает «Бой», сцена #2 — 4 мин, 41,0 ГБ"}
+    gpu["dispatcher"]["own"] = {}
+    assert _js(f"app.gpuBanner({json.dumps(gpu)}, Date.parse('2026-10-07T12:30:00Z'), "
+               f"{json.dumps(projects)})")["text"] == "H3 поднимается для «Бой», сцена #2"
+
+
+@_needs_node
+def test_banner_run_notes():
+    def text(note, projects="[]"):
+        gpu = {"ok": True, "dispatcher_error": None, "idle_release_at": None,
+               "dispatcher": {"own": {"h3": {"owner": "panel-worker"}}, "foreign": [], "gpu": None,
+                              "qwen": {"running": False, "unloaded_by_us": False}},
+               "queue": {"pending": 0, "paused": False, "running": {
+                   "id": "j1", "note": note, "started_at": "2026-10-07T12:29:00Z", "wait_reason": None}}}
+        return _js(f"app.gpuBanner({json.dumps(gpu)}, Date.parse('2026-10-07T12:30:00Z'), {projects})")["text"]
+    titles = "[{id: 'p1', title: 'Бой'}]"
+    assert text("upscale project p1", titles) == "Карту держит панель: H3 считает апскейл «Бой» — 1 мин"
+    assert text("assemble project p1", titles) == "Карту держит панель: H3 считает сборка «Бой» — 1 мин"
+    assert text("project scene p9 #0") == "Карту держит панель: H3 считает «p9», сцена #0 — 1 мин"
+    assert text("some other job") == "Карту держит панель: H3 считает some other job — 1 мин"
+
+
+@_needs_node
+def test_retry_cascade_matches_invalidate_scene_chain(tmp_path):
+    flags = [False, False, True, False, False, True]
+    scenes = [{"idx": i, "prompt": "x", "duration": 8.0, "status": "done", "job_id": None,
+               "clip_path": f"/c{i}.mp4", "keyframe_path": None, "fresh_start": f}
+              for i, f in enumerate(flags)]
+    for idx in range(len(flags)):
+        proj = project_module.create_project(tmp_path / str(idx), "video", "T")
+        proj.scenes = [dict(s) for s in scenes]
+        proj.save()
+        reset = [s["idx"] for s in project_module.load_project(proj.path)
+                 .invalidate_scene_chain(idx).scenes if s["status"] == "pending"]
+        assert _js(f"app.retryCascade({json.dumps(scenes)}, {idx})") == reset
+    assert _js(f"app.retryCascade({json.dumps(scenes)}, 0)") == [0, 1]
+
+
+@_needs_node
+def test_retry_body_sends_only_changes():
+    scene = "{prompt: '@a walks', seed: 305, steps: null}"
+    assert _js(f"app.retryBody({scene}, {{prompt: '@a walks', seed: '', steps: ''}})") == {}
+    assert _js(f"app.retryBody({scene}, {{prompt: '@a jumps', seed: '7', steps: '30'}})") == {
+        "prompt": "@a jumps", "seed": 7, "steps": 30}
+    assert _js(f"app.retryBody({scene}, {{prompt: '@a walks', seed: '305', steps: ''}})") == {}
+
+
+@_needs_node
+def test_scene_card_html():
+    ctx = "{projId: 'p1', outdir: '/o', deadMedia: new Set(), engine: 'sglang', projectSeed: null}"
+    pending = "{idx: 1, prompt: '@a runs', duration: 5.125, status: 'pending', clip_path: null}"
+    assert _js(f"app.sceneCardHtml({pending}, {ctx})") == (
+        '<div class="scene-card"><div class="frame"></div><div class="info"><div class="row1">'
+        '<span class="m wait" aria-hidden="true"></span><span class="idx">#1</span>'
+        '<span class="sdur">5 с</span></div><div class="prompt">@a runs</div>'
+        '<div class="scene-params mono">сид 42 · 50 шагов</div><div class="acts"></div></div></div>')
+    done = ("{idx: 0, prompt: 'x'.repeat(300), duration: 8, status: 'done', seed: 305, steps: 30, "
+            "clip_path: '/o/projects/p1/scenes/a.mp4', ltx_path: '/o/projects/p1/scenes/a-ltx.mp4'}")
+    clip = "/media/projects/p1/scenes/a.mp4"
+    assert _js(f"app.sceneCardHtml({done}, {ctx})") == (
+        f'<div class="scene-card"><div class="frame"><video src="{clip}" preload="metadata" controls '
+        f'data-media-url="{clip}"></video></div><div class="info"><div class="row1">'
+        '<span class="m done" aria-hidden="true"></span><span class="idx">#0</span>'
+        '<span class="sdur">8 с</span></div>'
+        f'<details class="scene-prompt"><summary>{"x" * 260}…</summary>{"x" * 300}</details>'
+        '<div class="scene-params mono">сид 305 · 30 шагов</div><div class="acts">'
+        '<a class="clip" href="/media/projects/p1/scenes/a-ltx.mp4" target="_blank" rel="noopener">LTX</a>'
+        '<button type="button" data-act="retry-scene" data-id="p1" data-idx="0">Пересчитать сцену</button>'
+        '</div></div></div>')
+    failed = "{idx: 2, prompt: 'p', duration: 3, status: 'failed', error: 'boom', clip_path: null}"
+    mlx = ctx.replace("'sglang'", "'mlx'")
+    assert _js(f"app.sceneCardHtml({failed}, {mlx})") == (
+        '<div class="scene-card"><div class="frame"></div><div class="info"><div class="row1">'
+        '<span class="m fail" aria-hidden="true"></span><span class="idx">#2</span>'
+        '<span class="sdur">3 с</span></div><div class="prompt">p</div>'
+        '<div class="scene-error why">boom</div><div class="acts">'
+        '<button type="button" data-act="retry-scene" data-id="p1" data-idx="2">Пересчитать сцену</button>'
+        '</div></div></div>')
+
+
+@_needs_node
+def test_retry_panel_html():
+    scene = "{idx: 0, prompt: '@a <b>', steps: null}"
+    tail = ('<p class="hint">Пересчитает сцены #0, #1</p>'
+            '<button type="button" class="inverse" data-act="retry-scene-go" data-id="p1" data-idx="0">Пересчитать</button>'
+            '<button type="button" class="ghost" data-act="retry-scene-cancel" data-idx="0">Отмена</button></div>')
+    assert _js(f"app.retryPanelHtml({scene}, {{id: 'p1', engine: 'sglang', effectiveSeed: 305, cascade: [0, 1]}})") == (
+        '<div class="retry-panel" data-idx="0"><textarea class="inp retry-prompt" rows="4">@a &lt;b&gt;</textarea>'
+        '<div class="scene-edit-row"><label>Сид <input class="inp num retry-seed" type="number" min="0" '
+        'value="" placeholder="сейчас: 305"></label>'
+        '<button type="button" class="ghost" data-act="retry-seed-random" data-idx="0">новый случайный</button>'
+        '<label>Шаги <input class="inp num retry-steps" type="number" min="2" max="100" value="" '
+        'placeholder="сейчас: 50"></label></div>' + tail)
+    assert _js(f"app.retryPanelHtml({scene}, {{id: 'p1', engine: 'mlx', effectiveSeed: 42, cascade: [0, 1]}})") == (
+        '<div class="retry-panel" data-idx="0"><textarea class="inp retry-prompt" rows="4">@a &lt;b&gt;</textarea>'
+        + tail)
+
+
+RUN_EXPECTED = {
+    "retry_with_new_seed": {"opened": True, "confirms": [],
+                            "posts": [["/api/projects/p1/scenes/0/retry", {"seed": 7}]]},
+    "locked_while_a_scene_runs": {"settings": True, "refs": True, "route": True},
+    "locked_route_during_upscale": {"route": True},
+    "settings_saved_mark": {"puts": [["/api/projects/p1/settings", {"i2v_prefix": "Go on."}]],
+                            "mark": True},
+    "seed_saved": {"puts": [["/api/projects/p1/settings", {"seed": 305}]], "mark": True},
+    "seed_cleared": {"puts": [["/api/projects/p1/settings", {"seed": None}]]},
+    "retry_panel_keeps_typing": {"prompt": "@a walks far", "seed": "9"},
+}
+
+
+@_needs_node
+@pytest.mark.parametrize("scenario", sorted(RUN_EXPECTED))
+def test_run_wiring(scenario):
+    assert _gaps(scenario) == RUN_EXPECTED[scenario]
+
+
+@_needs_node
+def test_retry_panel_names_a_single_scene():
+    assert '<p class="hint">Пересчитает сцену #5</p>' in _js(
+        "app.retryPanelHtml({idx: 5, prompt: 'p', steps: null}, {id: 'p1', engine: 'mlx', "
+        "effectiveSeed: 42, cascade: [5]})")

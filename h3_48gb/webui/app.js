@@ -70,7 +70,7 @@ export function formatGb(x) {
 }
 
 /** Плашка GPU (спека §3.3.13–14): что сказать сверху на любой вкладке. */
-export function gpuBanner(gpu, nowMs) {
+export function gpuBanner(gpu, nowMs, projects = []) {
   const hidden = { visible: false, text: "", tone: "", qwenUnload: false, qwenRestore: false };
   if (!gpu || !gpu.ok) return hidden;
   const d = gpu.dispatcher;
@@ -97,6 +97,18 @@ export function gpuBanner(gpu, nowMs) {
                + (holders ? ` — карту держит ${holders}` : "") };
   }
   const own = Object.keys(d.own || {});
+  if (run) {
+    const since = Date.parse(run.started_at);
+    const took = formatDuration(Number.isFinite(since) ? Math.max(0, (nowMs - since) / 1000) : 0);
+    const what = runWhat(run.note, projects);
+    if (!own.length) {
+      return { visible: true, tone: "own", qwenUnload: false, qwenRestore,
+               text: `H3 поднимается для ${what}` };
+    }
+    const memory = d.gpu ? `, ${formatGb(d.gpu.memory_used_mb / 1024)}` : "";
+    return { visible: true, tone: "own", qwenUnload: false, qwenRestore,
+             text: `Карту держит панель: H3 считает ${what} — ${took}${memory}` };
+  }
   if (own.length && !run) {
     // финальное ревью C3: у движка есть владелец; «панель» — воркер (и запись до владельцев)
     const whose = (n) => {
@@ -118,6 +130,45 @@ export function gpuBanner(gpu, nowMs) {
   }
   return { ...hidden, visible: qwenRestore, qwenRestore,
            text: qwenRestore ? "Qwen выгружен панелью — его можно вернуть" : "" };
+}
+
+/** «Что считается» по `job.note`: сцена, апскейл и сборка проекта называются его названием. */
+function runWhat(note, projects) {
+  const title = (id) => {
+    const found = (projects || []).find((p) => p.id === id);
+    return found && found.title ? found.title : id;
+  };
+  const text = String(note || "");
+  let m = text.match(/^project scene (\S+) #(\d+)$/);
+  if (m) return `«${title(m[1])}», сцена #${m[2]}`;
+  m = text.match(/^upscale project (\S+)$/);
+  if (m) return `апскейл «${title(m[1])}»`;
+  m = text.match(/^assemble project (\S+)$/);
+  if (m) return `сборка «${title(m[1])}»`;
+  return text;
+}
+
+/** Цифры прогона на sglang из аргументов и оценки задачи: проходов нет, есть время и доля. */
+export function sglangRunView(job, nowMs) {
+  const args = job.args || [];
+  const pick = (flag) => argValue(args, flag);
+  const chained = pick("--aspect") === "auto";
+  const requested = Number(pick("--duration"));
+  // a chained scene delivers one frame less than it requests (the repeated keyframe)
+  const delivered = chained ? (Math.round(requested * 24) - 1) / 24 : requested;
+  const parts = [`${pick("--width")}×${pick("--height")}`];
+  if (Number.isFinite(delivered)) parts.push(secondsText(delivered));
+  if (pick("--seed") !== null && pick("--seed") !== undefined) parts.push(`сид ${pick("--seed")}`);
+  if (pick("--steps")) parts.push(`${pick("--steps")} шагов`);
+  const since = Date.parse(job.started_at);
+  const passed = Number.isFinite(since) ? Math.max(0, (nowMs - since) / 1000) : 0;
+  const estimate = jobSeconds(job);
+  return {
+    spec: parts.join(" · "), elapsed: formatDuration(passed),
+    total: `≈${formatDuration(estimate)}`,
+    share: estimate ? Math.min(99, Math.floor((100 * passed) / estimate)) : 0,
+    leftSeconds: Math.max(0, estimate - passed), waiting: Boolean(job.wait_reason),
+  };
 }
 
 const WAIT_NOTIFY_AFTER_MS = 10 * 60_000;
@@ -212,12 +263,43 @@ export function projectTagWarningsHtml(proj, engine) {
   return rows.length ? `<ul class="tag-warnings">${rows.join("")}</ul>` : "";
 }
 
-export function projectSettingsHtml(proj) {
+/** Те же три строки, что `web.PROJECT_LOCK_TEXT` (сервер отказывает ими же, `project_running`). */
+export const PROJECT_LOCK_TEXT = {
+  references: "Проект считается — референсы меняются после конца прогона. Чтобы поменять "
+    + "для части сцен: дождитесь конца и пересчитайте с нужной сцены.",
+  settings: "Проект считается — начало сцепленной сцены и сид меняются после конца прогона. "
+    + "Чтобы поменять для части сцен: дождитесь конца и пересчитайте с нужной сцены.",
+  route: "Идёт апскейл или сборка — галочку апскейла можно поменять после них.",
+};
+
+/** Почему правка проекта сейчас закрыта: текст или `null`. Референсы и настройки — пока идёт
+ *  любая задача проекта, галочка апскейла — только пока идут апскейл или сборка. */
+export function projectLocks(proj, activeJob) {
+  const busy = Boolean(activeJob);
+  return {
+    references: busy ? PROJECT_LOCK_TEXT.references : null,
+    settings: busy ? PROJECT_LOCK_TEXT.settings : null,
+    route: activeJob && (activeJob.kind === "upscale" || activeJob.kind === "assembly")
+      ? PROJECT_LOCK_TEXT.route : null,
+  };
+}
+
+/** `saved` — поле, сохранённое последним (`"i2v_prefix"`/`"seed"`): рядом с ним «сохранено ✓». */
+export function projectSettingsHtml(proj, engine, lock = null, saved = null) {
   const id = escapeHtml(proj.id);
+  const off = lock ? " disabled" : "";
+  const mark = (field) => (saved === field ? `<span class="saved-mark">сохранено ✓</span>` : "");
+  const sglang = engine === "sglang";
   return `<div class="project-settings" data-id="${id}"><label>Начало сцепленной сцены `
-    + `(i2v_prefix) <textarea class="i2v-prefix" data-id="${id}" rows="2">`
-    + `${escapeHtml(proj.i2v_prefix || "")}</textarea></label> `
-    + `<button type="button" class="draft-assembly" data-id="${id}">Черновая сборка</button></div>`;
+    + `(i2v_prefix) <textarea class="i2v-prefix" data-id="${id}" rows="2"${off}>`
+    + `${escapeHtml(proj.i2v_prefix || "")}</textarea></label>${mark("i2v_prefix")}`
+    + (sglang
+      ? `<label>Сид проекта <input class="inp num project-seed" type="number" min="0" data-id="${id}" `
+        + `value="${proj.seed === null || proj.seed === undefined ? "" : escapeHtml(proj.seed)}" `
+        + `placeholder="по умолчанию: 42"${off}></label> `
+        + `<button type="button" class="ghost" data-act="project-seed-save" data-id="${id}"${off}>`
+        + `Сохранить сид</button>${mark("seed")}` : "")
+    + (lock ? `<p class="why lock-note">${escapeHtml(lock)}</p>` : "") + `</div>`;
 }
 
 /* -- редактор сцен видеопроекта (Task 7) ---------------------------------------------------
@@ -254,9 +336,12 @@ export function sglangGridSeconds(duration, chained) {
 }
 
 /** `5.1666…` → «на сетке: 5,17 с»; целые без хвоста: `8` → «на сетке: 8 с». */
+function secondsText(seconds) {
+  return `${Number(seconds).toFixed(2).replace(/\.?0+$/, "").replace(".", ",")} с`;
+}
+
 export function gridHint(seconds) {
-  const text = Number(seconds).toFixed(2).replace(/\.?0+$/, "").replace(".", ",");
-  return `на сетке: ${text} с`;
+  return `на сетке: ${secondsText(seconds)}`;
 }
 
 export function draftFromScenes(scenes) {
@@ -517,6 +602,83 @@ export function scenarioJsonHtml(id, text = "") {
     + `Загрузить сценарий</button></details>`;
 }
 
+/** Карточка сцены: кадр/клип, промпт целиком (длинный — под `<details>`), сид и шаги на sglang,
+ *  ошибка, ссылка на LTX и «Пересчитать сцену» у снятой (или упавшей) сцены. */
+export function sceneCardHtml(scene, ctx) {
+  const mark = { pending: "wait", running: "run", done: "done", failed: "fail" }[scene.status] || "wait";
+  const clipUrl = scene.clip_path ? projectMediaUrl(scene.clip_path, ctx.outdir) : null;
+  // the same dead-media placeholder the finished list draws: without it a deleted clip's <video>
+  // would hit its 404 again on every redraw
+  const frame = clipUrl
+    ? (ctx.deadMedia && ctx.deadMedia.has(clipUrl)
+        ? `<div class="frame">${deadMediaPlaceholderHtml("клип удалён")}</div>`
+        : `<div class="frame"><video src="${escapeHtml(clipUrl)}" preload="metadata" controls `
+          + `data-media-url="${escapeHtml(clipUrl)}"></video></div>`)
+    : `<div class="frame"></div>`;
+  const text = String(scene.prompt || "");
+  const prompt = text.length > 260
+    ? `<details class="scene-prompt"><summary>${escapeHtml(text.slice(0, 260))}…</summary>`
+      + `${escapeHtml(text)}</details>`
+    : `<div class="prompt">${escapeHtml(text)}</div>`;
+  const params = ctx.engine === "sglang"
+    ? `<div class="scene-params mono">сид ${escapeHtml(scene.seed ?? ctx.projectSeed ?? 42)} · `
+      + `${escapeHtml(scene.steps ?? 50)} шагов</div>` : "";
+  const ltxUrl = scene.ltx_path ? projectMediaUrl(scene.ltx_path, ctx.outdir) : null;
+  const ltx = ltxUrl ? `<a class="clip" href="${escapeHtml(ltxUrl)}" target="_blank" rel="noopener">LTX</a>` : "";
+  const retry = scene.status === "done" || scene.status === "failed"
+    ? `<button type="button" data-act="retry-scene" data-id="${escapeHtml(ctx.projId)}" `
+      + `data-idx="${scene.idx}">Пересчитать сцену</button>` : "";
+  return `<div class="scene-card">${frame}<div class="info"><div class="row1">`
+    + `<span class="m ${mark}" aria-hidden="true"></span><span class="idx">#${scene.idx}</span>`
+    + `<span class="sdur">${formatFine(scene.duration)}</span></div>`
+    + prompt + params + sceneErrorHtml(scene) + `<div class="acts">${ltx}${retry}</div></div></div>`;
+}
+
+/** Какие сцены сбросит пересъёмка `idx`: она сама и следующие до первой `fresh_start`
+ *  (зеркало `Project.invalidate_scene_chain`). */
+export function retryCascade(scenes, idx) {
+  const out = [];
+  for (const scene of scenes.slice().sort((a, b) => a.idx - b.idx)) {
+    if (scene.idx < idx) continue;
+    if (scene.idx > idx && scene.fresh_start) break;
+    out.push(scene.idx);
+  }
+  return out;
+}
+
+/** Тело `POST …/scenes/<idx>/retry`: только то, что человек поменял (пустое поле — не менять). */
+export function retryBody(scene, edits) {
+  const body = {};
+  if (typeof edits.prompt === "string" && edits.prompt !== scene.prompt) body.prompt = edits.prompt;
+  for (const field of ["seed", "steps"]) {
+    const raw = edits[field];
+    if (raw === undefined || raw === null || String(raw).trim() === "") continue;
+    const value = Number(raw);
+    if (Number.isFinite(value) && value !== scene[field]) body[field] = value;
+  }
+  return body;
+}
+
+/** Панель пересъёмки под карточкой: промпт целиком, сид и шаги (sglang), что пересчитается. */
+export function retryPanelHtml(scene, ctx) {
+  const e = ctx.edits || {};
+  const idx = scene.idx;
+  const sglang = ctx.engine === "sglang";
+  const row = sglang
+    ? `<div class="scene-edit-row"><label>Сид <input class="inp num retry-seed" type="number" min="0" `
+      + `value="${escapeHtml(e.seed ?? "")}" placeholder="сейчас: ${escapeHtml(ctx.effectiveSeed)}"></label>`
+      + `<button type="button" class="ghost" data-act="retry-seed-random" data-idx="${idx}">новый случайный</button>`
+      + `<label>Шаги <input class="inp num retry-steps" type="number" min="2" max="100" `
+      + `value="${escapeHtml(e.steps ?? "")}" placeholder="сейчас: ${escapeHtml(scene.steps ?? 50)}"></label></div>`
+    : "";
+  const list = ctx.cascade.map((n) => `#${n}`).join(", ");
+  return `<div class="retry-panel" data-idx="${idx}">`
+    + `<textarea class="inp retry-prompt" rows="4">${escapeHtml(e.prompt ?? scene.prompt)}</textarea>${row}`
+    + `<p class="hint">Пересчитает ${ctx.cascade.length === 1 ? "сцену" : "сцены"} ${escapeHtml(list)}</p>`
+    + `<button type="button" class="inverse" data-act="retry-scene-go" data-id="${escapeHtml(ctx.id)}" data-idx="${idx}">Пересчитать</button>`
+    + `<button type="button" class="ghost" data-act="retry-scene-cancel" data-idx="${idx}">Отмена</button></div>`;
+}
+
 /** Подсказка на `@`: карточки, чей тег начинается с набранного после последнего `@` до каретки. */
 export function tagSuggestions(text, caret, cards) {
   const head = String(text || "").slice(0, caret);
@@ -525,13 +687,14 @@ export function tagSuggestions(text, caret, cards) {
   return cards.filter((card) => card.tag.startsWith(`@${match[1]}`));
 }
 
-export function projectRouteHtml(proj, engine) {
+export function projectRouteHtml(proj, engine, lock = null) {
   if (engine !== "sglang") return "";   // апскейл LTX живёт только на alex-neuro
   const entry = (proj.route || []).find((e) => e.stage === "upscale");
   if (!entry) return "";
   return `<label class="route-upscale"><input type="checkbox" class="route-upscale-box" `
-    + `data-id="${escapeHtml(proj.id)}"${entry.enabled ? " checked" : ""}> `
-    + `Апскейл LTX после всех сцен</label>`;
+    + `data-id="${escapeHtml(proj.id)}"${entry.enabled ? " checked" : ""}${lock ? " disabled" : ""}> `
+    + `Апскейл LTX после всех сцен</label>`
+    + (lock ? `<p class="why lock-note">${escapeHtml(lock)}</p>` : "");
 }
 
 export function projectReferencesHtml(proj, cards, pinned, lock = null) {
@@ -2887,6 +3050,9 @@ function startPage() {
   let sceneDraftDirty = false;  // the person changed something the server has not seen
   let draftEpoch = 0;           // version of the draft the editor DOM was drawn from
   let scenarioJsonText = "";     // what is typed in «Вставить сценарий JSON»: survives redraws
+  let retryOpen = null;        // idx of the scene whose retry panel is open
+  let retryEdits = null;       // what is typed in it, kept across redraws
+  let settingsSaved = null;    // which project setting was saved last: "i2v_prefix" | "seed"
   let sceneDraftError = null;   // {idx, message} of the last client-side refusal, shown by that scene
   let draftResetPending = false; // the next project read (opening the panel) replaces the draft with the server's scenes
   let projectBusy = false;     // идёт запрос, меняющий проект — та же роль, что `busy` у очереди
@@ -3022,7 +3188,7 @@ function startPage() {
 
   function renderGpu() {
     const sglang = Boolean(state && state.engine === "sglang");
-    const banner = gpuBanner(gpu, Date.now());
+    const banner = gpuBanner(gpu, Date.now(), (state && state.projects) || []);
     $("gpu-banner").hidden = !banner.visible;
     $("gpu-banner").textContent = banner.text;
     $("gpu-banner").title = banner.text;
@@ -3306,6 +3472,9 @@ function startPage() {
     project = { id, project: null, active_job: null };
     draftResetPending = true;
     scenarioJsonText = "";
+    retryOpen = null;
+    retryEdits = null;
+    settingsSaved = null;
     projectMp3 = null;
     scenarioProviderChoice = null;
     scenarioProviderTest = null;
@@ -3366,6 +3535,8 @@ function startPage() {
 
   function closeProjectModal() {
     project = null;
+    retryOpen = null;
+    retryEdits = null;
     scenarioJsonText = "";
     sceneDraft = null;
     sceneDraftDirty = false;
@@ -3373,8 +3544,18 @@ function startPage() {
     $("project-modal").hidden = true;
   }
 
+  /** The open retry panel's fields -> `retryEdits`, so a redraw does not eat what is typed. */
+  function snapshotRetryEdits() {
+    if (retryOpen === null) return;
+    const panel = document.querySelector(`#project-body .retry-panel[data-idx="${retryOpen}"]`);
+    if (!panel) return;
+    const read = (sel) => { const el = panel.querySelector(sel); return el ? el.value : undefined; };
+    retryEdits = { prompt: read(".retry-prompt"), seed: read(".retry-seed"), steps: read(".retry-steps") };
+  }
+
   function renderProjectModal() {
     syncDraftFromDom();
+    snapshotRetryEdits();
     if (!project || !project.project) return;
     const proj = project.project;
     $("project-title").textContent = proj.title || proj.id;
@@ -3383,12 +3564,15 @@ function startPage() {
     const seconds = projectEstimateSeconds(proj, jobs);
     $("project-estimate").textContent = seconds ? `≈${formatDuration(seconds)}` : "";
     const outdir = state && state.outdir;
+    const locks = projectLocks(proj, project.active_job);
     $("project-body").innerHTML = projectScriptStageHtml(proj)
       + projectTrackStageHtml(proj, project.active_job, outdir)
       + projectScenarioStageHtml(proj, projectBusy)
-      + projectTagWarningsHtml(proj, state && state.engine) + projectSettingsHtml(proj)
-      + projectRouteHtml(proj, state && state.engine) + projectUpscaleHtml(proj, state && state.engine)
-      + projectReferencesHtml(proj, libraryCards, proj.references || [], null)
+      + projectTagWarningsHtml(proj, state && state.engine)
+      + projectSettingsHtml(proj, state && state.engine, locks.settings, settingsSaved)
+      + projectRouteHtml(proj, state && state.engine, locks.route)
+      + projectUpscaleHtml(proj, state && state.engine)
+      + projectReferencesHtml(proj, libraryCards, proj.references || [], locks.references)
       + projectScenesStageHtml(proj, outdir)
       + projectAssemblyStageHtml(proj, outdir);
   }
@@ -3895,35 +4079,6 @@ function startPage() {
     return pendingScenarioSave;
   }
 
-  function projectSceneCardHtml(scene, projId, outdir, deadMedia) {
-    const mark = { pending: "wait", running: "run", done: "done", failed: "fail" }[scene.status]
-      || "wait";
-    const clipUrl = scene.clip_path ? projectMediaUrl(scene.clip_path, outdir) : null;
-    // Находка 1 (живой проход 2026-08-24): та же заглушка, что `finishedRowHtml` теперь рисует
-    // для очереди «Готово» -- один и тот же `deadMediaUrls`, потому что и тут, и там разметка
-    // пересобирается заново на каждый опрос/refresh, и без заглушки `<video>` бил бы тот же 404
-    // по кругу, только реже (панель проекта перечитывается по действию, не по таймеру).
-    const frame = clipUrl
-      ? (deadMedia && deadMedia.has(clipUrl)
-          ? `<div class="frame">${deadMediaPlaceholderHtml("клип удалён")}</div>`
-          : `<div class="frame"><video src="${escapeHtml(clipUrl)}" preload="metadata" controls `
-            + `data-media-url="${escapeHtml(clipUrl)}"></video></div>`)
-      : `<div class="frame"></div>`;
-    const promptText = String(scene.prompt || "").slice(0, 260);
-    return `<div class="scene-card">${frame}`
-      + `<div class="info">`
-      + `<div class="row1">`
-      + `<span class="m ${mark}" aria-hidden="true"></span>`
-      + `<span class="idx">#${scene.idx}</span>`
-      + `<span class="sdur">${formatFine(scene.duration)}</span>`
-      + `</div>`
-      + `<div class="prompt">${escapeHtml(promptText)}</div>`
-      + sceneErrorHtml(scene)
-      + `<div class="acts"><button type="button" data-act="retry-scene" `
-      + `data-id="${escapeHtml(projId)}" data-idx="${scene.idx}">пересчитать</button></div>`
-      + `</div></div>`;
-  }
-
   /** «N/M готово» плюс, если что-то сейчас в работе, «, считается K-я» -- тот самый счётчик,
    *  который должен читаться и без раскрытия блока (task 10): человека, заглянувшего в проект,
    *  интересует прежде всего «где мы сейчас», а не готова ли сцена посмотреть карточками. */
@@ -3947,9 +4102,13 @@ function startPage() {
     if (proj.kind === "song" || !proj.scenes.length) return "";
     const total = proj.scenes.length;
     const cards = proj.scenes.slice().sort((a, b) => a.idx - b.idx)
-      .map((scene) => projectSceneCardHtml(scene, proj.id, outdir, deadMediaUrls)).join("");
+      .map((scene) => sceneCardHtml(scene, { projId: proj.id, outdir, deadMedia: deadMediaUrls,
+          engine: state && state.engine, projectSeed: proj.seed ?? null })
+        + (retryOpen === scene.idx ? retryPanelHtml(scene, { id: proj.id, engine: state && state.engine,
+          effectiveSeed: scene.seed ?? proj.seed ?? 42, cascade: retryCascade(proj.scenes, scene.idx),
+          edits: retryEdits }) : "")).join("");
     return `<div class="proj-stage">`
-      + `<details class="adv proj-scenes-block">`
+      + `<details class="adv proj-scenes-block"${retryOpen !== null ? " open" : ""}>`
       + `<summary class="proj-stage-head"><span class="t">Сцены (${total})</span>`
       + `<span class="proj-stage-status">${escapeHtml(projectScenesStatusText(proj))}</span>`
       + `</summary>`
@@ -4084,6 +4243,37 @@ function startPage() {
       rail.textContent = "Прогон не ведётся: некому его вести";
       steps.innerHTML = "";
       return { left: 0 };
+    }
+
+    if (state.engine === "sglang") {
+      // no denoising passes to count on sglang: elapsed time, the estimate and a share of it
+      const view = sglangRunView(job, now.getTime());
+      const cell = (k, v, cls = "") => `<div><span class="k">${k}</span><span class="v${cls}">${v}</span></div>`;
+      box.className = "running sglang-run";
+      box.innerHTML = [
+        `<div class="run-body">`,
+        `<div class="run-line1"><span class="m run" aria-hidden="true"></span>`,
+        `<span class="run-name">${escapeHtml(jobTag(job))}</span>`,
+        `<span class="run-spec">${escapeHtml(view.spec)}</span></div>`,
+        `<div class="run-num">`,
+        cell("Идёт", escapeHtml(view.elapsed)),
+        cell("Оценка", escapeHtml(view.total)),
+        view.waiting ? cell("Доля", "ждёт карту", " run-wait") : cell("Доля", `${view.share} %`),
+        cell("Кончится", formatClock(new Date(now.getTime() + view.leftSeconds * 1000))),
+        `</div>`,
+        `<div class="run-foot">старт <span class="num">`
+          + `${job.started_at ? formatClock(new Date(job.started_at)) : "—"}</span> · `,
+        `<span class="mono">${escapeHtml(job.id)}</span> · `,
+        `<span class="run-note">${escapeHtml(job.note)}</span>`,
+        runCancelHtml(job, state.engine),
+        `</div></div>`,
+      ].join("");
+      rail.className = "rail-run";
+      rail.innerHTML = `<span class="run-tag">${escapeHtml(jobTag(job))}</span>`
+        + `<span class="run-share">${view.waiting ? "ждёт карту" : `${view.share} %`}</span>`
+        + `<span class="run-left">осталось <b>${formatDuration(view.leftSeconds)}</b></span>`;
+      steps.innerHTML = "";
+      return { left: view.leftSeconds };
     }
 
     const run = runForJob(job, state.runs);
@@ -5552,25 +5742,55 @@ function startPage() {
       return;
     }
     if (button.dataset.act === "retry-scene") {
-      const idx = button.dataset.idx;
-      if (!window.confirm(`Пересчитать сцену ${idx}? Эта и все следующие сцены будут `
-                          + `инвалидированы и пересчитаны заново.`)) return;
-      // `deadMediaUrls`'s own docstring: ретрай инвалидирует эту сцену И все следующие
-      // (подтверждение выше называет это прямо) — снимаем пометку с клипов всех их, не только
-      // retried-сцены, иначе новый файл следующей сцены останется под старой заглушкой до
-      // ручного переоткрытия карточки.
-      if (project && project.project) {
-        const outdir = state && state.outdir;
-        const n = Number(idx);
-        (project.project.scenes || []).forEach((scene) => {
-          if (scene.idx >= n && scene.clip_path) {
-            const url = projectMediaUrl(scene.clip_path, outdir);
-            if (url) deadMediaUrls.delete(url);
-          }
-        });
-      }
+      // opens the panel (prompt, seed, steps); the cascade it names is what the server resets
+      retryOpen = Number(button.dataset.idx);
+      retryEdits = null;
+      renderProjectModal();
+      return;
+    }
+    if (button.dataset.act === "retry-scene-cancel") { retryOpen = null; retryEdits = null; renderProjectModal(); return; }
+    if (button.dataset.act === "retry-seed-random") {
+      const field = document.querySelector(
+        `#project-body .retry-panel[data-idx="${Number(button.dataset.idx)}"] .retry-seed`);
+      if (field) field.value = String(randomSeed());
+      return;
+    }
+    if (button.dataset.act === "retry-scene-go") {
+      const idx = Number(button.dataset.idx);
+      const panel = document.querySelector(`#project-body .retry-panel[data-idx="${idx}"]`);
+      const read = (sel) => { const el = panel && panel.querySelector(sel); return el ? el.value : undefined; };
+      const scenes = (project && project.project && project.project.scenes) || [];
+      const scene = scenes.find((item) => item.idx === idx) || { prompt: "" };
+      const body = retryBody(scene, { prompt: read(".retry-prompt"), seed: read(".retry-seed"),
+                                      steps: read(".retry-steps") });
+      // `deadMediaUrls`: the retry resets this scene and the chained ones after it -- their
+      // clips get new files, so the dead-clip marks come off all of them
+      const outdir = state && state.outdir;
+      scenes.forEach((item) => {
+        if (item.idx >= idx && item.clip_path) {
+          const url = projectMediaUrl(item.clip_path, outdir);
+          if (url) deadMediaUrls.delete(url);
+        }
+      });
+      retryOpen = null;
+      retryEdits = null;
       withProject(() => api(
-        "POST", `/api/projects/${encodeURIComponent(id)}/scenes/${encodeURIComponent(idx)}/retry`, {}));
+        "POST", `/api/projects/${encodeURIComponent(id)}/scenes/${encodeURIComponent(idx)}/retry`, body));
+      return;
+    }
+    if (button.dataset.act === "project-seed-save") {
+      const field = document.querySelector("#project-body .project-seed");
+      const raw = field ? String(field.value).trim() : "";
+      const seed = raw === "" ? null : Number(raw);
+      if (seed !== null && !(Number.isInteger(seed) && seed >= 0)) {
+        showProjectError({ error: { clientTitle: "Сид не сохранён", message: "Сид — целое число от 0" } });
+        return;
+      }
+      withProject(async () => {
+        settingsSaved = null;
+        await api("PUT", `/api/projects/${encodeURIComponent(id)}/settings`, { seed });
+        settingsSaved = "seed";
+      });
       return;
     }
     if (button.dataset.act === "retry-assembly") {
@@ -5604,8 +5824,12 @@ function startPage() {
     const field = event.target.closest(".i2v-prefix");
     if (!field || !project || !project.project) return;
     if (field.value === (project.project.i2v_prefix || "")) return;
-    withProject(() => api("PUT", `/api/projects/${encodeURIComponent(field.dataset.id)}/settings`,
-                          { i2v_prefix: field.value }));
+    withProject(async () => {
+      settingsSaved = null;
+      await api("PUT", `/api/projects/${encodeURIComponent(field.dataset.id)}/settings`,
+                { i2v_prefix: field.value });
+      settingsSaved = "i2v_prefix";
+    });
   });
 
   document.addEventListener("click", (event) => {

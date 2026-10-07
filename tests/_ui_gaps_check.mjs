@@ -39,6 +39,28 @@ const writes = () => calls.filter((c) => c.method !== "GET").map((c) => [c.metho
 const draftRoutes = (extra = {}) => ({ "GET /api/projects/p1": ok(DRAFT_PROJECT),
   "PUT /api/projects/p1/scenes": ok({ ok: true, project: DRAFT_PROJECT.project }), ...extra });
 
+const DONE_PROJECT = PROJECT({ scenes: [
+  { idx: 0, prompt: "@a walks", duration: 8, status: "done", job_id: null,
+    clip_path: "/o/projects/p1/scenes/a.mp4", keyframe_path: null, seed: 305 },
+  { idx: 1, prompt: "@a runs", duration: 5, status: "done", job_id: null,
+    clip_path: "/o/projects/p1/scenes/b.mp4", keyframe_path: null }],
+  references: [{ tag: "@a", version: 1 }], i2v_prefix: "Go.", seed: null });
+const CARD_A = { tag: "@a", kind: "person", version: 1, latest_version: 1, description: "d",
+                 assets: ["/o/library/a/v1/01-a.png"], versions: [{ version: 1 }] };
+// The whole <div class="cls" …>…</div>, nested divs included: a regex up to the first </div> would
+// silently cut a block that one day gets an inner wrapper and turn the comparison false.
+const block = (cls) => {
+  const html = getElementById("project-body").innerHTML;
+  const at = html.indexOf(`<div class="${cls}"`);
+  if (at < 0) return null;
+  let depth = 0;
+  for (const m of html.slice(at).matchAll(/<\/?div\b[^>]*>/g)) {
+    depth += m[0].startsWith("</") ? -1 : 1;
+    if (depth === 0) return html.slice(at, at + m.index + m[0].length);
+  }
+  return null;
+};
+
 const SCENARIOS = {
   async new_video() {
     answers.prompt = "Бой";
@@ -471,6 +493,87 @@ const SCENARIOS = {
     select.closest = (sel) => (sel === ".project-refs" ? box : null);
     fire("change", select);
     await sleep(120);
+    return { puts: puts() };
+  },
+  async retry_with_new_seed() {
+    await start(appUrl, { "GET /api/projects/p1": ok(DONE_PROJECT),
+      "POST /api/projects/p1/scenes/0/retry": ok({ ok: true, project: DONE_PROJECT.project }) });
+    await open();
+    await act("retry-scene", { idx: "0" });
+    const opened = /<div class="retry-panel" data-idx="0">/.test(getElementById("project-body").innerHTML);
+    const fields = { ".retry-prompt": { value: "@a walks" }, ".retry-seed": { value: "7" },
+                     ".retry-steps": { value: "" } };
+    queryOne['#project-body .retry-panel[data-idx="0"]'] = {
+      querySelector: (sel) => (Object.hasOwn(fields, sel) ? fields[sel] : null) };
+    await act("retry-scene-go", { idx: "0" });
+    return { opened, confirms, posts: posts() };
+  },
+  async retry_panel_keeps_typing() {
+    await start(appUrl, { "GET /api/projects/p1": ok(DONE_PROJECT),
+      "PUT /api/projects/p1/references": ok({ ok: true, references: [] }) });
+    await open();
+    await act("retry-scene", { idx: "0" });
+    // typed into the open panel, then an unrelated redraw (a reference is ticked)
+    const fields = { ".retry-prompt": { value: "@a walks far" }, ".retry-seed": { value: "9" },
+                     ".retry-steps": { value: "" } };
+    queryOne['#project-body .retry-panel[data-idx="0"]'] = {
+      querySelector: (sel) => (Object.hasOwn(fields, sel) ? fields[sel] : null) };
+    const pin = { checked: true, dataset: { tag: "@a" }, classList: { contains: (c) => c === "ref-pin" } };
+    const box = { dataset: { id: "p1" }, querySelectorAll: (sel) => (sel === ".ref-pin" ? [pin] : []) };
+    pin.closest = (sel) => (sel === ".project-refs" ? box : null);
+    fire("change", pin);
+    await sleep(120);
+    const html = getElementById("project-body").innerHTML;
+    const prompt = html.match(/<textarea class="inp retry-prompt"[^>]*>([^<]*)<\/textarea>/)[1];
+    const seed = html.match(/<input class="inp num retry-seed"[^>]* value="([^"]*)"/)[1];
+    return { prompt, seed };
+  },
+  async locked_while_a_scene_runs() {
+    const running = { ...DONE_PROJECT, active_job: { kind: "scene", idx: 1, job: { id: "j1" } } };
+    const app = await start(appUrl, { "GET /api/projects/p1": ok(running),
+      "GET /api/library": ok({ ok: true, cards: [CARD_A] }) });
+    await open();
+    const p = running.project;
+    return {
+      settings: block("project-settings") === app.projectSettingsHtml(p, "sglang", app.PROJECT_LOCK_TEXT.settings, null),
+      refs: block("project-refs") === app.projectReferencesHtml(p, [CARD_A], p.references, app.PROJECT_LOCK_TEXT.references),
+      route: getElementById("project-body").innerHTML.includes(app.projectRouteHtml(p, "sglang", null)),
+    };
+  },
+  async locked_route_during_upscale() {
+    const upscaling = { ...DONE_PROJECT, active_job: { kind: "upscale", job: { id: "j2" } } };
+    const app = await start(appUrl, { "GET /api/projects/p1": ok(upscaling) });
+    await open();
+    return { route: getElementById("project-body").innerHTML.includes(
+      app.projectRouteHtml(upscaling.project, "sglang", app.PROJECT_LOCK_TEXT.route)) };
+  },
+  async settings_saved_mark() {
+    const app = await start(appUrl, { "GET /api/projects/p1": ok(DONE_PROJECT),
+      "PUT /api/projects/p1/settings": ok({ ok: true, project: DONE_PROJECT.project }) });
+    await open();
+    // the real handler (document `focusout`) finds the field with event.target.closest(".i2v-prefix")
+    const prefix = { value: "Go on.", dataset: { id: "p1" }, classList: { contains: (c) => c === "i2v-prefix" } };
+    prefix.closest = (sel) => (sel === ".i2v-prefix" ? prefix : null);
+    fire("focusout", prefix);
+    await sleep(120);
+    return { puts: puts(),
+             mark: block("project-settings") === app.projectSettingsHtml(DONE_PROJECT.project, "sglang", null, "i2v_prefix") };
+  },
+  async seed_saved() {
+    const app = await start(appUrl, { "GET /api/projects/p1": ok(DONE_PROJECT),
+      "PUT /api/projects/p1/settings": ok({ ok: true, project: DONE_PROJECT.project }) });
+    await open();
+    queryOne["#project-body .project-seed"] = { value: "305" };
+    await act("project-seed-save");
+    return { puts: puts(),
+             mark: block("project-settings") === app.projectSettingsHtml(DONE_PROJECT.project, "sglang", null, "seed") };
+  },
+  async seed_cleared() {
+    await start(appUrl, { "GET /api/projects/p1": ok(DONE_PROJECT),
+      "PUT /api/projects/p1/settings": ok({ ok: true, project: DONE_PROJECT.project }) });
+    await open();
+    queryOne["#project-body .project-seed"] = { value: "" };
+    await act("project-seed-save");
     return { puts: puts() };
   },
 };
