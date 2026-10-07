@@ -35,7 +35,7 @@
 
 Входы, которые легко пропустить. Тест на каждый вписан в задачу-владельца.
 
-1. **Правка сцены теряется при любой перерисовке модалки**, а не только при структурных действиях: `renderProjectModal` пересобирает `#project-body` после каждой галочки референса, `i2v_prefix`, загрузки кадра, «сохранено ✓». `syncDraftFromDom()` — первая строка `renderProjectModal`. Тесты `editor_dom_edits_survive_add`, `editor_edits_survive_ref_pin` (задача 7).
+1. **Правка сцены теряется при любой перерисовке модалки**, а не только при структурных действиях: `renderProjectModal` пересобирает `#project-body` после каждой галочки референса, `i2v_prefix`, загрузки кадра, «сохранено ✓». `syncDraftFromDom()` — первая строка `renderProjectModal`, но снимает поля только из DOM с текущей меткой `draftEpoch` (иначе после «↓/Удалить/JSON» старый DOM перетрёт черновик). Тесты `editor_dom_edits_survive_add`, `editor_edits_survive_ref_pin`, `editor_move_keeps_scenes` (задача 7), `json_load_not_clobbered` (задача 8).
 2. **«Утвердить» при несохранённой правке** утверждает старый сценарий. Тест `editor_approve_saves_first` и `editor_approve_stops_on_save_error` (задача 7).
 3. **Перестановка сцен и стартовый кадр.** `start_image` — свойство первого кадра ролика, остаётся на позиции 0; `fresh_start` сцены, ставшей нулевой, снимается. Тест `test_move_scene_keeps_start_image_at_position_0` (задача 7).
 4. **Одно правило — две реализации.** Сетка длительностей (JS-подсказка против `web._snap_video_scenes_sglang`) и каскад пересъёмки (JS против `Project.invalidate_scene_chain`) сверяются таблицей через Python и node. Тесты `test_grid_hint_matches_the_server_snap`, `test_retry_cascade_matches_invalidate_scene_chain` (задачи 7, 10).
@@ -341,9 +341,10 @@ def test_a_refused_retry_touches_nothing(live, payload, code, message):
     assert sorted(job.id for job in _pending(live)) == before_jobs
 
 
-def test_seed_and_steps_on_mlx_are_refused_before_their_value(tmp_path):
+def test_seed_and_steps_on_mlx_are_refused_before_their_value(tmp_path, monkeypatch):
     """Task 0's fix round: seed/steps are sglang-only, and the engine is checked first -- an
     otherwise valid seed on MLX is refused for the engine, not accepted."""
+    monkeypatch.setenv("H3_ENGINE", "mlx")   # explicit: a shell with H3_ENGINE=sglang must not flip it
     outdir = tmp_path / "outdir"
     outdir.mkdir()
     live = _serve(q.layout(outdir / "queue")["root"], outdir)
@@ -999,12 +1000,13 @@ run().then((out) => { process.stdout.write(JSON.stringify(out)); process.exit(0)
   - `scenesPayload(draft, engine) -> {scenes: […]}` — `prompt`, `duration` всегда; `fresh_start` у `idx > 0` всегда (bool); `start_image` только у 0 и если задан; **только при `engine === "sglang"`**: `seed` если не `null`, `steps` если не `null`, `refs` если непуст (задача 8). На MLX эти три поля не уходят никогда — Task 0 их отклоняет.
   - `randomSeed(rand = Math.random) -> number` — `Math.floor(rand() * 2 ** 31)`.
   - `seedPlaceholder(projectSeed) -> string` — `"по проекту: 305"` / `"по умолчанию: 42"`.
-  - `sceneEditorHtml(draft, ctx) -> string`, `ctx = {id, engine, projectSeed, dirty}` (задача 8 добавит `pinned`, `outdir`); поля несут `data-scene-field="<поле>"` и `data-idx`, кнопки — `button[data-act]` со значениями `scene-up`, `scene-down`, `scene-del`, `scene-seed-random`, `scene-add`, `scenes-save`. Сид и шаги — **только на sglang**; подсказка сетки — `<span class="hint grid-hint" data-idx="N">`, только на sglang.
+  - `sceneEditorHtml(draft, ctx) -> string`, `ctx = {id, engine, projectSeed, dirty, epoch}` (задача 8 добавит `pinned`, `outdir`); корневой `<div class="scene-editor" data-id="…" data-epoch="<ctx.epoch>">`; поля несут `data-scene-field="<поле>"` и `data-idx`, кнопки — `button[data-act]` со значениями `scene-up`, `scene-down`, `scene-del`, `scene-seed-random`, `scene-add`, `scenes-save`. Сид и шаги — **только на sglang**; подсказка сетки — `<span class="hint grid-hint" data-idx="N">`, только на sglang.
 - DOM-половина:
-  - `syncDraftFromDom()` читает `document.querySelectorAll("#project-body [data-scene-field]")` (селектор ровно такой). Вызывается **первой строкой `renderProjectModal`** (любая перерисовка — после галочки референса, `i2v_prefix`, загрузки кадра, «сохранено ✓» — сначала снимает поля в черновик), а также в начале обработчиков `scene-*`, `scenes-save`, `approve-script`.
+  - `syncDraftFromDom()` читает `document.querySelectorAll("#project-body [data-scene-field]")` (селектор ровно такой) **только если DOM нарисован из текущего черновика**: `document.querySelector("#project-body .scene-editor")` есть и его `dataset.epoch === String(draftEpoch)`; иначе ничего не делает. Вызывается **первой строкой `renderProjectModal`** (любая перерисовка — после галочки референса, `i2v_prefix`, загрузки кадра, «сохранено ✓» — сначала снимает поля в черновик), а также в начале обработчиков `scene-*`, `scenes-save`, `approve-script`, `scene-h3-prompt`, `#project-close`.
+  - **Метка версии черновика `draftEpoch`** (проверка плана, Н1): без неё «↓» у сцены 0 работает так — обработчик снял поля, `moveScene` переставил сцены, `renderProjectModal` → `syncDraftFromDom()` читает **ещё старый** DOM и пишет промпт бывшей #0 в новую `sceneDraft[0]`; то же с «Удалить» и вставкой JSON. Правило: любой код, который пишет в `sceneDraft` не через `syncDraftFromDom` (`addScene`/`removeScene`/`moveScene`, «случайный» сид, загрузка кадра сцены 0, сброс из ответа сервера при `openProjectModal`, после успешного `PUT`, после JSON и «Применить»), делает: `syncDraftFromDom()` → запись → `draftEpoch += 1` → `renderProjectModal()`. Нарисованный редактор несёт новую метку, старый DOM в момент перерисовки — старую и пропускается.
   - `sceneDraft` сбрасывается из сервера при `openProjectModal` и после успешного `PUT`.
   - Обработчик `input` на `[data-scene-field="duration"]` (через `event.target.closest('[data-scene-field="duration"]')`) обновляет `textContent` у `document.querySelector('#project-body .grid-hint[data-idx="N"]')` — `gridHint(sglangGridSeconds(value, chained))`, без перерисовки модалки.
-  - «закрыть» модалки при `sceneDraftDirty` (после `syncDraftFromDom`) спрашивает `confirm("Закрыть без сохранения сценария?")`; «нет» — модалка остаётся.
+  - «закрыть» модалки при `sceneDraftDirty` (после `syncDraftFromDom`) спрашивает `confirm("Закрыть без сохранения сценария?")`; «нет» — модалка остаётся. **Проверка — в обработчике кнопки `#project-close` (`app.js:5271`), не в `closeProjectModal`**: тот же `closeProjectModal` зовёт `deleteProject` (`app.js:3551`), и после удаления проекта вопрос про черновик был бы бессмыслицей (Н3).
 
 - [ ] **Step 1: Написать падающие тесты** (дописать в `tests/test_webui_gaps.py`)
 ```python
@@ -1088,9 +1090,9 @@ def test_seed_helpers():
 def test_editor_html_for_one_scene_on_sglang():
     html = _js("app.sceneEditorHtml([{prompt: 'a <b>', duration: 5, fresh_start: false, seed: null, "
                "steps: null, start_image: null, refs: []}], {id: 'p1', engine: 'sglang', "
-               "projectSeed: null, dirty: false})")
+               "projectSeed: null, dirty: false, epoch: 0})")
     assert html == (
-        '<div class="scene-editor" data-id="p1">'
+        '<div class="scene-editor" data-id="p1" data-epoch="0">'
         '<div class="scene-edit" data-idx="0"><div class="scene-edit-head">'
         '<span class="idx">#0</span><div class="spacer"></div>'
         '<button type="button" class="ghost" data-act="scene-up" data-idx="0" disabled>↑</button>'
@@ -1121,9 +1123,9 @@ def test_editor_html_on_mlx():
     html = _js("app.sceneEditorHtml([{prompt: 'a cat', duration: 8, fresh_start: false, seed: null, "
                "steps: null, start_image: null, refs: []}, {prompt: 'a dog', duration: 6, "
                "fresh_start: true, seed: null, steps: null, start_image: null, refs: []}], "
-               "{id: 'p1', engine: 'mlx', projectSeed: null, dirty: true})")
+               "{id: 'p1', engine: 'mlx', projectSeed: null, dirty: true, epoch: 0})")
     assert html == (
-        '<div class="scene-editor" data-id="p1">'
+        '<div class="scene-editor" data-id="p1" data-epoch="0">'
         '<div class="scene-edit" data-idx="0"><div class="scene-edit-head">'
         '<span class="idx">#0</span><div class="spacer"></div>'
         '<button type="button" class="ghost" data-act="scene-up" data-idx="0" disabled>↑</button>'
@@ -1167,13 +1169,25 @@ const DRAFT_PROJECT = PROJECT({ stages: { script: "awaiting_approval", scenes: "
     keyframe_path: null, fresh_start: true }], references: [{ tag: "@a", version: 1 }] });
 const FIELDS = "#project-body [data-scene-field]";
 const field = (sceneField, idx, value) => ({ dataset: { sceneField, idx: String(idx) }, value });
+// After every redraw the browser's fields hold the draft's own values and the editor carries the
+// new epoch: the harness models that by pointing `.scene-editor` at the epoch it just drew and
+// emptying the fields. Fields a scenario sets afterwards are what the person typed since.
+const liveEditor = () => {
+  const m = getElementById("project-body").innerHTML.match(/<div class="scene-editor" data-id="p1" data-epoch="(\d+)">/);
+  if (m) queryOne["#project-body .scene-editor"] = { dataset: { epoch: m[1] } };
+  queryAll[FIELDS] = [];
+};
 const open = async () => {
   fire("click", clickable({ dataset: { act: "open-project", id: "p1" }, match: (s) => s === "button[data-act]" }));
   await sleep(80);
+  liveEditor();
 };
+// The redraw an action causes happens *inside* `act`, while the stale fields are still in
+// `queryAll` -- exactly the moment Н1 is about; `liveEditor` runs only after it.
 const act = async (name, extra = {}) => {
   fire("click", clickable({ dataset: { act: name, id: "p1", ...extra }, match: (s) => s === "button[data-act]" }));
   await sleep(80);
+  liveEditor();
 };
 const puts = () => calls.filter((c) => c.method === "PUT").map((c) => [c.url, c.body]);
 const writes = () => calls.filter((c) => c.method !== "GET").map((c) => [c.method, c.url]);
@@ -1194,10 +1208,13 @@ async editor_edits_survive_ref_pin() {
   await start(appUrl, draftRoutes({ "PUT /api/projects/p1/references": ok({ ok: true, references: [] }) }));
   await open();
   queryAll[FIELDS] = [field("prompt", 0, "@a jumps")];
-  fire("change", { checked: true, dataset: { tag: "@a", id: "p1" }, closest: () => null,
-                   classList: { contains: (c) => c === "ref-pin" } });
+  // the real handler (app.js:5064-5070): target.closest(".project-refs") -> box.querySelectorAll(".ref-pin")
+  const pin = { checked: true, dataset: { tag: "@a" }, classList: { contains: (c) => c === "ref-pin" } };
+  const box = { dataset: { id: "p1" }, querySelectorAll: (sel) => (sel === ".ref-pin" ? [pin] : []) };
+  pin.closest = (sel) => (sel === ".project-refs" ? box : null);
+  fire("change", pin);
   await sleep(120);
-  queryAll[FIELDS] = [];          // the modal was redrawn: the fields now hold whatever the draft had
+  liveEditor();                   // the modal was redrawn: the fields now hold whatever the draft had
   await act("scenes-save");
   return { puts: puts().filter(([url]) => url === "/api/projects/p1/scenes") };
 },
@@ -1241,6 +1258,27 @@ async editor_close_unsaved() {
   getElementById("project-close").__listeners.click[0]();
   return { confirms, hidden: getElementById("project-modal").hidden };
 },
+async editor_move_keeps_scenes() {
+  await start(appUrl, draftRoutes());
+  await open();
+  const typed = [field("prompt", 0, "@a walks far"), field("prompt", 1, "@a runs fast")];
+  queryAll[FIELDS] = typed;
+  // no `act` here on purpose: the stale fields stay in queryAll through the redraw and are still
+  // there at the save -- a DOM drawn from an older draft must never win over the moved draft
+  fire("click", clickable({ dataset: { act: "scene-down", id: "p1", idx: "0" }, match: (s) => s === "button[data-act]" }));
+  await sleep(80);
+  await act("scenes-save");
+  return { puts: puts() };
+},
+async delete_project_no_draft_question() {
+  await start(appUrl, draftRoutes({ "DELETE /api/projects/p1": ok({ ok: true }) }));
+  await open();
+  queryAll[FIELDS] = [field("prompt", 0, "@a jumps")];
+  answers.confirm = true;
+  getElementById("project-delete").__listeners.click[0]();
+  await sleep(80);
+  return { confirms };
+},
 ```
 Ожидания (в `test_webui_gaps.py`, каждый — отдельный тест с `_gaps(...) ==`):
 ```python
@@ -1260,6 +1298,13 @@ EDITOR_EXPECTED = {
                             "error": "<b>Запрос не прошёл</b><pre>Сцена #2: пустой промпт</pre>"},
     "editor_grid_hint_live": {"hint": "на сетке: 3,75 с"},
     "editor_close_unsaved": {"confirms": ["Закрыть без сохранения сценария?"], "hidden": False},
+    # Н1: after «↓» the stale DOM (old idx 0 = «@a walks far») must not overwrite the moved draft
+    "editor_move_keeps_scenes": {"puts": [["/api/projects/p1/scenes", {"scenes": [
+        {"prompt": "@a runs fast", "duration": 5, "start_image": "@arena"},
+        {"prompt": "@a walks far", "duration": 8, "fresh_start": False}]}]]},
+    # Н3: deleting a project with an unsaved draft asks only the delete question
+    "delete_project_no_draft_question": {"confirms": [
+        "Удалить проект целиком? Файлы (клипы, трек, сборка) удаляются с диска."]},
 }
 
 
@@ -1268,6 +1313,8 @@ EDITOR_EXPECTED = {
 def test_editor_wiring(scenario):
     assert _gaps(scenario) == EDITOR_EXPECTED[scenario]
 ```
+Почему `editor_move_keeps_scenes` красный без метки: обработчик «↓» снимает поля (эпоха совпадает) — черновик `[«@a walks far», «@a runs fast»]`, переставляет — `[«@a runs fast», «@a walks far»]`, перерисовка зовёт `syncDraftFromDom()` при **тех же** `queryAll` с `idx` 0/1 → без проверки эпохи черновик снова `[«@a walks far», «@a runs fast»]`. `start_image` и `fresh_start` в ожидании — по правилу `moveScene` (кадр у позиции 0, у новой нулевой `fresh_start` снят, у бывшей #0 его не было). Сценарий `json_load_not_clobbered` — в задаче 8.
+
 (Текст ошибки клиента — из `errorText` (`app.js:1506`): для `{error: {message}}` без кода он даёт заголовок «Запрос не прошёл» и `pre` с сообщением — сверено запуском 07.10.)
 
 - [ ] **Step 2: Увидеть красным** — `app.sglangGridSeconds is not a function` и т.д.; сценарии: `puts: []`.
@@ -1292,7 +1339,7 @@ def test_editor_wiring(scenario):
 ```
 `openProjectModal` и успешный `PUT` → `sceneDraft = draftFromScenes(proj.scenes.length ? proj.scenes : [])`, при пустом — `addScene([])`, `sceneDraftDirty = false`. Обработчики `scene-*`/`scenes-save` — в главном делегированном `click` (`app.js:4887`, по `button.dataset.act`), каждый начинается с `syncDraftFromDom()`. `approve-script`: `syncDraftFromDom(); if (sceneDraftDirty) { await saveScenes(); if (failed) return; }`. `projectScriptStageHtml` для видео в редактируемом состоянии добавляет `sceneEditorHtml(sceneDraft, {...})` и пометку `<span class="dirty-note">не сохранено</span>` при `sceneDraftDirty`.
 - [ ] **Step 4: Зелёный.** CSS для `scene-editor`, `scene-edit`, `scene-edit-head`, `scene-edit-row`, `scene-editor-acts`, `dirty-note`, `hint` (если нет), `fresh-start-toggle` (если нет) — и `CLASS_SOURCES` дополняется вызовами `sceneEditorHtml` (sglang и MLX); в `HOOK_CLASSES` — `scene-edit-prompt` (поле ввода, вид от `.inp`), `grid-hint` (адрес для обновления, вид от `.hint`).
-- [ ] **Step 5: Мутация** — (а) в `moveScene` не переносить `start_image` → красный `test_move_scene_keeps_start_image_at_position_0`; (б) убрать `syncDraftFromDom()` из обработчика `scene-add` → красный `editor_dom_edits_survive_add`; (в) убрать `syncDraftFromDom()` из `renderProjectModal` → красный `editor_edits_survive_ref_pin`; (г) убрать сохранение перед утверждением → красный `editor_approve_saves_first`; (д) в `sglangGridSeconds` взять остаток `5` и для сцепленной → красный `test_grid_hint_matches_the_server_snap`; (е) слать `seed` на MLX → красный `test_scenes_payload_sends_only_what_is_set`; (ж) в `removeScene` не снимать `fresh_start` → красный `test_move_scene…` (часть про `removeScene`).
+- [ ] **Step 5: Мутация** — (а) в `moveScene` не переносить `start_image` → красный `test_move_scene_keeps_start_image_at_position_0`; (б) убрать `syncDraftFromDom()` из обработчика `scene-add` → красный `editor_dom_edits_survive_add`; (в) убрать `syncDraftFromDom()` из `renderProjectModal` → красный `editor_edits_survive_ref_pin`; (г) убрать сохранение перед утверждением → красный `editor_approve_saves_first`; (д) в `sglangGridSeconds` взять остаток `5` и для сцепленной → красный `test_grid_hint_matches_the_server_snap`; (е) слать `seed` на MLX → красный `test_scenes_payload_sends_only_what_is_set`; (ж) в `removeScene` не снимать `fresh_start` → красный `test_move_scene…` (часть про `removeScene`); (з) убрать проверку `dataset.epoch` в `syncDraftFromDom` → красные `editor_move_keeps_scenes` и `json_load_not_clobbered` (задача 8); (и) перенести `confirm` закрытия в `closeProjectModal` → красный `delete_project_no_draft_question`.
 - [ ] **Step 6: Полный прогон; коммит** — `feat(webui): редактор сцен видеопроекта — промпт целиком, длительность с сеткой, сид, шаги, порядок, сохранение`.
 
 ---
@@ -1313,7 +1360,8 @@ def test_editor_wiring(scenario):
   - `sceneTagIssues(text, pinnedTags, {needsTag, refs = []})` — при непустом `refs` проблема `missing` не выдаётся (сцена с референсами без упоминания законна, `626db48d`); `projectTagWarningsHtml` передаёт `scene.refs`.
   - `parseScenarioJson(text) -> {body} | {error}` — список → `{body: {scenes: список}}`; объект со `scenes`-списком → `{body: {scenes, references?}}` (только эти два ключа); иначе `{error: 'Ожидается {"scenes": […]} или список сцен'}`; не JSON → `{error: "JSON не разобрался — проверьте запятые и кавычки"}`.
   - `scenarioReplaceConfirm(n) -> string` — `"Заменить 1 сцену сценария?"`, `"Заменить 2 сцены сценария?"`, `"Заменить 5 сцен сценария?"` (`plural`).
-  - Блок `<details class="adv scenario-json">` с `<textarea class="inp scenario-json-text">` и кнопкой `data-act="scenario-json-load"`: при непустом сценарии `confirm(scenarioReplaceConfirm(n))` → `PUT …/scenes` с `body` как есть → черновик из ответа.
+  - Блок `<details class="adv scenario-json">` с `<textarea class="inp scenario-json-text">` и кнопкой `data-act="scenario-json-load"`: при непустом сценарии `confirm(scenarioReplaceConfirm(n))` → `PUT …/scenes` с `body` как есть → черновик **из ответа этого `PUT`** (`draftFromScenes(answer.project.scenes)`), `draftEpoch += 1`, `sceneDraftDirty = false` — по правилу метки из задачи 7; последующий `refreshProjectDetail` черновик не сбрасывает.
+  - Загрузка кадра сцены 0 (`#scene0-file` → `uploadToServer`) — тоже по правилу метки: `syncDraftFromDom()` → `sceneDraft[0].start_image = path` → `draftEpoch += 1` → перерисовка (иначе перерисовка вернула бы в черновик старое значение `select`).
   - Обработчик `input` на `[data-scene-field="prompt"]` (sglang): подсветка проблем тегов (как у `.scenario-prompt`, `app.js:5111`) и `document.querySelector('#project-body .tag-hint-slot[data-idx="N"]').innerHTML = tagHintHtml(value, selectionStart, подключённые карточки)`. Клик `tag-pick` (`data-tag`, `data-idx`) правит поле `document.querySelector('#project-body [data-scene-field="prompt"][data-idx="N"]')` через `insertTagAt`, ставит каретку и помечает черновик изменённым.
 
 - [ ] **Step 1: Тесты** (в `tests/test_webui_gaps.py`)
@@ -1445,6 +1493,20 @@ async json_load() {
   await act("scenario-json-load");
   return { confirms, puts: puts() };
 },
+async json_load_not_clobbered() {
+  const loaded = PROJECT({ ...DRAFT_PROJECT.project, scenes: [{ idx: 0, prompt: "@a", duration: 5,
+    status: "pending", job_id: null, clip_path: null, keyframe_path: null }] });
+  await start(appUrl, draftRoutes({ "PUT /api/projects/p1/scenes": ok({ ok: true, project: loaded.project }) }));
+  await open();
+  // fields of the two old scenes, still in the DOM when the JSON answer redraws the modal
+  queryAll[FIELDS] = [field("prompt", 0, "@a walks"), field("prompt", 1, "@a runs")];
+  queryOne["#project-body .scenario-json-text"] = { value: '{"scenes": [{"prompt": "@a", "duration": 5}]}' };
+  answers.confirm = true;
+  fire("click", clickable({ dataset: { act: "scenario-json-load", id: "p1" }, match: (s) => s === "button[data-act]" }));
+  await sleep(120);
+  await act("scenes-save");
+  return { puts: puts() };
+},
 async json_load_bad() {
   await start(appUrl, draftRoutes());
   await open();
@@ -1468,6 +1530,10 @@ EDITOR8_EXPECTED = {
                       "start_image": "/o/uploads/open.png"},
     "json_load": {"confirms": ["Заменить 2 сцены сценария?"],
                   "puts": [["/api/projects/p1/scenes", {"scenes": [{"prompt": "@a", "duration": 5}]}]]},
+    # Н1: the redraw after the JSON answer must not pour the old scenes' fields back into the draft
+    "json_load_not_clobbered": {"puts": [
+        ["/api/projects/p1/scenes", {"scenes": [{"prompt": "@a", "duration": 5}]}],
+        ["/api/projects/p1/scenes", {"scenes": [{"prompt": "@a", "duration": 5}]}]]},
     "json_load_bad": {"puts": [], "error": "<b>Запрос не прошёл</b><pre>Ожидается {&quot;scenes&quot;: […]} "
                                           "или список сцен</pre>"},
 }
@@ -1497,7 +1563,7 @@ def test_editor_refs_and_json_wiring(scenario):
 
 **Interfaces:**
 - Produces:
-  - `GET /api/projects/<id>/scenes/<idx>/h3-prompt` (только sglang; MLX → 400 `args_invalid` «Промпт для H3 есть только на sglang») → `{"ok": true, "idx", "prompt", "pictures": [{"label": "<Picture k>", "path"}], "audios": [путь…], "keyframe": {"kind": "start_image"|"previous_scene"|null, "path": путь|null}, "duration", "seed", "steps"}`. Сцена берётся из `project.json` (сохранённая), длительность — после `_snap_video_scenes_sglang([scene])[0]`; `prompt` = `args[1]`, `pictures` — значения `--ref` по порядку, `audios` — `--audio`, `seed`/`steps` — из argv (эффективные). Сцепленная сцена → `keyframe = {"kind": "previous_scene", "path": null}`; сцена 0 с кадром → `{"kind": "start_image", "path": <разрешённый путь>}`; без кадра → `{"kind": null, "path": null}`. Ошибка сборки (`LibraryError`/`SglangArgsError`) → тот же код и текст, что у гейта (400). Нет сцены → 404 `project_scene_not_found`.
+  - `GET /api/projects/<id>/scenes/<idx>/h3-prompt` (только sglang; MLX → 400 `args_invalid` «Промпт для H3 есть только на sglang») → `{"ok": true, "idx", "prompt", "pictures": [{"label": "<Picture k>", "path"}], "audios": [путь…], "keyframe": {"kind": "start_image"|"previous_scene"|null, "path": путь|null}, "duration", "seed", "steps"}`. Сцена берётся из `project.json` (сохранённая), длительность — после `_snap_video_scenes_sglang([scene])[0]`; `prompt` = `args[1]`, `pictures` — значения `--ref` по порядку, `audios` — `--audio`, `seed`/`steps` — из argv (эффективные). Сцепленная сцена → `keyframe = {"kind": "previous_scene", "path": null}`; сцена 0 с кадром → `{"kind": "start_image", "path": <разрешённый путь>}`; без кадра → `{"kind": null, "path": null}`. Ошибка сборки — **те же три ветки, что у гейта** (`_scene_reference_errors`): `LibraryError`/`SglangArgsError` → их код и текст, `AssembleError` (сетка) → `duration_off_grid` с текстом исключения; всё 400. Вынесенный `_scene_sglang_args` бросает, а ловят оба вызывающих — иначе сбой сетки в маршруте даст 500 `internal_error` (Н6). Нет сцены → 404 `project_scene_not_found`.
   - `app.js`: `h3PromptHtml(answer, outdir) -> string`; кнопка `<button type="button" class="ghost" data-act="scene-h3-prompt" data-idx="N">Промпт для H3</button>` в шапке сцены редактора (только sglang, после стрелок и «Удалить»; **ожидание sglang-разметки редактора из задач 7/8 обновляется целиком**, MLX-ожидание не меняется); клик: `syncDraftFromDom()`, при `sceneDraftDirty` — сначала `PUT …/scenes` (отказ — стоп), потом `GET …/h3-prompt`, ответ кладётся в `h3Prompts[idx]` (сбрасывается при любой правке черновика) и рисуется под сценой.
 
 - [ ] **Step 1: Тесты**
@@ -1581,7 +1647,20 @@ def test_unknown_scene_and_mlx(live, monkeypatch):
     assert (status, body["error"]["code"], body["error"]["message"]) == (
         400, "args_invalid", "Промпт для H3 есть только на sglang")
 ```
-Ожидаемые промпты выведены из `library.build_ref2va` после `626db48d` (у `refs` нет `<Subject N>`, их картинки — первыми; тег текста получает следующую `<Picture k>`) и из `_scene_generate_args_sglang` (`f"{i2v_prefix}\n\n{prompt}"` у сцепленной) — сверить с `tests/test_sglang_scene_refs.py`; если расходится — разбираться в причине, а не подгонять литерал. Если `engine.is_sglang()` читает окружение один раз при старте сервера и `monkeypatch.setenv` посреди теста не действует — MLX-часть вынести в отдельный тест со своим сервером без `H3_ENGINE`.
+Ожидаемые промпты выведены из `library.build_ref2va` после `626db48d` (у `refs` нет `<Subject N>`, их картинки — первыми; тег текста получает следующую `<Picture k>`) и из `_scene_generate_args_sglang` (`f"{i2v_prefix}\n\n{prompt}"` у сцепленной) — сверить с `tests/test_sglang_scene_refs.py`; если расходится — разбираться в причине, а не подгонять литерал. `engine.is_sglang()` читает `os.environ` при каждом вызове (`h3_48gb/engine.py:20-29`, проверено), поэтому `monkeypatch.setenv` посреди теста действует.
+
+Тест ветки сетки (Н6):
+```python
+def test_an_off_grid_scene_answers_like_the_gate(live, monkeypatch):
+    proj = _project(live)
+    def off_grid(*_args, **_kwargs):
+        raise p_assemble.AssembleError("scene 0: 190 frames is off sglang's 17n+5 grid")
+    monkeypatch.setattr(p_assemble, "_scene_generate_args_sglang", off_grid)
+    status, body = _call(live, "GET", f"/api/projects/{proj.id}/scenes/0/h3-prompt")
+    assert (status, body["error"]["code"], body["error"]["message"]) == (
+        400, "duration_off_grid", "scene 0: 190 frames is off sglang's 17n+5 grid")
+```
+(в импорт файла — `from h3_48gb import assemble as p_assemble`; если `web` зовёт функцию через `assemble_module.…`, `monkeypatch.setattr` на модуле действует.)
 
 В `tests/test_webui_gaps.py`:
 ```python
@@ -1597,7 +1676,34 @@ def test_h3_prompt_html():
         '<div class="h3-pictures"><figure><img src="/media/library/arena/v1/01-o.png" alt="">'
         '<figcaption>&lt;Picture 1&gt;</figcaption></figure></div></div>')
 ```
-(варианты подписи кадра: `start_image` → `первый кадр: <имя файла>`, `null` → `без первого кадра` — ещё две строки того же теста, литералами.) Сценарий `h3_prompt_saves_first`: правка промпта сцены 0 в `queryAll[FIELDS]`, клик `scene-h3-prompt` с `idx: "0"`, маршрут `GET /api/projects/p1/scenes/0/h3-prompt` → `ok({...})`; ожидание `writes` в порядке `[["PUT", "/api/projects/p1/scenes"]]` и затем GET этого маршрута среди `calls` после PUT (`calls.findIndex` PUT < `findIndex` GET), в `#project-body` есть `<div class="h3-prompt" data-idx="0">`.
+Ещё две строки того же теста — подпись кадра (без картинок блок `h3-pictures` не рисуется):
+```python
+    start = ("{idx: 0, prompt: 'P', pictures: [], audios: [], keyframe: {kind: 'start_image', "
+             "path: '/o/library/arena/v1/01-o.png'}, duration: 8, seed: 305, steps: 50}")
+    assert _js(f"app.h3PromptHtml({start}, '/o')") == (
+        '<div class="h3-prompt" data-idx="0">'
+        '<p class="hint">8 с · сид 305 · 50 шагов · первый кадр: 01-o.png</p><pre>P</pre></div>')
+    none = start.replace("{kind: 'start_image', path: '/o/library/arena/v1/01-o.png'}",
+                         "{kind: null, path: null}")
+    assert _js(f"app.h3PromptHtml({none}, '/o')") == (
+        '<div class="h3-prompt" data-idx="0">'
+        '<p class="hint">8 с · сид 305 · 50 шагов · без первого кадра</p><pre>P</pre></div>')
+```
+Сценарий (helpers — из задачи 7):
+```js
+async h3_prompt_saves_first() {
+  const answer = { ok: true, idx: 0, prompt: "P", pictures: [], audios: [],
+                   keyframe: { kind: null, path: null }, duration: 8, seed: 42, steps: 50 };
+  await start(appUrl, draftRoutes({ "GET /api/projects/p1/scenes/0/h3-prompt": ok(answer) }));
+  await open();
+  queryAll[FIELDS] = [field("prompt", 0, "@a jumps")];
+  await act("scene-h3-prompt", { idx: "0" });
+  const watched = ["PUT /api/projects/p1/scenes", "GET /api/projects/p1/scenes/0/h3-prompt"];
+  return { order: calls.map((c) => `${c.method} ${c.url}`).filter((k) => watched.includes(k)),
+           shown: /<div class="h3-prompt" data-idx="0">/.test(getElementById("project-body").innerHTML) };
+},
+```
+Ожидание: `{"order": ["PUT /api/projects/p1/scenes", "GET /api/projects/p1/scenes/0/h3-prompt"], "shown": True}` (`watched.includes` — фильтр вывода, не мок).
 - [ ] **Step 2: Красный** — 404 `no route` / `h3PromptHtml is not a function`.
 - [ ] **Step 3: Реализация** по Interfaces. Гейт (`_scene_reference_errors`) после рефактора — тот же список ошибок: прогнать `tests/test_sglang_scenes.py tests/test_sglang_scenario_load.py tests/test_sglang_scene_refs.py` до и после.
 - [ ] **Step 4: Зелёный; CSS** (`h3-prompt`, `h3-pictures`; `pre` с `white-space: pre-wrap; overflow-wrap: anywhere`, чтобы 390 px не раздвигались) + `CLASS_SOURCES`.
@@ -1642,11 +1748,64 @@ def test_library_card_html_has_thumb_versions_and_actions():
         '<button type="button" class="ghost" data-act="lib-delete" data-tag="@alice">Удалить</button>'
         '<p class="why lib-card-error" hidden></p></div>')
 ```
-Плюс точная разметка `projectReferencesHtml` (её пишет исполнитель литералом, по образцу теста выше) с двумя версиями (выбрана v1 при `latest_version` 2) и с `lock`. Сценарии (код — в `_ui_gaps_check.mjs`, ожидания — литералами в `test_webui_gaps.py`):
+```python
+REF_CARDS = ("[{tag: '@a', kind: 'person', version: 2, latest_version: 2, "
+             "versions: [{version: 1}, {version: 2}]}]")
+
+
+@_needs_node
+def test_project_references_html_with_versions_and_lock():
+    assert _js(f"app.projectReferencesHtml({{id: 'p1'}}, {REF_CARDS}, [{{tag: '@a', version: 1}}], null)") == (
+        '<div class="project-refs" data-id="p1"><h4>Референсы проекта</h4>'
+        '<label><input type="checkbox" class="ref-pin" data-tag="@a" checked> @a '
+        '<span class="muted">person, v1 (есть v2)</span></label> '
+        '<select class="inp ref-version" data-tag="@a"><option value="1" selected>v1</option>'
+        '<option value="2">v2</option></select></div>')
+    lock = web.PROJECT_LOCK_TEXT["references"]
+    assert _js(f"app.projectReferencesHtml({{id: 'p1'}}, {REF_CARDS}, [], {json.dumps(lock)})") == (
+        '<div class="project-refs" data-id="p1"><h4>Референсы проекта</h4>'
+        '<label><input type="checkbox" class="ref-pin" data-tag="@a" disabled> @a '
+        '<span class="muted">person</span></label> '
+        '<select class="inp ref-version" data-tag="@a" disabled><option value="1">v1</option>'
+        '<option value="2" selected>v2</option></select>'
+        f'<p class="why lock-note">{lock}</p></div>')
+```
+(подпись `"person"` у неподключённой и `"person, v1 (есть v2)"` у подключённой — из существующей `projectReferencesHtml`, `app.js:239`; `from h3_48gb import web` уже есть в файле с задачи 7.)
+
+Сценарии (код — в `_ui_gaps_check.mjs`, ожидания — литералами в `test_webui_gaps.py`):
 - `library_preview_after_late_state`: `routes["GET /api/state"] = () => sleep(40).then(() => ok(SGLANG))` (SGLANG.outdir = "/o"), `GET /api/library` отвечает сразу карточкой с `assets: ["/o/library/alice/v1/01-a.png"]`; после `start` и `sleep(120)` — `{"img": <первое вхождение <img …> в #library-cards>}` == `'<img class="lib-thumb" src="/media/library/alice/v1/01-a.png" alt="">'`.
 - `library_delete_in_use`: `answers.confirm = true`, `DELETE /api/library/alice` → `err(409, "library_card_in_use", "@alice подключена к проектам: «Бой» (p1) — отключите её там или удалите проекты")`; карточка находится через `button.closest(".lib-card")` (мок: `closest(sel) { return sel === "button[data-act]" ? this : sel === ".lib-card" ? card : null; }`). Ожидание: `confirms == ["Удалить карточку @alice? Файлы уйдут в library/.trash."]`, `cardError == {"hidden": False, "textContent": "<то же сообщение>"}`, `deletes == ["/api/library/alice"]`.
-- `library_new_version`: у карточки `querySelector(".lib-new-files")` → `{files: [{name: "b.png"}]}`, `querySelector(".lib-edit-desc")` → `{value: "a woman"}`; `POST /api/uploads` → `ok({path: "/o/uploads/b.png"})`; ожидание `puts == [["/api/library/alice", {"description": "a woman", "assets": ["/o/uploads/b.png"]}]]`.
-- `refs_version_change`: открыть проект, `change` на `select.ref-version` (`{classList: {contains: (c) => c === "ref-version"}, dataset: {tag: "@a"}, value: "1", …}`) при отмеченной `@a` → `PUT /api/projects/p1/references` с `[{"tag": "@a", "version": 1}]`.
+- `library_new_version` и `refs_version_change` — кодом ниже. Обработчик `ref-version` устроен как существующий `ref-pin` (`app.js:5064-5070`): `target.closest(".project-refs")` → отмеченные `.ref-pin` и выбранные `.ref-version` из `box.querySelectorAll` → `referencesPayload(checked, pinned, chosen)`.
+```js
+async library_new_version() {
+  await start(appUrl, { "POST /api/uploads": ok({ ok: true, path: "/o/uploads/b.png" }),
+    "PUT /api/library/alice": ok({ ok: true, card: {} }) });
+  const cardError = { hidden: true, textContent: "" };
+  const parts = { ".lib-new-files": { files: [{ name: "b.png" }] },
+                  ".lib-edit-desc": { value: "a woman" }, ".lib-card-error": cardError };
+  const card = { querySelector: (sel) => (Object.hasOwn(parts, sel) ? parts[sel] : null) };
+  fire("click", { dataset: { act: "lib-new-version", tag: "@alice" },
+    closest(sel) { return sel === "button[data-act]" ? this : sel === ".lib-card" ? card : null; } });
+  await sleep(120);
+  return { uploads: calls.filter((c) => c.url === "/api/uploads").map((c) => c.headers["X-Filename"]),
+           puts: puts(), cardError };
+},
+async refs_version_change() {
+  const proj = PROJECT({ references: [{ tag: "@a", version: 2 }] });
+  await start(appUrl, { "GET /api/projects/p1": ok(proj),
+    "PUT /api/projects/p1/references": ok({ ok: true, references: [] }) });
+  await open();
+  const pin = { checked: true, dataset: { tag: "@a" } };
+  const select = { value: "1", dataset: { tag: "@a" }, classList: { contains: (c) => c === "ref-version" } };
+  const box = { dataset: { id: "p1" },
+    querySelectorAll: (sel) => (sel === ".ref-pin" ? [pin] : sel === ".ref-version" ? [select] : []) };
+  select.closest = (sel) => (sel === ".project-refs" ? box : null);
+  fire("change", select);
+  await sleep(120);
+  return { puts: puts() };
+},
+```
+Ожидания: `library_new_version` → `{"uploads": ["b.png"], "puts": [["/api/library/alice", {"description": "a woman", "assets": ["/o/uploads/b.png"]}]], "cardError": {"hidden": True, "textContent": ""}}`; `refs_version_change` → `{"puts": [["/api/projects/p1/references", {"references": [{"tag": "@a", "version": 1}]}]]}`.
 ```js
 async library_preview_after_late_state() {
   routes["GET /api/state"] = () => sleep(40).then(() => ok(SGLANG));
@@ -1817,7 +1976,58 @@ def test_retry_body_sends_only_changes():
         "prompt": "@a jumps", "seed": 7, "steps": 30}
     assert _js(f"app.retryBody({scene}, {{prompt: '@a walks', seed: '305', steps: ''}})") == {}
 ```
-Плюс точная разметка `sceneCardHtml` (литералами, по образцу `test_project_settings_html`) для `pending` (без кнопки), `done` с `ltx_path` и промптом длиннее 260, `failed`; `retryPanelHtml` для sglang и MLX (на MLX нет сида и шагов). `start(appUrl, extra)` харнесса возвращает импортированный модуль `app` — сценарии ниже строят ожидание его же чистой функцией, а сама функция пиннится литералом выше: так сценарий проверяет **проводку** (что `renderProjectModal` передал причину), а не разметку второй раз.
+```python
+@_needs_node
+def test_scene_card_html():
+    ctx = "{projId: 'p1', outdir: '/o', deadMedia: new Set(), engine: 'sglang', projectSeed: null}"
+    pending = "{idx: 1, prompt: '@a runs', duration: 5.125, status: 'pending', clip_path: null}"
+    assert _js(f"app.sceneCardHtml({pending}, {ctx})") == (
+        '<div class="scene-card"><div class="frame"></div><div class="info"><div class="row1">'
+        '<span class="m wait" aria-hidden="true"></span><span class="idx">#1</span>'
+        '<span class="sdur">5 с</span></div><div class="prompt">@a runs</div>'
+        '<div class="scene-params mono">сид 42 · 50 шагов</div><div class="acts"></div></div></div>')
+    done = ("{idx: 0, prompt: 'x'.repeat(300), duration: 8, status: 'done', seed: 305, steps: 30, "
+            "clip_path: '/o/projects/p1/scenes/a.mp4', ltx_path: '/o/projects/p1/scenes/a-ltx.mp4'}")
+    clip = "/media/projects/p1/scenes/a.mp4"
+    assert _js(f"app.sceneCardHtml({done}, {ctx})") == (
+        f'<div class="scene-card"><div class="frame"><video src="{clip}" preload="metadata" controls '
+        f'data-media-url="{clip}"></video></div><div class="info"><div class="row1">'
+        '<span class="m done" aria-hidden="true"></span><span class="idx">#0</span>'
+        '<span class="sdur">8 с</span></div>'
+        f'<details class="scene-prompt"><summary>{"x" * 260}…</summary>{"x" * 300}</details>'
+        '<div class="scene-params mono">сид 305 · 30 шагов</div><div class="acts">'
+        '<a class="clip" href="/media/projects/p1/scenes/a-ltx.mp4" target="_blank" rel="noopener">LTX</a>'
+        '<button type="button" data-act="retry-scene" data-id="p1" data-idx="0">Пересчитать сцену</button>'
+        '</div></div></div>')
+    failed = "{idx: 2, prompt: 'p', duration: 3, status: 'failed', error: 'boom', clip_path: null}"
+    mlx = ctx.replace("'sglang'", "'mlx'")
+    assert _js(f"app.sceneCardHtml({failed}, {mlx})") == (
+        '<div class="scene-card"><div class="frame"></div><div class="info"><div class="row1">'
+        '<span class="m fail" aria-hidden="true"></span><span class="idx">#2</span>'
+        '<span class="sdur">3 с</span></div><div class="prompt">p</div>'
+        '<div class="scene-error why">boom</div><div class="acts">'
+        '<button type="button" data-act="retry-scene" data-id="p1" data-idx="2">Пересчитать сцену</button>'
+        '</div></div></div>')
+
+
+@_needs_node
+def test_retry_panel_html():
+    scene = "{idx: 0, prompt: '@a <b>', steps: null}"
+    tail = ('<p class="hint">Пересчитает сцены #0, #1</p>'
+            '<button type="button" class="inverse" data-act="retry-scene-go" data-id="p1" data-idx="0">Пересчитать</button>'
+            '<button type="button" class="ghost" data-act="retry-scene-cancel" data-idx="0">Отмена</button></div>')
+    assert _js(f"app.retryPanelHtml({scene}, {{id: 'p1', engine: 'sglang', effectiveSeed: 305, cascade: [0, 1]}})") == (
+        '<div class="retry-panel" data-idx="0"><textarea class="inp retry-prompt" rows="4">@a &lt;b&gt;</textarea>'
+        '<div class="scene-edit-row"><label>Сид <input class="inp num retry-seed" type="number" min="0" '
+        'value="" placeholder="сейчас: 305"></label>'
+        '<button type="button" class="ghost" data-act="retry-seed-random" data-idx="0">новый случайный</button>'
+        '<label>Шаги <input class="inp num retry-steps" type="number" min="2" max="100" value="" '
+        'placeholder="сейчас: 50"></label></div>' + tail)
+    assert _js(f"app.retryPanelHtml({scene}, {{id: 'p1', engine: 'mlx', effectiveSeed: 42, cascade: [0, 1]}})") == (
+        '<div class="retry-panel" data-idx="0"><textarea class="inp retry-prompt" rows="4">@a &lt;b&gt;</textarea>'
+        + tail)
+```
+(Разметку кадра, отметки и длительности `sceneCardHtml` наследует от существующей `projectSceneCardHtml`, `app.js:3406`; `formatFine(5.125)` = «5 с». Реализация может поменять разметку, только обновив литералы целиком.) `start(appUrl, extra)` харнесса возвращает импортированный модуль `app` — сценарии ниже строят ожидание его же чистой функцией, а сама функция пиннится литералом выше: так сценарий проверяет **проводку** (что `renderProjectModal` передал причину), а не разметку второй раз.
 
 ```js
 const DONE_PROJECT = PROJECT({ scenes: [
@@ -1828,9 +2038,18 @@ const DONE_PROJECT = PROJECT({ scenes: [
   references: [{ tag: "@a", version: 1 }], i2v_prefix: "Go.", seed: null });
 const CARD_A = { tag: "@a", kind: "person", version: 1, latest_version: 1, description: "d",
                  assets: ["/o/library/a/v1/01-a.png"], versions: [{ version: 1 }] };
+// The whole <div class="cls" …>…</div>, nested divs included: a regex up to the first </div> would
+// silently cut a block that one day gets an inner wrapper and turn the comparison false (Н7).
 const block = (cls) => {
-  const m = getElementById("project-body").innerHTML.match(new RegExp(`<div class="${cls}"[\\s\\S]*?</div>`));
-  return m ? m[0] : null;
+  const html = getElementById("project-body").innerHTML;
+  const at = html.indexOf(`<div class="${cls}"`);
+  if (at < 0) return null;
+  let depth = 0;
+  for (const m of html.slice(at).matchAll(/<\/?div\b[^>]*>/g)) {
+    depth += m[0].startsWith("</") ? -1 : 1;
+    if (depth === 0) return html.slice(at, at + m.index + m[0].length);
+  }
+  return null;
 };
 // SCENARIOS:
 async retry_with_new_seed() {
@@ -1869,14 +2088,16 @@ async settings_saved_mark() {
   const app = await start(appUrl, { "GET /api/projects/p1": ok(DONE_PROJECT),
     "PUT /api/projects/p1/settings": ok({ ok: true, project: DONE_PROJECT.project }) });
   await open();
-  fire("focusout", { value: "Go on.", dataset: { id: "p1" },
-    classList: { contains: (c) => c === "i2v-prefix" }, closest: () => null });
+  // the real handler (app.js:5074-5080) finds the field with event.target.closest(".i2v-prefix")
+  const prefix = { value: "Go on.", dataset: { id: "p1" }, classList: { contains: (c) => c === "i2v-prefix" } };
+  prefix.closest = (sel) => (sel === ".i2v-prefix" ? prefix : null);
+  fire("focusout", prefix);
   await sleep(120);
   return { puts: puts(),
            mark: block("project-settings") === app.projectSettingsHtml(DONE_PROJECT.project, "sglang", null, "i2v_prefix") };
 },
 ```
-(`.includes` здесь — проверка вывода страницы на вхождение строки, которую строит та же чистая функция, а не мок; `closest`/`querySelector` моков — только точные ключи. Форму события `focusout` у `i2v-prefix` сверить с обработчиком `app.js:~5075` — если он ищет поле через `closest(".i2v-prefix")`, мок отвечает `sel === ".i2v-prefix" ? this : null`.)
+(`.includes` здесь — проверка вывода страницы на вхождение строки, которую строит та же чистая функция, а не мок; `closest`/`querySelector` моков — только точные ключи. Моки `focusout` и `change` повторяют фактические обработчики `app.js:5064-5080`: красный из-за мока, а не из-за кода, правится в моке **по коду обработчика**, а не обработчиком под мок.)
 
 Ожидания:
 ```python
