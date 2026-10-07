@@ -1763,9 +1763,10 @@ def test_error_codes_are_documented_in_one_place():
     from h3_48gb import provider as provider_mod
     from h3_48gb import web as web_mod
     from h3_48gb.cli import ERROR_CODES
+    from h3_48gb.engines import sglang_args as sglang_args_mod
 
     source = "\n".join(inspect.getsource(module)
-                       for module in (cli_mod, web_mod, provider_mod))
+                       for module in (cli_mod, web_mod, provider_mod, sglang_args_mod))
     # Four sources, not one, because there are four ways a code reaches a caller. A `CliError`
     # raise site is the original one. `web._error_bytes("code", ...)` writes a refusal the router
     # made before any exception existed -- scanned as a literal so a typo in one shows up here as
@@ -1783,6 +1784,9 @@ def test_error_codes_are_documented_in_one_place():
     raised_codes = (set(re.findall(r'CliError\(\s*"([a-z0-9_]+)"', source))
                     | set(re.findall(r'_error_bytes\(\s*"([a-z0-9_]+)"', source))
                     | set(re.findall(r'ProviderError\(\s*"([a-z0-9_]+)"', source))
+                    # The sglang adapter's parser raises its own exception type, which `web`
+                    # re-raises as a `CliError` with the same code (`_validate_args_sglang`).
+                    | set(re.findall(r'SglangArgsError\(\s*"([a-z0-9_]+)"', source))
                     | set(web_mod.ROUTER_CODES.values()))
 
     undocumented = raised_codes - set(ERROR_CODES)
