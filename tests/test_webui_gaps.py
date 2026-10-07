@@ -114,7 +114,7 @@ def test_new_video_creates_and_opens_the_project():
 
 @_needs_node
 def test_new_video_cancelled_creates_nothing():
-    assert _gaps("new_video_cancel") == {"posts": []}
+    assert _gaps("new_video_cancel") == {"posts": [], "alerts": [], "errHtml": ""}
 
 
 @_needs_node

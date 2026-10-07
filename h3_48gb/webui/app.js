@@ -273,7 +273,6 @@ export function runCancelHtml(job, engine) {
   return ` <button type="button" data-act="cancel-run" data-id="${escapeHtml(job.id)}">Отменить</button>`;
 }
 
-/** Запрос на правку карточки библиотеки: сервер сам заводит следующую версию (vN). */
 /** Название нового проекта по умолчанию: «Ролик ДД.ММ ЧЧ:ММ» по локальному времени. */
 export function defaultProjectTitle(date) {
   const two = (n) => String(n).padStart(2, "0");
@@ -286,6 +285,7 @@ export function newVideoRequest(title, now) {
   return { kind: "video", title: title.trim() || defaultProjectTitle(now) };
 }
 
+/** Запрос на правку карточки библиотеки: сервер сам заводит следующую версию (vN). */
 export function libraryUpdateRequest(tag, description) {
   return { name: tag.replace(/^@/, ""), body: { description } };
 }
