@@ -217,6 +217,7 @@ ERROR_CODES = {
     # Task 4 ("Сюжет клипа" wave): the human gate a clip's scenario goes through before
     # `build_clip_scenes` ever runs against it -- `POST .../scenario/generate` and `PUT
     # .../scenario` both.
+    "track_too_short": "an imported track is shorter than the shortest scene",
     "scenario_no_lyrics": "the track has neither real lyrics nor an auto-transcript (an "
                           "instrumental import Whisper found nothing to say) -- there is nothing "
                           "to write a scenario from; write one by hand through `PUT .../scenario` "

@@ -1016,8 +1016,9 @@ def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
     return errors
 
 
-def _snap_scene_duration(seconds: float, carry: float, *,
-                          chained: bool = False) -> tuple[float, float]:
+def _snap_scene_duration(seconds: float, carry: float, *, chained: bool = False,
+                          overlap_frames: int = _SCENE_LATENT_OVERLAP_FRAMES,
+                          round_up: bool = False) -> tuple[float, float]:
     """One scene's own duration, snapped onto H3's frame grid (C1, final review), and the leftover
     `carry` the caller should fold into the *next* scene's own target.
 
@@ -1067,10 +1068,18 @@ def _snap_scene_duration(seconds: float, carry: float, *,
     deliberately: the next scene must see that overspend and give the seconds back, and the total
     coverage check at the bottom of `build_clip_scenes` is what refuses honestly if there is no
     next scene left to give them back from.
+
+    **sglang** (`overlap_frames=_SGLANG_OVERLAP_FRAMES`, spec §4.1.5, §6): a chained scene repeats
+    one frame, not 22, so it snaps onto the `17k + 4` grid; `round_up=True` (the clip's last scene)
+    rounds *up* so the picture never ends before the song -- assembly trims the overshoot.
     """
-    remainder = _CHAINED_GRID_REMAINDER if chained else _H3_LATENTS_PER_CHUNK
+    remainder = ((_H3_LATENTS_PER_CHUNK - overlap_frames) % _H3_FRAMES_PER_CHUNK if chained
+                 else _H3_LATENTS_PER_CHUNK)
     target = seconds + carry
     frames = max(_H3_LATENTS_PER_CHUNK, round(target * _H3_FPS))
+    if round_up:
+        snapped = _grid_frames_at_or_above(frames, remainder=remainder) / _H3_FPS
+        return snapped, target - snapped
     snapped = _grid_frames_at_or_below(frames, remainder=remainder) / _H3_FPS
     if snapped < SCENE_MIN_SECONDS:
         snapped = _grid_frames_at_or_above(round(SCENE_MIN_SECONDS * _H3_FPS),
@@ -1625,6 +1634,8 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None,
     # remainder carried into the next scene's own target -- see `_snap_scene_duration`'s own
     # docstring for why down rather than nearest, and for the `SCENE_MIN_SECONDS`/
     # `SCENE_MAX_SECONDS` clamp.
+    sglang = engine.is_sglang()
+    overlap = _SGLANG_OVERLAP_FRAMES if sglang else _SCENE_LATENT_OVERLAP_FRAMES
     carry = 0.0
     scenes = []
     for i, seg in enumerate(expanded):
@@ -1637,7 +1648,9 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None,
         # `assemble` reads later from `project.json` -- deliberately not stored as a third field
         # a hand edit could put out of sync with the duration it explains.
         chained = i > 0 and not seg.get("fresh_start", False)
-        snapped, carry = _snap_scene_duration(seg["end"] - seg["start"], carry, chained=chained)
+        snapped, carry = _snap_scene_duration(seg["end"] - seg["start"], carry, chained=chained,
+                                              overlap_frames=overlap,
+                                              round_up=sglang and i == len(expanded) - 1)
         # `fresh_start` (P0 fix, keyframe-chain defect 2026-08-25): present on `seg` only for the
         # `scenario_scenes=` path (`_scenario_segments`/`_split_long_segment`, see their own
         # docstrings) -- the procedural path's own segments never carry it, so `.get(..., False)`
@@ -1657,8 +1670,14 @@ def build_clip_scenes(track: dict, *, style_block: str | None = None,
                        "keyframe_path": None, "fresh_start": seg.get("fresh_start", False)})
 
     snapped_total = sum(s["duration"] for s in scenes)
-    if not (duration - _SNAPPED_COVERAGE_SHORTFALL_SECONDS - _COVERAGE_TOLERANCE_SECONDS
-            <= snapped_total <= duration + _COVERAGE_TOLERANCE_SECONDS):
+    if sglang:
+        ok = (duration - _COVERAGE_TOLERANCE_SECONDS <= snapped_total
+              < duration + _H3_FRAMES_PER_CHUNK / _H3_FPS + _COVERAGE_TOLERANCE_SECONDS)
+        ok = ok and scenes[-1]["duration"] <= sglang_args.MAX_SECONDS
+    else:
+        ok = (duration - _SNAPPED_COVERAGE_SHORTFALL_SECONDS - _COVERAGE_TOLERANCE_SECONDS
+              <= snapped_total <= duration + _COVERAGE_TOLERANCE_SECONDS)
+    if not ok:
         raise ProjectSceneBuildError(
             f"scene durations snapped to H3's frame grid cover {snapped_total:.3f}s, track is "
             f"{duration:.3f}s -- outside the "
@@ -1899,7 +1918,23 @@ def _procedural_scenario_scenes(track: dict) -> list[dict]:
     return result
 
 
-def _scenario_context(lyrics: str, raw_segments: list[dict], caption: str, duration: float) -> str:
+def _equal_scenario_scenes(duration: float, caption: str) -> list[dict]:
+    """spec §3.3.10: no sections, no transcript -- equal pieces, as few as fit the 10 s ceiling
+    (each is then >= 5 s for any track >= 5 s). The human edits the prompts at the gate."""
+    count = max(1, math.ceil(duration / SCENE_MAX_SECONDS))
+    piece = duration / count
+    prompt = caption.strip() or "a music video scene matching the track's mood"
+    scenes = []
+    for i in range(count):
+        start = i * piece
+        end = duration if i == count - 1 else (i + 1) * piece
+        scenes.append({"tag": f"scene-{i}", "start": start, "end": end, "prompt": prompt,
+                       "duration": piece})
+    return scenes
+
+
+def _scenario_context(lyrics: str, raw_segments: list[dict], caption: str, duration: float, *,
+                      references_block: str = "") -> str:
     """The user turn `POST /scenario/generate` hands `provider.chat_scenario` -- lyrics **or** a
     raw Whisper transcript with timestamps (never both), `caption`, and the track's own measured
     `duration`: exactly the three things `docs/h3-prompt-system.md`'s "Clip scenario mode" section
@@ -1909,21 +1944,26 @@ def _scenario_context(lyrics: str, raw_segments: list[dict], caption: str, durat
     """
     if lyrics.strip():
         source = f"lyrics:\n{lyrics}"
-    else:
+    elif raw_segments:
         lines = "\n".join(
             f"[{seg.get('start')}-{seg.get('end')}] {seg.get('text', '')}" for seg in raw_segments)
         source = f"raw transcript with timestamps (Whisper, seconds):\n{lines}"
+    else:
+        source = ("no lyrics and no transcript: the track is an imported recording; build the "
+                  "scenes from the caption, the mood and the duration alone")
+    references = f"{references_block}\n\n" if references_block else ""
     return (f"## Context\nmode: clip_scenario\nduration: {duration:g} s\n\n"
-           f"caption:\n{caption}\n\n{source}\n\nWrite the clip's scenario now.")
+            f"caption:\n{caption}\n\n{source}\n\n{references}Write the clip's scenario now.")
 
 
 def _scenario_messages(lyrics: str, raw_segments: list[dict], caption: str,
-                       duration: float) -> list[dict]:
+                       duration: float, *, references_block: str = "") -> list[dict]:
     """The full `messages` list `provider.chat_scenario` needs for one, stateless, fire-and-forget
     turn -- no session, no history, unlike `_locked_turn`'s own chat turns: `/scenario/generate` is
     a single button press, not a conversation, so there is nothing to carry between calls."""
     return [{"role": "system", "content": provider.system_prompt()},
-            {"role": "user", "content": _scenario_context(lyrics, raw_segments, caption, duration)}]
+            {"role": "user", "content": _scenario_context(
+                lyrics, raw_segments, caption, duration, references_block=references_block)}]
 
 
 class _BadScenarioReply(Exception):
@@ -4527,7 +4567,11 @@ class _Handler(BaseHTTPRequestHandler):
                     self._restore_durations(proj, original)
                     raise
             elif proj.kind in ("clip", "song"):
-                result["submit"] = self._submit_project_song_job(proj)
+                if (engine.is_sglang() and proj.kind == "clip"
+                        and proj.track.get("source") == "import"):
+                    result["track"] = self._measure_imported_track(proj)
+                else:
+                    result["submit"] = self._submit_project_song_job(proj)
         elif stage == "track" and proj.kind == "clip":
             if proj.stages.get("scenario") == "approved" and not proj.scenario_scenes:
                 # Migration case: a `project.json` written before the scenario stage existed --
@@ -4576,6 +4620,23 @@ class _Handler(BaseHTTPRequestHandler):
         reloaded = project_module.load_project(proj.path)
         return 200, "application/json", _json_bytes(
             {"ok": True, **result, "project": _project_payload(reloaded)})
+
+    def _measure_imported_track(self, proj) -> dict:
+        """spec §3.3.10: on sglang an imported track is measured with ffprobe and approved as is
+        -- no song job, no Whisper; the mp3 itself is what assembly muxes in (`mastered_mp3`)."""
+        mp3 = Path(proj.track["mp3"])
+        try:
+            duration = songrun.probe_duration(mp3)
+        except songrun.SongRunError as exc:
+            raise CliError("project_scene_build_failed", f"трек не читается: {exc}",
+                           {"id": proj.id}) from exc
+        if duration < SCENE_MIN_SECONDS:
+            raise CliError("track_too_short",
+                           f"трек {duration:.1f} с короче минимальной сцены {SCENE_MIN_SECONDS:g} с",
+                           {"id": proj.id, "duration": duration})
+        proj.update_track(duration=duration, mastered_mp3=str(mp3), status="approved")
+        proj.set_stage_status("track", "approved")
+        return {"duration": duration}
 
     def _scenario_gate_project(self, raw_id: str) -> "project_module.Project":
         """`self._load_project(raw_id)`, refused (`project_stage_not_ready`, 409) unless this
@@ -4683,14 +4744,15 @@ class _Handler(BaseHTTPRequestHandler):
 
         if procedural:
             try:
-                scenes = _procedural_scenario_scenes(proj.track)
+                scenes = (_equal_scenario_scenes(float(duration), proj.track.get("caption") or "")
+                          if engine.is_sglang() else _procedural_scenario_scenes(proj.track))
             except ProjectSceneBuildError as exc:
                 raise CliError("project_scene_build_failed", str(exc), {"id": raw_id}) from exc
             style_block = None
         else:
             lyrics = proj.track.get("lyrics") or ""
             raw_segments = proj.track.get("raw_segments") or []
-            if not lyrics.strip() and not raw_segments:
+            if not lyrics.strip() and not raw_segments and not engine.is_sglang():
                 raise CliError(
                     "scenario_no_lyrics",
                     f"проект {raw_id}: нет ни лирики, ни авто-транскрипта — писать сценарий не "
@@ -4727,8 +4789,13 @@ class _Handler(BaseHTTPRequestHandler):
                     return 409, "application/json", _error_bytes(
                         "gpu_busy", "идёт прогон — модель поднимется после него",
                         {"running": _running_ids(running)})
+            references_block = ""
+            if proj.references:
+                cards = [library_module.get_card(self.server.outdir, ref["tag"], ref["version"])
+                         for ref in proj.references]
+                references_block = library_module.references_context(cards)
             messages = _scenario_messages(lyrics, raw_segments, proj.track.get("caption") or "",
-                                          float(duration))
+                                          float(duration), references_block=references_block)
             try:
                 if lam is not None:
                     lam.ensure_up()

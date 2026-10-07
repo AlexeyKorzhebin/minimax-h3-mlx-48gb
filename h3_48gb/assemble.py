@@ -791,6 +791,9 @@ def run(project_path, *, run=subprocess.run, log=None) -> Path:
             video_only = _pad_with_freeze_frame(
                 video_only, shortfall, assembly_dir / "pad", run=run)
             video_duration = _ffprobe_duration(video_only, run=run)
+        if engine.is_sglang() and video_duration - track_duration > _FREEZE_PAD_EPSILON_SECONDS:
+            video_only = _trim_video(video_only, track_duration, assembly_dir / "pad", run=run)
+            video_duration = _ffprobe_duration(video_only, run=run)
 
         if abs(video_duration - track_duration) > DURATION_TOLERANCE_SECONDS:
             raise AssembleError(
@@ -1234,6 +1237,42 @@ def _extract_last_frame(clip_path, dest_dir: Path, source_idx: int, *, run) -> P
     return out_path
 
 
+def _cut_track_piece(proj, idx: int, *, run) -> Path:
+    """spec §4.1.3/§4.3: the slice of the clip's track scene `idx` gets as its audio reference,
+    cut on the *snapped* frame grid. A chained scene's slice starts one frame early and runs one
+    frame longer -- its frame 0 repeats the previous scene's last frame and is dropped at
+    assembly together with its 1/24 s of audio, so what survives lines up with the track."""
+    scenes = sorted(proj.scenes, key=lambda scene: scene["idx"])
+    frames = [round(scene["duration"] * ASSEMBLY_FPS) for scene in scenes]
+    position = [scene["idx"] for scene in scenes].index(idx)
+    scene = scenes[position]
+    start = sum(frames[:position])
+    length = frames[position]
+    if position > 0 and not scene.get("fresh_start"):
+        start -= SGLANG_OVERLAP_FRAMES
+        length += SGLANG_OVERLAP_FRAMES
+    start = max(start, 0)
+    track = proj.track.get("mastered_mp3") or proj.track.get("mp3")
+    out_path = proj.path.parent / "track" / "pieces" / f"scene-{idx:03d}.wav"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{start / ASSEMBLY_FPS:.6f}",
+           "-t", f"{length / ASSEMBLY_FPS:.6f}", "-i", str(track), "-vn", "-ac", "2",
+           "-ar", "48000", "-c:a", "pcm_s16le", str(out_path)]
+    _run_ffmpeg(cmd, run, f"ffmpeg track piece for scene {idx}")
+    return out_path
+
+
+def _trim_video(video_path, seconds: float, workdir: Path, *, run) -> Path:
+    """sglang only: the last scene rounds *up* onto the grid (spec §4.1.5), so the picture may
+    run up to 17/24 s past the track. The picture is cut to the track; the song never is."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    out_path = workdir / "trimmed.mp4"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path), "-t", f"{seconds:.3f}",
+           "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-an", str(out_path)]
+    _run_ffmpeg(cmd, run, "ffmpeg trim to track")
+    return out_path
+
+
 def _scene_generate_args_sglang(scene: dict, *, keyframe, chained: bool, ref2va,
                                 track_piece, scenes_dir: Path,
                                 i2v_prefix: str = "") -> tuple[list[str], str]:
@@ -1295,7 +1334,7 @@ def _submit_next_scene_sglang(proj, scene: dict, queue_root, *, submit, run) -> 
         elif idx == 0 and proj.as_dict().get("start_image"):
             keyframe = Path(proj.as_dict()["start_image"])
         ref2va = library.build_ref2va(scene["prompt"], proj.references, outdir)
-        track_piece = None
+        track_piece = _cut_track_piece(proj, idx, run=run) if proj.kind == "clip" else None
         scenes_dir = proj.path.parent / "scenes"
         args, output_stem = _scene_generate_args_sglang(
             scene, keyframe=keyframe, chained=chained, ref2va=ref2va, track_piece=track_piece,
