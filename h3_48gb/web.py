@@ -4613,6 +4613,15 @@ class _Handler(BaseHTTPRequestHandler):
                         for s in fresh.scenes]
         fresh.save()
 
+    @staticmethod
+    def _restore_scenes_stage(proj, before) -> None:
+        """A refused approval also leaves `stages.scenes` as it was: `advance_project` sets it
+        `running` when it claims the first scene, and the claim is rolled back on a refusal, so a
+        stage left `running` would turn `PUT /scenes` away (it wants `draft`)."""
+        fresh = project_module.load_project(proj.path)
+        if fresh.stages.get("scenes") == "running" and before in ("draft", "approved"):
+            fresh.set_stage_status("scenes", before)
+
     def _refuse_bad_scene_references(self, proj, scenes) -> None:
         errors = _scene_reference_errors(proj, scenes, self.server.outdir)
         if errors:
@@ -4731,14 +4740,17 @@ class _Handler(BaseHTTPRequestHandler):
                     proj.save()
                 else:
                     original = None
+                scenes_before = proj.stages.get("scenes")
                 try:
                     result["advance"] = assemble_module.advance_project(
                         proj, self.server.queue_root, self.server.outdir)
                 except (library_module.LibraryError, sglang_args.SglangArgsError) as exc:
                     self._restore_durations(proj, original)
+                    self._restore_scenes_stage(proj, scenes_before)
                     raise CliError(exc.code, exc.message, getattr(exc, "detail", {})) from exc
                 except Exception:
                     self._restore_durations(proj, original)
+                    self._restore_scenes_stage(proj, scenes_before)
                     raise
             elif proj.kind in ("clip", "song"):
                 if (engine.is_sglang() and proj.kind == "clip"

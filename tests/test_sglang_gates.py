@@ -1,7 +1,10 @@
 """Gates on sglang: durations snapped to the delivered grid, @tags checked before a single scene
 is queued (spec §3.3.5, §3.5, §4.1.5), and the chat seeing the library tags."""
+import sys
+
 import pytest
 
+from h3_48gb import assemble
 from h3_48gb import library as lib
 from h3_48gb import project as p
 from h3_48gb import queue as q
@@ -60,6 +63,28 @@ def test_every_scene_without_a_tag_is_refused_and_nothing_is_queued(live):
     assert reloaded.stages["script"] == "awaiting_approval"
     assert [s["duration"] for s in reloaded.scenes] == [7.0, 7.0, 7.0]
     assert _pending(live) == []
+
+
+def test_a_refusal_at_approval_leaves_scenes_editable_again(live, monkeypatch):
+    """Final re-review: `advance_project` sets stages.scenes `running` before it builds the first
+    scene's arguments; a refusal there rolled the scene and the durations back but left the stage
+    `running`, so `PUT /scenes` (which wants `draft`) refused the fix."""
+    real = assemble._scene_generate_args_sglang
+
+    def refuse(*args, **kwargs):          # the pre-check calls it too; only the claimed submit fails
+        if sys._getframe(1).f_code.co_name == "_submit_next_scene_sglang":
+            raise sa.SglangArgsError("sglang_args_invalid", "refused after the claim")
+        return real(*args, **kwargs)
+    monkeypatch.setattr(assemble, "_scene_generate_args_sglang", refuse)
+    proj = _video(live, ["@alice sits"], [7.0])
+    status, body = _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})
+    assert (status, body["error"]["code"]) == (400, "sglang_args_invalid")
+    reloaded = p.load_project(proj.path)
+    assert reloaded.stages["scenes"] == "draft"
+    assert [(s["status"], s["duration"]) for s in reloaded.scenes] == [("pending", 7.0)]
+    status, body = _call(live, "PUT", f"/api/projects/{proj.id}/scenes",
+                         {"scenes": [{"prompt": "@alice waves", "duration": 7}]})
+    assert status == 200, body
 
 
 def test_settings_route_changes_the_i2v_prefix(live):
