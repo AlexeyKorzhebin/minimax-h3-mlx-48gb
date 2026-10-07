@@ -74,7 +74,7 @@
   о прогоне (`tools/battle_report.py`) читал одно место.
 
 ## Не менять
-- Протокол LLM — OpenAI-совместимый (CAILA, Qwen, OpenRouter); выбор модели — волна 1.6.
+- Протокол LLM — OpenAI-совместимый (CAILA, Qwen, OpenRouter); выбор модели — волна 2 (владелец 08.10 отложил; общий слой с ai-writer — обсудить).
 - Диспетчер GPU на хосте (systemd), движки на хосте, панель в Docker.
 - Медиа на диске в `/home/alex/Outputs/h3-panel`.
 
