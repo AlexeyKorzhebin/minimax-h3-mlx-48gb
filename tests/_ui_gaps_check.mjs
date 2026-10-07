@@ -77,7 +77,7 @@ const SCENARIOS = {
     await start(appUrl, draftRoutes({ "PUT /api/projects/p1/references": ok({ ok: true, references: [] }) }));
     await open();
     queryAll[FIELDS] = [field("prompt", 0, "@a jumps")];
-    // the real handler (app.js:5064-5070): target.closest(".project-refs") -> box.querySelectorAll(".ref-pin")
+    // the real handler (app.js:5334, the document `change` listener): target.closest(".project-refs") -> box.querySelectorAll(".ref-pin")
     const pin = { checked: true, dataset: { tag: "@a" }, classList: { contains: (c) => c === "ref-pin" } };
     const box = { dataset: { id: "p1" }, querySelectorAll: (sel) => (sel === ".ref-pin" ? [pin] : []) };
     pin.closest = (sel) => (sel === ".project-refs" ? box : null);
@@ -115,7 +115,7 @@ const SCENARIOS = {
     const hint = { textContent: "на сетке: 8 с" };
     queryOne['#project-body .grid-hint[data-idx="0"]'] = hint;
     const input = { value: "4", dataset: { sceneField: "duration", idx: "0" },
-      closest(sel) { return sel === '[data-scene-field="duration"]' ? this : null; } };
+      closest(sel) { return sel === "[data-scene-field]" ? this : null; } };
     fire("input", input);
     return { hint: hint.textContent };
   },
@@ -131,6 +131,58 @@ const SCENARIOS = {
     queryAll[FIELDS] = [box];
     fire("change", box);
     return { hint: hint.textContent };
+  },
+  async editor_save_resets_from_answer() {
+    const server = PROJECT({ ...DRAFT_PROJECT.project, scenes: DRAFT_PROJECT.project.scenes.map(
+      (s) => (s.idx === 0 ? { ...s, prompt: "@a server text" } : s)) });
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1": ok(DRAFT_PROJECT),
+      "PUT /api/projects/p1/scenes": ok({ ok: true, project: server.project }) }));
+    await open();
+    queryAll[FIELDS] = [field("prompt", 0, "@a jumps")];
+    await act("scenes-save");           // the stale fields stay in queryAll through the redraw
+    await act("scenes-save");
+    return { puts: puts().map(([url, body]) => [url, body.scenes.map((s) => s.prompt)]) };
+  },
+  async editor_save_resets_when_reread_fails() {
+    const server = PROJECT({ ...DRAFT_PROJECT.project, scenes: DRAFT_PROJECT.project.scenes.map(
+      (s) => (s.idx === 0 ? { ...s, prompt: "@a server text" } : s)) });
+    await start(appUrl, draftRoutes({ "PUT /api/projects/p1/scenes": ok({ ok: true, project: server.project }) }));
+    await open();
+    queryAll[FIELDS] = [field("prompt", 0, "@a jumps")];
+    routes["GET /api/projects/p1"] = err(500, "boom", "down");   // the re-read after the save fails
+    await act("scenes-save");
+    // an unrelated redraw (the person pins a reference) must not bring the typed text back
+    routes["GET /api/projects/p1"] = ok(DRAFT_PROJECT);
+    routes["PUT /api/projects/p1/references"] = ok({ ok: true, references: [] });
+    const pin = { checked: true, dataset: { tag: "@a" }, classList: { contains: (c) => c === "ref-pin" } };
+    const box = { dataset: { id: "p1" }, querySelectorAll: (sel) => (sel === ".ref-pin" ? [pin] : []) };
+    pin.closest = (sel) => (sel === ".project-refs" ? box : null);
+    fire("change", pin);
+    await sleep(120);
+    liveEditor();
+    await act("scenes-save");
+    return { puts: puts().filter(([url]) => url === "/api/projects/p1/scenes")
+      .map(([url, body]) => [url, body.scenes.map((s) => s.prompt)]) };
+  },
+  async editor_client_error_seed() {
+    await start(appUrl, draftRoutes());
+    await open();
+    queryAll[FIELDS] = [field("seed", 1, "-1")];
+    await act("scenes-save");
+    const body = getElementById("project-body").innerHTML;
+    return { puts: puts(), inline: body.match(/<span class="hint bad scene-edit-error"[^>]*>[^<]*<\/span>/)[0] };
+  },
+  async editor_dirty_note_on_input() {
+    await start(appUrl, draftRoutes());
+    await open();
+    const note = { hidden: true };
+    queryOne["#project-body .dirty-note"] = note;
+    const hiddenBefore = note.hidden;
+    const input = { value: "@a jumps", dataset: { sceneField: "prompt", idx: "0" },
+      closest(sel) { return sel === "[data-scene-field]" ? this : null; } };
+    queryAll[FIELDS] = [input];
+    fire("input", input);
+    return { hiddenBefore, hiddenAfter: note.hidden };
   },
   async editor_close_unsaved() {
     await start(appUrl, draftRoutes());

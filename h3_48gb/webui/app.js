@@ -293,14 +293,31 @@ export function moveScene(draft, idx, delta) {
   return pinStartImage(moved, draft[0].start_image);
 }
 
-export function scenesClientError(draft, engine) {
+/** The first thing the server would refuse, with the scene it belongs to: `{idx, message}`. Seed
+ *  and steps exist only on sglang (`web._scene_edit_fields`: seed integer >= 0, steps 2..100). */
+export function scenesClientIssue(draft, engine) {
   const { min, max } = sceneBounds(engine);
+  const sglang = engine === "sglang";
+  const whole = (v) => typeof v === "number" && Number.isInteger(v);
   for (let i = 0; i < draft.length; i += 1) {
-    if (!String(draft[i].prompt || "").trim()) return `Сцена #${i}: пустой промпт`;
-    const d = Number(draft[i].duration);
-    if (!Number.isFinite(d) || d < min || d > max) return `Сцена #${i}: длительность ${min}–${max} с`;
+    const scene = draft[i];
+    const issue = (text) => ({ idx: i, message: `Сцена #${i}: ${text}` });
+    if (!String(scene.prompt || "").trim()) return issue("пустой промпт");
+    const d = Number(scene.duration);
+    if (!Number.isFinite(d) || d < min || d > max) return issue(`длительность ${min}–${max} с`);
+    const seed = scene.seed ?? null;
+    const steps = scene.steps ?? null;
+    if (sglang && seed !== null && !(whole(seed) && seed >= 0)) return issue("сид — целое число от 0");
+    if (sglang && steps !== null && !(whole(steps) && steps >= 2 && steps <= 100)) {
+      return issue("шаги — целое число от 2 до 100");
+    }
   }
   return null;
+}
+
+export function scenesClientError(draft, engine) {
+  const issue = scenesClientIssue(draft, engine);
+  return issue ? issue.message : null;
 }
 
 /** Тело `PUT /scenes`. seed/steps/refs уходят только на sglang: на MLX сервер их отклоняет. */
@@ -357,7 +374,10 @@ function sceneEditHtml(scene, idx, total, ctx) {
     + button("scene-up", "↑", idx === 0) + button("scene-down", "↓", idx === total - 1)
     + (total > 1 ? button("scene-del", "Удалить", false) : "") + `</div>`
     + `<textarea class="inp scene-edit-prompt" data-scene-field="prompt" data-idx="${idx}" rows="4">`
-    + `${escapeHtml(scene.prompt)}</textarea><div class="scene-edit-row">${row.join("")}</div></div>`;
+    + `${escapeHtml(scene.prompt)}</textarea><div class="scene-edit-row">${row.join("")}</div>`
+    + (ctx.error && ctx.error.idx === idx
+      ? `<span class="hint bad scene-edit-error" data-idx="${idx}">${escapeHtml(ctx.error.message)}</span>` : "")
+    + `</div>`;
 }
 
 /** Редактор сцен: поля несут `data-scene-field`/`data-idx`, кнопки — `data-act`; `ctx.epoch` —
@@ -370,7 +390,7 @@ export function sceneEditorHtml(draft, ctx) {
     + `<div class="scene-editor-acts">`
     + `<button type="button" class="ghost" data-act="scene-add" data-id="${id}">+ Сцена</button>`
     + `<button type="button" class="inverse" data-act="scenes-save" data-id="${id}">Сохранить сценарий</button>`
-    + (ctx.dirty ? `<span class="dirty-note">не сохранено</span>` : "") + `</div></div>`;
+    + `<span class="dirty-note"${ctx.dirty ? "" : " hidden"}>не сохранено</span></div></div>`;
 }
 
 /** Подсказка на `@`: карточки, чей тег начинается с набранного после последнего `@` до каретки. */
@@ -2722,7 +2742,8 @@ function startPage() {
   let sceneDraft = null;        // Draft[] of the open video project's scene editor, or null
   let sceneDraftDirty = false;  // the person changed something the server has not seen
   let draftEpoch = 0;           // version of the draft the editor DOM was drawn from
-  let draftResetPending = false; // the next project read replaces the draft with the server's scenes
+  let sceneDraftError = null;   // {idx, message} of the last client-side refusal, shown by that scene
+  let draftResetPending = false; // the next project read (opening the panel) replaces the draft with the server's scenes
   let projectBusy = false;     // идёт запрос, меняющий проект — та же роль, что `busy` у очереди
   /** Роспись `/api/providers`, для селектора провайдера в этапе «Сюжет» (Task 2, "выбор
    *  провайдера для сценария") — своя копия, не `chat.providers`: панель проектов открывается
@@ -3219,6 +3240,7 @@ function startPage() {
     const draft = draftFromScenes(proj.scenes || []);
     sceneDraft = draft.length ? draft : addScene([]);
     sceneDraftDirty = false;
+    sceneDraftError = null;
     draftEpoch += 1;
   }
 
@@ -3248,6 +3270,7 @@ function startPage() {
     syncDraftFromDom();
     sceneDraft = change(sceneDraft);
     sceneDraftDirty = true;
+    sceneDraftError = null;
     draftEpoch += 1;
     renderProjectModal();
   }
@@ -3256,15 +3279,19 @@ function startPage() {
    *  `withProject` shows it in the project error banner and nothing goes to the server. */
   async function saveSceneDraft(id) {
     const engine = state && state.engine;
-    const message = scenesClientError(sceneDraft, engine);
-    if (message) {
-      const error = new Error(message);
-      error.payload = { error: { message } };
+    const issue = scenesClientIssue(sceneDraft, engine);
+    sceneDraftError = issue;
+    if (issue) {
+      const error = new Error(issue.message);
+      error.payload = { error: { message: issue.message } };
       throw error;
     }
-    await api("PUT", `/api/projects/${encodeURIComponent(id)}/scenes`, scenesPayload(sceneDraft, engine));
-    sceneDraftDirty = false;
-    draftResetPending = true;
+    const answer = await api("PUT", `/api/projects/${encodeURIComponent(id)}/scenes`,
+                             scenesPayload(sceneDraft, engine));
+    // The server's answer is the one source of truth: replace the draft now, not at the next read
+    // (that read may fail, and whatever is typed meanwhile must not be silently overwritten later).
+    if (answer && answer.project) resetSceneDraft(answer.project);
+    else sceneDraftDirty = false;
   }
 
   function requestCloseProject() {
@@ -3283,7 +3310,8 @@ function startPage() {
     let body;
     if (sceneDraft && sceneEditorActive(proj)) {
       body = sceneEditorHtml(sceneDraft, { id: proj.id, engine: state && state.engine,
-        projectSeed: proj.seed ?? null, dirty: sceneDraftDirty, epoch: draftEpoch });
+        projectSeed: proj.seed ?? null, dirty: sceneDraftDirty, epoch: draftEpoch,
+        error: sceneDraftError });
     } else if (proj.kind === "video") {
       const n = proj.scenes.length;
       body = n
@@ -5387,20 +5415,30 @@ function startPage() {
     hint.textContent = gridHint(sglangGridSeconds(duration, chained));
   }
 
+  /** «не сохранено» appears as soon as a field changes, without waiting for a redraw. */
+  function showDirtyNote() {
+    const note = document.querySelector("#project-body .dirty-note");
+    if (note) note.hidden = !sceneDraftDirty;
+  }
+
   // Ticking «начать с чистого листа» changes whether the scene is chained, hence its grid.
   document.addEventListener("change", (event) => {
     const box = event.target.closest('[data-scene-field="fresh_start"]');
     if (!box) return;
     syncDraftFromDom();
+    showDirtyNote();
     const idx = Number(box.dataset.idx);
     if (sceneDraft && sceneDraft[idx]) updateGridHint(idx, sceneDraft[idx].duration);
   });
 
   document.addEventListener("input", (event) => {
-    const durationField = event.target.closest('[data-scene-field="duration"]');
-    if (durationField) {
+    const sceneField = event.target.closest("[data-scene-field]");
+    if (sceneField) {
       syncDraftFromDom();
-      updateGridHint(Number(durationField.dataset.idx), Number(String(durationField.value).replace(",", ".")));
+      showDirtyNote();
+      if (sceneField.dataset.sceneField === "duration") {
+        updateGridHint(Number(sceneField.dataset.idx), Number(String(sceneField.value).replace(",", ".")));
+      }
       return;
     }
     const el = event.target.closest(".scenario-prompt");

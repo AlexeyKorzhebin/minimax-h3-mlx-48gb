@@ -48,6 +48,9 @@ CLASS_SOURCES = [
     "app.sceneEditorHtml([{prompt: 'a', duration: 8, fresh_start: false, seed: null, steps: null, "
     "start_image: null, refs: []}], {id: 'p1', engine: 'mlx', projectSeed: null, dirty: false, "
     "epoch: 0})",
+    "app.sceneEditorHtml([{prompt: 'a', duration: 8, fresh_start: false, seed: -1, steps: null, "
+    "start_image: null, refs: []}], {id: 'p1', engine: 'sglang', projectSeed: null, dirty: true, "
+    "epoch: 0, error: {idx: 0, message: 'm'}})",
 ]
 
 
@@ -135,7 +138,8 @@ def test_new_chat_opens_an_empty_session_on_sglang():
         "duration": 10}]]}
 
 
-GRID_TABLE = [3, 4, 5, 8, 10.3, 15]
+# the last two are ties (x.5 frames): Python rounds them to even, Math.round up
+GRID_TABLE = [3, 4, 5, 8, 10.3, 15, 3.3541666666666665, 4.104166666666667]
 
 
 @_needs_node
@@ -148,6 +152,7 @@ def test_grid_hint_matches_the_server_snap():
     # the literal table, so a change of the rule on both sides is still seen
     assert server[2] == [5.166666666666667, 5.125, 5.166666666666667]
     assert server[5] == [14.375, 14.333333333333334, 14.375]
+    assert server[6][0] == 3.0416666666666665 and server[7][0] == 3.75
 
 
 @_needs_node
@@ -204,6 +209,36 @@ def test_client_error_names_the_scene():
 
 
 @_needs_node
+def test_client_error_checks_seed_and_steps_on_sglang_only():
+    def err(field, value, engine="sglang"):
+        return _js("app.scenesClientError([{prompt: 'x', duration: 8}, {prompt: 'y', duration: 8, "
+                   f"{field}: {'null' if value is None else value}}}], '{engine}')")
+    assert err("seed", 1.5) == "Сцена #1: сид — целое число от 0"
+    assert err("seed", -1) == "Сцена #1: сид — целое число от 0"
+    assert err("steps", 1) == "Сцена #1: шаги — целое число от 2 до 100"
+    assert err("steps", 101) == "Сцена #1: шаги — целое число от 2 до 100"
+    assert err("steps", 30.5) == "Сцена #1: шаги — целое число от 2 до 100"
+    assert [err("seed", 0), err("seed", 305), err("steps", 2), err("steps", 100), err("seed", None)] \
+        == [None] * 5
+    assert err("seed", 1.5, "mlx") is None     # the field is not on the page and never sent
+
+
+@_needs_node
+def test_editor_html_marks_the_scene_with_a_client_error():
+    html = _js("app.sceneEditorHtml([{prompt: 'a', duration: 8, fresh_start: false, seed: 1.5, "
+               "steps: null, start_image: null, refs: []}], {id: 'p1', engine: 'sglang', "
+               "projectSeed: null, dirty: true, epoch: 0, error: {idx: 0, "
+               "message: 'Сцена #0: сид — целое число от 0'}})")
+    assert '</div><span class="hint bad scene-edit-error" data-idx="0">' \
+        'Сцена #0: сид — целое число от 0</span></div><div class="scene-editor-acts">' in html
+
+
+def test_disabled_ghost_buttons_look_disabled():
+    css = re.sub(r"\s+", " ", _page_text("style.css"))
+    assert "button.ghost:disabled {" in css
+
+
+@_needs_node
 def test_seed_helpers():
     assert _js("[app.randomSeed(() => 0.5), app.seedPlaceholder(305), app.seedPlaceholder(null)]") \
         == [1073741824, "по проекту: 305", "по умолчанию: 42"]
@@ -238,6 +273,7 @@ def test_editor_html_for_one_scene_on_sglang():
         '<div class="scene-editor-acts">'
         '<button type="button" class="ghost" data-act="scene-add" data-id="p1">+ Сцена</button>'
         '<button type="button" class="inverse" data-act="scenes-save" data-id="p1">Сохранить сценарий</button>'
+        '<span class="dirty-note" hidden>не сохранено</span>'
         '</div></div>')
 
 
@@ -299,6 +335,17 @@ EDITOR_EXPECTED = {
     "editor_grid_hint_live": {"hint": "на сетке: 3,75 с"},
     # a scene that stops being fresh is chained: 5 s lands on 17n+4 frames, not 17n+5
     "editor_grid_hint_follows_fresh_start": {"hint": "на сетке: 5,13 с"},
+    # the save answer replaces the draft at once (the re-read may fail): the second save sends the
+    # server's text, not the one typed before the first
+    "editor_save_resets_from_answer": {"puts": [
+        ["/api/projects/p1/scenes", ["@a jumps", "@a runs"]],
+        ["/api/projects/p1/scenes", ["@a server text", "@a runs"]]]},
+    "editor_save_resets_when_reread_fails": {"puts": [
+        ["/api/projects/p1/scenes", ["@a jumps", "@a runs"]],
+        ["/api/projects/p1/scenes", ["@a server text", "@a runs"]]]},
+    "editor_client_error_seed": {"puts": [], "inline": '<span class="hint bad scene-edit-error" '
+        'data-idx="1">Сцена #1: сид — целое число от 0</span>'},
+    "editor_dirty_note_on_input": {"hiddenBefore": True, "hiddenAfter": False},
     "editor_close_unsaved": {"confirms": ["Закрыть без сохранения сценария?"], "hidden": False},
     # Н1: after «↓» the stale DOM (old idx 0 = «@a walks far») must not overwrite the moved draft
     "editor_move_keeps_scenes": {"puts": [["/api/projects/p1/scenes", {"scenes": [
