@@ -13,6 +13,7 @@ import re
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -274,6 +275,27 @@ def load_providers(root) -> dict:
             cfg["available"], cfg["reason"] = True, None
         providers[name] = cfg
     return {"active": data.get("active"), "providers": providers}
+
+
+#: Hosts that mean "this machine" -- a provider served from one of them takes the GPU the render
+#: needs (or the machine's memory), which the page warns about.
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "host.docker.internal"})
+
+
+def shares_gpu(cfg: dict) -> bool | None:
+    """Whether this provider competes with the renderer for the GPU: `True`/`False` when known,
+    `None` when it cannot be told. An explicit `shares_gpu` boolean in the entry wins; otherwise a
+    `llama-local` provider, or one whose `base_url` host is this machine, shares it."""
+    explicit = cfg.get("shares_gpu")
+    if isinstance(explicit, bool):
+        return explicit
+    if cfg.get("type") == "llama-local":
+        return True
+    try:
+        host = urllib.parse.urlsplit(cfg.get("base_url") or "").hostname
+    except ValueError:
+        return None
+    return True if host in _LOCAL_HOSTS else None
 
 
 def local_ports(roster: dict) -> list[int]:

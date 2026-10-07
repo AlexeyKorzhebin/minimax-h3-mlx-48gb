@@ -264,8 +264,9 @@ UPLOAD_DIR = "uploads"
 #: What a chat session may say it was opened from. A closed list, and checked on creation: a
 #: session whose `kind` the page does not know is one the page can never open again, and the honest
 #: moment to say so is the moment it is written. `clip` is accepted and stored but not yet acted on
-#: -- the "проекты" spec is what gives it meaning.
-CHAT_SOURCE_KINDS = frozenset({"new", "prompt", "job", "clip"})
+#: -- the "проекты" spec is what gives it meaning. `project` (wave 1.5, spec §5.4) is the chat of an
+#: existing project: `id` must name one, and the session starts with that project's tags.
+CHAT_SOURCE_KINDS = frozenset({"new", "prompt", "job", "clip", "project"})
 
 #: The keys a `source` may carry beside `kind`: which prompt file, or which job/clip id.
 CHAT_SOURCE_KEYS = frozenset({"kind", "name", "id"})
@@ -4570,6 +4571,14 @@ class _Handler(BaseHTTPRequestHandler):
                 {"kind": kind, "kinds": sorted(PROJECT_KINDS)})
 
         scenes: list[dict] = []
+        low, high = ((sglang_args.MIN_SECONDS, sglang_args.MAX_SECONDS) if engine.is_sglang()
+                     else (SCENE_MIN_SECONDS, SCENE_MAX_SECONDS))
+        # The session's tags become the project's references, each on its latest version; an
+        # unknown tag refuses before a project directory exists.
+        pinned: list[dict] = []
+        if kind == "video" and session:
+            pinned = self._pinned_references(
+                [{"tag": t} for t in dict.fromkeys(session.get("tags") or [])])
         if kind == "video" and session_project:
             raw_scenes = session_project.get("scenes")
             if raw_scenes is not None:
@@ -4605,13 +4614,13 @@ class _Handler(BaseHTTPRequestHandler):
                     # `SCENE_MIN_SECONDS`/`SCENE_MAX_SECONDS` `build_clip_scenes` itself enforces
                     # for a `kind="clip"` project's own automatically-built scenes, so a
                     # `kind="video"` project's hand-written ones answer to the identical contract.
-                    if not (SCENE_MIN_SECONDS <= duration <= SCENE_MAX_SECONDS):
+                    # Wave 1.5: on sglang the range is sglang's own (3..15 s).
+                    if not (low <= duration <= high):
                         raise CliError(
                             "args_invalid",
                             f"session `project.scenes[{i}].duration` must be between "
-                            f"{SCENE_MIN_SECONDS} and {SCENE_MAX_SECONDS} seconds, got {duration}",
-                            {"index": i, "duration": duration, "min": SCENE_MIN_SECONDS,
-                             "max": SCENE_MAX_SECONDS})
+                            f"{low:g} and {high:g} seconds, got {duration}",
+                            {"index": i, "duration": duration, "min": low, "max": high})
                     scenes.append({"idx": i, "prompt": prompt, "duration": float(duration),
                                    "status": "pending", "job_id": None, "clip_path": None,
                                    "keyframe_path": None})
@@ -4670,6 +4679,7 @@ class _Handler(BaseHTTPRequestHandler):
         proj = project_module.create_project(self.server.outdir, kind, title)
         if kind == "video":
             proj.scenes = scenes
+            proj.references = pinned
             if scenes:
                 proj.stages["script"] = "awaiting_approval"
         else:
@@ -5607,7 +5617,7 @@ class _Handler(BaseHTTPRequestHandler):
         """
         roster = provider.load_providers(self.server.outdir)
         listed = [{"name": name, "type": cfg.get("type"), "available": cfg.get("available"),
-                   "reason": cfg.get("reason")} for name, cfg in roster["providers"].items()]
+                   "reason": cfg.get("reason"), "shares_gpu": provider.shares_gpu(cfg)} for name, cfg in roster["providers"].items()]
         return 200, "application/json", _json_bytes(
             {"ok": True, "active": roster["active"], "providers": listed})
 
@@ -5973,8 +5983,17 @@ class _Handler(BaseHTTPRequestHandler):
         # `mode` does.
         duration = self._number_of(payload, "duration", DEFAULT_CHAT_DURATION)
         self._check_chat_duration(duration)
+        # Wave 1.5, spec §5.4: the chat of an existing project. The project must exist (the page
+        # opens a chat for something it has just listed, so a miss is a stale page, not a typo to
+        # swallow), and the session starts with the project's pinned tags and its kind, so the
+        # model sees `kind: video` from the first turn instead of waiting to invent it.
+        project_fields: dict = {}
+        if source["kind"] == "project":
+            proj = self._load_project(source.get("id") if isinstance(source.get("id"), str) else "")
+            project_fields = {"tags": [ref["tag"] for ref in proj.references], "kind": proj.kind}
         session = {"id": secrets.token_hex(4),
                    "source": source,
+                   **project_fields,
                    "mode": mode,
                    "image": str(self._chat_image_path(image)) if image else "",
                    "end_image": str(self._chat_image_path(end_image)) if end_image else "",
@@ -6220,6 +6239,10 @@ class _Handler(BaseHTTPRequestHandler):
         # present, it rides every later turn's context so the model does not lose track of which
         # kind of project it already committed this session to.
         kind_line = f"\nkind: {session['kind']}" if session.get("kind") else ""
+        # Wave 1.5: the range a *scene* may take on the engine that will render it (sglang 3-15 s,
+        # MLX 5-10 s) -- `duration` above is the clip the person is editing, not a scene.
+        scene_low, scene_high = ((sglang_args.MIN_SECONDS, sglang_args.MAX_SECONDS)
+                                 if engine.is_sglang() else (SCENE_MIN_SECONDS, SCENE_MAX_SECONDS))
         raw_tags = payload.get("tags")
         if raw_tags is not None:
             if not isinstance(raw_tags, list) or not all(isinstance(t, str) for t in raw_tags):
@@ -6236,6 +6259,7 @@ class _Handler(BaseHTTPRequestHandler):
         system = (provider.system_prompt()
                   + "\n\n## Context\nmode: " + (session.get("mode") or DEFAULT_CHAT_MODE)
                   + f"\nduration: {duration:g} s"
+                  + f"\nscene duration: {scene_low:g}–{scene_high:g} s"
                   + kind_line
                   + end_image_line
                   + "\n\n## Current prompt\n" + self._string_of(payload, "prompt")
