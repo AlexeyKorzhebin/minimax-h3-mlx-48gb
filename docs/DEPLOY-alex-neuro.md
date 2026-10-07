@@ -160,6 +160,9 @@ curl -s -X POST $P/api/projects/$ID/approve/script -H 'Content-Type: application
   — 191 доставленный (запрос 192).
 - Необязательные поля сцены: `seed` (целое ≥ 0; порядок: seed сцены → seed проекта → 42) и `steps`
   (целое 2..100, по умолчанию 50; только sglang) — идут в payload (`seed`, `num_inference_steps`).
+  `seed`, `steps`, `refs` и seed проекта — только sglang; на MLX отказ `args_invalid`
+  («is only for the sglang engine»). `project.seed` относится к сценам видео и не связан с
+  `track.seed` песни. Оценка времени и история сцен учитывают `steps` (старые записи — 50 шагов).
   Seed проекта: `PUT /api/projects/<id>/settings` `{"seed": 7}` (`null` снимает), вместе с `i2v_prefix`.
 - Каждая сцена обязана иметь хотя бы один референс: `@тег` в тексте или в `refs` (ref2va без
   референса сервер не берёт; иначе `ref2va_needs_reference` при «Утвердить»).

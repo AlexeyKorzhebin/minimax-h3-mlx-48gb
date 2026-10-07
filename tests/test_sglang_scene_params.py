@@ -115,3 +115,77 @@ def test_settings_validate_seed_and_keep_i2v_prefix_changes(live):
     assert (status, body["project"]["i2v_prefix"], body["project"]["seed"]) == (200, "Go on.", 11)
     status, body = _call(live, "PUT", path, {"seed": None})
     assert (status, body["project"]["seed"], body["project"]["i2v_prefix"]) == (200, None, "Go on.")
+
+
+# == Fix round 1 =================================================================================
+
+
+def test_retry_and_invalidate_keep_seed_steps_and_refs_of_the_scene(live):
+    proj = p.create_project(live.outdir, "video", "Retry")
+    scene = {"prompt": "no tag here", "duration": 8, "seed": 7, "steps": 30, "refs": ["@amazon"]}
+    assert _put(live, proj, [scene])[0] == 200
+    assert _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})[0] == 200
+    (first,) = _pending(live)
+    status, body = _call(live, "POST", f"/api/projects/{proj.id}/scenes/0/retry", {})
+    assert status == 200, body
+    (again,) = _pending(live)
+    assert again.id != first.id
+    spec = sa.parse(again.args, check_files=False)
+    assert (spec.seed, spec.steps, spec.refs) == (7, 30, sa.parse(first.args, check_files=False).refs)
+    assert len(spec.refs) == 1
+    kept = p.load_project(proj.path).scenes[0]
+    assert (kept["seed"], kept["steps"], kept["refs"]) == (7, 30, ["@amazon"])
+
+
+def test_invalidate_scene_chain_keeps_the_new_fields(live):
+    proj = p.create_project(live.outdir, "video", "Chain")
+    assert _put(live, proj, [{"prompt": "@amazon a", "duration": 8, "seed": 0, "steps": 12,
+                              "refs": ["@amazon"]},
+                             {"prompt": "@amazon b", "duration": 8, "seed": 3}])[0] == 200
+    loaded = p.load_project(proj.path)
+    loaded.invalidate_scene_chain(0)
+    scenes = p.load_project(proj.path).scenes
+    assert [(s.get("seed"), s.get("steps"), s.get("refs")) for s in scenes] == [
+        (0, 12, ["@amazon"]), (3, None, None)]
+
+
+def test_a_scene_seed_of_zero_is_a_seed_not_a_missing_one(live):
+    proj = p.create_project(live.outdir, "video", "Zero")
+    assert _call(live, "PUT", f"/api/projects/{proj.id}/settings", {"seed": 5})[0] == 200
+    assert _put(live, proj, [{"prompt": "@amazon walks", "duration": 8, "seed": 0}])[0] == 200
+    assert _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})[0] == 200
+    (job,) = _pending(live)
+    assert sa.parse(job.args, check_files=False).seed == 0
+
+
+def test_duplicate_refs_are_stored_once_in_first_seen_order(live):
+    proj = p.create_project(live.outdir, "video", "Dups")
+    status, body = _put(live, proj, [{"prompt": "x", "duration": 8,
+                                      "refs": ["@amazon", "@amazon"]}])
+    assert status == 200, body
+    assert p.load_project(proj.path).scenes[0]["refs"] == ["@amazon"]
+
+
+def test_seed_steps_refs_and_project_seed_are_refused_on_mlx(tmp_path, monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "mlx")
+    outdir = tmp_path / "outdir"
+    (outdir / "uploads").mkdir(parents=True)
+    (outdir / "uploads" / "face.png").write_bytes(PNG)
+    lib.create_card(outdir, tag="@amazon", kind="person", description="an amazon",
+                    assets=[outdir / "uploads" / "face.png"])
+    server = _serve(q.layout(outdir / "queue")["root"], outdir)
+    try:
+        proj = p.create_project(outdir, "video", "Mlx")
+        for field, value in (("seed", 7), ("steps", 30), ("refs", ["@amazon"])):
+            status, answer = _call(server, "PUT", f"/api/projects/{proj.id}/scenes", {
+                "scenes": [{"prompt": "x", "duration": 8, field: value}],
+                "references": [{"tag": "@amazon"}]})
+            assert (status, *_error(answer)) == (
+                400, "args_invalid", f"`scenes[0].{field}` is only for the sglang engine")
+        status, answer = _call(server, "PUT", f"/api/projects/{proj.id}/settings", {"seed": 5})
+        assert (status, *_error(answer)) == (
+            400, "args_invalid", "`seed` is only for the sglang engine")
+        assert p.load_project(proj.path).scenes == []
+    finally:
+        server.httpd.shutdown()
+        server.httpd.server_close()

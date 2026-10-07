@@ -2531,7 +2531,7 @@ def _prepare_submission_sglang(args, roots) -> dict:
     resolve_within(report["output_stem"], roots, write=True)
     spec = sglang_args.parse(argv, check_files=False)
     cost = sglang_estimate.estimate_seconds(roots["outdir"], width=spec.width, height=spec.height,
-                                            frames=spec.frames)
+                                            frames=spec.frames, steps=spec.steps)
     return {"args": argv, "report": report, "estimate": cost,
             "prompt_text": None, "prompt_source": None}
 
@@ -3603,6 +3603,8 @@ class _Handler(BaseHTTPRequestHandler):
             raise CliError("args_invalid", "`i2v_prefix` must be a string", {})
         if "seed" in payload and payload["seed"] is not None and not _is_seed(payload["seed"]):
             raise CliError("args_invalid", "`seed` must be an integer >= 0", {})
+        if payload.get("seed") is not None and not engine.is_sglang():
+            raise CliError("args_invalid", "`seed` is only for the sglang engine", {})
         proj.update_settings(**payload)
         return 200, "application/json", _json_bytes(
             {"ok": True, "project": _project_payload(project_module.load_project(proj.path))})
@@ -4174,7 +4176,8 @@ class _Handler(BaseHTTPRequestHandler):
                 raise CliError(exc.code, exc.message, exc.detail) from exc
             return 200, "application/json", _json_bytes({"ok": True, "estimate":
                 sglang_estimate.estimate_seconds(self.server.outdir, width=spec.width,
-                                                 height=spec.height, frames=spec.frames)})
+                                                 height=spec.height, frames=spec.frames,
+                                                 steps=spec.steps)})
         _check_command_allowed(_parse_args(args))
         # The *normalised* list, for the same reason submission uses it: `--checkpoint
         # ~/models/h3-8bit` reaches `quant_bits` as a directory literally named `~` otherwise, and
@@ -4277,10 +4280,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _put_project_scenes(self, raw_id: str) -> tuple[int, str, bytes]:
         """`PUT /api/projects/<id>/scenes` (final review 2026-10-07, I1): a ready-made video
-        scenario without the LLM -- `{"scenes": [{prompt, duration, fresh_start?, start_image?, seed?, steps?, refs?}],
-        "references"?: [{tag, version?}]}`. Only before anything is queued (`stages.scenes` is
-        `draft`, `stages.script` is `draft` or `awaiting_approval`); it leaves the script waiting
-        for "Утвердить", which snaps the durations and checks every scene as for a chat scenario.
+        scenario without the LLM -- `{"scenes": [{prompt, duration, fresh_start?, start_image?,
+        seed?, steps?, refs?}], "references"?: [{tag, version?}]}`. Only before anything is
+        queued (`stages.scenes` is `draft`, `stages.script` is `draft` or `awaiting_approval`); it
+        leaves the script waiting for "Утвердить", which snaps the durations and checks every scene as for a chat scenario.
 
         `start_image` (I6) only on scene 0: a path inside the outdir, or an @tag the project pins
         (its card's first picture). It is the keyframe of scene 0 -- `assemble.scene_start_image`.
@@ -4330,6 +4333,10 @@ class _Handler(BaseHTTPRequestHandler):
                     raise CliError("args_invalid", f"`scenes[{i}].fresh_start` must be true/false",
                                    {"index": i})
                 scene["fresh_start"] = raw["fresh_start"]
+            for field in ("seed", "steps", "refs"):
+                if field in raw and not engine.is_sglang():
+                    raise CliError("args_invalid", f"`scenes[{i}].{field}` is only for the sglang "
+                                   "engine", {"index": i})
             if "seed" in raw:
                 if not _is_seed(raw["seed"]):
                     raise CliError("args_invalid", f"`scenes[{i}].seed` must be an integer >= 0",
@@ -4341,9 +4348,6 @@ class _Handler(BaseHTTPRequestHandler):
                         or not steps_low <= raw["steps"] <= steps_high):
                     raise CliError("args_invalid", f"`scenes[{i}].steps` must be an integer "
                                    f"between {steps_low} and {steps_high}", {"index": i})
-                if not engine.is_sglang():
-                    raise CliError("args_invalid", f"`scenes[{i}].steps` is only for the sglang "
-                                   "engine", {"index": i})
                 scene["steps"] = raw["steps"]
             if "refs" in raw:
                 refs = raw["refs"]
@@ -4357,7 +4361,7 @@ class _Handler(BaseHTTPRequestHandler):
                     if tag not in pinned_tags:
                         raise CliError("unknown_tag", f"refs {tag}: тег не подключён к проекту",
                                        {"index": i, "unknown": [tag]})
-                scene["refs"] = list(refs)
+                scene["refs"] = list(dict.fromkeys(refs))
             start = raw.get("start_image")
             if start is not None:
                 if i != 0 or not isinstance(start, str) or not start:
