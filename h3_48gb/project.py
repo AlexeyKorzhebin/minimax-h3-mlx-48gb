@@ -123,6 +123,12 @@ _SCENARIO_FIELDS = ("scenario_scenes", "scenario_style_block")
 #: `ASSEMBLY_AUDIO_MODES` rather than carrying a value nothing else in this enum recognizes.
 _DEFAULT_AUDIO_MODE = {"video": "clips", "clip": "song", "song": "clips"}
 
+#: spec §4.1.3: the prefix a chained scene's prompt gets on sglang. No `<Picture N>` label -- the
+#: server does not number the keyframe (presentation.py:230-270), so "<Picture 1>" would name the
+#: first reference picture instead.
+DEFAULT_I2V_PREFIX = ("The video begins exactly on the provided first frame and continues it "
+                      "seamlessly: same characters, setting, lighting and camera style.")
+
 PROJECT_FILENAME = "project.json"
 PROJECT_LOCK_NAME = "project.lock"
 
@@ -147,7 +153,7 @@ _REQUIRED_FIELDS = ("id", "kind", "title", "created_at", "stages", "scenes", "tr
 #: compatibility concern for `stages["scenario"]`) but are still first-class, always-present-once-
 #: loaded `Project` attributes, exactly like `scenes` itself.
 _OWNED_TOP_LEVEL_FIELDS = _REQUIRED_FIELDS + ("scenario_scenes", "scenario_style_block",
-                                              "references")
+                                              "references", "i2v_prefix")
 
 
 class ProjectError(Exception):
@@ -484,6 +490,7 @@ class Project:
         self.scenario_style_block = data.get("scenario_style_block")
         # Pinned reference-library cards, `[{tag, version}]` (spec §3.5); absent on older files.
         self.references = [dict(ref) for ref in data.get("references") or []]
+        self.i2v_prefix = data.get("i2v_prefix", DEFAULT_I2V_PREFIX)
 
     def as_dict(self) -> dict:
         """This project as a plain dict, ready for `json.dumps` -- every field this module
@@ -512,6 +519,7 @@ class Project:
             "scenario_scenes": [dict(scene) for scene in self.scenario_scenes],
             "scenario_style_block": self.scenario_style_block,
             "references": [dict(ref) for ref in self.references],
+            "i2v_prefix": self.i2v_prefix,
         })
         return result
 
@@ -854,6 +862,16 @@ class Project:
             self._apply(data)
         return self
 
+    def update_settings(self, *, i2v_prefix: str) -> "Project":
+        if not isinstance(i2v_prefix, str):
+            raise ProjectError("i2v_prefix must be a string")
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            data["i2v_prefix"] = i2v_prefix.strip()
+            write_json_durably(self.path, data)
+            self._apply(data)
+        return self
+
 
 def create_project(outdir, kind: str, title: str, now=None) -> Project:
     """Claim `<outdir>/projects/<YYYYMMDD-HHMM>-<slug>/`, write a fresh `project.json` into it,
@@ -910,6 +928,7 @@ def create_project(outdir, kind: str, title: str, now=None) -> Project:
         "scenario_scenes": [],
         "scenario_style_block": None,
         "references": [],
+        "i2v_prefix": DEFAULT_I2V_PREFIX,
     }
     project = Project(project_dir / PROJECT_FILENAME, data)
     project.save()

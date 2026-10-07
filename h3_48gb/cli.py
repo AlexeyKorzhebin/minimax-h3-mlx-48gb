@@ -256,6 +256,7 @@ ERROR_CODES = {
     "not_found": "no route, or no file, at that URL",
     "method_not_implemented": "this server has no handler for that HTTP method",
     "bad_request": "the request itself could not be served -- malformed, or too large to accept",
+    "scene_references_invalid": "one or more scenes name @tags or references sglang would refuse",
     "internal_error": "an unexpected exception reached the CLI boundary; see `detail` for its type",
 }
 

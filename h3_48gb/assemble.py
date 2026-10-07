@@ -88,9 +88,13 @@ from pathlib import Path
 
 import numpy as np
 
+from h3_48gb import engine
 from h3_48gb import framecheck
+from h3_48gb import library
 from h3_48gb import project as project_module
 from h3_48gb import queue as q
+from h3_48gb.engines import estimate as sglang_estimate
+from h3_48gb.engines import sglang_args
 
 #: The four steps' shared frame rate for the final concat (design spec: "перекодировка в единый
 #: профиль ... общий fps"). A fixed constant, not read off any one clip: clips can come from
@@ -173,6 +177,13 @@ SCENE_LATENT_TAIL_FRAMES = 5 * _SCENE_LATENT_TAIL_CHUNKS + 2
 #: OVERLAP_FRAMES` is the same number on the timeline side -- that is what makes a chained scene's
 #: delivered duration land on `17k` rather than `17k + 5` (§4.1).
 OVERLAP_PIXEL_FRAMES = 17 * _SCENE_LATENT_TAIL_CHUNKS + 5
+#: How many frames of the previous scene a chained scene repeats at its head on sglang (spec
+#: §3.3.5): the keyframe condition at frame_index 0 *is* the previous scene's last frame, so the
+#: assembly drops exactly that one frame (`head_drop_frames = 1`). Duplicated in web.py as
+#: `_SGLANG_OVERLAP_FRAMES`, pinned equal by test_sglang_scenes.py.
+SGLANG_OVERLAP_FRAMES = 1
+#: chain_beach.py's seed for every one of its 8/8 chained scenes.
+SGLANG_DEFAULT_SEED = 42
 
 #: What `_submit_next_scene` writes as a scene's own `head_drop_frames` when the previous scene's
 #: latent tail is missing and the chain falls back to the old keyframe path (P0-4). **Five, not
@@ -1206,6 +1217,110 @@ def _scene_generate_args(scene: dict, keyframe, scenes_dir: Path, *, latent=None
     return args, output_stem
 
 
+def _extract_last_frame(clip_path, dest_dir: Path, source_idx: int, *, run) -> Path:
+    """The literal last frame of the previous scene -- the sglang chain's keyframe
+    (`chain_beach.py`: `ffmpeg -sseof -1 ... -update 1`). No lookback on corruption: the next
+    scene repeats this exact frame at its head, so any other frame would put a jump in the cut.
+    A corrupt one fails the submission instead (`_submit_next_scene_sglang` rolls the claim back).
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    out_path = dest_dir / f"keyframe-{source_idx:03d}.png"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-sseof", "-1", "-i", str(clip_path),
+           "-update", "1", "-q:v", "1", str(out_path)]
+    _run_ffmpeg(cmd, run, "ffmpeg last-frame extraction")
+    if _frame_is_corrupt(out_path, run=run, workdir=dest_dir):
+        raise AssembleError(f"the last frame of {clip_path} reads as corrupt (zero-fill/tile-seam)"
+                            " -- refusing to chain the next scene off it")
+    return out_path
+
+
+def _scene_generate_args_sglang(scene: dict, *, keyframe, chained: bool, ref2va,
+                                track_piece, scenes_dir: Path,
+                                i2v_prefix: str = "") -> tuple[list[str], str]:
+    """spec §3.3.2: the sglang argv -- prompt (already Ref2VA-assembled from the scene's @tags),
+    canvas, duration, steps, seed, tag, outdir, task, keyframe, reference pictures, audio
+    references (voice cards, then the clip's own track piece). A chained scene requests one frame
+    more than it delivers (the repeated keyframe) and asks for `aspect_ratio: auto`."""
+    idx = scene["idx"]
+    width, height = DEFAULT_SCENE_CANVAS
+    tag = f"scene-{idx}-{secrets.token_hex(2)}"
+    delivered = round(scene["duration"] * ASSEMBLY_FPS)
+    requested = delivered + (SGLANG_OVERLAP_FRAMES if chained else 0)
+    if (requested - _H3_LATENTS_PER_CHUNK) % _H3_FRAMES_PER_CHUNK:
+        raise AssembleError(
+            f"scene {idx}: {requested} frames is off sglang's 17n+5 grid (delivered {delivered}, "
+            f"chained={chained}) -- the scene's duration was never snapped")
+    prompt = ref2va.prompt
+    if chained and i2v_prefix:
+        prompt = f"{i2v_prefix}\n\n{prompt}"
+    audios = list(ref2va.audios) + ([str(track_piece)] if track_piece is not None else [])
+    task = "ref2va"   # the only task the ref2va server serves (spec §4.1.3)
+    args = ["generate", prompt, "--width", str(width), "--height", str(height),
+            "--duration", str(requested / ASSEMBLY_FPS),
+            "--steps", str(sglang_args.DEFAULT_STEPS),
+            "--seed", str(scene.get("seed", SGLANG_DEFAULT_SEED)),
+            "--tag", tag, "--outdir", str(scenes_dir), "--task", task]
+    if keyframe is not None:
+        args += ["--image", str(keyframe)]
+    if chained:
+        args += ["--aspect", "auto"]
+    for image in ref2va.images:
+        args += ["--ref", image]
+    for audio in audios:
+        args += ["--audio", audio]
+    return args, str(Path(scenes_dir) / f"h3-{tag}-{width}x{height}")
+
+
+def _submit_next_scene_sglang(proj, scene: dict, queue_root, *, submit, run) -> dict:
+    """`_submit_next_scene`'s sglang twin: same claim-before-submit and rollback discipline (see
+    that function's docstring), but the chain is keyframe-first -- there is no latent tail on
+    sglang, so there is no fallback and no `MAX_CONSECUTIVE_KEYFRAME_FALLBACKS` limit."""
+    idx = scene["idx"]
+    claimed = proj.claim_next_scene(_SCENE_CLAIM_PLACEHOLDER_JOB_ID, expected_idx=idx)
+    if claimed is None:
+        return {"action": "nothing_to_do"}
+    if proj.stages.get("scenes") in ("draft", "approved"):
+        proj.set_stage_status("scenes", "running")
+    outdir = proj.path.parent.parent.parent
+    chained = idx > 0 and not scene.get("fresh_start")
+    try:
+        keyframe = None
+        if chained:
+            prev = _scene_by_idx(proj.scenes, idx - 1)
+            prev_clip = prev.get("clip_path") if prev else None
+            if not prev_clip:
+                raise AssembleError(f"scene {idx}: the previous scene has no clip to chain from")
+            keyframe = _extract_last_frame(prev_clip, proj.path.parent / "keyframes", idx - 1,
+                                           run=run)
+        elif idx == 0 and proj.as_dict().get("start_image"):
+            keyframe = Path(proj.as_dict()["start_image"])
+        ref2va = library.build_ref2va(scene["prompt"], proj.references, outdir)
+        track_piece = None
+        scenes_dir = proj.path.parent / "scenes"
+        args, output_stem = _scene_generate_args_sglang(
+            scene, keyframe=keyframe, chained=chained, ref2va=ref2va, track_piece=track_piece,
+            scenes_dir=scenes_dir, i2v_prefix=proj.i2v_prefix)
+        # What the adapter would refuse (too many pictures, no reference, off-grid duration) is
+        # refused here, before anything is queued -- never trimmed to fit.
+        sglang_args.parse(args, check_files=False)
+        width, height = DEFAULT_SCENE_CANVAS
+        frames = round(scene["duration"] * ASSEMBLY_FPS) + (SGLANG_OVERLAP_FRAMES if chained else 0)
+        estimate = sglang_estimate.estimate_seconds(outdir, width=width, height=height,
+                                                    frames=frames)
+        job = submit(queue_root, args, scene_note(proj, idx), {"output_stem": output_stem},
+                     estimate, kind=q.KIND_GENERATE)
+    except Exception:
+        proj.set_scene_status(idx, "pending", job_id=None)
+        raise
+    head_drop_frames = SGLANG_OVERLAP_FRAMES if chained else 0
+    proj.set_scene_status(idx, "running", job_id=job.id,
+                          keyframe_path=str(keyframe) if keyframe is not None else None,
+                          head_drop_frames=head_drop_frames)
+    return {"action": "submitted_scene", "idx": idx, "job_id": job.id,
+            "keyframe": str(keyframe) if keyframe is not None else None,
+            "latent": None, "head_drop_frames": head_drop_frames}
+
+
 def _extract_keyframe(clip_path, dest_dir: Path, source_idx: int, *, run) -> Path:
     """The automatic keyframe for the scene *after* `source_idx` -- design spec, "Клипы": "кадр из
     предпоследней секунды предыдущего клипа"; task brief: "посмотри длительность клипа ffprobe,
@@ -1312,6 +1427,8 @@ def _submit_next_scene(proj, scene: dict, queue_root, *, submit, run) -> dict:
     pointing at it): see the module's own report for why this narrower, pre-existing gap is
     accepted rather than closed in this round.
     """
+    if engine.is_sglang():
+        return _submit_next_scene_sglang(proj, scene, queue_root, submit=submit, run=run)
     idx = scene["idx"]
 
     claimed = proj.claim_next_scene(_SCENE_CLAIM_PLACEHOLDER_JOB_ID, expected_idx=idx)

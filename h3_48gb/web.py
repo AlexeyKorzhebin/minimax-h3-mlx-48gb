@@ -956,6 +956,66 @@ def _grid_frames_at_or_above(frames: int, *, remainder: int = _H3_LATENTS_PER_CH
     return below if below >= frames else below + _H3_FRAMES_PER_CHUNK
 
 
+#: spec §3.3.5: a chained scene on sglang repeats one frame (the keyframe). Duplicated from
+#: `assemble.SGLANG_OVERLAP_FRAMES` for the same reason `_SCENE_LATENT_OVERLAP_FRAMES` is
+#: (this module must not import the worker-side graph for one integer); pinned equal by a test.
+_SGLANG_OVERLAP_FRAMES = 1
+
+
+def _grid_frames_nearest(frames: int, *, remainder: int) -> int:
+    below = _grid_frames_at_or_below(frames, remainder=remainder)
+    above = _grid_frames_at_or_above(frames, remainder=remainder)
+    return below if frames - below <= above - frames else above
+
+
+def _snap_video_scenes_sglang(scenes: list[dict]) -> list[dict]:
+    """Every video scene's *delivered* duration onto sglang's grid (spec §4.1.5), nearest point:
+    `17n+5` for scene 0 and every `fresh_start` scene, `17n+4` for a chained one (it requests one
+    frame more, the repeated keyframe, and H3 renders `17j+5`)."""
+    snapped = []
+    for scene in scenes:
+        chained = scene["idx"] > 0 and not scene.get("fresh_start", False)
+        remainder = ((_H3_LATENTS_PER_CHUNK - _SGLANG_OVERLAP_FRAMES) % _H3_FRAMES_PER_CHUNK
+                     if chained else _H3_LATENTS_PER_CHUNK)
+        frames = _grid_frames_nearest(round(float(scene["duration"]) * _H3_FPS),
+                                      remainder=remainder)
+        snapped.append({**scene, "duration": frames / _H3_FPS})
+    return snapped
+
+
+def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
+    """spec §3.5/§4.1.3, checked at the gate so nothing is queued that sglang would refuse: every
+    @tag well-formed and pinned to the project, pictures within H3_MAX_REF_IMAGES, and **every**
+    scene names at least one reference -- the server serves only ref2va. A clip scene is exempt
+    from the last rule: its track piece is an audio reference."""
+    pinned = {ref["tag"]: ref for ref in proj.references}
+    errors: list[dict] = []
+    for scene in scenes:
+        idx = scene["idx"]
+        try:
+            limit = sglang_args.max_ref_images()
+            tags = library_module.scene_tags(scene["prompt"])
+            unknown = [tag for tag in tags if tag not in pinned]
+            if unknown:
+                errors.append({"idx": idx, "code": "unknown_tag",
+                               "message": f"теги не подключены к проекту: {', '.join(unknown)}"})
+                continue
+            images = sum(len(card["assets"]) for card in
+                         (library_module.get_card(outdir, tag, pinned[tag]["version"])
+                          for tag in tags) if card["kind"] != "voice")
+        except (library_module.LibraryError, sglang_args.SglangArgsError) as exc:
+            errors.append({"idx": idx, "code": exc.code, "message": exc.message})
+            continue
+        if images > limit:
+            errors.append({"idx": idx, "code": "too_many_reference_images",
+                           "message": f"картинок-референсов {images}, а можно не больше {limit}"})
+            continue
+        if not tags and proj.kind != "clip":
+            errors.append({"idx": idx, "code": "ref2va_needs_reference",
+                           "message": "нужен хотя бы один референс (@тег) в сцене"})
+    return errors
+
+
 def _snap_scene_duration(seconds: float, carry: float, *,
                           chained: bool = False) -> tuple[float, float]:
     """One scene's own duration, snapped onto H3's frame grid (C1, final review), and the leftover
@@ -3375,6 +3435,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._update_card(path[len("/api/library/"):])
         if path.startswith("/api/projects/") and path.endswith("/references"):
             return self._put_project_references(path[len("/api/projects/"):-len("/references")])
+        if path.startswith("/api/projects/") and path.endswith("/settings"):
+            return self._put_project_settings(path[len("/api/projects/"):-len("/settings")])
         if path.startswith("/api/jobs/"):
             return self._edit_job(path[len("/api/jobs/"):])
         if path.startswith("/api/prompts/"):
@@ -3385,6 +3447,15 @@ class _Handler(BaseHTTPRequestHandler):
             return self._edit_project_scenario(path[len("/api/projects/"):-len("/scenario")])
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for PUT {path}", {"path": path})
+
+    def _put_project_settings(self, raw_id: str) -> tuple[int, str, bytes]:
+        proj = self._load_project(raw_id)
+        payload = self._json_request(allowed=("i2v_prefix",))
+        if not isinstance(payload.get("i2v_prefix"), str):
+            raise CliError("args_invalid", "`i2v_prefix` must be a string", {})
+        proj.update_settings(i2v_prefix=payload["i2v_prefix"])
+        return 200, "application/json", _json_bytes(
+            {"ok": True, "project": _project_payload(project_module.load_project(proj.path))})
 
     def _route_delete(self) -> tuple[int, str, bytes]:
         path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
@@ -4293,6 +4364,14 @@ class _Handler(BaseHTTPRequestHandler):
                            estimate, kind=q.KIND_SONG)
         return {"job_id": job.id}
 
+    def _refuse_bad_scene_references(self, proj, scenes) -> None:
+        errors = _scene_reference_errors(proj, scenes, self.server.outdir)
+        if errors:
+            raise CliError("scene_references_invalid",
+                           "сцены нельзя ставить в очередь: " + "; ".join(
+                               f"сцена {e['idx']}: {e['message']}" for e in errors),
+                           {"scenes": errors})
+
     def _approve_project_stage(self, raw_id: str, stage: str) -> tuple[int, str, bytes]:
         """`POST /api/projects/<id>/approve/<stage>`: the human gate (design spec, "Этапы и
         гейты") -- `script`, `track` and, for `kind="clip"` (task 4, "Сюжет клипа" wave),
@@ -4395,6 +4474,11 @@ class _Handler(BaseHTTPRequestHandler):
         result: dict = {"stage": stage}
         if stage == "script":
             if proj.kind == "video":
+                if engine.is_sglang():
+                    snapped = _snap_video_scenes_sglang(proj.scenes)
+                    self._refuse_bad_scene_references(proj, snapped)
+                    proj.scenes = snapped
+                    proj.save()
                 result["advance"] = assemble_module.advance_project(
                     proj, self.server.queue_root, self.server.outdir)
             elif proj.kind in ("clip", "song"):
@@ -4430,6 +4514,8 @@ class _Handler(BaseHTTPRequestHandler):
                                           scenario_scenes=proj.scenario_scenes)
             except ProjectSceneBuildError as exc:
                 raise CliError("project_scene_build_failed", str(exc), {"id": raw_id}) from exc
+            if engine.is_sglang():
+                self._refuse_bad_scene_references(proj, built)
             proj.scenes = built
             proj.save()
             result["advance"] = assemble_module.advance_project(
@@ -5489,7 +5575,7 @@ class _Handler(BaseHTTPRequestHandler):
             return 404, "application/json", _error_bytes(
                 "chat_not_found", f"нет сессии {sid}", {"id": sid})
         payload = self._json_request(
-            allowed=("text", "prompt", "provider", "duration", "image", "set_mode"))
+            allowed=("text", "prompt", "provider", "duration", "image", "set_mode", "tags"))
         with chat_session_lock(path):
             return self._locked_turn(sid, path, payload)
 
@@ -5566,12 +5652,26 @@ class _Handler(BaseHTTPRequestHandler):
         # present, it rides every later turn's context so the model does not lose track of which
         # kind of project it already committed this session to.
         kind_line = f"\nkind: {session['kind']}" if session.get("kind") else ""
+        raw_tags = payload.get("tags")
+        if raw_tags is not None:
+            if not isinstance(raw_tags, list) or not all(isinstance(t, str) for t in raw_tags):
+                raise CliError("args_invalid", "`tags` must be a list of @tags", {})
+            session["tags"] = list(raw_tags)
+        references_block = ""
+        if session.get("tags"):
+            try:
+                cards = [library_module.get_card(self.server.outdir, tag)
+                         for tag in session["tags"]]
+            except library_module.LibraryError as exc:
+                raise CliError(exc.code, exc.message, exc.detail) from exc
+            references_block = "\n\n" + library_module.references_context(cards)
         system = (provider.system_prompt()
                   + "\n\n## Context\nmode: " + (session.get("mode") or DEFAULT_CHAT_MODE)
                   + f"\nduration: {duration:g} s"
                   + kind_line
                   + end_image_line
-                  + "\n\n## Current prompt\n" + self._string_of(payload, "prompt"))
+                  + "\n\n## Current prompt\n" + self._string_of(payload, "prompt")
+                  + references_block)
         content, warning = self._turn_content(text, session.get("image") or "")
         messages = ([{"role": "system", "content": system}]
                     + [{"role": message["role"], "content": message["content"]}
