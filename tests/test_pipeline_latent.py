@@ -38,6 +38,12 @@ Nothing here loads the real model: `ToyPipeline` (tests/test_checkpoint.py) driv
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.mlx
+pytest.importorskip("mlx.core", reason="mlx: needs the MLX stack, absent here")
+
+
 import inspect
 import json
 import sys

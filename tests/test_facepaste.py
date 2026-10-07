@@ -7,6 +7,13 @@ about detection at all.
 """
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.cv
+pytest.importorskip("cv2", reason="cv: needs opencv-python and scipy, absent here")
+pytest.importorskip("scipy", reason="cv: needs opencv-python and scipy, absent here")
+
+
 import subprocess
 import sys
 from pathlib import Path

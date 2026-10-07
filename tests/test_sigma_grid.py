@@ -6,6 +6,12 @@ impossible: upstream rebuilt a uniform grid inside `_build_schedules`, and the c
 `check_schedule` then rejected the run as a mismatch. Nothing was wrong with the baked table; the
 pipeline simply refused to sample where the table said it had been baked for.
 """
+
+import pytest
+
+pytestmark = pytest.mark.mlx
+pytest.importorskip("mlx.core", reason="mlx: needs the MLX stack, absent here")
+
 from pathlib import Path
 
 import mlx.core as mx

@@ -250,6 +250,7 @@ class _StubResult:
     seconds_per_step = 1.5
 
 
+@pytest.mark.mlx
 def test_raw_arrays_are_written_before_encoding_when_they_are_asked_for(tmp_path):
     """`--keep-raw` writes the latents *before* the encoders run, not after: that ordering is the
     whole point of the flag for a long run -- an ffmpeg failure then costs seconds instead of the
@@ -269,6 +270,7 @@ def test_raw_arrays_are_written_before_encoding_when_they_are_asked_for(tmp_path
     assert (tmp_path / "h3-t-64x64-raw.npz").exists(), "raw arrays must survive an encoder failure"
 
 
+@pytest.mark.mlx
 def test_no_raw_file_is_written_without_the_flag(tmp_path):
     """Умолчание перевернулось, и это главный тест пункта.
 
@@ -298,6 +300,7 @@ def test_the_keep_raw_flag_reaches_the_spec_from_the_command_line(tmp_path, monk
     assert spec_from_args(build_parser().parse_args([*base, "--keep-raw"])).keep_raw is True
 
 
+@pytest.mark.mlx
 def test_run_generate_creates_a_nonexistent_outdir(tmp_path):
     """`h3 generate` itself creates `--outdir` if it does not exist yet -- checked here (task A6)
     because `queue.submit`'s new per-job subdirectory (`<outdir>/<YYYYMMDD-HHMM>-<slug>/`) has
@@ -317,6 +320,7 @@ def test_run_generate_creates_a_nonexistent_outdir(tmp_path):
         "the run must have actually written its output inside the directory it created")
 
 
+@pytest.mark.mlx
 def test_truncated_raw_file_is_not_left_at_destination(tmp_path):
     """Crash after temp write but before rename must not corrupt destination.
 
@@ -442,6 +446,7 @@ def test_dir_returns_only_public_api():
     assert not extra, f"dir(h3_48gb) returns non-__all__ names: {extra}"
 
 
+@pytest.mark.mlx
 def test_checkpoint_locked_is_importable_from_the_package_root():
     """`CheckpointLocked` is a sibling of `CheckpointCorrupt`/`CheckpointMismatch` -- raised the
     same way in `checkpoint.py`, caught the same way in `cli.py`'s handler -- but was added to
@@ -895,6 +900,7 @@ class _StubPipe:
         return _StubResult()
 
 
+@pytest.mark.mlx
 def test_resume_fails_loudly_when_there_is_nothing_to_resume(tmp_path):
     spec = RunSpec(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
                    checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
@@ -906,6 +912,7 @@ def test_resume_fails_loudly_when_there_is_nothing_to_resume(tmp_path):
         raise AssertionError("resume without a matching checkpoint must fail, not start over silently")
 
 
+@pytest.mark.mlx
 def test_resume_continues_when_a_matching_checkpoint_exists(tmp_path):
     spec = RunSpec(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
                    checkpoint=bake_adaln_table(tmp_path), outdir=tmp_path, tag="t")
@@ -918,6 +925,7 @@ def test_resume_continues_when_a_matching_checkpoint_exists(tmp_path):
     assert report["tag"] == "t"
 
 
+@pytest.mark.mlx
 def test_resume_checkpoint_path_changes_with_the_request(tmp_path):
     """Two different requests must never resolve to the same checkpoint file."""
     spec_a = RunSpec(prompt="a cat", width=64, height=64, duration=1.0, steps=31, seed=0,
@@ -929,6 +937,7 @@ def test_resume_checkpoint_path_changes_with_the_request(tmp_path):
             != _checkpoint_path_for(spec_b, pipe, Path("/ckpt")))
 
 
+@pytest.mark.mlx
 def test_resume_checkpoint_path_changes_with_the_tag_alone(tmp_path):
     """Pins the fix: `tag` used to be invisible to `request_identity` (upstream's `__call__` has no
     such parameter, so it never reached `bound.arguments`), so two otherwise-identical specs
@@ -945,6 +954,7 @@ def test_resume_checkpoint_path_changes_with_the_tag_alone(tmp_path):
             != _checkpoint_path_for(spec_b, pipe, Path("/ckpt")))
 
 
+@pytest.mark.mlx
 def test_cli_and_checkpoint_module_agree_on_the_file_name(tmp_path):
     """`_checkpoint_path_for` (cli.py) must resolve to exactly what `_resolve_store`
     (checkpoint.py) resolves to for the same run.
@@ -979,6 +989,7 @@ def test_cli_and_checkpoint_module_agree_on_the_file_name(tmp_path):
     assert _checkpoint_path_for(spec, pipe, ckpt_dir) == from_pipeline
 
 
+@pytest.mark.mlx
 def test_cli_and_checkpoint_module_agree_on_the_file_name_with_a_keyframe(tmp_path):
     """The conditioned counterpart of `test_cli_and_checkpoint_module_agree_on_the_file_name`.
 
@@ -1031,6 +1042,7 @@ def test_generate_exposes_preview_and_checkpoint_flags():
     assert args.restart is False and args.no_checkpoint is False
 
 
+@pytest.mark.mlx
 def test_preview_arguments_reach_the_pipeline(tmp_path, monkeypatch):
     """`--preview-every`/`--preview-stem` were parsed by nothing and reached nothing before this."""
     stub_default_recipe(monkeypatch, tmp_path)
@@ -1051,6 +1063,7 @@ def test_preview_arguments_reach_the_pipeline(tmp_path, monkeypatch):
     assert seen["preview_stem"] == str(tmp_path / "h3-t-64x64")
 
 
+@pytest.mark.mlx
 def test_preview_stem_can_be_pointed_elsewhere(tmp_path, monkeypatch):
     stub_default_recipe(monkeypatch, tmp_path)
     seen = {}
@@ -1068,6 +1081,7 @@ def test_preview_stem_can_be_pointed_elsewhere(tmp_path, monkeypatch):
     assert seen["preview_stem"] == str(tmp_path / "elsewhere" / "peek")
 
 
+@pytest.mark.mlx
 def test_previews_disabled_explicitly_pass_no_stem(tmp_path, monkeypatch):
     """`--preview-every 0` must also clear the stem: the pipeline refuses a stem it will never use.
 
@@ -1130,6 +1144,7 @@ def test_an_unknown_preview_decoder_is_refused_by_the_parser(tmp_path):
             ["generate", "a cat", "--preview-decoder", "taa", "--outdir", str(tmp_path)])
 
 
+@pytest.mark.mlx
 def test_the_preview_decoder_reaches_the_pipeline(tmp_path):
     """The flag is worthless if it stops at the RunSpec."""
     seen = {}
@@ -1285,6 +1300,7 @@ def test_mode_refuses_before_a_corrupt_image_is_ever_decoded(tmp_path):
     assert excinfo.value.code == "mode_mismatch"
 
 
+@pytest.mark.mlx
 def test_one_image_anchors_the_first_frame(tmp_path):
     from h3_48gb.cli import load_keyframes
 
@@ -1293,6 +1309,7 @@ def test_one_image_anchors_the_first_frame(tmp_path):
     assert len(images) == 1
 
 
+@pytest.mark.mlx
 def test_two_images_anchor_both_ends(tmp_path):
     from h3_48gb.cli import load_keyframes
 
@@ -1309,6 +1326,7 @@ def test_no_image_means_no_conditioning(tmp_path):
     assert load_keyframes(_spec(tmp_path)) == ([], ())
 
 
+@pytest.mark.mlx
 def test_exif_rotation_is_applied(tmp_path):
     """A phone photo carries its rotation in EXIF. Ignoring it conditions the run on a
     differently-oriented frame than the user saw, silently.
@@ -1334,6 +1352,7 @@ def test_exif_rotation_is_applied(tmp_path):
     assert bottom[2] > bottom[0], f"the blue half should be at the bottom, got {bottom}"
 
 
+@pytest.mark.mlx
 def test_keyframes_passed_to_pipeline_with_no_images(tmp_path):
     """Verify run_generate wires keyframes to the pipeline call: empty conditioning case."""
     seen = {}
@@ -1349,6 +1368,7 @@ def test_keyframes_passed_to_pipeline_with_no_images(tmp_path):
     assert seen["keyframe_anchors"] == ()
 
 
+@pytest.mark.mlx
 def test_keyframes_passed_to_pipeline_with_one_image(tmp_path):
     """Verify run_generate wires keyframes to the pipeline call: single-image case."""
     seen = {}
@@ -1364,6 +1384,7 @@ def test_keyframes_passed_to_pipeline_with_one_image(tmp_path):
     assert seen["keyframe_anchors"] == ("first",)
 
 
+@pytest.mark.mlx
 def test_keyframes_passed_to_pipeline_with_two_images(tmp_path):
     """Verify run_generate wires keyframes to the pipeline call: both-ends case."""
     seen = {}
@@ -1380,6 +1401,7 @@ def test_keyframes_passed_to_pipeline_with_two_images(tmp_path):
     assert seen["keyframe_anchors"] == ("first", "last")
 
 
+@pytest.mark.mlx
 def test_a_keyframe_changes_the_checkpoint_identity(tmp_path):
     """Resuming a conditioned run from an unconditioned checkpoint would restart the clip
     from different latents than the ones it was written for."""
@@ -1391,6 +1413,7 @@ def test_a_keyframe_changes_the_checkpoint_identity(tmp_path):
             != _checkpoint_path_for(conditioned, pipe, ckpt_dir))
 
 
+@pytest.mark.mlx
 def test_different_keyframes_give_different_checkpoints(tmp_path):
     red = _spec(tmp_path, image=_png(tmp_path / "red.png", colour=(200, 30, 30)))
     blue = _spec(tmp_path, image=_png(tmp_path / "blue.png", colour=(30, 30, 200)))
@@ -1400,6 +1423,7 @@ def test_different_keyframes_give_different_checkpoints(tmp_path):
             != _checkpoint_path_for(blue, pipe, ckpt_dir))
 
 
+@pytest.mark.mlx
 def test_renaming_a_keyframe_keeps_the_same_checkpoint(tmp_path):
     """The digest is over content, not path — a renamed file is the same keyframe.
 
@@ -1422,6 +1446,7 @@ def test_renaming_a_keyframe_keeps_the_same_checkpoint(tmp_path):
     assert path_a == path_b
 
 
+@pytest.mark.mlx
 def test_checkpoint_dir_overrides_the_default_location(tmp_path, monkeypatch):
     stub_default_recipe(monkeypatch, tmp_path)
     seen = {}
@@ -1441,6 +1466,7 @@ def test_checkpoint_dir_overrides_the_default_location(tmp_path, monkeypatch):
     assert seen["checkpoint_dir"] == str(elsewhere)
 
 
+@pytest.mark.mlx
 def test_no_checkpoint_turns_checkpointing_off(tmp_path, monkeypatch):
     """`checkpoint_dir=None` is what makes `CheckpointingPipeline.__call__` fall through
     to upstream's untouched `__call__` — so this must be `None`, not a directory that is unused."""
@@ -1480,6 +1506,7 @@ def test_restart_disables_resumption(tmp_path, monkeypatch):
     assert spy.call_args.kwargs["resume"] is False
 
 
+@pytest.mark.mlx
 def test_restart_is_named_in_the_mismatch_refusal(tmp_path):
     """A user who hits `checkpoint_mismatch` cannot compute the `h3-{digest}.safetensors` filename
     they are being told about, so the message has to name the flag that recovers from it."""
@@ -1500,6 +1527,7 @@ def test_restart_is_named_in_the_mismatch_refusal(tmp_path):
 
 # -- machine-readable failures ------------------------------------------------------------------
 
+@pytest.mark.mlx
 def test_checkpoint_mismatch_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path):
     from h3_48gb.checkpoint import CheckpointMismatch
 
@@ -1516,6 +1544,7 @@ def test_checkpoint_mismatch_surfaces_as_a_cli_error_not_a_raw_exception(tmp_pat
         raise AssertionError("a CheckpointMismatch must surface as a machine-readable CliError")
 
 
+@pytest.mark.mlx
 def test_checkpoint_corrupt_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path):
     from h3_48gb.checkpoint import CheckpointCorrupt
 
@@ -1532,6 +1561,7 @@ def test_checkpoint_corrupt_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path
         raise AssertionError("a CheckpointCorrupt must surface as a machine-readable CliError")
 
 
+@pytest.mark.mlx
 def test_checkpoint_locked_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path):
     """The third sibling of the two tests above: a second writer refused the lock (round 2's fix
     to `CheckpointStore.acquire_lock`) must reach the caller the same way `CheckpointMismatch` and
@@ -1551,6 +1581,7 @@ def test_checkpoint_locked_surfaces_as_a_cli_error_not_a_raw_exception(tmp_path)
         raise AssertionError("a CheckpointLocked must surface as a machine-readable CliError")
 
 
+@pytest.mark.mlx
 def test_second_writer_reports_checkpoint_locked_not_internal_error_under_json(
         tmp_path, monkeypatch, capsys):
     """The task's literal scenario: a second writer hitting an already-occupied checkpoint, under
@@ -1791,6 +1822,7 @@ def test_main_json_output_stays_parseable_with_a_chatty_pipeline(tmp_path, monke
     assert payload["tag"] == "run"
 
 
+@pytest.mark.mlx
 def test_main_human_mode_still_shows_pipeline_progress(tmp_path, monkeypatch, capsys):
     """The fix for the bug above must not go too far and silence progress that was never the
     problem: a five-hour render without --json still needs to show it is doing something."""
@@ -1845,6 +1877,7 @@ def test_main_internal_error_still_raises_in_human_mode(tmp_path, monkeypatch):
 
 # -- the vendored upstream must carry this fork's keyframe patch ---------------------------------
 
+@pytest.mark.mlx
 def test_the_patch_detector_agrees_with_the_patch_file():
     """The marker must be the line the patch actually removes, or the guard rots silently.
 
@@ -1861,6 +1894,7 @@ def test_the_patch_detector_agrees_with_the_patch_file():
         f"{UNPATCHED_SCATTER!r} is not among the lines the patch removes: {removed}")
 
 
+@pytest.mark.mlx
 def test_the_vendored_checkout_is_patched():
     """Not a unit test of the detector — a statement about this working tree."""
     from h3_48gb.text_encoder import keyframe_scatter_patch_applied
@@ -1870,6 +1904,7 @@ def test_the_vendored_checkout_is_patched():
         "`git -C upstream apply ../patches/0001-keyframe-masked-scatter.patch`")
 
 
+@pytest.mark.mlx
 def test_a_keyframe_on_an_unpatched_checkout_is_refused_before_any_weight_loads(tmp_path,
                                                                                 monkeypatch):
     from h3_48gb import cli, text_encoder
@@ -1907,6 +1942,7 @@ def test_a_text_only_run_gets_the_default_canvas(tmp_path):
     assert abs(width / height - 1344 / 768) < 1e-9, "the default must keep the released aspect"
 
 
+@pytest.mark.mlx
 def test_the_canvas_follows_the_keyframe(tmp_path):
     """The first keyframe is *stretched* onto the canvas, so a wrong canvas deforms the clip.
 
@@ -1927,6 +1963,7 @@ def test_an_explicit_canvas_still_wins_over_the_keyframe(tmp_path):
                               "--width", "448", "--height", "576"]) == (448, 576)
 
 
+@pytest.mark.mlx
 def test_exif_orientation_decides_the_canvas_too(tmp_path):
     """A camera marks rotation in a tag; unread, a portrait photo reports itself as landscape —
     and would pick the very canvas that deforms it."""
@@ -1940,6 +1977,7 @@ def test_exif_orientation_decides_the_canvas_too(tmp_path):
     assert width < height, f"the EXIF tag was ignored: got a {width}x{height} canvas"
 
 
+@pytest.mark.mlx
 def test_the_pipeline_conditions_on_exactly_the_frame_the_digest_was_taken_over(tmp_path):
     """The checkpoint's identity and the clip's conditioning must describe the same picture.
 
@@ -1995,6 +2033,7 @@ def test_the_pipeline_conditions_on_exactly_the_frame_the_digest_was_taken_over(
         "the frame the pipeline conditions on differs from the one the digest was taken over")
 
 
+@pytest.mark.mlx
 def test_a_missing_keyframe_is_refused_by_code_not_by_traceback(tmp_path):
     """`resolve_canvas` opens the file before `RunSpec` validates it, so the refusal is its job."""
     with pytest.raises(CliError) as excinfo:
@@ -2004,6 +2043,7 @@ def test_a_missing_keyframe_is_refused_by_code_not_by_traceback(tmp_path):
     assert excinfo.value.code == "image_not_found"
 
 
+@pytest.mark.mlx
 def test_an_undecodable_keyframe_is_refused_by_code(tmp_path):
     path = tmp_path / "broken.png"
     path.write_bytes(b"this is not a PNG")
@@ -2013,6 +2053,7 @@ def test_an_undecodable_keyframe_is_refused_by_code(tmp_path):
     assert excinfo.value.code == "image_unreadable"
 
 
+@pytest.mark.mlx
 def test_an_extreme_aspect_keyframe_is_refused_with_advice(tmp_path):
     """The model supports 1:4..4:1. A 10:1 panorama must say so, not raise ValueError."""
     path = tmp_path / "panorama.png"
@@ -2043,6 +2084,7 @@ def test_half_a_canvas_without_a_keyframe_still_works(tmp_path):
     assert (spec.width, spec.height) == (640, 512)
 
 
+@pytest.mark.mlx
 def test_the_patch_detector_can_actually_tell_the_two_apart():
     """Without this, replacing the detector's body with `return True` passed the whole suite.
 
@@ -2066,6 +2108,7 @@ def test_the_patch_detector_can_actually_tell_the_two_apart():
         "unrelated source has no marker and must read as patched")
 
 
+@pytest.mark.mlx
 def test_an_undecodable_keyframe_is_refused_on_every_path(tmp_path):
     """`resolve_canvas` only decodes when it has to derive the canvas, and only `--image`.
 
@@ -2276,6 +2319,7 @@ def _turbo_spec(tmp_path, **overrides):
     return RunSpec(**base)
 
 
+@pytest.mark.mlx
 def test_the_lora_is_installed_once_even_when_resume_asks_twice(tmp_path):
     """`run_resume` installs, then calls `run_generate`, which installs again.
 
@@ -2313,6 +2357,7 @@ def test_the_lora_is_installed_once_even_when_resume_asks_twice(tmp_path):
         f"the adapter was applied {len(applied)} times at {applied} — nesting doubles the strength")
 
 
+@pytest.mark.mlx
 def test_the_adapter_and_its_strength_are_part_of_the_checkpoint_identity(tmp_path):
     """Resuming at a different strength must not silently continue the interrupted run.
 
@@ -2404,6 +2449,7 @@ def _run_generate_with_fakes(tmp_path, spec_fn=_turbo_spec, **overrides):
     return report, spec
 
 
+@pytest.mark.mlx
 def test_the_report_records_what_produced_the_run(tmp_path):
     """On 2026-08-10 two runs of the same prompt, canvas, duration, steps and seed measured 349
     and 265, and the cause was unrecoverable because none of this was written down.
@@ -2439,6 +2485,7 @@ def test_the_report_records_what_produced_the_run(tmp_path):
     json.dumps(report)
 
 
+@pytest.mark.mlx
 def test_the_report_writes_null_not_a_missing_key_when_there_was_no_lora_or_image(tmp_path):
     """`turbo_lora`/`turbo_strength`/`image`/`end_image`/`prompt_file` must let a reader tell
     "this run had none of this" apart from "the field was never recorded" -- only an explicit
@@ -2455,6 +2502,7 @@ def test_the_report_writes_null_not_a_missing_key_when_there_was_no_lora_or_imag
     json.dumps(report)
 
 
+@pytest.mark.mlx
 def test_the_report_does_not_swap_image_and_end_image(tmp_path):
     """`report["image"] == str(spec.end_image)` (and vice versa) would pass every other test in
     this file, since the two other report tests above use no keyframes at all -- with both None,
@@ -2474,6 +2522,7 @@ def test_the_report_does_not_swap_image_and_end_image(tmp_path):
     json.dumps(report)
 
 
+@pytest.mark.mlx
 def test_the_lora_side_path_is_numerically_unchanged_by_its_optimizations(tmp_path):
     """`addmm` and the stack-instead-of-gather must be exact, not approximate.
 

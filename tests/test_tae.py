@@ -1,3 +1,7 @@
+import pytest
+
+pytest.importorskip("mlx.core", reason="mlx: needs the MLX stack, absent here")
+
 from pathlib import Path
 
 import numpy as np
@@ -5,8 +9,9 @@ import pytest
 
 from h3_48gb.tae import TAE_WEIGHTS_PATH, to_mlx_conv2d_layout
 
-pytestmark = pytest.mark.skipif(not TAE_WEIGHTS_PATH.exists(),
-                                reason=f"no TAE weights at {TAE_WEIGHTS_PATH}")
+pytestmark = [pytest.mark.mlx,
+              pytest.mark.skipif(not TAE_WEIGHTS_PATH.exists(),
+                                 reason=f"no TAE weights at {TAE_WEIGHTS_PATH}")]
 
 
 def test_conv_layout_is_channels_last_by_value_not_by_shape():

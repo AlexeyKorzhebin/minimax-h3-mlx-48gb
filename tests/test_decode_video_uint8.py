@@ -15,6 +15,12 @@ is the ground truth both the old and the new code were checked against.
 """
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.mlx
+pytest.importorskip("mlx.core", reason="mlx: needs the MLX stack, absent here")
+
+
 import mlx.core as mx
 import numpy as np
 import pytest

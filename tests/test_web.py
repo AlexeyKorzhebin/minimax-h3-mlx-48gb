@@ -1956,6 +1956,7 @@ def test_the_estimate_is_stored_on_the_job(queue_server):
     assert stored == answer["estimate"]
 
 
+@pytest.mark.mlx
 def test_posting_a_job_with_an_image_never_pulls_mlx_into_the_server(tmp_path):
     """The one route where MLX could sneak in.
 
@@ -2423,6 +2424,7 @@ def _vertical_frame(live: _Live, width=768, height=1024, name="kadr.png") -> Pat
     return path
 
 
+@pytest.mark.mlx
 def test_the_estimate_of_a_keyframe_run_uses_the_canvas_derived_from_the_frame(queue_server):
     """Без `--width/--height` формула брала `DEFAULT_CANVAS` — 896x512, горизонтальный, — и
     вертикальный кадр получал оценку чужого канваса: время и память считались не для того ролика,
@@ -2443,6 +2445,7 @@ def test_the_estimate_of_a_keyframe_run_uses_the_canvas_derived_from_the_frame(q
     assert got != web.DEFAULT_CANVAS
 
 
+@pytest.mark.mlx
 def test_the_keyframe_estimate_works_without_a_prompt_because_estimates_have_none(queue_server):
     """Оценка промпт не носит намеренно: `requestEstimate` строит аргументы с `withPrompt: false`,
     чтобы не слать килобайты текста на каждое нажатие клавиши.
@@ -2477,6 +2480,7 @@ def test_an_estimate_with_explicit_numbers_still_starts_no_subprocess(queue_serv
     assert (answer["estimate"]["width"], answer["estimate"]["height"]) == (896, 576)
 
 
+@pytest.mark.mlx
 def test_a_keyframe_job_queued_without_a_canvas_carries_the_derived_one(queue_server):
     """Постановка без `--width/--height` обязана доезжать до очереди, а задача — нести выведенный
     канвас: иначе «из кадра (авто)» в форме ставит задачу, про которую потом нельзя сказать, в

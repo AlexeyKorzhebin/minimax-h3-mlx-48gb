@@ -34,6 +34,12 @@ real `_decode_video` with a stand-in for the 5.21 GB video VAE.
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.mlx
+pytest.importorskip("mlx.core", reason="mlx: needs the MLX stack, absent here")
+
+
 import inspect
 import json
 import os

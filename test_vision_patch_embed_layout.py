@@ -21,6 +21,12 @@ under test and the check itself cannot cancel out).
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.mlx
+pytest.importorskip("mlx.core", reason="mlx: needs the MLX stack, absent here")
+
+
 import sys
 from pathlib import Path
 

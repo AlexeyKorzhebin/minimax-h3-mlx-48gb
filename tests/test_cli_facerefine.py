@@ -13,6 +13,13 @@ also asserted on directly, with no process involved, per the brief's "сборк
 """
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.cv
+pytest.importorskip("cv2", reason="cv: needs opencv-python and scipy, absent here")
+pytest.importorskip("scipy", reason="cv: needs opencv-python and scipy, absent here")
+
+
 import json
 import shutil
 import subprocess

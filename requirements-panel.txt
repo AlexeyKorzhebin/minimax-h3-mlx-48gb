@@ -1,0 +1,9 @@
+# The panel's own runtime and test dependencies, without the MLX stack (spec §3.2): the Docker
+# image and the Mac test venv both install the package with `pip install --no-deps` and then this
+# file, because pyproject.toml keeps mlx/mlx-vlm/opencv/scipy as hard dependencies for the Mac
+# render path, which the panel never imports.
+numpy>=1.26
+pillow>=10.0
+safetensors>=0.4
+jsonschema>=4.0
+pytest>=8.0

@@ -460,6 +460,7 @@ def _run_one_window(sched, num_steps: int):
     return x
 
 
+@pytest.mark.mlx
 def test_run_windows_scheduler_state_is_finite_after_two_windows():
     """D1 regression (Task 5's integration gate). `_run_windows` builds `video_sched` once, in
     phase 2, *before* the loop over windows (`facerefine.py`'s phase-2 comment), and
@@ -499,6 +500,7 @@ def test_run_windows_scheduler_state_is_finite_after_two_windows():
         "window 2's output is not finite -- the scheduler carried window 1's step index over"
 
 
+@pytest.mark.mlx
 def test_reset_window_schedule_clears_the_step_index_before_a_window_starts():
     """The other half of D1: `_reset_window_schedule` must actually clear `_step_index`, not just
     happen to leave the arithmetic finite for this one grid. `step_index` is `None` only right

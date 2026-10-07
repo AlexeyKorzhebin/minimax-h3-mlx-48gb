@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import cv2
 import numpy as np
 import pytest
 
@@ -67,6 +66,7 @@ def test_zero_fill_fraction_tolerates_the_documented_slop():
     assert framecheck.zero_fill_fraction(outside) == pytest.approx(0.0)
 
 
+@pytest.mark.cv
 def test_is_frame_corrupt_catches_every_flat_frame_from_the_chunk_recon_calibration():
     """`chunk-recon/corruption-map.csv` is the investigation's own frame-by-frame calibration of
     the 2026-08-19 corrupted scenes (1600 frames, 8 real 896x512 clips). `flat > 0` marks a frame
@@ -81,6 +81,7 @@ def test_is_frame_corrupt_catches_every_flat_frame_from_the_chunk_recon_calibrat
     broken `zero_fill_fraction` could hide behind the seam detector and this test would never
     notice.
     """
+    cv2 = pytest.importorskip("cv2", reason="cv: needs opencv-python and scipy, absent here")
     import csv as csv_module
 
     csv_path = Path.home() / "Research/TestVideo/chunk-recon/corruption-map.csv"
@@ -265,6 +266,7 @@ def test_tile_seam_score_stays_disabled_at_the_min_seam_points_boundary_896x448(
     assert framecheck.tile_seam_score(frame) == 1.0
 
 
+@pytest.mark.cv
 def test_tile_seam_score_catches_the_reference_corrupt_frame_from_the_2026_08_20_incident():
     """The actual corrupt keyframe (`CLIP-ARTIFACT-seam1-corrupt-*`, 896x512) that came out of the
     boевые ворота 2026-08-19 investigation, saved to `gates-phase2-frames/` -- measured (task-1
@@ -272,6 +274,7 @@ def test_tile_seam_score_catches_the_reference_corrupt_frame_from_the_2026_08_20
     two variants (`FINAL-f226` and `SOURCE-scene1-frame0`). Real corruption clears the new
     computed-geometry threshold with the same wide margin the old hardcoded columns did.
     """
+    cv2 = pytest.importorskip("cv2", reason="cv: needs opencv-python and scipy, absent here")
     path = GATES_PHASE2_DIR / "CLIP-ARTIFACT-seam1-corrupt-SOURCE-scene1-frame0.png"
     if not path.is_file():
         pytest.skip(f"gates-phase2 reference frame not present under {GATES_PHASE2_DIR}")

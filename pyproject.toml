@@ -49,4 +49,8 @@ norecursedirs = ["upstream", ".venv"]
 # `slow` marks a test that needs the GPU and minutes of wall time (the face-refine v2v smoke).
 # Registered so an ordinary run does not warn; the tests themselves also gate on an environment
 # variable, because a marker alone would still let a bare `pytest tests/` run them.
-markers = ["slow: needs the GPU and minutes of wall time; opt in with an env var"]
+markers = [
+    "slow: needs the GPU and minutes of wall time; opt in with an env var",
+    "mlx: needs the MLX stack (mlx, mlx-vlm, upstream/); skipped where it is not installed",
+    "cv: needs opencv-python and scipy; skipped where they are not installed (the panel image)",
+]

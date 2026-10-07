@@ -20,6 +20,12 @@ purpose — reading them out of the patched module would compare the change agai
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.mlx
+pytest.importorskip("mlx.core", reason="mlx: needs the MLX stack, absent here")
+
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
