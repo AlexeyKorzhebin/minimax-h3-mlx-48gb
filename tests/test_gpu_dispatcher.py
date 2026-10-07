@@ -77,6 +77,10 @@ class FakeHost:
     def group_alive(self, pgid):
         return pgid in self.alive_groups
 
+    def group_members(self, pgid):
+        return sorted(pid for pid, g in self.pgids.items()
+                      if g == pgid and pid in self.cmdlines and pgid in self.alive_groups)
+
     def run_qwen(self, action):
         self.qwen_calls.append(action)
         return 0
@@ -603,3 +607,59 @@ def test_a_record_from_before_owners_is_adopted_and_not_stopped_by_a_client_rele
     host.ok_urls.add(H3_READY)
     assert reborn.acquire("h3", "panel-worker") == {"ok": True, "state": "ready", "engine": "h3"}
     assert reborn.status()["own"]["h3"]["owner"] == "panel-worker"
+
+
+# -- a leader that died before its children (final review 2026-10-07, I9) ---------------------------
+
+def _orphan_h3(tmp_path, host):
+    """Our H3 whose leader (sglang serve, pid 4242) died; its scheduler (4300) holds the card."""
+    d = _dispatcher(tmp_path, host)
+    d.acquire("h3", "w")
+    host.ok_urls.add(H3_READY)
+    d.acquire("h3", "w")                         # ready: the record says so
+    host.ok_urls.discard(H3_READY)
+    host.cmdlines.pop(4242)
+    host.cmdlines[4300] = "sglang::scheduler_TP0"
+    host.pgids[4300] = 4242
+    host.apps = [{"pid": 4300, "name": "sglang::scheduler", "memory_mb": 50000}]
+    return d
+
+
+def test_release_kills_a_group_whose_leader_died(tmp_path, host):
+    d = _orphan_h3(tmp_path, host)
+    assert d.release("w") == {"ok": True, "stopped": ["h3"]}
+    assert host.killed == [(4242, signal.SIGTERM)]
+    assert json.loads((tmp_path / "state.json").read_text())["engines"] == {}
+
+
+def test_acquire_after_the_leader_died_kills_the_orphans_instead_of_waiting_for_them(tmp_path, host):
+    d = _orphan_h3(tmp_path, host)
+    host.apps = []                               # gone once the group is killed
+    assert d.acquire("h3", "w")["state"] == "starting"
+    assert host.killed == [(4242, signal.SIGTERM)]
+    assert [s[0] for s in host.spawned] == ["h3", "h3"]
+
+
+def test_a_group_whose_members_are_not_the_engine_is_left_alone(tmp_path, host):
+    d = _orphan_h3(tmp_path, host)
+    host.cmdlines[4300] = "/usr/bin/python3 something_else.py"
+    d.release("w")
+    assert host.killed == []
+
+
+def test_a_reused_leader_pid_is_not_an_orphaned_group(tmp_path, host):
+    d = _orphan_h3(tmp_path, host)
+    host.cmdlines[4242] = "/usr/bin/vim notes.txt"
+    d.release("w")
+    assert host.killed == []
+
+
+def test_real_host_finds_group_members_in_proc_stat(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    for pid, stat in {4242: "4242 (sglang) S 1 4242 4242", 4300: "4300 (sglang::sch (TP0)) S 4242 4242 4242",
+                      5000: "5000 (bash) S 1 5000 5000"}.items():
+        (proc / str(pid)).mkdir(parents=True)
+        (proc / str(pid) / "stat").write_text(stat + " 0 -1 4194560\n")
+    (proc / "self").mkdir()
+    monkeypatch.setattr(gd, "PROC", proc)
+    assert sorted(gd.Host().group_members(4242)) == [4242, 4300]

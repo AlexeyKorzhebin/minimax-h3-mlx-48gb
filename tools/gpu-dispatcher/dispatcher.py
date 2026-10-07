@@ -43,6 +43,7 @@ STATE_PATH = Path(os.environ.get(
     "H3_DISPATCHER_STATE", str(Path.home() / ".local/state/h3-gpu-dispatcher/state.json")))
 QWEN_HEALTH = "http://127.0.0.1:8000/health"
 STOP_GRACE_SECONDS = 120.0
+PROC = Path("/proc")
 
 
 @dataclass(frozen=True)
@@ -190,6 +191,21 @@ class Host:
         except ProcessLookupError:
             pass
 
+    def group_members(self, pgid: int) -> list[int]:
+        """Live pids whose process group is `pgid` (field 5 of /proc/<pid>/stat)."""
+        members = []
+        for entry in PROC.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = (entry / "stat").read_text()
+            except OSError:
+                continue
+            fields = stat[stat.rfind(")") + 2:].split()
+            if len(fields) > 2 and fields[2] == str(pgid):
+                members.append(int(entry.name))
+        return members
+
     def group_alive(self, pgid: int) -> bool:
         # A dead leader that nobody waited for is a zombie, and killpg(pgid, 0) succeeds on a
         # zombie -- reap our own child first so "dead" is reported as dead.
@@ -294,9 +310,20 @@ class Dispatcher:
             return [{**app, "first_seen": self._first_seen.setdefault(app["pid"], now)}
                     for app in foreign]
 
+    def _orphaned_group(self, name: str, record: dict) -> bool:
+        """Final review 2026-10-07, I9: the leader died (OOM, a crash) but its children live on --
+        sglang's scheduler holds the 50 GB, not the leader. The group is still ours when the
+        leader's pid is gone entirely (Linux never hands out a pid still in use as a pgid, so the
+        group can only be the one we started) and a member carries the engine's first marker."""
+        if self.host.cmdline(record["pid"]) is not None:
+            return False                     # the pid lives on as something else: not ours
+        marker = self.specs[name].markers[0]
+        return any(marker in (self.host.cmdline(pid) or "")
+                   for pid in self.host.group_members(record["pgid"]))
+
     def _stop(self, name: str, record: dict) -> None:
         """Called with `_ops` held and `_state` free: kill our group, wait, then forget it."""
-        if self._alive(name, record):
+        if self._alive(name, record) or self._orphaned_group(name, record):
             pgid = record["pgid"]
             self.host.killpg(pgid, signal.SIGTERM)
             deadline = self.host.monotonic() + STOP_GRACE_SECONDS
@@ -313,7 +340,8 @@ class Dispatcher:
 
     def _release_all(self) -> list[str]:
         state = self._snapshot()
-        stopped = sorted(self._own_records(state))
+        stopped = sorted(name for name, record in state["engines"].items()
+                         if self._alive(name, record) or self._orphaned_group(name, record))
         for name, record in state["engines"].items():
             self._stop(name, record)
         self.lock.release()
@@ -323,7 +351,8 @@ class Dispatcher:
         state = self._snapshot()
         mine = {name: record for name, record in state["engines"].items()
                 if record.get("owner") == client}
-        stopped = sorted(name for name, record in mine.items() if self._alive(name, record))
+        stopped = sorted(name for name, record in mine.items()
+                         if self._alive(name, record) or self._orphaned_group(name, record))
         for name, record in mine.items():
             self._stop(name, record)
         self._release_lock_if_idle()
@@ -364,7 +393,7 @@ class Dispatcher:
             state = self._snapshot()
             record = state["engines"].get(engine)
             if record and not self._alive(engine, record):
-                self._update(lambda st: st["engines"].pop(engine, None))
+                self._stop(engine, record)        # kills an orphaned group (I9), then forgets
                 self._release_lock_if_idle()
                 if not record.get("ready"):
                     return {"ok": True, "state": "failed", "engine": engine, "log": record["log"],
