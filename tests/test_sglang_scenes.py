@@ -311,3 +311,20 @@ def test_more_pictures_than_the_limit_refuse_the_submission_instead_of_dropping_
         ("too_many_reference_images", "картинок-референсов 2, а можно не больше 1")
     assert submitted == []
     assert p.load_project(proj.path).scenes[4]["status"] == "pending"
+
+
+def test_every_stage_transition_is_stamped_for_the_battle_report(tmp_path, monkeypatch):
+    """Final review I7: when each stage last entered each status, in project.json."""
+    proj = p.create_project(tmp_path / "out", "video", "T")
+    stamps = iter(["2026-10-08T10:00:00", "2026-10-08T10:00:05", "2026-10-08T11:40:00",
+                   "2026-10-08T12:00:00", "2026-10-08T12:03:00"])
+    monkeypatch.setattr(p, "_now", lambda: next(stamps))
+    proj.approve_stage("script")
+    proj.set_stage_status("scenes", "running")
+    proj.set_stage_status("scenes", "done")
+    proj.set_stage_status("upscale", "running")
+    proj.finish_upscale({})
+    assert p.load_project(proj.path).as_dict()["stage_times"] == {
+        "script": {"approved": "2026-10-08T10:00:00"},
+        "scenes": {"running": "2026-10-08T10:00:05", "done": "2026-10-08T11:40:00"},
+        "upscale": {"running": "2026-10-08T12:00:00", "done": "2026-10-08T12:03:00"}}

@@ -208,6 +208,13 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _stamp_stage(data: dict, name: str, status: str) -> None:
+    """`stage_times[name][status]` = now (final review 2026-10-07, I7): when each stage last
+    entered each status, for the battle report ("от постановки до финального файла"). A top-level
+    field this class does not own, so it round-trips through `_extra` untouched by the others."""
+    data.setdefault("stage_times", {}).setdefault(name, {})[status] = _now()
+
+
 def _dir_stamp(created_at: str) -> str:
     """`created_at` as `YYYYmmdd-HHMM` -- the timestamp half of a project's directory name.
     Minute precision, matching `queue._dir_stamp`: a human reading directory names does not need
@@ -598,6 +605,7 @@ class Project:
         with _project_lock(self.path.parent, exclusive=True):
             data = _read_data(self.path)
             data["stages"][name] = "approved"
+            _stamp_stage(data, name, "approved")
             write_json_durably(self.path, data)
             self._apply(data)
         return self
@@ -655,6 +663,7 @@ class Project:
                 data["stages"]["upscale"] = "draft"
             else:
                 data["stages"]["upscale"] = "done" if ok else "failed"
+            _stamp_stage(data, "upscale", data["stages"]["upscale"])
             write_json_durably(self.path, data)
             self._apply(data)
         return current and ok
@@ -674,6 +683,7 @@ class Project:
         with _project_lock(self.path.parent, exclusive=True):
             data = _read_data(self.path)
             data["stages"][name] = status
+            _stamp_stage(data, name, status)
             write_json_durably(self.path, data)
             self._apply(data)
         return self
