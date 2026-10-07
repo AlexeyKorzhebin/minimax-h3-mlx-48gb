@@ -57,11 +57,12 @@ QUEUE_STATES = ("pending", "running", "done", "failed")
 KIND_GENERATE = "generate"
 KIND_SONG = "song"
 KIND_ASSEMBLE = "assemble"
+KIND_UPSCALE = "upscale"
 
 #: Every `Job.kind` this module and the worker know about. `submit` refuses anything else -- a
 #: caller with a typo'd kind should see `QueueError` at submission time, not a job that sits in
 #: `pending/` forever because nothing claims to know how to run it.
-JOB_KINDS = (KIND_GENERATE, KIND_SONG, KIND_ASSEMBLE)
+JOB_KINDS = (KIND_GENERATE, KIND_SONG, KIND_ASSEMBLE, KIND_UPSCALE)
 
 #: Every suffix a finished (or half-finished) run can leave next to `output_stem`. A stale `.wav`
 #: or `.json` from a killed run claims the name just as surely as a `.mp4` does -- the next attempt
@@ -635,13 +636,13 @@ def _validate_args_shape_for_kind(kind: str, args: list[str]) -> None:
     without also setting `kind`, which would otherwise be handed to `h3 generate` as its own
     subprocess argv and fail inside the CLI instead of at submission.
     """
-    if kind in (KIND_SONG, KIND_ASSEMBLE):
+    if kind in (KIND_SONG, KIND_ASSEMBLE, KIND_UPSCALE):
         if not args or args[0] != kind or "--project" not in args:
             raise QueueError(
                 f"kind={kind!r} job args must look like [{kind!r}, '--project', <path>, ...], "
                 f"got {args!r}")
     elif kind == KIND_GENERATE:
-        if args and args[0] in (KIND_SONG, KIND_ASSEMBLE):
+        if args and args[0] in (KIND_SONG, KIND_ASSEMBLE, KIND_UPSCALE):
             raise QueueError(
                 f"kind=\"generate\" job args must not start with {args[0]!r} -- pass "
                 f"kind={args[0]!r} to submit() instead, got {args!r}")

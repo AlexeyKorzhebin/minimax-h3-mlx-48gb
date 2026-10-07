@@ -46,7 +46,7 @@ def test_create_project_initializes_the_documented_model(tmp_path, kind):
     assert project.kind == kind
     assert project.title == "Title"
     assert project.scenes == []
-    assert set(project.stages) == {"script", "track", "scenario", "scenes", "assembly"}
+    assert set(project.stages) == {"script", "track", "scenario", "scenes", "upscale", "assembly"}
     # Task 3: "scenario" is the one stage that does not default to "draft" for every kind -- it is
     # meaningful only for kind="clip" (see STAGE_NAMES's own docstring), so video/song start it
     # straight at "approved" (nothing to gate) instead of a "draft" gate that would never resolve.

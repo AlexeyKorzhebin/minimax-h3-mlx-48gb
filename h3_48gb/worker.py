@@ -673,6 +673,36 @@ def _run_sglang_generate_job(root, outdir, job, *, gate=None) -> tuple[int, str]
     return result
 
 
+def _run_upscale_job(root, outdir, job) -> tuple[int, str]:
+    """spec §4.2: one job per project -- acquire ltx (the dispatcher stops our H3 and starts our
+    ComfyUI), then every part with one strength."""
+    from h3_48gb.engines import ltx
+
+    dispatcher = dispatcher_client.DispatcherClient()
+    try:
+        try:
+            reason = make_gpu_gate(root, "ltx", client=dispatcher)(job)
+        except GpuEngineFailed as exc:
+            return 1, f"движок не поднялся: {exc.reason}; лог: {exc.log}\n"
+        if reason:
+            return 1, f"ltx: {reason}\n"
+        client = ltx.ComfyClient(os.environ.get("H3_COMFY_URL", ltx.DEFAULT_COMFY_URL))
+        return ltx.run_upscale(
+            _project_arg(job.args), client=client,
+            comfy_output=os.environ.get("H3_COMFY_OUTPUT_DIR", ltx.DEFAULT_COMFY_OUTPUT),
+            run=subprocess.run,
+            # unique per *run*, not per job: a job resumed after a restart is the same job id,
+            # and its second attempt must never read frames the first attempt left behind
+            attempt=f"{job.id}-{time.time_ns()}",
+            cancelled=lambda: q.cancel_reason(root, job.id))
+    finally:
+        if q.cancel_reason(root, job.id) == "released_by_user":
+            try:
+                dispatcher.release()
+            except dispatcher_client.DispatcherUnavailable:
+                pass
+
+
 def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
     """The `kind="assemble"` job body (task 3 dispatches; the implementation is task 4's). A lazy
     `import h3_48gb.assemble` -- not a module-level one -- so this module keeps working, and every
@@ -927,6 +957,8 @@ def run_job(root, job, spawn=subprocess.Popen, outdir=None) -> int:
                     exit_code, log_text = 1, f"сборка отменена: {cancelled}\n"
                 else:
                     exit_code, log_text = _run_assemble_job(job, spawn=spawn)
+            elif job.kind == q.KIND_UPSCALE:
+                exit_code, log_text = _run_upscale_job(root, outdir, job)
             else:
                 exit_code, log_text = 1, f"unknown job kind {job.kind!r}\n"
             with open(q.log_path(root, job.id), "ab") as stream:
@@ -941,7 +973,7 @@ def run_job(root, job, spawn=subprocess.Popen, outdir=None) -> int:
 
     if job.kind == q.KIND_GENERATE:
         _handle_project_scene_result(root, outdir, job, exit_code, run=_tracked_child_run(spawn))
-    elif job.kind in (q.KIND_SONG, q.KIND_ASSEMBLE):
+    elif job.kind in (q.KIND_SONG, q.KIND_ASSEMBLE, q.KIND_UPSCALE):
         _advance_project_after_job(root, outdir, job, run=_tracked_child_run(spawn))
 
     return exit_code

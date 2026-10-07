@@ -36,7 +36,7 @@ packages = ["h3_48gb", "h3_48gb.engines"]
 # needs the files, not just the modules. There is no build step on purpose: a localhost tool must
 # still start in six months, and what rots is the toolchain, not the HTML.
 [tool.setuptools.package-data]
-h3_48gb = ["webui/*.html", "webui/*.css", "webui/*.js"]
+h3_48gb = ["webui/*.html", "webui/*.css", "webui/*.js", "engines/*.json"]
 
 [tool.pytest.ini_options]
 # `upstream/` is a vendored clone whose own tests import torch, which this fork does not install —

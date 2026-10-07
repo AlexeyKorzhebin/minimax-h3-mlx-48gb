@@ -2160,6 +2160,9 @@ def _project_active_job(proj, jobs) -> dict | None:
     song_job = _project_job_by_args(jobs, proj.path, q.KIND_SONG)
     if song_job is not None:
         return {"kind": "track", "job": song_job.as_dict()}
+    upscale_job = _project_job_by_args(jobs, proj.path, q.KIND_UPSCALE)
+    if upscale_job is not None:
+        return {"kind": "upscale", "job": upscale_job.as_dict()}
     assemble_job = _project_job_by_args(jobs, proj.path, q.KIND_ASSEMBLE)
     if assemble_job is not None:
         return {"kind": "assembly", "job": assemble_job.as_dict()}
@@ -5425,7 +5428,7 @@ class _Handler(BaseHTTPRequestHandler):
         payload = self._json_request(allowed=("confirm",))
         root = self.server.queue_root
         running, _pending = self._running_job()
-        if running is not None and running.kind in (q.KIND_GENERATE, "upscale"):
+        if running is not None and running.kind in (q.KIND_GENERATE, q.KIND_UPSCALE):
             # only GPU work is cancelled; an assembly (ffmpeg, no GPU) keeps running
             if payload.get("confirm") is not True:
                 raise CliError("release_needs_confirm",

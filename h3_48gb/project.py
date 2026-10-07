@@ -84,7 +84,7 @@ PROJECT_KINDS = ("video", "clip", "song")
 #: "этап не начат" -- an old clip project's scenes were already built the procedural way with no
 #: scenario step to gate in the first place, so migrating to `"draft"` would incorrectly leave an
 #: already-finished project looking like it is stuck waiting on a gate it never had.
-STAGE_NAMES = ("script", "track", "scenario", "scenes", "assembly")
+STAGE_NAMES = ("script", "track", "scenario", "scenes", "upscale", "assembly")
 
 #: What a stage's status can be. `draft` (nothing produced yet), `awaiting_approval` (produced,
 #: waiting on the gate -- "Утвердить сценарий" / "Утвердить трек"), `approved` (gate passed),
@@ -479,6 +479,9 @@ class Project:
             # at all -- migrate on read to "approved" ("этап пройден"), not "draft". See
             # `STAGE_NAMES`'s own docstring for why "draft" would be the wrong migration target.
             self.stages["scenario"] = "approved"
+        # spec §3.3.8/§4.2: a project.json written before the upscale stage existed has no key
+        # for it -- "draft" (not started), unlike scenario's "approved": nothing has upscaled it.
+        self.stages.setdefault("upscale", "draft")
         self.scenes = [dict(scene) for scene in data["scenes"]]
         self.track = dict(data["track"])
         self.assembly = dict(data["assembly"])
@@ -560,6 +563,20 @@ class Project:
         with _project_lock(self.path.parent, exclusive=True):
             data = _read_data(self.path)
             data["stages"][name] = "approved"
+            write_json_durably(self.path, data)
+            self._apply(data)
+        return self
+
+    _SCENE_FIELDS = ("ltx_path",)
+
+    def set_scene_fields(self, idx: int, **fields) -> "Project":
+        unknown = set(fields) - set(self._SCENE_FIELDS)
+        if unknown:
+            raise ProjectError(f"unknown scene field(s) {sorted(unknown)}")
+        with _project_lock(self.path.parent, exclusive=True):
+            data = _read_data(self.path)
+            scene = _find_scene(data["scenes"], idx)
+            scene.update(fields)
             write_json_durably(self.path, data)
             self._apply(data)
         return self
