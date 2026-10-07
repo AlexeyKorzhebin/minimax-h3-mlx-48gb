@@ -501,6 +501,18 @@ def _mark_assembly_failed(project_path) -> None:
         pass
 
 
+def _run_sglang_generate_job(root, outdir, job, *, gate=None) -> tuple[int, str]:
+    """spec §3.3.3: on sglang a generate job runs in this process through the adapter, under the
+    lease `run_job` already holds -- no subprocess, no caffeinate, no MLX."""
+    from h3_48gb.engines import sglang as sglang_engine
+
+    client = sglang_engine.SglangClient(os.environ.get("H3_SGLANG_URL", sglang_engine.DEFAULT_URL))
+    try:
+        return sglang_engine.run_generate(job, root=root, outdir=outdir, client=client, gate=gate)
+    except Exception as exc:  # noqa: BLE001 -- a bug here must fail the job, not kill the worker
+        return 1, f"sglang adapter crashed: {type(exc).__name__}: {exc}\n"
+
+
 def _run_assemble_job(job, *, spawn=subprocess.Popen) -> tuple[int, str]:
     """The `kind="assemble"` job body (task 3 dispatches; the implementation is task 4's). A lazy
     `import h3_48gb.assemble` -- not a module-level one -- so this module keeps working, and every
@@ -727,7 +739,7 @@ def run_job(root, job, spawn=subprocess.Popen, outdir=None) -> int:
     outdir = Path(outdir) if outdir is not None else root.parent
     lease = _acquire_lease(root, job.id)
     try:
-        if job.kind == q.KIND_GENERATE:
+        if job.kind == q.KIND_GENERATE and not engine.is_sglang():
             # Append rather than truncate: a job returned to `pending/` by reconciliation resumes
             # from its checkpoint, and the log of the attempt that was interrupted is the only
             # record of why it was interrupted.
@@ -742,7 +754,9 @@ def run_job(root, job, spawn=subprocess.Popen, outdir=None) -> int:
             finished_at = _now()
             log_tail = q.read_log_tail(root, job.id)
         else:
-            if job.kind == q.KIND_SONG:
+            if job.kind == q.KIND_GENERATE:
+                exit_code, log_text = _run_sglang_generate_job(root, outdir, job)
+            elif job.kind == q.KIND_SONG:
                 exit_code, log_text = _run_song_job(job, spawn=spawn)
             elif job.kind == q.KIND_ASSEMBLE:
                 exit_code, log_text = _run_assemble_job(job, spawn=spawn)
@@ -982,6 +996,12 @@ def main_loop(root, poll: float = 5.0, stop=None, spawn=subprocess.Popen, outdir
             if state.alive:
                 if stop.wait(poll):
                     break
+                continue
+            if state.resumable:
+                # spec §5: a scene sglang is already computing is resumed by polling its id,
+                # paused queue or not -- pausing stops *new* work, this is old work.
+                run_job(root, state.resumable[0], spawn=spawn, outdir=outdir)
+                ran += 1
                 continue
             if q.is_paused(root):
                 if stop.wait(poll):

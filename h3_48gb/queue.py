@@ -38,7 +38,7 @@ import os
 import re
 import secrets
 import string
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -143,6 +143,15 @@ class Job:
     finished_at: str | None = None
     exit_code: int | None = None
     log_tail: str | None = None
+    #: sglang's own job id once the adapter's POST was accepted (spec §4.1.6). A running job that
+    #: carries one is resumed by polling, never re-posted (`reconcile`'s `resumable`).
+    engine_ref: str | None = None
+    #: Why a running job is not computing yet ("ждём GPU: ...", "остываем, 81 °C"), for the page.
+    wait_reason: str | None = None
+    #: Set by the page (`request_cancel`) on a running sglang job; the adapter stops waiting.
+    cancel_reason: str | None = None
+    #: Wall-clock time of the accepted POST, so `wall_s` after a resume still counts from it.
+    engine_submitted_at: float | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -193,6 +202,9 @@ class Reconciled:
     changed: list[Job]
     alive: list[Job]
     conflicted: list[Broken]
+    #: Running jobs with an `engine_ref` and a free lease: a worker died while sglang was
+    #: computing; the next worker resumes polling them instead of re-posting.
+    resumable: list[Job] = field(default_factory=list)
 
 
 def _now() -> str:
@@ -970,6 +982,47 @@ def finish(root, job_id: str, exit_code: int, log_tail: str, finished_at=None) -
         return _finish_locked(root, job_id, exit_code, log_tail, finished_at)
 
 
+class JobNotRunning(QueueError):
+    """A running-only mutation was asked of a job that is not in `running/`."""
+
+
+RUNNING_FIELDS = ("engine_ref", "engine_submitted_at", "wait_reason")
+
+
+def _mutate_running(root, job_id: str, fields: dict) -> Job:
+    root = Path(root)
+    with queue_lock(root, exclusive=True):
+        running = job_path(root, job_id, "running")
+        if not running.exists():
+            raise JobNotRunning(f"job {job_id} is not running")
+        data = _read_job_dict(running)
+        data.update(fields)
+        job = _build_job(data, "running")
+        write_json_durably(running, data)
+        return job
+
+
+def set_running_fields(root, job_id: str, **fields) -> Job:
+    unknown = set(fields) - set(RUNNING_FIELDS)
+    if unknown:
+        raise ValueError(f"not a running-job field: {sorted(unknown)}")
+    return _mutate_running(root, job_id, fields)
+
+
+def request_cancel(root, job_id: str, reason: str) -> Job:
+    return _mutate_running(root, job_id, {"cancel_reason": reason})
+
+
+def cancel_reason(root, job_id: str) -> str | None:
+    """Read without the queue lock: every write to a job file is an atomic replace, so a reader
+    sees the old file or the new one, never half of either."""
+    try:
+        data = _read_job_dict(job_path(root, job_id, "running"))
+    except (OSError, QueueError, ValueError):
+        return None
+    return data.get("cancel_reason")
+
+
 def _return_to_pending_locked(root: Path, job_id: str) -> Job:
     """Move a job back from `running/` into `pending/` without acquiring the queue lock, for
     `reconcile`'s fourth row: the run was interrupted before it produced anything.
@@ -1140,7 +1193,9 @@ def reconcile(root) -> Reconciled:
     changed: list[Job] = []
     alive: list[Job] = []
     conflicted: list[Broken] = []
-    empty = Reconciled(changed=changed, alive=alive, conflicted=conflicted)
+    resumable: list[Job] = []
+    empty = Reconciled(changed=changed, alive=alive, conflicted=conflicted,
+                       resumable=resumable)
 
     if not root.is_dir():
         return empty
@@ -1164,11 +1219,14 @@ def reconcile(root) -> Reconciled:
                 if Path(f"{job.output_stem}.mp4").exists():
                     changed.append(_finish_locked(root, job.id, 0, RESULT_RECOVERED_NOTE))
                     continue
+                if job.engine_ref:
+                    resumable.append(job)
+                    continue
                 changed.append(_return_to_pending_locked(root, job.id))
             except QueueError as exc:
                 conflicted.append(Broken(path=str(file), error=f"{type(exc).__name__}: {exc}"))
 
-    return Reconciled(changed=changed, alive=alive, conflicted=conflicted)
+    return Reconciled(changed=changed, alive=alive, conflicted=conflicted, resumable=resumable)
 
 
 def update(root, job_id: str, args: list[str], note: str, dry_run_report: dict, estimate: dict,

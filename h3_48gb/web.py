@@ -3914,6 +3914,23 @@ class _Handler(BaseHTTPRequestHandler):
                 job = q.cancel(self.server.queue_root, job_id)
             return 200, "application/json", _json_bytes({"ok": True, "job": job.as_dict()})
 
+        if engine.is_sglang():
+            # spec §5: a running scene cannot be stopped on the GPU (DELETE only forgets the
+            # record), so this only asks the adapter to stop waiting for it.
+            with name_too_long_is_a_refusal("the job id"):
+                running = q.job_path(self.server.queue_root, job_id, "running").exists()
+            if running:
+                try:
+                    with queue_write_errors(self.server.queue_root, what="the job id"):
+                        job = q.request_cancel(self.server.queue_root, job_id, "cancelled_by_user")
+                except q.JobNotRunning:
+                    raise CliError(
+                        "job_not_pending",
+                        f"эта задача уже завершилась: {job_id}", {"id": job_id}) from None
+                return 200, "application/json", _json_bytes({
+                    "ok": True, "cancelling": True, "job": job.as_dict(),
+                    "message": "H3 досчитает сцену впустую, следующая задача начнётся после"})
+
         jobs, _broken = q.scan(self.server.queue_root)
         job = next((candidate for candidate in jobs if candidate.id == job_id
                    and candidate.state in ("done", "failed")), None)
