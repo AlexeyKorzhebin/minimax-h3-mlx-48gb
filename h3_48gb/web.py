@@ -4308,17 +4308,30 @@ class _Handler(BaseHTTPRequestHandler):
         return 200, "application/json", _json_bytes({"ok": True, "card": card})
 
     def _delete_card(self, name: str) -> tuple[int, str, bytes]:
-        """`DELETE /api/library/<name>`: refused while any project -- finished ones too -- names
-        the tag in its references, a scene's `refs` or a scene's `@tag` start image."""
+        """`DELETE /api/library/<name>`: refused while any project -- finished or unlistable ones
+        too -- holds the tag. The test is textual (`"@tag"` as a whole JSON string anywhere in
+        `project.json`): references, a scene's `refs`, either `start_image`, and whatever field a
+        later wave adds. A `project.json` that cannot be read refuses the delete as well."""
         tag = "@" + name
-        pinned_by = []
-        for proj in project_module.list_projects(self.server.outdir):
-            named = {ref["tag"] for ref in proj.references}
-            for scene in proj.scenes:
-                named.update(scene.get("refs") or ())
-                named.add(scene.get("start_image"))
-            if tag in named:
-                pinned_by.append({"id": proj.id, "title": proj.title})
+        needle = json.dumps(tag)
+
+        def pinned_by() -> list[dict]:
+            found = []
+            root = Path(self.server.outdir) / "projects"
+            for entry in sorted(root.iterdir()) if root.is_dir() else []:
+                path = entry / project_module.PROJECT_FILENAME
+                if not path.is_file():
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8")
+                    title = json.loads(text)["title"]
+                except (OSError, ValueError, KeyError, TypeError):
+                    found.append({"id": entry.name, "title": "project.json не читается"})
+                    continue
+                if needle in text:
+                    found.append({"id": entry.name, "title": title})
+            return found
+
         trashed = self._library_call(library_module.delete_card, self.server.outdir, tag,
                                      pinned_by=pinned_by)
         return 200, "application/json", _json_bytes({"ok": True, "trashed": str(trashed)})

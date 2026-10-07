@@ -87,3 +87,106 @@ def test_a_card_named_only_by_a_scene_is_not_deleted(live, outdir):
 def test_an_unknown_card_is_404(live):
     status, body = _call(live, "DELETE", "/api/library/nobody")
     assert (status, body["error"]["code"]) == (404, "library_card_not_found")
+
+
+def _edit_project_json(proj, **fields):
+    import json
+    path = proj.path
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.update(fields)
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _in_use(live, proj):
+    status, body = _call(live, "DELETE", "/api/library/alice")
+    assert (status, body["error"]["code"], body["error"]["detail"]["projects"]) == (
+        409, "library_card_in_use", [{"id": proj.id, "title": "Бой"}])
+
+
+def test_a_card_used_as_a_scenes_start_image_is_not_deleted(live, outdir):
+    proj = p.create_project(outdir, "video", "Бой")
+    proj.replace_scenes([{"idx": 0, "prompt": "x", "start_image": "@alice"}])
+    _in_use(live, proj)
+
+
+def test_a_card_used_as_the_projects_start_image_is_not_deleted(live, outdir):
+    proj = p.create_project(outdir, "video", "Бой")
+    _edit_project_json(proj, start_image="@alice")
+    _in_use(live, proj)
+
+
+def test_a_project_the_listing_skips_still_blocks_when_it_names_the_tag(live, outdir):
+    proj = p.create_project(outdir, "video", "Бой")
+    _edit_project_json(proj, scenes="not-a-list", references=[{"tag": "@alice", "version": 1}])
+    with pytest.warns(UserWarning, match="skipping corrupt project"):
+        assert proj.id not in [x.id for x in p.list_projects(outdir)]
+    _in_use(live, proj)
+
+
+def test_an_unreadable_project_refuses_the_delete_with_a_reason(live, outdir):
+    proj = p.create_project(outdir, "video", "Бой")
+    proj.path.write_text("{broken", encoding="utf-8")
+    status, body = _call(live, "DELETE", "/api/library/alice")
+    assert (status, body["error"]["code"], body["error"]["detail"]["projects"]) == (
+        409, "library_card_in_use", [{"id": proj.id, "title": "project.json не читается"}])
+
+
+def test_delete_create_delete_within_one_second_keeps_both_trashed_copies(outdir):
+    first = lib.delete_card(outdir, "@alice", pinned_by=[], now="20261007120000")
+    lib.create_card(outdir, tag="@alice", kind="person", description="again",
+                    assets=[outdir / "uploads" / "a.png"])
+    second = lib.delete_card(outdir, "@alice", pinned_by=[], now="20261007120000")
+    assert (first.name, second.name) == ("alice-20261007120000", "alice-20261007120000-2")
+    assert [lib.json.loads((d / "card.json").read_text(encoding="utf-8"))["version"]
+            for d in (first, second)] == [2, 1]
+
+
+def test_the_trash_keeps_every_version_file_of_the_card(outdir):
+    trashed = lib.delete_card(outdir, "@alice", pinned_by=[], now="20261007120000")
+    assert (trashed / "v1" / "01-a.png").read_bytes() == PNG
+
+
+def test_pinned_by_is_decided_under_the_card_lock(outdir):
+    seen = []
+
+    def pinned():
+        import fcntl
+        with open(outdir / "library" / "alice" / "card.lock", "a+") as other:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                seen.append("free")
+            except BlockingIOError:
+                seen.append("held")
+        return []
+
+    lib.delete_card(outdir, "@alice", pinned_by=pinned, now="20261007120000")
+    assert seen == ["held"]
+
+
+def test_a_writer_waiting_on_a_deleted_card_does_not_resurrect_its_directory(outdir):
+    import threading
+    card_dir = outdir / "library" / "alice"
+    outcome = []
+
+    def writer():
+        try:
+            lib.update_card(outdir, "@alice", description="late")
+        except lib.LibraryError as exc:
+            outcome.append(exc.code)
+
+    with lib._card_lock(card_dir, "@alice"):
+        thread = threading.Thread(target=writer)
+        thread.start()
+        import time
+        time.sleep(0.3)
+        card_dir.rename(outdir / "library" / ".trash-moved")
+    thread.join(5)
+    assert (outcome, card_dir.exists()) == (["library_card_not_found"], False)
+
+
+def test_locking_a_card_that_is_gone_does_not_recreate_its_directory(outdir):
+    gone = outdir / "library" / "bob"
+    with pytest.raises(lib.LibraryError) as err:
+        with lib._card_lock(gone, "@bob"):
+            pass
+    assert (err.value.code, gone.exists()) == ("library_card_not_found", False)

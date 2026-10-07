@@ -79,9 +79,15 @@ def _card_dir(outdir, tag) -> Path:
 
 
 @contextmanager
-def _card_lock(card_dir: Path):
-    card_dir.mkdir(parents=True, exist_ok=True)
-    with open(card_dir / "card.lock", "a+") as handle:
+def _card_lock(card_dir: Path, tag: str):
+    """Exclusive lock on one card. The directory must exist: a writer that was waiting while the
+    card was deleted must find it gone, not recreate an empty one (which `create_card` would then
+    refuse as `library_tag_exists` forever)."""
+    try:
+        handle = open(card_dir / "card.lock", "a+")
+    except FileNotFoundError:
+        raise LibraryError("library_card_not_found", f"нет карточки {tag}", {"tag": tag}) from None
+    with handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
@@ -155,7 +161,7 @@ def create_card(outdir, *, tag, kind, description, assets, now=None) -> dict:
     except FileExistsError:
         raise LibraryError("library_tag_exists", f"тег {tag} уже есть", {"tag": tag}) from None
     stamp = now or _now()
-    with _card_lock(card_dir):
+    with _card_lock(card_dir, tag):
         relative = _copy_assets(card_dir, 1, paths)
         card = {"tag": tag, "version": 1, "created": stamp, "updated": stamp,
                 "versions": {"1": {"kind": kind, "description": description.strip(),
@@ -166,8 +172,8 @@ def create_card(outdir, *, tag, kind, description, assets, now=None) -> dict:
 
 def update_card(outdir, tag, *, kind=None, description=None, assets=None, now=None) -> dict:
     card_dir = _card_dir(outdir, tag)
-    _read(card_dir, tag)  # refuse an unknown tag before _card_lock creates its directory
-    with _card_lock(card_dir):
+    _read(card_dir, tag)
+    with _card_lock(card_dir, tag):
         card = _read(card_dir, tag)
         previous = card["versions"][str(card["version"])]
         new_kind = kind if kind is not None else previous["kind"]
@@ -205,20 +211,28 @@ def card_history(outdir, tag) -> list[dict]:
             for number, entry in sorted(card["versions"].items(), key=lambda kv: int(kv[0]))]
 
 
-def delete_card(outdir, tag, *, pinned_by: list[dict], now: str | None = None) -> Path:
-    """Move the card's directory to `library/.trash/<name>-<stamp>`; never erase it. A card some
-    project pins is refused: `pinned_by` lists those projects as `{"id", "title"}`."""
+def delete_card(outdir, tag, *, pinned_by, now: str | None = None) -> Path:
+    """Move the card's directory to `library/.trash/<name>-<stamp>[-N]`; never erase it. A card some
+    project pins is refused. `pinned_by` is a list of `{"id", "title"}` or a zero-argument callable
+    returning one -- the callable is evaluated under the card lock, so a project cannot pin the
+    card between the check and the move."""
     card_dir = _card_dir(outdir, tag)
     _read(card_dir, tag)
-    if pinned_by:
-        listed = ", ".join(f"«{item['title']}» ({item['id']})" for item in pinned_by)
-        raise LibraryError("library_card_in_use",
-                           f"{tag} подключена к проектам: {listed} — отключите её там или "
-                           "удалите проекты", {"tag": tag, "projects": pinned_by})
-    trash = library_root(outdir) / ".trash"
-    target = trash / f"{card_dir.name}-{now or datetime.now().strftime('%Y%m%d%H%M%S')}"
-    with _card_lock(card_dir):
+    with _card_lock(card_dir, tag):
+        _read(card_dir, tag)  # a concurrent delete may have moved it while we waited
+        pins = pinned_by() if callable(pinned_by) else pinned_by
+        if pins:
+            listed = ", ".join(f"«{item['title']}» ({item['id']})" for item in pins)
+            raise LibraryError("library_card_in_use",
+                               f"{tag} подключена к проектам: {listed} — отключите её там или "
+                               "удалите проекты", {"tag": tag, "projects": pins})
+        trash = library_root(outdir) / ".trash"
         trash.mkdir(exist_ok=True)
+        base = f"{card_dir.name}-{now or datetime.now().strftime('%Y%m%d%H%M%S')}"
+        target, number = trash / base, 1
+        while target.exists():
+            number += 1
+            target = trash / f"{base}-{number}"
         card_dir.rename(target)
     return target
 
