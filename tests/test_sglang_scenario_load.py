@@ -112,3 +112,18 @@ def test_scenes_cannot_be_replaced_once_the_chain_started(live):
     clip = p.create_project(live.outdir, "clip", "Клип")
     status, answer = _call(live, "PUT", f"/api/projects/{clip.id}/scenes", _scenario())
     assert (status, _error(answer)[0]) == (400, "args_invalid")
+
+
+def test_a_voice_card_as_start_image_is_refused_at_approval(live):
+    (live.outdir / "uploads" / "v.mp3").write_bytes(b"ID3")
+    lib.create_card(live.outdir, tag="@voice", kind="voice", description="a low voice",
+                    assets=[live.outdir / "uploads" / "v.mp3"])
+    proj = p.create_project(live.outdir, "video", "Бой")
+    body = _scenario("@voice")
+    body["references"].append({"tag": "@voice"})
+    assert _call(live, "PUT", f"/api/projects/{proj.id}/scenes", body)[0] == 200
+    status, answer = _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})
+    assert (status, answer.get("error", {}).get("detail")) == (400, {"scenes": [
+        {"idx": 0, "code": "start_image_invalid",
+         "message": "start_image @voice: это голос, а нужен кадр"}]})
+    assert _pending(live) == []

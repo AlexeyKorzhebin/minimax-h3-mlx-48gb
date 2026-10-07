@@ -1015,7 +1015,7 @@ def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
             # I6: scene 0's start image is resolved here exactly as the submission resolves it
             start = assemble_module.scene_start_image(proj, scene, outdir)
             if start is not None and not start.is_file():
-                raise library_module.LibraryError("start_image_missing",
+                raise library_module.LibraryError("start_image_invalid",
                                                   f"нет файла start_image {start}", {})
             args, _ = assemble_module._scene_generate_args_sglang(
                 scene, keyframe=Path("keyframe.png") if chained else start, chained=chained,

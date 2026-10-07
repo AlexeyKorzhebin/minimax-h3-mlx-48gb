@@ -1365,7 +1365,7 @@ def scene_start_image(proj, scene: dict, outdir) -> Path | None:
                                    {"unknown": [raw]})
     card = library.get_card(outdir, raw, pinned[raw].get("version"))
     if card["kind"] == "voice":
-        raise library.LibraryError("start_image_not_picture",
+        raise library.LibraryError("start_image_invalid",
                                    f"start_image {raw}: это голос, а нужен кадр", {"tag": raw})
     return Path(card["assets"][0])
 

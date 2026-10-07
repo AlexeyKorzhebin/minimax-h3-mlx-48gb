@@ -42,6 +42,7 @@ ERROR_CODES = {
     "library_version_not_found": "the reference card has no such version",
     "tag_invalid": "an @tag in scene text is not lowercase [a-z0-9-]{2,32}",
     "unknown_tag": "an @tag in scene text is not pinned to the project",
+    "start_image_invalid": "scene 0's start_image is not a picture on disk (no such file, or a voice card)",
 }
 
 
