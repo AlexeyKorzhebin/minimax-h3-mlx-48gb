@@ -2273,6 +2273,26 @@ def _media_mtime(path) -> int | None:
         return None
 
 
+def _upscale_report(proj) -> dict | None:
+    """What the LTX upscale did, from `<project>/upscale/report.json` (`engines/ltx._write_report`).
+    `attempted` is the parts the attempt *started* (a part enters the report before it is
+    upscaled, and `done` is written after a cut-short re-shot too) -- which parts are finished is
+    `ltx_path` on the scene, not this. No file, or not a JSON object -> None."""
+    try:
+        report = json.loads((proj.path.parent / "upscale" / "report.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(report, dict):
+        return None
+    parts = report.get("parts")
+    return {"status": report.get("status"), "strength": report.get("strength"),
+            "motion": report.get("motion"),
+            "attempted": [part["idx"] for part in parts
+                          if isinstance(part, dict) and "idx" in part]
+            if isinstance(parts, list) else [],
+            "error": report.get("error")}
+
+
 def _project_payload(proj) -> dict:
     """`proj.as_dict()`, with a cache-buster `v` field added to `track`/`assembly` when their own
     media file exists on disk (I2, final review) -- every route that hands a project back to the
@@ -2306,6 +2326,7 @@ def _project_payload(proj) -> dict:
     if assembly_v is not None:
         assembly["v"] = assembly_v
     result["assembly"] = assembly
+    result["upscale_report"] = _upscale_report(proj)
     return result
 
 
