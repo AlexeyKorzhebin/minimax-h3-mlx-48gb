@@ -5,9 +5,13 @@ services:
     network_mode: host
     user: "1000:1000"
     restart: unless-stopped
+    # reaps the orphans of a killed job (ffmpeg and the like) that would otherwise stay zombies
+    init: true
     stop_grace_period: 30s
     environment:
       TZ: Europe/Moscow
+      # uid 1000 has no passwd entry/home in the image; /tmp keeps caches off / and off the data volume
+      HOME: /tmp
       H3_ENGINE: sglang
       H3_OUTDIR: /home/alex/Outputs/h3-panel
       H3_ALLOWED_HOSTS: "192.168.100.50:8765,alex-neuro:8765"

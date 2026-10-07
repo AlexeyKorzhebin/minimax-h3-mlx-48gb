@@ -12,8 +12,11 @@ trap 'kill -TERM "$web" "$worker" 2>/dev/null' TERM INT
 while kill -0 "$web" 2>/dev/null && kill -0 "$worker" 2>/dev/null; do
     sleep 1
 done
+# The container's code is the code of whoever died FIRST; decided before the TERM below, so the
+# survivor's own (143) status cannot overwrite it.
+if kill -0 "$web" 2>/dev/null; then first=$worker; second=$web; else first=$web; second=$worker; fi
 kill -TERM "$web" "$worker" 2>/dev/null
 status=0
-wait "$web" || status=$?
-wait "$worker" || status=$?
+wait "$first" || status=$?
+wait "$second" 2>/dev/null || true
 exit "$status"

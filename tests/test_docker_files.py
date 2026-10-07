@@ -28,7 +28,7 @@ def test_compose_mounts_host_paths_at_the_same_paths_and_sets_the_spec_env():
     lines = [line.strip() for line in _lines("compose.yaml")]
     for expected in (
             "network_mode: host", 'user: "1000:1000"', "restart: unless-stopped",
-            "TZ: Europe/Moscow",
+            "TZ: Europe/Moscow", "HOME: /tmp", "init: true",
             "- /home/alex/Outputs/h3-panel:/home/alex/Outputs/h3-panel",
             "- /home/alex/Outputs/comfy/output:/home/alex/Outputs/comfy/output:ro",
             "- /home/alex/Outputs/comfy/output/h3panel:/home/alex/Outputs/comfy/output/h3panel",
@@ -50,32 +50,46 @@ def test_dockerignore_keeps_the_context_small_but_keeps_what_the_panel_reads():
     assert not ({"docs", "prompts", "tests", "h3_48gb"} & ignored)
 
 
-def _stub_python(tmp_path, worker_exit: int) -> Path:
+def _stub_python(tmp_path, *, web_exit=None, worker_exit=None) -> Path:
+    """`python -m h3_48gb web|worker`: the one given an exit code dies with it after a second,
+    the other sleeps for 30 s (and so only ends if the entrypoint stops it)."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     stub = bin_dir / "python"
+
+    def branch(exit_code):
+        return "exec sleep 30" if exit_code is None else f"sleep 1; exit {exit_code}"
+
     stub.write_text("#!/bin/sh\n"
                     'echo "$@" >> "$STUB_LOG"\n'
                     'case "$3" in\n'
-                    "  web) exec sleep 30 ;;\n"
-                    f"  worker) sleep 1; exit {worker_exit} ;;\n"
+                    f"  web) {branch(web_exit)} ;;\n"
+                    f"  worker) {branch(worker_exit)} ;;\n"
                     "esac\n")
     stub.chmod(0o755)
     return bin_dir
 
 
-def test_entrypoint_starts_both_and_exits_with_the_dead_ones_code(tmp_path):
-    bin_dir = _stub_python(tmp_path, 3)
+def _run_entrypoint(tmp_path, bin_dir):
     log = tmp_path / "calls.log"
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STUB_LOG": str(log),
            "H3_OUTDIR": str(tmp_path / "out")}
     started = time.monotonic()
     result = subprocess.run([str(ROOT / "docker" / "entrypoint.sh")], env=env, timeout=20)
-    assert result.returncode == 3
-    assert time.monotonic() - started < 10, "the web stub (sleep 30) was not stopped"
+    assert time.monotonic() - started < 10, "the surviving stub (sleep 30) was not stopped"
     assert sorted(log.read_text().splitlines()) == sorted([
         f"-m h3_48gb web --host 0.0.0.0 --port 8765 --outdir {tmp_path / 'out'}",
         f"-m h3_48gb worker --outdir {tmp_path / 'out'}"])
+    return result.returncode
+
+
+def test_entrypoint_starts_both_and_exits_with_the_dead_workers_code(tmp_path):
+    assert _run_entrypoint(tmp_path, _stub_python(tmp_path, worker_exit=3)) == 3
+
+
+def test_entrypoint_exits_with_the_dead_webs_code(tmp_path):
+    # the worker survives and is stopped by TERM (143): its status must not replace the web's
+    assert _run_entrypoint(tmp_path, _stub_python(tmp_path, web_exit=5)) == 5
 
 
 def test_entrypoint_refuses_to_start_without_an_outdir(tmp_path):

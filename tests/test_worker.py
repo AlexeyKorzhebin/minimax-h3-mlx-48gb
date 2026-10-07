@@ -94,21 +94,27 @@ def _queued(root, tmp_path, tag="a"):
 # -- Step 3: the command, and that `run_job` actually uses it -----------------------------------
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
+#: What the worker does about sleep on *this* machine: the wrapper exists only on macOS.
+_CAFFEINATE_PREFIX = ["caffeinate", "-dimsu"] if sys.platform == "darwin" else []
+_EXPECTED_CAFFEINATE_CALLS = ([["caffeinate", "-dimsu", "-w", str(os.getpid())]]
+                              if sys.platform == "darwin" else [])
+
+
 def test_job_command_wraps_the_job_in_caffeinate_and_this_interpreter(tmp_path):
     root = tmp_path / "queue"
     job = _queued(root, tmp_path)
     # `job.args` itself, not a hard-coded list: `submit` (task A6) appends the job's own
     # `--outdir`, whose value is a timestamp this test does not pin. What this test is actually
     # about -- the caffeinate/python/module wrapping -- does not depend on that value.
-    assert worker.job_command(job, python="/venv/bin/python") == [
+    assert worker.job_command(job, python="/venv/bin/python", platform="darwin") == [
         "caffeinate", "-dimsu", "/venv/bin/python", "-m", "h3_48gb", *job.args]
+    assert worker.job_command(job, python="/venv/bin/python", platform="linux") == [
+        "/venv/bin/python", "-m", "h3_48gb", *job.args], "off macOS the job runs bare"
     assert job.args[:3] == ["generate", "--tag", "a"], "the job's own args must pass through"
-    assert worker.job_command(job)[2] == sys.executable, (
+    assert worker.job_command(job)[-len(job.args) - 3] == sys.executable, (
         "the child must run in the worker's own virtualenv, not whichever python is on PATH")
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_run_job_launches_exactly_the_command_job_command_builds(tmp_path):
     """A correct `job_command` proves nothing if `run_job` builds its own line and skips
     caffeinate. On 2026-08-10 an idle sleep took the GPU firmware down mid-run.
@@ -125,7 +131,8 @@ def test_run_job_launches_exactly_the_command_job_command_builds(tmp_path):
 
     worker.run_job(root, job, spawn=spawn)
     assert seen["cmd"] == worker.job_command(job)
-    assert seen["cmd"][:2] == ["caffeinate", "-dimsu"]
+    assert seen["cmd"][:len(_CAFFEINATE_PREFIX)] == _CAFFEINATE_PREFIX
+    assert ("caffeinate" in seen["cmd"]) == (sys.platform == "darwin"), seen["cmd"]
     assert seen["session"] is True
 
 
@@ -722,7 +729,6 @@ def test_the_first_stop_signal_lets_the_running_job_finish_and_takes_no_new_one(
         "the worker took a new job after being asked to stop")
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_the_second_stop_signal_kills_the_grandchild_not_just_the_direct_child(tmp_path):
     """A signal to the direct child only would kill `caffeinate` and leave the nested Python --
     the process actually holding 36 GB -- orphaned, with no worker and no lease. This checks a
@@ -984,7 +990,6 @@ def _fake_song_result(track_dir: Path, *, undersung=False) -> sr.SongResult:
     )
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_run_job_dispatches_a_song_kind_to_songrun_run_song_and_gates_the_track(tmp_path,
                                                                                  monkeypatch):
     """`kind="song"` (design spec, "Трек"): the worker calls `songrun.run_song` in-process --
@@ -1017,11 +1022,11 @@ def test_run_job_dispatches_a_song_kind_to_songrun_run_song_and_gates_the_track(
     assert seen["lyrics"] == proj.track["lyrics"]
     assert seen["caption"] == proj.track["caption"]
     assert seen["duration"] == sr.estimate_duration(proj.track["lyrics"])
-    assert caffeinate_calls == [["caffeinate", "-dimsu", "-w", str(os.getpid())]], (
+    assert caffeinate_calls == _EXPECTED_CAFFEINATE_CALLS, (
         "a song job must be caffeinated the same way a generate job is (task 3 brief); M1 (fix "
         "round 1) additionally binds it to the worker's own pid so it cannot outlive a killed "
         "worker")
-    assert caffeinate_calls  # sanity, redundant with the assert above
+    assert bool(caffeinate_calls) == (sys.platform == "darwin")
 
     reloaded = project_module.load_project(proj.path)
     assert reloaded.track["status"] == "awaiting_approval"
@@ -1248,7 +1253,6 @@ def test_i1_a_failed_song_job_after_a_retry_also_marks_stages_track_failed(tmp_p
     assert reloaded.stages["track"] == "failed"
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_run_job_treats_a_kind_less_job_as_generate(tmp_path):
     """Backward compatibility end to end (task 3 brief, mandatory), not just at the dataclass level
     (`test_queue.py` covers that half): a job claimed from a `pending/<id>.json` written before
@@ -1277,7 +1281,9 @@ def test_run_job_treats_a_kind_less_job_as_generate(tmp_path):
     code = worker.run_job(root, job, spawn=spawn)
 
     assert code == 0
-    assert seen["cmd"][:2] == ["caffeinate", "-dimsu"], "must still go through job_command"
+    assert seen["cmd"][:len(_CAFFEINATE_PREFIX)] == _CAFFEINATE_PREFIX, "must still go through job_command"
+    assert seen["cmd"] == worker.job_command(job), "must still go through job_command"
+    assert ("caffeinate" in seen["cmd"]) == (sys.platform == "darwin"), seen["cmd"]
     assert q.job_path(root, job.id, "done").exists()
 
 
@@ -1318,7 +1324,6 @@ def test_run_job_dispatches_an_assemble_kind_with_an_honest_failure_before_task_
     assert "Task 4" in log
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_run_job_dispatches_an_assemble_kind_to_h3_48gb_assemble_run(tmp_path, monkeypatch):
     """The worker's lazy import finds the real `h3_48gb.assemble` and calls `.run(project_path,
     run=...)` -- proven by monkeypatching `.run` directly on the real, already-imported module
@@ -1351,7 +1356,7 @@ def test_run_job_dispatches_an_assemble_kind_to_h3_48gb_assemble_run(tmp_path, m
     called_path, called_run = calls[0]
     assert called_path == proj.path
     assert callable(called_run), "assemble.run must receive an injectable run callable"
-    assert caffeinate_calls == [["caffeinate", "-dimsu", "-w", str(os.getpid())]]
+    assert caffeinate_calls == _EXPECTED_CAFFEINATE_CALLS
     # Task 9 (2026-08-24, user-approved): `assemble.run` is called with `log=log_lines.append`, so
     # its own cleanup summary lands in this job's own log record, not on stderr.
     log_text = q.log_path(root, job.id).read_text(encoding="utf-8")
@@ -2030,7 +2035,6 @@ def test_i3_a_broken_assemble_import_does_not_crash_run_job_for_a_generate_scene
 # -- M1 (fix round 1, 2026-08-18 review): the bare caffeinate is bound to the worker's own pid ----
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate exists only on macOS (worker.py runs jobs bare elsewhere)")
 def test_m1_caffeinate_block_binds_to_the_workers_own_pid(tmp_path):
     """A `finally: proc.terminate()` never runs if the worker itself is taken down by `kill -9`
     (or the second-SIGTERM path, which sets `SIG_DFL` and re-signals itself -- indistinguishable
@@ -2040,9 +2044,13 @@ def test_m1_caffeinate_block_binds_to_the_workers_own_pid(tmp_path):
     is gone, whichever way it goes.
     """
     calls = []
-    with worker._caffeinate_block(spawn=_caffeinate_spy(calls)):
+    with worker._caffeinate_block(spawn=_caffeinate_spy(calls), platform="darwin"):
         pass
     assert calls == [["caffeinate", "-dimsu", "-w", str(os.getpid())]]
+    off = []
+    with worker._caffeinate_block(spawn=_caffeinate_spy(off), platform="linux"):
+        pass
+    assert off == [], "off macOS there is nothing to hold awake and no caffeinate to start"
 
 
 # -- I5 (fix round 1, 2026-08-18 review): a worker killed mid-song-job recovers cleanly -----------
