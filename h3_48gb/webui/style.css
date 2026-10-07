@@ -503,6 +503,7 @@ button.inverse:disabled {
 }
 button.ghost { background: transparent; border-color: transparent; color: var(--ink-3); }
 button.ghost:hover { background: var(--fill); color: var(--ink-2); }
+button.ghost:disabled { opacity: .35; cursor: not-allowed; background: transparent; color: var(--ink-3); }
 button.lg { padding: 10px 16px; font-size: 14px; border-radius: var(--r-inner); }
 
 /* ===========================================================================
@@ -1528,6 +1529,30 @@ audio.proj-audio { width: 100%; margin-top: 8px; display: block; }
   .running { grid-template-columns: minmax(0, 1fr); }
   .running img, .running .noshot { width: 100%; max-width: 320px; }
 }
+/* ---------- блоки волны 1.5: библиотека, настройки и референсы проекта, апскейл, предупреждения ---------- */
+/* Карточка в духе `.proj-stage`: вложенная плоскость на токенах, без собственных цветов. */
+.lib-card, .project-settings, .project-refs, .upscale-status {
+  background: var(--card); border: 1px solid var(--hairline); border-radius: var(--r-inner);
+  padding: 12px 14px; margin: 10px 0;
+}
+.lib-card { display: flow-root; }
+.lib-card img { float: left; margin: 0 12px 6px 0; width: 96px; height: 96px; object-fit: cover; border-radius: var(--r-ctl); }
+.lib-card p { margin: 4px 0; }
+.lib-card input { margin: 6px 0; }
+.lib-card-error { color: var(--fail-ink); font-size: 12px; }
+.muted { color: var(--ink-3); }
+.project-settings, .project-refs { display: grid; gap: 8px; }
+.project-settings textarea { width: 100%; box-sizing: border-box; }
+.project-refs h4 { margin: 0; font: 500 12.5px/1.3 var(--ui); color: var(--ink); }
+.project-refs label, .route-upscale { display: flex; align-items: center; gap: 8px; }
+.project-refs input[type="checkbox"], .route-upscale input[type="checkbox"] { width: auto; flex: none; }
+.route-upscale { margin: 8px 0; }
+.upscale-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12.5px; }
+.tag-warnings {
+  background: var(--warn-soft); color: var(--warn-ink); border-radius: var(--r-inner);
+  margin: 8px 0; padding: 8px 14px 8px 28px; font-size: 12.5px;
+}
+
 @media (max-width: 860px) {
   :root { --pad: 16px; }
   .params, .adv-body { grid-template-columns: minmax(0, 1fr); }
@@ -1601,6 +1626,8 @@ audio.proj-audio { width: 100%; margin-top: 8px; display: block; }
   .acts button { padding: 4px 6px; }
   .scene-grid { grid-template-columns: minmax(0, 1fr); gap: 8px; }
   .proj-stage { padding: 12px 10px; }
+  #library form, .project-settings, .project-refs { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .lib-card input, .project-settings textarea { width: 100%; }
 }
 
 /* ---------- уважение к системной настройке движения ---------- */
@@ -1618,3 +1645,75 @@ audio.proj-audio { width: 100%; margin-top: 8px; display: block; }
 .scenario-prompt.has-tag-issues { outline: 2px solid var(--fail); }
 .tag-hint { font-size: 0.85em; }
 body:not([data-platform="darwin"]) [data-act="reveal"] { display: none; }
+
+/* ---------- редактор сцен видеопроекта (Task 7) ---------- */
+.scene-editor { display: flex; flex-direction: column; gap: 10px; }
+.scene-editor-note { margin: 0; }
+.scene-edit {
+  border: 1px solid var(--hairline); border-radius: var(--r-ctl); background: var(--card-2);
+  padding: 10px; display: flex; flex-direction: column; gap: 8px;
+}
+.scene-edit-head { display: flex; align-items: center; gap: 6px; }
+.scene-edit-head .idx { font: 500 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0; }
+.scene-edit-prompt { resize: vertical; min-height: 5.5em; background: var(--card); }
+.scene-edit-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.scene-edit-row label { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.scene-edit-row input.num { width: 84px; padding: 4px 7px; text-align: right; }
+.scene-edit-row .fresh-start-toggle input { width: auto; }
+.scene-editor-acts { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dirty-note { font-size: 11.5px; color: var(--warn-ink); }
+.scene-edit-row input[data-scene-field="seed"] { width: 150px; }
+.scene-edit-error { font-weight: 500; }
+
+/* ---------- редактор сцен: подсказка @, референсы, стартовый кадр, JSON (Task 8) ---------- */
+.tag-hint-slot:empty { display: none; }
+.tag-hint { display: flex; flex-wrap: wrap; gap: 6px; }
+.tag-pick {
+  font: 500 11.5px/1 var(--mono); letter-spacing: 0; padding: 5px 8px;
+  border: 1px solid var(--hairline); border-radius: 999px; background: var(--card); color: var(--ink-2);
+}
+.tag-pick:hover { border-color: var(--accent); color: var(--accent); }
+.scene-refs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-size: 12px; }
+.scene-refs-label { color: var(--ink-3); }
+.scene-refs label { display: flex; align-items: center; gap: 5px; }
+.scene-refs input { width: auto; margin: 0; }
+.start-image { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; font-size: 12px; }
+.start-image select { width: auto; min-width: 180px; }
+.start-thumb { height: 56px; width: auto; border-radius: 6px; border: 1px solid var(--hairline); }
+.scenario-json { margin-top: 10px; }
+.scenario-json textarea { margin: 8px 0; }
+.ref-missing { color: var(--fail-ink); font-size: 11.5px; }
+
+/* ---------- библиотека: превью, новая версия, выбор версии (Task 9) ---------- */
+.lib-thumb { width: 96px; height: 96px; object-fit: cover; border-radius: 8px; border: 1px solid var(--hairline); display: block; margin-bottom: 6px; }
+.lib-new-files { margin-top: 8px; width: 100%; font-size: 12px; }
+.ref-version { width: auto; min-width: 72px; margin: 0 0 6px 6px; padding: 3px 6px; }
+.lock-note { margin: 6px 0 0; }
+
+/* ---------- прогон на sglang, блокировки, пересъёмка с правкой (Task 10) ---------- */
+.running.sglang-run { grid-template-columns: minmax(0, 1fr); }
+.run-wait { color: var(--warn-ink); }
+.saved-mark { margin-left: 8px; font-size: 11.5px; color: var(--ok-ink, var(--ink-3)); }
+.project-settings { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.project-seed { width: 120px; }
+.scene-params { font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
+.scene-prompt { font-size: 12px; margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.scene-prompt summary { cursor: pointer; list-style-position: outside; }
+.retry-panel {
+  grid-column: 1 / -1; border: 1px solid var(--hairline); border-radius: var(--r-ctl);
+  background: var(--card-2); padding: 10px; display: flex; flex-direction: column; gap: 8px;
+}
+.retry-prompt { resize: vertical; min-height: 5.5em; }
+.retry-panel button { align-self: flex-start; }
+.scene-edit-row input.retry-seed, .scene-edit-row input.retry-steps { width: calc(20ch + 24px); }
+.project-settings textarea:disabled, .project-settings input:disabled { opacity: .55; cursor: not-allowed; }
+.upscale-error { margin: 6px 0 0; }
+.proj-final { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 8px; }
+.retry-error { margin: 0; }
+
+/* ---------- «Промпт для H3» под сценой (Task 8b) ---------- */
+.h3-prompt { border-top: 1px dashed var(--hairline); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.h3-prompt pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.45 var(--mono); }
+.h3-pictures { display: flex; flex-wrap: wrap; gap: 8px; }
+.h3-pictures figure { margin: 0; font-size: 11px; color: var(--ink-3); }
+.h3-pictures img { display: block; height: 64px; width: auto; border-radius: 6px; border: 1px solid var(--hairline); }

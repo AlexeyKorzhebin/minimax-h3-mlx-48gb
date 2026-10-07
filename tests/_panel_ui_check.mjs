@@ -3,104 +3,20 @@
 // `tests/test_webui_panel.py` compares for exact equality.
 //
 // usage: node _panel_ui_check.mjs <appUrl> <scenario>
-// The fake DOM is a Proxy per element id that records `addEventListener` and lets `.hidden`,
-// `.value`, `.innerHTML`, ... be read back; document-level listeners are collected so a scenario
-// can fire the same delegated `click`/`change` events a browser would.
+
+import { routes, calls, alerts, confirms, answers, notifications, intervals, getElementById, fire,
+  clickable, ok, err, sleep, countCalls, PROJECT, SGLANG, start as startApp } from "./_ui_harness.mjs";
 
 const [, , appUrl, scenario] = process.argv;
 const fail = (m) => { process.stderr.write(`${m}\n`); process.exit(1); };
 if (!appUrl || !scenario) fail("usage: node _panel_ui_check.mjs <appUrl> <scenario>");
 
-const SGLANG = { ok: true, engine: "sglang", platform: "linux", worker: { state: "stopped" },
-                 paused: true, outdir: "/o", queue: { pending: [], running: [], done: [], failed: [],
-                 broken: [] }, runs: [], projects: [] };
-
-function makeEl(label) {
-  const store = { value: "", textContent: "", innerHTML: "", checked: false, hidden: false, title: "" };
-  const own = {};
-  return new Proxy(function stub() {}, {
-    get(_t, prop) {
-      if (prop === "then" || typeof prop === "symbol") return undefined;
-      if (prop === "dataset" || prop === "style") return (store[prop] ||= {});
-      if (prop === "classList") {
-        return (store.classList ||= { add() {}, remove() {}, toggle() {}, contains: () => false });
-      }
-      if (prop === "__listeners") return own;
-      if (prop in store) return store[prop];
-      if (prop === "addEventListener") return (type, fn) => { (own[type] ||= []).push(fn); };
-      if (prop === "removeEventListener") return () => {};
-      if (prop === "querySelector" || prop === "closest") return () => null;
-      if (prop === "querySelectorAll") return () => [];
-      if (prop === "children" || prop === "childNodes") return [];
-      return () => makeEl(`${label}.${String(prop)}`);
-    },
-    set(_t, prop, value) { store[prop] = value; return true; },
-  });
-}
-const els = new Map();
-const getElementById = (id) => { if (!els.has(id)) els.set(id, makeEl(id)); return els.get(id); };
-const docListeners = {};
-globalThis.document = {
-  body: makeEl("body"), documentElement: makeEl("html"), getElementById,
-  querySelectorAll: () => [], querySelector: () => null, createElement: () => makeEl("new"),
-  addEventListener(type, fn) { (docListeners[type] ||= []).push(fn); }, removeEventListener() {},
-};
-console.error = () => {};
-const alerts = [];
-const confirms = [];
-let confirmAnswer = true;
-globalThis.alert = (m) => alerts.push(m);
-globalThis.confirm = (m) => { confirms.push(m); return confirmAnswer; };
-globalThis.window = { confirm: globalThis.confirm, alert: globalThis.alert, prompt: () => null,
-  location: { hash: "", host: "x" }, addEventListener() {}, removeEventListener() {}, scrollTo() {} };
-const storage = new Map();
-globalThis.localStorage = { getItem: (k) => (storage.has(k) ? storage.get(k) : null),
-  setItem: (k, v) => storage.set(k, String(v)), removeItem: (k) => storage.delete(k) };
-const notifications = [];
-globalThis.Notification = class { constructor(title, opts) { notifications.push({ title, body: opts.body }); } };
-globalThis.Notification.permission = "granted";
-const intervals = [];
-globalThis.setInterval = (fn) => { intervals.push(fn); return intervals.length; };
-
-// -- scripted fetch: routes["METHOD url"] is a response or a list consumed one per call ----------
-const routes = {};
-const calls = [];
-globalThis.fetch = async (url, opts) => {
-  const method = (opts && opts.method) || "GET";
-  const key = `${method} ${url}`;
-  calls.push({ method, url, body: opts && opts.body ? JSON.parse(opts.body) : null });
-  let entry = routes[key];
-  if (Array.isArray(entry)) entry = entry.length > 1 ? entry.shift() : entry[0];
-  if (typeof entry === "function") entry = entry();
-  if (!entry) entry = { status: 404, body: { error: { code: "no_route", message: key } } };
-  return { ok: entry.status >= 200 && entry.status < 300, status: entry.status, json: async () => entry.body };
-};
-const ok = (body) => ({ status: 200, body });
-const err = (status, code, message) => ({ status, body: { ok: false, error: { code, message } } });
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const clickable = (props) => ({ ...props, closest(sel) { return props.match(sel) ? this : null; } });
-const fire = (type, target) => (docListeners[type] || []).forEach((fn) => fn({ target }));
-const countCalls = (m, u) => calls.filter((c) => c.method === m && c.url === u).length;
-
-const PROJECT = (over = {}) => ({ ok: true, active_job: null, project: {
-  id: "p1", kind: "video", title: "P", stages: { script: "approved", scenes: "done", upscale: "draft",
-  assembly: "draft", scenario: "approved", track: "approved" }, scenes: [], scenario_scenes: [],
-  references: [], route: [{ stage: "upscale", enabled: true }], i2v_prefix: "", track: {}, assembly: {},
-  ...over } });
-
-async function start(extra = {}) {
-  Object.assign(routes, { "GET /api/state": ok(SGLANG), "GET /api/llm": ok({ status: "" }),
-    "GET /api/providers": ok({ active: "", providers: [] }), "GET /api/library": ok({ cards: [] }),
-    "GET /api/gpu": ok({ ok: true, dispatcher: null, dispatcher_error: "x", idle_release_at: null,
-                         queue: { pending: 0, paused: true, running: null } }), ...extra });
-  await import(appUrl);
-  await sleep(80);
-}
+const start = (extra) => startApp(appUrl, extra);
 
 async function main() {
   let out;
   if (scenario === "release_confirmed" || scenario === "release_declined" || scenario === "release_second_fails") {
-    confirmAnswer = scenario !== "release_declined";
+    answers.confirm = scenario !== "release_declined";
     const second = scenario === "release_second_fails" ? err(500, "dispatcher_unavailable", "диспетчер лёг") : ok({ ok: true });
     await start({ "POST /api/gpu/release": [
       err(409, "release_needs_confirm", "H3 считает сцену — освободить карту? Сцена будет потеряна"), second] });
