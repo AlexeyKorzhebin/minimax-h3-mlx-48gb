@@ -57,6 +57,8 @@ CLASS_SOURCES = [
     "app.sceneRefsHtml({refs: ['@hero']}, 1, ['@hero', '@arena'])",
     "app.tagHintHtml('fight @a', 8, [{tag: '@arena'}])",
     "app.scenarioJsonHtml('p1')",
+    "app.h3PromptHtml({idx: 0, prompt: 'P', pictures: [{label: '<Picture 1>', path: '/o/library/a/v1/x.png'}], "
+    "audios: [], keyframe: {kind: null, path: null}, duration: 8, seed: 1, steps: 50}, '/o')",
     "app.projectUpscaleHtml({id: 'p1', stages: {upscale: 'failed'}, route: [{stage: 'upscale', enabled: true}], "
     "scenes: [], upscale_report: {status: 'failed', error: 'x'}}, 'sglang')",
     "app.projectAssemblyHtml({id: 'p1', title: 'T', created_at: '2026-10-05T10:00:00', "
@@ -285,6 +287,7 @@ def test_editor_html_for_one_scene_on_sglang():
         '<span class="idx">#0</span><div class="spacer"></div>'
         '<button type="button" class="ghost" data-act="scene-up" data-idx="0" disabled>↑</button>'
         '<button type="button" class="ghost" data-act="scene-down" data-idx="0" disabled>↓</button>'
+        '<button type="button" class="ghost" data-act="scene-h3-prompt" data-idx="0">Промпт для H3</button>'
         '</div>'
         '<textarea class="inp scene-edit-prompt" data-scene-field="prompt" data-idx="0" rows="4">'
         'a &lt;b&gt;</textarea>'
@@ -581,6 +584,7 @@ def test_editor_html_with_pinned_cards_and_refs():
         '<span class="idx">#0</span><div class="spacer"></div>'
         '<button type="button" class="ghost" data-act="scene-up" data-idx="0" disabled>↑</button>'
         '<button type="button" class="ghost" data-act="scene-down" data-idx="0" disabled>↓</button>'
+        '<button type="button" class="ghost" data-act="scene-h3-prompt" data-idx="0">Промпт для H3</button>'
         '</div>'
         '<textarea class="inp scene-edit-prompt" data-scene-field="prompt" data-idx="0" rows="4">a</textarea>'
         '<div class="tag-hint-slot" data-idx="0"></div>' + refs +
@@ -1137,3 +1141,54 @@ def test_an_assembly_outside_the_outdir_gets_no_link():
     outside = DRAFT_JOB.replace("/o/projects", "/elsewhere/projects")
     assert _js(f"app.assembleFinalUrl({outside}, '/o')") is None
     assert 'href="/media' not in _js(f"app.finishedRowHtml({outside}, '/o', [], new Set(), undefined)")
+
+
+@_needs_node
+def test_h3_prompt_html():
+    answer = ("{idx: 1, prompt: 'Continue.\\n\\n<Subject 1> runs <b>', pictures: [{label: '<Picture 1>', "
+              "path: '/o/library/arena/v1/01-o.png'}], audios: [], keyframe: {kind: 'previous_scene', "
+              "path: null}, duration: 5.125, seed: 42, steps: 30}")
+    assert _js(f"app.h3PromptHtml({answer}, '/o')") == (
+        '<div class="h3-prompt" data-idx="1">'
+        '<p class="hint">доставляется 5,13 с · сид 42 · 30 шагов · первый кадр: последний кадр сцены #0</p>'
+        '<pre>Continue.\n\n&lt;Subject 1&gt; runs &lt;b&gt;</pre>'
+        '<div class="h3-pictures"><figure><img src="/media/library/arena/v1/01-o.png" alt="">'
+        '<figcaption>&lt;Picture 1&gt;</figcaption></figure></div></div>')
+    start = ("{idx: 0, prompt: 'P', pictures: [], audios: [], keyframe: {kind: 'start_image', "
+             "path: '/o/library/arena/v1/01-o.png'}, duration: 8, seed: 305, steps: 50}")
+    assert _js(f"app.h3PromptHtml({start}, '/o')") == (
+        '<div class="h3-prompt" data-idx="0">'
+        '<p class="hint">доставляется 8 с · сид 305 · 50 шагов · первый кадр: 01-o.png</p><pre>P</pre></div>')
+    none = start.replace("{kind: 'start_image', path: '/o/library/arena/v1/01-o.png'}",
+                         "{kind: null, path: null}")
+    assert _js(f"app.h3PromptHtml({none}, '/o')") == (
+        '<div class="h3-prompt" data-idx="0">'
+        '<p class="hint">доставляется 8 с · сид 305 · 50 шагов · без первого кадра</p><pre>P</pre></div>')
+
+
+@_needs_node
+def test_h3_prompt_pictures_outside_the_outdir_get_no_image():
+    answer = ("{idx: 0, prompt: 'P', pictures: [{label: '<Picture 1>', path: '/etc/x.png'}, "
+              "{label: '<Picture 2>', path: '/o/../etc/y.png'}], audios: [], keyframe: {kind: null, path: null}, "
+              "duration: 8, seed: 1, steps: 50}")
+    assert _js(f"app.h3PromptHtml({answer}, '/o')") == (
+        '<div class="h3-prompt" data-idx="0">'
+        '<p class="hint">доставляется 8 с · сид 1 · 50 шагов · без первого кадра</p><pre>P</pre>'
+        '<div class="h3-pictures"><figure><figcaption>&lt;Picture 1&gt;</figcaption></figure>'
+        '<figure><figcaption>&lt;Picture 2&gt;</figcaption></figure></div></div>')
+
+
+H3_EXPECTED = {
+    "h3_prompt_saves_first": {"order": ["PUT /api/projects/p1/scenes",
+                                        "GET /api/projects/p1/scenes/0/h3-prompt"], "shown": True},
+    "h3_prompt_clean_skips_save": {"order": ["GET /api/projects/p1/scenes/0/h3-prompt"], "shown": True},
+    "h3_prompt_refused": {"shown": False, "errorHidden": False,
+                          "error": "<b>Запрос не прошёл</b><pre>scene 0: 190 frames is off sglang's grid</pre>"},
+    "h3_prompt_goes_out_on_edit": {"removed": 1, "shownAfterRedraw": False},
+}
+
+
+@_needs_node
+@pytest.mark.parametrize("scenario", sorted(H3_EXPECTED))
+def test_h3_prompt_wiring(scenario):
+    assert _gaps(scenario) == H3_EXPECTED[scenario]

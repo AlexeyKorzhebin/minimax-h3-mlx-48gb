@@ -1710,3 +1710,10 @@ body:not([data-platform="darwin"]) [data-act="reveal"] { display: none; }
 .upscale-error { margin: 6px 0 0; }
 .proj-final { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 8px; }
 .retry-error { margin: 0; }
+
+/* ---------- «Промпт для H3» под сценой (Task 8b) ---------- */
+.h3-prompt { border-top: 1px dashed var(--hairline); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.h3-prompt pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.45 var(--mono); }
+.h3-pictures { display: flex; flex-wrap: wrap; gap: 8px; }
+.h3-pictures figure { margin: 0; font-size: 11px; color: var(--ink-3); }
+.h3-pictures img { display: block; height: 64px; width: auto; border-radius: 6px; border: 1px solid var(--hairline); }

@@ -464,13 +464,15 @@ function sceneEditHtml(scene, idx, total, ctx) {
   return `<div class="scene-edit" data-idx="${idx}"><div class="scene-edit-head">`
     + `<span class="idx">#${idx}</span><div class="spacer"></div>`
     + button("scene-up", "↑", idx === 0) + button("scene-down", "↓", idx === total - 1)
-    + (total > 1 ? button("scene-del", "Удалить", false) : "") + `</div>`
+    + (total > 1 ? button("scene-del", "Удалить", false) : "")
+    + (sglang ? button("scene-h3-prompt", "Промпт для H3", false) : "") + `</div>`
     + `<textarea class="inp scene-edit-prompt" data-scene-field="prompt" data-idx="${idx}" rows="4">`
     + `${escapeHtml(scene.prompt)}</textarea>`
     + (sglang ? `<div class="tag-hint-slot" data-idx="${idx}"></div>`
       + sceneRefsHtml(scene, idx, pinnedTags, ctx.refTags || pinnedTags) : "")
     + `<div class="scene-edit-row">${row.join("")}</div>`
     + (idx === 0 ? startImageFieldHtml(scene.start_image, ctx.pinned || [], ctx.outdir) : "")
+    + (ctx.h3Prompts && ctx.h3Prompts[idx] ? h3PromptHtml(ctx.h3Prompts[idx], ctx.outdir) : "")
     + (ctx.error && ctx.error.idx === idx
       ? `<span class="hint bad scene-edit-error" data-idx="${idx}">${escapeHtml(ctx.error.message)}</span>` : "")
     + `</div>`;
@@ -730,6 +732,24 @@ export function projectAssemblyHtml(proj, outdir) {
     + `<span class="proj-stage-status">${escapeHtml(statusWord)}</span>`
     + `<div class="spacer"></div>${retry}</div>`
     + `<div class="proj-stage-body">${link}${draft}</div></div>`;
+}
+
+/** «Промпт для H3»: то, что уйдёт в sglang для сохранённой сцены. Длительность в ответе —
+ *  доставляемая (у сцепленной на кадр меньше запрошенной); картинки — только внутри `outdir`. */
+export function h3PromptHtml(answer, outdir) {
+  const key = answer.keyframe || {};
+  const frame = key.kind === "previous_scene" ? `последний кадр сцены #${answer.idx - 1}`
+    : key.kind === "start_image" ? String(key.path || "").split("/").pop() : "";
+  const hint = [`доставляется ${secondsText(answer.duration)}`, `сид ${answer.seed}`, `${answer.steps} шагов`,
+    frame ? `первый кадр: ${frame}` : "без первого кадра"].join(" · ");
+  const figures = (answer.pictures || []).map((picture) => {
+    const url = startImageUrl(picture.path, outdir);
+    return `<figure>${url ? `<img src="${escapeHtml(url)}" alt="">` : ""}`
+      + `<figcaption>${escapeHtml(picture.label)}</figcaption></figure>`;
+  }).join("");
+  return `<div class="h3-prompt" data-idx="${answer.idx}"><p class="hint">${escapeHtml(hint)}</p>`
+    + `<pre>${escapeHtml(answer.prompt)}</pre>`
+    + (figures ? `<div class="h3-pictures">${figures}</div>` : "") + `</div>`;
 }
 
 /** Подсказка на `@`: карточки, чей тег начинается с набранного после последнего `@` до каретки. */
@@ -3123,6 +3143,7 @@ function startPage() {
   let sceneDraftDirty = false;  // the person changed something the server has not seen
   let draftEpoch = 0;           // version of the draft the editor DOM was drawn from
   let scenarioJsonText = "";     // what is typed in «Вставить сценарий JSON»: survives redraws
+  let h3Prompts = {};          // idx -> answer of GET .../h3-prompt; any edit of the draft drops them
   let retryOpen = null;        // idx of the scene whose retry panel is open
   let retryEdits = null;       // what is typed in it, kept across redraws
   let retryError = null;       // why the server refused the retry, shown in the panel
@@ -3666,7 +3687,14 @@ function startPage() {
     sceneDraft = draft.length ? draft : addScene([]);
     sceneDraftDirty = false;
     sceneDraftError = null;
+    h3Prompts = {};
     draftEpoch += 1;
+  }
+
+  /** The draft changed: unsaved, and any shown «Промпт для H3» is stale. */
+  function touchDraft() {
+    sceneDraftDirty = true;
+    h3Prompts = {};
   }
 
   /** Reads the editor fields into the draft -- but only when the DOM was drawn from the current
@@ -3693,7 +3721,7 @@ function startPage() {
       else if (field === "duration") scene.duration = Number(String(el.value).replace(",", "."));
       else if (field === "seed" || field === "steps") scene[field] = el.value === "" ? null : Number(el.value);
       else scene[field] = el.value;
-      if (JSON.stringify(scene[field]) !== before) sceneDraftDirty = true;
+      if (JSON.stringify(scene[field]) !== before) touchDraft();
     });
     for (const [idx, ticked] of refsByScene) {
       // the saved order stays (it numbers <Picture k>); newly ticked tags go to the end
@@ -3701,7 +3729,7 @@ function startPage() {
       const next = [...old.filter((tag) => ticked.includes(tag)), ...ticked.filter((tag) => !old.includes(tag))];
       if (JSON.stringify(old) !== JSON.stringify(next)) {
         sceneDraft[idx].refs = next;
-        sceneDraftDirty = true;
+        touchDraft();
       }
     }
   }
@@ -3711,7 +3739,7 @@ function startPage() {
   function changeSceneDraft(change) {
     syncDraftFromDom();
     sceneDraft = change(sceneDraft);
-    sceneDraftDirty = true;
+    touchDraft();
     sceneDraftError = null;
     draftEpoch += 1;
     renderProjectModal();
@@ -3767,7 +3795,7 @@ function startPage() {
     field.focus();
     field.setSelectionRange(result.caret, result.caret);
     sceneDraft[idx].prompt = result.text;
-    sceneDraftDirty = true;
+    touchDraft();
     showDirtyNote();
     if (slot) slot.innerHTML = "";
   }
@@ -3792,7 +3820,7 @@ function startPage() {
     if (sceneDraft && sceneEditorActive(proj)) {
       body = sceneEditorHtml(sceneDraft, { id: proj.id, engine: state && state.engine,
         projectSeed: proj.seed ?? null, dirty: sceneDraftDirty, epoch: draftEpoch,
-        error: sceneDraftError, pinned: pinnedCards(proj.references, libraryCards),
+        error: sceneDraftError, h3Prompts, pinned: pinnedCards(proj.references, libraryCards),
         refTags: (proj.references || []).map((r) => r.tag),
         outdir: state && state.outdir }) + scenarioJsonHtml(proj.id, scenarioJsonText);
     } else if (proj.kind === "video") {
@@ -5688,6 +5716,18 @@ function startPage() {
       return;
     }
     // -- редактор сцен видеопроекта (Task 7): каждое действие сначала снимает поля в черновик ----
+    if (button.dataset.act === "scene-h3-prompt") {
+      syncDraftFromDom();
+      const idx = Number(button.dataset.idx);
+      withProject(async () => {
+        // what goes to sglang is built from the saved scene: unsaved edits are saved first
+        if (sceneDraft && sceneDraftDirty) await saveSceneDraft(id);
+        const answer = await api("GET",
+          `/api/projects/${encodeURIComponent(id)}/scenes/${encodeURIComponent(idx)}/h3-prompt`);
+        h3Prompts = { ...h3Prompts, [idx]: answer };
+      });
+      return;
+    }
     if (button.dataset.act === "project-chat") {
       openChatModal({ kind: "project", id }, { prompt: "", mode: "", image: "", endImage: "", duration: 10 });
       return;
@@ -6040,6 +6080,8 @@ function startPage() {
     if (sceneField) {
       syncDraftFromDom();
       showDirtyNote();
+      // the shown «Промпт для H3» was built from the saved scene: stale as soon as a field moves
+      document.querySelectorAll("#project-body .h3-prompt").forEach((el) => el.remove());
       if (sceneField.dataset.sceneField === "duration") {
         updateGridHint(Number(sceneField.dataset.idx), Number(String(sceneField.value).replace(",", ".")));
       }

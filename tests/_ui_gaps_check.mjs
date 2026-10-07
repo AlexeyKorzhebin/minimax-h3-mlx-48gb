@@ -688,6 +688,57 @@ const SCENARIOS = {
     await sleep(120);
     return { label: getElementById("chat-make-project").textContent };
   },
+  async h3_prompt_saves_first() {
+    const answer = { ok: true, idx: 0, prompt: "P", pictures: [], audios: [],
+                     keyframe: { kind: null, path: null }, duration: 8, seed: 42, steps: 50 };
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1/scenes/0/h3-prompt": ok(answer) }));
+    await open();
+    queryAll[FIELDS] = [field("prompt", 0, "@a jumps")];
+    await act("scene-h3-prompt", { idx: "0" });
+    const watched = ["PUT /api/projects/p1/scenes", "GET /api/projects/p1/scenes/0/h3-prompt"];
+    return { order: calls.map((c) => `${c.method} ${c.url}`).filter((k) => watched.includes(k)),
+             shown: /<div class="h3-prompt" data-idx="0">/.test(getElementById("project-body").innerHTML) };
+  },
+  async h3_prompt_clean_skips_save() {
+    const answer = { ok: true, idx: 0, prompt: "P", pictures: [], audios: [],
+                     keyframe: { kind: null, path: null }, duration: 8, seed: 42, steps: 50 };
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1/scenes/0/h3-prompt": ok(answer) }));
+    await open();
+    await act("scene-h3-prompt", { idx: "0" });
+    const watched = ["PUT /api/projects/p1/scenes", "GET /api/projects/p1/scenes/0/h3-prompt"];
+    return { order: calls.map((c) => `${c.method} ${c.url}`).filter((k) => watched.includes(k)),
+             shown: /<div class="h3-prompt" data-idx="0">/.test(getElementById("project-body").innerHTML) };
+  },
+  async h3_prompt_refused() {
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1/scenes/0/h3-prompt": { status: 400,
+      body: { ok: false, error: { message: "scene 0: 190 frames is off sglang's grid" } } } }));
+    await open();
+    await act("scene-h3-prompt", { idx: "0" });
+    return { shown: /<div class="h3-prompt"/.test(getElementById("project-body").innerHTML),
+             errorHidden: getElementById("project-err").hidden, error: getElementById("project-err").innerHTML };
+  },
+  async h3_prompt_goes_out_on_edit() {
+    const answer = { ok: true, idx: 0, prompt: "P", pictures: [], audios: [],
+                     keyframe: { kind: null, path: null }, duration: 8, seed: 42, steps: 50 };
+    await start(appUrl, draftRoutes({ "GET /api/projects/p1/scenes/0/h3-prompt": ok(answer),
+      "PUT /api/projects/p1/references": ok({ ok: true, references: [] }) }));
+    await open();
+    await act("scene-h3-prompt", { idx: "0" });
+    // typing in a field: the shown prompt is stale at once, in the page and in the state
+    const gone = { removed: 0, remove() { this.removed += 1; } };
+    queryAll["#project-body .h3-prompt"] = [gone];
+    queryAll[FIELDS] = [field("prompt", 0, "@a jumps far")];
+    fire("input", { value: "@a jumps far", selectionStart: 0, title: "", dataset: { sceneField: "prompt", idx: "0" },
+      classList: { toggle() {}, contains: () => false },
+      closest(sel) { return sel === "[data-scene-field]" ? this : null; } });
+    const pin = { checked: true, dataset: { tag: "@a" }, classList: { contains: (c) => c === "ref-pin" } };
+    const box = { dataset: { id: "p1" }, querySelectorAll: (sel) => (sel === ".ref-pin" ? [pin] : []) };
+    pin.closest = (sel) => (sel === ".project-refs" ? box : null);
+    fire("change", pin);
+    await sleep(120);
+    return { removed: gone.removed,
+             shownAfterRedraw: /<div class="h3-prompt"/.test(getElementById("project-body").innerHTML) };
+  },
 };
 
 const run = SCENARIOS[scenario];
