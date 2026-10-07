@@ -1,0 +1,17 @@
+[Unit]
+Description=h3 panel GPU dispatcher (spec §3.4)
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=alex
+Group=alex
+ExecStart=/usr/bin/python3 /home/alex/Projects/h3-panel/tools/gpu-dispatcher/dispatcher.py --host 127.0.0.1 --port 8790
+Restart=on-failure
+RestartSec=5
+# The engines it starts live in their own sessions; a dispatcher restart must not take them down
+# with its cgroup -- state.json lets the new process recognise them as its own.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
