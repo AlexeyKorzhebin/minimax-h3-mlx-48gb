@@ -7,6 +7,7 @@ variable does, so the roster can be shown to the page verbatim.
 """
 from __future__ import annotations
 
+import copy
 import http.client
 import json
 import re
@@ -234,12 +235,35 @@ SCENARIO_SCHEMA = {
 _SYSTEM_PROMPT_CACHE: str | None = None
 
 
+def scene_seconds() -> tuple[float, float]:
+    """The `(min, max)` seconds one scene of a `kind: "video"` project may last on the engine in
+    force: sglang's own range, or the MLX pipeline's. Read on every call (`H3_ENGINE` can change)."""
+    from h3_48gb import engine
+    from h3_48gb.engines import sglang_args
+    if engine.is_sglang():
+        return sglang_args.MIN_SECONDS, sglang_args.MAX_SECONDS
+    return 5.0, 10.0
+
+
+def prompt_schema() -> dict:
+    """`PROMPT_SCHEMA` with the video-scene `duration` bounds of the engine in force. The module
+    constant stays as the MLX shape; every caller that sends a schema asks for this one."""
+    schema = copy.deepcopy(PROMPT_SCHEMA)
+    low, high = scene_seconds()
+    duration = schema["schema"]["properties"]["project"]["properties"]["scenes"]["items"][
+        "properties"]["duration"]
+    duration["minimum"], duration["maximum"] = low, high
+    return schema
+
+
 def system_prompt() -> str:
     global _SYSTEM_PROMPT_CACHE
     if _SYSTEM_PROMPT_CACHE is None:
         path = Path(__file__).parent.parent / "docs" / "h3-prompt-system.md"
         _SYSTEM_PROMPT_CACHE = path.read_text(encoding="utf-8")
-    return _SYSTEM_PROMPT_CACHE
+    low, high = scene_seconds()
+    return (_SYSTEM_PROMPT_CACHE.replace("@@SCENE_MIN@@", f"{low:g}")
+            .replace("@@SCENE_MAX@@", f"{high:g}"))
 
 
 def load_env(root) -> dict[str, str]:
@@ -797,7 +821,7 @@ def chat(cfg: dict, env: dict, messages: list[dict]) -> dict:
     See `_chat_turn` for the shared mechanics (retry, the four named failures) this and
     `chat_scenario` both build on.
     """
-    return _chat_turn(cfg, env, messages, PROMPT_SCHEMA,
+    return _chat_turn(cfg, env, messages, prompt_schema(),
                       "Ответ строго одним JSON-объектом по схеме "
                       "{reply: string, prompt: object|null}. Без другого текста.")
 

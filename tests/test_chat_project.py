@@ -121,3 +121,37 @@ def test_providers_carry_shares_gpu(_serve, fake_llama):  # noqa: F811
     body = srv.get_json("/api/providers")
     assert [(row["name"], row["shares_gpu"]) for row in body["providers"]] == [
         ("qwen-local", True)]
+
+
+def _scene_duration(schema):
+    return schema["schema"]["properties"]["project"]["properties"]["scenes"]["items"][
+        "properties"]["duration"]
+
+
+@pytest.mark.parametrize("engine, low, high", [("sglang", 3, 15), ("mlx", 5, 10)])
+def test_the_grammar_and_the_system_prompt_follow_the_engine(monkeypatch, engine, low, high):
+    monkeypatch.setenv("H3_ENGINE", engine)
+    assert _scene_duration(provider.prompt_schema()) == {
+        "type": "number", "minimum": low, "maximum": high}
+    text = provider.system_prompt()
+    assert (f"Each scene is\n**{low} to {high} seconds** long (`duration`) — split a longer idea "
+            f"into more scenes rather than writing\none scene past {high} seconds; the pipeline "
+            f"generates and stitches one clip per scene, and {high} seconds\nis the ceiling") in text
+    assert "@@" not in text
+
+
+def test_the_module_schema_constant_is_untouched_by_the_engine(monkeypatch):
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    provider.prompt_schema()
+    assert _scene_duration(provider.PROMPT_SCHEMA) == {
+        "type": "number", "minimum": 5, "maximum": 10}
+
+
+def test_the_chat_turn_sends_the_engines_grammar(_serve, fake_llama, monkeypatch):  # noqa: F811
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    srv = _serve(providers_port=fake_llama.port)
+    sid = srv.post_json("/api/chat", {"source": {"kind": "new"}, "prompt": ""})["id"]
+    srv.post_json(f"/api/chat/{sid}/message", {"text": "ролик", "prompt": ""})
+    body = fake_llama.requests[-1]["body"]
+    assert _scene_duration(body["response_format"]["json_schema"]) == {
+        "type": "number", "minimum": 3.0, "maximum": 15.0}
