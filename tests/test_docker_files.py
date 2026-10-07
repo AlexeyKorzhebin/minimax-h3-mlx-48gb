@@ -42,6 +42,15 @@ def test_compose_mounts_host_paths_at_the_same_paths_and_sets_the_spec_env():
         assert expected in lines, expected
 
 
+def test_compose_healthcheck_asks_the_page_itself_on_the_loopback():
+    """`docker compose ps` says `healthy` only when the page answers /api/state: a live process
+    with a dead page (or a page refusing its own Host) must read as unhealthy, not as `Up`."""
+    lines = [line.strip() for line in _lines("compose.yaml")]
+    assert "healthcheck:" in lines
+    assert ('test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('
+            "'http://127.0.0.1:8765/api/state', timeout=5)\"]") in lines
+
+
 def test_dockerignore_keeps_the_context_small_but_keeps_what_the_panel_reads():
     ignored = set(_lines(".dockerignore"))
     # upstream/ is the MLX reference checkout: the package imports without it (task 2)

@@ -8,6 +8,13 @@ services:
     # reaps the orphans of a killed job (ffmpeg and the like) that would otherwise stay zombies
     init: true
     stop_grace_period: 30s
+    # `healthy` = the page answers /api/state on the loopback (always in its allowed Host set)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/state', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
     environment:
       TZ: Europe/Moscow
       # uid 1000 has no passwd entry/home in the image; /tmp keeps caches off / and off the data volume
