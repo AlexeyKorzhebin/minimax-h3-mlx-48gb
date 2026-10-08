@@ -1288,3 +1288,15 @@ def test_error_text_names_the_wave_refusals_in_russian():
         {"title": "Сцене нужен референс", "pre": "m ref2va_needs_reference"},
         {"title": "Этап ещё не готов", "pre": "m project_stage_not_ready"},
         {"title": "Стартовый кадр не подходит", "pre": "m start_image_invalid"}]
+
+
+def test_panel_head_wraps_so_the_new_project_button_stays_on_the_screen():
+    """Acceptance D2: at 390 px the head of the projects zone was 494 px wide in a 368 px panel and
+    "+ Новый проект" sat at x 374..505 behind `overflow: hidden`."""
+    css = (Path(__file__).resolve().parent.parent / "h3_48gb" / "webui" / "style.css").read_text(
+        encoding="utf-8")
+    rule = re.search(r"(?m)^\.panel-head\s*\{([^}]*)\}", css).group(1)
+    declarations = {k.strip(): v.strip() for k, v in
+                    (d.split(":", 1) for d in rule.split(";") if ":" in d)}
+    assert declarations["display"] == "flex"
+    assert declarations["flex-wrap"] == "wrap"
