@@ -190,3 +190,25 @@ def test_locking_a_card_that_is_gone_does_not_recreate_its_directory(outdir):
         with lib._card_lock(gone, "@bob"):
             pass
     assert (err.value.code, gone.exists()) == ("library_card_not_found", False)
+
+
+def test_card_paths_and_the_state_outdir_agree_through_a_symlinked_outdir(tmp_path, monkeypatch):
+    """The page builds `/media/...` for a card's picture only when the path starts with the
+    `outdir` of `/api/state`. With `H3_OUTDIR` behind a symlink the state used to say the resolved
+    path and the cards the unresolved one -- no thumbnail, no `<Picture k>` preview."""
+    monkeypatch.setenv("H3_ENGINE", "sglang")
+    real = tmp_path / "real"
+    (real / "uploads").mkdir(parents=True)
+    (real / "uploads" / "a.png").write_bytes(PNG)
+    lib.create_card(real, tag="@alice", kind="person", description="a woman",
+                    assets=[real / "uploads" / "a.png"])
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    server = _serve(q.layout(tmp_path / "queue")["root"], link)
+    try:
+        state_outdir = _call(server, "GET", "/api/state")[1]["outdir"]
+        asset = _call(server, "GET", "/api/library")[1]["cards"][0]["assets"][0]
+    finally:
+        server.httpd.shutdown()
+        server.httpd.server_close()
+    assert asset.startswith(state_outdir + "/")

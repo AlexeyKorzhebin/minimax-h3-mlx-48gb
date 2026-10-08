@@ -6763,7 +6763,10 @@ def make_server(queue_root, outdir, repo=None, models=None, webui=None, port=DEF
     # sets cannot drift apart, and `http://` because this server has no TLS and never will.
     httpd.allowed_origins = frozenset(f"http://{name}" for name in httpd.allowed_hosts)
     httpd.queue_root = Path(queue_root)
-    httpd.outdir = Path(outdir)
+    # resolved once, here: `/api/state` has always said the resolved path, and the page builds
+    # `/media` links only for paths that start with it -- cards, uploads and projects must be
+    # spelled the same way
+    httpd.outdir = Path(outdir).resolve()
     httpd.webui = Path(webui) if webui is not None else WEBUI_ROOT
     httpd.roots = {"repo": Path(repo) if repo is not None else REPO_ROOT,
                    "outdir": Path(outdir),
