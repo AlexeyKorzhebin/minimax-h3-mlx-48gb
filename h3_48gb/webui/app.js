@@ -151,8 +151,14 @@ function runWhat(note, projects) {
   return { what: "задача", active: "H3 считает задачу" };
 }
 
-/** Цифры прогона на sglang из аргументов и оценки задачи: проходов нет, есть время и доля. */
-export function sglangRunView(job, nowMs) {
+/** Задачи без размеров и шагов: апскейл и сборка проекта называются по делу, а не «null×null». */
+const STAGE_LABELS = { upscale: "апскейл LTX", assemble: "сборка проекта" };
+export const jobStageLabel = (job) => STAGE_LABELS[job && job.kind] || null;
+
+/** Параметры сцены sglang из аргументов задачи: холст, длительность, сид, шаги. */
+function sglangSpecText(job) {
+  const stage = jobStageLabel(job);
+  if (stage) return stage;
   const args = job.args || [];
   const pick = (flag) => argValue(args, flag);
   const chained = pick("--aspect") === "auto";
@@ -163,14 +169,24 @@ export function sglangRunView(job, nowMs) {
   if (Number.isFinite(delivered)) parts.push(secondsText(delivered));
   if (pick("--seed") !== null && pick("--seed") !== undefined) parts.push(`сид ${pick("--seed")}`);
   if (pick("--steps")) parts.push(`${pick("--steps")} шагов`);
+  return parts.join(" · ");
+}
+
+/** Цифры прогона на sglang из аргументов и оценки задачи: проходов нет, есть время и доля. */
+export function sglangRunView(job, nowMs) {
   const since = Date.parse(job.started_at);
   const passed = Number.isFinite(since) ? Math.max(0, (nowMs - since) / 1000) : 0;
   const estimate = jobSeconds(job);
+  if (!estimate) {
+    // no estimate (upscale, assemble): elapsed time only, no percent or end time to invent
+    return { spec: sglangSpecText(job), elapsed: formatDuration(passed), total: "—", share: null,
+             leftSeconds: 0, over: null, waiting: Boolean(job.wait_reason) };
+  }
   // sglang reports no step progress (progress is 0, then 100), so past the estimate there is no
   // honest percent or end time: say how far over it is instead of "99 % · осталось 0 с"
   const over = estimate && passed > estimate ? `дольше оценки на ${formatDuration(passed - estimate)}` : null;
   return {
-    spec: parts.join(" · "), elapsed: formatDuration(passed),
+    spec: sglangSpecText(job), elapsed: formatDuration(passed),
     total: `≈${formatDuration(estimate)}`,
     share: over ? null : (estimate ? Math.min(99, Math.floor((100 * passed) / estimate)) : 0),
     leftSeconds: Math.max(0, estimate - passed), over, waiting: Boolean(job.wait_reason),
@@ -1684,6 +1700,12 @@ export function stepsHtml(completed, total) {
  *  числа по вертикали между ними больше нечем и незачем — параметры стали подписью под именем. */
 const specText = (job) => {
   const e = job.estimate || {};
+  const stage = jobStageLabel(job);
+  if (stage) return escapeHtml(stage);
+  // the sglang estimate carries no canvas; the scene's own parameters are in its args
+  if (e.width === undefined && argValue(job.args, "--width") !== null) {
+    return escapeHtml(sglangSpecText(job));
+  }
   const mode = argValue(job.args, "--mode") || "auto";
   const w = e.width ?? "?";
   const h = e.height ?? "?";
@@ -1720,7 +1742,7 @@ export function pendingRowHtml(job, { editingId = null, index = null } = {}) {
     + `<span class="n">${escapeHtml(jobTag(job))}`
     + (priority > 0 ? ` <span class="prio">↑${priority}</span>` : "")
     + `</span>`
-    + `<span class="meta">${specText(job)} · ≈${formatDuration(jobSeconds(job))}`
+    + `<span class="meta">${specText(job)}${jobSeconds(job) ? ` · ≈${formatDuration(jobSeconds(job))}` : ""}`
     + `<span class="mem${over ? " over" : ""}">${formatGb(peak)}`
     + `<i class="mg" title="из ${PHYSICAL_GB} ГБ, риска на ${WARN_GB}">`
     + `<b style="width:${Math.min(100, peak / PHYSICAL_GB * 100)}%"></b></i></span></span>`
@@ -4393,8 +4415,9 @@ function startPage() {
         cell("Идёт", escapeHtml(view.elapsed)),
         cell("Оценка", escapeHtml(view.total)),
         view.waiting ? cell("Доля", "ждёт карту", " run-wait")
-          : view.over ? cell("Доля", escapeHtml(view.over), " run-wait") : cell("Доля", `${view.share} %`),
-        view.over ? cell("Кончится", "неизвестно")
+          : view.over ? cell("Доля", escapeHtml(view.over), " run-wait")
+          : view.share === null ? cell("Доля", "—") : cell("Доля", `${view.share} %`),
+        view.over || view.share === null ? cell("Кончится", "неизвестно")
           : cell("Кончится", formatClock(new Date(now.getTime() + view.leftSeconds * 1000))),
         `</div>`,
         `<div class="run-foot">старт <span class="num">`
@@ -4406,8 +4429,8 @@ function startPage() {
       ].join("");
       rail.className = "rail-run";
       rail.innerHTML = `<span class="run-tag">${escapeHtml(jobTag(job))}</span>`
-        + `<span class="run-share">${view.waiting ? "ждёт карту" : view.over ? escapeHtml(view.over) : `${view.share} %`}</span>`
-        + (view.over ? "" : `<span class="run-left">осталось <b>${formatDuration(view.leftSeconds)}</b></span>`);
+        + `<span class="run-share">${view.waiting ? "ждёт карту" : view.over ? escapeHtml(view.over) : view.share === null ? "идёт" : `${view.share} %`}</span>`
+        + (view.over || view.share === null ? "" : `<span class="run-left">осталось <b>${formatDuration(view.leftSeconds)}</b></span>`);
       steps.innerHTML = "";
       return { left: view.leftSeconds };
     }

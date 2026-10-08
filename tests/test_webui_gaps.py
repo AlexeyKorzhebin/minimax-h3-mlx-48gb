@@ -786,7 +786,8 @@ def test_sglang_run_view_has_no_zeros():
     chained = SG_JOB.replace("'--seed', '305']", "'--seed', '305', '--aspect', 'auto']")
     assert _js(f"app.sglangRunView({chained}, {now})")["spec"] == "896×576 · 5,13 с · сид 305 · 50 шагов"
     no_estimate = SG_JOB.replace("estimate: {seconds: 540, source: 'history', samples: 3}", "estimate: {}")
-    assert _js(f"app.sglangRunView({no_estimate}, {now})")["share"] == 0
+    # no estimate at all: no percent to invent either (D4)
+    assert _js(f"app.sglangRunView({no_estimate}, {now})")["share"] is None
 
 
 @_needs_node
@@ -1308,3 +1309,36 @@ def test_finished_tiles_are_not_redrawn_while_nothing_changed():
     poll, BrokenPipe in the container log) because `#finished` was rebuilt from scratch."""
     assert _gaps("finished_tiles_stable") == {
         "afterFirst": 1, "writesAfterTwoMorePolls": 1, "writesAfterNewJob": 2, "tiles": 2}
+
+
+def _meta(job_js: str) -> str:
+    html = _js(f"app.pendingRowHtml({job_js})")
+    return re.search(r'<span class="meta">(.*?)<span class="mem', html).group(1)
+
+
+@_needs_node
+def test_pending_scene_row_shows_the_scene_parameters_from_its_args():
+    """Acceptance D5: a project scene in "Ждут" read "auto · ?×? · ? с · ? шаг." -- the sglang
+    estimate carries no canvas, but every parameter is in the job's args."""
+    job = ("{id: 'j1', kind: 'generate', note: 'project scene p1 #0', estimate: {seconds: 1022}, "
+           "args: ['generate', 'p', '--width', '896', '--height', '512', '--duration', '3.75', "
+           "'--steps', '49', '--seed', '305']}")
+    assert _meta(job) == "896×512 · 3,75 с · сид 305 · 49 шагов · ≈17 мин"
+
+
+@_needs_node
+def test_pending_upscale_and_assemble_rows_name_the_stage_not_empty_sizes():
+    for kind, text in (("upscale", "апскейл LTX"), ("assemble", "сборка проекта")):
+        job = (f"{{id: 'j1', kind: '{kind}', note: 'x project p1', estimate: {{}}, "
+               f"args: ['{kind}', '--project', '/o/p1/project.json']}}")
+        assert _meta(job) == text      # no estimate: no "≈0 с" either
+
+
+@_needs_node
+def test_running_upscale_card_has_a_human_line_and_no_made_up_numbers():
+    """Acceptance D4: "null×null · 0 с · 0 % · осталось 0 с" for the whole upscale."""
+    job = ("{id: 'j1', kind: 'upscale', args: ['upscale', '--project', '/o/p1/project.json'], "
+           "started_at: '2026-10-07T12:30:00Z', estimate: {}, note: 'upscale project p1'}")
+    view = _js(f"app.sglangRunView({job}, Date.parse('2026-10-07T12:33:10Z'))")
+    assert view == {"spec": "апскейл LTX", "elapsed": "3 мин", "total": "—", "share": None,
+                    "leftSeconds": 0, "over": None, "waiting": False}
