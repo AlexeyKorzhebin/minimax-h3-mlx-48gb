@@ -287,7 +287,7 @@ def test_editor_html_for_one_scene_on_sglang():
         '<span class="idx">#0</span><div class="spacer"></div>'
         '<button type="button" class="ghost" data-act="scene-up" data-idx="0" disabled>↑</button>'
         '<button type="button" class="ghost" data-act="scene-down" data-idx="0" disabled>↓</button>'
-        '<button type="button" class="ghost" data-act="scene-h3-prompt" data-idx="0">Промпт для H3</button>'
+        '<button type="button" class="ghost" data-act="scene-h3-prompt" data-id="p1" data-idx="0">Промпт для H3</button>'
         '</div>'
         '<textarea class="inp scene-edit-prompt" data-scene-field="prompt" data-idx="0" rows="4">'
         'a &lt;b&gt;</textarea>'
@@ -584,7 +584,7 @@ def test_editor_html_with_pinned_cards_and_refs():
         '<span class="idx">#0</span><div class="spacer"></div>'
         '<button type="button" class="ghost" data-act="scene-up" data-idx="0" disabled>↑</button>'
         '<button type="button" class="ghost" data-act="scene-down" data-idx="0" disabled>↓</button>'
-        '<button type="button" class="ghost" data-act="scene-h3-prompt" data-idx="0">Промпт для H3</button>'
+        '<button type="button" class="ghost" data-act="scene-h3-prompt" data-id="p1" data-idx="0">Промпт для H3</button>'
         '</div>'
         '<textarea class="inp scene-edit-prompt" data-scene-field="prompt" data-idx="0" rows="4">a</textarea>'
         '<div class="tag-hint-slot" data-idx="0"></div>' + refs +

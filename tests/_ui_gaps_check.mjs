@@ -29,8 +29,33 @@ const open = async () => {
 };
 // The redraw an action causes happens *inside* `act`, while the stale fields are still in
 // `queryAll` -- exactly the moment Н1 is about; `liveEditor` runs only after it.
+// The button a click lands on is the one the page really drew: its `data-*` come from the markup in
+// `#project-body`, not from the scenario. (A scenario that handed the handler an `id` the markup does
+// not carry once hid a button that called `/api/projects/undefined/...`.) Only a button the page
+// draws into another place than `#project-body` (the tag-hint buttons are filled in by a mocked slot)
+// may fall back to the scenario's own values.
+const markupDataset = (tag) => {
+  const dataset = {};
+  for (const m of tag.matchAll(/ data-([a-z0-9-]+)="([^"]*)"/g)) {
+    dataset[m[1].replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = m[2]
+      .replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  }
+  return dataset;
+};
+const SYNTHETIC_OK = new Set(["tag-pick"]);
+const realButton = (name, want = {}) => {
+  const html = getElementById("project-body").innerHTML;
+  for (const m of html.matchAll(/<button\b[^>]*>/g)) {
+    const dataset = markupDataset(m[0]);
+    if (dataset.act === name && Object.entries(want).every(([k, v]) => dataset[k] === v)) return dataset;
+  }
+  if (SYNTHETIC_OK.has(name)) return { act: name, ...want };
+  throw new Error(`no <button data-act="${name}"> ${JSON.stringify(want)} in the drawn markup`);
+};
+const clickReal = (name, want = {}) =>
+  fire("click", clickable({ dataset: realButton(name, want), match: (s) => s === "button[data-act]" }));
 const act = async (name, extra = {}) => {
-  fire("click", clickable({ dataset: { act: name, id: "p1", ...extra }, match: (s) => s === "button[data-act]" }));
+  clickReal(name, extra);
   await sleep(80);
   liveEditor();
 };
@@ -226,7 +251,7 @@ const SCENARIOS = {
     queryAll[FIELDS] = typed;
     // no `act` here on purpose: the stale fields stay in queryAll through the redraw and are still
     // there at the save -- a DOM drawn from an older draft must never win over the moved draft
-    fire("click", clickable({ dataset: { act: "scene-down", id: "p1", idx: "0" }, match: (s) => s === "button[data-act]" }));
+    clickReal("scene-down", { idx: "0" });
     await sleep(80);
     await act("scenes-save");
     return { puts: puts() };
@@ -294,7 +319,7 @@ const SCENARIOS = {
     queryAll[FIELDS] = [field("prompt", 0, "@a walks"), field("prompt", 1, "@a runs")];
     queryOne["#project-body .scenario-json-text"] = { value: '{"scenes": [{"prompt": "@a", "duration": 5}]}' };
     answers.confirm = true;
-    fire("click", clickable({ dataset: { act: "scenario-json-load", id: "p1" }, match: (s) => s === "button[data-act]" }));
+    clickReal("scenario-json-load");
     await sleep(120);
     await act("scenes-save");
     return { puts: puts() };
@@ -723,8 +748,7 @@ const SCENARIOS = {
     await start(appUrl, draftRoutes({ "GET /api/projects/p1/scenes/0/h3-prompt":
       () => sleep(80).then(() => ok(answer)) }));
     await open();
-    fire("click", clickable({ dataset: { act: "scene-h3-prompt", id: "p1", idx: "0" },
-      match: (sel) => sel === "button[data-act]" }));
+    clickReal("scene-h3-prompt", { idx: "0" });
     await sleep(30);                       // the GET is in flight: the person types
     queryAll[FIELDS] = [field("prompt", 0, "@a jumps far")];
     fire("input", { value: "@a jumps far", selectionStart: 0, title: "", dataset: { sceneField: "prompt", idx: "0" },
@@ -739,8 +763,7 @@ const SCENARIOS = {
     await start(appUrl, draftRoutes({ "GET /api/projects/p1/scenes/0/h3-prompt":
       () => sleep(80).then(() => ok(answer)), "PUT /api/projects/p1/references": ok({ ok: true, references: [] }) }));
     await open();
-    fire("click", clickable({ dataset: { act: "scene-h3-prompt", id: "p1", idx: "0" },
-      match: (sel) => sel === "button[data-act]" }));
+    clickReal("scene-h3-prompt", { idx: "0" });
     await sleep(30);                       // the GET is in flight: a reference is ticked
     const pin = { checked: true, dataset: { tag: "@a" }, classList: { contains: (c) => c === "ref-pin" } };
     const box = { dataset: { id: "p1" }, querySelectorAll: (sel) => (sel === ".ref-pin" ? [pin] : []) };

@@ -465,7 +465,8 @@ function sceneEditHtml(scene, idx, total, ctx) {
     + `<span class="idx">#${idx}</span><div class="spacer"></div>`
     + button("scene-up", "↑", idx === 0) + button("scene-down", "↓", idx === total - 1)
     + (total > 1 ? button("scene-del", "Удалить", false) : "")
-    + (sglang ? button("scene-h3-prompt", "Промпт для H3", false) : "") + `</div>`
+    + (sglang ? `<button type="button" class="ghost" data-act="scene-h3-prompt" data-id="${escapeHtml(ctx.id)}" `
+      + `data-idx="${idx}">Промпт для H3</button>` : "") + `</div>`
     + `<textarea class="inp scene-edit-prompt" data-scene-field="prompt" data-idx="${idx}" rows="4">`
     + `${escapeHtml(scene.prompt)}</textarea>`
     + (sglang ? `<div class="tag-hint-slot" data-idx="${idx}"></div>`
