@@ -6483,3 +6483,28 @@ def test_nothing_in_the_chrome_refuses_to_shrink_except_the_clock():
             f"{selector} с `flex: none` выталкивает часы за край окна:\n{body}")
         assert "min-width: 0" in body, (
             f"{selector} без `min-width: 0` не сожмётся, что бы ни говорил flex:\n{body}")
+
+
+@_needs_node
+def test_pending_entry_for_a_remote_provider_does_not_talk_about_a_cold_model():
+    """Acceptance D7: an external provider (CAILA, openrouter) has no model of ours to raise, yet
+    the log said "поднимаю модель…" whenever `/api/llm` reported `down` (always, for them)."""
+    remote, local = _node_eval("""
+      console.log(JSON.stringify([
+        app.pendingEntry("down", {remote: true}).text,
+        app.pendingEntry("down", {remote: false}).text,
+      ]));
+    """)
+    assert remote == "жду ответ модели…"
+    assert local == "поднимаю модель…"
+    assert _node_eval("""console.log(JSON.stringify([
+      app.chatProviderIsRemote({type: "openai", shares_gpu: false}),
+      app.chatProviderIsRemote({type: "openai", shares_gpu: true}),
+      app.chatProviderIsRemote({type: "llama-local", shares_gpu: true}),
+      app.chatProviderIsRemote(null)]));""") == [True, False, False, False]
+    assert _node_eval("""console.log(JSON.stringify([app.chatWaitPlateText(true),
+      app.chatWaitPlateText(false)]));""") == [
+        "жду ответа модели", "жду ответа — на холодной модели это до минуты"]
+    body = _js_function(_page_text("app.js"), "async function sendChatMessage()")
+    assert "chatProviderIsRemote(" in body and "chatWaitPlateText(remote)" in body
+    assert "pendingEntry(session.llmStatus, { remote })" in body

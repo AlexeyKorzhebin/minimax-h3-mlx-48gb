@@ -2843,9 +2843,21 @@ export function attachmentBody(state) {
  * приземлился; `role: "note"` — чтобы `renderChatLog` собрал ей тот же CSS-класс, что и другим
  * служебным строкам ленты (`warn`/`bad`).
  */
-export function pendingEntry(llmStatus) {
+export function pendingEntry(llmStatus, { remote = false } = {}) {
+  // a remote provider has no model of ours to raise: `/api/llm` says `down` for it, always
+  if (remote) return { role: "note", kind: "pending", text: "жду ответ модели…" };
   return { role: "note", kind: "pending",
            text: llmStatus === "down" ? "поднимаю модель…" : "модель думает…" };
+}
+
+/** Провайдер считает не на этой видеокарте: не llama-local и не делит карту с H3. */
+export function chatProviderIsRemote(row) {
+  return Boolean(row) && row.type !== "llama-local" && row.shares_gpu !== true;
+}
+
+/** Плашка модели на время хода. */
+export function chatWaitPlateText(remote) {
+  return remote ? "жду ответа модели" : "жду ответа — на холодной модели это до минуты";
 }
 
 /**
@@ -5012,11 +5024,13 @@ function startPage() {
     const session = chat;
     session.sending = true;
     $("chat-send").disabled = true;
-    renderLlmPlate("жду ответа — на холодной модели это до минуты");
+    const remote = chatProviderIsRemote(
+      ((session.providers) || []).find((item) => item.name === $("chat-provider").value));
+    renderLlmPlate(chatWaitPlateText(remote));
     session.log.push({ role: "user", text: outgoingText,
                        attachment: attachment ? attachment.name : "" });
     // Плейсхолдер хода — точки, что ход идёт, пока сервер ничего не прислал (см. `pendingEntry`).
-    session.log.push(pendingEntry(session.llmStatus));
+    session.log.push(pendingEntry(session.llmStatus, { remote }));
     $("chat-input").value = "";
     clearChatAttachment();
     renderChatLog();
