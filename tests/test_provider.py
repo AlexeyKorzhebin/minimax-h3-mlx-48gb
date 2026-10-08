@@ -1805,3 +1805,135 @@ def test_keys_outside_a_schema_without_additional_properties_false_are_kept():
     assert provider._parse_model_json('{"a": "x", "b": 1}', schema) == {"a": "x", "b": 1}
     schema["schema"]["additionalProperties"] = True
     assert provider._parse_model_json('{"a": "x", "b": 1}', schema) == {"a": "x", "b": 1}
+
+
+# -- `response_format: "json_object"`: CAILA's Sonnet 5.5 route rejects strict json_schema (400
+# "tool_choice: type tool and any are not supported for this model") but answers json_object --
+
+_GOOD_TURN_TEXT = json.dumps({"reply": "ok", "prompt": None})
+
+
+def _object_cfg(port: int, **extra) -> dict:
+    return {**_llama_cfg(port), "response_format": "json_object", **extra}
+
+
+def _content(text: str) -> dict:
+    return {"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}
+
+
+def test_json_object_sends_plain_json_object_response_format_and_the_schema_as_text(tmp_path):
+    fake = _FakeLlama(chat_payload=_content(_GOOD_TURN_TEXT))
+    try:
+        turn = provider.chat(_object_cfg(fake.port), {},
+                             [{"role": "system", "content": "SYS"},
+                              {"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn == {"reply": "ok", "prompt": None, "slug": None, "project": None}
+    (req,) = fake.requests
+    assert req["body"]["response_format"] == {"type": "json_object"}
+    assert req["body"]["messages"] == [
+        {"role": "system",
+         "content": "SYS\n\nОтвет — один JSON-объект по этой JSON-схеме: "
+                    + json.dumps(provider.prompt_schema()["schema"], ensure_ascii=False)},
+        {"role": "user", "content": "x"}]
+
+
+def test_json_object_without_a_system_message_prepends_one_with_the_schema(tmp_path):
+    fake = _FakeLlama(chat_payload=_content(_GOOD_TURN_TEXT))
+    try:
+        provider.chat(_object_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    assert req["body"]["messages"] == [
+        {"role": "system",
+         "content": "Ответ — один JSON-объект по этой JSON-схеме: "
+                    + json.dumps(provider.prompt_schema()["schema"], ensure_ascii=False)},
+        {"role": "user", "content": "x"}]
+
+
+def test_default_response_format_is_still_the_strict_json_schema(tmp_path):
+    fake = _FakeLlama(chat_payload=_TURN)
+    try:
+        provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    (req,) = fake.requests
+    assert req["body"]["response_format"] == {"type": "json_schema",
+                                              "json_schema": provider.PROMPT_SCHEMA}
+    assert req["body"]["messages"] == [{"role": "user", "content": "x"}]
+
+
+def test_json_object_missing_required_field_is_bad_model_json_after_one_retry(tmp_path):
+    fake = _FakeLlama(chat_payload=_content(json.dumps({"prompt": None})))
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_object_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_model_json"
+        assert len(fake.requests) == 2
+    finally:
+        fake.close()
+
+
+def test_json_object_wrong_type_is_bad_model_json(tmp_path):
+    fake = _FakeLlama(chat_payload=_content(json.dumps({"reply": 5, "prompt": None})))
+    try:
+        with pytest.raises(provider.ProviderError) as err:
+            provider.chat(_object_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+        assert err.value.code == "bad_model_json"
+    finally:
+        fake.close()
+
+
+def test_json_object_nested_wrong_type_and_missing_nested_required_are_rejected(tmp_path):
+    bad_nested = {"reply": "r", "prompt": {"instruction": None,
+                                           "integrated_multimodal_description": 7,
+                                           "overall_soundscape": "s", "non_diegetic_music": "m"}}
+    missing_nested = {"reply": "r", "prompt": {"instruction": None}}
+    for bad in (bad_nested, missing_nested):
+        fake = _FakeLlama(chat_payload=_content(json.dumps(bad)))
+        try:
+            with pytest.raises(provider.ProviderError) as err:
+                provider.chat(_object_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+            assert err.value.code == "bad_model_json"
+        finally:
+            fake.close()
+
+
+def test_json_object_valid_fenced_reply_with_extra_key_is_accepted(tmp_path):
+    text = "```json\n" + json.dumps({"reply": "ok", "prompt": None, "_note": "x"}) + "\n```"
+    fake = _FakeLlama(chat_payload=_content(text))
+    try:
+        turn = provider.chat(_object_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn == {"reply": "ok", "prompt": None, "slug": None, "project": None}
+
+
+def test_json_schema_path_does_not_validate_types(tmp_path):
+    """Unchanged behaviour: the strict path trusts the provider's own enforcement."""
+    fake = _FakeLlama(chat_payload=_content(json.dumps({"reply": 5, "prompt": None})))
+    try:
+        turn = provider.chat(_llama_cfg(fake.port), {}, [{"role": "user", "content": "x"}])
+    finally:
+        fake.close()
+    assert turn == {"reply": 5, "prompt": None, "slug": None, "project": None}
+
+
+def test_schema_validator_rules():
+    v = provider._schema_violation
+    s = {"type": "object", "required": ["a"],
+         "properties": {"a": {"type": ["integer", "null"], "minimum": 1, "maximum": 3},
+                        "b": {"type": "array", "items": {"enum": ["x", "y"]}}}}
+    assert v({"a": 2, "b": ["x"]}, s) is None
+    assert v({"a": None}, s) is None
+    assert v({}, s) is not None            # required missing
+    assert v({"a": True}, s) is not None   # bool is not an integer
+    assert v({"a": 1.5}, s) is not None
+    assert v({"a": 0}, s) is not None      # below minimum
+    assert v({"a": 4}, s) is not None      # above maximum
+    assert v({"a": 1, "b": ["z"]}, s) is not None   # enum in items
+    assert v({"a": 1, "b": "x"}, s) is not None
+    assert v([], s) is not None
+    assert v({"a": 1.0 + 1}, {"type": "object", "properties": {"a": {"type": "number"}}}) is None

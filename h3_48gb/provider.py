@@ -619,6 +619,57 @@ def _fill_nullable(value, sub: dict):
     return value
 
 
+def _type_ok(value, t: str) -> bool:
+    if t == "null":
+        return value is None
+    if t == "boolean":
+        return isinstance(value, bool)
+    if t == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if t == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if t == "string":
+        return isinstance(value, str)
+    if t == "array":
+        return isinstance(value, list)
+    if t == "object":
+        return isinstance(value, dict)
+    return True
+
+
+def _schema_violation(value, sub: dict, path: str = "$") -> str | None:
+    """First violation of `sub` by `value`, or None. The small subset of JSON Schema this module's
+    own schemas use: type (string or list), required, properties, items, enum, minimum, maximum.
+    Only the `json_object` response format needs it -- there the provider enforces nothing."""
+    t = sub.get("type")
+    if t is not None:
+        types = t if isinstance(t, list) else [t]
+        if not any(_type_ok(value, x) for x in types):
+            return f"{path}: ожидался тип {types}, получено {type(value).__name__}"
+    if "enum" in sub and value not in sub["enum"]:
+        return f"{path}: значение вне enum"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in sub and value < sub["minimum"]:
+            return f"{path}: меньше минимума {sub['minimum']}"
+        if "maximum" in sub and value > sub["maximum"]:
+            return f"{path}: больше максимума {sub['maximum']}"
+    if isinstance(value, dict):
+        for key in sub.get("required", []):
+            if key not in value:
+                return f"{path}: нет обязательного поля {key}"
+        for key, child in (sub.get("properties") or {}).items():
+            if key in value:
+                bad = _schema_violation(value[key], child, f"{path}.{key}")
+                if bad:
+                    return bad
+    elif isinstance(value, list) and isinstance(sub.get("items"), dict):
+        for i, item in enumerate(value):
+            bad = _schema_violation(item, sub["items"], f"{path}[{i}]")
+            if bad:
+                return bad
+    return None
+
+
 def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
                retry_reminder: str) -> dict:
     """One turn of the OpenAI chat protocol, response shaped by `schema`.
@@ -693,6 +744,22 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
             "messages": messages,
             token_limit_key: max_tokens,
             "response_format": {"type": "json_schema", "json_schema": schema}}
+    # `response_format: "json_object"` in a provider's own entry: for routes that refuse strict
+    # `json_schema` (CAILA's just-ai/openrouter-proxy/anthropic/claude-sonnet-5.5 answers 400
+    # "tool_choice: type tool and any are not supported for this model"). The wire format is the
+    # plain `{"type":"json_object"}`, the schema goes into the system message as text, and the
+    # reply is checked against it here (`_schema_violation`) since the provider enforces nothing.
+    json_object = cfg.get("response_format", "json_schema") == "json_object"
+    if json_object:
+        body["response_format"] = {"type": "json_object"}
+        note = ("Ответ — один JSON-объект по этой JSON-схеме: "
+                + json.dumps(schema.get("schema", schema), ensure_ascii=False))
+        if messages and messages[0].get("role") == "system":
+            messages = [{**messages[0], "content": f"{messages[0]['content']}\n\n{note}"},
+                        *messages[1:]]
+        else:
+            messages = [{"role": "system", "content": note}, *messages]
+        body["messages"] = messages
     # `send_temperature: false` in a provider's own entry leaves `temperature` out of the body
     # entirely. Default `true` (unchanged behaviour): every provider this file currently talks to
     # sends an explicit `temperature` in `providers.json` and today's live caila.io call still
@@ -842,19 +909,27 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
             f"ответ обрезан лимитом вывода ({token_limit_key}={max_tokens}) раньше, чем модель "
             f"закончила -- {advice}")
 
+    def _parse(text):
+        value = _parse_model_json(text, schema)
+        if json_object:
+            bad = _schema_violation(value, schema.get("schema", schema))
+            if bad:
+                raise ValueError(bad)
+        return value
+
     raw, finish_reason = ask(messages)
     if finish_reason == "length":
         raise _truncated()
     try:
-        return _parse_model_json(raw, schema)
-    except (json.JSONDecodeError, TypeError):
+        return _parse(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
         reminder = {"role": "system", "content": retry_reminder}
         raw2, finish_reason2 = ask([reminder, *messages])
         if finish_reason2 == "length":
             raise _truncated()
         try:
-            return _parse_model_json(raw2, schema)
-        except (json.JSONDecodeError, TypeError):
+            return _parse(raw2)
+        except (json.JSONDecodeError, TypeError, ValueError):
             raise ProviderError("bad_model_json",
                                f"модель не удержала формат: {(raw2 or '')[:400]}")
 
