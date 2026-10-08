@@ -776,14 +776,18 @@ def test_sglang_run_view_has_no_zeros():
     now = "Date.parse('2026-10-07T12:33:10Z')"
     assert _js(f"app.sglangRunView({SG_JOB}, {now})") == {
         "spec": "896×576 · 5,17 с · сид 305 · 50 шагов", "elapsed": "3 мин", "total": "≈9 мин",
-        "share": 35, "leftSeconds": 350, "waiting": False}
-    late = "Date.parse('2026-10-07T12:45:00Z')"          # past the estimate: never 100 % while running
-    assert _js(f"app.sglangRunView({SG_JOB}, {late})")["share"] == 99
-    assert _js(f"app.sglangRunView({SG_JOB}, {late})")["leftSeconds"] == 0
+        "share": 35, "leftSeconds": 350, "over": None, "waiting": False}
+    # past the estimate (acceptance D1: "99 % · осталось 0 с" for ten minutes looked like a hang):
+    # no percent, no end time, only how far over the estimate it already is
+    late = "Date.parse('2026-10-07T12:45:00Z')"
+    over = _js(f"app.sglangRunView({SG_JOB}, {late})")
+    assert (over["share"], over["leftSeconds"], over["over"]) == (None, 0, "дольше оценки на 6 мин")
+    assert _js(f"app.sglangRunView({SG_JOB}, {now})")["over"] is None
     chained = SG_JOB.replace("'--seed', '305']", "'--seed', '305', '--aspect', 'auto']")
     assert _js(f"app.sglangRunView({chained}, {now})")["spec"] == "896×576 · 5,13 с · сид 305 · 50 шагов"
     no_estimate = SG_JOB.replace("estimate: {seconds: 540, source: 'history', samples: 3}", "estimate: {}")
-    assert _js(f"app.sglangRunView({no_estimate}, {now})")["share"] == 0
+    # no estimate at all: no percent to invent either (D4)
+    assert _js(f"app.sglangRunView({no_estimate}, {now})")["share"] is None
 
 
 @_needs_node
@@ -1285,3 +1289,63 @@ def test_error_text_names_the_wave_refusals_in_russian():
         {"title": "Сцене нужен референс", "pre": "m ref2va_needs_reference"},
         {"title": "Этап ещё не готов", "pre": "m project_stage_not_ready"},
         {"title": "Стартовый кадр не подходит", "pre": "m start_image_invalid"}]
+
+
+def test_panel_head_wraps_so_the_new_project_button_stays_on_the_screen():
+    """Acceptance D2: at 390 px the head of the projects zone was 494 px wide in a 368 px panel and
+    "+ Новый проект" sat at x 374..505 behind `overflow: hidden`."""
+    css = (Path(__file__).resolve().parent.parent / "h3_48gb" / "webui" / "style.css").read_text(
+        encoding="utf-8")
+    rule = re.search(r"(?m)^\.panel-head\s*\{([^}]*)\}", css).group(1)
+    declarations = {k.strip(): v.strip() for k, v in
+                    (d.split(":", 1) for d in rule.split(";") if ":" in d)}
+    assert declarations["display"] == "flex"
+    assert declarations["flex-wrap"] == "wrap"
+
+
+@_needs_node
+def test_finished_tiles_are_not_redrawn_while_nothing_changed():
+    """Acceptance D3: both final.mp4 were requested again on every ~40 s poll (6 range requests per
+    poll, BrokenPipe in the container log) because `#finished` was rebuilt from scratch."""
+    assert _gaps("finished_tiles_stable") == {
+        "afterFirst": 1, "writesAfterTwoMorePolls": 1, "writesAfterNewJob": 2, "tiles": 2}
+
+
+def _meta(job_js: str) -> str:
+    html = _js(f"app.pendingRowHtml({job_js})")
+    return re.search(r'<span class="meta">(.*?)<span class="mem', html).group(1)
+
+
+@_needs_node
+def test_pending_scene_row_shows_the_scene_parameters_from_its_args():
+    """Acceptance D5: a project scene in "Ждут" read "auto · ?×? · ? с · ? шаг." -- the sglang
+    estimate carries no canvas, but every parameter is in the job's args."""
+    job = ("{id: 'j1', kind: 'generate', note: 'project scene p1 #0', estimate: {seconds: 1022}, "
+           "args: ['generate', 'p', '--width', '896', '--height', '512', '--duration', '3.75', "
+           "'--steps', '49', '--seed', '305']}")
+    assert _meta(job) == "896×512 · 3,75 с · сид 305 · 49 шагов · ≈17 мин"
+
+
+@_needs_node
+def test_pending_upscale_and_assemble_rows_name_the_stage_not_empty_sizes():
+    for kind, text in (("upscale", "апскейл LTX"), ("assemble", "сборка проекта")):
+        job = (f"{{id: 'j1', kind: '{kind}', note: 'x project p1', estimate: {{}}, "
+               f"args: ['{kind}', '--project', '/o/p1/project.json']}}")
+        assert _meta(job) == text      # no estimate: no "≈0 с" either
+
+
+@_needs_node
+def test_running_upscale_card_has_a_human_line_and_no_made_up_numbers():
+    """Acceptance D4: "null×null · 0 с · 0 % · осталось 0 с" for the whole upscale."""
+    job = ("{id: 'j1', kind: 'upscale', args: ['upscale', '--project', '/o/p1/project.json'], "
+           "started_at: '2026-10-07T12:30:00Z', estimate: {}, note: 'upscale project p1'}")
+    view = _js(f"app.sglangRunView({job}, Date.parse('2026-10-07T12:33:10Z'))")
+    assert view == {"spec": "апскейл LTX", "elapsed": "3 мин", "total": "—", "share": None,
+                    "leftSeconds": 0, "over": None, "waiting": False}
+
+
+@_needs_node
+def test_finished_tiles_are_redrawn_when_data_changes_but_markup_length_does_not():
+    """Review of the D3 fix: same job id, another finished_at -> same-length markup, new content."""
+    assert _gaps("finished_tiles_same_length_change") == {
+        "sameLength": True, "changed": True, "writesAdded": 1}

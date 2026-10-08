@@ -151,8 +151,14 @@ function runWhat(note, projects) {
   return { what: "задача", active: "H3 считает задачу" };
 }
 
-/** Цифры прогона на sglang из аргументов и оценки задачи: проходов нет, есть время и доля. */
-export function sglangRunView(job, nowMs) {
+/** Задачи без размеров и шагов: апскейл и сборка проекта называются по делу, а не «null×null». */
+const STAGE_LABELS = { upscale: "апскейл LTX", assemble: "сборка проекта" };
+export const jobStageLabel = (job) => STAGE_LABELS[job && job.kind] || null;
+
+/** Параметры сцены sglang из аргументов задачи: холст, длительность, сид, шаги. */
+function sglangSpecText(job) {
+  const stage = jobStageLabel(job);
+  if (stage) return stage;
   const args = job.args || [];
   const pick = (flag) => argValue(args, flag);
   const chained = pick("--aspect") === "auto";
@@ -163,14 +169,27 @@ export function sglangRunView(job, nowMs) {
   if (Number.isFinite(delivered)) parts.push(secondsText(delivered));
   if (pick("--seed") !== null && pick("--seed") !== undefined) parts.push(`сид ${pick("--seed")}`);
   if (pick("--steps")) parts.push(`${pick("--steps")} шагов`);
+  return parts.join(" · ");
+}
+
+/** Цифры прогона на sglang из аргументов и оценки задачи: проходов нет, есть время и доля. */
+export function sglangRunView(job, nowMs) {
   const since = Date.parse(job.started_at);
   const passed = Number.isFinite(since) ? Math.max(0, (nowMs - since) / 1000) : 0;
   const estimate = jobSeconds(job);
+  if (!estimate) {
+    // no estimate (upscale, assemble): elapsed time only, no percent or end time to invent
+    return { spec: sglangSpecText(job), elapsed: formatDuration(passed), total: "—", share: null,
+             leftSeconds: 0, over: null, waiting: Boolean(job.wait_reason) };
+  }
+  // sglang reports no step progress (progress is 0, then 100), so past the estimate there is no
+  // honest percent or end time: say how far over it is instead of "99 % · осталось 0 с"
+  const over = estimate && passed > estimate ? `дольше оценки на ${formatDuration(passed - estimate)}` : null;
   return {
-    spec: parts.join(" · "), elapsed: formatDuration(passed),
+    spec: sglangSpecText(job), elapsed: formatDuration(passed),
     total: `≈${formatDuration(estimate)}`,
-    share: estimate ? Math.min(99, Math.floor((100 * passed) / estimate)) : 0,
-    leftSeconds: Math.max(0, estimate - passed), waiting: Boolean(job.wait_reason),
+    share: over ? null : (estimate ? Math.min(99, Math.floor((100 * passed) / estimate)) : 0),
+    leftSeconds: Math.max(0, estimate - passed), over, waiting: Boolean(job.wait_reason),
   };
 }
 
@@ -1681,6 +1700,12 @@ export function stepsHtml(completed, total) {
  *  числа по вертикали между ними больше нечем и незачем — параметры стали подписью под именем. */
 const specText = (job) => {
   const e = job.estimate || {};
+  const stage = jobStageLabel(job);
+  if (stage) return escapeHtml(stage);
+  // the sglang estimate carries no canvas; the scene's own parameters are in its args
+  if (e.width === undefined && argValue(job.args, "--width") !== null) {
+    return escapeHtml(sglangSpecText(job));
+  }
   const mode = argValue(job.args, "--mode") || "auto";
   const w = e.width ?? "?";
   const h = e.height ?? "?";
@@ -1717,7 +1742,7 @@ export function pendingRowHtml(job, { editingId = null, index = null } = {}) {
     + `<span class="n">${escapeHtml(jobTag(job))}`
     + (priority > 0 ? ` <span class="prio">↑${priority}</span>` : "")
     + `</span>`
-    + `<span class="meta">${specText(job)} · ≈${formatDuration(jobSeconds(job))}`
+    + `<span class="meta">${specText(job)}${jobSeconds(job) ? ` · ≈${formatDuration(jobSeconds(job))}` : ""}`
     + `<span class="mem${over ? " over" : ""}">${formatGb(peak)}`
     + `<i class="mg" title="из ${PHYSICAL_GB} ГБ, риска на ${WARN_GB}">`
     + `<b style="width:${Math.min(100, peak / PHYSICAL_GB * 100)}%"></b></i></span></span>`
@@ -2818,9 +2843,21 @@ export function attachmentBody(state) {
  * приземлился; `role: "note"` — чтобы `renderChatLog` собрал ей тот же CSS-класс, что и другим
  * служебным строкам ленты (`warn`/`bad`).
  */
-export function pendingEntry(llmStatus) {
+export function pendingEntry(llmStatus, { remote = false } = {}) {
+  // a remote provider has no model of ours to raise: `/api/llm` says `down` for it, always
+  if (remote) return { role: "note", kind: "pending", text: "жду ответ модели…" };
   return { role: "note", kind: "pending",
            text: llmStatus === "down" ? "поднимаю модель…" : "модель думает…" };
+}
+
+/** Провайдер считает не на этой видеокарте: не llama-local и не делит карту с H3. */
+export function chatProviderIsRemote(row) {
+  return Boolean(row) && row.type !== "llama-local" && row.shares_gpu !== true;
+}
+
+/** Плашка модели на время хода. */
+export function chatWaitPlateText(remote) {
+  return remote ? "жду ответа модели" : "жду ответа — на холодной модели это до минуты";
 }
 
 /**
@@ -3115,6 +3152,7 @@ function startPage() {
   let promptFromFile = null;   // {name, text} — что было загружено из файла
   let estimateTimer = null;
   let chat = null;             // состояние открытой модалки диалога, или null
+  let lastFinishedHtml = null; // разметка «Готово», которая сейчас на странице (см. renderQueue)
   let runningLeft = 0;         // сколько осталось идущему прогону — им объясняется gpu_busy
   let llmStatus = "";          // последний известный `/api/llm`'s `status` — своя переменная,
                                 // отдельная от `chat.llmStatus` модалки, чтобы не путать их опрос
@@ -3510,9 +3548,16 @@ function startPage() {
     // очереди осталась) — не повод падать, `finishedRowHtml` сама откатывается на `jobTag`.
     const projectTitleById = {};
     for (const row of (state.projects || [])) projectTitleById[row.id] = row.title || row.id;
-    $("finished").innerHTML = finished
+    // Плитки перерисовываются, только если изменилась сама разметка (она целиком определяется
+    // id, путями, временем и множеством мёртвых медиа): присвоенный заново innerHTML создаёт
+    // свежие <video>, и браузер запрашивает каждый ролик заново на каждом опросе (приёмка D3).
+    const finishedHtml = finished
       .map((job) => finishedRowHtml(job, state.outdir, state.runs, deadMediaUrls,
         projectTitleById[assembleProjectId(job.note)])).join("");
+    if (finishedHtml !== lastFinishedHtml) {
+      $("finished").innerHTML = finishedHtml;
+      lastFinishedHtml = finishedHtml;
+    }
     $("finished-empty").hidden = finished.length > 0;
     // Пустой список после фильтрации кусков проекта — не то же самое, что пустой список
     // вообще: если что-то посчиталось, но всё оно оказалось сценами/треком проекта, честная
@@ -4381,8 +4426,11 @@ function startPage() {
         `<div class="run-num">`,
         cell("Идёт", escapeHtml(view.elapsed)),
         cell("Оценка", escapeHtml(view.total)),
-        view.waiting ? cell("Доля", "ждёт карту", " run-wait") : cell("Доля", `${view.share} %`),
-        cell("Кончится", formatClock(new Date(now.getTime() + view.leftSeconds * 1000))),
+        view.waiting ? cell("Доля", "ждёт карту", " run-wait")
+          : view.over ? cell("Доля", escapeHtml(view.over), " run-wait")
+          : view.share === null ? cell("Доля", "—") : cell("Доля", `${view.share} %`),
+        view.over || view.share === null ? cell("Кончится", "неизвестно")
+          : cell("Кончится", formatClock(new Date(now.getTime() + view.leftSeconds * 1000))),
         `</div>`,
         `<div class="run-foot">старт <span class="num">`
           + `${job.started_at ? formatClock(new Date(job.started_at)) : "—"}</span> · `,
@@ -4393,8 +4441,8 @@ function startPage() {
       ].join("");
       rail.className = "rail-run";
       rail.innerHTML = `<span class="run-tag">${escapeHtml(jobTag(job))}</span>`
-        + `<span class="run-share">${view.waiting ? "ждёт карту" : `${view.share} %`}</span>`
-        + `<span class="run-left">осталось <b>${formatDuration(view.leftSeconds)}</b></span>`;
+        + `<span class="run-share">${view.waiting ? "ждёт карту" : view.over ? escapeHtml(view.over) : view.share === null ? "идёт" : `${view.share} %`}</span>`
+        + (view.over || view.share === null ? "" : `<span class="run-left">осталось <b>${formatDuration(view.leftSeconds)}</b></span>`);
       steps.innerHTML = "";
       return { left: view.leftSeconds };
     }
@@ -4976,11 +5024,13 @@ function startPage() {
     const session = chat;
     session.sending = true;
     $("chat-send").disabled = true;
-    renderLlmPlate("жду ответа — на холодной модели это до минуты");
+    const remote = chatProviderIsRemote(
+      ((session.providers) || []).find((item) => item.name === $("chat-provider").value));
+    renderLlmPlate(chatWaitPlateText(remote));
     session.log.push({ role: "user", text: outgoingText,
                        attachment: attachment ? attachment.name : "" });
     // Плейсхолдер хода — точки, что ход идёт, пока сервер ничего не прислал (см. `pendingEntry`).
-    session.log.push(pendingEntry(session.llmStatus));
+    session.log.push(pendingEntry(session.llmStatus, { remote }));
     $("chat-input").value = "";
     clearChatAttachment();
     renderChatLog();

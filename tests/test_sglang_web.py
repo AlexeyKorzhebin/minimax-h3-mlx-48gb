@@ -111,3 +111,12 @@ def test_estimate_history_is_keyed_by_steps_and_old_rows_count_as_50(tmp_path):
 def test_estimate_table_fallback_scales_with_steps(tmp_path):
     assert est.estimate_seconds(tmp_path, width=896, height=512, frames=175, steps=25) == \
         {"seconds": 1405.0, "source": "table", "samples": 0}
+
+
+def test_estimate_table_has_the_measured_896x512_scene_of_the_acceptance_run(tmp_path):
+    """Acceptance 2026-10-08: a 3.75 s scene (90 frames) at 896x512, 50 steps took 1022 s on the
+    real server; the table said 345 s (the 124-frame row, nearest) and the bar sat at 99 %."""
+    assert est.estimate_seconds(tmp_path, width=896, height=512, frames=90) == \
+        {"seconds": 1022.0, "source": "table", "samples": 0}
+    assert est.estimate_seconds(tmp_path, width=896, height=512, frames=90, steps=25) == \
+        {"seconds": 511.0, "source": "table", "samples": 0}
