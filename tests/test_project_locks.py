@@ -86,3 +86,27 @@ def test_route_is_closed_while_the_upscale_or_the_assembly_runs(live, kind, args
         "code": "project_running", "message": ROUTE, "detail": {"id": other.id, "active": active}})
     assert [e for e in p.load_project(other.path).route if e["stage"] == "upscale"] == [
         {"stage": "upscale", "enabled": True}]
+
+
+def test_a_refusal_before_the_body_still_reads_the_body(live, monkeypatch):
+    """The 409 is decided before `_json_request`; the request body must still be consumed, or a
+    client that sent it can get a connection reset instead of the answer (Linux)."""
+    import io
+    from h3_48gb import web
+    fake = type("Fake", (), {})()
+    fake.headers = {"Content-Length": "5"}
+    fake.rfile = io.BytesIO(b"abcdefgh")
+    web._Handler._drain_body(fake)
+    assert fake.rfile.tell() == 5
+    fake.headers = {"Content-Length": "x"}
+    fake.rfile = io.BytesIO(b"abc")
+    web._Handler._drain_body(fake)
+    assert fake.rfile.tell() == 0                      # unparsable: nothing read, nothing raised
+    # and the refusal really goes through it
+    drained = []
+    monkeypatch.setattr(web._Handler, "_drain_body", lambda self: drained.append(1))
+    proj = _ready(live)
+    assert _call(live, "POST", f"/api/projects/{proj.id}/approve/script", {})[0] == 200
+    status, body = _call(live, "PUT", f"/api/projects/{proj.id}/settings", {"i2v_prefix": "x"})
+    assert (status, _error(body)[0]) == (409, "project_running")
+    assert drained == [1]

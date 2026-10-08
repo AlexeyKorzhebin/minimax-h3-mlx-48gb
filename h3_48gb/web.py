@@ -3640,8 +3640,7 @@ class _Handler(BaseHTTPRequestHandler):
         """Wave 1.5, spec §5.5: `project_running` (409) with `PROJECT_LOCK_TEXT[what]` while the
         project has work in the queue (`route`: only an upscale or an assembly). Called right after
         `_load_project`, before `_json_request`, so the refusal does not depend on the body; the
-        body is left unread on purpose -- the server is HTTP/1.0 (closes the connection) and the
-        bodies are small."""
+        body is drained (`_drain_body`) before the 409 so the client always gets the answer."""
         with queue_errors(self.server.queue_root):
             jobs, _broken = q.scan(self.server.queue_root)
         if what == "route":
@@ -3652,8 +3651,20 @@ class _Handler(BaseHTTPRequestHandler):
             busy = _project_active_job(proj, jobs)
             active = (busy or {}).get("kind")
         if busy:
+            self._drain_body()
             raise CliError("project_running", PROJECT_LOCK_TEXT[what],
                            {"id": proj.id, "active": active})
+
+    def _drain_body(self) -> None:
+        """Read (and drop) the request body before an early refusal: closing a socket that still
+        holds unread bytes can answer with a connection reset instead of the 409 on some stacks.
+        Bounded by `MAX_BODY_BYTES`; an unparsable `Content-Length` drains nothing."""
+        try:
+            length = int((self.headers.get("Content-Length") if self.headers else None) or 0)
+        except ValueError:
+            return
+        if 0 < length <= MAX_BODY_BYTES:
+            self.rfile.read(length)
 
     def _put_project_route(self, raw_id: str) -> tuple[int, str, bytes]:
         proj = self._load_project(raw_id)
