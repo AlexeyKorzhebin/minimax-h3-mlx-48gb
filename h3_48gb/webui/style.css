@@ -1717,3 +1717,7 @@ body:not([data-platform="darwin"]) [data-act="reveal"] { display: none; }
 .h3-pictures { display: flex; flex-wrap: wrap; gap: 8px; }
 .h3-pictures figure { margin: 0; font-size: 11px; color: var(--ink-3); }
 .h3-pictures img { display: block; height: 64px; width: auto; border-radius: 6px; border: 1px solid var(--hairline); }
+
+/* the chat opens from the project modal (and the form): it must sit above it, not behind
+   it -- both are `.modal-back` and the project modal comes later in the page */
+#chat-modal { z-index: 51; }

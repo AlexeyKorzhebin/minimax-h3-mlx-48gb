@@ -1218,3 +1218,28 @@ def test_h3_prompt_lists_its_audio():
         '<div class="h3-prompt" data-idx="0">'
         '<p class="hint">доставляется 8 с · сид 1 · 50 шагов · без первого кадра</p><pre>P</pre>'
         '<p class="hint">аудио: 01-v.mp3, t.wav</p></div>')
+
+
+def _z_index(css: str, selector: str):
+    """The `z-index` a rule whose selector list is exactly `selector` gives (last one wins)."""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    found = None
+    for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css):
+        if selector in [s.strip() for s in selectors.split(",")]:
+            m = re.search(r"z-index:\s*(\d+)", body)
+            if m:
+                found = int(m.group(1))
+    return found
+
+
+def test_the_chat_modal_stacks_above_the_project_modal():
+    """«Чат по сценарию» opens while the project modal is open. Both are `.modal-back` (fixed, same
+    z-index) and the project modal comes later in the page, so the chat used to open *behind* it --
+    drawn, but not clickable. The page has to say which one is on top."""
+    css = _page_text("style.css")
+    page = _page_text("index.html")
+    assert page.index('id="project-modal"') > page.index('id="chat-modal"')    # why equal z-index loses
+    base = _z_index(css, ".modal-back")
+    chat = _z_index(css, "#chat-modal")
+    assert base == 50
+    assert chat is not None and chat > base
