@@ -3118,6 +3118,7 @@ function startPage() {
   let promptFromFile = null;   // {name, text} — что было загружено из файла
   let estimateTimer = null;
   let chat = null;             // состояние открытой модалки диалога, или null
+  let lastFinishedHtml = null; // разметка «Готово», которая сейчас на странице (см. renderQueue)
   let runningLeft = 0;         // сколько осталось идущему прогону — им объясняется gpu_busy
   let llmStatus = "";          // последний известный `/api/llm`'s `status` — своя переменная,
                                 // отдельная от `chat.llmStatus` модалки, чтобы не путать их опрос
@@ -3513,9 +3514,16 @@ function startPage() {
     // очереди осталась) — не повод падать, `finishedRowHtml` сама откатывается на `jobTag`.
     const projectTitleById = {};
     for (const row of (state.projects || [])) projectTitleById[row.id] = row.title || row.id;
-    $("finished").innerHTML = finished
+    // Плитки перерисовываются, только если изменилась сама разметка (она целиком определяется
+    // id, путями, временем и множеством мёртвых медиа): присвоенный заново innerHTML создаёт
+    // свежие <video>, и браузер запрашивает каждый ролик заново на каждом опросе (приёмка D3).
+    const finishedHtml = finished
       .map((job) => finishedRowHtml(job, state.outdir, state.runs, deadMediaUrls,
         projectTitleById[assembleProjectId(job.note)])).join("");
+    if (finishedHtml !== lastFinishedHtml) {
+      $("finished").innerHTML = finishedHtml;
+      lastFinishedHtml = finishedHtml;
+    }
     $("finished-empty").hidden = finished.length > 0;
     // Пустой список после фильтрации кусков проекта — не то же самое, что пустой список
     // вообще: если что-то посчиталось, но всё оно оказалось сценами/треком проекта, честная

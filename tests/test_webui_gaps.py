@@ -1300,3 +1300,11 @@ def test_panel_head_wraps_so_the_new_project_button_stays_on_the_screen():
                     (d.split(":", 1) for d in rule.split(";") if ":" in d)}
     assert declarations["display"] == "flex"
     assert declarations["flex-wrap"] == "wrap"
+
+
+@_needs_node
+def test_finished_tiles_are_not_redrawn_while_nothing_changed():
+    """Acceptance D3: both final.mp4 were requested again on every ~40 s poll (6 range requests per
+    poll, BrokenPipe in the container log) because `#finished` was rebuilt from scratch."""
+    assert _gaps("finished_tiles_stable") == {
+        "afterFirst": 1, "writesAfterTwoMorePolls": 1, "writesAfterNewJob": 2, "tiles": 2}

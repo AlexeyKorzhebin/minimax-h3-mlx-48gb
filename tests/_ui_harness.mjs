@@ -3,6 +3,9 @@ export const SGLANG = { ok: true, engine: "sglang", platform: "linux", worker: {
                  paused: true, outdir: "/o", queue: { pending: [], running: [], done: [], failed: [],
                  broken: [] }, runs: [], projects: [] };
 
+// every innerHTML assignment per element label, so a scenario can tell a redraw from a skipped one
+export const htmlWrites = {};
+
 function makeEl(label) {
   const store = { value: "", textContent: "", innerHTML: "", checked: false, hidden: false, title: "" };
   const own = {};
@@ -22,7 +25,10 @@ function makeEl(label) {
       if (prop === "children" || prop === "childNodes") return [];
       return () => makeEl(`${label}.${String(prop)}`);
     },
-    set(_t, prop, value) { store[prop] = value; return true; },
+    set(_t, prop, value) {
+      if (prop === "innerHTML") (htmlWrites[label] ||= []).push(value);
+      store[prop] = value; return true;
+    },
   });
 }
 const els = new Map();

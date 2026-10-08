@@ -1,5 +1,5 @@
 // Wave 1.5 DOM wiring scenarios; usage: node _ui_gaps_check.mjs <appUrl> <scenario>
-import { SGLANG, routes, calls, alerts, prompts, answers, getElementById, start, ok, err, PROJECT, sleep, queryAll, queryOne,
+import { htmlWrites, intervals, SGLANG, routes, calls, alerts, prompts, answers, getElementById, start, ok, err, PROJECT, sleep, queryAll, queryOne,
   fire, clickable, confirms } from "./_ui_harness.mjs";
 
 const [, , appUrl, scenario] = process.argv;
@@ -834,6 +834,27 @@ const SCENARIOS = {
     return { removed: gone.removed,
              shownAfterRedraw: /<div class="h3-prompt"/.test(getElementById("project-body").innerHTML) };
   },
+};
+
+SCENARIOS.finished_tiles_stable = async function finished_tiles_stable() {
+  // Acceptance D3: every poll rebuilt the "Готово" tiles, so each <video> was requested again
+  // ("?×? / ? с" and a black frame in between). Same data twice -> the tiles are not reassigned.
+  const done = { id: "j1", exit_code: 0, kind: "generate", output_stem: "/o/clip", note: "",
+    args: [], started_at: "2026-10-08T01:00:00Z", finished_at: "2026-10-08T01:05:00Z",
+    estimate: { width: 896, height: 512, duration_seconds: 4 } };
+  const state = { ...SGLANG, queue: { ...SGLANG.queue, done: [done] } };
+  await start(appUrl, { "GET /api/state": ok(state) });
+  const afterFirst = (htmlWrites.finished || []).length;
+  await intervals[0]();
+  await intervals[0]();
+  const same = (htmlWrites.finished || []).length;
+  // a new finished job is news: the list is drawn again
+  const second = { ...done, id: "j2", output_stem: "/o/clip2" };
+  routes["GET /api/state"] = ok({ ...state, queue: { ...state.queue, done: [second, done] } });
+  await intervals[0]();
+  const html = getElementById("finished").innerHTML;
+  return { afterFirst, writesAfterTwoMorePolls: same,
+           writesAfterNewJob: (htmlWrites.finished || []).length, tiles: (html.match(/<article /g) || []).length };
 };
 
 const run = SCENARIOS[scenario];
