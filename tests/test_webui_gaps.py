@@ -1261,3 +1261,27 @@ def test_a_remembered_version_is_drawn_selected_on_an_unticked_card():
     # a pinned card shows its pinned version whatever was remembered; a stale number is ignored
     assert 'value="2" selected' in _js(f"app.projectReferencesHtml({{id: 'p1'}}, {cards}, [{{tag: '@a', version: 2}}], null, {{'@a': 1}})")
     assert 'value="2" selected' in _js(f"app.projectReferencesHtml({{id: 'p1'}}, {cards}, [], null, {{'@a': 7}})")
+
+
+@_needs_node
+def test_upscale_line_without_a_strength_has_no_null():
+    no_strength = UPSCALED.replace("strength: 0.6", "strength: null")
+    assert _js(f"app.projectUpscaleHtml({no_strength}, 'sglang')") == (
+        '<div class="upscale-status" data-id="p1">Апскейл LTX: готов · 2 из 3 частей</div>')
+    missing = UPSCALED.replace("strength: 0.6, ", "")
+    assert _js(f"app.projectUpscaleHtml({missing}, 'sglang')") == (
+        '<div class="upscale-status" data-id="p1">Апскейл LTX: готов · 2 из 3 частей</div>')
+
+
+@_needs_node
+def test_error_text_names_the_wave_refusals_in_russian():
+    codes = ["project_running", "library_card_in_use", "unknown_tag", "ref2va_needs_reference",
+             "project_stage_not_ready", "start_image_invalid"]
+    got = _js("%s.map((code) => app.errorText({error: {code, message: 'm ' + code}}))" % json.dumps(codes))
+    assert got == [
+        {"title": "Проект считается — правка закрыта", "pre": "m project_running"},
+        {"title": "Карточка подключена к проектам", "pre": "m library_card_in_use"},
+        {"title": "Тег не подключён к проекту", "pre": "m unknown_tag"},
+        {"title": "Сцене нужен референс", "pre": "m ref2va_needs_reference"},
+        {"title": "Этап ещё не готов", "pre": "m project_stage_not_ready"},
+        {"title": "Стартовый кадр не подходит", "pre": "m start_image_invalid"}]

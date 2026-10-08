@@ -819,7 +819,9 @@ export function projectUpscaleHtml(proj, engine) {
   if (status === "done" && report.status === "done") {
     const scenes = proj.scenes || [];
     const parts = scenes.filter((scene) => scene.ltx_path).length;
-    detail = ` · сила ${escapeHtml(String(report.strength).replace(".", ","))} · ${parts} из ${scenes.length} частей`;
+    const strength = report.strength === null || report.strength === undefined || Number.isNaN(Number(report.strength))
+      ? "" : ` · сила ${escapeHtml(String(report.strength).replace(".", ","))}`;
+    detail = `${strength} · ${parts} из ${scenes.length} частей`;
   }
   const error = status === "failed" && report.error
     ? `<p class="why upscale-error">${escapeHtml(report.error)}</p>` : "";
@@ -2211,6 +2213,19 @@ export function errorText(payload) {
       // единственная причина: неизвестное имя параметра лимита вывода).
       return { title: "У провайдера в настройках неизвестный параметр лимита вывода",
                pre: error.message };
+    // refusals of the project wave: the server's text is Russian, the heading says what happened
+    case "project_running":
+      return { title: "Проект считается — правка закрыта", pre: error.message };
+    case "library_card_in_use":
+      return { title: "Карточка подключена к проектам", pre: error.message };
+    case "unknown_tag":
+      return { title: "Тег не подключён к проекту", pre: error.message };
+    case "ref2va_needs_reference":
+      return { title: "Сцене нужен референс", pre: error.message };
+    case "project_stage_not_ready":
+      return { title: "Этап ещё не готов", pre: error.message };
+    case "start_image_invalid":
+      return { title: "Стартовый кадр не подходит", pre: error.message };
     // `GET .../h3-prompt`: the server's own words are English (an `AssembleError` text) or terse
     case "duration_off_grid":
       return { title: "Длительность сцены не на сетке H3",
