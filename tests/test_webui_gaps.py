@@ -945,6 +945,9 @@ RUN_EXPECTED = {
                             "mark": True},
     "seed_saved": {"puts": [["/api/projects/p1/settings", {"seed": 305}]], "mark": True},
     "seed_cleared": {"puts": [["/api/projects/p1/settings", {"seed": None}]]},
+    # a version picked on an unticked card is remembered (no PUT, no reset), and rides with the tick
+    "version_chosen_before_the_tick": {"putsAfterPick": [], "selectedAfterRedraw": True,
+        "putsAfterTick": [["/api/projects/p1/references", {"references": [{"tag": "@a", "version": 1}]}]]},
     "retry_panel_keeps_typing": {"prompt": "@a walks far", "seed": "9"},
     # a refusal keeps the panel open with what was typed, and says why next to it
     "retry_refused_keeps_panel": {"open": True, "prompt": "@a walks far", "seed": "9",
@@ -1243,3 +1246,18 @@ def test_the_chat_modal_stacks_above_the_project_modal():
     chat = _z_index(css, "#chat-modal")
     assert base == 50
     assert chat is not None and chat > base
+
+
+@_needs_node
+def test_a_remembered_version_is_drawn_selected_on_an_unticked_card():
+    cards = ("[{tag: '@a', kind: 'person', version: 2, latest_version: 2, "
+             "versions: [{version: 1}, {version: 2}]}]")
+    assert _js(f"app.projectReferencesHtml({{id: 'p1'}}, {cards}, [], null, {{'@a': 1}})") == (
+        '<div class="project-refs" data-id="p1"><h4>Референсы проекта</h4>'
+        '<label><input type="checkbox" class="ref-pin" data-tag="@a"> @a '
+        '<span class="muted">person</span></label> '
+        '<select class="inp ref-version" data-tag="@a"><option value="1" selected>v1</option>'
+        '<option value="2">v2</option></select></div>')
+    # a pinned card shows its pinned version whatever was remembered; a stale number is ignored
+    assert 'value="2" selected' in _js(f"app.projectReferencesHtml({{id: 'p1'}}, {cards}, [{{tag: '@a', version: 2}}], null, {{'@a': 1}})")
+    assert 'value="2" selected' in _js(f"app.projectReferencesHtml({{id: 'p1'}}, {cards}, [], null, {{'@a': 7}})")

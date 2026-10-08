@@ -774,7 +774,7 @@ export function projectRouteHtml(proj, engine, lock = null) {
     + (lock ? `<p class="why lock-note">${escapeHtml(lock)}</p>` : "");
 }
 
-export function projectReferencesHtml(proj, cards, pinned, lock = null) {
+export function projectReferencesHtml(proj, cards, pinned, lock = null, remembered = {}) {
   const byTag = new Map(pinned.map((ref) => [ref.tag, ref.version]));
   const off = lock ? " disabled" : "";
   const rows = cards.map((card) => {
@@ -784,7 +784,11 @@ export function projectReferencesHtml(proj, cards, pinned, lock = null) {
         + (version < card.latest_version ? ` (есть v${card.latest_version})` : "");
     const numbers = (card.versions || []).map((v) => v.version);
     if (!numbers.length) numbers.push(card.latest_version ?? card.version);
-    const chosen = version === undefined ? (card.latest_version ?? numbers[numbers.length - 1]) : version;
+    // a pinned card shows its pinned version; an unticked one the version picked before the tick
+    // (if it still exists), else the latest
+    const picked = remembered[card.tag];
+    const chosen = version !== undefined ? version
+      : (numbers.includes(picked) ? picked : (card.latest_version ?? numbers[numbers.length - 1]));
     const options = numbers.map((n) => `<option value="${n}"${n === chosen ? " selected" : ""}>v${n}</option>`)
       .join("");
     return `<label><input type="checkbox" class="ref-pin" data-tag="${escapeHtml(card.tag)}"`
@@ -3154,6 +3158,7 @@ function startPage() {
   let draftEpoch = 0;           // version of the draft the editor DOM was drawn from
   let scenarioJsonText = "";     // what is typed in «Вставить сценарий JSON»: survives redraws
   let draftVersion = 0;        // bumped by anything that makes a «Промпт для H3» answer stale
+  let chosenVersions = {};     // tag -> version picked on a card that is not ticked yet
   let h3Prompts = {};          // idx -> answer of GET .../h3-prompt; any edit of the draft drops them
   let retryOpen = null;        // idx of the scene whose retry panel is open
   let retryEdits = null;       // what is typed in it, kept across redraws
@@ -3578,6 +3583,7 @@ function startPage() {
     project = { id, project: null, active_job: null };
     draftResetPending = true;
     scenarioJsonText = "";
+    chosenVersions = {};
     retryOpen = null;
     retryEdits = null;
     retryError = null;
@@ -3680,7 +3686,8 @@ function startPage() {
       + projectSettingsHtml(proj, state && state.engine, locks.settings, settingsSaved)
       + projectRouteHtml(proj, state && state.engine, locks.route)
       + projectUpscaleHtml(proj, state && state.engine)
-      + projectReferencesHtml(proj, libraryCards, proj.references || [], locks.references)
+      + projectReferencesHtml(proj, libraryCards, proj.references || [], locks.references,
+          chosenVersions)
       + projectScenesStageHtml(proj, outdir)
       + projectAssemblyHtml(proj, outdir);
   }
@@ -5955,6 +5962,15 @@ function startPage() {
     }
     if (target.classList.contains("ref-pin") || target.classList.contains("ref-version")) {
       const box = target.closest(".project-refs");
+      if (target.classList.contains("ref-version")) {
+        // a version picked on a card that is not ticked: nothing to send yet (the server pins only
+        // ticked cards) -- remember it, so a redraw does not reset it and the tick carries it
+        const pin = [...box.querySelectorAll(".ref-pin")].find((el) => el.dataset.tag === target.dataset.tag);
+        if (pin && !pin.checked) {
+          chosenVersions[target.dataset.tag] = Number(target.value);
+          return;
+        }
+      }
       const refs = [...box.querySelectorAll(".ref-pin")].filter((el) => el.checked)
         .map((el) => el.dataset.tag);
       const chosen = {};

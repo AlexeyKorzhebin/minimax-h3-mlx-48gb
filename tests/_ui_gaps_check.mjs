@@ -646,6 +646,30 @@ const SCENARIOS = {
     return { puts: puts(),
              mark: block("project-settings") === app.projectSettingsHtml(DONE_PROJECT.project, "sglang", null, "i2v_prefix") };
   },
+  async version_chosen_before_the_tick() {
+    const card = { tag: "@a", kind: "person", version: 2, latest_version: 2, description: "d",
+      assets: ["/o/library/a/v2/01-a.png"], versions: [{ version: 1, assets: ["/o/library/a/v1/01-a.png"] },
+                                                       { version: 2 }] };
+    const proj = PROJECT({ ...DONE_PROJECT.project, references: [] });
+    await start(appUrl, { "GET /api/projects/p1": ok(proj), "GET /api/library": ok({ ok: true, cards: [card] }),
+      "PUT /api/projects/p1/references": ok({ ok: true, references: [] }) });
+    await open();
+    const pin = { checked: false, dataset: { tag: "@a" }, classList: { contains: (c) => c === "ref-pin" } };
+    const select = { value: "1", dataset: { tag: "@a" }, classList: { contains: (c) => c === "ref-version" } };
+    const box = { dataset: { id: "p1" },
+      querySelectorAll: (sel) => (sel === ".ref-pin" ? [pin] : sel === ".ref-version" ? [select] : []) };
+    select.closest = (sel) => (sel === ".project-refs" ? box : null);
+    pin.closest = (sel) => (sel === ".project-refs" ? box : null);
+    fire("change", select);                      // the version is picked first ...
+    await sleep(120);
+    const putsAfterPick = puts();
+    await act("retry-scene", { idx: "0" });      // ... an unrelated redraw does not reset it ...
+    const selectedAfterRedraw = /<option value="1" selected>v1<\/option>/.test(getElementById("project-body").innerHTML);
+    pin.checked = true;                          // ... and the tick sends it
+    fire("change", pin);
+    await sleep(120);
+    return { putsAfterPick, selectedAfterRedraw, putsAfterTick: puts() };
+  },
   async seed_saved() {
     const app = await start(appUrl, { "GET /api/projects/p1": ok(DONE_PROJECT),
       "PUT /api/projects/p1/settings": ok({ ok: true, project: DONE_PROJECT.project }) });
