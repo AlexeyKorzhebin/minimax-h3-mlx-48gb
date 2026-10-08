@@ -3507,6 +3507,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/":
             return _serve_file(self.server.webui, "index.html", suffixes=ANY_SUFFIX)
+        if path == "/favicon.ico":
+            # browsers ask for it on every page load; an empty 204 keeps the console clean
+            return 204, "image/x-icon", b""
         if path.startswith("/static/"):
             return _serve_file(self.server.webui, path[len("/static/"):],
                                suffixes=ANY_SUFFIX)

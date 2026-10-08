@@ -6508,3 +6508,16 @@ def test_pending_entry_for_a_remote_provider_does_not_talk_about_a_cold_model():
     body = _js_function(_page_text("app.js"), "async function sendChatMessage()")
     assert "chatProviderIsRemote(" in body and "chatWaitPlateText(remote)" in body
     assert "pendingEntry(session.llmStatus, { remote })" in body
+
+
+def test_favicon_is_an_empty_204_not_a_404(tmp_path):
+    """Acceptance D10: every page load logged a 404 for /favicon.ico in the browser console."""
+    outdir = tmp_path / "outdir"
+    outdir.mkdir()
+    live = _serve(outdir / "queue", outdir, webui=tmp_path)
+    try:
+        status, headers, body = _request(live, "/favicon.ico")
+        assert (status, body, headers["Content-Length"]) == (204, b"", "0")
+    finally:
+        live.httpd.shutdown()
+        live.httpd.server_close()
