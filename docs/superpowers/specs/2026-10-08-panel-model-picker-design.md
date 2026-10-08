@@ -1,7 +1,7 @@
 # Панель h3, волна 1.6: выбор модели LLM (CAILA и другие OpenAI-совместимые провайдеры)
 
 Дата: 2026-10-08. Статус: мини-спека, утверждена координатором по решениям ниже.
-Источник: `~/worktrees/battle/llm-providers/REPORT.md` (§4 «Предложение»), живые замеры CAILA —
+Источник: `docs/panel/2026-10-08-llm-providers.md` (§4 «Предложение»), живые замеры CAILA —
 `docs/LLM-PROVIDERS.md`. Образец — ai-writer 2.0 (`backend/app/services/provider_service.py`,
 `integrations/llm/openai_compatible_client.py`, `frontend/src/pages/ModelsPage/AddModelDialog.jsx`):
 переносятся идеи и две чистые функции, не код.

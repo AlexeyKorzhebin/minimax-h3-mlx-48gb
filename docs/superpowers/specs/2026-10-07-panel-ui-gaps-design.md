@@ -1,7 +1,7 @@
 # Монтажная панель, волна 1.5: владелец проходит конвейер сам — дизайн
 
 Дата: 2026-10-07. Ветка: `feat/panel-ui-gaps`. Основа: аудит
-`~/worktrees/battle/ui-audit/REPORT.md` (07.10), обходы боя `~/worktrees/battle/run_battle.sh` и
+`docs/panel/2026-10-07-ui-audit/REPORT.md` (07.10), обходы боя `~/worktrees/battle/run_battle.sh` и
 `~/worktrees/battle/fixed/run_fixed.sh`, спека волны 1
 `docs/superpowers/specs/2026-10-06-panel-on-alex-neuro-design.md` (дальше «спека W1»), IA волны 2
 `docs/design/2026-10-panel-audit/IA.md` и макет `mockups/variant-a`.

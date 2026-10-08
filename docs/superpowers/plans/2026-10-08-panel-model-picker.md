@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12 stdlib, node (через pytest), фейковый HTTP-сервер `tests/_fake_llama.py`.
 
-**Spec:** `docs/superpowers/specs/2026-10-08-panel-model-picker-design.md` (читать целиком до любой задачи). Источник: `~/worktrees/battle/llm-providers/REPORT.md` §4.
+**Spec:** `docs/superpowers/specs/2026-10-08-panel-model-picker-design.md` (читать целиком до любой задачи). Источник: `docs/panel/2026-10-08-llm-providers.md` §4.
 
 **Две полосы:**
 - **СЕРВЕР** — задачи 1–6, worktree `~/worktrees/panel-ui-gaps`, идут **сейчас**, параллельно UI-полосе волны 1.5. Строго последовательно (все правят `provider.py`/`web.py`).

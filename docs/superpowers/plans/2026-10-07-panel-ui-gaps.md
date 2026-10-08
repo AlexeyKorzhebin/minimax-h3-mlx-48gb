@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12 stdlib, node (проверки фронта через pytest), playwright MCP (только приёмка).
 
-**Spec:** `docs/superpowers/specs/2026-10-07-panel-ui-gaps-design.md` (читать целиком перед любой задачей). Спека W1: `docs/superpowers/specs/2026-10-06-panel-on-alex-neuro-design.md`. Аудит: `~/worktrees/battle/ui-audit/REPORT.md`.
+**Spec:** `docs/superpowers/specs/2026-10-07-panel-ui-gaps-design.md` (читать целиком перед любой задачей). Спека W1: `docs/superpowers/specs/2026-10-06-panel-on-alex-neuro-design.md`. Аудит: `docs/panel/2026-10-07-ui-audit/REPORT.md`.
 
 **Ветка:** `feat/panel-ui-gaps`, worktree `~/worktrees/panel-ui-gaps`. В том же worktree параллельно работает агент Task 0.
 

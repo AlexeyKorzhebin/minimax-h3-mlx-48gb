@@ -7,8 +7,8 @@
 Основа: решения по стеку `docs/design/2026-10-panel-audit/WAVE2-STACK.md` (дальше «STACK»), аудит
 и IA там же (`AUDIT.md`, `IA.md`, макет `mockups/variant-a`), спеки волн 1 / 1.5 / 1.6 в
 `docs/superpowers/specs/2026-10-0{6,7,8}-*.md`, бой `docs/battle/2026-10-07-fight-armored-40-panel.md`,
-аудит UI `~/worktrees/battle/ui-audit/REPORT.md`, сравнение LLM-слоя
-`~/worktrees/battle/llm-providers/REPORT.md`, бэклог `h3-bench/docs/TODO.md` §3.3, §5.
+аудит UI `docs/panel/2026-10-07-ui-audit/REPORT.md`, сравнение LLM-слоя
+`docs/panel/2026-10-08-llm-providers.md`, бэклог `h3-bench/docs/TODO.md` §3.3, §5.
 
 ## 1. Цель и критерий готовности
 

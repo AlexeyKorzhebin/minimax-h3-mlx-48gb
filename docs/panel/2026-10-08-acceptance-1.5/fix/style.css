@@ -1,0 +1,1723 @@
+/* ===========================================================================
+   h3 — панель прогонов. Оформление: тёмная тема по умолчанию, светлая —
+   по системному предпочтению или ручному выбору в шапке (task C1).
+
+   Правила, из которых выведено всё остальное:
+
+   1. Инструмент, а не витрина, но инструмент современный: содержимое лежит
+      карточками на подложке чуть темнее их самих, группы разделяются
+      воздухом, линия остаётся только там, где воздух не справляется —
+      между однотипными строками списка.
+   2. Числа времени и памяти сравниваются глазами между строками — значит
+      табличные цифры, выравнивание по правому краю и одна колоночная сетка,
+      общая для всех трёх списков. Моноширинный шрифт оставлен там, где он
+      действительно нужен: пути, идентификаторы, имена файлов, текст промпта.
+      Числа набраны системным шрифтом с табличными цифрами — они и ровнее,
+      и легче на вид.
+   3. Четыре состояния (ждёт, идёт, сделано, упало) различаются формой знака:
+      полое кольцо, залитая точка с пульсом, галочка, крестик. Цвет — только
+      подтверждение, чтобы читалось и на чёрно-белой печати, и при дальтонизме.
+   4. Шрифты только системные: страница должна открыться через пять лет
+      без сети и без тулчейна. Ни одного внешнего файла, ни одной картинки
+      извне — стрелки у списков нарисованы data-URI прямо здесь.
+   5. Движение только служебное и короткое: пульс текущего шага, пульс
+      идущей задачи, 120 мс на смену состояния наведения. Всё остальное
+      статично — на эту страницу смотрят по десять раз за день.
+   6. Палитра — не своя: обе темы скопированы (значениями, не структурой) из
+      двух канонических макетов, `docs/superpowers/design-demos/
+      variant-reference.html` (тёмная, эталон Linear) и `variant-reference-
+      light.html` (светлая бумажная достройка той же школы). Токены этой
+      страницы называются иначе (у неё свой набор компонентов — форма,
+      очередь, диалог, а не панель/редактор канона), но их ЗНАЧЕНИЯ взяты
+      оттуда 1:1 там, где роль совпадает, и выведены по тому же правилу
+      (тот же вид, что у --warn/--warn-weak) там, где канон этой роли не
+      знает вовсе — у макета нет состояния «отказ». Единственный самосто-
+      ятельный кусок палитры — --fill/-2/-3: у канона поля стоят на своей
+      панели и заливаются соседним сплошным шагом лестницы (s2/s3/s4), а
+      здесь поля стоят прямо на --card, и в светлой теме s1 и s3 совпадают
+      (у обоих одно значение, белая бумага) — сплошной заливкой поле слилось
+      бы с карточкой. Взят
+      технический приём канона (--hatch/--hl-bg: полупрозрачный ink поверх
+      чего угодно), но громче — там текстура и подсветка (.02–.06), тут
+      читаемое поле (.05–.16).
+   =========================================================================== */
+
+/* tokens */
+/* ---------- токены: тёмная тема, дефолт ---------------------------------
+   Лестница поверхностей Linear-школы: canvas темнее панелей, панели
+   темнее вложенных полей, иерархия — светимостью и линией, не тенью.
+   Единственный акцент — янтарный сигнал вычисления, а не системный синий.
+   ----------------------------------------------------------------------- */
+:root {
+  --bg:            #08090a;   /* canvas */
+  --card:          #0f1011;   /* s1 */
+  --card-2:        #141516;   /* s2 — вложенная плоскость внутри карточки */
+
+  --fill:          rgba(255,255,255,.06);   /* заливка полей и кнопок, см. правило 6 выше */
+  --fill-2:        rgba(255,255,255,.10);
+  --fill-3:        rgba(255,255,255,.16);
+  --hairline:      #23252a;   /* line */
+  --hairline-2:    #34343a;   /* line-2 */
+
+  --ink:           #f7f8f8;
+  --ink-2:         #d0d6e0;
+  --ink-3:         #8a8f98;
+
+  --accent:        #e0a33e;                 /* signal — «GPU считает», см. канон */
+  --accent-ink:    #e0a33e;                 /* тот же тон уже достаточно контрастен как текст */
+  --accent-soft:   rgba(224,163,62,.14);    /* signal-weak */
+  --accent-ring:   rgba(224,163,62,.35);    /* focus-ring */
+
+  --wait:          #62666d;                 /* ink-4 канона — та же роль, что у .dot.idle */
+  --done:          #4f9b6a;                 /* ok */
+  --done-ink:      var(--done);
+  --done-soft:     rgba(79,155,106,.14);    /* канон не даёт soft-варианта --ok; по правилу --warn-weak */
+  --fail:          #d9635a;                 /* у канона нет состояния «отказ» вовсе (см. правило 6);
+                                                тон подобран в той же приглушённой семье, что --warn/--ok */
+  --fail-ink:      var(--fail);
+  --fail-soft:     rgba(217,99,90,.12);
+  --warn:          #c9784a;
+  --warn-ink:      var(--warn);
+  --warn-soft:     rgba(201,120,74,.10);    /* warn-weak */
+
+  --sel:           rgba(224,163,62,.24);    /* sel-bg */
+
+  /* Инверсная главная кнопка канона (`.btn.inverse`): светлая плашка на тёмной странице и
+     тёмная на светлой. Акцент на неё не тратится — янтарь на этой странице значит «GPU
+     считает», и кнопка, которая всего лишь ставит задачу в очередь, не имеет права его
+     занимать. Значения — те же, что у --btn-inv-* обоих канонов. */
+  --inverse:       #f7f8f8;
+  --inverse-hover: #ffffff;
+  --inverse-ink:   #0a0b0c;
+
+  /* Канон не рисует размытую тень вовсе — глубина только линией и светимостью
+     (см. заголовок variant-reference.html). Волосяная обводка — тот же
+     приём, что у канона `.panel{border:1px solid var(--line)}`. */
+  --shadow:        0 0 0 1px var(--hairline);
+  --shadow-pop:    0 32px 72px -20px rgba(0,0,0,.85), 0 0 0 1px rgba(0,0,0,.4);   /* modal-shadow */
+
+  /* Кадр превью — медиа-окно, а не поверхность интерфейса: не участвует в
+     инверсии темы (variant-reference-light.html, комментарий у --frame-*). */
+  --frame-1:         #1c1d20;
+  --frame-2:         #141517;
+  --frame-3:         #0b0c0d;
+  --frame-warm:      rgba(224,163,62,.085);
+  --frame-cool:      rgba(127,168,189,.06);
+  --frame-ink:       #8a8f98;
+  --frame-chip-bg:   rgba(8,9,10,.62);
+  --frame-chip-line: rgba(255,255,255,.07);
+  --frame-edge:      transparent;
+
+  --stage-1:       rgba(0,0,0,.55);         /* вуаль под модалкой */
+
+  --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1.5L5 5.5L9 1.5' stroke='%23d0d6e0' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E");
+
+  color-scheme: dark;
+}
+
+/* ---------- токены: светлая тема ----------------------------------------
+   По системному предпочтению, если человек не выбрал тёмную явно — guard
+   `:not([data-theme="dark"])` не даёт смене системной темы перекрасить
+   страницу поверх ручного выбора. Не инверсия тёмной: тёплая бумажная
+   лестница, а не чёрно-белый негатив — та же логика, что у
+   variant-reference-light.html. --frame-* здесь НЕ светлеют до бумаги —
+   у медиа-окна собственная, более тёмная графитовая пара значений.
+   ----------------------------------------------------------------------- */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg:            #f1efec;
+    --card:          #ffffff;
+    --card-2:        #f7f5f2;
+
+    --fill:          rgba(20,22,26,.05);
+    --fill-2:        rgba(20,22,26,.08);
+    --fill-3:        rgba(20,22,26,.13);
+    --hairline:      #e6e3de;
+    --hairline-2:    #d6d2cc;
+
+    --ink:           #14161a;
+    --ink-2:         #33383f;
+    --ink-3:         #4e545e;
+
+    --accent:        #d18a12;
+    --accent-ink:    #8a5a07;
+    --accent-soft:   rgba(209,138,18,.13);
+    --accent-ring:   rgba(209,138,18,.45);
+
+    --wait:          #676c75;
+    --done:          #2f7d4f;
+    --done-ink:      var(--done);
+    --done-soft:     rgba(47,125,79,.10);
+    --fail:          #a82d21;
+    --fail-ink:      var(--fail);
+    --fail-soft:     rgba(168,45,33,.09);
+    --warn:          #a24a1c;
+    --warn-ink:      var(--warn);
+    --warn-soft:     rgba(162,74,28,.08);
+
+    --sel:           rgba(209,138,18,.22);
+
+    --inverse:       #16181d;
+    --inverse-hover: #000000;
+    --inverse-ink:   #faf9f8;
+
+    --shadow:        0 0 0 1px var(--hairline);
+    --shadow-pop:    0 28px 64px -20px rgba(20,22,26,.20), 0 2px 8px rgba(20,22,26,.06);
+
+    --frame-1:         #3c3f45;
+    --frame-2:         #2d3036;
+    --frame-3:         #212328;
+    --frame-warm:      rgba(224,163,62,.10);
+    --frame-cool:      rgba(127,168,189,.07);
+    --frame-ink:       #b9bcc2;
+    --frame-chip-bg:   rgba(10,11,12,.55);
+    --frame-chip-line: rgba(255,255,255,.13);
+    --frame-edge:      rgba(20,22,26,.10);
+
+    --stage-1:       rgba(20,22,26,.10);
+
+    --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1.5L5 5.5L9 1.5' stroke='%2333383f' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E");
+
+    color-scheme: light;
+  }
+}
+
+/* ---------- ручной выбор побеждает системный, в обе стороны ------------- */
+:root[data-theme="light"] {
+  --bg:            #f1efec;
+  --card:          #ffffff;
+  --card-2:        #f7f5f2;
+  --fill:          rgba(20,22,26,.05);
+  --fill-2:        rgba(20,22,26,.08);
+  --fill-3:        rgba(20,22,26,.13);
+  --hairline:      #e6e3de;
+  --hairline-2:    #d6d2cc;
+  --ink:           #14161a;
+  --ink-2:         #33383f;
+  --ink-3:         #4e545e;
+  --accent:        #d18a12;
+  --accent-ink:    #8a5a07;
+  --accent-soft:   rgba(209,138,18,.13);
+  --accent-ring:   rgba(209,138,18,.45);
+  --wait:          #676c75;
+  --done:          #2f7d4f;
+  --done-ink:      var(--done);
+  --done-soft:     rgba(47,125,79,.10);
+  --fail:          #a82d21;
+  --fail-ink:      var(--fail);
+  --fail-soft:     rgba(168,45,33,.09);
+  --warn:          #a24a1c;
+  --warn-ink:      var(--warn);
+  --warn-soft:     rgba(162,74,28,.08);
+  --sel:           rgba(209,138,18,.22);
+  --inverse:       #16181d;
+  --inverse-hover: #000000;
+  --inverse-ink:   #faf9f8;
+  --shadow:        0 0 0 1px var(--hairline);
+  --shadow-pop:    0 28px 64px -20px rgba(20,22,26,.20), 0 2px 8px rgba(20,22,26,.06);
+  --frame-1:         #3c3f45;
+  --frame-2:         #2d3036;
+  --frame-3:         #212328;
+  --frame-warm:      rgba(224,163,62,.10);
+  --frame-cool:      rgba(127,168,189,.07);
+  --frame-ink:       #b9bcc2;
+  --frame-chip-bg:   rgba(10,11,12,.55);
+  --frame-chip-line: rgba(255,255,255,.13);
+  --frame-edge:      rgba(20,22,26,.10);
+  --stage-1:       rgba(20,22,26,.10);
+  --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1.5L5 5.5L9 1.5' stroke='%2333383f' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E");
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --bg:            #08090a;
+  --card:          #0f1011;
+  --card-2:        #141516;
+  --fill:          rgba(255,255,255,.06);
+  --fill-2:        rgba(255,255,255,.10);
+  --fill-3:        rgba(255,255,255,.16);
+  --hairline:      #23252a;
+  --hairline-2:    #34343a;
+  --ink:           #f7f8f8;
+  --ink-2:         #d0d6e0;
+  --ink-3:         #8a8f98;
+  --accent:        #e0a33e;
+  --accent-ink:    #e0a33e;
+  --accent-soft:   rgba(224,163,62,.14);
+  --accent-ring:   rgba(224,163,62,.35);
+  --wait:          #62666d;
+  --done:          #4f9b6a;
+  --done-ink:      var(--done);
+  --done-soft:     rgba(79,155,106,.14);
+  --fail:          #d9635a;
+  --fail-ink:      var(--fail);
+  --fail-soft:     rgba(217,99,90,.12);
+  --warn:          #c9784a;
+  --warn-ink:      var(--warn);
+  --warn-soft:     rgba(201,120,74,.10);
+  --sel:           rgba(224,163,62,.24);
+  --inverse:       #f7f8f8;
+  --inverse-hover: #ffffff;
+  --inverse-ink:   #0a0b0c;
+  --shadow:        0 0 0 1px var(--hairline);
+  --shadow-pop:    0 32px 72px -20px rgba(0,0,0,.85), 0 0 0 1px rgba(0,0,0,.4);
+  --frame-1:         #1c1d20;
+  --frame-2:         #141517;
+  --frame-3:         #0b0c0d;
+  --frame-warm:      rgba(224,163,62,.085);
+  --frame-cool:      rgba(127,168,189,.06);
+  --frame-ink:       #8a8f98;
+  --frame-chip-bg:   rgba(8,9,10,.62);
+  --frame-chip-line: rgba(255,255,255,.07);
+  --frame-edge:      transparent;
+  --stage-1:       rgba(0,0,0,.55);
+  --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1.5L5 5.5L9 1.5' stroke='%23d0d6e0' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E");
+  color-scheme: dark;
+}
+
+/* ---------- основа ---------- */
+:root {
+  --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, "DejaVu Sans Mono", monospace;
+
+  /* Полоса макета и его 4px-сетка: одна ширина у чромы, зон и модалки,
+     радиусы 4/8/10/12 (канон: --r-xs/--r-sm/--r-lg/--r-xl). */
+  --shell: 1380px;      /* полоса макета            */
+  --pad: 24px;          /* поле страницы            */
+  --r-card: 12px;       /* скругление панели        */
+  --r-inner: 10px;      /* скругление вложенного    */
+  --r-ctl: 8px;         /* скругление элемента ввода */
+  --r-xs: 4px;          /* скругление мелкого       */
+}
+/* /tokens */
+* { box-sizing: border-box; }
+/* [hidden] обязан побеждать любой display ниже по файлу: иначе галочка
+   «всё равно поставить» вылезает при пике, который её не требует. */
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 var(--ui);
+  letter-spacing: -.011em;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  padding-bottom: 96px;
+}
+::selection { background: var(--sel); }
+
+.mono { font-family: var(--mono); font-size: .93em; font-variant-numeric: tabular-nums;
+        letter-spacing: 0; }
+.num  { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+.dim  { color: var(--ink-3); }
+b { font-weight: 600; }
+.spacer { flex: 1; }
+
+/* Полоса макета: одна ширина у чромы, зон и разделителей. */
+.shell { max-width: var(--shell); margin: 0 auto; padding: var(--pad); }
+.section-gap { margin-top: 20px; }
+
+/* ===========================================================================
+   ЧРОМА
+   Полупрозрачная панель с размытием: под ней проезжает содержимое, и это
+   единственное место, где полупрозрачность что-то сообщает. Слева — кто мы и
+   на каком адресе, справа — три показания и часы; читается с метра.
+   =========================================================================== */
+.chrome {
+  position: sticky; top: 0; z-index: 20;
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
+  backdrop-filter: saturate(180%) blur(12px);
+  border-bottom: 1px solid var(--hairline);
+  transition: background .2s ease;
+}
+.chrome-in {
+  max-width: var(--shell); margin: 0 auto;
+  padding: 9px var(--pad);
+  display: flex; align-items: center; gap: 16px;
+}
+.mark {
+  display: flex; align-items: center; gap: 10px; flex: none;
+  padding-right: 16px; border-right: 1px solid var(--hairline);
+}
+.glyph {
+  width: 24px; height: 24px; border-radius: var(--r-ctl);
+  border: 1px solid var(--hairline-2); background: var(--fill);
+  display: grid; place-items: center;
+  font: 500 11px/1 var(--mono); color: var(--ink-2); letter-spacing: 0;
+}
+.mark-name { font: 510 13px/1 var(--ui); letter-spacing: -.01em; white-space: nowrap; }
+.host { font-size: 12px; color: var(--ink-3); flex: 0 1 auto; min-width: 0;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Всё, что несёт текст переменной длины, обязано уметь сжиматься: чрома — одна flex-строка,
+   и `flex: none` на строке идущего прогона выталкивал часы за правый край окна ровно тогда,
+   когда прогон шёл (C3, живая проверка на 1024 и 1440). Не сжимаются только часы справа и
+   марка слева — им и нечем, у них фиксированное содержимое. */
+.readout { display: flex; align-items: center; gap: 4px; flex: 0 1 auto; min-width: 0; }
+.stat {
+  display: flex; align-items: baseline; gap: 7px; min-width: 0;
+  padding: 4px 10px; border-radius: var(--r-ctl);
+}
+.stat .k {
+  font-size: 11px; color: var(--ink-3); letter-spacing: .4px; text-transform: uppercase;
+}
+.stat .v {
+  font-family: var(--mono); font-size: 12px; letter-spacing: 0;
+  color: var(--ink-2); font-variant-numeric: tabular-nums;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.stat .v.hot { color: var(--accent-ink); }
+.stat .v.warn { color: var(--warn-ink); }
+.stat.worker { gap: 8px; }
+
+/* состояние работника: лампа как форма, цвет — только подтверждение */
+.lamp {
+  position: relative; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--done); flex: none;
+  box-shadow: 0 0 0 3px var(--done-soft);
+}
+.chrome[data-worker="stopped"] .lamp { background: var(--fail); box-shadow: 0 0 0 3px var(--fail-soft); }
+.chrome[data-worker="stopped"] .lamp::before {
+  content: ""; position: absolute; left: 1px; right: 1px; top: 3.2px;
+  /* theme-invariant: bar drawn on top of the --fail dot itself, not on page ink/bg */
+  height: 1.6px; background: #fff; border-radius: 1px;
+}
+.chrome[data-worker="stopped"] .stat.worker .v { color: var(--fail-ink); }
+.chrome[data-worker="unknown"] .lamp { background: transparent; box-shadow: inset 0 0 0 2px var(--warn); }
+.chrome[data-worker="unknown"] .stat.worker .v { color: var(--warn-ink); }
+.chrome[data-worker="stopped"] { background: color-mix(in srgb, var(--fail-soft) 86%, transparent); }
+.chrome[data-worker="unknown"] { background: color-mix(in srgb, var(--warn-soft) 86%, transparent); }
+
+.rail-run {
+  display: flex; align-items: baseline; gap: 14px; min-width: 0; flex: 0 1 auto;
+  overflow: hidden; white-space: nowrap;
+  font-variant-numeric: tabular-nums; font-size: 12.5px;
+}
+.rail-run > * { overflow: hidden; text-overflow: ellipsis; }
+.run-tag { font-weight: 600; font-family: var(--mono); font-size: 12.5px; letter-spacing: 0; }
+.run-step, .run-share, .run-left { color: var(--ink-2); }
+.run-left b { font-size: 14px; color: var(--ink); }
+.rail-run.idle { color: var(--ink-3); }
+
+.rail-clock { margin-left: auto; display: flex; align-items: baseline; gap: 12px; flex: none; }
+.rail-clock .theme-toggle { flex: none; }
+.clock { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.poll { font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.theme-toggle { white-space: nowrap; }
+
+/* шаги как деления шкалы: доля считается, а не читается */
+.steps { display: flex; gap: 3px; }
+.steps i {
+  display: block; height: 4px; flex: 1; border-radius: 2px;
+  background: var(--fill-2); box-shadow: inset 0 0 0 1px var(--hairline);
+}
+.steps i.done { background: var(--accent); box-shadow: none; }
+.steps i.now  {
+  background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent);
+  animation: breathe 2.4s ease-in-out infinite;
+}
+@keyframes breathe { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+.rail-steps { max-width: var(--shell); margin: 0 auto; padding: 0 var(--pad) 8px; }
+.chrome[data-worker="stopped"] .rail-steps i.done,
+.chrome[data-worker="stopped"] .rail-steps i.now { background: var(--wait); animation: none; }
+
+/* Сервер не отвечает. Полоса во всю чрому — её нельзя не заметить, а цифры
+   выше неё в этот момент устарели и об этом сказано словами. */
+.conn {
+  max-width: var(--shell); margin: 0 auto; padding: 0 var(--pad) 9px;
+  display: flex; gap: 9px; align-items: baseline;
+  font-size: 12.5px; color: var(--fail-ink); font-weight: 500; line-height: 1.45;
+}
+.chrome:has(.conn:not([hidden])) { background: color-mix(in srgb, var(--fail-soft) 86%, transparent); }
+.conn::before {
+  content: ""; width: 13px; height: 13px; flex: none; align-self: flex-start; margin-top: 3px;
+  background: var(--fail); clip-path: polygon(50% 4%, 100% 96%, 0 96%);
+}
+/* Пока сервер молчит, цифры очереди — прошлогодний снег. Чрома остаётся
+   яркой: там висит объяснение, почему всё остальное поблёкло. */
+body[data-stale] main { opacity: .55; }
+
+/* ===========================================================================
+   ЗОНЫ. Панель с шапкой-номером — единица раскладки макета: номер, название,
+   и справа одна строка eyebrow с ответом на «сколько».
+   =========================================================================== */
+.panel {
+  background: var(--card);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-card);
+  overflow: hidden;
+}
+.panel-head {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--card-2);
+}
+.panel-head h2 {
+  margin: 0; font: 510 13px/1.3 var(--ui); letter-spacing: -.01em; color: var(--ink);
+}
+.panel-head .num {
+  font: 500 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0;
+  width: 18px; height: 18px; border: 1px solid var(--hairline-2); border-radius: var(--r-xs);
+  display: grid; place-items: center; flex: none;
+}
+.panel-body { padding: 16px; }
+.eyebrow {
+  font-size: 11px; font-weight: 500; letter-spacing: .4px; text-transform: uppercase;
+  color: var(--ink-3); font-variant-numeric: tabular-nums;
+}
+
+/* ===========================================================================
+   КНОПКИ
+   Три веса: главная (инверсная плашка), обычная, призрачная.
+
+   Главная не янтарная (правка по ревью C2). Янтарь на этой странице — не
+   «важно», а «GPU считает»: им горят деления пройденных проходов, знак идущей
+   задачи, шкала памяти и подсветка планов в промпте. Пока им же горели три
+   кнопки — «Поставить в очередь», «Начать расчёт», «Новый через диалог» —
+   первый экран светился акцентом в четырёх местах сразу, и ни одно из них не
+   означало, что что-то считается. Канон решает это иначе и в обеих темах
+   одинаково: главная кнопка — инверсия страницы (`.btn.inverse`), светлая
+   плашка на тёмном и тёмная на светлом. Ни одного янтарного пикселя, и при
+   этом самая громкая вещь на экране.
+   =========================================================================== */
+button {
+  font: 510 13px/1.2 var(--ui); letter-spacing: -.005em;
+  border-radius: var(--r-ctl); cursor: pointer; white-space: nowrap;
+  border: 1px solid var(--hairline-2); background: var(--fill); color: var(--ink-2);
+  padding: 7px 12px;
+  display: inline-flex; align-items: center; gap: 7px;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+button:hover { background: var(--fill-2); color: var(--ink); }
+button:focus-visible { outline: none; box-shadow: 0 0 0 3.5px var(--accent-ring); }
+button.inverse {
+  background: var(--inverse); color: var(--inverse-ink); border-color: var(--inverse);
+  font-weight: 590;
+}
+button.inverse:hover { background: var(--inverse-hover); border-color: var(--inverse-hover);
+                       color: var(--inverse-ink); }
+button.inverse:disabled {
+  background: var(--fill-2); color: var(--ink-3); border-color: transparent; cursor: not-allowed;
+}
+button.ghost { background: transparent; border-color: transparent; color: var(--ink-3); }
+button.ghost:hover { background: var(--fill); color: var(--ink-2); }
+button.ghost:disabled { opacity: .35; cursor: not-allowed; background: transparent; color: var(--ink-3); }
+button.lg { padding: 10px 16px; font-size: 14px; border-radius: var(--r-inner); }
+
+/* ===========================================================================
+   ЗОНА 1: СОЧИНЕНИЕ
+   Слева промпт с разбором, справа параметры. Пропорция колонок — из макета.
+   =========================================================================== */
+.form-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.32fr) minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+.col-prompt, .col-params { min-width: 0; }
+
+.editor-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+.editor-bar .sel { flex: 0 1 260px; }
+
+/* ---------- элементы ввода ---------- */
+label { color: var(--ink-3); }
+input, textarea, select, button { font-family: var(--ui); }
+.inp, input, textarea {
+  font-family: var(--mono); font-size: 13px; letter-spacing: 0;
+  color: var(--ink); background: var(--card-2);
+  border: 1px solid var(--hairline); border-radius: var(--r-ctl);
+  padding: 7px 10px; width: 100%;
+  font-variant-numeric: tabular-nums;
+  transition: background .12s ease, box-shadow .12s ease, border-color .12s ease;
+}
+input:hover, textarea:hover { border-color: var(--hairline-2); }
+input:focus, textarea:focus, select:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3.5px var(--accent-ring);
+}
+input::placeholder, textarea::placeholder { color: var(--ink-3); }
+
+/* Выпадашка — своя стрелка (data-URI в токенах), потому что системная не
+   красится и в тёмной теме остаётся чёрной на чёрном. */
+.sel { position: relative; display: inline-flex; min-width: 0; }
+.sel select, select {
+  appearance: none; -webkit-appearance: none;
+  font: 400 13px/1.4 var(--ui); letter-spacing: -.005em;
+  color: var(--ink-2); background: var(--card-2);
+  border: 1px solid var(--hairline); border-radius: var(--r-ctl);
+  padding: 7px 28px 7px 10px; width: 100%; cursor: pointer;
+  background-image: var(--chev);
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+select:hover { border-color: var(--hairline-2); color: var(--ink); }
+.pick { font-family: var(--mono); font-size: 12px; max-width: 260px; }
+
+/* Число с подписью в строку — макет пишет её так и в шапке модалки, и в поле ввода. */
+.dur-inline {
+  display: inline-flex; align-items: center; gap: 7px; flex: none;
+  font-size: 12px; color: var(--ink-3); letter-spacing: -.005em;
+}
+.dur-inline label { font-size: 12px; }
+.dur-inline .u { font: 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0; }
+#chat-duration { width: 58px; text-align: right; padding: 4px 8px; font-size: 12px; }
+
+/* ---------- редактор промпта: слой подсветки под прозрачным полем ------- */
+.editor {
+  position: relative;
+  height: 336px;
+  border: 1px solid var(--hairline-2);
+  border-radius: var(--r-inner);
+  background: var(--bg);
+  overflow: hidden;
+  transition: box-shadow .12s ease, border-color .12s ease;
+}
+.hl, .editor textarea {
+  /* Всё, что влияет на раскладку строк, обязано совпадать в обоих слоях */
+  position: absolute; inset: 0;
+  margin: 0; border: 0; padding: 14px 16px;
+  font: 12.5px/1.72 var(--mono);
+  letter-spacing: 0;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  tab-size: 4;
+  overflow: auto;
+  width: auto;
+}
+/* Слой подсветки не прокручивается пользователем и не показывает полосу
+   прокрутки: иначе ширина строки в нём и в поле разошлась бы на её толщину. */
+.hl { color: var(--ink-2); pointer-events: none; overflow: hidden; }
+.editor textarea {
+  background: transparent; color: transparent; caret-color: var(--accent);
+  resize: none; outline: none; border-radius: 0;
+}
+.editor textarea:hover, .editor textarea:focus { background: transparent; box-shadow: none; border: 0; }
+.editor:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3.5px var(--accent-ring); }
+
+.hl mark { background: none; color: inherit; }
+/* Пять видов разметки документированного формата: планы, три поля, теги
+   речи, идентификаторы говорящих — и шестой, остатки старого, красным. */
+.hl mark.shot  { background: var(--accent-soft); color: var(--accent-ink); font-weight: 700; border-radius: 4px; }
+.hl mark.shot.bad { background: var(--fail-soft); color: var(--fail-ink); }
+.hl mark.fld   { font-weight: 700; color: var(--done-ink); border-bottom: 1.5px solid var(--done); }
+.hl mark.dlg   { font-weight: 700; color: var(--ink); border-bottom: 1.5px solid var(--hairline-2); }
+.hl mark.spk   { color: var(--ink-2); }
+/* Ни одного свойства, меняющего метрику: разрядка, размер и семейство здесь
+   запрещены — от них слой уехал бы относительно поля на длинных строках. */
+.hl mark.old   { background: var(--fail-soft); color: var(--fail-ink); border-radius: 4px; }
+
+/* ---------- полоска планов ---------- */
+.scale {
+  position: relative; height: 28px; margin: 10px 0 4px;
+  border-radius: var(--r-ctl); background: var(--card-2);
+  border: 1px solid var(--hairline);
+  overflow: hidden;
+}
+.scale .seg {
+  position: absolute; top: 3px; bottom: 3px;
+  background: var(--accent-soft);
+  border-radius: 5px;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
+  color: var(--accent-ink);
+  font: 500 10.5px/20px var(--ui); font-variant-numeric: tabular-nums;
+  text-align: center; overflow: hidden;
+}
+
+/* ---------- разбор промпта ---------- */
+.parse { list-style: none; margin: 4px 0 0; padding: 0; font-size: 12.5px; }
+/* Строка разбора — обычный текстовый абзац с висячим знаком слева.
+   Ни flex, ни grid: внутри строки есть подстроки <span class="num">,
+   и в контейнере-флексе каждая из них стала бы отдельной колонкой. */
+.parse li {
+  position: relative;
+  padding: 7px 0 7px 25px;
+  line-height: 1.45;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--ink-2);
+}
+.parse li:last-child { border-bottom: 0; }
+.parse li::before {
+  content: ""; position: absolute; left: 0; top: 9px;
+  width: 13px; height: 13px; border-radius: 50%;
+}
+.parse li::after { content: ""; position: absolute; }
+
+/* сделано: галочка */
+.parse li.ok::before { background: var(--done-soft); }
+.parse li.ok::after {
+  left: 4.6px; top: 11px; width: 3.6px; height: 7px;
+  border: solid var(--done-ink); border-width: 0 1.7px 1.7px 0;
+  transform: rotate(45deg); border-radius: 1px;
+}
+/* внимание: треугольник */
+.parse li.warn::before {
+  background: var(--warn); border-radius: 0;
+  clip-path: polygon(50% 4%, 100% 96%, 0 96%);
+}
+.parse li.warn { color: var(--warn-ink); }
+/* ошибка: крестик в круге */
+.parse li.bad::before { background: var(--fail); }
+.parse li.bad::after {
+  left: 3.5px; top: 12.5px; width: 6px; height: 6px;
+  /* theme-invariant: cross drawn on top of the --fail dot itself, not on page ink/bg */
+  background:
+    linear-gradient(45deg, transparent 42%, #fff 42% 58%, transparent 58%),
+    linear-gradient(-45deg, transparent 42%, #fff 42% 58%, transparent 58%);
+}
+.parse li.bad  { color: var(--fail-ink); font-weight: 500; }
+.parse .num { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--ink); }
+.parse li.warn .num { color: var(--warn-ink); }
+.parse li.bad  .num { color: var(--fail-ink); }
+
+/* Откуда уйдёт промпт: из файла (тогда очередь снимет с него копию) или
+   текстом в командной строке (тогда снимка не будет). */
+.src { margin: 8px 0 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.45; }
+.src.dirty { color: var(--warn-ink); }
+
+/* ===========================================================================
+   ПАРАМЕТРЫ
+   Две колонки по 4px-сетке макета; поля, которым нужна вся ширина, берут её
+   классом .full. Ни одной разделительной линии: группы разделяет воздух.
+   =========================================================================== */
+.params {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.field.full { grid-column: 1 / -1; }
+.field > label { font-size: 11.5px; color: var(--ink-3); letter-spacing: -.005em; }
+.field .sel { width: 100%; }
+
+.inp-unit { position: relative; display: flex; }
+.inp-unit .u {
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  font: 11px/1 var(--mono); color: var(--ink-3); pointer-events: none; letter-spacing: 0;
+}
+.canvas { display: flex; align-items: center; gap: 9px; min-width: 0; flex-wrap: wrap; }
+.canvas input { width: 96px; text-align: right; }
+.x { color: var(--ink-3); }
+.hint { font-size: 11.5px; color: var(--ink-3); min-width: 0; line-height: 1.4; }
+.hint.bad { color: var(--fail-ink); font-weight: 500; }
+
+/* ---------- зона загрузки кадра (A7) -------------------------------------
+   Пунктир — тот же язык, что у любого «сюда» в системных приложениях: клик
+   и перетаскивание запускают одно и то же действие, поэтому это одна зона,
+   а не поле плюс кнопка рядом. ----------------------------------------------- */
+.drop-row { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
+.dropzone {
+  flex: 1; min-width: 0; display: flex; align-items: center;
+  padding: 10px 12px;
+  border: 1px dashed var(--hairline-2);
+  border-radius: var(--r-inner);
+  background: var(--card-2);
+  color: var(--ink-3);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+.dropzone:hover { background: var(--fill); }
+.dropzone:focus-visible {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px var(--accent-ring);
+}
+.dropzone.dragover { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-ink); }
+.dropzone.loaded { border-style: solid; color: var(--ink); }
+.dropzone.loaded .dropzone-label { font-family: var(--mono); font-size: 12px; }
+.dropzone.busy { opacity: .6; cursor: progress; }
+.dropzone.error { border-color: var(--fail); background: var(--fail-soft); color: var(--fail-ink); }
+.dropzone-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.upload-link {
+  background: none; border: none; padding: 0; font-family: var(--ui);
+  font-size: 11.5px; color: var(--accent-ink); text-decoration: none;
+  white-space: nowrap; cursor: pointer;
+}
+.upload-link:hover { text-decoration: underline; }
+.upload-link:focus-visible { outline: none; box-shadow: 0 0 0 3.5px var(--accent-ring); }
+
+/* ---------- настройки модели: свёрнуто, со сводкой в самом summary ---------- */
+details.adv {
+  grid-column: 1 / -1;
+  border: 1px solid var(--hairline); border-radius: var(--r-inner);
+  background: var(--card-2);
+}
+details.adv > summary {
+  list-style: none; cursor: pointer;
+  padding: 10px 14px;
+  display: flex; align-items: center; gap: 9px;
+  font: 500 13px/1.4 var(--ui); color: var(--ink-2); letter-spacing: -.008em;
+}
+details.adv > summary::-webkit-details-marker { display: none; }
+details.adv > summary::before {
+  content: ""; width: 5px; height: 5px; flex: none;
+  border-right: 1.3px solid var(--ink-3); border-bottom: 1.3px solid var(--ink-3);
+  transform: rotate(-45deg); transition: transform .15s ease;
+}
+details.adv[open] > summary::before { transform: rotate(45deg); }
+details.adv > summary:hover { color: var(--ink); }
+details.adv > summary .hint {
+  margin-left: auto; font-family: var(--mono); font-size: 11px; letter-spacing: 0;
+  font-variant-numeric: tabular-nums; text-align: right;
+}
+.adv-body {
+  border-top: 1px solid var(--hairline); padding: 14px;
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px;
+}
+
+/* ===========================================================================
+   ОЦЕНКА — главный ответ формы
+   =========================================================================== */
+.estimate {
+  margin-top: 16px; padding: 14px;
+  background: var(--card-2);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-inner);
+}
+.est-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.est-time {
+  font-size: 26px; font-weight: 500; letter-spacing: -.4px;
+  font-variant-numeric: tabular-nums;
+}
+.est-sub { font-size: 12.5px; color: var(--ink-3); }
+
+.mem { margin-top: 16px; }
+.mem-top { display: flex; align-items: baseline; gap: 8px; font-size: 12px; color: var(--ink-3); }
+.mem-top .num { font-size: 14px; font-weight: 600; color: var(--ink); font-family: var(--mono); }
+/* Шкала не обрезает содержимое: подписи рисок 40 и 46 стоят под ней,
+   а сама заливка скруглена по своему правому краю. */
+.gauge {
+  position: relative; height: 8px; margin: 8px 0 24px;
+  background: var(--fill-2); border-radius: 4px;
+  overflow: visible;
+}
+.gauge .fill {
+  position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px;
+  background: var(--accent); transition: width .18s ease, background-color .18s ease;
+}
+.gauge .fill.warn { background: var(--warn); }
+.gauge .fill.bad  { background: var(--fail); }
+/* Риски 40 и 46 из 48 — те же места, что и на микрошкале в строках очереди */
+.gauge .tick { position: absolute; top: 0; bottom: 0; width: 1.5px; background: var(--card-2); opacity: .9; }
+.gauge .tick span {
+  position: absolute; top: 11px; left: -6px;
+  font: 10.5px/1 var(--mono); color: var(--ink-3); font-variant-numeric: tabular-nums;
+}
+.gauge .t40 { left: 83.33%; }
+.gauge .t46 { left: 95.83%; }
+.mem-warn {
+  margin: 4px 0 0; font-size: 12.5px; line-height: 1.45;
+  color: var(--warn-ink); font-weight: 500;
+  background: var(--warn-soft); padding: 10px 12px; border-radius: var(--r-inner);
+  border: 1px solid color-mix(in srgb, var(--warn) 26%, transparent);
+}
+.mem-warn.bad { color: var(--fail-ink); background: var(--fail-soft);
+                border-color: color-mix(in srgb, var(--fail) 26%, transparent); }
+
+/* Плашка выгрузки — единственный `.mem-warn` с кнопками внутри, и до этого правила у неё не
+   было своих вовсе: два `<span>` вставали в строку по-инлайновому, кнопки прилипали к тексту
+   без просвета, а на узком окне переносились по одной. Тон тот же предупреждающий, что у
+   `.mem-warn` (плашка говорит «очередь стоит»), плюс рамка — она просит нажать. */
+.unload-banner {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px 14px; flex-wrap: wrap;
+  margin: 16px;
+}
+/* `flex: none` — кнопки не сжимаются: первым переносится текст, у него для этого есть слова. */
+.unload-banner-acts { display: flex; align-items: center; gap: 8px; flex: none; }
+/* На кегль плашки: кнопка карточки рядом с 12.5px текстом выглядит вдвое громче, чем стоит. */
+.unload-banner button { font-size: 12.5px; padding: 6px 12px; }
+.force {
+  display: inline-flex; align-items: center; gap: 9px;
+  margin-top: 10px; font-size: 12.5px; color: var(--fail-ink); font-weight: 500;
+  cursor: pointer;
+}
+/* Переключатель в системном духе — он же единственный «тяжёлый» контрол
+   на странице, и это правильно: он снимает защиту по памяти. */
+.force input[type=checkbox] {
+  appearance: none; -webkit-appearance: none;
+  position: relative; width: 36px; height: 22px; border-radius: 11px;
+  background: var(--fill-3); border: 0; padding: 0; flex: none;
+  cursor: pointer; transition: background .16s ease;
+}
+.force input[type=checkbox]::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 18px; height: 18px; border-radius: 50%;
+  /* theme-invariant: physical toggle-knob face and its own cast shadow, same in any theme */
+  background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3);
+  transition: transform .16s ease;
+}
+.force input[type=checkbox]:checked { background: var(--fail); }
+.force input[type=checkbox]:checked::after { transform: translateX(14px); }
+.force input[type=checkbox]:focus-visible { box-shadow: 0 0 0 3.5px var(--accent-ring); outline: none; }
+
+.est-actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+.est-actions .inverse { flex: 1; justify-content: center; }
+.est-foot { margin: 12px 0 0; font-size: 11px; color: var(--ink-3); line-height: 1.45; }
+.est-said { font-size: 12.5px; color: var(--done-ink); font-weight: 500; }
+
+/* Отказ на запрос. Текст stderr от argparse показывается как есть,
+   моноширинным: «unrecognized arguments: --widht 896» точнее пересказа. */
+.err {
+  margin: 12px 0 0; padding: 10px 12px;
+  background: var(--fail-soft); border-radius: var(--r-inner);
+  font-size: 12.5px; color: var(--fail-ink); line-height: 1.5; overflow-wrap: anywhere;
+}
+.err b { display: block; margin-bottom: 3px; }
+.err pre {
+  margin: 6px 0 0; font-family: var(--mono); font-size: 11.5px;
+  white-space: pre-wrap; color: var(--fail-ink); opacity: .9;
+}
+
+/* ===========================================================================
+   ЗОНА 2: ОЧЕРЕДЬ
+   Крупное состояние и кнопка старта сверху — их видно с метра и они одни на
+   всю очередь; ниже идущая задача, плашка выгрузки и список ждущих.
+   =========================================================================== */
+.qstate {
+  padding: 16px;
+  border-bottom: 1px solid var(--hairline);
+}
+.qstate-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.qstate-txt { min-width: 0; }
+.qstate .title { font: 500 20px/1.2 var(--ui); letter-spacing: -.4px; color: var(--ink); }
+.qstate .sub {
+  margin-top: 4px; font: 12px/1.45 var(--mono); letter-spacing: 0;
+  color: var(--ink-3); font-variant-numeric: tabular-nums;
+}
+
+/* ---- идущая задача ---- */
+.running {
+  display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 20px;
+  padding: 16px;
+  background: var(--card-2);
+  border-bottom: 1px solid var(--hairline);
+}
+.running.none, .running.stale {
+  display: block; position: relative; padding: 16px;
+  font-size: 12.5px; line-height: 1.5;
+}
+.running.none { background: var(--card); color: var(--ink-3); }
+/* Задача в running/ без работника — не «идёт», а «неизвестно»: знак тот же
+   треугольник, что у нечитаемых файлов очереди, и заливка та же. */
+.running.stale {
+  background: var(--warn-soft); color: var(--warn-ink); font-size: 13px;
+  padding-left: 42px;
+}
+.running.stale::before {
+  content: ""; position: absolute; left: 18px; top: 19px;
+  width: 14px; height: 14px; background: var(--warn);
+  clip-path: polygon(50% 4%, 100% 96%, 0 96%);
+}
+.running.stale .mono { color: inherit; }
+.running img {
+  width: 200px; display: block; border-radius: var(--r-ctl);
+  background: var(--frame-3);
+  /* Requirement 3: the preview frame is a media window, not a page surface -- its edge uses
+     --frame-edge (own dark-only pair), and the drop shadow below it is theme-invariant: a
+     photograph casts the same shadow regardless of what theme is reading the page around it. */
+  box-shadow: 0 0 0 1px var(--frame-edge), 0 1px 3px rgba(0,0,0,.35);
+}
+.run-cap { font-size: 11px; color: var(--ink-3); margin-top: 7px; }
+.run-body { min-width: 0; }
+.run-line1 { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.run-name { font: 500 13px/1.3 var(--mono); letter-spacing: 0; color: var(--ink);
+            min-width: 0; overflow-wrap: anywhere; }
+.run-spec { font: 12px/1.3 var(--mono); color: var(--ink-3); letter-spacing: 0;
+            font-variant-numeric: tabular-nums; }
+.run-num { display: flex; gap: 24px; margin: 14px 0 12px; flex-wrap: wrap; }
+.run-num div { display: flex; flex-direction: column; gap: 2px; }
+.run-num .k { font-size: 11px; color: var(--ink-3); }
+.run-num .v {
+  font: 500 18px/1.15 var(--mono); letter-spacing: -.02em;
+  font-variant-numeric: tabular-nums;
+}
+.run-num .v.over { color: var(--warn-ink); }
+/* Сегменты проходов внутри карточки задачи (макет: `.now .steps`). */
+.run-steps { margin: 12px 0 8px; }
+.steps-legend { display: flex; justify-content: space-between; }
+.steps-legend span {
+  font: 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+.run-foot { margin-top: 12px; font-size: 11.5px; color: var(--ink-3); line-height: 1.5; }
+.run-note { color: var(--ink-2); }
+
+/* ---- ждущие ---- */
+.waiting { padding: 16px; }
+.waiting-head { display: flex; justify-content: space-between; margin-bottom: 10px; }
+.qlist { display: flex; flex-direction: column; gap: 8px; }
+.qitem {
+  border: 1px solid var(--hairline); border-radius: var(--r-inner);
+  background: var(--card-2);
+  padding: 11px 12px;
+  display: flex; align-items: center; gap: 12px;
+  transition: border-color .12s ease, background-color .12s ease;
+}
+.qitem:hover { border-color: var(--hairline-2); }
+.qitem .idx {
+  font: 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0;
+  width: 14px; flex: none; text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.qitem .body { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.qitem .n {
+  font: 500 12.5px/1.3 var(--mono); color: var(--ink); letter-spacing: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.qitem .meta {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font: 11px/1.3 var(--mono); color: var(--ink-3); letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+.qitem .note {
+  font-size: 11.5px; color: var(--ink-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.qitem .mem { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
+.qitem .mem.over { color: var(--warn-ink); font-weight: 500; }
+.qitem .prio { font-size: 11px; color: var(--accent-ink); font-weight: 600; }
+.qitem.editing { border-color: var(--accent); background: var(--accent-soft); }
+
+/* Микрошкала памяти: число сравнивается точно, полоска — мгновенно.
+   Риска на 40 из 48 стоит на том же месте, что и на большой шкале формы. */
+.mg {
+  display: inline-block; width: 44px; height: 3px; position: relative;
+  background: var(--fill-2); border-radius: 2px; overflow: hidden; vertical-align: middle;
+}
+.mg::after {
+  content: ""; position: absolute; left: 83.33%; top: 0; bottom: 0;
+  width: 1px; background: var(--card-2);
+}
+.mg b { position: absolute; left: 0; top: 0; bottom: 0; background: var(--wait); border-radius: 2px; }
+.qitem .mem.over .mg b { background: var(--warn); }
+
+/* ---- действия строки/карточки: текстовые, плотно ---- */
+.acts { display: flex; align-items: center; gap: 2px; flex: none; flex-wrap: wrap; }
+.acts button {
+  font-size: 11.5px; padding: 4px 7px; border-color: transparent;
+  background: transparent; color: var(--ink-3); border-radius: var(--r-xs);
+}
+.acts button:hover { color: var(--ink); background: var(--fill); }
+.acts button[data-act="del"]:hover,
+.acts button[data-act="delrun"]:hover { background: var(--fail-soft); color: var(--fail-ink); }
+
+.empty { font-size: 12.5px; color: var(--ink-3); margin: 6px 0; }
+.empty.pad { margin: 0; padding: 16px; }
+.badfiles {
+  display: flex; gap: 9px; align-items: baseline;
+  margin: 12px 0 0; padding: 10px 12px;
+  background: var(--warn-soft); border-radius: var(--r-inner);
+  font-size: 12.5px; color: var(--warn-ink); line-height: 1.45;
+}
+.badfiles::before {
+  content: ""; width: 13px; height: 13px; flex: none;
+  background: var(--warn); clip-path: polygon(50% 4%, 100% 96%, 0 96%);
+  align-self: flex-start; margin-top: 3px;
+}
+.badfiles .mono { color: var(--warn-ink); opacity: .85; }
+
+/* ---- знаки четырёх состояний: форма важнее цвета ---- */
+.m {
+  position: relative; display: inline-block; width: 12px; height: 12px;
+  border-radius: 50%; flex: none; vertical-align: -1px;
+}
+/* ждёт — полое кольцо */
+.m.wait { box-shadow: inset 0 0 0 1.7px var(--wait); }
+/* идёт — залитая точка с пульсирующим ореолом */
+.m.run  { background: var(--accent); }
+.m.run::after {
+  content: ""; position: absolute; inset: -4px; border-radius: 50%;
+  box-shadow: 0 0 0 1.5px var(--accent); opacity: .45;
+  animation: pulse 2.4s ease-out infinite;
+}
+@keyframes pulse {
+  0%   { transform: scale(.72); opacity: .55; }
+  70%  { transform: scale(1.12); opacity: 0; }
+  100% { transform: scale(1.12); opacity: 0; }
+}
+/* сделано — галочка */
+.m.done { background: var(--done); }
+.m.done::before {
+  content: ""; position: absolute; left: 3.9px; top: 2.4px;
+  /* theme-invariant: checkmark drawn on top of the --done dot itself, not on page ink/bg */
+  width: 3.4px; height: 6.4px; border: solid #fff; border-width: 0 1.6px 1.6px 0;
+  transform: rotate(45deg); border-radius: 1px;
+}
+/* упало — крестик */
+.m.fail { background: var(--fail); }
+/* theme-invariant: cross drawn on top of the --fail dot itself, not on page ink/bg */
+.m.fail::before, .m.fail::after {
+  content: ""; position: absolute; left: 2.5px; top: 5.2px;
+  width: 7px; height: 1.6px; background: #fff; border-radius: 1px;
+}
+.m.fail::before { transform: rotate(45deg); }
+.m.fail::after  { transform: rotate(-45deg); }
+
+/* ===========================================================================
+   ЗОНА 3: ГОТОВО
+   Карточками, а не строками: у законченного прогона главное — кадр.
+   =========================================================================== */
+.results {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px; padding: 16px;
+}
+.results:empty { display: none; }
+.rcard {
+  border: 1px solid var(--hairline); border-radius: var(--r-inner);
+  background: var(--card-2); overflow: hidden;
+  transition: border-color .12s ease;
+}
+.rcard:hover { border-color: var(--hairline-2); }
+/* Кадр — медиа-окно, а не поверхность интерфейса: не участвует в инверсии темы
+   (variant-reference-light.html, комментарий у --frame-*). Пустая рамка — тот же
+   градиент: битая картинка хуже пустой. */
+.frame {
+  position: relative;
+  aspect-ratio: 14 / 9;
+  background:
+    radial-gradient(120% 120% at 22% 8%, var(--frame-warm), transparent 58%),
+    radial-gradient(90% 90% at 85% 100%, var(--frame-cool), transparent 60%),
+    linear-gradient(162deg, var(--frame-1) 0%, var(--frame-2) 46%, var(--frame-3) 100%);
+  border-bottom: 1px solid var(--hairline);
+  overflow: hidden;
+}
+.frame img, .frame video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.frame video { cursor: pointer; }
+.frame .tc, .frame .dur {
+  position: absolute; bottom: 9px; z-index: 1;
+  font: 10.5px/1 var(--mono); letter-spacing: 0; color: var(--frame-ink);
+  font-variant-numeric: tabular-nums;
+  background: var(--frame-chip-bg);
+  border: 1px solid var(--frame-chip-line);
+  border-radius: var(--r-xs); padding: 3px 6px;
+}
+.frame .tc { left: 9px; }
+.frame .dur { right: 9px; }
+
+/* Находка 1 (живой проход 2026-08-24): заглушка вместо `<video>`/`<img>` для медиа, чей файл
+   уже отвечал 404 в этой вкладке (`deadMediaPlaceholderHtml`, app.js) -- та же пустая рамка,
+   что и у карточки без кадра вовсе (комментарий выше, "битая картинка хуже пустой"), только
+   с подписью: пустое место без объяснения читается как "ещё грузится", а не "файла больше нет". */
+.frame .media-gone {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  padding: 10px; text-align: center;
+  font: 500 11.5px/1.4 var(--ui); color: var(--frame-ink); letter-spacing: -.005em;
+}
+
+.rcard .info { padding: 11px 12px; }
+.rcard .info .n {
+  display: flex; align-items: center; gap: 8px;
+  font: 500 13px/1.3 var(--ui); color: var(--ink); letter-spacing: -.01em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rcard .info .meta {
+  font: 11px/1.4 var(--mono); color: var(--ink-3); letter-spacing: 0; margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.rcard .info .link {
+  margin-top: 4px; font: 11px/1.4 var(--mono); letter-spacing: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rcard .info .acts { margin: 8px -7px -4px; }
+.rcard.fail { border-color: color-mix(in srgb, var(--fail) 34%, transparent); }
+.rcard.fail .info .link { color: var(--fail-ink); }
+.rcard .why {
+  margin-top: 6px; font: 11px/1.5 var(--mono); letter-spacing: 0;
+  color: var(--fail-ink); overflow-wrap: anywhere;
+  max-height: 4.5em; overflow: hidden;
+}
+
+/* Ссылка на готовый ролик, рядом с кадром (`.frame-video`), а не вместо него: `/media` читает
+   файл в память целиком и перемотки не поддерживает, но `preload="metadata"` на трёх-двенадцати
+   мегабайтах — не сорок мегабайт без спроса, браузер останавливает загрузку сам, как только
+   вытянул первый кадр (проверено вживую, round 2). Ссылка ниже — тот же принцип для полного
+   открытия/скачивания: явное действие, а не подгрузка при одном только рендере карточки. */
+.clip { color: var(--accent-ink); text-decoration: none; }
+.clip:hover { text-decoration: underline; }
+
+/* Превью может не существовать: кадр пишется раз в несколько проходов, а
+   первый появляется не сразу. Пустая рамка вместо картинки честнее битой. */
+.running .noshot {
+  display: grid; place-items: center; width: 200px; height: 116px;
+  background:
+    radial-gradient(120% 120% at 22% 8%, var(--frame-warm), transparent 58%),
+    radial-gradient(90% 90% at 85% 100%, var(--frame-cool), transparent 60%),
+    linear-gradient(162deg, var(--frame-1) 0%, var(--frame-2) 46%, var(--frame-3) 100%);
+  box-shadow: inset 0 0 0 1px var(--frame-edge);
+  border-radius: var(--r-ctl);
+  font-size: 11px; color: var(--frame-ink); text-align: center; padding: 8px;
+}
+
+/* ===========================================================================
+   ДИАЛОГОВЫЙ РЕДАКТОР ПРОМПТА (C3; макет: «Экран 2» variant-reference)
+
+   Модалка — не форма на подложке, а собственное окно: у неё своя шапка со
+   своим фоном, своя граница между половинами и свой подвал ввода. Отсюда
+   `overflow: hidden` на самом окне и ноль внутренних полей у него — поля
+   принадлежат частям, а не окну, иначе разделительная линия между колонками
+   не доходит до краёв и окно рассыпается на три карточки.
+
+   Три части сверху вниз: `.mhead` (о чём разговор, кем ведётся, чем
+   кончится), `.mgrid` (слева промпт, справа лента) и внутри правой колонки
+   `.composer` — поле ввода со своей полосой действий. Обе половины видны
+   разом от 860 px: правка промпта и реплика, которая её объясняет, читаются
+   вместе или не читаются вовсе. Ниже — колонкой, промпт сверху.
+
+   Подложка прокручивается сама (`overflow: auto`), а окно центрируется
+   полями `margin: auto` внутри флекса: на коротком экране модалка не
+   обрезается снизу, а уезжает вверх вместе с прокруткой.
+   =========================================================================== */
+.modal-back {
+  position: fixed; inset: 0; z-index: 50;
+  background: var(--stage-1);
+  overflow: auto;
+  display: flex; padding: var(--pad);
+}
+.modal {
+  margin: auto; width: min(1080px, 100%);
+  background: var(--card); border: 1px solid var(--hairline-2); border-radius: var(--r-card);
+  box-shadow: var(--shadow-pop);
+  overflow: hidden;
+}
+
+/* ---------- шапка ---------- */
+.mhead {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--card-2);
+}
+.mhead .t { font: 510 13px/1.3 var(--ui); letter-spacing: -.01em; color: var(--ink); flex: none; }
+.mhead .msrc { font-size: 11.5px; color: var(--ink-3); flex: none; }
+.mhead .prov { flex: 0 1 190px; min-width: 120px; }
+.mhead .prov select { padding-top: 4px; padding-bottom: 4px; font-size: 12px; }
+.mhead .status {
+  display: inline-flex; align-items: center; gap: 7px; min-width: 0;
+  font-size: 11.5px; color: var(--ink-3); letter-spacing: -.005em;
+}
+.mhead-acts { display: flex; align-items: center; gap: 7px; flex: none; }
+.mhead-acts button { font-size: 12.5px; padding: 6px 11px; }
+/* Точка состояния — форма макета: цвет только подтверждает слово рядом. */
+.dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--wait); }
+.dot.ok { background: var(--done); }
+.dot.hot { background: var(--accent); }
+/* Подпись клавиши внутри кнопки. На инверсной плашке — тем же чернилом, что и её текст. */
+.kbd { font: 11px/1 var(--mono); letter-spacing: 0; opacity: .6; }
+
+/* ---------- две колонки ---------- */
+.mgrid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); }
+.mleft {
+  min-width: 0; padding: 14px;
+  border-right: 1px solid var(--hairline);
+  display: flex; flex-direction: column; gap: 9px;
+}
+.mleft-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.mleft-head label { font: inherit; color: inherit; }
+.mleft-head .mono { text-transform: none; letter-spacing: 0; font-size: 10.5px; }
+/* Окно промпта ниже, чем в форме: рядом с ним лента, и обе половины должны
+   уместиться в экран целиком. */
+.mleft .editor { height: min(44vh, 420px); min-height: 220px; }
+.mright { min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
+
+/* ---------- лента ---------- */
+/* Лента занимает всё, что осталось от колонки после поля ввода: `flex: 1` вместо заданной
+   высоты — иначе на широком экране под полем ввода зияет пустота, а на узком лента упирается
+   в потолок раньше, чем в край экрана. */
+.chat-log {
+  list-style: none; margin: 0; padding: 14px;
+  flex: 1; min-height: 200px; max-height: 56vh; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 12px;
+}
+/* Реплика — абзац, а не строка таблицы: переносы модели значимы (она пишет
+   промпт блоками), поэтому pre-wrap, а длинное имя файла в предупреждении
+   рвётся где придётся, лишь бы не растягивало колонку. */
+.chat-log .turn {
+  max-width: 88%; padding: 10px 12px; border-radius: var(--r-inner);
+  border: 1px solid var(--hairline);
+  line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere;
+  color: var(--ink-2); font-size: 13px; letter-spacing: -.008em;
+  background: var(--card-2);
+}
+.chat-log .user {
+  align-self: flex-end; background: var(--fill); border-color: var(--hairline-2); color: var(--ink);
+}
+.chat-log .note { max-width: 100%; font-size: 12.5px; color: var(--ink-3); }
+.chat-log .note.warn { background: var(--warn-soft); color: var(--warn-ink); }
+.chat-log .note.bad { background: var(--fail-soft); color: var(--fail-ink); }
+/* Стадия хода (`pendingEntry`, A2) — не реплика, а состояние: макет рисует её строкой без
+   пузыря (`.thinking`), потому что пузырь обещает содержание, а содержания ещё нет. */
+.chat-log .note.pending {
+  align-self: flex-start; max-width: 100%;
+  background: none; border: 0; padding: 2px 0;
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: var(--ink-3);
+}
+.chat-log .pending .dots { display: inline-flex; gap: 3px; }
+.chat-log .pending .dots i {
+  display: block; width: 3px; height: 3px; border-radius: 50%;
+  background: currentColor; opacity: .22;
+  animation: pending-dot 1.25s infinite ease-in-out;
+}
+.chat-log .pending .dots i:nth-child(2) { animation-delay: .16s; }
+.chat-log .pending .dots i:nth-child(3) { animation-delay: .32s; }
+@keyframes pending-dot {
+  0%, 60%, 100% { opacity: .22; transform: translateY(0); }
+  30%           { opacity: 1;   transform: translateY(-2px); }
+}
+/* Пометка кадра внутри реплики ленты (`entry.attachment`, задача A8, требование 2). */
+.chat-log .turn-attach {
+  display: block; font-size: 11.5px; opacity: .75; margin-bottom: 2px;
+}
+
+/* Пустая лента: не белое пятно, а короткая инструкция. Разговор начинается с чистого листа
+   каждый раз, и лист обязан сказать, чего от него ждут. */
+.feed-empty {
+  margin: auto 0; padding: 4px 2px;
+  display: flex; flex-direction: column; gap: 7px;
+  color: var(--ink-3); font-size: 12.5px; line-height: 1.5;
+}
+.feed-empty .fe-t { font: 500 14px/1.3 var(--ui); color: var(--ink-2); letter-spacing: -.01em; }
+
+/* ---------- поле ввода ---------- */
+.composer { border-top: 1px solid var(--hairline); padding: 12px 14px; background: var(--card); }
+#chat-form.box {
+  border: 1px solid var(--hairline-2); border-radius: var(--r-inner);
+  background: var(--card-2);
+  padding: 8px 10px;
+  display: flex; flex-direction: column;
+}
+#chat-input {
+  border: 0; background: none; padding: 2px 0; border-radius: 0;
+  resize: vertical; line-height: 1.45; font-family: var(--ui); font-size: 13px; min-height: 40px;
+}
+#chat-input:hover, #chat-input:focus { border: 0; box-shadow: none; background: none; }
+#chat-form.box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3.5px var(--accent-ring); }
+.composer .bottom {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--hairline);
+}
+#chat-send:disabled { background: var(--fill-2); color: var(--ink-3); border-color: transparent;
+                      cursor: not-allowed; }
+
+/* A8: скрепка — квадратная кнопка-иконка макета, не растягивается вместе с полем при resize. */
+.iconbtn {
+  width: 28px; height: 28px; padding: 0; flex: none;
+  border-radius: var(--r-xs); border: 1px solid var(--hairline);
+  background: var(--fill); color: var(--ink-3);
+  display: grid; place-items: center; font-size: 14px; line-height: 1;
+}
+.iconbtn:hover { color: var(--ink); border-color: var(--hairline-2); background: var(--fill-2); }
+/* Подсказка о перетаскивании — пунктиром, тем же языком, что и `.dropzone` в форме. */
+.dndhint {
+  flex: 0 1 auto; min-width: 0;
+  border: 1px dashed var(--hairline); border-radius: var(--r-xs);
+  padding: 4px 8px; font-size: 11px; color: var(--ink-3); line-height: 1.35;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Перетаскивание кадра прямо на поле ввода (A8, требование 1) — та же подсветка рамкой, что и
+   у `.dropzone.dragover` в форме постановки, чтобы приём файла читался одинаково в обоих
+   местах страницы. */
+#chat-input.dragover {
+  outline: 2px dashed var(--accent); outline-offset: -2px; background: var(--accent-soft);
+}
+
+/* Бейдж загруженного, но ещё не отправленного кадра (`chat.pendingImage`) — над полем ввода,
+   тем же тоном, что и служебные строки ленты. */
+.chat-attachment {
+  display: flex; align-items: center; gap: 8px; margin: 0 0 8px;
+  padding: 6px 10px; border-radius: var(--r-xs);
+  border: 1px solid var(--hairline);
+  background: var(--card-2); color: var(--ink-2); font-size: 12px;
+}
+.chat-attachment.busy { opacity: .7; }
+.chat-attachment.error { background: var(--fail-soft); color: var(--fail-ink);
+                         border-color: color-mix(in srgb, var(--fail) 26%, transparent); }
+#chat-attachment-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-attachment-clear {
+  margin-left: auto; background: none; border: none; padding: 0 2px;
+  font-size: 15px; line-height: 1; color: inherit; cursor: pointer;
+}
+.chat-attachment-clear:hover { color: var(--fail-ink); }
+
+/* ===========================================================================
+   ЗОНА 3: ПРОЕКТЫ (Task 7)
+
+   Список — строки-кнопки в стиле `.qitem` (та же карточная подложка, та же
+   плотность), а не таблица: название, kind-бейдж, этап словом, прогресс
+   сцен числом справа — ровно то, что design spec просит в списке. Кнопкой,
+   а не `<div role="button">`: делегированный обработчик клика страницы уже
+   ловит `button[data-act]` — второй механизм клика тут не нужен.
+
+   Панель проекта переиспользует макет диалоговой модалки (`.modal`/`.mhead`)
+   без `.mgrid`: тело — не два окна, а вертикальный список этапов, каждый в
+   своей полосе с волосяной границей снизу (`.proj-stage`), тем же приёмом,
+   что разделяет чрому и `panel-head`. Бейдж kind — намеренно без цвета
+   (правило 6 палитры этой страницы: один-единственный акцент — янтарь
+   вычисления, а kind-бейдж не о вычислении, а о типе продукта).
+   =========================================================================== */
+.proj-list { padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+.proj-list:empty { display: none; }
+.proj-item {
+  width: 100%; text-align: left; font: inherit; color: inherit;
+  border: 1px solid var(--hairline); border-radius: var(--r-inner);
+  background: var(--card-2);
+  padding: 11px 12px;
+  display: flex; align-items: center; gap: 12px;
+  transition: border-color .12s ease, background-color .12s ease;
+}
+.proj-item:hover { border-color: var(--hairline-2); background: var(--fill); }
+.proj-item .body { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.proj-item .row1 { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.proj-item .n {
+  font: 500 13px/1.3 var(--ui); color: var(--ink); letter-spacing: -.01em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.proj-item .stage { font: 11px/1.3 var(--mono); color: var(--ink-3); letter-spacing: 0; }
+.proj-item .scenes {
+  font: 11px/1 var(--mono); color: var(--ink-3); flex: none; letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+.proj-item .scenes.bad { color: var(--fail-ink); }
+
+/* Kind — метка формата, не состояние вычисления: одна нейтральная плашка на все три. */
+.badge {
+  display: inline-flex; align-items: center; flex: none;
+  font: 500 10.5px/1 var(--mono); letter-spacing: .3px; text-transform: uppercase;
+  padding: 3px 7px; border-radius: var(--r-xs);
+  background: var(--fill-2); color: var(--ink-3); border: 1px solid var(--hairline-2);
+}
+
+.proj-body { max-height: 74vh; overflow-y: auto; }
+.proj-stage { padding: 14px 16px; border-bottom: 1px solid var(--hairline); }
+.proj-stage:last-child { border-bottom: 0; }
+.proj-stage-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.proj-stage-head .t { font: 500 12.5px/1.3 var(--ui); color: var(--ink); letter-spacing: -.005em; }
+.proj-stage-status { font-size: 11.5px; color: var(--ink-3); }
+.proj-stage-body { margin-top: 10px; }
+.proj-stage-note {
+  margin: 8px 0 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.5; white-space: pre-wrap;
+}
+/* Task 2: результат «Проверить провайдера» -- те же два чернила, что `.hint.bad`/`.est-said`
+   уже используют для отказа/успеха в этой же панели, никаких новых токенов. */
+.proj-stage-note.ok  { color: var(--done-ink); font-weight: 500; }
+.proj-stage-note.bad { color: var(--fail-ink); font-weight: 500; }
+/* Находка 1 (волна ux-фиксов 2026-08-24): «идёт запрос» -- тот же сигнальный тон, что уже
+   значит «GPU считает» в остальной панели (`--accent-ink`), не новый цвет для того же смысла. */
+.proj-stage-note.busy { color: var(--accent-ink); font-weight: 500; }
+.proj-lyrics {
+  margin: 8px 0 0; padding: 9px 10px; border-radius: var(--r-xs);
+  background: var(--bg); border: 1px solid var(--hairline);
+  font-size: 11.5px; color: var(--ink-2); line-height: 1.5; white-space: pre-wrap;
+  max-height: 7.5em; overflow-y: auto;
+}
+audio.proj-audio { width: 100%; margin-top: 8px; display: block; }
+.proj-track-retry { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.proj-track-retry input.inp { width: 130px; }
+.proj-final { margin-top: 10px; }
+.proj-final a.clip { font: 12.5px/1.4 var(--mono); }
+
+/* Task 5 ("Сюжет клипа" wave): этап «Сюжет» — кнопки генерации, затем список редактируемых
+   секций. Кнопки в один ряд с переносом (та же форма, что `.proj-track-retry`), список — свои
+   карточки, не `.scene-grid`: там кадр и превью, здесь текст промпта и два коротких поля,
+   одна колонка читается быстрее, чем сетка из четырёх узких. */
+.proj-scenario-gen { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* Task 2 ("выбор провайдера для сценария"): тот же приём, что у `.mhead .prov` для селектора
+   провайдера чата -- гибкая ширина с потолком, а не `.pick`'s собственный статичный max-width,
+   чтобы на 360px строка переносилась, а не сжимала выпадашку до нечитаемой полоски. */
+.proj-scenario-gen select.scenario-provider { flex: 1 1 160px; max-width: 220px; min-width: 0; }
+/* Находка 2 (живой проход 2026-08-24): блок общей части промптов, над списком сцен -- та же
+   свёрнутая карточка, что `details.adv` уже рисует для настроек модели (шеврон, серый саммари),
+   только тело в одну колонку (текст библии + подпись «не редактируется здесь»), не `.adv-body`'s
+   собственная двухколоночная сетка -- содержимому здесь спорить не с чем. */
+.scenario-common { margin-top: 10px; }
+.scenario-common .adv-body.scenario-common-body { display: block; }
+.scenario-common .scenario-common-body .proj-lyrics { margin-top: 0; }
+/* Task 10 (волна ux-фиксов 2026-08-24): блок «Сцены» проекта, тем же приёмом -- свёрнутая
+   карточка `details.adv`, тело в одну колонку (сетка карточек сцен сама решает свою раскладку,
+   спорить с `.adv-body`'s двухколоночной сеткой ей незачем). Счётчик/статус живут в `<summary>`
+   через уже существующие `.proj-stage-head .t`/`.proj-stage-status` -- сворачивается всё, кроме
+   них, поэтому свёрнутый вид остаётся осмысленным сам по себе. */
+.proj-scenes-block .adv-body.proj-scenes-body { display: block; }
+.proj-scenes-block .proj-scenes-body .proj-stage-body { margin-top: 0; }
+.scenario-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.scenario-scene {
+  border: 1px solid var(--hairline); border-radius: var(--r-inner);
+  background: var(--card-2); padding: 9px 10px;
+}
+.scenario-scene-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.scenario-scene-head .tag {
+  font: 500 11px/1 var(--mono); color: var(--ink-2); letter-spacing: 0;
+  text-transform: uppercase;
+}
+.scenario-scene-head .timing {
+  font: 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+.scenario-scene-head .dur-inline input.num { width: 56px; text-align: right; padding: 4px 7px; }
+.scenario-prompt { margin-top: 8px; resize: vertical; min-height: 3.4em; }
+.scenario-prompt-ro {
+  margin-top: 8px; font-size: 12px; color: var(--ink-2); line-height: 1.5; white-space: pre-wrap;
+}
+.scenario-duration-ro { font-size: 11.5px; color: var(--ink-3); letter-spacing: 0; }
+/* fresh_start (P0 fix, keyframe-chain defect 2026-08-25): a visible, but deliberately quiet,
+   marker -- most scenes never set this flag, so it must not compete with the tag/timing it sits
+   next to for a human scanning many scene cards at once. */
+.fresh-start-toggle {
+  display: flex; align-items: center; gap: 5px; font: 11px/1 var(--mono); color: var(--ink-3);
+  letter-spacing: 0; cursor: pointer; white-space: nowrap;
+}
+.fresh-start-toggle input { margin: 0; }
+.fresh-start-badge {
+  font: 500 10.5px/1 var(--mono); letter-spacing: 0; text-transform: uppercase;
+  color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 3px 7px;
+}
+
+/* сетка сцен: та же карточка кадра, что и в «Готово» (`.frame`), уменьшенная. Фиксированное
+   число дорожек (не `auto-fill`), `minmax(0, …)` каждая — тот же приём, что `.results`: `1fr`
+   без снятого минимума раздвигает сетку длинным словом промпта шире экрана. */
+.scene-grid {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px;
+}
+.scene-card {
+  border: 1px solid var(--hairline); border-radius: var(--r-inner);
+  background: var(--card-2); overflow: hidden;
+}
+.scene-card .frame { aspect-ratio: 16 / 9; }
+.scene-card .info { padding: 8px 9px; display: flex; flex-direction: column; gap: 5px; }
+.scene-card .info .row1 { display: flex; align-items: center; gap: 6px; }
+.scene-card .info .idx { font: 500 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0; }
+.scene-card .info .sdur {
+  margin-left: auto; font: 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+.scene-card .info .prompt {
+  font-size: 11px; color: var(--ink-3); line-height: 1.4;
+  overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+.scene-card .acts { margin: 0 -2px -2px; }
+
+/* Task 7: панель создания проекта из чат-сессии, в шапке диалоговой модалки. */
+.chat-project-panel {
+  padding: 12px 14px; border-bottom: 1px solid var(--hairline); background: var(--card-2);
+  display: flex; flex-direction: column; gap: 10px;
+}
+.cpp-row { display: flex; align-items: center; gap: 10px; }
+.cpp-track { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12.5px; color: var(--ink-2); }
+.cpp-track label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+
+/* ---------- узкие окна -----------------------------------------------------
+   Страница держит от 360 до 1920 (C3). Сверху её ограничивает --shell: за
+   1380 px растут поля, а не строки — строка в полтора экрана не читается.
+   Снизу — четыре ступени ниже. Правило у всех одно: сначала уходит то, что
+   можно узнать иначе (адрес, подпись показания, приборная строка), потом
+   колонки складываются в одну, и только в последнюю очередь мельчает набор.
+   Ни одна из ступеней ничего не обрезает: то, что не помещается в ряд,
+   переносится (`flex-wrap`), а не уезжает за край.
+   --------------------------------------------------------------------------- */
+@media (max-width: 1180px) {
+  .form-grid { grid-template-columns: minmax(0, 1fr); }
+  .results { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .chrome-in { gap: 12px; }
+  /* Подпись и значение прячутся парой: одинокое «● запущен» без слова «работник» не
+     говорит, что именно запущено, а лампа своей формой и цветом говорит то же самое и одна. */
+  .stat.worker .k, .stat.worker .v, .host { display: none; }
+}
+@media (max-width: 1040px) {
+  .running { grid-template-columns: minmax(0, 1fr); }
+  .running img, .running .noshot { width: 100%; max-width: 320px; }
+}
+/* ---------- блоки волны 1.5: библиотека, настройки и референсы проекта, апскейл, предупреждения ---------- */
+/* Карточка в духе `.proj-stage`: вложенная плоскость на токенах, без собственных цветов. */
+.lib-card, .project-settings, .project-refs, .upscale-status {
+  background: var(--card); border: 1px solid var(--hairline); border-radius: var(--r-inner);
+  padding: 12px 14px; margin: 10px 0;
+}
+.lib-card { display: flow-root; }
+.lib-card img { float: left; margin: 0 12px 6px 0; width: 96px; height: 96px; object-fit: cover; border-radius: var(--r-ctl); }
+.lib-card p { margin: 4px 0; }
+.lib-card input { margin: 6px 0; }
+.lib-card-error { color: var(--fail-ink); font-size: 12px; }
+.muted { color: var(--ink-3); }
+.project-settings, .project-refs { display: grid; gap: 8px; }
+.project-settings textarea { width: 100%; box-sizing: border-box; }
+.project-refs h4 { margin: 0; font: 500 12.5px/1.3 var(--ui); color: var(--ink); }
+.project-refs label, .route-upscale { display: flex; align-items: center; gap: 8px; }
+.project-refs input[type="checkbox"], .route-upscale input[type="checkbox"] { width: auto; flex: none; }
+.route-upscale { margin: 8px 0; }
+.upscale-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12.5px; }
+.tag-warnings {
+  background: var(--warn-soft); color: var(--warn-ink); border-radius: var(--r-inner);
+  margin: 8px 0; padding: 8px 14px 8px 28px; font-size: 12.5px;
+}
+
+@media (max-width: 860px) {
+  :root { --pad: 16px; }
+  .params, .adv-body { grid-template-columns: minmax(0, 1fr); }
+  .results { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 12px; }
+  .readout .stat:nth-child(n+2) { display: none; }
+  .rail-run { display: none; }
+  .qitem { flex-wrap: wrap; }
+  .qitem .acts { width: 100%; justify-content: flex-start; margin-left: 26px; }
+  /* Колонки модалки — друг под друга, промпт сверху: он главный, лента — способ его
+     получить. Линия между ними переезжает с правого края левой колонки на её низ. */
+  .mgrid { grid-template-columns: minmax(0, 1fr); }
+  .mleft { border-right: 0; border-bottom: 1px solid var(--hairline); }
+  .mleft .editor { height: min(38vh, 300px); min-height: 180px; }
+  .chat-log { max-height: 42vh; }
+  .proj-item { flex-wrap: wrap; }
+  .proj-item .scenes { margin-left: auto; }
+  .scene-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 620px) {
+  /* Шапка модалки перестаёт быть одной строкой: действия уходят на свою, во всю ширину.
+     Раньше их выдавливало за правый край окна — то самое замечание про кнопки. */
+  .mhead { gap: 8px 10px; }
+  .mhead .spacer { display: none; }
+  .mhead .prov { flex: 1 1 140px; }
+  .mhead-acts { width: 100%; }
+  .mhead-acts #chat-finish { flex: 1; justify-content: center; }
+  .qstate-row .spacer { display: none; }
+  .qstate-row #queue-pause-toggle { width: 100%; justify-content: center; }
+  .est-actions .inverse { flex: 1 1 100%; }
+  .editor-bar .sel { flex: 1 1 100%; }
+  .editor-bar .spacer { display: none; }
+}
+@media (max-width: 420px) {
+  /* 360 — самое узкое окно, ради которого страница вообще проверяется: телефон, с которого
+     смотрят на ночную очередь из кухни. Поля жмутся до 10 px, окно промпта опускается до
+     высоты, при которой под ним ещё видно разбор, а модалка занимает экран целиком. */
+  :root { --pad: 10px; }
+  .chrome-in { gap: 8px; }
+  .mark { padding-right: 10px; }
+  .mark-name, .poll { display: none; }
+  .editor { height: 240px; }
+  /* BACKLOG "UX-мелочи", task 4. На десктопе подложка (`.modal-back`) нарочно прокручивается
+     сама (см. её докстринг выше `.modal-back`) -- окно центрируется `margin: auto` и на длинном
+     содержимом просто уезжает вверх. На 360 это же поведение -- баг: `.modal` был во весь экран
+     (`min-height: 100%`) без верхней границы высоты, так что длинный диалог в `.chat-log` не
+     упирался в свой собственный `max-height` первым -- он в него упирался, но вся `.modal`
+     колонка (шапка + промпт + лента + композер) всё равно оказывалась выше экрана целиком, и
+     листать приходилось саму подложку, а не ленту внутри неё: палец там, где текст, а
+     прокручивается всё окно вокруг него.
+     Фикс -- дать `.modal` собственную, действительно ограниченную высоту (`height: 100%`
+     вместо одного лишь `min-height`, плюс `display: flex` колонкой), чтобы `.mgrid` забирал
+     остаток (`flex: 1; min-height: 0`) и прокручивался сам, если promt-колонка тоже не
+     влезает, а `.chat-log` внутри него — тем более (свой `overflow-y`/`max-height` у неё уже
+     есть, см. `.chat-log` выше). Подложке при таком фиксе просто нечего прокручивать. */
+  .modal-back { padding: 0; overflow: hidden; }
+  .modal {
+    width: 100%; height: 100%; min-height: 0;
+    border-radius: 0; border-left: 0; border-right: 0;
+    display: flex; flex-direction: column;
+  }
+  .mgrid, .proj-body { flex: 1; min-height: 0; overflow-y: auto; }
+  /* `overscroll-behavior: contain` -- долистав ленту до конца, дальнейший свайп не должен
+     «протекать» на то, что находится под ней (`.mgrid`, а через него и подложку): без этого
+     сама лента больше не скроллится вместо подложки, но жест у её края всё равно перехватывает
+     родителя, что на телефоне читается как «дёрнулось не то». Тот же приём — `.proj-body`
+     (Task 7): панель проекта на 360 занимает весь экран той же логикой. */
+  .chat-log, .proj-body { overscroll-behavior: contain; }
+  .mleft, .chat-log, .composer, .mhead { padding-left: 10px; padding-right: 10px; }
+  .dndhint { display: none; }
+  .run-num { gap: 14px; }
+  .acts button { padding: 4px 6px; }
+  .scene-grid { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .proj-stage { padding: 12px 10px; }
+  #library form, .project-settings, .project-refs { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .lib-card input, .project-settings textarea { width: 100%; }
+}
+
+/* ---------- уважение к системной настройке движения ---------- */
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+
+.gpu-row { max-width: var(--shell); margin: 0 auto; padding: 0 var(--pad) 8px; display: flex;
+  flex-wrap: wrap; align-items: center; gap: 8px; }
+.gpu-row:not(:has(> :not([hidden]))) { display: none; }   /* mlx: ни одного элемента — строки нет */
+.gpu-banner { padding: 2px 8px; border-radius: 4px; font-size: 0.9em; }
+.gpu-banner[data-tone="wait"] { background: var(--warn-soft); }
+.gpu-banner[data-tone="own"] { background: var(--accent-soft); }
+.gpu-banner[data-tone="bad"] { background: var(--fail-soft); }
+.scenario-prompt.has-tag-issues { outline: 2px solid var(--fail); }
+.tag-hint { font-size: 0.85em; }
+body:not([data-platform="darwin"]) [data-act="reveal"] { display: none; }
+
+/* ---------- редактор сцен видеопроекта (Task 7) ---------- */
+.scene-editor { display: flex; flex-direction: column; gap: 10px; }
+.scene-editor-note { margin: 0; }
+.scene-edit {
+  border: 1px solid var(--hairline); border-radius: var(--r-ctl); background: var(--card-2);
+  padding: 10px; display: flex; flex-direction: column; gap: 8px;
+}
+.scene-edit-head { display: flex; align-items: center; gap: 6px; }
+.scene-edit-head .idx { font: 500 11px/1 var(--mono); color: var(--ink-3); letter-spacing: 0; }
+.scene-edit-prompt { resize: vertical; min-height: 5.5em; background: var(--card); }
+.scene-edit-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.scene-edit-row label { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.scene-edit-row input.num { width: 84px; padding: 4px 7px; text-align: right; }
+.scene-edit-row .fresh-start-toggle input { width: auto; }
+.scene-editor-acts { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dirty-note { font-size: 11.5px; color: var(--warn-ink); }
+.scene-edit-row input[data-scene-field="seed"] { width: 150px; }
+.scene-edit-error { font-weight: 500; }
+
+/* ---------- редактор сцен: подсказка @, референсы, стартовый кадр, JSON (Task 8) ---------- */
+.tag-hint-slot:empty { display: none; }
+.tag-hint { display: flex; flex-wrap: wrap; gap: 6px; }
+.tag-pick {
+  font: 500 11.5px/1 var(--mono); letter-spacing: 0; padding: 5px 8px;
+  border: 1px solid var(--hairline); border-radius: 999px; background: var(--card); color: var(--ink-2);
+}
+.tag-pick:hover { border-color: var(--accent); color: var(--accent); }
+.scene-refs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-size: 12px; }
+.scene-refs-label { color: var(--ink-3); }
+.scene-refs label { display: flex; align-items: center; gap: 5px; }
+.scene-refs input { width: auto; margin: 0; }
+.start-image { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; font-size: 12px; }
+.start-image select { width: auto; min-width: 180px; }
+.start-thumb { height: 56px; width: auto; border-radius: 6px; border: 1px solid var(--hairline); }
+.scenario-json { margin-top: 10px; }
+.scenario-json textarea { margin: 8px 0; }
+.ref-missing { color: var(--fail-ink); font-size: 11.5px; }
+
+/* ---------- библиотека: превью, новая версия, выбор версии (Task 9) ---------- */
+.lib-thumb { width: 96px; height: 96px; object-fit: cover; border-radius: 8px; border: 1px solid var(--hairline); display: block; margin-bottom: 6px; }
+.lib-new-files { margin-top: 8px; width: 100%; font-size: 12px; }
+.ref-version { width: auto; min-width: 72px; margin: 0 0 6px 6px; padding: 3px 6px; }
+.lock-note { margin: 6px 0 0; }
+
+/* ---------- прогон на sglang, блокировки, пересъёмка с правкой (Task 10) ---------- */
+.running.sglang-run { grid-template-columns: minmax(0, 1fr); }
+.run-wait { color: var(--warn-ink); }
+.saved-mark { margin-left: 8px; font-size: 11.5px; color: var(--ok-ink, var(--ink-3)); }
+.project-settings { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.project-seed { width: 120px; }
+.scene-params { font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
+.scene-prompt { font-size: 12px; margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.scene-prompt summary { cursor: pointer; list-style-position: outside; }
+.retry-panel {
+  grid-column: 1 / -1; border: 1px solid var(--hairline); border-radius: var(--r-ctl);
+  background: var(--card-2); padding: 10px; display: flex; flex-direction: column; gap: 8px;
+}
+.retry-prompt { resize: vertical; min-height: 5.5em; }
+.retry-panel button { align-self: flex-start; }
+.scene-edit-row input.retry-seed, .scene-edit-row input.retry-steps { width: calc(20ch + 24px); }
+.project-settings textarea:disabled, .project-settings input:disabled { opacity: .55; cursor: not-allowed; }
+.upscale-error { margin: 6px 0 0; }
+.proj-final { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 8px; }
+.retry-error { margin: 0; }
+
+/* ---------- «Промпт для H3» под сценой (Task 8b) ---------- */
+.h3-prompt { border-top: 1px dashed var(--hairline); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.h3-prompt pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.45 var(--mono); }
+.h3-pictures { display: flex; flex-wrap: wrap; gap: 8px; }
+.h3-pictures figure { margin: 0; font-size: 11px; color: var(--ink-3); }
+.h3-pictures img { display: block; height: 64px; width: auto; border-radius: 6px; border: 1px solid var(--hairline); }
+
+/* the chat opens from the project modal (and the form): it must sit above it, not behind
+   it -- both are `.modal-back` and the project modal comes later in the page */
+#chat-modal { z-index: 51; }

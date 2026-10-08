@@ -1,0 +1,2 @@
+{"steps": 25, "status": "completed", "wall_s": 540.2, "inference_time_s": 527.2317851049593, "peak_memory_mb": 55378.0, "error": null, "id": "1d0b8413-4322-434e-8c26-dab4dd76ab73"}
+{"steps": 35, "status": "completed", "wall_s": 750.2, "inference_time_s": 737.6500486899167, "peak_memory_mb": 54006.0, "error": null, "id": "90affb82-4704-4f33-a8c6-51a615f20df0"}
