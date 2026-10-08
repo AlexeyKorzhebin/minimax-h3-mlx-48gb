@@ -70,7 +70,7 @@ export function formatGb(x) {
 }
 
 /** Плашка GPU (спека §3.3.13–14): что сказать сверху на любой вкладке. */
-export function gpuBanner(gpu, nowMs) {
+export function gpuBanner(gpu, nowMs, projects = []) {
   const hidden = { visible: false, text: "", tone: "", qwenUnload: false, qwenRestore: false };
   if (!gpu || !gpu.ok) return hidden;
   const d = gpu.dispatcher;
@@ -97,6 +97,18 @@ export function gpuBanner(gpu, nowMs) {
                + (holders ? ` — карту держит ${holders}` : "") };
   }
   const own = Object.keys(d.own || {});
+  if (run) {
+    const since = Date.parse(run.started_at);
+    const took = formatDuration(Number.isFinite(since) ? Math.max(0, (nowMs - since) / 1000) : 0);
+    const named = runWhat(run.note, projects);
+    if (!own.length) {
+      return { visible: true, tone: "own", qwenUnload: false, qwenRestore,
+               text: `H3 поднимается для ${named.what}` };
+    }
+    const memory = d.gpu ? `, ${formatGb(d.gpu.memory_used_mb / 1024)}` : "";
+    return { visible: true, tone: "own", qwenUnload: false, qwenRestore,
+             text: `Карту держит панель: ${named.active} — ${took}${memory}` };
+  }
   if (own.length && !run) {
     // финальное ревью C3: у движка есть владелец; «панель» — воркер (и запись до владельцев)
     const whose = (n) => {
@@ -118,6 +130,48 @@ export function gpuBanner(gpu, nowMs) {
   }
   return { ...hidden, visible: qwenRestore, qwenRestore,
            text: qwenRestore ? "Qwen выгружен панелью — его можно вернуть" : "" };
+}
+
+/** Что считается по `job.note`: `{what}` — для «H3 поднимается для …», `{active}` — для «Карту
+ *  держит панель: …». Заметка, которую страница не знает, сырой не выводится. */
+function runWhat(note, projects) {
+  const title = (id) => {
+    const found = (projects || []).find((p) => p.id === id);
+    return found && found.title ? found.title : id;
+  };
+  const text = String(note || "");
+  let m = text.match(/^project scene (\S+) #(\d+)$/);
+  if (m) { const what = `«${title(m[1])}», сцена #${m[2]}`; return { what, active: `H3 считает ${what}` }; }
+  m = text.match(/^upscale project (\S+)$/);
+  if (m) return { what: `апскейл «${title(m[1])}»`, active: `LTX апскейлит «${title(m[1])}»` };
+  m = text.match(/^assemble project (\S+)$/);
+  if (m) { const what = `сборка «${title(m[1])}»`; return { what, active: what }; }
+  m = text.match(/^project track (\S+)$/);
+  if (m) { const what = `трек «${title(m[1])}»`; return { what, active: `H3 считает ${what}` }; }
+  return { what: "задача", active: "H3 считает задачу" };
+}
+
+/** Цифры прогона на sglang из аргументов и оценки задачи: проходов нет, есть время и доля. */
+export function sglangRunView(job, nowMs) {
+  const args = job.args || [];
+  const pick = (flag) => argValue(args, flag);
+  const chained = pick("--aspect") === "auto";
+  const requested = Number(pick("--duration"));
+  // a chained scene delivers one frame less than it requests (the repeated keyframe)
+  const delivered = chained ? (Math.round(requested * 24) - 1) / 24 : requested;
+  const parts = [`${pick("--width")}×${pick("--height")}`];
+  if (Number.isFinite(delivered)) parts.push(secondsText(delivered));
+  if (pick("--seed") !== null && pick("--seed") !== undefined) parts.push(`сид ${pick("--seed")}`);
+  if (pick("--steps")) parts.push(`${pick("--steps")} шагов`);
+  const since = Date.parse(job.started_at);
+  const passed = Number.isFinite(since) ? Math.max(0, (nowMs - since) / 1000) : 0;
+  const estimate = jobSeconds(job);
+  return {
+    spec: parts.join(" · "), elapsed: formatDuration(passed),
+    total: `≈${formatDuration(estimate)}`,
+    share: estimate ? Math.min(99, Math.floor((100 * passed) / estimate)) : 0,
+    leftSeconds: Math.max(0, estimate - passed), waiting: Boolean(job.wait_reason),
+  };
 }
 
 const WAIT_NOTIFY_AFTER_MS = 10 * 60_000;
@@ -176,7 +230,7 @@ const TAG_IN_TEXT = /(?<![\w@.])@([A-Za-z0-9-]+)/g;
 const TAG_OK = /^@[a-z0-9-]{2,32}$/;
 
 /** @-теги сцены, которые не уйдут в H3 (спека §3.5): незнакомые проекту и написанные не так. */
-export function sceneTagIssues(text, pinnedTags, { needsTag = false } = {}) {
+export function sceneTagIssues(text, pinnedTags, { needsTag = false, refs = [] } = {}) {
   const issues = [];
   const seen = new Set();
   for (const match of String(text || "").matchAll(TAG_IN_TEXT)) {
@@ -186,7 +240,8 @@ export function sceneTagIssues(text, pinnedTags, { needsTag = false } = {}) {
     if (!TAG_OK.test(tag)) issues.push({ tag, problem: "invalid" });
     else if (!pinnedTags.includes(tag)) issues.push({ tag, problem: "unknown" });
   }
-  if (needsTag && seen.size === 0) issues.push({ tag: null, problem: "missing" });
+  // a scene with refs needs no tag in its text: the refs carry the pictures (626db48d)
+  if (needsTag && seen.size === 0 && !(refs && refs.length)) issues.push({ tag: null, problem: "missing" });
   return issues;
 }
 
@@ -204,19 +259,501 @@ export function projectTagWarningsHtml(proj, engine) {
   const needsTag = proj.kind !== "clip";
   const rows = [];
   for (const scene of proj.scenes || []) {
-    for (const issue of sceneTagIssues(scene.prompt, pinned, { needsTag })) {
+    for (const issue of sceneTagIssues(scene.prompt, pinned, { needsTag, refs: scene.refs || [] })) {
       rows.push(`<li>Сцена ${scene.idx}: ${escapeHtml(TAG_PROBLEM_TEXT[issue.problem](issue.tag))}</li>`);
     }
   }
   return rows.length ? `<ul class="tag-warnings">${rows.join("")}</ul>` : "";
 }
 
-export function projectSettingsHtml(proj) {
+/** Те же три строки, что `web.PROJECT_LOCK_TEXT` (сервер отказывает ими же, `project_running`). */
+export const PROJECT_LOCK_TEXT = {
+  references: "Проект считается — референсы меняются после конца прогона. Чтобы поменять "
+    + "для части сцен: дождитесь конца и пересчитайте с нужной сцены.",
+  settings: "Проект считается — начало сцепленной сцены и сид меняются после конца прогона. "
+    + "Чтобы поменять для части сцен: дождитесь конца и пересчитайте с нужной сцены.",
+  route: "Идёт апскейл или сборка — галочку апскейла можно поменять после них.",
+};
+
+/** Почему правка проекта сейчас закрыта: текст или `null`. Референсы и настройки — пока идёт
+ *  любая задача проекта, галочка апскейла — только пока идут апскейл или сборка. */
+export function projectLocks(proj, activeJob) {
+  const busy = Boolean(activeJob);
+  return {
+    references: busy ? PROJECT_LOCK_TEXT.references : null,
+    settings: busy ? PROJECT_LOCK_TEXT.settings : null,
+    route: activeJob && (activeJob.kind === "upscale" || activeJob.kind === "assembly")
+      ? PROJECT_LOCK_TEXT.route : null,
+  };
+}
+
+/** `saved` — поле, сохранённое последним (`"i2v_prefix"`/`"seed"`): рядом с ним «сохранено ✓». */
+export function projectSettingsHtml(proj, engine, lock = null, saved = null) {
   const id = escapeHtml(proj.id);
+  const off = lock ? " disabled" : "";
+  const mark = (field) => (saved === field ? `<span class="saved-mark">сохранено ✓</span>` : "");
+  const sglang = engine === "sglang";
   return `<div class="project-settings" data-id="${id}"><label>Начало сцепленной сцены `
-    + `(i2v_prefix) <textarea class="i2v-prefix" data-id="${id}" rows="2">`
-    + `${escapeHtml(proj.i2v_prefix || "")}</textarea></label> `
-    + `<button type="button" class="draft-assembly" data-id="${id}">Черновая сборка</button></div>`;
+    + `(i2v_prefix) <textarea class="i2v-prefix" data-id="${id}" rows="2"${off}>`
+    + `${escapeHtml(proj.i2v_prefix || "")}</textarea></label>${mark("i2v_prefix")}`
+    + (sglang
+      ? `<label>Сид проекта <input class="inp num project-seed" type="number" min="0" data-id="${id}" `
+        + `value="${proj.seed === null || proj.seed === undefined ? "" : escapeHtml(proj.seed)}" `
+        + `placeholder="по умолчанию: 42"${off}></label> `
+        + `<button type="button" class="ghost" data-act="project-seed-save" data-id="${id}"${off}>`
+        + `Сохранить сид</button>${mark("seed")}` : "")
+    + (lock ? `<p class="why lock-note">${escapeHtml(lock)}</p>` : "") + `</div>`;
+}
+
+/* -- редактор сцен видеопроекта (Task 7) ---------------------------------------------------
+   Чистая половина: черновик сцен как массив `Draft`, его операции и разметка. DOM-половина
+   (снятие значений полей в черновик, метка версии `draftEpoch`) — на странице ниже. */
+
+/** Границы длительности одной сцены: на sglang 3–15 с, на MLX 5–10 с. */
+export function sceneBounds(engine) {
+  return engine === "sglang" ? { min: 3, max: 15 } : { min: 5, max: 10 };
+}
+
+/** Python `round`: к ближайшему целому, ничья — к чётному (JS `Math.round` на ничьей идёт вверх). */
+function roundHalfEven(x) {
+  const floor = Math.floor(x);
+  const diff = x - floor;
+  if (diff === 0.5) return floor % 2 === 0 ? floor : floor + 1;
+  return diff < 0.5 ? floor : floor + 1;
+}
+
+/** Зеркало `web._snap_video_scenes_sglang` для одной сцены: 24 к/с, запрошенные кадры `17n+5`,
+ *  у сцепленной поставка на кадр меньше (она повторяет кадр-ключ), пределы 73..345 запрошенных. */
+export function sglangGridSeconds(duration, chained) {
+  const FPS = 24, STEP = 17, LATENTS = 5, OVERLAP = chained ? 1 : 0;
+  const remainder = (((LATENTS - OVERLAP) % STEP) + STEP) % STEP;
+  const frames = roundHalfEven(Number(duration) * FPS);
+  const minimum = remainder || STEP;
+  const mod = (((frames - remainder) % STEP) + STEP) % STEP;
+  let below = frames - mod;
+  if (below < minimum) below = minimum;
+  const above = below >= frames ? below : below + STEP;
+  let nearest = frames - below <= above - frames ? below : above;
+  nearest = Math.min(Math.max(nearest, 73 - OVERLAP), 345 - OVERLAP);
+  return nearest / FPS;
+}
+
+/** `5.1666…` → «на сетке: 5,17 с»; целые без хвоста: `8` → «на сетке: 8 с». */
+function secondsText(seconds) {
+  return `${Number(seconds).toFixed(2).replace(/\.?0+$/, "").replace(".", ",")} с`;
+}
+
+export function gridHint(seconds) {
+  return `на сетке: ${secondsText(seconds)}`;
+}
+
+export function draftFromScenes(scenes) {
+  return (scenes || []).map((scene) => ({
+    prompt: scene.prompt || "", duration: scene.duration, fresh_start: Boolean(scene.fresh_start),
+    seed: scene.seed ?? null, steps: scene.steps ?? null, start_image: scene.start_image ?? null,
+    refs: Array.isArray(scene.refs) ? scene.refs.slice() : [],
+  }));
+}
+
+/** Кадр-старт принадлежит позиции 0, а не сцене; у сцены, ставшей нулевой, цепляться не к чему. */
+function pinStartImage(scenes, startImage) {
+  return scenes.map((scene, idx) => (idx === 0
+    ? { ...scene, start_image: startImage, fresh_start: false }
+    : { ...scene, start_image: null }));
+}
+
+export function addScene(draft) {
+  const last = draft.length ? draft[draft.length - 1].duration : 8;
+  return [...draft.map((scene) => ({ ...scene })), { prompt: "", duration: last, fresh_start: false,
+    seed: null, steps: null, start_image: null, refs: [] }];
+}
+
+export function removeScene(draft, idx) {
+  if (!draft[idx]) return draft.map((scene) => ({ ...scene }));
+  const startImage = draft.length ? draft[0].start_image : null;
+  return pinStartImage(draft.filter((_, i) => i !== idx), startImage);
+}
+
+export function moveScene(draft, idx, delta) {
+  const target = idx + delta;
+  if (!draft[idx] || target < 0 || target >= draft.length) return draft.map((scene) => ({ ...scene }));
+  const moved = draft.map((scene) => ({ ...scene }));
+  [moved[idx], moved[target]] = [moved[target], moved[idx]];
+  return pinStartImage(moved, draft[0].start_image);
+}
+
+/** The first thing the server would refuse, with the scene it belongs to: `{idx, message}`. Seed
+ *  and steps exist only on sglang (`web._scene_edit_fields`: seed integer >= 0, steps 2..100). */
+export function scenesClientIssue(draft, engine, pinnedTags) {
+  const { min, max } = sceneBounds(engine);
+  const sglang = engine === "sglang";
+  const whole = (v) => typeof v === "number" && Number.isInteger(v);
+  for (let i = 0; i < draft.length; i += 1) {
+    const scene = draft[i];
+    const issue = (text) => ({ idx: i, message: `Сцена #${i}: ${text}` });
+    if (!String(scene.prompt || "").trim()) return issue("пустой промпт");
+    const d = Number(scene.duration);
+    if (!Number.isFinite(d) || d < min || d > max) return issue(`длительность ${min}–${max} с`);
+    const seed = scene.seed ?? null;
+    const steps = scene.steps ?? null;
+    if (sglang && seed !== null && !(whole(seed) && seed >= 0)) return issue("сид — целое число от 0");
+    const stray = sglang && pinnedTags ? (scene.refs || []).find((tag) => !pinnedTags.includes(tag)) : null;
+    if (stray) return issue(`референс ${stray} не подключён к проекту — снимите галочку или подключите карточку`);
+    if (sglang && steps !== null && !(whole(steps) && steps >= 2 && steps <= 100)) {
+      return issue("шаги — целое число от 2 до 100");
+    }
+  }
+  return null;
+}
+
+export function scenesClientError(draft, engine, pinnedTags) {
+  const issue = scenesClientIssue(draft, engine, pinnedTags);
+  return issue ? issue.message : null;
+}
+
+/** Тело `PUT /scenes`. seed/steps/refs уходят только на sglang: на MLX сервер их отклоняет. */
+export function scenesPayload(draft, engine) {
+  const sglang = engine === "sglang";
+  return { scenes: draft.map((scene, idx) => {
+    const out = { prompt: scene.prompt, duration: scene.duration };
+    if (idx > 0) out.fresh_start = Boolean(scene.fresh_start);
+    if (idx === 0 && scene.start_image) out.start_image = scene.start_image;
+    if (sglang) {
+      if (scene.seed !== null && scene.seed !== undefined) out.seed = scene.seed;
+      if (scene.steps !== null && scene.steps !== undefined) out.steps = scene.steps;
+      if (scene.refs && scene.refs.length) out.refs = scene.refs.slice();
+    }
+    return out;
+  }) };
+}
+
+export function randomSeed(rand = Math.random) {
+  return Math.floor(rand() * 2 ** 31);
+}
+
+export function seedPlaceholder(projectSeed) {
+  return projectSeed === null || projectSeed === undefined
+    ? "по умолчанию: 42" : `по проекту: ${projectSeed}`;
+}
+
+export const STEPS_NOTE = "Шаги: по умолчанию 50; 25 — черновик, вдвое быстрее, мягче лица и руки.";
+
+function sceneEditHtml(scene, idx, total, ctx) {
+  const sglang = ctx.engine === "sglang";
+  const { min, max } = sceneBounds(ctx.engine);
+  const chained = idx > 0 && !scene.fresh_start;
+  const pinnedTags = (ctx.pinned || []).filter((card) => card.kind !== "voice").map((card) => card.tag);
+  const num = (value) => (value === null || value === undefined || Number.isNaN(value) ? "" : value);
+  const button = (act, label, disabled) => `<button type="button" class="ghost" data-act="${act}" `
+    + `data-idx="${idx}"${disabled ? " disabled" : ""}>${label}</button>`;
+  const row = [`<label>Длительность <input class="inp num" type="number" step="0.5" min="${min}" `
+    + `max="${max}" data-scene-field="duration" data-idx="${idx}" value="${num(scene.duration)}"> с</label>`];
+  if (sglang) {
+    row.push(`<span class="hint grid-hint" data-idx="${idx}">`
+      + `${gridHint(sglangGridSeconds(scene.duration, chained))}</span>`
+      + `<label>Сид <input class="inp num" type="number" min="0" data-scene-field="seed" `
+      + `data-idx="${idx}" value="${num(scene.seed)}" placeholder="${escapeHtml(seedPlaceholder(ctx.projectSeed))}">`
+      + `</label>${button("scene-seed-random", "случайный", false)}`
+      + `<label>Шаги <input class="inp num" type="number" min="2" max="100" data-scene-field="steps" `
+      + `data-idx="${idx}" value="${num(scene.steps)}" placeholder="50"></label>`);
+  }
+  if (idx > 0) {
+    row.push(`<label class="fresh-start-toggle"><input type="checkbox" data-scene-field="fresh_start" `
+      + `data-idx="${idx}"${scene.fresh_start ? " checked" : ""}> начать с чистого листа</label>`);
+  }
+  return `<div class="scene-edit" data-idx="${idx}"><div class="scene-edit-head">`
+    + `<span class="idx">#${idx}</span><div class="spacer"></div>`
+    + button("scene-up", "↑", idx === 0) + button("scene-down", "↓", idx === total - 1)
+    + (total > 1 ? button("scene-del", "Удалить", false) : "")
+    + (sglang ? `<button type="button" class="ghost" data-act="scene-h3-prompt" data-id="${escapeHtml(ctx.id)}" `
+      + `data-idx="${idx}">Промпт для H3</button>` : "") + `</div>`
+    + `<textarea class="inp scene-edit-prompt" data-scene-field="prompt" data-idx="${idx}" rows="4">`
+    + `${escapeHtml(scene.prompt)}</textarea>`
+    + (sglang ? `<div class="tag-hint-slot" data-idx="${idx}"></div>`
+      + sceneRefsHtml(scene, idx, pinnedTags, ctx.refTags || pinnedTags) : "")
+    + `<div class="scene-edit-row">${row.join("")}</div>`
+    + (idx === 0 ? startImageFieldHtml(scene.start_image, ctx.pinned || [], ctx.outdir) : "")
+    + (ctx.h3Prompts && ctx.h3Prompts[idx] ? h3PromptHtml(ctx.h3Prompts[idx], ctx.outdir) : "")
+    + (ctx.error && ctx.error.idx === idx
+      ? `<span class="hint bad scene-edit-error" data-idx="${idx}">${escapeHtml(ctx.error.message)}</span>` : "")
+    + `</div>`;
+}
+
+/** Редактор сцен: поля несут `data-scene-field`/`data-idx`, кнопки — `data-act`; `ctx.epoch` —
+ *  версия черновика, из которого нарисован этот DOM (см. `syncDraftFromDom`). */
+export function sceneEditorHtml(draft, ctx) {
+  const id = escapeHtml(ctx.id);
+  return `<div class="scene-editor" data-id="${id}" data-epoch="${ctx.epoch}">`
+    + (ctx.engine === "sglang" ? `<p class="hint scene-editor-note">${escapeHtml(STEPS_NOTE)}</p>` : "")
+    + draft.map((scene, idx) => sceneEditHtml(scene, idx, draft.length, ctx)).join("")
+    + `<div class="scene-editor-acts">`
+    + `<button type="button" class="ghost" data-act="scene-add" data-id="${id}">+ Сцена</button>`
+    + `<button type="button" class="inverse" data-act="scenes-save" data-id="${id}">Сохранить сценарий</button>`
+    + `<span class="dirty-note"${ctx.dirty ? "" : " hidden"}>не сохранено</span></div></div>`;
+}
+
+/** Подключённые к проекту карточки в подключённой версии (`card.versions` из списка библиотеки,
+ *  иначе текущая): `[{tag, kind, assets}]`. Карточки, которых в библиотеке уже нет, пропускаются. */
+export function pinnedCards(references, cards) {
+  const byTag = new Map((cards || []).map((card) => [card.tag, card]));
+  const out = [];
+  for (const ref of references || []) {
+    const card = byTag.get(ref.tag);
+    if (!card) continue;
+    const version = (card.versions || []).find((v) => v.version === ref.version);
+    out.push({ tag: card.tag, kind: (version && version.kind) || card.kind,
+      assets: (version && version.assets) || card.assets || [] });
+  }
+  return out;
+}
+
+const TAG_BEFORE_CARET = /(?:^|[^\w@.])@([a-z0-9-]*)$/;
+
+/** Подставляет `tag` вместо недописанного `@…` перед кареткой; пробел после тега — только если
+ *  дальше не пробельный символ, каретка — после этого пробела. */
+export function insertTagAt(text, caret, tag) {
+  const value = String(text || "");
+  const head = value.slice(0, caret);
+  const rest = value.slice(caret);
+  const match = head.match(TAG_BEFORE_CARET);
+  let before = head;
+  let lead = "";
+  if (match) before = head.slice(0, head.length - match[1].length - 1);
+  else if (head && !/\s$/.test(head)) lead = " ";
+  const needSpace = !/^\s/.test(rest);
+  const inserted = `${lead}${tag}${needSpace ? " " : ""}`;
+  const out = `${before}${inserted}${rest}`;
+  return { text: out, caret: before.length + inserted.length + (needSpace ? 0 : 1) };
+}
+
+export function tagHintHtml(text, caret, cards) {
+  const matches = tagSuggestions(text, caret, cards);
+  if (!matches.length) return "";
+  return `<div class="tag-hint">` + matches.map((card) => `<button type="button" class="tag-pick" `
+    + `data-act="tag-pick" data-tag="${escapeHtml(card.tag)}">${escapeHtml(card.tag)}</button>`).join("")
+    + `</div>`;
+}
+
+/** `/media/…` для кадра в поле сцены 0: только картинка внутри `outdir` и без `.`/`..` в пути —
+ *  верхнеуровневый `start_image` проекта сервер не проверяет, ему адрес не доверяем. */
+function startImageUrl(path, outdir) {
+  const p = String(path || "");
+  if (!/\.(png|jpe?g)$/i.test(p) || !outdir || !p.startsWith(`${outdir}/`)) return null;
+  if (p.slice(outdir.length + 1).split("/").some((part) => part === "." || part === ".." || part === "")) {
+    return null;
+  }
+  return projectMediaUrl(p, outdir);
+}
+
+export function startImageFieldHtml(current, pinnedCards_, outdir) {
+  const cur = current || "";
+  const cards = (pinnedCards_ || []).filter((card) => card.kind !== "voice");
+  const option = (value, label, selected) => `<option value="${escapeHtml(value)}"`
+    + `${selected ? " selected" : ""}>${escapeHtml(label)}</option>`;
+  let options = option("", "без кадра", cur === "")
+    + cards.map((card) => option(card.tag, `${card.tag} — кадр карточки`, card.tag === cur)).join("");
+  if (cur && !cards.some((card) => card.tag === cur)) {
+    options += option(cur, cur.startsWith("@") ? cur : cur.split("/").pop(), true);
+  }
+  const card = cards.find((c) => c.tag === cur);
+  const url = startImageUrl(card ? (card.assets || [])[0] : cur, outdir);
+  return `<div class="start-image"><label>Стартовый кадр `
+    + `<select class="inp" data-scene-field="start_image" data-idx="0">${options}</select></label> `
+    + `<button type="button" class="ghost" data-act="scene0-upload">Загрузить кадр…</button>`
+    + (url ? `<img class="start-thumb" src="${escapeHtml(url)}" alt="">` : "") + `</div>`;
+}
+
+/** Референсы сцены без упоминания в тексте — только sglang и только если есть что выбрать. */
+export function sceneRefsHtml(scene, idx, pinnedTags, knownTags = pinnedTags) {
+  const chosen = scene.refs || [];
+  // The scene's own order first: it numbers <Picture k>, and the server keeps it. A ref the
+  // project does not pin (`knownTags` = the project's references) stays, ticked, with a note.
+  const order = [...chosen, ...pinnedTags.filter((tag) => !chosen.includes(tag))];
+  if (!order.length) return "";
+  const box = (tag) => `<label><input type="checkbox" data-scene-field="refs" `
+    + `data-idx="${idx}" data-tag="${escapeHtml(tag)}"${chosen.includes(tag) ? " checked" : ""}> `
+    + `${escapeHtml(tag)}${knownTags.includes(tag) ? "" : ` <span class="ref-missing">не подключён к проекту</span>`}`
+    + `</label> `;
+  return `<div class="scene-refs"><span class="scene-refs-label">Референсы без упоминания:</span> `
+    + order.map(box).join("")
+    + `<span class="hint">их картинки идут первыми: &lt;Picture 1…&gt;</span></div>`;
+}
+
+const JSON_SHAPE_ERROR = 'Ожидается {"scenes": […]} или список сцен';
+
+/** Вставленный человеком сценарий → тело `PUT /scenes` как есть (только `scenes` и `references`). */
+export function parseScenarioJson(text) {
+  let data;
+  try { data = JSON.parse(text); } catch { return { error: "JSON не разобрался — проверьте запятые и кавычки" }; }
+  if (Array.isArray(data)) return { body: { scenes: data } };
+  if (data && typeof data === "object" && Array.isArray(data.scenes)) {
+    const body = { scenes: data.scenes };
+    if ("references" in data) body.references = data.references;
+    return { body };
+  }
+  return { error: JSON_SHAPE_ERROR };
+}
+
+export function scenarioReplaceConfirm(n, dirty = false) {
+  if (!n && dirty) return "Заменить несохранённый сценарий? Правки пропадут.";
+  return `Заменить ${n} ${plural(n, "сцену", "сцены", "сцен")} сценария?`
+    + (dirty ? " Несохранённые правки пропадут." : "");
+}
+
+/** Тело `PUT /scenes` из проекта диалога: только промпт и длительность каждой сцены. */
+export function chatApplyBody(chatProject) {
+  return { scenes: (chatProject.scenes || []).map((scene) => ({ prompt: scene.prompt, duration: scene.duration })) };
+}
+
+/** Вопрос перед заменой сцен проекта сценами диалога; `null`, когда заменять нечего. */
+export function chatApplyConfirm(current, incoming) {
+  if (!current) return null;
+  return `Заменить ${current} ${plural(current, "сцену", "сцены", "сцен")} проекта на ${incoming} из диалога?`;
+}
+
+export function scenarioJsonHtml(id, text = "") {
+  return `<details class="adv scenario-json"${text ? " open" : ""}><summary>Вставить сценарий JSON</summary>`
+    + `<textarea class="inp scenario-json-text" rows="6" placeholder='{"scenes": [{"prompt": "…", `
+    + `"duration": 5}]}'>${escapeHtml(text)}</textarea> `
+    + `<button type="button" class="ghost" data-act="scenario-json-load" data-id="${escapeHtml(id)}">`
+    + `Загрузить сценарий</button></details>`;
+}
+
+/** Карточка сцены: кадр/клип, промпт целиком (длинный — под `<details>`), сид и шаги на sglang,
+ *  ошибка, ссылка на LTX и «Пересчитать сцену» у снятой (или упавшей) сцены. */
+export function sceneCardHtml(scene, ctx) {
+  const mark = { pending: "wait", running: "run", done: "done", failed: "fail" }[scene.status] || "wait";
+  const clipUrl = scene.clip_path ? projectMediaUrl(scene.clip_path, ctx.outdir) : null;
+  // the same dead-media placeholder the finished list draws: without it a deleted clip's <video>
+  // would hit its 404 again on every redraw
+  const frame = clipUrl
+    ? (ctx.deadMedia && ctx.deadMedia.has(clipUrl)
+        ? `<div class="frame">${deadMediaPlaceholderHtml("клип удалён")}</div>`
+        : `<div class="frame"><video src="${escapeHtml(clipUrl)}" preload="metadata" controls `
+          + `data-media-url="${escapeHtml(clipUrl)}"></video></div>`)
+    : `<div class="frame"></div>`;
+  const text = String(scene.prompt || "");
+  const prompt = text.length > 260
+    ? `<details class="scene-prompt"><summary>${escapeHtml(text.slice(0, 260))}…</summary>`
+      + `${escapeHtml(text)}</details>`
+    : `<div class="prompt">${escapeHtml(text)}</div>`;
+  const params = ctx.engine === "sglang"
+    ? `<div class="scene-params mono">сид ${escapeHtml(scene.seed ?? ctx.projectSeed ?? 42)} · `
+      + `${escapeHtml(scene.steps ?? 50)} шагов</div>` : "";
+  const ltxUrl = scene.ltx_path ? projectMediaUrl(scene.ltx_path, ctx.outdir) : null;
+  const ltx = ltxUrl ? `<a class="clip" href="${escapeHtml(ltxUrl)}" target="_blank" rel="noopener">LTX</a>` : "";
+  const retry = scene.status === "done" || scene.status === "failed"
+    ? `<button type="button" data-act="retry-scene" data-id="${escapeHtml(ctx.projId)}" `
+      + `data-idx="${scene.idx}">Пересчитать сцену</button>` : "";
+  return `<div class="scene-card">${frame}<div class="info"><div class="row1">`
+    + `<span class="m ${mark}" aria-hidden="true"></span><span class="idx">#${scene.idx}</span>`
+    + `<span class="sdur">${formatFine(scene.duration)}</span></div>`
+    + prompt + params + sceneErrorHtml(scene) + `<div class="acts">${ltx}${retry}</div></div></div>`;
+}
+
+/** Какие сцены сбросит пересъёмка `idx`: она сама и следующие до первой `fresh_start`
+ *  (зеркало `Project.invalidate_scene_chain`). */
+export function retryCascade(scenes, idx) {
+  const out = [];
+  for (const scene of scenes.slice().sort((a, b) => a.idx - b.idx)) {
+    if (scene.idx < idx) continue;
+    if (scene.idx > idx && scene.fresh_start) break;
+    out.push(scene.idx);
+  }
+  return out;
+}
+
+/** Тело `POST …/scenes/<idx>/retry`: только то, что человек поменял (пустое поле — не менять). */
+export function retryBody(scene, edits) {
+  const body = {};
+  if (typeof edits.prompt === "string" && edits.prompt !== scene.prompt) body.prompt = edits.prompt;
+  for (const field of ["seed", "steps"]) {
+    const raw = edits[field];
+    if (raw === undefined || raw === null || String(raw).trim() === "") continue;
+    const value = Number(raw);
+    if (Number.isFinite(value) && value !== scene[field]) body[field] = value;
+  }
+  return body;
+}
+
+/** Панель пересъёмки под карточкой: промпт целиком, сид и шаги (sglang), что пересчитается. */
+export function retryPanelHtml(scene, ctx) {
+  const e = ctx.edits || {};
+  const idx = scene.idx;
+  const sglang = ctx.engine === "sglang";
+  const row = sglang
+    ? `<div class="scene-edit-row"><label>Сид <input class="inp num retry-seed" type="number" min="0" `
+      + `value="${escapeHtml(e.seed ?? "")}" placeholder="сейчас: ${escapeHtml(ctx.effectiveSeed)}"></label>`
+      + `<button type="button" class="ghost" data-act="retry-seed-random" data-idx="${idx}">новый случайный</button>`
+      + `<label>Шаги <input class="inp num retry-steps" type="number" min="2" max="100" `
+      + `value="${escapeHtml(e.steps ?? "")}" placeholder="сейчас: ${escapeHtml(scene.steps ?? 50)}"></label></div>`
+    : "";
+  const list = ctx.cascade.map((n) => `#${n}`).join(", ");
+  return `<div class="retry-panel" data-idx="${idx}">`
+    + `<textarea class="inp retry-prompt" rows="4">${escapeHtml(e.prompt ?? scene.prompt)}</textarea>${row}`
+    + `<p class="hint">Пересчитает ${ctx.cascade.length === 1 ? "сцену" : "сцены"} ${escapeHtml(list)}</p>`
+    + (ctx.error ? `<p class="why retry-error">${escapeHtml(ctx.error)}</p>` : "")
+    + `<button type="button" class="inverse" data-act="retry-scene-go" data-id="${escapeHtml(ctx.id)}" data-idx="${idx}">Пересчитать</button>`
+    + `<button type="button" class="ghost" data-act="retry-scene-cancel" data-idx="${idx}">Отмена</button></div>`;
+}
+
+/** Имя скачиваемого файла: `<слаг названия или id>-<ГГГГММДД>-final.mp4`; дата — локальная дата
+ *  `assembly.v` (mtime финала, секунды), без него — `created_at`. */
+export function downloadName(proj) {
+  const v = Number(proj.assembly && proj.assembly.v);
+  const date = Number.isFinite(v) && v > 0 ? new Date(v * 1000) : new Date(proj.created_at);
+  const stamp = Number.isNaN(date.getTime()) ? "" : String(date.getFullYear())
+    + String(date.getMonth() + 1).padStart(2, "0") + String(date.getDate()).padStart(2, "0");
+  return `${normalizeSlug(proj.title) || proj.id}-${stamp}-final.mp4`;
+}
+
+/** Этап «Сборка»: статус, финал со ссылкой и «Скачать», «Черновая сборка» — когда все сцены готовы. */
+export function projectAssemblyHtml(proj, outdir) {
+  if (proj.kind === "song") return "";
+  const status = proj.stages.assembly;
+  const scenes = proj.scenes || [];
+  const draftDue = scenes.length > 0 && scenes.every((scene) => scene.status === "done")
+    && status !== "running";
+  const finalUrl = proj.assembly.final_path
+    ? projectMediaUrl(proj.assembly.final_path, outdir, proj.assembly.v) : null;
+  if (status === "draft" && !finalUrl && !draftDue) return "";   // сборка ещё не начиналась
+  const statusWord = { draft: "не начата", running: "идёт", done: "готово", failed: "упала" }
+    [status] || status;
+  const id = escapeHtml(proj.id);
+  const retry = status === "failed"
+    ? `<button class="ghost" type="button" data-act="retry-assembly" data-id="${id}">`
+      + `Пересчитать сборку</button>` : "";
+  const link = finalUrl
+    ? `<p class="proj-final"><a class="clip" href="${escapeHtml(finalUrl)}" target="_blank" `
+      + `rel="noopener">final.mp4</a> <a class="ghost" href="${escapeHtml(finalUrl)}" `
+      + `download="${escapeHtml(downloadName(proj))}">Скачать</a></p>` : "";
+  const draft = draftDue
+    ? `<button type="button" class="ghost draft-assembly" data-id="${id}">Черновая сборка</button>` : "";
+  return `<div class="proj-stage"><div class="proj-stage-head"><span class="t">Сборка</span>`
+    + `<span class="proj-stage-status">${escapeHtml(statusWord)}</span>`
+    + `<div class="spacer"></div>${retry}</div>`
+    + `<div class="proj-stage-body">${link}${draft}</div></div>`;
+}
+
+/** «Промпт для H3»: то, что уйдёт в sglang для сохранённой сцены. Длительность в ответе —
+ *  доставляемая (у сцепленной на кадр меньше запрошенной); картинки — только внутри `outdir`. */
+export function h3PromptHtml(answer, outdir) {
+  const key = answer.keyframe || {};
+  const frame = key.kind === "previous_scene" ? `последний кадр сцены #${answer.idx - 1}`
+    : key.kind === "start_image" ? String(key.path || "").split("/").pop() : "";
+  const hint = [`доставляется ${secondsText(answer.duration)}`, `сид ${answer.seed}`, `${answer.steps} шагов`,
+    frame ? `первый кадр: ${frame}` : "без первого кадра"].join(" · ");
+  const figures = (answer.pictures || []).map((picture) => {
+    const url = startImageUrl(picture.path, outdir);
+    return `<figure>${url ? `<img src="${escapeHtml(url)}" alt="">` : ""}`
+      + `<figcaption>${escapeHtml(picture.label)}</figcaption></figure>`;
+  }).join("");
+  return `<div class="h3-prompt" data-idx="${answer.idx}"><p class="hint">${escapeHtml(hint)}</p>`
+    + `<pre>${escapeHtml(answer.prompt)}</pre>`
+    + ((answer.audios || []).length
+      ? `<p class="hint">аудио: ${escapeHtml(answer.audios.map((path) => String(path).split("/").pop()).join(", "))}</p>`
+      : "")
+    + (figures ? `<div class="h3-pictures">${figures}</div>` : "") + `</div>`;
 }
 
 /** Подсказка на `@`: карточки, чей тег начинается с набранного после последнего `@` до каретки. */
@@ -227,28 +764,40 @@ export function tagSuggestions(text, caret, cards) {
   return cards.filter((card) => card.tag.startsWith(`@${match[1]}`));
 }
 
-export function projectRouteHtml(proj, engine) {
+export function projectRouteHtml(proj, engine, lock = null) {
   if (engine !== "sglang") return "";   // апскейл LTX живёт только на alex-neuro
   const entry = (proj.route || []).find((e) => e.stage === "upscale");
   if (!entry) return "";
   return `<label class="route-upscale"><input type="checkbox" class="route-upscale-box" `
-    + `data-id="${escapeHtml(proj.id)}"${entry.enabled ? " checked" : ""}> `
-    + `Апскейл LTX после всех сцен</label>`;
+    + `data-id="${escapeHtml(proj.id)}"${entry.enabled ? " checked" : ""}${lock ? " disabled" : ""}> `
+    + `Апскейл LTX после всех сцен</label>`
+    + (lock ? `<p class="why lock-note">${escapeHtml(lock)}</p>` : "");
 }
 
-export function projectReferencesHtml(proj, cards, pinned) {
+export function projectReferencesHtml(proj, cards, pinned, lock = null, remembered = {}) {
   const byTag = new Map(pinned.map((ref) => [ref.tag, ref.version]));
+  const off = lock ? " disabled" : "";
   const rows = cards.map((card) => {
     const version = byTag.get(card.tag);
     const note = version === undefined ? escapeHtml(card.kind)
       : `${escapeHtml(card.kind)}, v${version}`
         + (version < card.latest_version ? ` (есть v${card.latest_version})` : "");
+    const numbers = (card.versions || []).map((v) => v.version);
+    if (!numbers.length) numbers.push(card.latest_version ?? card.version);
+    // a pinned card shows its pinned version; an unticked one the version picked before the tick
+    // (if it still exists), else the latest
+    const picked = remembered[card.tag];
+    const chosen = version !== undefined ? version
+      : (numbers.includes(picked) ? picked : (card.latest_version ?? numbers[numbers.length - 1]));
+    const options = numbers.map((n) => `<option value="${n}"${n === chosen ? " selected" : ""}>v${n}</option>`)
+      .join("");
     return `<label><input type="checkbox" class="ref-pin" data-tag="${escapeHtml(card.tag)}"`
-      + `${version === undefined ? "" : " checked"}> ${escapeHtml(card.tag)} `
-      + `<span class="muted">${note}</span></label>`;
+      + `${version === undefined ? "" : " checked"}${off}> ${escapeHtml(card.tag)} `
+      + `<span class="muted">${note}</span></label> `
+      + `<select class="inp ref-version" data-tag="${escapeHtml(card.tag)}"${off}>${options}</select>`;
   }).join("");
   return `<div class="project-refs" data-id="${escapeHtml(proj.id)}"><h4>Референсы проекта</h4>`
-    + rows + `</div>`;
+    + rows + (lock ? `<p class="why lock-note">${escapeHtml(lock)}</p>` : "") + `</div>`;
 }
 
 const UPSCALE_WORD = { draft: "ещё не шёл", running: "идёт", done: "готов", failed: "упал",
@@ -261,16 +810,41 @@ export function projectUpscaleHtml(proj, engine) {
   if (!entry || !entry.enabled) return "";
   const status = (proj.stages || {}).upscale || "draft";
   const id = escapeHtml(proj.id);
+  const report = proj.upscale_report || {};
   const retry = status === "failed"
     ? ` <button type="button" class="upscale-retry" data-id="${id}">Повторить апскейл</button>` : "";
+  // strength and parts only for a finished upscale: the report of an earlier attempt must not
+  // look like the current one while the stage is running or has been reset
+  let detail = "";
+  if (status === "done" && report.status === "done") {
+    const scenes = proj.scenes || [];
+    const parts = scenes.filter((scene) => scene.ltx_path).length;
+    const strength = report.strength === null || report.strength === undefined || Number.isNaN(Number(report.strength))
+      ? "" : ` · сила ${escapeHtml(String(report.strength).replace(".", ","))}`;
+    detail = `${strength} · ${parts} из ${scenes.length} частей`;
+  }
+  const error = status === "failed" && report.error
+    ? `<p class="why upscale-error">${escapeHtml(report.error)}</p>` : "";
   return `<div class="upscale-status" data-id="${id}">Апскейл LTX: `
-    + `${escapeHtml(UPSCALE_WORD[status] || status)}${retry}</div>`;
+    + `${escapeHtml(UPSCALE_WORD[status] || status)}${detail}${retry}${error}</div>`;
 }
 
 /** «Отменить» у выполняемой задачи (только sglang: на mlx бежащую задачу не остановить). */
 export function runCancelHtml(job, engine) {
   if (engine !== "sglang") return "";
   return ` <button type="button" data-act="cancel-run" data-id="${escapeHtml(job.id)}">Отменить</button>`;
+}
+
+/** Название нового проекта по умолчанию: «Ролик ДД.ММ ЧЧ:ММ» по локальному времени. */
+export function defaultProjectTitle(date) {
+  const two = (n) => String(n).padStart(2, "0");
+  return `Ролик ${two(date.getDate())}.${two(date.getMonth() + 1)} `
+    + `${two(date.getHours())}:${two(date.getMinutes())}`;
+}
+
+/** Тело POST /api/projects для пустого видеопроекта; пустое имя заменяется датой. */
+export function newVideoRequest(title, now) {
+  return { kind: "video", title: title.trim() || defaultProjectTitle(now) };
 }
 
 /** Запрос на правку карточки библиотеки: сервер сам заводит следующую версию (vN). */
@@ -296,23 +870,34 @@ export function chatTagsBody(raw, known) {
 
 /** Тело `PUT …/references`: уже закреплённая карточка сохраняет свою версию (снятие соседней
  *  галочки не должно молча обновить её до последней), новая уходит без `version`. */
-export function referencesPayload(checkedTags, pinned) {
+export function referencesPayload(checkedTags, pinned, chosen = {}) {
   const byTag = new Map(pinned.map((ref) => [ref.tag, ref.version]));
-  return checkedTags.map((tag) => (byTag.has(tag) ? { tag, version: byTag.get(tag) } : { tag }));
+  return checkedTags.map((tag) => {
+    if (typeof chosen[tag] === "number") return { tag, version: chosen[tag] };
+    return byTag.has(tag) ? { tag, version: byTag.get(tag) } : { tag };
+  });
 }
 
 export function libraryCardsHtml(cards, outdir) {
   if (!cards.length) return '<p class="empty">Библиотека пуста</p>';
   return cards.map((card) => {
-    const first = card.assets[0] || "";
-    const thumb = first && /\.(png|jpe?g)$/i.test(first) && outdir && first.startsWith(`${outdir}/`)
-      ? `<img src="/media/${escapeHtml(first.slice(outdir.length + 1))}" alt="">` : "";
-    return `<div class="lib-card">${thumb}<b>${escapeHtml(card.tag)}</b> `
-      + `<span class="muted">${escapeHtml(card.kind)}, v${card.version}</span>`
+    const first = (card.assets || [])[0] || "";
+    const url = startImageUrl(first, outdir);
+    const thumb = url ? `<img class="lib-thumb" src="${escapeHtml(url)}" alt="">` : "";
+    // the number of pictures decides the <Picture k> numbering of a scene, so it is on the card
+    const count = card.kind === "voice" ? "аудио" : `картинок: ${(card.assets || []).length}`;
+    const versions = (card.versions || []).length > 1 ? ` · версий: ${card.versions.length}` : "";
+    const tag = escapeHtml(card.tag);
+    return `<div class="lib-card">${thumb}<b>${tag}</b> `
+      + `<span class="muted">${escapeHtml(card.kind)}, v${card.version}, ${count}${versions}</span>`
       + `<p>${escapeHtml(card.description)}</p>`
       + `<input class="lib-edit-desc" value="${escapeHtml(card.description)}"> `
-      + `<button type="button" class="lib-save" data-tag="${escapeHtml(card.tag)}">`
-      + `Сохранить описание</button><p class="why lib-card-error" hidden></p></div>`;
+      + `<button type="button" class="lib-save" data-tag="${tag}">`
+      + `Сохранить описание</button>`
+      + `<input class="lib-new-files" type="file" multiple accept=".png,.jpg,.jpeg,.mp3,.wav"> `
+      + `<button type="button" class="ghost" data-act="lib-new-version" data-tag="${tag}">Новая версия</button> `
+      + `<button type="button" class="ghost" data-act="lib-delete" data-tag="${tag}">Удалить</button>`
+      + `<p class="why lib-card-error" hidden></p></div>`;
   }).join("");
 }
 
@@ -424,7 +1009,9 @@ export function assembleFinalUrl(job, outdir) {
   const stem = String(job.output_stem || "");
   const lastSlash = stem.lastIndexOf("/");
   if (lastSlash < 0) return null;
-  const finalStem = `${stem.slice(0, lastSlash)}/final`;
+  // the draft assembly (`--draft`) writes its own `draft.mp4` beside `final.mp4`
+  const file = /^draft assemble project /.test(String(job.note || "")) ? "draft" : "final";
+  const finalStem = `${stem.slice(0, lastSlash)}/${file}`;
   const parts = mediaParts(finalStem, outdir);
   if (!parts) return null;
   const url = `/media/${encodeURIComponent(parts.run)}/${encodeURIComponent(parts.stem + ".mp4")}`;
@@ -1036,7 +1623,8 @@ export function pendingSummary(jobs, { now, runningSeconds = 0, workerState = "a
 export function isProjectPipelineNote(note) {
   const s = String(note || "");
   return /^project scene \S+ #\d+$/.test(s)
-    || /^project track \S+$/.test(s);
+    || /^project track \S+$/.test(s)
+    || /^upscale project \S+$/.test(s);
 }
 
 /** `id` проекта, чью финальную сборку описывает `note`, или `null` -- зеркало `assemble.
@@ -1276,9 +1864,9 @@ export function finishedRowHtml(job, outdir, runs, deadMedia, projectTitle) {
     + `<div class="link">${link}</div>`
     + (ok ? "" : `<div class="why">${escapeHtml(job.log_tail || "причина не записана")}</div>`)
     + `<div class="acts">`
-    + `<button data-act="chat" data-id="${id}">Обсудить</button>`
+    + (isAssemble ? "" : `<button data-act="chat" data-id="${id}">Обсудить</button>`)
     + `<button data-act="reveal" data-id="${id}">Показать в Finder</button>`
-    + `<button data-act="dup" data-id="${id}">Копия</button>`
+    + (isAssemble ? "" : `<button data-act="dup" data-id="${id}">Копия</button>`)
     + `<button data-act="delrun" data-id="${id}">Удалить</button>`
     + `</div>`
     + `</div>`
@@ -1505,6 +2093,8 @@ export function offlineNotice(failures, lastOkAt, now) {
  *  любой заглушки. */
 export function errorText(payload) {
   const error = (payload && payload.error) || {};
+  // a refusal the page itself made, before any request: it names its own heading
+  if (error.clientTitle) return { title: error.clientTitle, pre: error.message };
   const detail = error.detail || {};
   switch (error.code) {
     // Один код на два непохожих отказа: командная строка задачи, которую разобрал argparse
@@ -1623,6 +2213,25 @@ export function errorText(payload) {
       // единственная причина: неизвестное имя параметра лимита вывода).
       return { title: "У провайдера в настройках неизвестный параметр лимита вывода",
                pre: error.message };
+    // refusals of the project wave: the server's text is Russian, the heading says what happened
+    case "project_running":
+      return { title: "Проект считается — правка закрыта", pre: error.message };
+    case "library_card_in_use":
+      return { title: "Карточка подключена к проектам", pre: error.message };
+    case "unknown_tag":
+      return { title: "Тег не подключён к проекту", pre: error.message };
+    case "ref2va_needs_reference":
+      return { title: "Сцене нужен референс", pre: error.message };
+    case "project_stage_not_ready":
+      return { title: "Этап ещё не готов", pre: error.message };
+    case "start_image_invalid":
+      return { title: "Стартовый кадр не подходит", pre: error.message };
+    // `GET .../h3-prompt`: the server's own words are English (an `AssembleError` text) or terse
+    case "duration_off_grid":
+      return { title: "Длительность сцены не на сетке H3",
+               pre: "Сохраните сценарий заново: длительность подгонится под сетку." };
+    case "project_scene_not_found":
+      return { title: "Такой сцены нет в сохранённом проекте", pre: "Сохраните сценарий и повторите." };
     case "chat_truncated":
       // Не то же, что `bad_model_json`: там модель ответила текстом не той формы, тут её
       // оборвали по лимиту вывода раньше, чем она вообще договорила — повтор с тем же лимитом
@@ -2301,8 +2910,14 @@ const LLM_TEXT = {
  * `busy` — GPU занят прогоном; остаток берётся из того же прогресса работника, что печатается
  * в приборной строке. Прогон без оценки молчит, а не обещает «~0 мин».
  */
-export function llmPlateText(status, { external = false, runningSeconds = 0 } = {}) {
-  if (external) return "внешний провайдер — память этой машины не занимает";
+export function llmPlateText(status, { external = false, sharesGpu = null, runningSeconds = 0 } = {}) {
+  // a local model (`llama-local`): the old words about its own state; every other provider is
+  // named by where it computes, as the provider's `shares_gpu` says -- unknown stays unknown
+  if (external) {
+    if (sharesGpu === true) return "делит видеокарту с H3: пока модель поднята, рендер ждёт";
+    if (sharesGpu === false) return "внешний провайдер — память этой машины не занимает";
+    return "где считает провайдер, не указано (shares_gpu в providers.json)";
+  }
   if (status === "busy") {
     const left = Number(runningSeconds) || 0;
     return "идёт прогон — модель поднимется после него"
@@ -2553,6 +3168,19 @@ function startPage() {
 
   // -- проекты (Task 7) --------------------------------------------------------------------
   let project = null;          // {id, project: {...as_dict()}, active_job} панели, или null
+  let sceneDraft = null;        // Draft[] of the open video project's scene editor, or null
+  let sceneDraftDirty = false;  // the person changed something the server has not seen
+  let draftEpoch = 0;           // version of the draft the editor DOM was drawn from
+  let scenarioJsonText = "";     // what is typed in «Вставить сценарий JSON»: survives redraws
+  let draftVersion = 0;        // bumped by anything that makes a «Промпт для H3» answer stale
+  let chosenVersions = {};     // tag -> version picked on a card that is not ticked yet
+  let h3Prompts = {};          // idx -> answer of GET .../h3-prompt; any edit of the draft drops them
+  let retryOpen = null;        // idx of the scene whose retry panel is open
+  let retryEdits = null;       // what is typed in it, kept across redraws
+  let retryError = null;       // why the server refused the retry, shown in the panel
+  let settingsSaved = null;    // which project setting was saved last: "i2v_prefix" | "seed"
+  let sceneDraftError = null;   // {idx, message} of the last client-side refusal, shown by that scene
+  let draftResetPending = false; // the next project read (opening the panel) replaces the draft with the server's scenes
   let projectBusy = false;     // идёт запрос, меняющий проект — та же роль, что `busy` у очереди
   /** Роспись `/api/providers`, для селектора провайдера в этапе «Сюжет» (Task 2, "выбор
    *  провайдера для сценария") — своя копия, не `chat.providers`: панель проектов открывается
@@ -2648,6 +3276,8 @@ function startPage() {
       $("form").hidden = sglangEngine;
       $("form-sglang-note").hidden = !sglangEngine;
       if (!$("outdir").value) $("outdir").value = defaultOutdir(state);
+      // thumbnails need the outdir: the cards may have arrived before the first state did
+      if (state.outdir !== libraryOutdir) renderLibrary();
     } catch {
       failures += 1;
     }
@@ -2684,7 +3314,7 @@ function startPage() {
 
   function renderGpu() {
     const sglang = Boolean(state && state.engine === "sglang");
-    const banner = gpuBanner(gpu, Date.now());
+    const banner = gpuBanner(gpu, Date.now(), (state && state.projects) || []);
     $("gpu-banner").hidden = !banner.visible;
     $("gpu-banner").textContent = banner.text;
     $("gpu-banner").title = banner.text;
@@ -2739,9 +3369,30 @@ function startPage() {
     await pollGpu();
   }
 
+  let libraryOutdir = null;    // the outdir the library cards were last drawn with
+
+  function renderLibrary() {
+    libraryOutdir = state ? state.outdir : null;
+    $("library-cards").innerHTML = libraryCardsHtml(libraryCards, libraryOutdir);
+  }
+
   async function loadLibrary() {
     try { libraryCards = (await api("GET", "/api/library")).cards; } catch { libraryCards = []; }
-    $("library-cards").innerHTML = libraryCardsHtml(libraryCards, state && state.outdir);
+    renderLibrary();
+  }
+
+  /** Сырые байты файла на `POST /api/uploads` (заголовок `X-Filename`) → путь на диске сервера. */
+  async function uploadToServer(file) {
+    const response = await fetch("/api/uploads", { method: "POST", body: file,
+      headers: { "Content-Type": "application/octet-stream",
+                 "X-Filename": encodeURIComponent(file.name) } });
+    const body = await response.json();
+    if (!response.ok) {
+      const error = new Error("upload");
+      error.payload = body;
+      throw error;
+    }
+    return body.path;
   }
 
   async function addLibraryCard(event) {
@@ -2750,12 +3401,7 @@ function startPage() {
     try {
       const assets = [];
       for (const file of $("lib-files").files) {
-        const response = await fetch("/api/uploads", { method: "POST", body: file,
-          headers: { "Content-Type": "application/octet-stream",
-                     "X-Filename": encodeURIComponent(file.name) } });
-        const body = await response.json();
-        if (!response.ok) throw { payload: body };
-        assets.push(body.path);
+        assets.push(await uploadToServer(file));
       }
       await api("POST", "/api/library", { tag: $("lib-tag").value.trim(),
         kind: $("lib-kind").value, description: $("lib-desc").value.trim(), assets });
@@ -2950,6 +3596,13 @@ function startPage() {
    *  уже открытой модалки, а не молча никуда. */
   async function openProjectModal(id) {
     project = { id, project: null, active_job: null };
+    draftResetPending = true;
+    scenarioJsonText = "";
+    chosenVersions = {};
+    retryOpen = null;
+    retryEdits = null;
+    retryError = null;
+    settingsSaved = null;
     projectMp3 = null;
     scenarioProviderChoice = null;
     scenarioProviderTest = null;
@@ -2995,6 +3648,7 @@ function startPage() {
       const answer = await api("GET", "/api/projects/" + encodeURIComponent(project.id));
       if (!project || project.id !== answer.project.id) return;  // окно закрыли/сменили, пока шёл запрос
       project = { id: project.id, project: answer.project, active_job: answer.active_job };
+      if (draftResetPending) resetSceneDraft(answer.project);
       // `keepError`: the refresh that follows a refused action must redraw the panel from the
       // server's state without wiping the very message that explains the refusal.
       if (!keepError) clearProjectError();
@@ -3009,11 +3663,28 @@ function startPage() {
 
   function closeProjectModal() {
     project = null;
+    retryOpen = null;
+    retryEdits = null;
+    retryError = null;
+    scenarioJsonText = "";
+    sceneDraft = null;
+    sceneDraftDirty = false;
     projectMp3 = null;
     $("project-modal").hidden = true;
   }
 
+  /** The open retry panel's fields -> `retryEdits`, so a redraw does not eat what is typed. */
+  function snapshotRetryEdits() {
+    if (retryOpen === null) return;
+    const panel = document.querySelector(`#project-body .retry-panel[data-idx="${retryOpen}"]`);
+    if (!panel) return;
+    const read = (sel) => { const el = panel.querySelector(sel); return el ? el.value : undefined; };
+    retryEdits = { prompt: read(".retry-prompt"), seed: read(".retry-seed"), steps: read(".retry-steps") };
+  }
+
   function renderProjectModal() {
+    syncDraftFromDom();
+    snapshotRetryEdits();
     if (!project || !project.project) return;
     const proj = project.project;
     $("project-title").textContent = proj.title || proj.id;
@@ -3022,14 +3693,156 @@ function startPage() {
     const seconds = projectEstimateSeconds(proj, jobs);
     $("project-estimate").textContent = seconds ? `≈${formatDuration(seconds)}` : "";
     const outdir = state && state.outdir;
+    const locks = projectLocks(proj, project.active_job);
     $("project-body").innerHTML = projectScriptStageHtml(proj)
       + projectTrackStageHtml(proj, project.active_job, outdir)
       + projectScenarioStageHtml(proj, projectBusy)
-      + projectTagWarningsHtml(proj, state && state.engine) + projectSettingsHtml(proj)
-      + projectRouteHtml(proj, state && state.engine) + projectUpscaleHtml(proj, state && state.engine)
-      + projectReferencesHtml(proj, libraryCards, proj.references || [])
+      + projectTagWarningsHtml(proj, state && state.engine)
+      + projectSettingsHtml(proj, state && state.engine, locks.settings, settingsSaved)
+      + projectRouteHtml(proj, state && state.engine, locks.route)
+      + projectUpscaleHtml(proj, state && state.engine)
+      + projectReferencesHtml(proj, libraryCards, proj.references || [], locks.references,
+          chosenVersions)
       + projectScenesStageHtml(proj, outdir)
-      + projectAssemblyStageHtml(proj, outdir);
+      + projectAssemblyHtml(proj, outdir);
+  }
+
+  /** The scene editor replaces the read-only scene count while a video script can still be edited. */
+  function sceneEditorActive(proj) {
+    return proj.kind === "video" && proj.stages.scenes === "draft"
+      && (proj.stages.script === "draft" || proj.stages.script === "awaiting_approval");
+  }
+
+  function resetSceneDraft(proj) {
+    draftResetPending = false;
+    if (proj.kind !== "video") { sceneDraft = null; sceneDraftDirty = false; return; }
+    const draft = draftFromScenes(proj.scenes || []);
+    sceneDraft = draft.length ? draft : addScene([]);
+    sceneDraftDirty = false;
+    sceneDraftError = null;
+    invalidateH3Prompts();
+    draftEpoch += 1;
+  }
+
+  /** The draft changed: unsaved, and any shown «Промпт для H3» is stale. */
+  function touchDraft() {
+    sceneDraftDirty = true;
+    invalidateH3Prompts();
+  }
+
+  /** A shown or in-flight «Промпт для H3» no longer matches what would be built now. */
+  function invalidateH3Prompts() {
+    h3Prompts = {};
+    draftVersion += 1;
+  }
+
+  /** Reads the editor fields into the draft -- but only when the DOM was drawn from the current
+   *  draft (`data-epoch`): after a move/add/remove the old DOM still holds the old order, and
+   *  reading it would write the previous scene's text over the moved one. */
+  function syncDraftFromDom() {
+    if (!sceneDraft) return;
+    const editor = document.querySelector("#project-body .scene-editor");
+    if (!editor || editor.dataset.epoch !== String(draftEpoch)) return;
+    const refsByScene = new Map();   // a scene with any refs checkbox in the DOM: its refs = the ticked ones
+    document.querySelectorAll("#project-body [data-scene-field]").forEach((el) => {
+      const scene = sceneDraft[Number(el.dataset.idx)];
+      if (!scene) return;
+      const field = el.dataset.sceneField;
+      if (field === "refs") {
+        const list = refsByScene.get(Number(el.dataset.idx)) || [];
+        refsByScene.set(Number(el.dataset.idx), list);
+        if (el.checked) list.push(el.dataset.tag);
+        return;
+      }
+      const before = JSON.stringify(scene[field]);
+      if (field === "start_image") scene.start_image = el.value === "" ? null : el.value;
+      else if (field === "fresh_start") scene.fresh_start = Boolean(el.checked);
+      else if (field === "duration") scene.duration = Number(String(el.value).replace(",", "."));
+      else if (field === "seed" || field === "steps") scene[field] = el.value === "" ? null : Number(el.value);
+      else scene[field] = el.value;
+      if (JSON.stringify(scene[field]) !== before) touchDraft();
+    });
+    for (const [idx, ticked] of refsByScene) {
+      // the saved order stays (it numbers <Picture k>); newly ticked tags go to the end
+      const old = sceneDraft[idx].refs || [];
+      const next = [...old.filter((tag) => ticked.includes(tag)), ...ticked.filter((tag) => !old.includes(tag))];
+      if (JSON.stringify(old) !== JSON.stringify(next)) {
+        sceneDraft[idx].refs = next;
+        touchDraft();
+      }
+    }
+  }
+
+  /** Any change of the draft that does not come from the fields: take the fields first, write,
+   *  bump the epoch so the redraw does not read the old DOM back, redraw. */
+  function changeSceneDraft(change) {
+    syncDraftFromDom();
+    sceneDraft = change(sceneDraft);
+    touchDraft();
+    sceneDraftError = null;
+    draftEpoch += 1;
+    renderProjectModal();
+  }
+
+  /** PUT the draft. A client-side refusal throws the same `{payload}` shape `api` does, so
+   *  `withProject` shows it in the project error banner and nothing goes to the server. */
+  async function saveSceneDraft(id) {
+    const engine = state && state.engine;
+    const pinnedTags = ((project && project.project && project.project.references) || []).map((r) => r.tag);
+    const issue = scenesClientIssue(sceneDraft, engine, pinnedTags);
+    sceneDraftError = issue;
+    if (issue) {
+      const error = new Error(issue.message);
+      error.payload = { error: { message: issue.message } };
+      throw error;
+    }
+    const answer = await api("PUT", `/api/projects/${encodeURIComponent(id)}/scenes`,
+                             scenesPayload(sceneDraft, engine));
+    // The server's answer is the one source of truth: replace the draft now, not at the next read
+    // (that read may fail, and whatever is typed meanwhile must not be silently overwritten later).
+    if (answer && answer.project) resetSceneDraft(answer.project);
+    else sceneDraftDirty = false;
+  }
+
+  /** «Вставить сценарий JSON»: тело как есть в `PUT /scenes`, черновик — из ответа этого PUT. */
+  async function loadScenarioJson(id) {
+    const field = document.querySelector("#project-body .scenario-json-text");
+    const parsed = parseScenarioJson(field ? field.value : "");
+    if (parsed.error) {
+      const error = new Error(parsed.error);
+      error.payload = { error: { message: parsed.error, clientTitle: "Сценарий не разобран" } };
+      throw error;
+    }
+    // the number is of the saved scenes; unsaved edits count as something to lose even in an empty project
+    const saved = ((project && project.project && project.project.scenes) || []).length;
+    const unsaved = Boolean(sceneDraft && sceneDraftDirty);
+    if ((saved > 0 || unsaved) && !window.confirm(scenarioReplaceConfirm(saved, unsaved))) return;
+    const answer = await api("PUT", `/api/projects/${encodeURIComponent(id)}/scenes`, parsed.body);
+    if (answer && answer.project) resetSceneDraft(answer.project);
+    scenarioJsonText = "";
+  }
+
+  /** Кнопка подсказки: недописанный `@…` перед кареткой поля промпта заменяется тегом. */
+  function pickTag(button) {
+    syncDraftFromDom();
+    const slot = button.closest(".tag-hint-slot");
+    const idx = Number(button.dataset.idx ?? (slot && slot.dataset.idx));
+    const field = document.querySelector(`#project-body [data-scene-field="prompt"][data-idx="${idx}"]`);
+    if (!field || !sceneDraft || !sceneDraft[idx]) return;
+    const result = insertTagAt(field.value, field.selectionStart, button.dataset.tag);
+    field.value = result.text;
+    field.focus();
+    field.setSelectionRange(result.caret, result.caret);
+    sceneDraft[idx].prompt = result.text;
+    touchDraft();
+    showDirtyNote();
+    if (slot) slot.innerHTML = "";
+  }
+
+  function requestCloseProject() {
+    syncDraftFromDom();
+    if (sceneDraft && sceneDraftDirty && !window.confirm("Закрыть без сохранения сценария?")) return;
+    closeProjectModal();
   }
 
   function projectScriptStageHtml(proj) {
@@ -3039,8 +3852,17 @@ function startPage() {
     const gate = status === "awaiting_approval"
       ? `<button class="inverse" type="button" data-act="approve-script" `
         + `data-id="${escapeHtml(proj.id)}">Утвердить сценарий</button>` : "";
+    const chatButton = sceneDraft && sceneEditorActive(proj)
+      ? `<button type="button" class="ghost" data-act="project-chat" data-id="${escapeHtml(proj.id)}">`
+        + `Чат по сценарию</button>` : "";
     let body;
-    if (proj.kind === "video") {
+    if (sceneDraft && sceneEditorActive(proj)) {
+      body = sceneEditorHtml(sceneDraft, { id: proj.id, engine: state && state.engine,
+        projectSeed: proj.seed ?? null, dirty: sceneDraftDirty, epoch: draftEpoch,
+        error: sceneDraftError, h3Prompts, pinned: pinnedCards(proj.references, libraryCards),
+        refTags: (proj.references || []).map((r) => r.tag),
+        outdir: state && state.outdir }) + scenarioJsonHtml(proj.id, scenarioJsonText);
+    } else if (proj.kind === "video") {
       const n = proj.scenes.length;
       body = n
         ? `<p class="proj-stage-note">${n} ${plural(n, "сцена", "сцены", "сцен")} в сценарии.</p>`
@@ -3057,7 +3879,7 @@ function startPage() {
       + `<div class="proj-stage-head">`
       + `<span class="t">Сценарий</span>`
       + `<span class="proj-stage-status">${escapeHtml(statusWord)}</span>`
-      + `<div class="spacer"></div>${gate}</div>`
+      + `<div class="spacer"></div>${chatButton}${gate}</div>`
       + `<div class="proj-stage-body">${body}</div></div>`;
   }
 
@@ -3403,35 +4225,6 @@ function startPage() {
     return pendingScenarioSave;
   }
 
-  function projectSceneCardHtml(scene, projId, outdir, deadMedia) {
-    const mark = { pending: "wait", running: "run", done: "done", failed: "fail" }[scene.status]
-      || "wait";
-    const clipUrl = scene.clip_path ? projectMediaUrl(scene.clip_path, outdir) : null;
-    // Находка 1 (живой проход 2026-08-24): та же заглушка, что `finishedRowHtml` теперь рисует
-    // для очереди «Готово» -- один и тот же `deadMediaUrls`, потому что и тут, и там разметка
-    // пересобирается заново на каждый опрос/refresh, и без заглушки `<video>` бил бы тот же 404
-    // по кругу, только реже (панель проекта перечитывается по действию, не по таймеру).
-    const frame = clipUrl
-      ? (deadMedia && deadMedia.has(clipUrl)
-          ? `<div class="frame">${deadMediaPlaceholderHtml("клип удалён")}</div>`
-          : `<div class="frame"><video src="${escapeHtml(clipUrl)}" preload="metadata" controls `
-            + `data-media-url="${escapeHtml(clipUrl)}"></video></div>`)
-      : `<div class="frame"></div>`;
-    const promptText = String(scene.prompt || "").slice(0, 260);
-    return `<div class="scene-card">${frame}`
-      + `<div class="info">`
-      + `<div class="row1">`
-      + `<span class="m ${mark}" aria-hidden="true"></span>`
-      + `<span class="idx">#${scene.idx}</span>`
-      + `<span class="sdur">${formatFine(scene.duration)}</span>`
-      + `</div>`
-      + `<div class="prompt">${escapeHtml(promptText)}</div>`
-      + sceneErrorHtml(scene)
-      + `<div class="acts"><button type="button" data-act="retry-scene" `
-      + `data-id="${escapeHtml(projId)}" data-idx="${scene.idx}">пересчитать</button></div>`
-      + `</div></div>`;
-  }
-
   /** «N/M готово» плюс, если что-то сейчас в работе, «, считается K-я» -- тот самый счётчик,
    *  который должен читаться и без раскрытия блока (task 10): человека, заглянувшего в проект,
    *  интересует прежде всего «где мы сейчас», а не готова ли сцена посмотреть карточками. */
@@ -3455,38 +4248,19 @@ function startPage() {
     if (proj.kind === "song" || !proj.scenes.length) return "";
     const total = proj.scenes.length;
     const cards = proj.scenes.slice().sort((a, b) => a.idx - b.idx)
-      .map((scene) => projectSceneCardHtml(scene, proj.id, outdir, deadMediaUrls)).join("");
+      .map((scene) => sceneCardHtml(scene, { projId: proj.id, outdir, deadMedia: deadMediaUrls,
+          engine: state && state.engine, projectSeed: proj.seed ?? null })
+        + (retryOpen === scene.idx ? retryPanelHtml(scene, { id: proj.id, engine: state && state.engine,
+          effectiveSeed: scene.seed ?? proj.seed ?? 42, cascade: retryCascade(proj.scenes, scene.idx),
+          edits: retryEdits, error: retryError }) : "")).join("");
     return `<div class="proj-stage">`
-      + `<details class="adv proj-scenes-block">`
+      + `<details class="adv proj-scenes-block"${retryOpen !== null ? " open" : ""}>`
       + `<summary class="proj-stage-head"><span class="t">Сцены (${total})</span>`
       + `<span class="proj-stage-status">${escapeHtml(projectScenesStatusText(proj))}</span>`
       + `</summary>`
       + `<div class="adv-body proj-scenes-body">`
       + `<div class="proj-stage-body"><div class="scene-grid">${cards}</div></div>`
       + `</div></details></div>`;
-  }
-
-  function projectAssemblyStageHtml(proj, outdir) {
-    if (proj.kind === "song") return "";
-    const status = proj.stages.assembly;
-    if (status === "draft" && !proj.assembly.final_path) return "";  // сборка ещё не начиналась
-    const statusWord = { draft: "не начата", running: "идёт", done: "готово", failed: "упала" }
-      [status] || status;
-    const retry = status === "failed"
-      ? `<button class="ghost" type="button" data-act="retry-assembly" `
-        + `data-id="${escapeHtml(proj.id)}">Пересчитать сборку</button>` : "";
-    const finalUrl = proj.assembly.final_path
-      ? projectMediaUrl(proj.assembly.final_path, outdir, proj.assembly.v) : null;
-    const link = finalUrl
-      ? `<p class="proj-final"><a class="clip" href="${escapeHtml(finalUrl)}" target="_blank" `
-        + `rel="noopener">final.mp4</a></p>`
-      : `<p class="proj-stage-note">пока нечего собирать</p>`;
-    return `<div class="proj-stage">`
-      + `<div class="proj-stage-head">`
-      + `<span class="t">Сборка</span>`
-      + `<span class="proj-stage-status">${escapeHtml(statusWord)}</span>`
-      + `<div class="spacer"></div>${retry}</div>`
-      + `<div class="proj-stage-body">${link}</div></div>`;
   }
 
   /** Немедленная реакция на клик по одной из кнопок этапа «Сюжет» (находка 1, волна ux-фиксов
@@ -3592,6 +4366,37 @@ function startPage() {
       rail.textContent = "Прогон не ведётся: некому его вести";
       steps.innerHTML = "";
       return { left: 0 };
+    }
+
+    if (state.engine === "sglang") {
+      // no denoising passes to count on sglang: elapsed time, the estimate and a share of it
+      const view = sglangRunView(job, now.getTime());
+      const cell = (k, v, cls = "") => `<div><span class="k">${k}</span><span class="v${cls}">${v}</span></div>`;
+      box.className = "running sglang-run";
+      box.innerHTML = [
+        `<div class="run-body">`,
+        `<div class="run-line1"><span class="m run" aria-hidden="true"></span>`,
+        `<span class="run-name">${escapeHtml(jobTag(job))}</span>`,
+        `<span class="run-spec">${escapeHtml(view.spec)}</span></div>`,
+        `<div class="run-num">`,
+        cell("Идёт", escapeHtml(view.elapsed)),
+        cell("Оценка", escapeHtml(view.total)),
+        view.waiting ? cell("Доля", "ждёт карту", " run-wait") : cell("Доля", `${view.share} %`),
+        cell("Кончится", formatClock(new Date(now.getTime() + view.leftSeconds * 1000))),
+        `</div>`,
+        `<div class="run-foot">старт <span class="num">`
+          + `${job.started_at ? formatClock(new Date(job.started_at)) : "—"}</span> · `,
+        `<span class="mono">${escapeHtml(job.id)}</span> · `,
+        `<span class="run-note">${escapeHtml(job.note)}</span>`,
+        runCancelHtml(job, state.engine),
+        `</div></div>`,
+      ].join("");
+      rail.className = "rail-run";
+      rail.innerHTML = `<span class="run-tag">${escapeHtml(jobTag(job))}</span>`
+        + `<span class="run-share">${view.waiting ? "ждёт карту" : `${view.share} %`}</span>`
+        + `<span class="run-left">осталось <b>${formatDuration(view.leftSeconds)}</b></span>`;
+      steps.innerHTML = "";
+      return { left: view.leftSeconds };
     }
 
     const run = runForJob(job, state.runs);
@@ -3869,6 +4674,7 @@ function startPage() {
     if (it.kind === "prompt") return `промпт ${it.name || "?"}`;
     if (it.kind === "job") return `задача ${it.id || "?"}`;
     if (it.kind === "clip") return `ролик ${it.id || "?"}`;
+    if (it.kind === "project") return `проект ${it.id || "?"}`;
     return "новый промпт";
   }
 
@@ -3883,6 +4689,7 @@ function startPage() {
     const status = (chat && chat.llmStatus) || "";
     $("chat-llm").textContent = llmPlateText(status, {
       external: Boolean(row) && row.type !== "llama-local",
+      sharesGpu: row ? row.shares_gpu : null,
       runningSeconds: runningLeft,
     });
     /* Точка рядом со словом — форма макета. Янтарь достаётся только `busy`, то есть ровно
@@ -4067,7 +4874,7 @@ function startPage() {
     $("chat-finish").textContent = FINISH_LABEL[chat.source.kind] || FINISH_LABEL.new;
     $("chat-source").textContent = chatSourceText(chat.source);
     $("chat-duration").value = chat.duration;
-    $("chat-make-project").disabled = !chat.project;
+    renderChatMakeProject();
     $("chat-project-panel").hidden = true;   // панель создания — не состояние прошлой сессии
     renderChatPrompt();
     renderChatLog();
@@ -4076,6 +4883,13 @@ function startPage() {
                                // последнем состоянии (открытая/ошибочная загрузка).
     await loadProviders();
     $("chat-input").focus();
+  }
+
+  /** «Сделать проектом» — или «Применить к проекту» у диалога по сценарию уже созданного проекта. */
+  function renderChatMakeProject() {
+    $("chat-make-project").disabled = !chat.project;
+    $("chat-make-project").textContent = chat.source.kind === "project" ? "Применить к проекту"
+                                                                       : "Сделать проектом";
   }
 
   function closeChat() {
@@ -4215,7 +5029,7 @@ function startPage() {
     // Task 7: этот самый ход мог быть первым, ответившим полем `project` (`applyTurn` уже
     // положил его в `chat.project`, если да) — кнопка «Сделать проектом» обязана ожить тем же
     // кадром, без ожидания следующего действия.
-    $("chat-make-project").disabled = !chat.project;
+    renderChatMakeProject();
   }
 
   /** Промпт поставленной задачи, насколько его вообще видно странице.
@@ -4933,7 +5747,60 @@ function startPage() {
     // -- проекты (Task 7) — тот же делегированный обработчик, свои `data-act` --------------
     if (button.dataset.act === "open-project") { openProjectModal(id); return; }
     if (button.dataset.act === "approve-script") {
-      withProject(() => api("POST", `/api/projects/${encodeURIComponent(id)}/approve/script`, {}));
+      syncDraftFromDom();
+      withProject(async () => {
+        if (sceneDraft && sceneDraftDirty) await saveSceneDraft(id);
+        await api("POST", `/api/projects/${encodeURIComponent(id)}/approve/script`, {});
+      });
+      return;
+    }
+    // -- редактор сцен видеопроекта (Task 7): каждое действие сначала снимает поля в черновик ----
+    if (button.dataset.act === "scene-h3-prompt") {
+      syncDraftFromDom();
+      const idx = Number(button.dataset.idx);
+      withProject(async () => {
+        // what goes to sglang is built from the saved scene: unsaved edits are saved first
+        if (sceneDraft && sceneDraftDirty) await saveSceneDraft(id);
+        const version = draftVersion;
+        const answer = await api("GET",
+          `/api/projects/${encodeURIComponent(id)}/scenes/${encodeURIComponent(idx)}/h3-prompt`);
+        // an edit (a field, a reference, a setting) while the answer was on its way makes it stale
+        if (version === draftVersion) h3Prompts = { ...h3Prompts, [idx]: answer };
+      });
+      return;
+    }
+    if (button.dataset.act === "project-chat") {
+      openChatModal({ kind: "project", id }, { prompt: "", mode: "", image: "", endImage: "", duration: 10 });
+      return;
+    }
+    if (button.dataset.act === "lib-new-version") { newLibraryVersion(button); return; }
+    if (button.dataset.act === "lib-delete") { deleteLibraryCard(button); return; }
+    if (button.dataset.act === "tag-pick") { pickTag(button); return; }
+    if (button.dataset.act === "scene0-upload") { $("scene0-file").click(); return; }
+    if (button.dataset.act === "scenario-json-load") {
+      syncDraftFromDom();
+      withProject(() => loadScenarioJson(id));
+      return;
+    }
+    if (button.dataset.act === "scene-add") { changeSceneDraft(addScene); return; }
+    if (button.dataset.act === "scene-up" || button.dataset.act === "scene-down") {
+      const idx = Number(button.dataset.idx);
+      changeSceneDraft((draft) => moveScene(draft, idx, button.dataset.act === "scene-up" ? -1 : 1));
+      return;
+    }
+    if (button.dataset.act === "scene-del") {
+      const idx = Number(button.dataset.idx);
+      changeSceneDraft((draft) => removeScene(draft, idx));
+      return;
+    }
+    if (button.dataset.act === "scene-seed-random") {
+      const idx = Number(button.dataset.idx);
+      changeSceneDraft((draft) => draft.map((scene, i) => (i === idx ? { ...scene, seed: randomSeed() } : scene)));
+      return;
+    }
+    if (button.dataset.act === "scenes-save") {
+      syncDraftFromDom();
+      withProject(() => saveSceneDraft(id));
       return;
     }
     if (button.dataset.act === "approve-track") {
@@ -5025,25 +5892,72 @@ function startPage() {
       return;
     }
     if (button.dataset.act === "retry-scene") {
-      const idx = button.dataset.idx;
-      if (!window.confirm(`Пересчитать сцену ${idx}? Эта и все следующие сцены будут `
-                          + `инвалидированы и пересчитаны заново.`)) return;
-      // `deadMediaUrls`'s own docstring: ретрай инвалидирует эту сцену И все следующие
-      // (подтверждение выше называет это прямо) — снимаем пометку с клипов всех их, не только
-      // retried-сцены, иначе новый файл следующей сцены останется под старой заглушкой до
-      // ручного переоткрытия карточки.
-      if (project && project.project) {
+      // opens the panel (prompt, seed, steps); the cascade it names is what the server resets
+      retryOpen = Number(button.dataset.idx);
+      retryEdits = null;
+      retryError = null;
+      renderProjectModal();
+      return;
+    }
+    if (button.dataset.act === "retry-scene-cancel") {
+      retryOpen = null; retryEdits = null; retryError = null;
+      renderProjectModal();
+      return;
+    }
+    if (button.dataset.act === "retry-seed-random") {
+      const field = document.querySelector(
+        `#project-body .retry-panel[data-idx="${Number(button.dataset.idx)}"] .retry-seed`);
+      if (field) field.value = String(randomSeed());
+      return;
+    }
+    if (button.dataset.act === "retry-scene-go") {
+      const idx = Number(button.dataset.idx);
+      const panel = document.querySelector(`#project-body .retry-panel[data-idx="${idx}"]`);
+      const read = (sel) => { const el = panel && panel.querySelector(sel); return el ? el.value : undefined; };
+      const scenes = (project && project.project && project.project.scenes) || [];
+      const scene = scenes.find((item) => item.idx === idx) || { prompt: "" };
+      const body = retryBody(scene, { prompt: read(".retry-prompt"), seed: read(".retry-seed"),
+                                      steps: read(".retry-steps") });
+      // the panel and what is typed in it stay until the server took the retry: a refusal
+      // (409 project_running, 400) must not eat the text
+      retryEdits = { prompt: read(".retry-prompt"), seed: read(".retry-seed"), steps: read(".retry-steps") };
+      retryError = null;
+      withProject(async () => {
+        try {
+          await api("POST", `/api/projects/${encodeURIComponent(id)}/scenes/${encodeURIComponent(idx)}/retry`, body);
+        } catch (error) {
+          const reason = error.payload ? errorText(error.payload) : null;
+          retryError = reason ? (reason.pre || reason.title) : "сервер не ответил";
+          throw error;
+        }
+        // the retry resets this scene and the chained ones after it: their clips get new files,
+        // so the dead-clip marks come off all of them
         const outdir = state && state.outdir;
-        const n = Number(idx);
-        (project.project.scenes || []).forEach((scene) => {
-          if (scene.idx >= n && scene.clip_path) {
-            const url = projectMediaUrl(scene.clip_path, outdir);
+        scenes.forEach((item) => {
+          if (item.idx >= idx && item.clip_path) {
+            const url = projectMediaUrl(item.clip_path, outdir);
             if (url) deadMediaUrls.delete(url);
           }
         });
+        retryOpen = null;
+        retryEdits = null;
+      });
+      return;
+    }
+    if (button.dataset.act === "project-seed-save") {
+      const field = document.querySelector("#project-body .project-seed");
+      const raw = field ? String(field.value).trim() : "";
+      const seed = raw === "" ? null : Number(raw);
+      if (seed !== null && !(Number.isInteger(seed) && seed >= 0)) {
+        showProjectError({ error: { clientTitle: "Сид не сохранён", message: "Сид — целое число от 0" } });
+        return;
       }
-      withProject(() => api(
-        "POST", `/api/projects/${encodeURIComponent(id)}/scenes/${encodeURIComponent(idx)}/retry`, {}));
+      invalidateH3Prompts();    // the seed is part of what «Промпт для H3» shows
+      withProject(async () => {
+        settingsSaved = null;
+        await api("PUT", `/api/projects/${encodeURIComponent(id)}/settings`, { seed });
+        settingsSaved = "seed";
+      });
       return;
     }
     if (button.dataset.act === "retry-assembly") {
@@ -5061,11 +5975,23 @@ function startPage() {
       withProject(() => api("PUT", `/api/projects/${encodeURIComponent(target.dataset.id)}/route`,
                             { upscale: target.checked }));
     }
-    if (target.classList.contains("ref-pin")) {
+    if (target.classList.contains("ref-pin") || target.classList.contains("ref-version")) {
       const box = target.closest(".project-refs");
+      if (target.classList.contains("ref-version")) {
+        // a version picked on a card that is not ticked: nothing to send yet (the server pins only
+        // ticked cards) -- remember it, so a redraw does not reset it and the tick carries it
+        const pin = [...box.querySelectorAll(".ref-pin")].find((el) => el.dataset.tag === target.dataset.tag);
+        if (pin && !pin.checked) {
+          chosenVersions[target.dataset.tag] = Number(target.value);
+          return;
+        }
+      }
       const refs = [...box.querySelectorAll(".ref-pin")].filter((el) => el.checked)
         .map((el) => el.dataset.tag);
-      const refsBody = referencesPayload(refs, project.project.references || []);
+      const chosen = {};
+      for (const select of box.querySelectorAll(".ref-version")) chosen[select.dataset.tag] = Number(select.value);
+      const refsBody = referencesPayload(refs, project.project.references || [], chosen);
+      invalidateH3Prompts();    // references decide <Picture k> and the subject definitions
       withProject(() => api("PUT", `/api/projects/${encodeURIComponent(box.dataset.id)}/references`,
                             { references: refsBody }));
     }
@@ -5075,8 +6001,13 @@ function startPage() {
     const field = event.target.closest(".i2v-prefix");
     if (!field || !project || !project.project) return;
     if (field.value === (project.project.i2v_prefix || "")) return;
-    withProject(() => api("PUT", `/api/projects/${encodeURIComponent(field.dataset.id)}/settings`,
-                          { i2v_prefix: field.value }));
+    invalidateH3Prompts();      // i2v_prefix is part of a chained scene's prompt
+    withProject(async () => {
+      settingsSaved = null;
+      await api("PUT", `/api/projects/${encodeURIComponent(field.dataset.id)}/settings`,
+                { i2v_prefix: field.value });
+      settingsSaved = "i2v_prefix";
+    });
   });
 
   document.addEventListener("click", (event) => {
@@ -5094,6 +6025,41 @@ function startPage() {
     if (save) saveLibraryDescription(save);
   });
 
+  function showCardError(card, err) {
+    const box = card.querySelector(".lib-card-error");
+    box.textContent = err.payload ? err.payload.error.message : String(err);
+    box.hidden = false;
+  }
+
+  /** «Новая версия»: файлы на `/api/uploads`, затем `PUT /api/library/<имя>` с описанием и путями. */
+  async function newLibraryVersion(button) {
+    const card = button.closest(".lib-card");
+    card.querySelector(".lib-card-error").hidden = true;
+    try {
+      const files = [...(card.querySelector(".lib-new-files").files || [])];
+      if (!files.length) throw new Error("Выберите файлы новой версии");
+      const assets = [];
+      for (const file of files) assets.push(await uploadToServer(file));
+      const request = libraryUpdateRequest(button.dataset.tag, card.querySelector(".lib-edit-desc").value.trim());
+      await api("PUT", `/api/library/${encodeURIComponent(request.name)}`, { ...request.body, assets });
+      await loadLibrary();
+    } catch (err) {
+      showCardError(card, err);
+    }
+  }
+
+  async function deleteLibraryCard(button) {
+    const tag = button.dataset.tag;
+    if (!window.confirm(`Удалить карточку ${tag}? Файлы уйдут в library/.trash.`)) return;
+    const card = button.closest(".lib-card");
+    try {
+      await api("DELETE", `/api/library/${encodeURIComponent(tag.replace(/^@/, ""))}`);
+      await loadLibrary();
+    } catch (err) {
+      showCardError(card, err);
+    }
+  }
+
   async function saveLibraryDescription(button) {
     const card = button.closest(".lib-card");
     const cardError = card.querySelector(".lib-card-error");
@@ -5108,7 +6074,73 @@ function startPage() {
     }
   }
 
+  // Grid hint under the duration field: updated in place, no redraw (a redraw would drop the caret).
+  function updateGridHint(idx, duration) {
+    if (!state || state.engine !== "sglang" || !sceneDraft || !sceneDraft[idx]) return;
+    const hint = document.querySelector(`#project-body .grid-hint[data-idx="${idx}"]`);
+    if (!hint) return;
+    const chained = idx > 0 && !sceneDraft[idx].fresh_start;
+    hint.textContent = gridHint(sglangGridSeconds(duration, chained));
+  }
+
+  /** sglang prompt of the scene editor: tag problems like `.scenario-prompt`, and the `@` hint buttons. */
+  function promptTyped(el) {
+    if (!project || !project.project || !state || state.engine !== "sglang") return;
+    const idx = Number(el.dataset.idx);
+    const cards = pinnedCards(project.project.references, libraryCards);
+    const refs = (sceneDraft && sceneDraft[idx] && sceneDraft[idx].refs) || [];
+    const issues = sceneTagIssues(el.value, cards.map((c) => c.tag),
+      { needsTag: project.project.kind !== "clip", refs });
+    el.classList.toggle("has-tag-issues", issues.length > 0);
+    el.title = issues.map((i) => TAG_PROBLEM_TEXT[i.problem](i.tag)).join("; ");
+    const slot = document.querySelector(`#project-body .tag-hint-slot[data-idx="${idx}"]`);
+    if (slot) slot.innerHTML = tagHintHtml(el.value, el.selectionStart, cards);
+  }
+
+  /** «не сохранено» appears as soon as a field changes, without waiting for a redraw. */
+  function showDirtyNote() {
+    const note = document.querySelector("#project-body .dirty-note");
+    if (note) note.hidden = !sceneDraftDirty;
+  }
+
+  // The frame of scene 0 changed: redraw from the draft, so the thumbnail follows the pick.
+  document.addEventListener("change", (event) => {
+    if (!event.target.closest('[data-scene-field="start_image"]') || !sceneDraft) return;
+    changeSceneDraft((draft) => draft);
+  });
+
+  // Ticking «начать с чистого листа» changes whether the scene is chained, hence its grid.
+  document.addEventListener("change", (event) => {
+    const box = event.target.closest('[data-scene-field="fresh_start"]');
+    if (!box) return;
+    syncDraftFromDom();
+    showDirtyNote();
+    const idx = Number(box.dataset.idx);
+    if (sceneDraft && sceneDraft[idx]) updateGridHint(idx, sceneDraft[idx].duration);
+  });
+
   document.addEventListener("input", (event) => {
+    if (event.target.closest(".i2v-prefix, .project-seed")) {
+      // a field being edited again is no longer «сохранено ✓»
+      settingsSaved = null;
+      const mark = document.querySelector("#project-body .saved-mark");
+      if (mark) mark.remove();
+      return;
+    }
+    const jsonField = event.target.closest(".scenario-json-text");
+    if (jsonField) { scenarioJsonText = jsonField.value; return; }
+    const sceneField = event.target.closest("[data-scene-field]");
+    if (sceneField) {
+      syncDraftFromDom();
+      showDirtyNote();
+      // the shown «Промпт для H3» was built from the saved scene: stale as soon as a field moves
+      document.querySelectorAll("#project-body .h3-prompt").forEach((el) => el.remove());
+      if (sceneField.dataset.sceneField === "duration") {
+        updateGridHint(Number(sceneField.dataset.idx), Number(String(sceneField.value).replace(",", ".")));
+      }
+      if (sceneField.dataset.sceneField === "prompt") promptTyped(sceneField);
+      return;
+    }
     const el = event.target.closest(".scenario-prompt");
     // mlx has no references: no highlight, no hint, no demand for a tag
     if (!el || !project || !project.project || !state || state.engine !== "sglang") return;
@@ -5224,6 +6256,20 @@ function startPage() {
 
   // -- подписки модалки -------------------------------------------------------------------
 
+  $("project-new-video").addEventListener("click", async () => {
+    const title = window.prompt("Название проекта (пусто — по дате):", "");
+    if (title === null) return;
+    try {
+      const created = await api("POST", "/api/projects", newVideoRequest(title, new Date()));
+      await poll();
+      await openProjectModal(created.id);
+    } catch (error) {
+      showError(error.payload || { error: { message: "сервер не ответил" } });
+    }
+  });
+  $("project-new-chat").addEventListener("click", () =>
+    openChatModal({ kind: "new" }, { prompt: "", mode: "", image: "", endImage: "", duration: 10 }));
+
   $("chat-new").addEventListener("click", () => {
     const mode = $("mode").value;
     openChatModal({ kind: "new" }, {
@@ -5268,8 +6314,29 @@ function startPage() {
   $("chat-finish").addEventListener("click", finishChat);
 
   // -- проекты (Task 7) --------------------------------------------------------------------
-  $("project-close").addEventListener("click", closeProjectModal);
+  $("project-close").addEventListener("click", requestCloseProject);
   $("project-delete").addEventListener("click", deleteProject);
+  $("scene0-file").addEventListener("change", async () => {
+    const input = $("scene0-file");
+    const file = input.files && input.files[0];
+    if (!file || !sceneDraft) return;
+    try {
+      if (!/\.(png|jpe?g)$/i.test(file.name)) {
+        showProjectError({ error: { clientTitle: "Кадр не загружен",
+          message: "Стартовый кадр — только png или jpg" } });
+        return;
+      }
+      const path = await uploadToServer(file);
+      if (!project || !sceneDraft) return;     // the panel was closed while the file went up
+      clearProjectError();
+      changeSceneDraft((draft) => draft.map((scene, i) => (i === 0 ? { ...scene, start_image: path } : scene)));
+    } catch (error) {
+      if (!project) return;
+      showProjectError(error.payload ? error.payload : { error: { message: "сервер не ответил" } });
+    } finally {
+      input.value = "";
+    }
+  });
 
   /** «Сделать проектом», шапка чат-модалки — активна только когда `chat.project` реально есть
    *  (design spec: "активна при наличии project-поля в сессии"). Раскрывает `#chat-project-
@@ -5379,7 +6446,30 @@ function startPage() {
     });
   }
 
-  $("chat-make-project").addEventListener("click", openProjectCreatePanel);
+  /** «Применить к проекту»: сцены диалога заменяют все сцены проекта (с вопросом, если они есть). */
+  async function applyChatToProject() {
+    if (!chat || !chat.project) return;
+    const id = chat.source.id;
+    clearChatProjectError();
+    try {
+      const current = await api("GET", `/api/projects/${encodeURIComponent(id)}`);
+      const question = chatApplyConfirm(((current.project || {}).scenes || []).length,
+                                        (chat.project.scenes || []).length);
+      if (question !== null && !window.confirm(question)) return;
+      await api("PUT", `/api/projects/${encodeURIComponent(id)}/scenes`, chatApplyBody(chat.project));
+      closeChat();
+      await poll();
+      await openProjectModal(id);
+    } catch (error) {
+      $("chat-project-panel").hidden = false;     // the error is shown in the panel
+      showChatProjectError(error.payload ? error.payload : { error: { message: "сервер не ответил" } });
+    }
+  }
+
+  $("chat-make-project").addEventListener("click", () => {
+    if (chat && chat.source.kind === "project") applyChatToProject();
+    else openProjectCreatePanel();
+  });
   $("chat-project-cancel").addEventListener("click", closeProjectCreatePanel);
   $("chat-project-create").addEventListener("click", async () => {
     if (!chat || !chat.project) return;

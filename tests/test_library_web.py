@@ -1,4 +1,6 @@
 """Library and project-references JSON API (spec §3.5, §10: wave 1 is data + API)."""
+import json
+
 import pytest
 
 from h3_48gb import project as p
@@ -29,7 +31,13 @@ def test_create_and_list(live):
                      "version": 1, "latest_version": 1,
                      "assets": [str(live.outdir / "library" / "alice" / "v1" / "01-face.png")]}
     assert (status, body) == (200, {"ok": True, "card": expected_card})
-    assert _call(live, "GET", "/api/library") == (200, {"ok": True, "cards": [expected_card]})
+    created = json.loads((live.outdir / "library" / "alice" / "card.json").read_text(
+        encoding="utf-8"))["versions"]["1"]["created"]  # wall clock: take what the card recorded
+    # spec §5.3: the listing (not create's answer) also carries every version of the card
+    listed = {**expected_card, "versions": [
+        {"version": 1, "kind": "person", "description": "a young woman",
+         "assets": expected_card["assets"], "created": created}]}
+    assert _call(live, "GET", "/api/library") == (200, {"ok": True, "cards": [listed]})
 
 
 def test_assets_outside_the_outdir_are_refused(live):

@@ -244,8 +244,8 @@ uninvited; the page and the person on the other end are not expecting one.
 ### `kind: "video"` — a scripted sequence of clips
 
 `scenes` is a list of `{"prompt": string, "duration": number}`, in play order. Each scene is
-**5 to 10 seconds** long (`duration`) — split a longer idea into more scenes rather than writing
-one scene past 10 seconds; the pipeline generates and stitches one clip per scene, and 10 seconds
+**@@SCENE_MIN@@ to @@SCENE_MAX@@ seconds** long (`duration`) — split a longer idea into more scenes rather than writing
+one scene past @@SCENE_MAX@@ seconds; the pipeline generates and stitches one clip per scene, and @@SCENE_MAX@@ seconds
 is the ceiling a single clip is written to reach.
 
 Each scene's `prompt` is a full, self-contained H3 prompt, in exactly the format the rest of this

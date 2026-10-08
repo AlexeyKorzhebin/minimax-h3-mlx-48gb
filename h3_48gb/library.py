@@ -39,6 +39,7 @@ ERROR_CODES = {
     "library_description_invalid": "a reference card description is empty or too long",
     "library_assets_invalid": "a reference card needs 1-4 png/jpg pictures, or exactly one mp3/wav for a voice",
     "library_card_not_found": "no reference card with this tag",
+    "library_card_in_use": "a reference card is pinned by at least one project (finished ones included) and is not deleted",
     "library_version_not_found": "the reference card has no such version",
     "tag_invalid": "an @tag in scene text is not lowercase [a-z0-9-]{2,32}",
     "unknown_tag": "an @tag in scene text is not pinned to the project",
@@ -78,9 +79,15 @@ def _card_dir(outdir, tag) -> Path:
 
 
 @contextmanager
-def _card_lock(card_dir: Path):
-    card_dir.mkdir(parents=True, exist_ok=True)
-    with open(card_dir / "card.lock", "a+") as handle:
+def _card_lock(card_dir: Path, tag: str):
+    """Exclusive lock on one card. The directory must exist: a writer that was waiting while the
+    card was deleted must find it gone, not recreate an empty one (which `create_card` would then
+    refuse as `library_tag_exists` forever)."""
+    try:
+        handle = open(card_dir / "card.lock", "a+")
+    except FileNotFoundError:
+        raise LibraryError("library_card_not_found", f"нет карточки {tag}", {"tag": tag}) from None
+    with handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
@@ -154,7 +161,7 @@ def create_card(outdir, *, tag, kind, description, assets, now=None) -> dict:
     except FileExistsError:
         raise LibraryError("library_tag_exists", f"тег {tag} уже есть", {"tag": tag}) from None
     stamp = now or _now()
-    with _card_lock(card_dir):
+    with _card_lock(card_dir, tag):
         relative = _copy_assets(card_dir, 1, paths)
         card = {"tag": tag, "version": 1, "created": stamp, "updated": stamp,
                 "versions": {"1": {"kind": kind, "description": description.strip(),
@@ -165,8 +172,8 @@ def create_card(outdir, *, tag, kind, description, assets, now=None) -> dict:
 
 def update_card(outdir, tag, *, kind=None, description=None, assets=None, now=None) -> dict:
     card_dir = _card_dir(outdir, tag)
-    _read(card_dir, tag)  # refuse an unknown tag before _card_lock creates its directory
-    with _card_lock(card_dir):
+    _read(card_dir, tag)
+    with _card_lock(card_dir, tag):
         card = _read(card_dir, tag)
         previous = card["versions"][str(card["version"])]
         new_kind = kind if kind is not None else previous["kind"]
@@ -194,6 +201,42 @@ def get_card(outdir, tag, version=None) -> dict:
     return _view(card_dir, card, card["version"] if version is None else int(version))
 
 
+def card_history(outdir, tag) -> list[dict]:
+    """Every version of the card, oldest first, with absolute asset paths."""
+    card_dir = _card_dir(outdir, tag)
+    card = _read(card_dir, tag)
+    return [{"version": int(number), "kind": entry["kind"], "description": entry["description"],
+             "assets": [str(card_dir / rel) for rel in entry["assets"]],
+             "created": entry["created"]}
+            for number, entry in sorted(card["versions"].items(), key=lambda kv: int(kv[0]))]
+
+
+def delete_card(outdir, tag, *, pinned_by, now: str | None = None) -> Path:
+    """Move the card's directory to `library/.trash/<name>-<stamp>[-N]`; never erase it. A card some
+    project pins is refused. `pinned_by` is a list of `{"id", "title"}` or a zero-argument callable
+    returning one -- the callable is evaluated under the card lock, so a project cannot pin the
+    card between the check and the move."""
+    card_dir = _card_dir(outdir, tag)
+    _read(card_dir, tag)
+    with _card_lock(card_dir, tag):
+        _read(card_dir, tag)  # a concurrent delete may have moved it while we waited
+        pins = pinned_by() if callable(pinned_by) else pinned_by
+        if pins:
+            listed = ", ".join(f"«{item['title']}» ({item['id']})" for item in pins)
+            raise LibraryError("library_card_in_use",
+                               f"{tag} подключена к проектам: {listed} — отключите её там или "
+                               "удалите проекты", {"tag": tag, "projects": pins})
+        trash = library_root(outdir) / ".trash"
+        trash.mkdir(exist_ok=True)
+        base = f"{card_dir.name}-{now or datetime.now().strftime('%Y%m%d%H%M%S')}"
+        target, number = trash / base, 1
+        while target.exists():
+            number += 1
+            target = trash / f"{base}-{number}"
+        card_dir.rename(target)
+    return target
+
+
 def list_cards(outdir) -> list[dict]:
     root = library_root(outdir)
     if not root.is_dir():
@@ -202,7 +245,8 @@ def list_cards(outdir) -> list[dict]:
     for entry in sorted(root.iterdir()):
         if (entry / CARD_NAME).is_file():
             try:
-                cards.append(get_card(outdir, "@" + entry.name))
+                cards.append({**get_card(outdir, "@" + entry.name),
+                              "versions": card_history(outdir, "@" + entry.name)})
             except (LibraryError, ValueError, KeyError):
                 continue
     return cards
@@ -225,42 +269,56 @@ def scene_tags(text: str) -> list[str]:
 _OWN_DEFINITIONS_RE = re.compile(r"(?m)^\s*subject_definitions\s*:")
 
 
-def build_ref2va(scene_prompt: str, references, outdir) -> Ref2VAScene:
+def build_ref2va(scene_prompt: str, references, outdir, extra_refs=()) -> Ref2VAScene:
     """The scene as sglang's Ref2VA takes it: each @tag, in order of first mention, becomes
-    `<Subject N>` in the text and its card's pictures `<Picture k>` (audio `<Audio k>`) in the
-    same order; the panel puts its own `subject_definitions:` block in front.
+    `<Subject N>` in the text and its card's pictures `<Picture k>` (audio `<Audio k>`); the panel
+    puts its own `subject_definitions:` block in front.
+
+    `extra_refs` (UI-gap API 2): the scene's explicit `refs` -- cards connected as conditions
+    without a mention in the text and without a `<Subject N>`. Conditions go in this order: the
+    explicit refs, then the tags the text mentions, each card once -- so `<Picture k>` counts the
+    explicit refs' pictures first, and a text tag that is also in `extra_refs` points at the
+    pictures it already brought. The keyframe is not a reference and is never numbered.
 
     I5 (coordinator's ruling): a prompt that already has its own `subject_definitions:` section
     gets no second block -- the owner's definitions stand as written. The @tags in it still
     become `<Subject N>` and still bring their pictures as conditions, numbered exactly as above,
     so the owner's block has to follow that numbering."""
     tags = scene_tags(scene_prompt)
-    if not tags:
+    extra = list(dict.fromkeys(extra_refs))
+    if not tags and not extra:
         return Ref2VAScene(scene_prompt, (), (), ())
     pinned = {ref["tag"]: ref for ref in references}
-    unknown = [tag for tag in tags if tag not in pinned]
+    unknown = [tag for tag in [*extra, *tags] if tag not in pinned]
     if unknown:
         raise LibraryError("unknown_tag", f"теги не подключены к проекту: {', '.join(unknown)}",
-                           {"unknown": unknown})
+                           {"unknown": list(dict.fromkeys(unknown))})
     images: list[str] = []
     audios: list[str] = []
-    lines: list[str] = []
-    for number, tag in enumerate(tags, start=1):
+    cards: dict[str, dict] = {}     # tag -> {"card", "pictures": [k...], "audio": k | None}
+    for tag in [*extra, *(tag for tag in tags if tag not in extra)]:
         card = get_card(outdir, tag, pinned[tag].get("version"))
-        description = card["description"].strip().rstrip(".")
+        entry = {"card": card, "pictures": [], "audio": None}
         if card["kind"] == "voice":
             audios.append(card["assets"][0])
-            lines.append(f"<Subject {number}> is {description}, voice from <Audio {len(audios)}>.")
+            entry["audio"] = len(audios)
         else:
-            labels = []
             for asset in card["assets"]:
                 images.append(asset)
-                labels.append(f"<Picture {len(images)}>")
-            lines.append(f"<Subject {number}> is {description}, appearance from "
-                         f"{', '.join(labels)}.")
+                entry["pictures"].append(len(images))
+        cards[tag] = entry
+    lines: list[str] = []
+    for number, tag in enumerate(tags, start=1):
+        entry = cards[tag]
+        description = entry["card"]["description"].strip().rstrip(".")
+        if entry["audio"] is not None:
+            lines.append(f"<Subject {number}> is {description}, voice from <Audio {entry['audio']}>.")
+        else:
+            labels = ", ".join(f"<Picture {k}>" for k in entry["pictures"])
+            lines.append(f"<Subject {number}> is {description}, appearance from {labels}.")
     body = _TAG_IN_TEXT_RE.sub(lambda m: f"<Subject {tags.index('@' + m.group(1)) + 1}>",
                                scene_prompt)
-    if _OWN_DEFINITIONS_RE.search(scene_prompt):
+    if not tags or _OWN_DEFINITIONS_RE.search(scene_prompt):
         prompt = body
     else:
         prompt = "subject_definitions:\n" + "\n".join(lines) + "\n\n" + body

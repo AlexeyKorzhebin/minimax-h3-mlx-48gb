@@ -7,12 +7,14 @@ variable does, so the roster can be shown to the page verbatim.
 """
 from __future__ import annotations
 
+import copy
 import http.client
 import json
 import re
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -233,12 +235,35 @@ SCENARIO_SCHEMA = {
 _SYSTEM_PROMPT_CACHE: str | None = None
 
 
+def scene_seconds() -> tuple[float, float]:
+    """The `(min, max)` seconds one scene of a `kind: "video"` project may last on the engine in
+    force: sglang's own range, or the MLX pipeline's. Read on every call (`H3_ENGINE` can change)."""
+    from h3_48gb import engine
+    from h3_48gb.engines import sglang_args
+    if engine.is_sglang():
+        return sglang_args.MIN_SECONDS, sglang_args.MAX_SECONDS
+    return 5.0, 10.0
+
+
+def prompt_schema() -> dict:
+    """`PROMPT_SCHEMA` with the video-scene `duration` bounds of the engine in force. The module
+    constant stays as the MLX shape; every caller that sends a schema asks for this one."""
+    schema = copy.deepcopy(PROMPT_SCHEMA)
+    low, high = scene_seconds()
+    duration = schema["schema"]["properties"]["project"]["properties"]["scenes"]["items"][
+        "properties"]["duration"]
+    duration["minimum"], duration["maximum"] = low, high
+    return schema
+
+
 def system_prompt() -> str:
     global _SYSTEM_PROMPT_CACHE
     if _SYSTEM_PROMPT_CACHE is None:
         path = Path(__file__).parent.parent / "docs" / "h3-prompt-system.md"
         _SYSTEM_PROMPT_CACHE = path.read_text(encoding="utf-8")
-    return _SYSTEM_PROMPT_CACHE
+    low, high = scene_seconds()
+    return (_SYSTEM_PROMPT_CACHE.replace("@@SCENE_MIN@@", f"{low:g}")
+            .replace("@@SCENE_MAX@@", f"{high:g}"))
 
 
 def load_env(root) -> dict[str, str]:
@@ -274,6 +299,27 @@ def load_providers(root) -> dict:
             cfg["available"], cfg["reason"] = True, None
         providers[name] = cfg
     return {"active": data.get("active"), "providers": providers}
+
+
+#: Hosts that mean "this machine" -- a provider served from one of them takes the GPU the render
+#: needs (or the machine's memory), which the page warns about.
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "host.docker.internal"})
+
+
+def shares_gpu(cfg: dict) -> bool | None:
+    """Whether this provider competes with the renderer for the GPU: `True`/`False` when known,
+    `None` when it cannot be told. An explicit `shares_gpu` boolean in the entry wins; otherwise a
+    `llama-local` provider, or one whose `base_url` host is this machine, shares it."""
+    explicit = cfg.get("shares_gpu")
+    if isinstance(explicit, bool):
+        return explicit
+    if cfg.get("type") == "llama-local":
+        return True
+    try:
+        host = urllib.parse.urlsplit(cfg.get("base_url") or "").hostname
+    except ValueError:
+        return None
+    return True if host in _LOCAL_HOSTS else None
 
 
 def local_ports(roster: dict) -> list[int]:
@@ -529,6 +575,101 @@ def _read_sse(r) -> tuple[str, str | None]:
         "поток оборвался раньше [DONE] -- провайдер закрыл соединение посреди ответа")
 
 
+_FENCE_RE = re.compile(r"\A\s*```(?:json)?[ \t]*\r?\n?(.*?)\r?\n?```\s*\Z", re.S)
+
+
+def _parse_model_json(raw, schema: dict):
+    """`json.loads` of the model's text, with the two repairs CAILA's non-OpenAI routes need.
+
+    1. The whole text is one ```json ...``` (or bare ``` ...```) block, whitespace around it
+       allowed: the fence is stripped. Prose with JSON somewhere inside is NOT searched -- that
+       stays a parse failure (`bad_model_json` upstream).
+    2. Properties the schema allows to be null (`"null"` in `type`) that the object omits are
+       added as null. Required non-nullable properties are never invented.
+    """
+    text = raw
+    if isinstance(text, str):
+        m = _FENCE_RE.match(text)
+        if m:
+            text = m.group(1)
+    return _fill_nullable(json.loads(text), schema.get("schema", schema))
+
+
+def _allows_null(sub: dict) -> bool:
+    t = sub.get("type")
+    return t == "null" or (isinstance(t, list) and "null" in t)
+
+
+def _fill_nullable(value, sub: dict):
+    if isinstance(value, dict) and isinstance(sub.get("properties"), dict):
+        if sub.get("additionalProperties") is False:
+            # Strict object: keys outside `properties` (Sonnet adds `fresh_start`, `_note`) are
+            # dropped so the answer matches the schema. Only for an explicit `false`.
+            for key in [k for k in value if k not in sub["properties"]]:
+                del value[key]
+        for key, child in sub["properties"].items():
+            if key not in value:
+                if _allows_null(child):
+                    value[key] = None
+            else:
+                _fill_nullable(value[key], child)
+    elif isinstance(value, list) and isinstance(sub.get("items"), dict):
+        for item in value:
+            _fill_nullable(item, sub["items"])
+    return value
+
+
+def _type_ok(value, t: str) -> bool:
+    if t == "null":
+        return value is None
+    if t == "boolean":
+        return isinstance(value, bool)
+    if t == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if t == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if t == "string":
+        return isinstance(value, str)
+    if t == "array":
+        return isinstance(value, list)
+    if t == "object":
+        return isinstance(value, dict)
+    return True
+
+
+def _schema_violation(value, sub: dict, path: str = "$") -> str | None:
+    """First violation of `sub` by `value`, or None. The small subset of JSON Schema this module's
+    own schemas use: type (string or list), required, properties, items, enum, minimum, maximum.
+    Only the `json_object` response format needs it -- there the provider enforces nothing."""
+    t = sub.get("type")
+    if t is not None:
+        types = t if isinstance(t, list) else [t]
+        if not any(_type_ok(value, x) for x in types):
+            return f"{path}: ожидался тип {types}, получено {type(value).__name__}"
+    if "enum" in sub and value not in sub["enum"]:
+        return f"{path}: значение вне enum"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in sub and value < sub["minimum"]:
+            return f"{path}: меньше минимума {sub['minimum']}"
+        if "maximum" in sub and value > sub["maximum"]:
+            return f"{path}: больше максимума {sub['maximum']}"
+    if isinstance(value, dict):
+        for key in sub.get("required", []):
+            if key not in value:
+                return f"{path}: нет обязательного поля {key}"
+        for key, child in (sub.get("properties") or {}).items():
+            if key in value:
+                bad = _schema_violation(value[key], child, f"{path}.{key}")
+                if bad:
+                    return bad
+    elif isinstance(value, list) and isinstance(sub.get("items"), dict):
+        for i, item in enumerate(value):
+            bad = _schema_violation(item, sub["items"], f"{path}[{i}]")
+            if bad:
+                return bad
+    return None
+
+
 def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
                retry_reminder: str) -> dict:
     """One turn of the OpenAI chat protocol, response shaped by `schema`.
@@ -603,6 +744,22 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
             "messages": messages,
             token_limit_key: max_tokens,
             "response_format": {"type": "json_schema", "json_schema": schema}}
+    # `response_format: "json_object"` in a provider's own entry: for routes that refuse strict
+    # `json_schema` (CAILA's just-ai/openrouter-proxy/anthropic/claude-sonnet-5.5 answers 400
+    # "tool_choice: type tool and any are not supported for this model"). The wire format is the
+    # plain `{"type":"json_object"}`, the schema goes into the system message as text, and the
+    # reply is checked against it here (`_schema_violation`) since the provider enforces nothing.
+    json_object = cfg.get("response_format", "json_schema") == "json_object"
+    if json_object:
+        body["response_format"] = {"type": "json_object"}
+        note = ("Ответ — один JSON-объект по этой JSON-схеме: "
+                + json.dumps(schema.get("schema", schema), ensure_ascii=False))
+        if messages and messages[0].get("role") == "system":
+            messages = [{**messages[0], "content": f"{messages[0]['content']}\n\n{note}"},
+                        *messages[1:]]
+        else:
+            messages = [{"role": "system", "content": note}, *messages]
+        body["messages"] = messages
     # `send_temperature: false` in a provider's own entry leaves `temperature` out of the body
     # entirely. Default `true` (unchanged behaviour): every provider this file currently talks to
     # sends an explicit `temperature` in `providers.json` and today's live caila.io call still
@@ -752,19 +909,27 @@ def _chat_turn(cfg: dict, env: dict, messages: list[dict], schema: dict,
             f"ответ обрезан лимитом вывода ({token_limit_key}={max_tokens}) раньше, чем модель "
             f"закончила -- {advice}")
 
+    def _parse(text):
+        value = _parse_model_json(text, schema)
+        if json_object:
+            bad = _schema_violation(value, schema.get("schema", schema))
+            if bad:
+                raise ValueError(bad)
+        return value
+
     raw, finish_reason = ask(messages)
     if finish_reason == "length":
         raise _truncated()
     try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+        return _parse(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
         reminder = {"role": "system", "content": retry_reminder}
         raw2, finish_reason2 = ask([reminder, *messages])
         if finish_reason2 == "length":
             raise _truncated()
         try:
-            return json.loads(raw2)
-        except (json.JSONDecodeError, TypeError):
+            return _parse(raw2)
+        except (json.JSONDecodeError, TypeError, ValueError):
             raise ProviderError("bad_model_json",
                                f"модель не удержала формат: {(raw2 or '')[:400]}")
 
@@ -775,7 +940,7 @@ def chat(cfg: dict, env: dict, messages: list[dict]) -> dict:
     See `_chat_turn` for the shared mechanics (retry, the four named failures) this and
     `chat_scenario` both build on.
     """
-    return _chat_turn(cfg, env, messages, PROMPT_SCHEMA,
+    return _chat_turn(cfg, env, messages, prompt_schema(),
                       "Ответ строго одним JSON-объектом по схеме "
                       "{reply: string, prompt: object|null}. Без другого текста.")
 

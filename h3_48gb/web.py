@@ -264,8 +264,9 @@ UPLOAD_DIR = "uploads"
 #: What a chat session may say it was opened from. A closed list, and checked on creation: a
 #: session whose `kind` the page does not know is one the page can never open again, and the honest
 #: moment to say so is the moment it is written. `clip` is accepted and stored but not yet acted on
-#: -- the "проекты" spec is what gives it meaning.
-CHAT_SOURCE_KINDS = frozenset({"new", "prompt", "job", "clip"})
+#: -- the "проекты" spec is what gives it meaning. `project` (wave 1.5, spec §5.4) is the chat of an
+#: existing project: `id` must name one, and the session starts with that project's tags.
+CHAT_SOURCE_KINDS = frozenset({"new", "prompt", "job", "clip", "project"})
 
 #: The keys a `source` may carry beside `kind`: which prompt file, or which job/clip id.
 CHAT_SOURCE_KEYS = frozenset({"kind", "name", "id"})
@@ -486,6 +487,16 @@ def _upload_stamp() -> str:
     """
     return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
 
+#: Wave 1.5, spec §5.5: why an edit of a running project is refused. The page shows the same
+#: text before the click (`app.PROJECT_LOCK_TEXT`, pinned equal by a test).
+PROJECT_LOCK_TEXT = {
+    "references": "Проект считается — референсы меняются после конца прогона. Чтобы поменять "
+                  "для части сцен: дождитесь конца и пересчитайте с нужной сцены.",
+    "settings": "Проект считается — начало сцепленной сцены и сид меняются после конца прогона. "
+                "Чтобы поменять для части сцен: дождитесь конца и пересчитайте с нужной сцены.",
+    "route": "Идёт апскейл или сборка — галочку апскейла можно поменять после них.",
+}
+
 #: HTTP status for each `CliError` code that is not a plain refusal of the request. Everything
 #: absent from here is 400: the caller asked for something this server will not do.
 #:
@@ -495,6 +506,7 @@ def _upload_stamp() -> str:
 ERROR_STATUS = {
     "library_card_not_found": 404,
     "library_tag_exists": 409,
+    "library_card_in_use": 409,
     "reveal_unsupported": 409,
     "host_not_allowed": 403,
     # A separate code from `host_not_allowed`, and separate on purpose: `Host` answers "which name
@@ -984,6 +996,10 @@ def _sglang_frame_bounds(chained: bool) -> tuple[int, int]:
     return 73 - overlap, 345 - overlap
 
 
+def _is_seed(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def _snap_video_scenes_sglang(scenes: list[dict]) -> list[dict]:
     """Every video scene's *delivered* duration onto sglang's grid (spec §4.1.5), nearest point,
     kept inside what sglang accepts: the **requested** frames must be `17n+5` within 3..15 s, i.e.
@@ -1002,31 +1018,78 @@ def _snap_video_scenes_sglang(scenes: list[dict]) -> list[dict]:
     return snapped
 
 
+def _scene_edit_fields(raw: dict, i: int, *, sglang: bool) -> dict:
+    """The checked `prompt`/`seed`/`steps` of `raw` (only those present): one rule for
+    `PUT .../scenes` and `POST .../scenes/<idx>/retry`. seed/steps are sglang-only and the engine
+    is refused before the value is looked at."""
+    out: dict = {}
+    if "prompt" in raw:
+        prompt = raw["prompt"]
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise CliError("args_invalid", f"`scenes[{i}].prompt` must be a non-empty string",
+                           {"index": i})
+        out["prompt"] = prompt
+    for field in ("seed", "steps"):
+        if field in raw and not sglang:
+            raise CliError("args_invalid", f"`scenes[{i}].{field}` is only for the sglang "
+                           "engine", {"index": i})
+    if "seed" in raw:
+        if not _is_seed(raw["seed"]):
+            raise CliError("args_invalid", f"`scenes[{i}].seed` must be an integer >= 0",
+                           {"index": i})
+        out["seed"] = raw["seed"]
+    if "steps" in raw:
+        steps_low, steps_high = sglang_args.MIN_STEPS, sglang_args.MAX_STEPS
+        if (not isinstance(raw["steps"], int) or isinstance(raw["steps"], bool)
+                or not steps_low <= raw["steps"] <= steps_high):
+            raise CliError("args_invalid", f"`scenes[{i}].steps` must be an integer "
+                           f"between {steps_low} and {steps_high}", {"index": i})
+        out["steps"] = raw["steps"]
+    return out
+
+
+def _scene_sglang_args(proj, scene: dict, outdir) -> list[str]:
+    """The sglang argv for one scene, built by the very path the submission runs: `build_ref2va`,
+    scene 0's start image, the argv `assemble` builds (a chained scene with a stand-in keyframe
+    path) and the adapter's own `sglang_args.parse`. A clip scene gets a stand-in track piece: its
+    audio reference. Raises `LibraryError`, `SglangArgsError` or `AssembleError`; the gate and the
+    «Промпт для H3» route both catch them."""
+    chained = scene["idx"] > 0 and not scene.get("fresh_start", False)
+    ref2va = library_module.build_ref2va(scene["prompt"], proj.references, outdir,
+                                         extra_refs=scene.get("refs") or ())
+    # I6: scene 0's start image is resolved here exactly as the submission resolves it
+    start = assemble_module.scene_start_image(proj, scene, outdir)
+    if start is not None and not start.is_file():
+        raise library_module.LibraryError("start_image_invalid",
+                                          f"нет файла start_image {start}", {})
+    args, _ = assemble_module._scene_generate_args_sglang(
+        scene, keyframe=Path("keyframe.png") if chained else start, chained=chained,
+        ref2va=ref2va,
+        track_piece=Path("track-piece.wav") if proj.kind == "clip" else None,
+        scenes_dir=Path("scenes"), i2v_prefix=proj.i2v_prefix,
+        default_seed=proj.seed)
+    sglang_args.parse(args, check_files=False)
+    return args
+
+
+def _scene_args_error(idx: int, exc: Exception) -> dict:
+    """One gate entry for a failed `_scene_sglang_args`: the library/adapter code and text, or
+    `duration_off_grid` for a scene that was never snapped onto sglang's grid."""
+    if isinstance(exc, assemble_module.AssembleError):
+        return {"idx": idx, "code": "duration_off_grid", "message": str(exc)}
+    return {"idx": idx, "code": exc.code, "message": exc.message}
+
+
 def _scene_reference_errors(proj, scenes: list[dict], outdir) -> list[dict]:
-    """spec §3.5/§4.1.3: the gate runs the very path the submission runs -- `build_ref2va`, the
-    argv `assemble` builds (a chained scene with a stand-in keyframe path) and the adapter's own
-    `sglang_args.parse` -- so nothing is queued that sglang would refuse and there is one source of
-    truth for the rules. A clip scene gets a stand-in track piece: its audio reference."""
+    """spec §3.5/§4.1.3: the gate runs the very path the submission runs (`_scene_sglang_args`), so
+    nothing is queued that sglang would refuse and there is one source of truth for the rules."""
     errors: list[dict] = []
     for scene in scenes:
-        chained = scene["idx"] > 0 and not scene.get("fresh_start", False)
         try:
-            ref2va = library_module.build_ref2va(scene["prompt"], proj.references, outdir)
-            # I6: scene 0's start image is resolved here exactly as the submission resolves it
-            start = assemble_module.scene_start_image(proj, scene, outdir)
-            if start is not None and not start.is_file():
-                raise library_module.LibraryError("start_image_invalid",
-                                                  f"нет файла start_image {start}", {})
-            args, _ = assemble_module._scene_generate_args_sglang(
-                scene, keyframe=Path("keyframe.png") if chained else start, chained=chained,
-                ref2va=ref2va,
-                track_piece=Path("track-piece.wav") if proj.kind == "clip" else None,
-                scenes_dir=Path("scenes"), i2v_prefix=proj.i2v_prefix)
-            sglang_args.parse(args, check_files=False)
-        except (library_module.LibraryError, sglang_args.SglangArgsError) as exc:
-            errors.append({"idx": scene["idx"], "code": exc.code, "message": exc.message})
-        except assemble_module.AssembleError as exc:
-            errors.append({"idx": scene["idx"], "code": "duration_off_grid", "message": str(exc)})
+            _scene_sglang_args(proj, scene, outdir)
+        except (library_module.LibraryError, sglang_args.SglangArgsError,
+                assemble_module.AssembleError) as exc:
+            errors.append(_scene_args_error(scene["idx"], exc))
     return errors
 
 
@@ -2225,6 +2288,26 @@ def _media_mtime(path) -> int | None:
         return None
 
 
+def _upscale_report(proj) -> dict | None:
+    """What the LTX upscale did, from `<project>/upscale/report.json` (`engines/ltx._write_report`).
+    `attempted` is the parts the attempt *started* (a part enters the report before it is
+    upscaled, and `done` is written after a cut-short re-shot too) -- which parts are finished is
+    `ltx_path` on the scene, not this. No file, or not a JSON object -> None."""
+    try:
+        report = json.loads((proj.path.parent / "upscale" / "report.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(report, dict):
+        return None
+    parts = report.get("parts")
+    return {"status": report.get("status"), "strength": report.get("strength"),
+            "motion": report.get("motion"),
+            "attempted": [part["idx"] for part in parts
+                          if isinstance(part, dict) and "idx" in part]
+            if isinstance(parts, list) else [],
+            "error": report.get("error")}
+
+
 def _project_payload(proj) -> dict:
     """`proj.as_dict()`, with a cache-buster `v` field added to `track`/`assembly` when their own
     media file exists on disk (I2, final review) -- every route that hands a project back to the
@@ -2258,6 +2341,7 @@ def _project_payload(proj) -> dict:
     if assembly_v is not None:
         assembly["v"] = assembly_v
     result["assembly"] = assembly
+    result["upscale_report"] = _upscale_report(proj)
     return result
 
 
@@ -2525,7 +2609,7 @@ def _prepare_submission_sglang(args, roots) -> dict:
     resolve_within(report["output_stem"], roots, write=True)
     spec = sglang_args.parse(argv, check_files=False)
     cost = sglang_estimate.estimate_seconds(roots["outdir"], width=spec.width, height=spec.height,
-                                            frames=spec.frames)
+                                            frames=spec.frames, steps=spec.steps)
     return {"args": argv, "report": report, "estimate": cost,
             "prompt_text": None, "prompt_source": None}
 
@@ -3435,6 +3519,9 @@ class _Handler(BaseHTTPRequestHandler):
             return self._list_library()
         if path.startswith("/api/projects/") and path.endswith("/references"):
             return self._project_references(path[len("/api/projects/"):-len("/references")])
+        scene_prompt = re.fullmatch(r"/api/projects/([^/]+)/scenes/([^/]+)/h3-prompt", path)
+        if scene_prompt:
+            return self._scene_h3_prompt(*scene_prompt.groups())
         if path.startswith("/api/projects/"):
             return self._read_project(path[len("/api/projects/"):])
         if path == "/api/prompts":
@@ -3549,8 +3636,39 @@ class _Handler(BaseHTTPRequestHandler):
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for PUT {path}", {"path": path})
 
+    def _refuse_while_running(self, proj, what: str) -> None:
+        """Wave 1.5, spec §5.5: `project_running` (409) with `PROJECT_LOCK_TEXT[what]` while the
+        project has work in the queue (`route`: only an upscale or an assembly). Called right after
+        `_load_project`, before `_json_request`, so the refusal does not depend on the body; the
+        body is drained (`_drain_body`) before the 409 so the client always gets the answer."""
+        with queue_errors(self.server.queue_root):
+            jobs, _broken = q.scan(self.server.queue_root)
+        if what == "route":
+            busy = (_project_job_by_args(jobs, proj.path, q.KIND_UPSCALE)
+                    or _project_job_by_args(jobs, proj.path, q.KIND_ASSEMBLE))
+            active = "upscale" if busy and busy.kind == q.KIND_UPSCALE else "assembly"
+        else:
+            busy = _project_active_job(proj, jobs)
+            active = (busy or {}).get("kind")
+        if busy:
+            self._drain_body()
+            raise CliError("project_running", PROJECT_LOCK_TEXT[what],
+                           {"id": proj.id, "active": active})
+
+    def _drain_body(self) -> None:
+        """Read (and drop) the request body before an early refusal: closing a socket that still
+        holds unread bytes can answer with a connection reset instead of the 409 on some stacks.
+        Bounded by `MAX_BODY_BYTES`; an unparsable `Content-Length` drains nothing."""
+        try:
+            length = int((self.headers.get("Content-Length") if self.headers else None) or 0)
+        except ValueError:
+            return
+        if 0 < length <= MAX_BODY_BYTES:
+            self.rfile.read(length)
+
     def _put_project_route(self, raw_id: str) -> tuple[int, str, bytes]:
         proj = self._load_project(raw_id)
+        self._refuse_while_running(proj, "route")
         payload = self._json_request(allowed=("upscale",))
         if not isinstance(payload.get("upscale"), bool):
             raise CliError("args_invalid", "`upscale` must be true or false", {})
@@ -3590,10 +3708,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _put_project_settings(self, raw_id: str) -> tuple[int, str, bytes]:
         proj = self._load_project(raw_id)
-        payload = self._json_request(allowed=("i2v_prefix",))
-        if not isinstance(payload.get("i2v_prefix"), str):
+        self._refuse_while_running(proj, "settings")
+        payload = self._json_request(allowed=("i2v_prefix", "seed"))
+        if not payload:
+            raise CliError("args_invalid", "settings: pass `i2v_prefix` and/or `seed`", {})
+        if "i2v_prefix" in payload and not isinstance(payload["i2v_prefix"], str):
             raise CliError("args_invalid", "`i2v_prefix` must be a string", {})
-        proj.update_settings(i2v_prefix=payload["i2v_prefix"])
+        if "seed" in payload and payload["seed"] is not None and not _is_seed(payload["seed"]):
+            raise CliError("args_invalid", "`seed` must be an integer >= 0", {})
+        if payload.get("seed") is not None and not engine.is_sglang():
+            raise CliError("args_invalid", "`seed` is only for the sglang engine", {})
+        proj.update_settings(**payload)
         return 200, "application/json", _json_bytes(
             {"ok": True, "project": _project_payload(project_module.load_project(proj.path))})
 
@@ -3606,6 +3731,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._delete_chat(path[len("/api/chat/"):])
         if path.startswith("/api/projects/"):
             return self._delete_project(path[len("/api/projects/"):])
+        if path.startswith("/api/library/"):
+            return self._delete_card(path[len("/api/library/"):])
         return 404, "application/json", _error_bytes(
             "not_found", f"no route for DELETE {path}", {"path": path})
 
@@ -4164,7 +4291,8 @@ class _Handler(BaseHTTPRequestHandler):
                 raise CliError(exc.code, exc.message, exc.detail) from exc
             return 200, "application/json", _json_bytes({"ok": True, "estimate":
                 sglang_estimate.estimate_seconds(self.server.outdir, width=spec.width,
-                                                 height=spec.height, frames=spec.frames)})
+                                                 height=spec.height, frames=spec.frames,
+                                                 steps=spec.steps)})
         _check_command_allowed(_parse_args(args))
         # The *normalised* list, for the same reason submission uses it: `--checkpoint
         # ~/models/h3-8bit` reaches `quant_bits` as a directory literally named `~` otherwise, and
@@ -4230,6 +4358,35 @@ class _Handler(BaseHTTPRequestHandler):
             assets=self._library_assets(payload))
         return 200, "application/json", _json_bytes({"ok": True, "card": card})
 
+    def _delete_card(self, name: str) -> tuple[int, str, bytes]:
+        """`DELETE /api/library/<name>`: refused while any project -- finished or unlistable ones
+        too -- holds the tag. The test is textual (`"@tag"` as a whole JSON string anywhere in
+        `project.json`): references, a scene's `refs`, either `start_image`, and whatever field a
+        later wave adds. A `project.json` that cannot be read refuses the delete as well."""
+        tag = "@" + name
+        needle = json.dumps(tag)
+
+        def pinned_by() -> list[dict]:
+            found = []
+            root = Path(self.server.outdir) / "projects"
+            for entry in sorted(root.iterdir()) if root.is_dir() else []:
+                path = entry / project_module.PROJECT_FILENAME
+                if not path.is_file():
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8")
+                    title = json.loads(text)["title"]
+                except (OSError, ValueError, KeyError, TypeError):
+                    found.append({"id": entry.name, "title": "project.json не читается"})
+                    continue
+                if needle in text:
+                    found.append({"id": entry.name, "title": title})
+            return found
+
+        trashed = self._library_call(library_module.delete_card, self.server.outdir, tag,
+                                     pinned_by=pinned_by)
+        return 200, "application/json", _json_bytes({"ok": True, "trashed": str(trashed)})
+
     def _resolved_references(self, proj) -> list[dict]:
         return [self._library_call(library_module.get_card, self.server.outdir, ref["tag"],
                                    ref["version"]) for ref in proj.references]
@@ -4241,6 +4398,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _put_project_references(self, raw_id: str) -> tuple[int, str, bytes]:
         proj = self._load_project(raw_id)
+        self._refuse_while_running(proj, "references")
         payload = self._json_request(allowed=("references",))
         proj.set_references(self._pinned_references(payload.get("references")))
         return self._project_references(raw_id)
@@ -4267,10 +4425,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _put_project_scenes(self, raw_id: str) -> tuple[int, str, bytes]:
         """`PUT /api/projects/<id>/scenes` (final review 2026-10-07, I1): a ready-made video
-        scenario without the LLM -- `{"scenes": [{prompt, duration, fresh_start?, start_image?}],
-        "references"?: [{tag, version?}]}`. Only before anything is queued (`stages.scenes` is
-        `draft`, `stages.script` is `draft` or `awaiting_approval`); it leaves the script waiting
-        for "Утвердить", which snaps the durations and checks every scene as for a chat scenario.
+        scenario without the LLM -- `{"scenes": [{prompt, duration, fresh_start?, start_image?,
+        seed?, steps?, refs?}], "references"?: [{tag, version?}]}`. Only before anything is
+        queued (`stages.scenes` is `draft`, `stages.script` is `draft` or `awaiting_approval`); it
+        leaves the script waiting for "Утвердить", which snaps the durations and checks every
+        scene as for a chat scenario.
 
         `start_image` (I6) only on scene 0: a path inside the outdir, or an @tag the project pins
         (its card's first picture). It is the keyframe of scene 0 -- `assemble.scene_start_image`.
@@ -4298,14 +4457,17 @@ class _Handler(BaseHTTPRequestHandler):
         for i, raw in enumerate(raw_scenes):
             if not isinstance(raw, dict):
                 raise CliError("args_invalid", f"`scenes[{i}]` must be an object", {"index": i})
-            extra = set(raw) - {"prompt", "duration", "fresh_start", "start_image"}
+            extra = set(raw) - {"prompt", "duration", "fresh_start", "start_image", "seed",
+                                "steps", "refs"}
             if extra:
                 raise CliError("args_invalid", f"`scenes[{i}]`: unknown field(s) {sorted(extra)}",
                                {"index": i, "fields": sorted(extra)})
-            prompt, duration = raw.get("prompt"), raw.get("duration")
-            if not isinstance(prompt, str) or not prompt.strip():
+            edit = _scene_edit_fields({k: v for k, v in raw.items() if k == "prompt"}, i,
+                                      sglang=engine.is_sglang())
+            if "prompt" not in edit:
                 raise CliError("args_invalid", f"`scenes[{i}].prompt` must be a non-empty string",
                                {"index": i})
+            prompt, duration = edit["prompt"], raw.get("duration")
             if (not isinstance(duration, (int, float)) or isinstance(duration, bool)
                     or not low <= duration <= high):
                 raise CliError("args_invalid", f"`scenes[{i}].duration` must be a number between "
@@ -4319,6 +4481,25 @@ class _Handler(BaseHTTPRequestHandler):
                     raise CliError("args_invalid", f"`scenes[{i}].fresh_start` must be true/false",
                                    {"index": i})
                 scene["fresh_start"] = raw["fresh_start"]
+            if "refs" in raw and not engine.is_sglang():
+                raise CliError("args_invalid", f"`scenes[{i}].refs` is only for the sglang "
+                               "engine", {"index": i})
+            scene.update(_scene_edit_fields({k: v for k, v in raw.items()
+                                             if k in ("seed", "steps")}, i,
+                                            sglang=engine.is_sglang()))
+            if "refs" in raw:
+                refs = raw["refs"]
+                if not isinstance(refs, list) or not all(isinstance(tag, str) for tag in refs):
+                    raise CliError("args_invalid", f"`scenes[{i}].refs` must be a list of @tags",
+                                   {"index": i})
+                for tag in refs:
+                    if not library_module.TAG_RE.match(tag):
+                        raise CliError("args_invalid", f"`scenes[{i}].refs`: {tag} is not a tag",
+                                       {"index": i, "tag": tag})
+                    if tag not in pinned_tags:
+                        raise CliError("unknown_tag", f"refs {tag}: тег не подключён к проекту",
+                                       {"index": i, "unknown": [tag]})
+                scene["refs"] = list(dict.fromkeys(refs))
             start = raw.get("start_image")
             if start is not None:
                 if i != 0 or not isinstance(start, str) or not start:
@@ -4353,6 +4534,48 @@ class _Handler(BaseHTTPRequestHandler):
         except project_module.ProjectNotFound as exc:
             raise CliError("project_not_found", f"нет проекта {raw_id}: {exc}",
                            {"id": raw_id}) from exc
+
+    def _scene_h3_prompt(self, raw_id: str, raw_idx: str) -> tuple[int, str, bytes]:
+        """`GET /api/projects/<id>/scenes/<idx>/h3-prompt` (spec §5.2.1): what sglang will get for
+        the saved scene -- the argv `_scene_sglang_args` builds, the same one the approval gate and
+        the submission use -- shown before approval. sglang only."""
+        if not engine.is_sglang():
+            raise CliError("args_invalid", "Промпт для H3 есть только на sglang", {})
+        try:
+            idx = int(raw_idx)
+        except ValueError:
+            raise CliError("args_invalid", f"a scene index must be an integer, and {raw_idx!r} "
+                           "is not", {"idx": raw_idx}) from None
+        proj = self._load_project(raw_id)
+        scene = next((s for s in proj.scenes if s["idx"] == idx), None)
+        if scene is None:
+            raise CliError("project_scene_not_found", f"нет сцены {idx} в проекте {raw_id}",
+                           {"id": raw_id, "idx": idx})
+        scene = _snap_video_scenes_sglang([scene])[0]
+        try:
+            args = _scene_sglang_args(proj, scene, self.server.outdir)
+        except (library_module.LibraryError, sglang_args.SglangArgsError,
+                assemble_module.AssembleError) as exc:
+            error = _scene_args_error(idx, exc)
+            raise CliError(error["code"], error["message"], {"idx": idx}) from exc
+
+        def values(flag: str) -> list[str]:
+            return [args[i + 1] for i, a in enumerate(args[:-1]) if a == flag]
+
+        chained = idx > 0 and not scene.get("fresh_start", False)
+        if chained:
+            keyframe = {"kind": "previous_scene", "path": None}
+        else:
+            start = assemble_module.scene_start_image(proj, scene, self.server.outdir)
+            keyframe = ({"kind": "start_image", "path": str(start)} if start is not None
+                        else {"kind": None, "path": None})
+        return 200, "application/json", _json_bytes({
+            "ok": True, "idx": idx, "prompt": args[1],
+            "pictures": [{"label": f"<Picture {k}>", "path": path}
+                         for k, path in enumerate(values("--ref"), 1)],
+            "audios": values("--audio"), "keyframe": keyframe,
+            "duration": scene["duration"], "seed": int(values("--seed")[0]),
+            "steps": int(values("--steps")[0])})
 
     def _list_projects(self) -> tuple[int, str, bytes]:
         """`GET /api/projects`: every project under `<outdir>/projects/`, summarised -- design
@@ -4440,6 +4663,14 @@ class _Handler(BaseHTTPRequestHandler):
                 {"kind": kind, "kinds": sorted(PROJECT_KINDS)})
 
         scenes: list[dict] = []
+        low, high = ((sglang_args.MIN_SECONDS, sglang_args.MAX_SECONDS) if engine.is_sglang()
+                     else (SCENE_MIN_SECONDS, SCENE_MAX_SECONDS))
+        # The session's tags become the project's references, each on its latest version; an
+        # unknown tag refuses before a project directory exists.
+        pinned: list[dict] = []
+        if kind == "video" and session:
+            pinned = self._pinned_references(
+                [{"tag": t} for t in dict.fromkeys(session.get("tags") or [])])
         if kind == "video" and session_project:
             raw_scenes = session_project.get("scenes")
             if raw_scenes is not None:
@@ -4475,13 +4706,13 @@ class _Handler(BaseHTTPRequestHandler):
                     # `SCENE_MIN_SECONDS`/`SCENE_MAX_SECONDS` `build_clip_scenes` itself enforces
                     # for a `kind="clip"` project's own automatically-built scenes, so a
                     # `kind="video"` project's hand-written ones answer to the identical contract.
-                    if not (SCENE_MIN_SECONDS <= duration <= SCENE_MAX_SECONDS):
+                    # Wave 1.5: on sglang the range is sglang's own (3..15 s).
+                    if not (low <= duration <= high):
                         raise CliError(
                             "args_invalid",
                             f"session `project.scenes[{i}].duration` must be between "
-                            f"{SCENE_MIN_SECONDS} and {SCENE_MAX_SECONDS} seconds, got {duration}",
-                            {"index": i, "duration": duration, "min": SCENE_MIN_SECONDS,
-                             "max": SCENE_MAX_SECONDS})
+                            f"{low:g} and {high:g} seconds, got {duration}",
+                            {"index": i, "duration": duration, "min": low, "max": high})
                     scenes.append({"idx": i, "prompt": prompt, "duration": float(duration),
                                    "status": "pending", "job_id": None, "clip_path": None,
                                    "keyframe_path": None})
@@ -4540,6 +4771,7 @@ class _Handler(BaseHTTPRequestHandler):
         proj = project_module.create_project(self.server.outdir, kind, title)
         if kind == "video":
             proj.scenes = scenes
+            proj.references = pinned
             if scenes:
                 proj.stages["script"] = "awaiting_approval"
         else:
@@ -5279,10 +5511,26 @@ class _Handler(BaseHTTPRequestHandler):
                 "args_invalid", f"a scene index must be an integer, and {raw_idx!r} is not",
                 {"idx": raw_idx})
         proj = self._load_project(raw_id)
+        payload = self._json_request(allowed=("prompt", "seed", "steps"))
+        sglang = engine.is_sglang()
+        edits = _scene_edit_fields(payload, idx, sglang=sglang)
+        scene = next((s for s in proj.scenes if s["idx"] == idx), None)
+        if scene is None:
+            raise CliError(
+                "project_scene_not_found", f"нет сцены {idx} в проекте {raw_id}",
+                {"id": raw_id, "idx": idx})
+        if scene["status"] == "pending":
+            raise CliError(
+                "project_stage_not_ready", f"сцена #{idx} ещё не снималась — пересчитывать нечего",
+                {"id": raw_id, "idx": idx})
+        if "prompt" in edits and sglang:
+            errors = _scene_reference_errors(proj, [{**scene, **edits}], self.server.outdir)
+            if errors:
+                raise CliError(errors[0]["code"], errors[0]["message"], {"idx": idx})
         self._cancel_project_scene_tail_jobs(proj, idx)
         self._cancel_project_upscale_jobs(proj)
         try:
-            proj.invalidate_scene_chain(idx)
+            proj.invalidate_scene_chain(idx, edits=edits)
         except project_module.UnknownScene as exc:
             raise CliError(
                 "project_scene_not_found", f"нет сцены {idx} в проекте {raw_id}: {exc}",
@@ -5461,7 +5709,7 @@ class _Handler(BaseHTTPRequestHandler):
         """
         roster = provider.load_providers(self.server.outdir)
         listed = [{"name": name, "type": cfg.get("type"), "available": cfg.get("available"),
-                   "reason": cfg.get("reason")} for name, cfg in roster["providers"].items()]
+                   "reason": cfg.get("reason"), "shares_gpu": provider.shares_gpu(cfg)} for name, cfg in roster["providers"].items()]
         return 200, "application/json", _json_bytes(
             {"ok": True, "active": roster["active"], "providers": listed})
 
@@ -5827,8 +6075,17 @@ class _Handler(BaseHTTPRequestHandler):
         # `mode` does.
         duration = self._number_of(payload, "duration", DEFAULT_CHAT_DURATION)
         self._check_chat_duration(duration)
+        # Wave 1.5, spec §5.4: the chat of an existing project. The project must exist (the page
+        # opens a chat for something it has just listed, so a miss is a stale page, not a typo to
+        # swallow), and the session starts with the project's pinned tags and its kind, so the
+        # model sees `kind: video` from the first turn instead of waiting to invent it.
+        project_fields: dict = {}
+        if source["kind"] == "project":
+            proj = self._load_project(source.get("id") if isinstance(source.get("id"), str) else "")
+            project_fields = {"tags": [ref["tag"] for ref in proj.references], "kind": proj.kind}
         session = {"id": secrets.token_hex(4),
                    "source": source,
+                   **project_fields,
                    "mode": mode,
                    "image": str(self._chat_image_path(image)) if image else "",
                    "end_image": str(self._chat_image_path(end_image)) if end_image else "",
@@ -6074,6 +6331,10 @@ class _Handler(BaseHTTPRequestHandler):
         # present, it rides every later turn's context so the model does not lose track of which
         # kind of project it already committed this session to.
         kind_line = f"\nkind: {session['kind']}" if session.get("kind") else ""
+        # Wave 1.5: the range a *scene* may take on the engine that will render it (sglang 3-15 s,
+        # MLX 5-10 s) -- `duration` above is the clip the person is editing, not a scene.
+        scene_low, scene_high = ((sglang_args.MIN_SECONDS, sglang_args.MAX_SECONDS)
+                                 if engine.is_sglang() else (SCENE_MIN_SECONDS, SCENE_MAX_SECONDS))
         raw_tags = payload.get("tags")
         if raw_tags is not None:
             if not isinstance(raw_tags, list) or not all(isinstance(t, str) for t in raw_tags):
@@ -6090,6 +6351,7 @@ class _Handler(BaseHTTPRequestHandler):
         system = (provider.system_prompt()
                   + "\n\n## Context\nmode: " + (session.get("mode") or DEFAULT_CHAT_MODE)
                   + f"\nduration: {duration:g} s"
+                  + f"\nscene duration: {scene_low:g}–{scene_high:g} s"
                   + kind_line
                   + end_image_line
                   + "\n\n## Current prompt\n" + self._string_of(payload, "prompt")
@@ -6501,7 +6763,10 @@ def make_server(queue_root, outdir, repo=None, models=None, webui=None, port=DEF
     # sets cannot drift apart, and `http://` because this server has no TLS and never will.
     httpd.allowed_origins = frozenset(f"http://{name}" for name in httpd.allowed_hosts)
     httpd.queue_root = Path(queue_root)
-    httpd.outdir = Path(outdir)
+    # resolved once, here: `/api/state` has always said the resolved path, and the page builds
+    # `/media` links only for paths that start with it -- cards, uploads and projects must be
+    # spelled the same way
+    httpd.outdir = Path(outdir).resolve()
     httpd.webui = Path(webui) if webui is not None else WEBUI_ROOT
     httpd.roots = {"repo": Path(repo) if repo is not None else REPO_ROOT,
                    "outdir": Path(outdir),

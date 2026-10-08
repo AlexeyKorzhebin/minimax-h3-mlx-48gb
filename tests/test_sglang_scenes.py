@@ -328,3 +328,18 @@ def test_every_stage_transition_is_stamped_for_the_battle_report(tmp_path, monke
         "script": {"approved": "2026-10-08T10:00:00"},
         "scenes": {"running": "2026-10-08T10:00:05", "done": "2026-10-08T11:40:00"},
         "upscale": {"running": "2026-10-08T12:00:00", "done": "2026-10-08T12:03:00"}}
+
+
+def test_the_estimate_of_a_scene_follows_its_own_steps(chain):
+    out, proj = chain
+    proj.scenes[4]['steps'] = 25
+    proj.save()
+    submitted = []
+
+    def submit(root, args, note, report, estimate, kind):
+        submitted.append(estimate)
+        return _Submitted("j4")
+
+    assemble.advance_project(p.load_project(proj.path), out / "queue", out, submit=submit,
+                             run=_fake_run([]))
+    assert submitted == [{"seconds": 1405.0, "source": "table", "samples": 0}]

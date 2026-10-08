@@ -60,6 +60,40 @@ caila молча игнорируют `max_completion_tokens` — им нуже�
 впереди, и копировать их вариант не надо. Функциональные вызовы как альтернативу
 они рассматривали и отвергли: локальные endpoint'ы поддерживают их неодинаково.
 
+## Маршрут `anthropic-claude` исчез (08.10.2026), Sonnet 5.5 — только через `json_object`
+
+CAILA убрала маршрут `just-ai/anthropic-claude/...`. Sonnet 5.5 доступен только как
+`just-ai/openrouter-proxy/anthropic/claude-sonnet-5.5`, и на нём строгая схема
+(`response_format: json_schema`) отвечает 400 «tool_choice: type "tool" and "any" are not
+supported for this model». С `{"type":"json_object"}` тот же маршрут отвечает 200 примерно за 26 с
+чистым JSON.
+
+Поле записи провайдера `"response_format": "json_object"` (по умолчанию `"json_schema"`, как
+раньше) включает этот режим: в тело уходит `{"type":"json_object"}`, схема дописывается текстом в
+системное сообщение («Ответ — один JSON-объект по этой JSON-схеме: …»), а ответ после разбора
+(снятие ```-ограды, `null` для опущенных nullable, удаление лишних ключей) проверяется маленьким
+валидатором по той же схеме: обязательные поля, типы, `enum`, `minimum`/`maximum`. Нарушение —
+`bad_model_json` и один обычный повтор. На пути `json_schema` поведение не менялось и ответ не
+перепроверяется — там схему держит провайдер.
+
+```json
+"caila-sonnet": {
+  "type": "openai",
+  "base_url": "https://caila.io/api/adapters/openai",
+  "model": "just-ai/openrouter-proxy/anthropic/claude-sonnet-5.5",
+  "api_key_env": "CAILA_API_KEY",
+  "response_format": "json_object",
+  "max_tokens_param": "max_tokens",
+  "max_tokens": 32000,
+  "stream": false,
+  "shares_gpu": false,
+  "send_temperature": false
+}
+```
+
+Код, не знающий поля, его молча игнорирует и шлёт `json_schema` — то есть получит тот же 400;
+запись менять только вместе с выкладкой этого кода.
+
 ## Stream: не для скорости, а против таймаута шлюза
 
 Долго не использовали вовсе, и по правильным причинам: пайплайн фоновый,

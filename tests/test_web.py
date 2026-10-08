@@ -5947,7 +5947,7 @@ def test_the_plate_says_the_run_is_in_the_way_rather_than_the_model_being_down()
         app.llmPlateText("busy", {runningSeconds: 4200}),
         app.llmPlateText("busy", {runningSeconds: 0}),
         app.llmPlateText("down", {}),
-        app.llmPlateText("down", {external: true})]));
+        app.llmPlateText("down", {external: true, sharesGpu: false})]));
     """)
     assert status == "busy", "a turn refused by the queue must not leave the plate saying `down`"
     assert "прогон" in busy and "1 ч 10 мин" in busy, busy

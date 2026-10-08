@@ -96,3 +96,18 @@ def test_estimate_route_refuses_a_ref_outside_the_roots_on_sglang(queue_server, 
     assert status == 400
     assert (body["error"]["code"], body["error"]["message"]) == (
         "path_outside_root", "path is outside every root this server may read: /etc/passwd")
+
+
+def test_estimate_history_is_keyed_by_steps_and_old_rows_count_as_50(tmp_path):
+    (tmp_path / est.HISTORY_NAME).write_text(json.dumps(
+        {"width": 896, "height": 512, "frames": 175, "wall_s": 400}) + "\n", encoding="utf-8")
+    est.record(tmp_path, width=896, height=512, frames=175, wall_s=100, steps=20)
+    assert est.estimate_seconds(tmp_path, width=896, height=512, frames=175) == \
+        {"seconds": 400.0, "source": "history", "samples": 1}
+    assert est.estimate_seconds(tmp_path, width=896, height=512, frames=175, steps=20) == \
+        {"seconds": 100.0, "source": "history", "samples": 1}
+
+
+def test_estimate_table_fallback_scales_with_steps(tmp_path):
+    assert est.estimate_seconds(tmp_path, width=896, height=512, frames=175, steps=25) == \
+        {"seconds": 1405.0, "source": "table", "samples": 0}
