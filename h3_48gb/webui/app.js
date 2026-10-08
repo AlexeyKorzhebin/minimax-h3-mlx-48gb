@@ -166,11 +166,14 @@ export function sglangRunView(job, nowMs) {
   const since = Date.parse(job.started_at);
   const passed = Number.isFinite(since) ? Math.max(0, (nowMs - since) / 1000) : 0;
   const estimate = jobSeconds(job);
+  // sglang reports no step progress (progress is 0, then 100), so past the estimate there is no
+  // honest percent or end time: say how far over it is instead of "99 % · осталось 0 с"
+  const over = estimate && passed > estimate ? `дольше оценки на ${formatDuration(passed - estimate)}` : null;
   return {
     spec: parts.join(" · "), elapsed: formatDuration(passed),
     total: `≈${formatDuration(estimate)}`,
-    share: estimate ? Math.min(99, Math.floor((100 * passed) / estimate)) : 0,
-    leftSeconds: Math.max(0, estimate - passed), waiting: Boolean(job.wait_reason),
+    share: over ? null : (estimate ? Math.min(99, Math.floor((100 * passed) / estimate)) : 0),
+    leftSeconds: Math.max(0, estimate - passed), over, waiting: Boolean(job.wait_reason),
   };
 }
 
@@ -4381,8 +4384,10 @@ function startPage() {
         `<div class="run-num">`,
         cell("Идёт", escapeHtml(view.elapsed)),
         cell("Оценка", escapeHtml(view.total)),
-        view.waiting ? cell("Доля", "ждёт карту", " run-wait") : cell("Доля", `${view.share} %`),
-        cell("Кончится", formatClock(new Date(now.getTime() + view.leftSeconds * 1000))),
+        view.waiting ? cell("Доля", "ждёт карту", " run-wait")
+          : view.over ? cell("Доля", escapeHtml(view.over), " run-wait") : cell("Доля", `${view.share} %`),
+        view.over ? cell("Кончится", "неизвестно")
+          : cell("Кончится", formatClock(new Date(now.getTime() + view.leftSeconds * 1000))),
         `</div>`,
         `<div class="run-foot">старт <span class="num">`
           + `${job.started_at ? formatClock(new Date(job.started_at)) : "—"}</span> · `,
@@ -4393,8 +4398,8 @@ function startPage() {
       ].join("");
       rail.className = "rail-run";
       rail.innerHTML = `<span class="run-tag">${escapeHtml(jobTag(job))}</span>`
-        + `<span class="run-share">${view.waiting ? "ждёт карту" : `${view.share} %`}</span>`
-        + `<span class="run-left">осталось <b>${formatDuration(view.leftSeconds)}</b></span>`;
+        + `<span class="run-share">${view.waiting ? "ждёт карту" : view.over ? escapeHtml(view.over) : `${view.share} %`}</span>`
+        + (view.over ? "" : `<span class="run-left">осталось <b>${formatDuration(view.leftSeconds)}</b></span>`);
       steps.innerHTML = "";
       return { left: view.leftSeconds };
     }

@@ -776,10 +776,13 @@ def test_sglang_run_view_has_no_zeros():
     now = "Date.parse('2026-10-07T12:33:10Z')"
     assert _js(f"app.sglangRunView({SG_JOB}, {now})") == {
         "spec": "896×576 · 5,17 с · сид 305 · 50 шагов", "elapsed": "3 мин", "total": "≈9 мин",
-        "share": 35, "leftSeconds": 350, "waiting": False}
-    late = "Date.parse('2026-10-07T12:45:00Z')"          # past the estimate: never 100 % while running
-    assert _js(f"app.sglangRunView({SG_JOB}, {late})")["share"] == 99
-    assert _js(f"app.sglangRunView({SG_JOB}, {late})")["leftSeconds"] == 0
+        "share": 35, "leftSeconds": 350, "over": None, "waiting": False}
+    # past the estimate (acceptance D1: "99 % · осталось 0 с" for ten minutes looked like a hang):
+    # no percent, no end time, only how far over the estimate it already is
+    late = "Date.parse('2026-10-07T12:45:00Z')"
+    over = _js(f"app.sglangRunView({SG_JOB}, {late})")
+    assert (over["share"], over["leftSeconds"], over["over"]) == (None, 0, "дольше оценки на 6 мин")
+    assert _js(f"app.sglangRunView({SG_JOB}, {now})")["over"] is None
     chained = SG_JOB.replace("'--seed', '305']", "'--seed', '305', '--aspect', 'auto']")
     assert _js(f"app.sglangRunView({chained}, {now})")["spec"] == "896×576 · 5,13 с · сид 305 · 50 шагов"
     no_estimate = SG_JOB.replace("estimate: {seconds: 540, source: 'history', samples: 3}", "estimate: {}")

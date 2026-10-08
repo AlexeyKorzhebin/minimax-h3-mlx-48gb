@@ -16,7 +16,11 @@ DEFAULT_STEPS = 50
 #: 512/192 ×4, 512/243 ×6, 512/277 ×1, 768/124 ×1, 768/192 ×2, 768/209 ×10. The 512/175 and
 #: 512/192 rows are the beach ref2va runs (references scaled to 2048 px) -- kept on purpose: on
 #: this server every scene is ref2va now (spec §4.1.3), so they are the closest to what runs.
-FALLBACK_SECONDS = {512: {124: 345.0, 175: 2810.0, 192: 2980.0, 243: 580.0, 277: 720.0},
+#: 512/90 is 896x512 at 50 steps from two scenes of the 2026-10-08 acceptance run (1022.8 s,
+#: 1021.9 s). sglang gives no step progress (video_api.py: progress 0, then 100), so the panel's
+#: share is time over this estimate -- a 3.75 s scene must not be estimated as the 124-frame 345 s.
+FALLBACK_SECONDS = {512: {90: 1022.0, 124: 345.0, 175: 2810.0, 192: 2980.0, 243: 580.0,
+                          277: 720.0},
                     768: {124: 1140.0, 192: 1793.0, 209: 2820.0}}
 
 
