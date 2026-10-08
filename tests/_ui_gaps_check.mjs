@@ -857,6 +857,24 @@ SCENARIOS.finished_tiles_stable = async function finished_tiles_stable() {
            writesAfterNewJob: (htmlWrites.finished || []).length, tiles: (html.match(/<article /g) || []).length };
 };
 
+SCENARIOS.finished_tiles_same_length_change = async function finished_tiles_same_length_change() {
+  // Same id, another finish time: the markup changes but keeps its length. A redraw decision made
+  // on the length of the markup would miss it; the tile must be written again.
+  const done = { id: "j1", exit_code: 0, kind: "generate", output_stem: "/o/clip", note: "",
+    args: [], started_at: "2026-10-08T01:00:00Z", finished_at: "2026-10-08T01:05:00Z",
+    estimate: { width: 896, height: 512, duration_seconds: 4 } };
+  const state = { ...SGLANG, queue: { ...SGLANG.queue, done: [done] } };
+  await start(appUrl, { "GET /api/state": ok(state) });
+  const before = getElementById("finished").innerHTML;
+  const writes = (htmlWrites.finished || []).length;
+  const later = { ...done, finished_at: "2026-10-08T01:07:00Z" };
+  routes["GET /api/state"] = ok({ ...state, queue: { ...state.queue, done: [later] } });
+  await intervals[0]();
+  const after = getElementById("finished").innerHTML;
+  return { sameLength: before.length === after.length, changed: before !== after,
+           writesAdded: (htmlWrites.finished || []).length - writes };
+};
+
 const run = SCENARIOS[scenario];
 if (!run) fail(`unknown scenario ${scenario}`);
 run().then((out) => { process.stdout.write(JSON.stringify(out)); process.exit(0); },

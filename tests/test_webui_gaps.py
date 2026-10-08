@@ -1342,3 +1342,10 @@ def test_running_upscale_card_has_a_human_line_and_no_made_up_numbers():
     view = _js(f"app.sglangRunView({job}, Date.parse('2026-10-07T12:33:10Z'))")
     assert view == {"spec": "апскейл LTX", "elapsed": "3 мин", "total": "—", "share": None,
                     "leftSeconds": 0, "over": None, "waiting": False}
+
+
+@_needs_node
+def test_finished_tiles_are_redrawn_when_data_changes_but_markup_length_does_not():
+    """Review of the D3 fix: same job id, another finished_at -> same-length markup, new content."""
+    assert _gaps("finished_tiles_same_length_change") == {
+        "sameLength": True, "changed": True, "writesAdded": 1}
