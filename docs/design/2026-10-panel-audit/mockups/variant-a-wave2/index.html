@@ -1,0 +1,790 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вариант A, волна 2 — недостающие экраны</title>
+<!-- Вариант A («мастер»), добивка по CJM волны 2 (docs/superpowers/specs/2026-10-09-panel-wave2-CJM.md §4).
+     Статический макет, данные вымышленные: ролик «Венок на воде», 4 сцены × 8 с, 16:9.
+     Адреса: #toc (оглавление), #projects, #s1 … #s15, #s5/1 (редактор сцены 1);
+     тема: ?theme=dark|light. Разделы «Референсы», «Очередь», «Настройки» — в ../variant-a/index.html. -->
+<style>
+:root{
+  --bg:#f5f2ea; --surface:#fffdf8; --sunk:#ece7db; --line:#ddd6c6; --ink:#1d2321; --ink2:#5b6460; --ink3:#8a918c;
+  --accent:#1f5a52; --accent-ink:#fff; --accent-soft:#d9e8e3; --warn:#a9500f; --warn-soft:#f6e3cf; --bad:#a32d2d; --bad-soft:#f6dede; --good:#2c7a4b; --good-soft:#dcefe2;
+  --tag:#14594f; --tag-bg:#d6e9e3;
+  --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif; --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#131716; --surface:#1b2120; --sunk:#10130f; --line:#2c3532; --ink:#e8ece9; --ink2:#a1aca6; --ink3:#6f7b75;
+  --accent:#6fc2b3; --accent-ink:#0c1a17; --accent-soft:#1f3532; --warn:#e0a46a; --warn-soft:#33261a; --bad:#e58a8a; --bad-soft:#3a2222; --good:#76c593; --good-soft:#1c3226; --tag:#8fdccd; --tag-bg:#1f3a35;}}
+:root[data-theme="dark"]{
+  --bg:#131716; --surface:#1b2120; --sunk:#10130f; --line:#2c3532; --ink:#e8ece9; --ink2:#a1aca6; --ink3:#6f7b75;
+  --accent:#6fc2b3; --accent-ink:#0c1a17; --accent-soft:#1f3532; --warn:#e0a46a; --warn-soft:#33261a; --bad:#e58a8a; --bad-soft:#3a2222; --good:#76c593; --good-soft:#1c3226; --tag:#8fdccd; --tag-bg:#1f3a35;}
+*{box-sizing:border-box;margin:0}
+html{background:var(--bg)} body{font:15px/1.5 var(--sans);color:var(--ink);background:var(--bg);min-height:100vh;overflow-x:hidden}
+button{font:inherit;color:inherit;cursor:pointer;border:1px solid var(--line);background:var(--surface);border-radius:8px;padding:7px 13px}
+button.pri{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+button.ghost{background:transparent}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.sm{padding:4px 10px;font-size:13px}
+h1,h2,h3{font-family:var(--serif);font-weight:600;letter-spacing:-.01em}
+h3{font-size:18px}
+a{color:var(--accent)}
+.mono{font-family:var(--mono);font-size:12.5px}
+p,li,div,span{overflow-wrap:break-word}
+/* top bar (как в variant-a) */
+.top{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:20px;padding:0 28px;height:60px}
+.brand{font-family:var(--serif);font-size:20px;font-weight:700;margin-right:8px;color:var(--ink);text-decoration:none}
+.nav{display:flex;gap:4px}.nav a{padding:8px 14px;border-radius:8px;color:var(--ink2);text-decoration:none;font-weight:500}
+.nav a.on{background:var(--accent-soft);color:var(--accent)}
+.sp{flex:1}
+.gpu{display:flex;align-items:center;gap:10px;border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:5px 6px 5px 14px;font-size:13px;white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--good);flex:none}
+.gpu[data-s=idle] .dot,.dot.idle{background:var(--ink3)} .gpu[data-s=foreign] .dot,.gpu[data-s=qwen] .dot,.dot.warn{background:var(--warn)}
+.gpu[data-s=up] .dot,.dot.up{background:var(--accent);animation:pulse 1.2s infinite} .gpu[data-s=off] .dot,.dot.off{background:var(--bad)}
+@keyframes pulse{50%{opacity:.3}}
+.gpu button{padding:4px 11px;border-radius:999px;font-size:13px}
+.wrap{max-width:1180px;margin:0 auto;padding:28px}
+.screen{display:none}.screen.on{display:block}
+.pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:22px;flex-wrap:wrap}
+.pagehead h1{font-size:30px}.sub{color:var(--ink2)}
+.crumb{font-size:14px;color:var(--ink2)}.crumb a{color:inherit}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:18px}
+.card+.card{margin-top:14px}
+.card h3{margin-bottom:8px}
+.kind{font-size:11px;letter-spacing:.06em;text-transform:uppercase;border:1px solid var(--line);border-radius:5px;padding:1px 6px;color:var(--ink2);white-space:nowrap}
+.st{font-size:12px;padding:2px 8px;border-radius:99px;background:var(--sunk);color:var(--ink2);white-space:nowrap}
+.st.ok{color:var(--good);background:var(--good-soft)}.st.run{background:var(--accent-soft);color:var(--accent)}.st.bad{color:var(--bad);background:var(--bad-soft)}.st.warn{color:var(--warn);background:var(--warn-soft)}
+.tag{display:inline-block;font:600 13px var(--mono);color:var(--tag);background:var(--tag-bg);border-radius:5px;padding:0 5px}
+.tag.bad{color:var(--warn);background:var(--warn-soft);text-decoration:wavy underline}
+mark.cyr{background:var(--bad-soft);color:var(--bad);border-bottom:2px solid var(--bad);padding:0 2px;border-radius:3px}
+/* макетная полоса над экраном */
+.demo{font-size:12px;color:var(--ink3);margin:0 0 14px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.demo a{color:var(--ink2);border:1px solid var(--line);border-radius:6px;padding:1px 8px;text-decoration:none}
+.demo b{color:var(--ink2)}
+/* оглавление */
+.toc{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px}
+.toc a{display:grid;grid-template-columns:34px 1fr;gap:10px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px 14px;text-decoration:none;color:var(--ink)}
+.toc a b.n{width:30px;height:30px;border-radius:50%;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;font-size:13px}
+.toc a small{display:block;color:var(--ink2);font-size:13px}
+.toc a.old b.n{background:var(--sunk);color:var(--ink2)}
+/* stepper */
+.stepper{display:flex;margin:6px 0 24px;border:1px solid var(--line);border-radius:12px;background:var(--surface);overflow:hidden}
+.step{flex:1;min-width:0;padding:11px 14px;border-right:1px solid var(--line);display:flex;gap:10px;align-items:center;text-decoration:none;color:var(--ink2)}
+.step:last-child{border:0}
+.step b{width:26px;height:26px;border-radius:50%;border:1.5px solid var(--line);display:grid;place-items:center;font-size:13px;flex:none}
+.step.d b{background:var(--good);border-color:var(--good);color:#fff}.step.c{background:var(--accent-soft);color:var(--ink)}.step.c b{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.step.x{opacity:.45}
+.step small{display:block;font-size:12px;color:var(--ink3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.step span{font-weight:600;white-space:nowrap}
+.step>div{min-width:0}
+.cols{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:24px;align-items:start}
+.cols.wide{grid-template-columns:minmax(0,1fr) 400px}
+.foot{display:flex;justify-content:space-between;align-items:center;margin-top:22px;gap:12px;flex-wrap:wrap}
+.why{font-size:13px;color:var(--warn)}
+/* поля */
+.fld{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
+.fld>label{font-weight:600;font-size:14px}
+.fld>label small{font-weight:400;color:var(--ink3)}
+.hint{font-size:13px;color:var(--ink3)}
+.inp,textarea.inp,select.inp{font:inherit;color:var(--ink);background:var(--sunk);border:1px solid var(--line);border-radius:10px;padding:10px 12px;width:100%}
+textarea.inp{resize:vertical;min-height:84px;line-height:1.6}
+.inp.req{border-color:var(--accent)}
+.inp.locked{opacity:.6}
+.seg{display:inline-flex;flex-wrap:wrap;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--surface);max-width:100%}
+.seg button{border:0;border-right:1px solid var(--line);border-radius:0;padding:7px 12px;font-size:14px;background:transparent}
+.seg button:last-child{border-right:0}
+.seg button.on{background:var(--accent);color:var(--accent-ink);font-weight:600}
+.seg button small{font-size:11px;opacity:.8}
+.fmt{display:flex;gap:10px;flex-wrap:wrap}
+.fmt label{display:flex;flex-direction:column;align-items:center;gap:6px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--surface);cursor:pointer;font-size:13px;min-width:72px}
+.fmt label.on{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+.fmt i{display:block;border:2px solid var(--ink3);border-radius:3px}
+.fmt label.on i{border-color:var(--accent)}
+/* плашки-сообщения */
+.box{border:1px solid var(--line);border-radius:12px;padding:12px 14px;display:flex;gap:12px;align-items:flex-start;background:var(--surface)}
+.box.warn{border-color:var(--warn);background:var(--warn-soft)}
+.box.bad{border-color:var(--bad);background:var(--bad-soft)}
+.box.ok{border-color:var(--good);background:var(--good-soft)}
+.box.info{background:var(--accent-soft);border-color:var(--accent-soft)}
+.box .ico{font-weight:700;flex:none;width:20px;text-align:center}
+.box>div{min-width:0;flex:1}
+.box p{font-size:14px}
+.box .row{margin-top:8px}
+/* картинки/плееры */
+.ph{border-radius:8px;position:relative;overflow:hidden}
+.ph em{position:absolute;left:4px;bottom:3px;font:600 10px var(--mono);color:#fff;text-shadow:0 1px 2px #000;font-style:normal}
+.strip{display:flex;gap:8px;align-items:center;margin:10px 0;flex-wrap:wrap}
+.strip .ph{width:54px;height:54px;border:1px solid var(--line)}
+.strip .ph.port{width:40px;height:58px}
+.strip .ph.slot{border:1.5px dashed var(--line);background:transparent;display:grid;place-items:center;color:var(--ink3)}
+.meter{display:flex;gap:3px;margin-top:4px}.meter i{width:18px;height:6px;border-radius:2px;background:var(--line)}.meter i.f{background:var(--accent)}.meter.full i.f{background:var(--warn)}
+.player{aspect-ratio:16/9;border-radius:12px;position:relative;overflow:hidden;display:grid;place-items:center}
+.player .play{width:64px;height:64px;border-radius:50%;background:rgba(0,0,0,.45);color:#fff;display:grid;place-items:center;font-size:24px;border:2px solid rgba(255,255,255,.7)}
+.player .cap{position:absolute;left:12px;top:10px;right:12px;display:flex;gap:6px;flex-wrap:wrap}
+.player .cap span{background:rgba(0,0,0,.55);color:#fff;font-size:12px;padding:2px 8px;border-radius:6px}
+.player .bar2{position:absolute;left:12px;right:12px;bottom:10px;height:4px;background:rgba(255,255,255,.3);border-radius:3px}
+.player .bar2 i{display:block;height:100%;width:35%;background:#fff;border-radius:3px}
+.bar{height:8px;border-radius:6px;background:var(--sunk);overflow:hidden;margin:6px 0}.bar i{display:block;height:100%;background:var(--accent)}
+.bar.ind i{width:30%;background:repeating-linear-gradient(90deg,var(--accent) 0 10px,var(--accent-soft) 10px 20px)}
+/* список сцен ролика */
+.scl{display:flex;flex-direction:column;gap:10px}
+.sr{display:grid;grid-template-columns:30px 112px minmax(0,1fr) auto;gap:14px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px;align-items:start}
+.sr.sel{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+.sr .num{font:700 18px var(--serif);color:var(--ink3);text-align:center;padding-top:2px}
+.sr .ph{height:63px}
+.sr .t{font-size:14px}
+.sr .emo{font-size:13px;color:var(--ink2);margin-top:4px}
+.sr .emo b{color:var(--ink3);font-weight:600}
+.sr .side{display:flex;flex-direction:column;gap:6px;align-items:flex-end}
+.mode{font-size:12px;font-weight:600;border-radius:6px;padding:2px 8px;white-space:nowrap;border:1px solid var(--line)}
+.mode.ref{color:#7a3fa0;background:#efe3f6;border-color:#dcc6ea}.mode.fl{color:var(--accent);background:var(--accent-soft);border-color:var(--accent-soft)}
+:root[data-theme="dark"] .mode.ref{color:#d4b0ea;background:#2f2438;border-color:#46345a}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .mode.ref{color:#d4b0ea;background:#2f2438;border-color:#46345a}}
+.dur{font:600 13px var(--mono);color:var(--ink2)}
+.vb{font-size:12px;border-radius:99px;padding:2px 9px;white-space:nowrap}
+.vb.fast{background:var(--good-soft);color:var(--good)}.vb.slow{background:var(--warn-soft);color:var(--warn)}
+.sum{display:flex;gap:18px;flex-wrap:wrap;font-size:14px;color:var(--ink2);padding:12px 0 0}
+.sum b{color:var(--ink)}
+/* редактор */
+.ed-text{background:var(--sunk);border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-height:76px;line-height:1.75}
+.frames{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.frame{border:1px solid var(--line);border-radius:12px;padding:10px;background:var(--surface)}
+.frame .ph{aspect-ratio:16/9;margin:8px 0}
+.frame.empty .ph{border:1.5px dashed var(--line);background:transparent;display:grid;place-items:center;color:var(--ink3);font-size:13px}
+.src{display:flex;flex-direction:column;gap:4px;font-size:13px}
+.src label{display:flex;gap:6px;align-items:center}
+details.prompt{border:1px solid var(--line);border-radius:10px;padding:10px 14px;background:var(--surface)}
+details.prompt summary{cursor:pointer;font-weight:600}
+details.prompt pre{font:12px/1.55 var(--mono);white-space:pre-wrap;color:var(--ink2);margin-top:8px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:14px}.kv>span:nth-child(odd){color:var(--ink3)}
+.params{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.params div{background:var(--sunk);border-radius:10px;padding:8px 10px}
+.params small{display:block;color:var(--ink3);font-size:12px}
+.params b{font-family:var(--mono);font-size:14px}
+.saved{font-size:12px;color:var(--ink3)}
+/* референсы в кастинге */
+.refc{display:grid;grid-template-columns:120px minmax(0,1fr);gap:14px;padding:14px 0;border-top:1px solid var(--line)}
+.refc:first-of-type{border-top:0;padding-top:4px}
+.refc .pics{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.refc .pics .ph{aspect-ratio:1}
+.refc .pics .ph.port{aspect-ratio:3/4}
+.en{font:13px/1.55 var(--mono);background:var(--sunk);border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-top:6px}
+.lbl{font-size:12px;color:var(--ink3);margin-top:8px;display:block}
+.collapse{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--surface);margin-top:14px}
+.drop{border:2px dashed var(--line);border-radius:14px;display:grid;place-items:center;min-height:120px;color:var(--ink2);text-align:center;padding:14px}
+.wave{height:34px;border-radius:6px;background:repeating-linear-gradient(90deg,var(--accent) 0 2px,transparent 2px 5px);opacity:.55;mask:linear-gradient(180deg,transparent 0,#000 30%,#000 70%,transparent 100%)}
+/* чат */
+.chatp{background:var(--surface);border:1px solid var(--line);border-radius:14px;display:flex;flex-direction:column;position:sticky;top:76px;max-height:calc(100vh - 96px)}
+.chatp .ch{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid var(--line)}
+.chatp .ch .x{display:none}
+.chatp .grab{display:none}
+.msgs{padding:14px;display:flex;flex-direction:column;gap:12px;overflow:auto;flex:1}
+.msg{max-width:92%;font-size:14px;border-radius:12px;padding:9px 12px}
+.msg.u{align-self:flex-end;background:var(--accent-soft)}
+.msg.a{align-self:flex-start;background:var(--sunk);max-width:100%}
+.prop{border:1px solid var(--line);background:var(--surface);border-radius:10px;padding:8px 10px;margin-top:8px;font-size:13px}
+.prop .row{gap:6px}
+.prop .e{color:var(--ink2);margin-top:3px}
+.diff{border:1px solid var(--accent);border-radius:12px;padding:10px 12px;background:var(--surface);margin-top:10px}
+.diff div{font-size:13px;padding:3px 0;display:flex;gap:8px}
+.diff .p{color:var(--good)}.diff .m{color:var(--warn)}.diff .s{color:var(--ink3)}
+.chatin{border-top:1px solid var(--line);padding:10px;display:flex;gap:8px}
+.chatin input{flex:1;min-width:0}
+.dim{opacity:.5;pointer-events:none}
+.fab{display:none}
+/* проверка и план */
+.chk{display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:10px;align-items:start;padding:11px 0;border-top:1px solid var(--line)}
+.chk:first-of-type{border:0}
+.chk .ic{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:13px}
+.chk .ic.ok{background:var(--good-soft);color:var(--good)}.chk .ic.no{background:var(--bad-soft);color:var(--bad)}
+.chk p{font-size:13px;color:var(--ink2)}
+.chk p.no{color:var(--bad)}
+.plan{display:flex;gap:4px;margin:12px 0 6px}
+.plan>div{border-radius:8px;padding:8px 9px;font-size:12px;min-width:0;line-height:1.35}
+.plan .cold{background:var(--sunk);color:var(--ink2)}
+.plan .sw{background:repeating-linear-gradient(135deg,var(--warn-soft) 0 6px,var(--surface) 6px 12px);color:var(--warn);border:1px solid var(--warn)}
+.plan .r{background:#efe3f6;color:#5d2f7c}.plan .f{background:var(--accent-soft);color:var(--accent)}
+:root[data-theme="dark"] .plan .r{background:#2f2438;color:#d4b0ea}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .plan .r{background:#2f2438;color:#d4b0ea}}
+.plan b{display:block;font-size:12.5px}
+.plan .run{outline:2px solid var(--accent);outline-offset:1px}
+.plan .done{opacity:.55}
+.est{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:12px}
+.est div{background:var(--sunk);border-radius:10px;padding:10px 12px}
+.est small{display:block;color:var(--ink3);font-size:12px}.est b{font-size:18px;font-family:var(--serif)}
+/* просмотр эскизов */
+.rev{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:22px;align-items:start}
+.takes{display:flex;gap:10px;margin:12px 0;flex-wrap:wrap}
+.take{border:1px solid var(--line);border-radius:10px;padding:6px;background:var(--surface);width:150px;font-size:12px}
+.take.on{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+.take .ph{aspect-ratio:16/9;margin-bottom:4px}
+.verdict{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+.verdict button.good{background:var(--good);border-color:var(--good);color:#fff;font-weight:600}
+.mini{display:grid;grid-template-columns:76px minmax(0,1fr);gap:10px;align-items:center;padding:8px;border-radius:10px;border:1px solid transparent}
+.mini.sel{border-color:var(--accent);background:var(--accent-soft)}
+.mini .ph{aspect-ratio:16/9}
+.mini b{font-size:14px}
+.mini .row{gap:4px}
+.cnt{font-weight:700;font-family:var(--serif);font-size:22px}
+.confirm{border:1px solid var(--warn);background:var(--warn-soft);border-radius:12px;padding:12px 14px;margin-top:10px}
+.confirm ul{margin:6px 0 0 18px;font-size:14px}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:22px;z-index:30;background:var(--ink);color:var(--bg);border-radius:12px;padding:10px 12px 10px 16px;display:none;align-items:center;gap:14px;box-shadow:0 8px 30px rgba(0,0,0,.25);width:min(560px,calc(100vw - 24px))}
+.toast.on{display:flex}
+.toast span{flex:1;font-size:14px;min-width:0}
+.toast button{background:transparent;color:var(--bg);border-color:rgba(255,255,255,.35);white-space:nowrap}
+.toast .ring{font:700 13px var(--mono);width:30px;height:30px;border-radius:50%;border:2px solid var(--bg);display:grid;place-items:center;flex:none}
+/* состояния */
+.states{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.sx{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px}
+.sx .hd{display:grid;grid-template-columns:96px minmax(0,1fr);gap:12px;align-items:center;margin-bottom:10px}
+.sx .hd .ph{aspect-ratio:16/9}
+.sx .lab{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3);margin-bottom:6px;display:block}
+pre.log{font:11.5px/1.5 var(--mono);background:var(--sunk);border:1px solid var(--line);border-radius:8px;padding:8px 10px;white-space:pre-wrap;word-break:break-word;color:var(--ink2);margin-top:8px;max-height:150px;overflow:auto}
+/* плашки GPU */
+.gpus{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.gpus .card{display:flex;flex-direction:column;gap:10px}
+.gpus .card+.card{margin-top:0}
+.gpus .gpu{align-self:flex-start;max-width:100%}
+.gpus .gpu span.t{overflow:hidden;text-overflow:ellipsis}
+.chip{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:999px;padding:4px 5px 4px 10px;background:var(--surface);font-size:12px;align-self:flex-start}
+.chip button{padding:2px 9px;border-radius:99px;font-size:12px}
+.offline{background:var(--bad);color:#fff;text-align:center;font-size:13px;padding:6px 12px;border-radius:10px;margin-bottom:14px}
+/* пустые */
+.empties{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.empty{background:var(--surface);border:1px dashed var(--line);border-radius:14px;padding:24px 18px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:10px}
+.empty .glyph{width:64px;height:64px;border-radius:16px;background:var(--sunk);display:grid;place-items:center;font-size:26px;color:var(--ink3)}
+.empty p{font-size:14px;color:var(--ink2);max-width:300px}
+/* проекты */
+.plist{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px}
+.pcard{background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}
+.pcard .pic{height:120px;position:relative}
+.pcard .body{padding:14px 16px 16px;display:flex;flex-direction:column;gap:8px}
+.route{display:flex;gap:4px}.route i{flex:1;height:5px;border-radius:3px;background:var(--line)}.route i.d{background:var(--good)}.route i.c{background:var(--accent)}
+.pcard .next{font-size:13px;color:var(--ink2);display:flex;justify-content:space-between;align-items:center;gap:8px}
+/* результат */
+.res{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:22px;align-items:start}
+.pipe{display:flex;flex-direction:column;gap:2px}
+.pipe div{display:grid;grid-template-columns:22px minmax(0,1fr) auto;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--line);font-size:14px}
+.pipe div:first-child{border:0}
+.seeds div{display:grid;grid-template-columns:22px minmax(0,1fr) auto;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--line);font-size:14px}
+.tabbar{display:none}
+.lbl-short{display:none}
+@media (max-width:820px){
+  .top{padding:0 14px;gap:10px;height:54px}.nav{display:none}.brand{font-size:18px}
+  .top .gpu .lbl-long{display:none}
+  .top .gpu .lbl-short{display:inline}
+  .top .gpu{padding-left:10px;gap:7px;font-size:12px}
+  .refc .pics{display:flex;flex-wrap:wrap;gap:4px;align-content:start}.refc .pics .ph,.refc .pics .ph.port{width:34px;height:34px;aspect-ratio:auto}.refc .pics .ph.port{width:26px;height:36px}
+  .gpus .gpu{display:none}
+  .wrap{padding:16px 14px 150px}.pagehead h1{font-size:24px}.pagehead{margin-bottom:16px}
+  .cols,.cols.wide,.rev,.res,.states,.gpus,.empties,.frames{grid-template-columns:minmax(0,1fr)}
+  .stepper{margin-bottom:18px}
+  .step{padding:10px 6px;justify-content:center;flex:0 0 auto}
+  .step:not(.c)>div{display:none}
+  .step.c{flex:1;justify-content:flex-start;padding:10px 12px}
+  .sr{grid-template-columns:24px 72px minmax(0,1fr);gap:10px}
+  .sr .ph{height:41px}
+  .sr .side{grid-column:2/4;flex-direction:row;align-items:center;flex-wrap:wrap}
+  .refc{grid-template-columns:76px minmax(0,1fr)}
+  .params{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .plan{flex-direction:column}.plan>div{flex:auto!important}
+  .est{grid-template-columns:minmax(0,1fr)}
+  .take{width:calc(50% - 5px)}
+  .toc{grid-template-columns:minmax(0,1fr)}
+  .plist{grid-template-columns:minmax(0,1fr)}
+  .seg button{padding:6px 9px;font-size:13px}
+  .tabbar{display:flex;position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:1px solid var(--line);z-index:6}
+  .tabbar a{flex:1;text-align:center;padding:10px 0 12px;font-size:12px;color:var(--ink2);text-decoration:none}.tabbar a.on{color:var(--accent);font-weight:700}
+  /* чат на телефоне — полноэкранная шторка */
+  .chatp{position:fixed;left:0;right:0;bottom:0;top:46px;max-height:none;border-radius:16px 16px 0 0;z-index:20;box-shadow:0 -10px 40px rgba(0,0,0,.25)}
+  .chatp .grab{display:block;width:44px;height:5px;border-radius:3px;background:var(--line);margin:8px auto 0}
+  .chatp .ch .x{display:inline-block}
+  .shade{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:19}
+  .fab{display:block;position:fixed;right:14px;bottom:64px;z-index:7;border-radius:99px;padding:9px 16px;box-shadow:0 4px 16px rgba(0,0,0,.2)}
+  .toast{bottom:62px}
+}
+@media (min-width:821px){.shade{display:none}}
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#toc">h3</a>
+  <nav class="nav" id="nav"><a href="#projects" data-s="projects">Проекты</a><a href="../variant-a/index.html#library">Референсы</a><a href="../variant-a/index.html#queue">Очередь</a><a href="../variant-a/index.html#settings">Настройки</a></nav>
+  <span class="sp"></span>
+  <div class="gpu" id="gpu"><span class="dot"></span><span id="gpu-t"></span><button id="gpu-b"></button></div>
+  <button class="ghost" id="theme" title="Тема">◐</button>
+</header>
+<nav class="tabbar" id="tabbar"><a href="#projects" data-s="projects">Проекты</a><a href="../variant-a/index.html#library">Референсы</a><a href="../variant-a/index.html#queue">Очередь</a><a href="../variant-a/index.html#settings">Ещё</a></nav>
+
+<main class="wrap">
+
+<!-- ОГЛАВЛЕНИЕ -->
+<section class="screen" id="toc">
+  <div class="pagehead"><div><h1>Волна 2: недостающие экраны</h1><p class="sub">Макет A («мастер»), добивка по CJM §4. Пример — ролик «Венок на воде»: 4 сцены по 8 с, 16:9.</p></div></div>
+  <div class="toc" id="toclist"></div>
+  <h3 style="margin:26px 0 12px">Экраны из variant-a</h3>
+  <div class="toc">
+    <a href="#projects"><b class="n">П</b><div><b>Проекты</b><small>Перенесён и обновлён: ролик «Венок на воде», ярлык «+ Одна сцена»</small></div></a>
+    <a class="old" href="../variant-a/index.html#library"><b class="n">Р</b><div><b>Библиотека референсов</b><small>Без изменений, по ссылке в variant-a</small></div></a>
+    <a class="old" href="../variant-a/index.html#queue"><b class="n">О</b><div><b>Очередь и видеокарта</b><small>Без изменений, по ссылке в variant-a. Состояния плашки — экран 12</small></div></a>
+    <a class="old" href="../variant-a/index.html#settings"><b class="n">Н</b><div><b>Настройки</b><small>Без изменений, по ссылке в variant-a</small></div></a>
+  </div>
+</section>
+
+<!-- ПРОЕКТЫ (перенесён) -->
+<section class="screen" id="projects">
+  <div class="pagehead"><div><h1>Проекты</h1><p class="sub">7 проектов · в работе: «Венок на воде»</p></div><div class="row"><button class="ghost" onclick="location.hash='#s15'">+ Одна сцена</button><button class="pri" onclick="location.hash='#s1'">+ Новый проект</button></div></div>
+  <div class="plist" id="plist"></div>
+</section>
+
+<!-- 1. НОВЫЙ ПРОЕКТ -->
+<section class="screen" id="s1">
+  <div class="pagehead"><div><p class="crumb"><a href="#projects">Проекты</a> / новый</p><h1>Новый проект</h1></div></div>
+  <div class="cols">
+    <div class="card">
+      <div class="fld"><label>Идея</label>
+        <textarea class="inp req" rows="4">Девушка в белом льняном платье выходит из березняка к реке на закате и пускает венок по воде. Без слов, тихо, около 30 секунд. Настроение — прощание, но светлое.</textarea>
+        <span class="hint">Уйдёт первым сообщением в чат проекта. Сцены чат предложит сам.</span></div>
+      <div class="fld"><label>Формат кадра</label>
+        <div class="fmt" id="fmt"></div>
+        <span class="hint">Фиксируется на проект. После первого готового клипа поменять нельзя.</span></div>
+      <div class="fld"><label>Целевая длина ролика</label>
+        <div class="row"><div class="seg"><button>15 с</button><button class="on">30 с</button><button>45 с</button><button>60 с</button></div><span class="hint">или <input class="inp" style="width:84px;padding:6px 8px" value="30"> с</span></div>
+        <span class="hint">Ориентир для чата: 30 с ≈ 4 сцены по 8 с. Одна сцена — от 3 до 15 с.</span></div>
+      <div class="fld" style="margin-bottom:0"><label>Вид</label><div class="row"><span class="kind">Ролик</span><span class="hint">Клип под готовый трек — в волне 3.</span></div></div>
+      <div class="foot"><button class="ghost" onclick="location.hash='#projects'">Отмена</button><button class="pri" onclick="location.hash='#s3'">Создать и обсудить →</button></div>
+    </div>
+    <aside>
+      <div class="card"><h3>Что будет дальше</h3>
+        <ol style="margin-left:18px;font-size:14px;color:var(--ink2);display:flex;flex-direction:column;gap:4px">
+          <li>Кастинг: героиня, место, предметы. Можно пропустить.</li>
+          <li>Сценарий: чат предложит сцены карточками.</li>
+          <li>Эскизы — 20 шагов, ≈ 25–30 мин на 4 сцены.</li>
+          <li>Финал — 50 шагов, ≈ 55 мин.</li>
+          <li>Сборка и скачивание mp4.</li></ol></div>
+      <div class="card"><h3>Нужна одна сцена?</h3><p class="sub" style="font-size:14px">Для пробы без сборки — проект из одной сцены.</p><button class="ghost" style="margin-top:10px;width:100%" onclick="location.hash='#s15'">+ Одна сцена</button></div>
+      <div class="card"><h3>Пустая идея</h3><p class="sub" style="font-size:14px;margin-bottom:8px">Так выглядит кнопка, пока поле пустое:</p><button class="pri" disabled>Создать и обсудить →</button><p class="why" style="margin-top:6px">Напишите идею — хотя бы одно предложение.</p></div>
+    </aside>
+  </div>
+</section>
+
+<!-- 2. КАСТИНГ -->
+<section class="screen" id="s2">
+  <div data-head="Кастинг"></div>
+  <div data-stepper="2"></div>
+  <div class="cols">
+    <div>
+      <div class="card">
+        <div class="row" style="justify-content:space-between;margin-bottom:6px"><h3 style="margin:0">В проекте · 4</h3><button class="pri">+ Референс</button></div>
+        <div id="castlist"></div>
+      </div>
+      <div class="collapse"><div><b>Можно подключить из библиотеки · 14</b><div class="hint">@mama, @zal, @plenka, @ryzhiy-kot… Свёрнуто, чтобы не путать с подключёнными.</div></div><button class="ghost sm">Развернуть ▾</button></div>
+    </div>
+    <aside>
+      <div class="card"><h3>Загрузить сюда</h3>
+        <div class="drop">Перетащите фото, аудио или видео<br><small>или выберите с диска / из галереи телефона</small></div>
+        <div class="fld" style="margin:14px 0 10px"><label>Роль</label><div class="seg"><button class="on">Человек</button><button>Место</button><button>Предмет</button><button>Стиль</button><button>Голос</button><button>Трек</button></div></div>
+        <div class="fld" style="margin-bottom:6px"><label>Тег</label><input class="inp mono" value="@"></div>
+        <p class="hint">Карточка сразу попадёт в библиотеку и подключится к проекту с фиксированной версией.</p>
+      </div>
+      <div class="box bad" style="margin-top:14px"><span class="ico">✕</span><div><p><b>дождь-по-крыше.m4a не принят:</b> 22 с, а медиа-референс — от 2 до 15 с. Обрежьте и загрузите снова.</p></div></div>
+      <div class="card" style="margin-top:14px"><h3>Шаг можно пропустить</h3><p class="sub" style="font-size:14px">Ролик целиком по тексту референсов не требует. Тогда все сцены пойдут в режимах «Текст» и «От кадра».</p></div>
+    </aside>
+  </div>
+  <div class="foot"><button class="ghost">← Идея</button><span class="row"><button class="ghost">Пропустить</button><button class="pri" onclick="location.hash='#s4'">Сценарий →</button></span></div>
+  <button class="fab pri" onclick="location.hash='#s3'">Чат</button>
+</section>
+
+<!-- 3. ЧАТ -->
+<section class="screen" id="s3">
+  <div data-head="Сценарий"></div>
+  <div data-stepper="3"></div>
+  <div class="cols wide">
+    <div class="dim" id="s3-under"></div>
+    <div class="shade"></div>
+    <aside class="chatp">
+      <div class="grab"></div>
+      <div class="ch"><b>Чат проекта</b><span class="row"><span class="hint">CAILA · Sonnet</span><button class="ghost sm">⋯</button><button class="ghost sm x">✕</button></span></div>
+      <div class="msgs">
+        <div class="msg u">Девушка в белом льняном платье выходит из березняка к реке на закате и пускает венок по воде. Без слов, тихо, около 30 секунд.</div>
+        <div class="msg a">Предлагаю 4 сцены по 8 с. Первая задаёт героиню по референсам, остальные продолжают её последний кадр.</div>
+        <div class="msg u">Во второй пусть она шепчет что-то венку. И в конце уходит решительно, чтобы шаги было слышно.</div>
+        <div class="msg a">Поправил #2 и #4. В #4 громкость шагов задаю походкой: идёт быстро и твёрдо.
+          <div id="props"></div>
+          <div class="diff">
+            <div class="s"><span>=</span><span>#1 без изменений — эскиз сохранится</span></div>
+            <div class="m"><span>~</span><span>#2 текст и игра изменены → сбросит эскиз #2 и продолжения #3, #4</span></div>
+            <div class="s"><span>=</span><span>#3 без изменений, но пересчитается как продолжение #2</span></div>
+            <div class="m"><span>~</span><span>#4 звук изменён → сбросит эскиз #4</span></div>
+            <div class="row" style="margin-top:8px"><button class="pri">В проект (4 сцены)</button><button class="ghost">Не применять</button></div>
+          </div>
+        </div>
+      </div>
+      <div class="chatin"><input class="inp" placeholder="Напишите, что поправить…"><button class="pri">↑</button></div>
+    </aside>
+  </div>
+</section>
+
+<!-- 4. СЦЕНАРИЙ -->
+<section class="screen" id="s4">
+  <div data-head="Сценарий"></div>
+  <div data-stepper="3"></div>
+  <div class="cols">
+    <div>
+      <div class="scl" id="sclist"></div>
+      <div class="sum"><span>Итого: <b>32 с</b> · цель 30 с</span><span>Сцен: <b>4</b></span><span>Режимы: <b>1 «Референсы»</b>, <b>3 «От кадра»</b></span></div>
+      <div class="row" style="margin-top:14px"><button class="ghost">+ Сцена</button><span class="saved">Сохранено автоматически · 2 с назад</span></div>
+    </div>
+    <aside>
+      <div class="card"><h3>Чат по сценарию</h3><p class="sub" style="font-size:14px">Последнее: «Во второй пусть она шепчет что-то венку…» — применено, 4 сцены.</p><button class="ghost" style="width:100%;margin-top:10px" onclick="location.hash='#s3'">Открыть чат</button></div>
+      <div class="card"><h3>Режим ставится сам</h3><p class="sub" style="font-size:14px">Сцена 1 с <span class="tag">@человеком</span> — «Референсы», продолжения — «От кадра» последнего кадра предыдущей. Поменять можно в сцене.</p></div>
+      <div class="card"><h3>У каждой сцены</h3><p class="sub" style="font-size:14px">Обязательное поле «Эмоция и игра»: без него герои выходят «как зомби». Сцена без него не пройдёт проверку.</p></div>
+    </aside>
+  </div>
+  <div class="foot"><button class="ghost" onclick="location.hash='#s2'">← Кастинг</button><button class="pri" onclick="location.hash='#s6'">К эскизам →</button></div>
+  <button class="fab pri" onclick="location.hash='#s3'">Чат</button>
+</section>
+
+<!-- 5. РЕДАКТОР СЦЕНЫ -->
+<section class="screen" id="s5">
+  <div data-head="Сценарий"></div>
+  <div data-stepper="3"></div>
+  <div class="cols">
+    <div class="card" id="editor"></div>
+    <aside id="ed-side"></aside>
+  </div>
+  <button class="fab pri" onclick="location.hash='#s3'">Чат</button>
+</section>
+
+<!-- 6. ПРОВЕРКА ВВОДА -->
+<section class="screen" id="s6">
+  <div data-head="Эскизы"></div>
+  <div data-stepper="4"></div>
+  <div class="cols">
+    <div>
+      <div class="card"><h3>Проверка сцен</h3><div id="checks"></div></div>
+      <div class="card"><h3>План очереди</h3>
+        <p class="sub" style="font-size:14px">Сцены сгруппированы по варианту сервера; цепочку «от кадра» порядок не нарушает.</p>
+        <div class="plan" id="plan6"></div>
+        <p class="hint">1 смена варианта. Время 8 с при 20 шагах — экстраполяция: замер есть только для 3 с.</p>
+        <div class="est"><div><small>Эскизы, 20 шагов</small><b>≈ 25–30 мин</b><small>экстр.</small></div><div><small>Финал, 50 шагов</small><b>≈ 55 мин</b><small>2 смены варианта</small></div><div><small>Ваше участие</small><b>просмотр эскизов</b><small>вкладку можно закрыть</small></div></div>
+      </div>
+    </div>
+    <aside>
+      <div class="card"><h3>Готово к постановке</h3><p style="font-size:14px"><b class="cnt" style="color:var(--bad)">3 из 4</b> сцен прошли проверку.</p>
+        <button class="pri" disabled style="width:100%;margin-top:12px">Поставить эскизы (4)</button>
+        <p class="why" style="margin-top:6px">Сначала исправьте сцену 2 — тег не уйдёт в модель.</p></div>
+      <div class="card"><h3>Что проверено</h3><ul style="font-size:13px;color:var(--ink2);margin-left:16px"><li>картинок в H3 не больше 6</li><li>медиа по 2–15 с, сумма по типу до 15 с</li><li>кадр совпадает с форматом 16:9</li><li>портретного кадра в «Референсах» нет</li><li>теги работают в режиме сцены</li><li>цепочка ссылается на существующие сцены</li><li>«Эмоция и игра» заполнена</li></ul><p class="hint" style="margin-top:6px">Сервер повторит те же проверки.</p></div>
+    </aside>
+  </div>
+</section>
+
+<!-- 7. ЭСКИЗЫ: ПРОСМОТР -->
+<section class="screen" id="s7">
+  <div data-head="Эскизы"></div>
+  <div data-stepper="4"></div>
+  <div class="rev">
+    <div>
+      <div class="player" style="background:var(--g2)"><div class="cap"><span>Сцена 2 · эскиз той же сцены</span><span>20 шагов · сид 88310</span><span>дубль 2 из 2</span></div><div class="play">▶</div><div class="bar2"><i></i></div></div>
+      <p class="hint" style="margin-top:8px">Эскиз показывает композицию, позу и движение финала на том же сиде. Свет и резкость лица в финале будут другими.</p>
+      <div class="takes"><div class="take"><div class="ph" style="background:var(--g2b)"></div>Дубль 1 · сид 41552</div><div class="take on"><div class="ph" style="background:var(--g2)"></div><b>Дубль 2 · сид 88310</b> ✓ выбран</div></div>
+      <div class="verdict" id="verdict7"><button class="good">✓ Годится</button><button>Пересъёмка с новым сидом</button><button class="ghost">Править</button></div>
+      <div id="confirm7"></div>
+    </div>
+    <aside>
+      <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Сцены</h3><span><span class="cnt" id="cnt7">2</span> <span class="sub">из 4 «Годится»</span></span></div>
+        <div id="mini7" style="margin-top:8px"></div>
+        <button class="ghost" style="width:100%;margin-top:10px">▶ Эскиз ролика подряд</button>
+        <button class="pri" disabled style="width:100%;margin-top:8px">Финал всего ролика</button>
+        <p class="why" style="margin-top:6px">Финал откроется, когда все 4 сцены отмечены «Годится».</p></div>
+    </aside>
+  </div>
+</section>
+
+<!-- 8. КАСКАД И ОТМЕНА -->
+<section class="screen" id="s8">
+  <div data-head="Эскизы"></div>
+  <div data-stepper="4"></div>
+  <div class="rev">
+    <div>
+      <div class="player" style="background:var(--g2)"><div class="cap"><span>Сцена 2 · эскиз той же сцены</span><span>сид 88310</span></div><div class="play">▶</div><div class="bar2"><i></i></div></div>
+      <div class="verdict" style="margin-top:12px"><button>✓ Годится</button><button class="pri">Пересъёмка с новым сидом</button><button class="ghost">Править</button></div>
+      <div class="confirm"><b>Пересъёмка сцены 2 с новым сидом</b>
+        <ul><li>пересчитает <b>#2</b>, затем продолжения <b>#3</b> и <b>#4</b> — они идут от её последнего кадра;</li><li>≈ 13 мин (экстр.), сервер уже на fl2va — без смены варианта;</li><li>нынешние эскизы останутся дублями, к ним можно вернуться;</li><li><b>#1</b> не затронута.</li></ul>
+        <div class="row" style="margin-top:10px"><button class="pri">Переснять 3 сцены</button><button class="ghost">Не надо</button></div></div>
+      <div class="card" style="margin-top:14px"><h3>«Отмена 5 с» вместо вопроса «Вы уверены?»</h3><p class="sub" style="font-size:14px">Удаление сцены, дубля или задачи из очереди выполняется сразу, а внизу 5 секунд висит «Отменить». Пример — внизу экрана.</p></div>
+    </div>
+    <aside>
+      <div class="card"><h3>Сцены</h3><div id="mini8"></div></div>
+    </aside>
+  </div>
+  <div class="toast" id="toast8"><span class="ring" id="ring8">5</span><span>Дубль 1 сцены 2 удалён</span><button>Отменить</button></div>
+</section>
+
+<!-- 9. ФИНАЛ -->
+<section class="screen" id="s9">
+  <div data-head="Финал"></div>
+  <div data-stepper="5"></div>
+  <div class="cols">
+    <div>
+      <div class="box warn"><span class="ico">!</span><div><p><b>Продолжения #2–#4 пойдут от финального кадра #1.</b> Он может немного отличаться от эскиза, который вы одобрили: композиция та же, свет и детали — нет.</p></div></div>
+      <div class="card" style="margin-top:14px"><h3>План финала · 50 шагов</h3><div class="plan" id="plan9"></div><div class="est"><div><small>Всего</small><b>≈ 55 мин</b><small>2 смены варианта</small></div><div><small>Осталось</small><b>≈ 47 мин</b><small>по счётчику шагов</small></div><div><small>Готово</small><b>0 из 4</b><small>финалов</small></div></div></div>
+      <div class="card"><h3>Сцены</h3><div id="fin9"></div></div>
+    </div>
+    <aside>
+      <div class="card"><h3>Тот же сид и входы</h3><p class="sub" style="font-size:14px">Финал ставится с сидом выбранного дубля, steps = 50. Цепочка — строго по порядку.</p></div>
+      <div class="card"><h3>Финал одной сцены</h3><p class="sub" style="font-size:14px">В «⋯» у сцены: «Финал этой сцены» и «Сразу финал» для продолжения — без эскиза, после финала предыдущей.</p></div>
+      <div class="card"><h3>После финала</h3><label class="row" style="font-size:14px"><input type="checkbox" checked> Апскейл LTX, сила 0,6</label><p class="hint" style="margin-top:6px">Сборка запустится сама, когда все финалы будут готовы.</p></div>
+    </aside>
+  </div>
+</section>
+
+<!-- 10. СБОРКА И РЕЗУЛЬТАТ -->
+<section class="screen" id="s10">
+  <div data-head="Сборка"></div>
+  <div data-stepper="6"></div>
+  <div class="res">
+    <div>
+      <div class="player" style="background:var(--g1)"><div class="cap"><span>Венок на воде · готово</span><span>32 с · 1792×1024</span></div><div class="play">▶</div><div class="bar2"><i></i></div></div>
+      <div class="row" style="margin-top:12px"><button class="pri">⇩ Скачать mp4</button><button class="ghost">Скопировать путь</button><span class="hint">48 МБ · H.264 + AAC</span></div>
+      <p class="mono" style="color:var(--ink3);margin-top:8px">~/Research/TestVideo/venok-na-vode/final-20261009-1842.mp4</p>
+      <div class="box bad" style="margin-top:14px"><span class="ico">✕</span><div><p><b>Так выглядит удалённый файл:</b> «Клип удалён с диска. Сцены и финалы целы — пересобрать за ≈ 1 мин?»</p><div class="row"><button class="sm">Пересобрать</button></div></div></div>
+    </div>
+    <aside>
+      <div class="card"><h3>Как собрано</h3><div class="pipe">
+        <div><span style="color:var(--good)">✓</span><span>Финалы, 50 шагов</span><span class="st ok">4 из 4</span></div>
+        <div><span style="color:var(--good)">✓</span><span>Апскейл LTX · сила 0,6</span><span class="st ok">4 из 4 частей</span></div>
+        <div><span style="color:var(--good)">✓</span><span>Склейка и звук</span><span class="st ok">готово</span></div></div>
+        <p class="hint" style="margin-top:6px">Пока идёт апскейл, здесь «сила 0,6 · 3 из 4 частей» и полоса прогресса.</p></div>
+      <div class="card"><h3>Сцены и сиды</h3><div class="seeds" id="seeds"></div></div>
+    </aside>
+  </div>
+</section>
+
+<!-- 11. СОСТОЯНИЯ СЦЕНЫ -->
+<section class="screen" id="s11">
+  <div data-head="Эскизы"></div>
+  <div data-stepper="4"></div>
+  <p class="sub" style="margin-bottom:14px">Как сцена выглядит в списке, когда что-то идёт не по плану. Ожидание — не ошибка: красным только то, что требует действия.</p>
+  <div class="states" id="states"></div>
+</section>
+
+<!-- 12. ПЛАШКА GPU -->
+<section class="screen" id="s12">
+  <div class="offline" id="offline12">Нет связи с панелью · переподключаюсь… Расчёт на видеокарте продолжается.</div>
+  <div class="pagehead"><div><h1>Плашка видеокарты</h1><p class="sub">Шапка, на любом экране. На телефоне — чип: точка и одна кнопка; по нажатию шторка с подробностями.</p></div></div>
+  <div class="gpus" id="gpus"></div>
+</section>
+
+<!-- 13. ВОССТАНОВЛЕНИЕ ПРАВКИ -->
+<section class="screen" id="s13">
+  <div data-head="Сценарий"></div>
+  <div data-stepper="3"></div>
+  <div class="box warn"><span class="ico">↺</span><div><p><b>Восстановить несохранённую правку сцены 2?</b> Набрано сегодня в 14:32, связь оборвалась — до сервера правка не дошла. Хранится только в этом браузере.</p>
+    <div class="row"><button class="pri sm">Восстановить</button><button class="sm">Сравнить</button><button class="ghost sm">Отбросить</button></div></div></div>
+  <div class="cols" style="margin-top:16px">
+    <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Сцена 2 · сравнение</h3><span class="saved">на сервере — версия 13:58</span></div>
+      <span class="lbl">На сервере</span><div class="ed-text">Она опускается на колени у кромки воды и кладёт венок на воду.</div>
+      <span class="lbl">В браузере, не сохранено</span><div class="ed-text" style="border-color:var(--warn)">Она опускается на колени у кромки воды, <b style="background:var(--good-soft);color:var(--good)">что-то шепчет венку</b> и кладёт его на воду.</div>
+      <span class="lbl">Эмоция и игра — изменено</span><div class="ed-text" style="border-color:var(--warn);min-height:0">Сосредоточенность; губы беззвучно шепчут, <b style="background:var(--good-soft);color:var(--good)">пальцы чуть дрожат</b>, взгляд не отрывается от венка.</div>
+      <p class="hint" style="margin-top:10px">Восстановление изменит отпечаток сцены 2: эскиз #2 и продолжения #3, #4 сбросятся (каскад покажем перед сохранением).</p>
+    </div>
+    <aside><div class="card"><h3>Автосохранение</h3><p class="sub" style="font-size:14px">Поля сохраняются сами через ≈ 1 с. Кнопки «Сохранить» нет. Индикатор у заголовка сцены:</p>
+      <div style="display:flex;flex-direction:column;gap:6px;margin-top:10px;font-size:13px"><span class="saved">✓ сохранено · 2 с назад</span><span class="saved" style="color:var(--accent)">… сохраняю</span><span class="saved" style="color:var(--warn)">⚠ нет связи · правка в браузере</span></div></div></aside>
+  </div>
+</section>
+
+<!-- 14. ПУСТЫЕ СОСТОЯНИЯ -->
+<section class="screen" id="s14">
+  <div class="pagehead"><div><h1>Пустые состояния</h1><p class="sub">Первый вход и пустые шаги. Каждое предлагает следующее действие.</p></div></div>
+  <div class="empties">
+    <div class="empty"><span class="glyph">▦</span><h3>Проектов пока нет</h3><p>Проект — это ролик из нескольких сцен. Начните с идеи в одну строку, остальное предложит чат.</p><button class="pri">+ Новый проект</button><button class="ghost">+ Одна сцена</button></div>
+    <div class="empty"><span class="glyph">@</span><h3>В проекте нет референсов</h3><p>Загрузите фото героини, места или предмета — их можно звать в сценах по <span class="tag">@тегу</span>. Шаг можно пропустить: тогда сцены пойдут по тексту.</p><button class="pri">+ Референс</button><button class="ghost">Подключить из библиотеки · 14</button></div>
+    <div class="empty"><span class="glyph">≡</span><h3>Сценарий пуст</h3><p>Попросите чат разбить идею на сцены или добавьте первую сцену сами.</p><button class="pri">Открыть чат</button><button class="ghost">+ Сцена</button></div>
+  </div>
+</section>
+
+<!-- 15. ОДНА СЦЕНА -->
+<section class="screen" id="s15">
+  <div class="pagehead"><div><p class="crumb"><a href="#projects">Проекты</a> / одна сцена</p><h1>Проба: туман над рекой</h1></div><span class="kind">одна сцена</span></div>
+  <div class="stepper" id="st15"></div>
+  <div class="cols">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:12px"><h3 style="margin:0">Сцена · 6 с</h3><span class="saved">✓ сохранено</span></div>
+      <div class="fld"><label>Режим</label><div class="seg"><button class="on">Текст</button><button>От кадра</button><button>К кадру</button><button>Между кадрами</button><button>Референсы</button></div><div class="row"><span class="vb fast">быстро · fl2va</span><span class="hint">картинок в H3: 0 из 6</span></div></div>
+      <div class="fld"><label>Что в кадре</label><div class="ed-text">Утренний туман стелется над рекой, из него медленно выплывает пустая деревянная лодка. Камера неподвижна, на уровне воды.</div></div>
+      <div class="fld"><label>Эмоция и игра <small>· обязательно</small></label><textarea class="inp" rows="2">Людей в кадре нет. Настроение — тревожная тишина: движение лодки едва заметно.</textarea></div>
+      <div class="fld"><label>Звук</label><textarea class="inp" rows="2">Вода тихо плещет о деревянный борт, далёкий крик птицы. Ни шагов, ни голосов.</textarea></div>
+      <div class="params"><div><small>Длительность</small><b>6 с</b></div><div><small>Формат</small><b>16:9</b></div><div><small>Сид</small><b>случайный</b></div><div><small>Шаги</small><b>20 → 50</b></div></div>
+      <div class="foot"><span class="hint">Без сценария и сборки: эскиз → финал → скачать.</span><button class="pri">Поставить эскиз · ≈ 5 мин (экстр.)</button></div>
+    </div>
+    <aside><div class="card"><h3>Чем отличается</h3><p class="sub" style="font-size:14px">Это обычный проект, только из одной сцены: тот же редактор, проверки, эскиз и финал. Шагов «Сценарий» и «Сборка» нет — результат финала и есть ролик.</p></div>
+    <div class="card"><h3>Понравилось?</h3><p class="sub" style="font-size:14px">«⋯ → Превратить в ролик» добавит шаги «Сценарий» и «Сборка», сцена станет первой.</p></div></aside>
+  </div>
+</section>
+</main>
+
+<script>
+const $=s=>document.querySelector(s), $$=s=>document.querySelectorAll(s), q=new URLSearchParams(location.search);
+const grad=(h,h2)=>`linear-gradient(135deg,hsl(${h} 28% 34%),hsl(${h2??h+40} 32% 16%))`;
+const R=document.documentElement.style;
+R.setProperty('--g1',grad(28,210));R.setProperty('--g2',grad(195,30));R.setProperty('--g2b',grad(205,250));
+const T=s=>s.replace(/@[a-z-]+/g,m=>`<span class="tag">${m}</span>`);
+const TOC=[
+ ['s1','Новый проект','Идея, формат кадра, целевая длина'],
+ ['s2','Кастинг','«В проекте» и «Можно подключить», роль, рус → англ, аудио-роль, лимит 15 с'],
+ ['s3','Чат проекта','Ответ карточками сцен, diff, «В проект (4 сцены)»; на телефоне — шторка'],
+ ['s4','Сценарий ролика','Сцены с режимом, длительностью, игрой; сумма; «+ Сцена»'],
+ ['s5','Редактор сцены','Режим, кадры [0]/[-1] с источником, N из 6, бейдж варианта, промпт для H3'],
+ ['s6','Проверка ввода','✓/✕ по сценам, план очереди со сменой варианта, оценка'],
+ ['s7','Эскизы: просмотр','Эскиз той же сцены, дубли, «Годится / Пересъёмка / Править», 2 из 4'],
+ ['s8','Каскад и «Отмена 5 с»','Встроенное подтверждение с последствием, тост отмены'],
+ ['s9','Финал','План со сменами, предупреждение о цепочке, статус по сценам'],
+ ['s10','Сборка и результат','Апскейл, плеер, «Скачать», «Скопировать путь», «Переснять сцену»'],
+ ['s11','Состояния сцены','Ждёт сервер, повтор после падения, ошибка с логом, шаг неизвестен'],
+ ['s12','Плашка видеокарты','Поднимается вариант, нет связи; чип на телефоне'],
+ ['s13','Восстановление правки','Несохранённое из браузера, сравнение, автосохранение'],
+ ['s14','Пустые состояния','Нет проектов, нет референсов, сценарий пуст'],
+ ['s15','Проект из одной сцены','Без шагов «Сценарий» и «Сборка»']];
+$('#toclist').innerHTML=TOC.map((t,i)=>`<a href="#${t[0]}"><b class="n">${i+1}</b><div><b>${t[1]}</b><small>${t[2]}</small></div></a>`).join('');
+
+/* проекты */
+const proj=[['Венок на воде','ролик',2,4,'Эскизы','Смотреть эскизы',195,[1,1,1,0,0,0]],['Проба: туман над рекой','одна сцена',0,1,'Сцена','Поставить эскиз',210,[1,1,0,0]],['Амазонка и гоплит — диалоги','ролик',4,4,'Готово','Смотреть ролик',30,[1,1,1,1,1,1]],['Рыжий кот на рынке','ролик',3,3,'Сборка','Собрать',25,[1,1,1,1,1,0]],['Колыбельная — ночь 5','клип · архив',12,40,'Сцены','Открыть',215,[1,1,0,0]],['Дождь по карнизу','клип · архив',0,0,'Трек','Открыть',260,[1,0,0,0]]];
+$('#plist').innerHTML=proj.map(p=>`<article class="pcard"><div class="pic" style="background:${grad(p[6])}"></div><div class="body"><div class="row" style="justify-content:space-between;flex-wrap:nowrap"><h3>${p[0]}</h3><span class="kind">${p[1]}</span></div><div class="route">${p[7].map((x,i)=>`<i class="${x?'d':(p[7][i-1]?'c':'')}"></i>`).join('')}</div><div class="next"><span>Шаг: <b>${p[4]}</b>${p[3]?` · ${p[2]}/${p[3]}`:''}</span><button class="${p[4]=='Готово'||p[1].includes('архив')?'ghost':'pri'}" style="padding:5px 11px" onclick="location.hash='${p[1]=='одна сцена'?'#s15':'#s7'}'">${p[5]}</button></div></div></article>`).join('');
+
+/* шапка проекта и степпер */
+const STEPS=['Идея','Кастинг','Сценарий','Эскизы','Финал','Сборка'];
+const SUBS={1:'создан 9 окт',2:'4 референса',3:'4 сцены · 32 с',4:'2 из 4 «Годится»',5:'50 шагов',6:'апскейл и склейка'};
+const SUBS_LATE={4:'4 из 4 «Годится»',5:'идёт · 0 из 4',6:'после финала'};
+const SUBS_DONE={4:'4 из 4 «Годится»',5:'4 из 4',6:'готово · 32 с'};
+const LINK={1:'#s1',2:'#s2',3:'#s4',4:'#s7',5:'#s9',6:'#s10'};
+function stepper(cur,subs){return`<div class="stepper">${STEPS.map((s,i)=>{const n=i+1,c=n==cur?'c':n<cur?'d':'';return`<a class="step ${c}" href="${LINK[n]}"><b>${n<cur?'✓':n}</b><div><span>${s}</span><small>${(subs&&subs[n])||SUBS[n]}</small></div></a>`}).join('')}</div>`}
+$$('[data-stepper]').forEach(e=>{const c=+e.dataset.stepper;const sub=c==5?Object.assign({},SUBS,SUBS_LATE):c==6?Object.assign({},SUBS,SUBS_DONE):SUBS;e.outerHTML=stepper(c,sub)});
+$$('[data-head]').forEach(e=>{e.outerHTML=`<div class="pagehead"><div><p class="crumb"><a href="#projects">Проекты</a> / ролик · 16:9 · 896×512</p><h1>Венок на воде</h1></div><div class="row"><button class="ghost" onclick="location.hash='#s3'">Чат проекта</button><button class="ghost">⋯</button></div></div>`});
+$('#st15').outerHTML=`<div class="stepper">${['Идея','Сцена','Эскиз','Финал'].map((s,i)=>`<a class="step ${i==1?'c':i<1?'d':''}" href="#s15"><b>${i<1?'✓':i+1}</b><div><span>${s}</span><small>${['создан сейчас','режим «Текст»','20 шагов','50 шагов · скачать'][i]}</small></div></a>`).join('')}<span class="step x"><b>–</b><div><span>Сценарий, Сборка</span><small>не нужны</small></div></span></div>`;
+
+/* формат кадра */
+const F=[['16:9',32,18],['9:16',18,32],['1:1',24,24],['3:2',30,20],['2:3',20,30]];
+$('#fmt').innerHTML=F.map((f,i)=>`<label class="${i==0?'on':''}"><i style="width:${f[1]}px;height:${f[2]}px"></i>${f[0]}${i==0?'<small class="hint">896×512</small>':''}</label>`).join('');
+
+/* кастинг */
+const cast=[
+ {t:'@slavicgirl',k:'Человек',v:2,h:28,ru:'Девушка 20 лет, светло-русая коса до пояса, веснушки, белое льняное платье с красной вышивкой по вороту.',en:'A 20-year-old woman, ash-blond waist-length braid, freckles, white linen dress with red embroidery at the collar.',pics:[28,18,40],port:2,note:'Фото 3 портретное: как референс годится, как кадр в «Референсах» не сработает (проект 16:9).'},
+ {t:'@bereg',k:'Место',v:1,h:150,ru:'Пологий берег реки, березняк, крупная галька, закатный свет сбоку.',en:'A gentle river bank, birch grove, large pebbles, low side light of sunset.',pics:[150,190]},
+ {t:'@venok',k:'Предмет',v:1,h:220,ru:'Венок из васильков и ромашек, перевязан красной ниткой.',en:'A wreath of cornflowers and <mark class="cyr">ромашек</mark>, tied with a red thread.',pics:[220],cyr:'В английском тексте осталась кириллица — перевести заново или поправить руками.'},
+ {t:'@reka-zvuk',k:'Аудио',v:1,h:185,audio:true}];
+$('#castlist').innerHTML=cast.map(c=>c.audio?`<div class="refc"><div><div class="wave"></div><p class="hint" style="margin-top:4px">12,0 с · m4a</p></div><div><div class="row" style="justify-content:space-between"><b class="mono">${c.t}</b><span class="row"><span class="kind">Аудио</span><span class="hint">версия 1</span></span></div><p class="sub" style="font-size:14px">Течение реки у берега, без птиц и голосов.</p><span class="lbl">Как использовать</span><div class="seg" style="margin-top:4px"><button>Голос / тембр</button><button class="on">Фон</button><button>Точный трек</button></div><p class="hint" style="margin-top:6px">Фон — H3 возьмёт характер звука. «Точный трек» подкладывается после рендера. Аудио в проекте: 12 из 15 с.</p></div></div>`
+ :`<div class="refc"><div class="pics">${c.pics.map((h,i)=>`<div class="ph ${c.port===i?'port':''}" style="background:${grad(h)}"></div>`).join('')}</div><div><div class="row" style="justify-content:space-between"><b class="mono">${c.t}</b><span class="row"><span class="kind">${c.k}</span><span class="hint">версия ${c.v} · ${c.pics.length} фото</span></span></div><p style="font-size:14px">${c.ru}</p><span class="lbl">Уйдёт в H3 (английский, можно править)</span><div class="en">${c.en}</div>${c.cyr?`<p class="hint" style="color:var(--bad);margin-top:4px">${c.cyr} <a href="#s2">Перевести заново</a></p>`:''}${c.note?`<div class="box warn" style="margin-top:8px;padding:8px 10px"><span class="ico">!</span><div><p style="font-size:13px">${c.note}</p></div></div>`:''}</div></div>`).join('');
+
+/* сцены */
+const SC=[
+ {n:1,m:'ref',d:8,h:28,t:'@slavicgirl выходит из березняка на @bereg, прижимая к груди @venok. Камера на уровне плеча медленно отъезжает.',e:'Настороженность → облегчение: взгляд скользит по воде, плечи опускаются, уголки губ поднимаются.',snd:'Идёт тихо и неторопливо: мягкие шаги по траве, редкий хруст гальки, подол шуршит по стеблям. Река журчит фоном.',st:'ok',seed:41207},
+ {n:2,m:'fl',d:8,h:195,t:'Она опускается на колени у кромки воды, что-то шепчет венку и кладёт его на воду.',e:'Сосредоточенность; губы беззвучно шепчут, пальцы чуть дрожат, взгляд не отрывается от венка.',snd:'Колени глухо касаются мокрой гальки, ладонь плещет по воде, падают капли.',st:'rev',seed:88310},
+ {n:3,m:'fl',d:8,h:205,t:'Венок отплывает по течению, камера следует за ним; девушка остаётся в расфокусе на берегу.',e:'Отпускание: медленно выпрямляется, руки опускаются вдоль тела, лёгкий вздох.',snd:'Вода плещет о венок, ветер в берёзах. Ни шагов, ни голоса.',st:'ok',seed:15562},
+ {n:4,m:'fl',d:8,h:120,t:'Широкий план: она уходит вверх по берегу к берёзам, не оглядываясь.',e:'Решимость: подбородок поднят, ладонь сжимает подол.',snd:'Идёт быстро и твёрдо: каждый шаг громко хрустит галькой, у берёз глохнет в траве.',st:'run',seed:70941}];
+const MODE={ref:'<span class="mode ref">Референсы</span>',fl:'<span class="mode fl">От кадра</span>'};
+const VB={ref:'<span class="vb slow">медленнее в 1,5× · ref2va</span>',fl:'<span class="vb fast">быстро · fl2va</span>'};
+$('#sclist').innerHTML=SC.map(s=>`<div class="sr ${s.n==2?'sel':''}" onclick="location.hash='#s5/${s.n}'" style="cursor:pointer"><span class="num">${s.n}</span><div class="ph" style="background:${grad(s.h)}"></div><div><div class="t">${T(s.n==2?'@slavicgirl опускается на колени у кромки воды, что-то шепчет венку и кладёт его на воду.':s.t)}</div><div class="emo"><b>Игра:</b> ${s.e}</div>${s.n==2?'<p class="why" style="margin-top:4px">⚠ @slavicgirl в режиме «От кадра» не уйдёт в модель</p>':''}</div><div class="side">${MODE[s.m]}<span class="dur">${s.d} с</span>${s.n>1?'<span class="hint">от кадра #'+(s.n-1)+'</span>':''}</div></div>`).join('');
+$('#s3-under').innerHTML=$('#s4 .cols>div').outerHTML;
+$('#props').innerHTML=SC.map(s=>`<div class="prop"><div class="row"><b>#${s.n}</b>${MODE[s.m]}<span class="dur">${s.d} с</span>${s.n==2||s.n==4?'<span class="st warn">изменена</span>':''}</div><div style="margin-top:3px">${T(s.t)}</div><div class="e"><b>Игра:</b> ${s.e}</div>${s.n==4?`<div class="e"><b>Звук:</b> ${s.snd}</div>`:''}</div>`).join('');
+
+/* редактор */
+const MODES=[['text','Текст'],['from','От кадра'],['to','К кадру'],['between','Между кадрами'],['ref','Референсы'],['hyb','Референсы + кадр']];
+function frameBox(lbl,kind){
+ if(kind=='prev')return`<div class="frame"><b>${lbl}</b><div class="ph" style="background:${grad(28,150)}"><em>последний кадр #1</em></div><div class="src"><label><input type="radio" name="src${lbl}" checked> последний кадр сцены 1</label><label><input type="radio" name="src${lbl}"> загрузить</label><label><input type="radio" name="src${lbl}"> из библиотеки</label></div></div>`;
+ if(kind=='up')return`<div class="frame"><b>${lbl}</b><div class="ph" style="background:${grad(120,200)}"><em>bereza-vyhod.jpg · 16:9</em></div><div class="src"><label><input type="radio" name="src${lbl}"> загрузить</label><label><input type="radio" name="src${lbl}" checked> из библиотеки · @bereg</label></div><p class="hint">Конечный кадр — всегда ваш выбор.</p></div>`;
+ return`<div class="frame empty"><b>${lbl}</b><div class="ph">перетащите или выберите</div><div class="src"><label><input type="radio" name="src${lbl}"> загрузить</label><label><input type="radio" name="src${lbl}"> из библиотеки</label></div></div>`}
+function refStrip(n){const pics=[[28,'@slavicgirl'],[18,'@slavicgirl'],[40,'@slavicgirl'],[150,'@bereg'],[190,'@bereg'],[220,'@venok']].slice(0,n);
+ return`<div class="strip">${pics.map(p=>`<div class="ph" style="background:${grad(p[0])}"><em>${p[1]}</em></div>`).join('')}${n<6?'<div class="ph slot">+</div>':''}</div><div class="row"><span><b>Картинок в H3: ${n} из 6</b></span><div class="meter ${n>=6?'full':''}">${[...Array(6)].map((_,i)=>`<i class="${i<n?'f':''}"></i>`).join('')}</div><span class="hint">${n>=6?'лимит: седьмую добавить нельзя (64 ГБ карты)':''}</span></div><div class="row" style="margin-top:6px"><span class="hint">Аудио: <span class="tag">@reka-zvuk</span> фон · 12 из 15 с</span></div>`}
+function editor(sn,mode){
+ const s=SC[sn-1]; const isRef=mode=='ref'||mode=='hyb';
+ let fields='';
+ if(mode=='from')fields=`<div class="frames">${frameBox('Первый кадр [0]','prev')}</div><p class="hint" style="margin-top:6px">Кадра в середине у H3 нет — такого поля не будет.</p>`;
+ if(mode=='to')fields=`<div class="frames">${frameBox('Конечный кадр [-1]','up')}</div>`;
+ if(mode=='between')fields=`<div class="frames">${frameBox('Первый кадр [0]','prev')}${frameBox('Конечный кадр [-1]','up')}</div><p class="hint" style="margin-top:6px">Модель интерполирует между кадрами, сюжет — в тексте. Оба кадра обязательны.</p>`;
+ if(mode=='ref')fields=refStrip(6);
+ if(mode=='hyb')fields=`<div class="box warn" style="padding:8px 10px;margin-bottom:8px"><span class="ico">⚗</span><div><p style="font-size:13px"><b>Экспериментально.</b> Официально режимы не смешиваются, гарантий нет. Кадр — только альбомный: портретный H3 молча проигнорирует.</p></div></div>${refStrip(5)}<div class="frames" style="margin-top:10px">${frameBox('Первый кадр [0]','prev')}</div>`;
+ const text=sn==2&&!isRef?`<span class="tag bad">@slavicgirl</span> опускается на колени у кромки воды, что-то шепчет венку и кладёт его на воду.`:T(s.t);
+ const tagWarn=sn==2&&!isRef?`<div class="box warn" style="margin-top:8px;padding:8px 10px"><span class="ico">!</span><div><p style="font-size:13px"><b>@slavicgirl не уйдёт в модель:</b> в режиме «${MODES.find(m=>m[0]==mode)[1]}» теги не передаются.</p><div class="row"><button class="sm" onclick="edMode='ref';renderEd()">Перевести сцену в «Референсы»</button><button class="sm" onclick="this.closest('.box').outerHTML=''">Вставить описание текстом</button></div></div></div>`:'';
+ const imgs=mode=='ref'?6:mode=='hyb'?6:mode=='between'?2:mode=='text'?0:1;
+ $('#editor').innerHTML=`<div class="row" style="justify-content:space-between;margin-bottom:12px"><h3 style="margin:0">Сцена ${sn} · ${s.d} с</h3><span class="saved">✓ сохранено · 1 с назад</span></div>
+ <div class="fld"><label>Режим</label><div class="seg" id="segmode">${MODES.map(m=>`<button data-m="${m[0]}" class="${m[0]==mode?'on':''}">${m[1]}${m[0]=='hyb'?' <small>эксп.</small>':''}</button>`).join('')}</div>
+ <div class="row">${isRef?VB.ref:VB.fl}${!isRef?`<span class="hint">картинок в H3: ${imgs} из 6</span>`:''}${sn>1&&mode=='from'?'<span class="hint">· ждёт эскиз сцены 1</span>':''}</div></div>
+ <div class="fld">${fields}</div>
+ ${sn>1&&!isRef&&mode!='text'?'<p class="hint" style="margin:-6px 0 14px">Лицо может дрейфовать по цепочке: держите описание героини одинаковым во всех сценах.</p>':''}
+ <div class="fld"><label>Что в кадре</label><div class="ed-text">${text}</div>${tagWarn}<span class="hint">@ — подсказка с превью. Текст переведётся на английский; результат — в «Промпт для H3».</span></div>
+ <div class="fld"><label>Эмоция и игра <small>· обязательно</small></label><textarea class="inp req" rows="2">${s.e}</textarea><span class="hint">Состояние и его смена, мимика, взгляд, руки. Без этого герои выходят «как зомби».</span></div>
+ <div class="fld"><label>Звук действий</label><textarea class="inp" rows="2">${s.snd}</textarea><span class="hint">Материал и контакт. Громкость шагов задаёт походка: крадётся / идёт тихо / топает — не обувь.</span></div>
+ <div class="params"><div><small>Длительность</small><b>${s.d} с</b></div><div><small>Сид</small><b>${s.seed}</b></div><div><small>Шаги</small><b>20 эскиз · 50 финал</b></div><div><small>Формат</small><b>16:9</b></div></div>
+ <details class="prompt" style="margin-top:14px"><summary>Промпт для H3 · ${isRef?'ref2va, 6 секций':'fl2va, 3 поля'} · только чтение</summary><pre>${isRef?`subject_definitions: a 20-year-old woman, ash-blond waist-length braid…\nscene: gentle river bank, birch grove, sunset side light…\naction: …\nemotion_and_performance: wary, then relieved…\nsound: soft steps on grass, sparse crunch of pebbles…\nretention_analysis: keep dress embroidery and braid…`:`scene: kneels at the water's edge, whispers to the wreath, sets it afloat\nemotion_and_performance: focused; lips move silently, fingers tremble…\nsound: knees thud on wet pebbles, palm splashes the water, droplets`}</pre></details>`;
+ $$('#segmode button').forEach(b=>b.onclick=()=>{edMode=b.dataset.m;renderEd()});
+ $('#ed-side').innerHTML=`<div class="card"><h3>Сцены</h3>${SC.map(x=>`<a class="mini ${x.n==sn?'sel':''}" href="#s5/${x.n}" style="text-decoration:none;color:inherit"><div class="ph" style="background:${grad(x.h)}"></div><div><b>Сцена ${x.n}</b><div class="row">${MODE[x.m]}<span class="dur">${x.d} с</span></div></div></a>`).join('')}<button class="ghost" style="width:100%;margin-top:10px">+ Сцена</button></div>
+ <div class="card"><h3>Референсы проекта</h3>${cast.map(c=>`<div class="row" style="padding:4px 0"><span class="tag">${c.t}</span><span class="hint">${c.k.toLowerCase()} · v${c.v}</span></div>`).join('')}<button class="ghost" style="width:100%;margin-top:8px" onclick="location.hash='#s2'">+ Референс</button></div>`}
+let edScene=2, edMode='from';
+function renderEd(){editor(edScene,edMode)}
+
+/* проверка */
+const CH=[[1,1,'Референсы · ref2va · 6 из 6 картинок · аудио 12 с'],[2,0,'@slavicgirl в режиме «От кадра» не уйдёт в модель'],[3,1,'От кадра #2 · fl2va'],[4,1,'От кадра #3 · fl2va']];
+$('#checks').innerHTML=CH.map(c=>`<div class="chk"><span class="ic ${c[1]?'ok':'no'}">${c[1]?'✓':'✕'}</span><div><b>Сцена ${c[0]}</b><p class="${c[1]?'':'no'}">${c[2]}</p></div>${c[1]?'<span></span>':'<a href="#s5/2" class="sm">исправить</a>'}</div>`).join('');
+const plan=(arr)=>arr.map(p=>`<div class="${p[0]}" style="flex:${p[1]}"><b>${p[2]}</b>${p[3]}</div>`).join('');
+$('#plan6').innerHTML=plan([['cold',3,'Старт','≈ 3 мин'],['r',6.5,'ref2va · #1','≈ 6,5 мин'],['sw',2.5,'Смена','≈ 2,5 мин'],['f',4.5,'fl2va · #2','≈ 4,5'],['f',4.5,'#3','≈ 4,5'],['f',4.5,'#4','≈ 4,5']]);
+$('#plan9').innerHTML=plan([['sw done',2.5,'Смена','2,5 мин'],['r run',16,'ref2va · #1','шаг 31/50'],['sw',2.5,'Смена','≈ 2,5'],['f',11,'fl2va · #2','≈ 11'],['f',11,'#3','≈ 11'],['f',11,'#4','≈ 11']]);
+$('#fin9').innerHTML=SC.map(s=>`<div class="mini"><div class="ph" style="background:${grad(s.h)}"></div><div><div class="row" style="justify-content:space-between"><b>Сцена ${s.n}</b>${MODE[s.m]}</div>${s.n==1?'<div class="bar"><i style="width:62%"></i></div><span class="hint">шаг 31 из 50 · ≈ 6 мин · сид 41207</span>':`<span class="st">ждёт финальный кадр #${s.n-1}</span> <span class="hint">сид ${s.seed}</span>`}</div></div>`).join('');
+
+/* эскизы */
+const miniRev=(sel)=>SC.map(s=>`<div class="mini ${s.n==sel?'sel':''}"><div class="ph" style="background:${grad(s.h)}"></div><div><b>Сцена ${s.n}</b><div class="row">${s.st=='ok'?'<span class="st ok">✓ годится</span>':s.st=='rev'?'<span class="st warn">смотреть · 2 дубля</span>':'<span class="st run">шаг 12/20 · ≈ 2 мин</span>'}${s.m=='ref'&&s.st=='ok'?'<span class="hint">звук эскиза ref2va финал не предсказывает</span>':''}</div></div></div>`).join('');
+$('#mini7').innerHTML=miniRev(2);$('#mini8').innerHTML=miniRev(2);
+
+/* результат */
+$('#seeds').innerHTML=SC.map(s=>`<div><b>${s.n}</b><span>${MODE[s.m]} <span class="mono" style="color:var(--ink3)">сид ${s.seed}</span></span><button class="ghost sm">Переснять</button></div>`).join('');
+
+/* состояния сцены */
+const STS=[
+ ['Смена варианта','<span class="st">ждёт сервер</span>','Поднимается fl2va · ≈ 2,5 мин. Сцена встанет сама.','<div class="bar ind"><i></i></div>',SC[1]],
+ ['Сервер упал во время сцены','<span class="st warn">повтор · попытка 2 из 2</span>','Сервер H3 перезапускается, сцена 3 повторится. Если упадёт снова — станет ошибкой.','',SC[2]],
+ ['Ошибка сцены','<span class="st bad">ошибка</span>','Не хватило памяти видеокарты: 6 картинок при 8 с оказались тяжелее, чем при 3 с. Уберите 1–2 картинки или укоротите сцену.',`<pre class="log">[14:51:07] sampling 4/20
+[14:51:19] torch.OutOfMemoryError: CUDA out of memory.
+  Tried to allocate 1.12 GiB. GPU 0 has 63.81 GiB in use
+[14:51:19] task venok-1-draft failed (attempt 2/2)</pre><div class="row" style="margin-top:8px"><button class="pri sm">Повторить</button><button class="sm">Править</button><button class="ghost sm">Весь лог</button></div><p class="hint" style="margin-top:6px">Сцены #2–#4 — продолжения #1 и ждут её. Сцены других режимов очередь считает дальше.</p>`,SC[0]],
+ ['Шаг неизвестен','<span class="st run">идёт 4 мин</span>','Движок не отдал счётчик шагов. Честно: шаг неизвестен, идёт 4 мин из ожидаемых ≈ 4,5.','<div class="bar ind"><i></i></div>',SC[3]],
+ ['Ждёт карту','<span class="st">ждёт карту</span>','ComfyUI Krea2 (pid 4412) держит 18 ГБ. Чужое не гасим — сцена начнётся сама.','',SC[1]],
+ ['Ждёт предыдущую','<span class="st">ждёт эскиз #2</span>','«От кадра»: нужен последний кадр сцены 2. Поставится сразу после неё.','',SC[2]]];
+$('#states').innerHTML=STS.map(x=>`<div class="sx"><span class="lab">${x[0]}</span><div class="hd"><div class="ph" style="background:${grad(x[4].h)}"></div><div><div class="row" style="justify-content:space-between"><b>Сцена ${x[4].n}</b>${MODE[x[4].m]}</div><div style="margin-top:4px">${x[1]}</div></div></div><p style="font-size:14px">${x[2]}</p>${x[3]}</div>`).join('');
+
+/* плашки GPU */
+const GS=[
+ ['up','Поднимается ref2va · ≈ 2,5 мин','ждём…',1,'Смена варианта сервера: сцены ждут, не падают. Полоса — по логу запуска, без таймера.','<div class="bar ind"><i></i></div>','поднимается ref2va'],
+ ['run','Считает: эскиз сцены 4 · шаг 12/20 · 61 °C','Освободить карту',0,'Обычная работа. «Освободить» спросит встроенно, если очередь не пуста.','<div class="bar"><i style="width:60%"></i></div>','шаг 12/20'],
+ ['foreign','Ждёт карту: ComfyUI Krea2 (pid 4412) · 18 ГБ','ждём…',1,'Чужое не гасим. Кнопка неактивна, очередь стартует сама.','','ждёт карту'],
+ ['qwen','Qwen держит карту · 31 / 64 ГБ','Выгрузить Qwen и начать',0,'Единственный случай, когда панель предлагает выгрузить чужое: Qwen наш.','',"Qwen"],
+ ['idle','Свободна · движки погашены','Занять H3',0,'Очередь пуста 15 мин — карта отдана автоматически.','','свободна'],
+ ['off','Нет связи с панелью · переподключаюсь','ждём…',1,'Упала вкладка или веб-сервер. Работник в своём контейнере считает дальше; после переподключения придёт снимок.','','нет связи']];
+$('#gpus').innerHTML=GS.map(g=>`<div class="card"><div class="gpu" data-s="${g[0]}"><span class="dot"></span><span class="t">${g[1]}</span><button ${g[3]?'disabled':''}>${g[2]}</button></div><div class="chip"><span class="dot ${g[0]=='foreign'||g[0]=='qwen'?'warn':g[0]=='idle'?'idle':g[0]=='up'?'up':g[0]=='off'?'off':''}"></span>${g[6]}<button ${g[3]?'disabled':''}>${g[0]=='qwen'?'Выгрузить':g[0]=='idle'?'Занять':g[0]=='run'?'Освободить':'…'}</button></div>${g[5]}<p class="sub" style="font-size:14px">${g[4]}</p></div>`).join('');
+
+/* шапка GPU по экрану */
+const HG={toc:'run',projects:'run',s1:'run',s2:'run',s3:'run',s4:'run',s5:'run',s6:'idle',s7:'run',s8:'run',s9:'run',s10:'idle',s11:'up',s12:'up',s13:'off',s14:'idle',s15:'idle'};
+const HT={run:['Считает: эскиз сцены 4 · шаг 12/20 · 61 °C','Освободить карту','шаг 12/20','Освободить'],idle:['Свободна · движки погашены','Занять H3','свободна','Занять'],up:['Поднимается fl2va · ≈ 2,5 мин','ждём…','поднимается fl2va','…'],off:['Нет связи · переподключаюсь','ждём…','нет связи','…']};
+function setGpu(s){const g=HT[s];$('#gpu').dataset.s=s;$('#gpu-t').innerHTML=`<span class="lbl-long">${g[0]}</span><span class="lbl-short">${g[2]}</span>`;const b=$('#gpu-b');b.innerHTML=`<span class="lbl-long">${g[1]}</span><span class="lbl-short">${g[3]}</span>`;b.disabled=g[1]=='ждём…'}
+
+/* «Отмена 5 с» */
+let tm;function toast8(){const t=$('#toast8');t.classList.add('on');let n=5;$('#ring8').textContent=n;clearInterval(tm);if(q.get('freeze'))return;tm=setInterval(()=>{n--;$('#ring8').textContent=n;if(n<=0){clearInterval(tm);t.classList.remove('on')}},1000)}
+
+/* роутер и тема */
+const th=q.get('theme'); if(th)document.documentElement.dataset.theme=th;
+$('#theme').onclick=()=>{const d=document.documentElement;d.dataset.theme=(d.dataset.theme=='dark'||(!d.dataset.theme&&matchMedia('(prefers-color-scheme:dark)').matches))?'light':'dark'};
+function demoBar(id){const i=TOC.findIndex(t=>t[0]==id);if(i<0)return'';const p=TOC[i-1],n=TOC[i+1];return`<p class="demo" id="demobar"><b>Макет · экран ${i+1} из 15</b>${p?`<a href="#${p[0]}">← ${i}</a>`:''}${n?`<a href="#${n[0]}">${i+2} →</a>`:''}<a href="#toc">оглавление</a></p>`}
+function route(){const raw=(location.hash||'#toc').slice(1);const [h,arg]=raw.split('/');
+ $$('.screen').forEach(s=>s.classList.toggle('on',s.id==h));
+ $$('[data-s]').forEach(a=>a.classList.toggle('on',a.dataset.s=='projects'&&h!='toc'));
+ const old=$('#demobar');if(old)old.remove();const sc=$('#'+h);if(sc)sc.insertAdjacentHTML('afterbegin',demoBar(h));
+ setGpu(HG[h]||'run');
+ if(h=='s5'){edScene=+(arg||2);edMode=edScene==1?'ref':'from';renderEd()}
+ $('#toast8').classList.remove('on');if(h=='s8')toast8();
+ scrollTo(0,0)}
+addEventListener('hashchange',route);route();
+</script>
+</body>
+</html>
