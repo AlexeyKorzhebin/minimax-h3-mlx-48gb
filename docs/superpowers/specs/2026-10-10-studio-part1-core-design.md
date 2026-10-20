@@ -1,50 +1,84 @@
-# Студия, часть 1: ядро, исполнители, режиссёр, MCP — спека
+# Студия, часть 1: ядро, исполнитель ComfyUI, минимальный мастер, сценарист — спека
 
-Дата: 2026-10-10. Статус: **спека на проверку не автором** (CLAUDE.md: план против спеки проверяет
-тот, кто его не писал). Код не написан. Автор: Claude Fable 5.1 по заданию владельца.
+Дата: 2026-10-10, **редакция 2 — 2026-10-20**. Статус: **спека на проверку не автором** (CLAUDE.md:
+план против спеки проверяет тот, кто его не писал). Код не написан. Автор редакции 1: Claude Fable 5.1;
+редакции 2: Claude Opus 5.5 по заданию владельца (`BRIEF-spec-part1-rev2.md`).
 
 Источники решений, которые здесь не пересматриваются:
-- видение `2026-10-09-studio-vision.md` (+§5а) и его ревью `vision-review/{SUMMARY,codex,codex-2-hermes,fable}.md`;
-- ландшафт `docs/research/2026-10-09-studio-landscape/README.md` (итог 10.10: свой тонкий слой;
-  исполнители ComfyUI / Draw Things / sglang; режиссёр ai-writer 2.0; MCP по образцу ArcReel и comfyui-mcp);
+- видение `2026-10-09-studio-vision.md` (+§5а) и его ревью `vision-review/{SUMMARY,codex,codex-2-hermes,fable}.md`
+  (консенсус: вертикальные срезы, мастер первым, своего чата нет, одно хранилище состояния);
+- ландшафт `docs/research/2026-10-09-studio-landscape/README.md` (свой тонкий слой; MCP по образцу ArcReel и comfyui-mcp);
 - решения владельца `2026-10-08-panel-wave2-DRAFT.md` §4 (Р1–Р9) и стек `docs/design/2026-10-panel-audit/WAVE2-STACK.md`;
 - путь пользователя `2026-10-09-panel-wave2-CJM.md` (П1–П7, пять ставок приняты);
-- факты о H3: `docs/h3-modes/{README,MATRIX,DRAFT-VS-FINAL,PROMPT-FORMAT,GAIT-SOUND}.md`.
+- факты о H3: `docs/h3-modes/{README,MATRIX,DRAFT-VS-FINAL,PROMPT-FORMAT,GAIT-SOUND}.md`;
+- **замеры первого дня с GPU** `docs/h3-modes/GPU-DAY-20261020.md` (далее GPU-DAY);
+- **ревью спеки** `vision-review/codex-3-spec-part1.md` (далее «Codex-N» — номер находки);
+- **решения владельца 20.10** (§17, п. 1–5).
 
 Обозначения: «ч» — человек (владелец), «с» — система. Пути без корня — относительно этого репо.
-Пометка **(ставка)** — решение без замера, проверяется в срезе или в день с GPU.
+Пометка **(ставка)** — решение без замера, проверяется в срезе или проверкой §15.
+
+---
+
+## 0. Редакция 2: что изменилось и почему
+
+| # | Изменение | Почему | Находка / источник |
+|---|---|---|---|
+| Р2-1 | **Основной исполнитель видео H3 — ComfyUI**, sglang — план Б вне части 1 | GPU-DAY п.1: 3 с/20 шагов за 72 с, смена fl2va↔ref2va ≈16 с против ≈150 с у sglang | GPU-DAY п.1; снимает Codex-3 и Codex-7 с критического пути |
+| Р2-2 | Krea 2 на alex-neuro — шаблон ComfyUI; Draw Things убран из части 1 (остаётся будущим исполнителем Мака) | gRPC-сервера DT на alex-neuro нет; Krea 2 в ComfyUI 5,4 с на кадр; решение владельца 5 | GPU-DAY п.2; Codex-9 (синхронный DT remote), Codex-14 |
+| Р2-3 | В части 1 **один адаптер** — `executors/comfy.py` (H3 fl2va/ref2va, Krea 2); договор §8.1 описывает возможности адаптера, а не общее равенство | лишние адаптеры — инфраструктура раньше пути | Codex-9, Codex-14 |
+| Р2-4 | **Минимальный мастер на две сцены** входит в часть 1 и является каналом приёмки; MCP — второй канал над теми же операциями, не на критическом пути | решение владельца 1; «мастер первым» — консенсус ревью видения | Codex-6, Codex-14 |
+| Р2-5 | Режиссёр: основной путь — **своя LLM-роль «Сценарист»** (как Scenario mode старой панели); ai-writer — дополнительный путь для сложных сцен, импорт вне критического пути | решение владельца 4 | — |
+| Р2-6 | Дубль-намерение и материализация: дубль продолжения создаётся в `pending_input`, его `inputs_json` пишется один раз — когда готов кадр предыдущей сцены; ожидание кадра — `blocked`, не ошибка линта | замороженные входы цепочки не существуют в момент постановки | **Codex-1** |
+| Р2-7 | Две версии сцены: `revision` (содержание) и `state_version` (одобрения); одобрение привязано к дублю и к дублю-источнику кадра; каскад пересчитывается при правке, одобрении и завершении дубля; «выбрать» и «одобрить» слиты в одно действие | устаревшие продолжения можно было одобрить и собрать | **Codex-2**, Codex-12 |
+| Р2-8 | Переключение вариантов sglang в диспетчере специфицировано (§8.6), но в часть 1 не входит; в часть 1 диспетчер получает один новый EngineSpec `comfy-studio` без вариантов | при ComfyUI-основном вариант меняется внутри одного процесса | **Codex-3** (переоценён: не блокер части 1) |
+| Р2-9 | `submit_unknown` без положительной находки не повторяется автоматически; правило «GPU util < 10 %» удалено; единственное автоматическое разрешение без находки — доказанный рестарт процесса исполнителя после попытки постановки | низкая загрузка не доказывает, что задачи нет | **Codex-4**, GPU-DAY п.5 |
+| Р2-10 | `assemble.run()` не вызывается; из него выделяется чистая `concat_clips()` над замороженным списком входов, без `Project`, стадий и уборки | `run()` читает и меняет `project.json`, удаляет `keyframes/` | **Codex-5** |
+| Р2-11 | `library.build_ref2va` делится на чистую нумерацию над переданными карточками и обёртку с `get_card` | функция читает файловую библиотеку сама | Codex-8 |
+| Р2-12 | Контрактные тесты проверяют фактический payload и байты загруженных файлов; сравнение результата — по декодированным кадрам (`framemd5`), мутаций 11 | одинаковый итоговый SHA-256 не доказывает правильных входов | Codex-10 |
+| Р2-13 | Добавлены таблицы `proposal`, `render_plan`, `estimate_sample`, `cast_asset`; устойчивый `scene_id`, мягкое удаление сцен; правила роста ревизий | сущности были без схем | Codex-11 |
+| Р2-14 | Длительность: запрошенная `requested_s` и фактические `frames`; снап — к ближайшей точке сетки в `[73, 345]` кадров; пример исправлен на 192 кадра | 8 с = 192 кадра (проверено), 15 с = 362 кадра вне границы | Codex-13 (проверено кодом, §6.2) |
+| Р2-15 | Лимит картинок-референсов — функция числа кадров в карточке шаблона, по замерам 20.10 | 15 с держит 4 картинки, 5 не проходят уже на 10 с | GPU-DAY п.4 |
+| Р2-16 | Срезы перестроены: первым — две сцены через мастер на настоящем ComfyUI; критерий достигается в S4; порт ai-writer, LoRA, sglang, DT, MCP — после | инфраструктура раньше пути | Codex-14 |
+| Р2-17 | Числа: 482 теста в переиспользуемых файлах (было «≈380»), всего 2103 `def test_`; инструменты MCP пересчитаны; регрессия старых тестов отделена от доказательств новых инвариантов | — | Codex-15 |
+| Р2-18 | Прогресс: ComfyUI — WS `progress` по `prompt_id`; sglang (план Б) — tqdm из лога; `GET /v1/videos` живёт в памяти процесса | замер | GPU-DAY п.5, п.7 |
+
+Отклонённые части находок — в тексте разделов с причиной; сводка — §17.3.
 
 ---
 
 ## 1. Цель и критерий готовности
 
-**Цель части 1.** Ядро студии, с которым владелец сам, без ssh/curl/правки файлов, проходит путь
-«идея → сцены → эскиз первого кадра → эскизы сцен → выбор дубля → финал → сборка → mp4», где
-исполнители подключены по одному договору, состояние живёт в одной базе, задачи переживают обрывы,
-а любой MCP-хост (Hermes, Claude Desktop, OpenClaw) и будущий мастер (часть 3) работают через один и
-тот же набор явных операций.
+**Цель части 1.** Ядро студии и минимальный мастер, с которыми владелец сам, без ssh/curl/правки
+файлов, проходит путь «идея → две сцены → первый кадр → эскизы → выбор → финал → сборка → mp4», где
+исполнитель подключён по договору (§8), состояние живёт в одной базе, задачи переживают обрывы, а
+мастер и любой MCP-хост работают через один и тот же набор явных операций (§7).
 
-**Критерий готовности (один).** До возврата alex-neuro (~19.10) владелец проходит путь выше на Маке:
-из Claude Desktop или Hermes (MCP-инструменты, §11) плюс страница просмотра дублей (§4.4), с
-настоящим Draw Things (Krea 2 Turbo) для кадра и **имитацией H3** (§12), отдающей ролики проб
-08–09.10 из `~/Research/TestVideo/h3-modes/`. Путь закреплён контрактным тестом (§12.3) на тех же
-имитациях, и тот же тест в первый день с GPU выполняется на настоящих sglang/ComfyUI (§15).
-Проход владельца — отдельно и обязательно; тест проверяет, что путь есть, а не что им удобно
-пользоваться.
+**Критерий готовности (один).** Владелец в браузере на Маке открывает мастер студии
+`http://alex-neuro:8766/studio` и без подсказок проходит путь выше на **настоящем ComfyUI** alex-neuro
+(H3 fl2va/ref2va и Krea 2): две сцены (1 — от кадра Krea 2 или от референса, 2 — продолжение от
+последнего кадра 1), эскизы обеих, выбор, финалы обеих, повторное одобрение продолжения, сборка,
+скачивание mp4. Проход журналируется (что нажато, сколько ждал, где застрял). Путь закреплён
+сквозным тестом (§12.3) на имитациях; тот же контрактный тест исполнителя (§12.2) зелёный на живом
+ComfyUI alex-neuro. Тест доказывает, что путь есть; проход владельца — что им можно пользоваться.
 
-Срезы §14 — каждый со своей приёмкой владельцем; часть считается сделанной после среза S9.
+Срезы §14 — каждый со своей приёмкой владельцем; критерий достигается в S4, часть сделана после S6.
 
 ## 2. Не-цели части 1
 
 | Не делаем | Где это будет |
 |---|---|
-| React-мастер, 390 px, темы, «Готовое» как раздел | часть 3 (`CJM` экраны 1–15) |
+| Полный мастер (CJM экраны 1–15), темы, «Готовое» как раздел, 3+ сцены в мастере | часть 3; в части 1 — минимальный мастер на две сцены (§4.4) |
 | Vision-критик, автопересъёмка | часть 2; сейчас только линтер промпта (§10) |
 | MCP Apps (`ui://` виджеты) | после мастера, слой 2 (SUMMARY §«Хосты») |
-| Граф цепочек, карточки-DSL узлов, маршрутизация по нескольким машинам | отвергнуто ревью (SUMMARY п.7); адрес узла — строка в настройках |
-| Обучение LoRA (Z-Image / Krea 2 Raw) | LoRA в части 1 — только ресурс с происхождением (§6), обучение — отдельная задача после GPU |
-| Wan, YuE2, клип под трек («Сюжет» 16–40 сцен) | волна 3 (Р3) |
-| Перенос старых `project.json` в SQLite | часть 3 вместе с мастером (Р8: разовый импорт, файлы — архив); старая панель живёт |
+| Граф цепочек, карточки-DSL узлов, маршрутизация по нескольким машинам | отвергнуто ревью (SUMMARY п.7); адрес исполнителя — строка в `SETTING` |
+| Адаптер sglang H3 и переключение вариантов в диспетчере | план Б (§8.6): после части 1 или если проверка §15 п.1 провалится |
+| Адаптер Draw Things (local/remote) | после части 1, как исполнитель Мака (решение владельца 5) |
+| Импорт сценария ai-writer (`clip_*`, `?format=h3`) | опциональный срез S7 после критерия (решение владельца 4) |
+| LoRA: импорт и обучение | после части 1; в схеме зарезервирован только `asset.kind='lora'` |
+| Апскейл LTX из студии | после проверки LTX в экземпляре `comfy-studio` (§15 п.10); в части 1 сборка без апскейла |
+| Wan, YuE2, клип под трек | волна 3 (Р3) |
+| Перенос старых `project.json` в SQLite | не делается (решение владельца 3); старая панель живёт |
 | Авторизация и доступ из интернета | до любого мобильного хоста (fable §2б); в части 1 — LAN и bearer на MCP |
 | Свой чат | не пишем (SUMMARY п.3) |
 
@@ -54,49 +88,51 @@
 
 **Решение: студия растёт в этом репо как пакет `h3_48gb/studio/` рядом с `web.py`, новое
 FastAPI-приложение на своём порту, доменные модули переиспользуются через узкие швы, существующие
-тесты остаются контрактом.** Ставка владельца принимается; ниже — почему она верна и где её граница.
+тесты остаются контрактом.** Ниже — что именно берётся и где шов шире, чем казалось в редакции 1
+(всё проверено по коду 20.10).
 
-### 3.1. Что именно переиспользуется (пути:строки)
+### 3.1. Что переиспользуется (пути:строки)
 
-| Модуль | Строк | Тестов | Что берём и как |
-|---|---|---|---|
-| `h3_48gb/engines/ltx.py` | 274 | 22 (`tests/test_ltx_upscale.py`) | `ComfyClient` (upload/prompt/history/interrupt, `:55-100`), цикл опроса `/history` с `MAX_ODD_HISTORY_POLLS=12` (`:31`, `:150-168`), `set_scene_ltx_if_current` (`:252`) — образец «поздний результат не затирает». Обобщается в `studio/executors/comfy.py` (§8.1); `upscale_part` вызывает обобщённый клиент, тесты проходят без правок |
-| `h3_48gb/engines/sglang.py` | 348 | 22 (`tests/test_sglang_adapter.py`) | `SglangClient` (`:87-158`), `build_payload` (`:160-178`), `run_generate` (`:239-348`): возобновление по `engine_ref`, `LOST_RETRIES=5`, проверка залитых кадров `_flat_frames`. Шов: два прямых вызова `q.cancel_reason`/`q.set_running_fields` заменяются параметром `store` (§8.3) |
-| `h3_48gb/engines/sglang_args.py` | 233 | `tests/test_sglang_args.py` | лимиты и сетка: `MIN_SECONDS=3`, `MAX_SECONDS=15`, `grid_frames_up` 17n+5 (`:81-83`), `DEFAULT_MAX_REF_IMAGES=5` (`:24`, проба 07.10: 6 портретов на 10 с = 63,6 из 64,9 ГБ), `TASKS=("ref2va",)` (`:32`) — расширяется до трёх задач |
-| `h3_48gb/engines/dispatcher_client.py` | 77 | 26 (`tests/test_gpu_gate.py`) | как есть: `acquire/release/status`, таймауты 130/10 с, клиенты `panel-worker`/`panel-web` — добавляется `studio-worker` |
-| `h3_48gb/worker.py` | 1308 | 64 | `make_gpu_gate` (`:524-597`): цикл acquire каждые 30 с, 5 с при `starting`, тепловой порог 80→72 °C; `_IdleRelease` (`:603`). Берётся функцией, не процессом: у студии свой цикл воркера (§4.2) |
-| `h3_48gb/library.py` | 331 | 17 + `test_library_web` | `build_ref2va` (`:272-325`): нумерация `<Subject N>`/`<Picture k>`/`<Audio k>`, `subject_definitions`. Вызывается с картами из SQLite через тот же словарный вид карточки |
-| `h3_48gb/assemble.py` | 1806 | 68 | `run()` (`:700`, склейка/заморозка/звук/ffmpeg), `_extract_last_frame` (`:1258`), `_extract_valid_last_frame` (`:593`, пропуск битого хвоста) — вызываются как функции над путями; `advance_project`/`_submit_next_scene_sglang` **не** берутся (их логика «один дубль на сцену» уходит, §6) |
-| `h3_48gb/engines/estimate.py` | 64 | — | история времени `sglang-history.jsonl`, `estimate_seconds` — переезжает в таблицу `estimate_sample` с той же формулой |
-| `h3_48gb/provider.py` | 1046 | `tests/test_provider.py` | OpenAI-совместимый клиент со строгой `json_schema`, SSE против обрыва шлюза, `LlamaLocal` — слой LLM режиссёра (§9.2) |
-| `h3_48gb/queue.py` | 1347 | 98 | **не переиспользуется как хранилище** (очередь уходит в SQLite, Р-STACK §4), но его таблица `reconcile` (`:1161-1250`: lease / marker / mp4 / engine_ref) переносится как спецификация состояний задачи (§8.5) и как тесты точным равенством |
-| `tools/gpu-dispatcher/dispatcher.py` | 619 | `tests/test_gpu_dispatcher.py` | хост остаётся единственным владельцем `generation.lock`. Правка одна: `engine_specs()` (`:65-85`) получает `h3-fl2va` рядом с `h3-ref2va` и `dt` (§8.4) |
-| `tests/_fake_{comfy,sglang,dispatcher,llama}.py` | — | — | имитации уже есть; дописываются ролики проб и тайминги (§12) |
+| Модуль | Тестов | Что берём и как |
+|---|---|---|
+| `h3_48gb/engines/ltx.py` (274) | 22 `test_ltx_upscale.py` | `ComfyClient` (`:55`, upload/prompt/history/interrupt), опрос `/history` с `MAX_ODD_HISTORY_POLLS=12` (`:31`), `set_scene_ltx_if_current` (`:252`) как образец «поздний результат не затирает». Обобщается в `studio/executors/comfy.py` (+`queue`, `object_info`, `models`, WS); `upscale_part` переводится на обобщённый клиент, 22 теста без правок |
+| `h3_48gb/engines/sglang_args.py` (233) | 18 | **только константы и сетка**: `FPS=24`, `MIN_SECONDS/MAX_SECONDS` (`:18-19`), `grid_frames_up` (`:81`). `parse()` не берётся: требует референс независимо от задачи (`:201-203`), `TASKS=("ref2va",)` (`:32`), отказывает вне сетки вместо снапа (`:170-177`) |
+| `h3_48gb/engines/dispatcher_client.py` (77) | 26 `test_gpu_gate.py` | как есть: `acquire/release/status`; новый клиент `studio-worker` |
+| `h3_48gb/worker.py` (1308) | 64 | **логика**, не функция: `make_gpu_gate` (`:524`) пишет в файловую очередь (`q.set_running_fields`, `:534`) и спит через `sglang._sleep_unless_cancelled`, который читает файловую очередь (`sglang.py:184`). Студия пишет свой цикл GPU-гейта с теми же параметрами (acquire каждые 30 с, 5 с при `starting`, тепловой порог 80→72 °C) и `_IdleRelease` (`:603`, 15 мин); тесты `test_gpu_gate.py` переносятся как спецификация точными равенствами |
+| `h3_48gb/library.py` (331) | 17 + 11 | выделяется чистая `number_references(scene_prompt, cards: dict[tag, card], extra_refs) -> Ref2VAScene` — тело `build_ref2va` (`:272-325`) без `get_card` (`:303`); `build_ref2va` становится обёрткой, читающей карточки из файлов, старые тесты без правок. Студия передаёт карточки из `cast_member`+`cast_asset` в том же словарном виде (`kind`, `description`, `assets`). Голос → `<Audio k>`, картинки → `<Picture k>`; видео-, трек- и LoRA-ресурсы в нумерацию не попадают (видео-референсы и трек — не в части 1; LoRA — не условие, а параметр шаблона) |
+| `h3_48gb/assemble.py` (1806) | 68 | выделяется чистая `concat_clips(clips: list[ClipInput], out_path, *, run) -> Path`, где `ClipInput = (path, head_drop_frames, idx)` — тело `_build_video_clip_paths` (`:408`) + `_concat` (`:447`) для режима звука `clips`; без `Project`, без `set_stage_status`, без `_cleanup_*` (`:862-877`). `run()` вызывает её для `audio_mode="clips"`, старые тесты без правок. `_extract_valid_last_frame` (`:593`) берётся как функция над путями. `run()`, `advance_project`, `_submit_next_scene_sglang` студия **не** вызывает (Codex-5: `run()` грузит проект `:757`, меняет его `:864-865`, убирает `keyframes/` `:876`) |
+| `h3_48gb/engines/estimate.py` (64) | — | формула «медиана последних 10» переезжает в таблицу `estimate_sample`; ключ расширяется: сейчас `(width, height, frames, steps)` (`:54-57`), в студии `(executor, template, machine, width, height, frames, steps)` — fl2va и ref2va различаются по времени вдвое (GPU-DAY п.1) |
+| `h3_48gb/provider.py` (1046) | 92 | OpenAI-совместимый клиент со строгой `json_schema`, SSE против обрыва шлюза; `provider.chat` (`:937`) со своей схемой студии — слой LLM «Сценариста» (§9); `shares_gpu` (`:309`) — для координации с GPU-замком на Маке (§8.4) |
+| `h3_48gb/queue.py` (1347) | 98 | не хранилище; таблица `reconcile` (`:1161-1250`) переносится как спецификация состояний задачи (§8.5) и как тесты точным равенством |
+| `tools/gpu-dispatcher/dispatcher.py` (619) | 44 | хост остаётся единственным владельцем `generation.lock`. Правка части 1 одна: новый EngineSpec `comfy-studio` в `engine_specs()` (`:65-85`), §8.4. Старые `h3` и `ltx` не меняются |
+| `tests/_fake_{comfy,sglang,dispatcher,llama}.py` | — | имитации есть; `_fake_comfy` дописывается шаблонами H3/Krea 2, журналом payload и WS (§12) |
 
-Итого: ≈5,5 тыс. строк доменного кода и ≈380 тестов с проверенными инвариантами (порядок
-«лиза → маркер → снятие лизы» `worker.py:936-960`; «маркер важнее mp4» `queue.py:1176,1230-1236`;
+Итого: 482 теста в перечисленных файлах (подсчёт `grep -c "def test_"` 20.10) с инвариантами
+(«лиза → маркер → снятие лизы» `worker.py:936-960`; «маркер важнее mp4» `queue.py:1176,1230-1236`;
 «поздний апскейл не крепится к новому дублю» `ltx.py:252`; 17n+5-сетка; нумерация `<Picture k>`).
-Новый пакет повторил бы эти ошибки заново — именно этот класс находок закрывали семь раундов ревью
-04–11.08 (CLAUDE.md).
+Их зелёный цвет после каждого среза доказывает только, что **старое не сломано**; новые SQLite-пути
+доказываются своими тестами с мутациями (§12), а не этими.
 
 ### 3.2. Где эволюция кончается
 
 Новое, не наследуемое: модель «сцена с ревизией → неизменяемые дубли» (у `project.py` один
-`clip_path` на сцену и `invalidate_scene_chain` стирает его, `project.py:827-898`); очередь и
-задачи в SQLite; исполнитель как договор (§8); события как таблица. `web.py` (6779 строк) не
-трогается и не импортируется студией. Эти части пишутся заново в `h3_48gb/studio/`.
+`clip_path` на сцену и `invalidate_scene_chain` стирает его, `project.py:827-898`); очередь и задачи в
+SQLite; исполнитель как договор (§8); события как таблица; мастер. `web.py` (6779 строк) не трогается
+и не импортируется студией.
 
 ### 3.3. Отвергнутые варианты
 
 | Вариант | Почему нет |
 |---|---|
-| Новый пакет/репо «studio» с нуля | потеря ≈380 тестов-инвариантов; оценка переписывания ядра DRAFT §2 — 35–55 дней при цели «контент сейчас» (fable §5) |
-| ArcReel или Toonflow как основа | проверено руками 10.10: ArcReel — AGPL, нет продолжения от кадра (`extract_video_last_frame` не вызывается), нет русского, агент не работает с локальной Qwen; Toonflow — холст, нет сборки, нет тестов; «основой 2–3 недели против тонкого слоя» (`eval-toonflow.md`) |
-| AI Movie Studio 2 | затих с 16.09 (README ландшафта) |
-| Мак как настоящий исполнитель H3 на MLX (`engine.py: ENGINES=("mlx","sglang")`) вместо имитации | Мак заморожен для рендера с 01.10 (память владельца); прогон 1344×768 10.08 закончился kernel panic (CLAUDE.md). Имитация с роликами проб дешевле и безопаснее |
-| Доработка `web.py` на месте (без FastAPI) | STACK §1: ручной роутинг — источник находок «400 вместо 404»; решение владельца — FastAPI |
+| Новый пакет/репо «studio» с нуля | потеря 482 тестов-инвариантов; оценка переписывания ядра DRAFT §2 — 35–55 дней (fable §5) |
+| ArcReel или Toonflow как основа | проверено руками 10.10: ArcReel — AGPL, нет продолжения от кадра, нет русского; Toonflow — холст, нет сборки, нет тестов (`eval-toonflow.md`) |
+| sglang основным исполнителем видео | GPU-DAY п.1: ComfyUI вдвое быстрее на ref2va и меняет чекпойнт в 9 раз быстрее; sglang — план Б |
+| Вызывать `assemble.run()` и `sglang.run_generate()` как есть | оба завязаны на файловую очередь и `project.json` (Codex-5, Codex-7); выделяются чистые части |
+| Мак как исполнитель H3 на MLX | Мак заморожен для рендера с 01.10; прогон 1344×768 10.08 закончился kernel panic (CLAUDE.md) |
+| Доработка `web.py` на месте | STACK §1: ручной роутинг — источник находок «400 вместо 404»; решение владельца — FastAPI |
+| Мастер на f-строках без сборки | выбрасывается в части 3; STACK §2 уже принял React + Vite + TypeScript |
 | Prefect / LangGraph для цепочек | codex: преждевременно; одна зависимость `depends_on` |
-| SQLAlchemy + Alembic (как в ai-writer) | 11 таблиц, один пользователь; `sqlite3` из stdlib + миграции SQL-файлами по `PRAGMA user_version` держат `requirements-panel.txt` коротким (образ без MLX, спека W1 §3.2) |
+| SQLAlchemy + Alembic | ~14 таблиц, один пользователь; `sqlite3` + SQL-миграции по `PRAGMA user_version` |
 | Redis/ARQ для очереди | STACK §4: GPU один, задач единицы в час |
 
 ---
@@ -107,143 +143,144 @@ FastAPI-приложение на своём порту, доменные мод
 
 ```mermaid
 flowchart LR
-  subgraph HOSTS["Агентные хосты (чужие)"]
-    HER["Hermes 0.21.5<br/>десктоп + Telegram"]
+  BR["Браузер владельца<br/>минимальный мастер :8766/studio"]
+  subgraph HOSTS["Агентные хосты (второй канал, S5)"]
+    HER["Hermes"]
     CLD["Claude Desktop"]
-    OCL["OpenClaw"]
   end
-  BR["Браузер владельца<br/>(просмотр дублей, старая панель)"]
-  subgraph STUDIO["h3_48gb/studio/ — один процесс API + один воркер"]
-    MCP["mcp.py<br/>MCP streamable HTTP /mcp<br/>bearer, 14 инструментов"]
+  subgraph STUDIO["h3_48gb/studio/ — процесс API + процесс воркера"]
+    WEB["web/ (React+Vite, статика)<br/>мастер на две сцены"]
     API["app.py FastAPI<br/>/api/studio/* явные операции<br/>SSE /api/studio/events"]
-    OPS["ops.py<br/>expected_revision, Idempotency-Key"]
-    LINT["lint.py<br/>линтер промпта"]
-    DIR["director/<br/>идея→клип (порт domain/clip ai-writer)<br/>глава→клип (MCP-клиент ai-writer)"]
+    MCP["mcp.py<br/>/mcp, bearer"]
+    OPS["ops.py<br/>expected_revision / state_version,<br/>Idempotency-Key, каскад"]
+    LINT["lint.py"]
+    DIR["director/scenarist.py<br/>LLM-роль «Сценарист»"]
+    AWI["director/aw_import.py<br/>(опция, S7)"]
     DB[("db.py SQLite WAL<br/>studio.sqlite")]
-    WRK["worker.py<br/>цикл задач, GPU-scope, reconcile"]
-    EXB["executors/base.py<br/>договор Executor"]
-    EXC["executors/comfy.py<br/>обобщение engines/ltx.py"]
-    EXD["executors/drawthings.py<br/>CLI / --remote gRPC"]
-    EXS["executors/sglang_h3.py<br/>обёртка engines/sglang.py"]
-    EXF["executors/fake.py<br/>имитации с роликами проб"]
-    PAGE["pages.py<br/>страница дублей (только чтение)"]
+    WRK["worker.py<br/>цикл задач, материализация,<br/>GPU-гейт, reconcile"]
+    EXB["executors/base.py<br/>договор + возможности"]
+    EXC["executors/comfy.py<br/>H3 fl2va/ref2va, Krea 2"]
+    EXF["FakeComfy (тесты, --fakes)"]
   end
   subgraph LEGACY["Переиспользуемые модули h3_48gb/"]
-    LIB["library.build_ref2va"]
-    ASM["assemble.run / _extract_valid_last_frame"]
-    PRV["provider.py (LLM, json_schema)"]
-    SGA["engines/sglang_args (лимиты, сетка)"]
+    LIB["library.number_references"]
+    ASM["assemble.concat_clips /<br/>_extract_valid_last_frame"]
+    PRV["provider.py (json_schema)"]
+    GRID["sglang_args: FPS, grid_frames_up"]
     DCL["engines/dispatcher_client"]
   end
-  subgraph EXEC["Исполнители (чужие процессы)"]
-    CMF["ComfyUI :8188<br/>LTX сейчас, H3 после проверки"]
-    DT["Draw Things<br/>Krea 2 / Z-Image / LoRA"]
-    SGL["sglang H3 :30020<br/>fl2va | ref2va"]
+  subgraph NEURO["alex-neuro"]
+    CMF["ComfyUI comfy-studio :8189<br/>v0.42, H3 + Krea 2"]
     GPU["gpu-dispatcher :8790<br/>generation.lock"]
+    SGL["sglang H3 :30020<br/>(план Б, вне части 1)"]
   end
-  AW["ai-writer 2.0 :8000<br/>/mcp clip_* (bearer)"]
-  LLM["LLM: CAILA / llama.cpp :8080"]
+  AW["ai-writer :8000 (опция)"]
+  LLM["LLM: CAILA / llama.cpp"]
 
-  HER & CLD & OCL -->|MCP| MCP
+  BR -->|HTTP| WEB
   BR -->|HTTP| API
-  BR -->|HTTP| PAGE
+  HER & CLD -->|MCP| MCP
   MCP --> OPS
   API --> OPS
   OPS --> DB
   OPS --> LINT
-  OPS --> DIR
-  DIR -->|MCP-клиент| AW
-  DIR --> PRV --> LLM
+  OPS --> DIR --> PRV --> LLM
+  OPS -.-> AWI -.->|MCP-клиент| AW
   WRK --> DB
   WRK --> EXB
-  EXB --- EXC & EXD & EXS & EXF
+  EXB --- EXC & EXF
   EXC --> CMF
-  EXD --> DT
-  EXS --> SGL
-  EXS --> SGA
-  EXS --> LIB
+  EXC --> LIB
+  EXC --> GRID
   WRK -->|acquire/release| DCL --> GPU
-  GPU -.поднимает/гасит.-> CMF & SGL
+  GPU -.поднимает/гасит.-> CMF
+  GPU -.-> SGL
   WRK --> ASM
-  PAGE --> DB
 ```
 
 Границы:
-- **Единственный источник состояния — `studio.sqlite`.** Хост хранит только разговор (SUMMARY п.4).
+- **Единственный источник состояния — `studio.sqlite`.** Мастер и хосты хранят только вид/разговор.
   ai-writer хранит книгу; студия импортирует его сценарий как ресурс с происхождением, обратной
   синхронизации нет (codex-2 §4).
-- **MCP-сервер — обёртка над `ops.py` без своей логики.** Любой инструмент = одна операция API.
-- **Исполнители — чужие процессы.** Студия не загружает модели и не запускает графы; поднимает и
-  гасит движки на alex-neuro только диспетчер.
-- **Воркер — один процесс, одна задача за раз на GPU-scope.** Брокера нет.
+- **Мастер и MCP — клиенты одних и тех же операций `ops.py`**, своей логики нет ни у одного.
+- **Исполнители — чужие процессы.** Студия не загружает модели; движки на alex-neuro поднимает и
+  гасит только диспетчер.
+- **Воркер — один процесс; одна GPU-задача за раз на GPU-scope**, плюс второй поток для задач
+  без GPU (`assemble`, `extract_frame`).
 
 ### 4.2. Процессы
 
 | Процесс | Запуск | Что делает | Падение |
 |---|---|---|---|
-| `studio-api` | `python -m h3_48gb.studio api --port 8766 --outdir $H3_OUTDIR` | FastAPI + MCP в одном процессе (как `/mcp` в ai-writer); SSE; страница дублей | перезапуск; воркер не замечает (DB — на диске) |
-| `studio-worker` | `python -m h3_48gb.studio worker --outdir $H3_OUTDIR` | `reconcile` → взять задачу → GPU-scope → исполнитель → результат → событие; один экземпляр под `flock worker.lock` (как `worker.py:105`) | при старте `reconcile` по `engine_ref` (§8.5); задачу не повторяет вслепую |
-| `gpu-dispatcher` (alex-neuro) | systemd, уже есть | владелец движков и `generation.lock` | `KillMode=process`, движки живут |
-| исполнители | диспетчер (alex-neuro) / вручную (Мак) | см. §8 | задача → `waiting_ready`, не ошибка |
+| `studio-api` | `python -m h3_48gb.studio api --port 8766 --outdir $H3_OUTDIR` | FastAPI + статика мастера + MCP (S5) + SSE | перезапуск; воркер не замечает (БД на диске); предложения сценариста живут в БД (`proposal`) |
+| `studio-worker` | `python -m h3_48gb.studio worker --outdir $H3_OUTDIR [--fakes]` | `reconcile` → взять задачу с выполненной зависимостью → материализовать входы → GPU-гейт → исполнитель → результат → каскад → событие; один экземпляр под `flock worker.lock` (как `worker.py:105`) | при старте `reconcile` (§8.5); задачу не повторяет вслепую |
+| `gpu-dispatcher` (alex-neuro) | systemd, есть | владелец движков и `generation.lock` | `KillMode=process`, движки живут |
+| ComfyUI `comfy-studio` | поднимает диспетчер по `acquire("comfy-studio")` | H3 и Krea 2 | задача → `lost` или `submit_unknown` по §8.5 |
 
 На alex-neuro оба процесса студии — два контейнера compose (`studio-api`, `studio-worker`) по
-STACK §5, со своими healthcheck; старый `h3-panel` остаётся на :8765 до приёмки части 3 (Р6).
-На Маке — два процесса в venv (Docker на Маке не нужен).
+STACK §5, со своими healthcheck; старый `h3-panel` остаётся на :8765 (решение владельца 2). На Маке —
+разработка: два процесса в venv с `--fakes`; живой контракт на Маке — ComfyUI MPS с `sd_turbo`
+(§12.2), **только под `caffeinate -dimsu`**, логи в `~/Research/TestVideo/_логи/` (CLAUDE.md).
 
 ### 4.3. Развёртывание по машинам и портам
 
 ```mermaid
 flowchart TB
-  subgraph MAC["Мак 48 ГБ — сейчас (до ~19.10)"]
-    M_API["studio-api :8766<br/>+ /mcp"]
-    M_WRK["studio-worker<br/>GPU-scope local-mac"]
-    M_DB[("~/Research/TestVideo/studio/studio.sqlite<br/>медиа рядом, логи в _логи/")]
-    M_DT["Draw Things (CLI, локально)<br/>krea_2_turbo_q8p, z_image_*_q8p"]
-    M_CMF["ComfyUI 0.39.0 MPS :8188<br/>~/Research/studio-eval/shared/ComfyUI<br/>sd_turbo — только контракт"]
-    M_FAKE["fake sglang / fake comfy / fake dispatcher<br/>в тестах и в режиме --fakes"]
-    M_LLM["llama.cpp :8080"]
-    M_AW["ai-writer 2.0 :8000 (/mcp)<br/>uvicorn + arq + redis"]
-    M_HER["Hermes / Claude Desktop"]
-    M_API --- M_DB
-    M_WRK --- M_DB
-    M_WRK --> M_DT
-    M_WRK --> M_CMF
-    M_WRK --> M_FAKE
-    M_API --> M_LLM
-    M_API --> M_AW
-    M_HER -->|MCP| M_API
-  end
-  subgraph NEURO["alex-neuro CMP 170HX 64 ГБ — после ~19.10"]
-    N_API["контейнер studio-api :8766"]
-    N_WRK["контейнер studio-worker"]
+  subgraph NEURO["alex-neuro CMP 170HX 64 ГБ — основная машина части 1"]
+    N_API["контейнер studio-api :8766<br/>мастер + API + /mcp"]
+    N_WRK["контейнер studio-worker<br/>клиент диспетчера studio-worker"]
     N_OLD["контейнер h3-panel :8765 (старая панель)"]
-    N_DB[("/home/alex/Outputs/h3-panel/studio.sqlite<br/>только через API, не по SMB")]
-    N_DISP["gpu-dispatcher :8790 (systemd)<br/>engines: h3-ref2va, h3-fl2va, comfy, dt"]
-    N_SGL["sglang H3 :30020"]
-    N_CMF["ComfyUI :8188 (LTX, H3?)"]
-    N_DT["Draw Things gRPC :7859 (проверить)"]
+    N_DB[("/home/alex/Outputs/studio/studio.sqlite<br/>только через API, не по SMB")]
+    N_DISP["gpu-dispatcher :8790 (systemd)<br/>engines: h3 (ref2va), ltx, comfy-studio"]
+    N_CS["ComfyUI comfy-studio :8189<br/>~/Projects/comfy-h3, v0.42<br/>H3 fl2va/ref2va, Krea 2"]
+    N_LTX["ComfyUI ltx :8188 (старая панель)"]
+    N_SGL["sglang H3 :30020 (старая панель, план Б студии)"]
     N_QWEN["Qwen :8000 (чужой, гасится по просьбе)"]
     N_API --- N_DB
     N_WRK --- N_DB
-    N_WRK -->|acquire| N_DISP
-    N_DISP --> N_SGL & N_CMF & N_DT
+    N_WRK -->|acquire comfy-studio| N_DISP
+    N_DISP --> N_CS & N_LTX & N_SGL
     N_DISP -.unload/restore.-> N_QWEN
   end
-  MAC_B["Браузер / Hermes на Маке"] -->|LAN http| N_API
+  subgraph MAC["Мак 48 ГБ — разработка"]
+    M_DEV["studio-api + studio-worker --fakes"]
+    M_CMF["ComfyUI 0.39 MPS sd_turbo<br/>только контракт API, под caffeinate"]
+    M_BR["Браузер владельца"]
+  end
+  M_BR -->|LAN http :8766| N_API
 ```
 
-Порты: 8765 старая панель, **8766 студия (ставка, вопрос 2 §17)**, 8188 ComfyUI, 30020 sglang,
-8790 диспетчер, 7859 Draw Things gRPC, 8000 Qwen на alex-neuro / ai-writer на Маке (разные машины,
-коллизии нет), 8080 llama.cpp на Маке.
+Порты: 8765 старая панель, **8766 студия** (решение владельца 2), 8188 ComfyUI старой панели (LTX),
+**8189 ComfyUI студии**, 30020 sglang, 8790 диспетчер, 8000 Qwen.
 
-### 4.4. Страница дублей (минимум, без React)
+**Почему отдельный экземпляр ComfyUI.** H3 и Krea 2 замерены в `~/Projects/comfy-h3` (v0.42, :8189,
+GPU-DAY п.1); рабочий `~/Projects/comfy` (v0.36, :8188) обслуживает LTX старой панели и с H3 не
+проверялся. Два экземпляра — два EngineSpec с разными портами; диспетчер держит на карте один из них
+(`acquire` гасит другой собственный движок, если он не занят чужим клиентом, `dispatcher.py:472-479`).
+Слияние в один экземпляр — после проверки LTX в `comfy-studio` (§15 п.10).
 
-`studio/pages.py`: три серверных HTML-страницы на f-строках (без шаблонизатора и сборки):
-`/studio/projects/<id>` (сцены, статусы, план очереди), `/studio/scenes/<id>/takes` (дубли с
-`<video controls>` и кнопкой «Выбрать» — единственное действие, POST с `expected_revision`),
-`/studio/projects/<id>/result` (финал, «Скачать»). Медиа отдаются с Range (`/studio/media/<asset_id>`).
-Это не мастер (часть 3), а окно, в которое ссылаются MCP-инструменты (fable 2а: «виджет = страница
-панели»). Проверяется скриншотом на 1440 и 390 px: без горизонтальной прокрутки.
+### 4.4. Минимальный мастер (S0–S4)
+
+`h3_48gb/studio/web/` — React + Vite + TypeScript (STACK §2), собирается в статику, отдаётся
+`studio-api`; типы запросов генерируются из OpenAPI FastAPI. Состояние — только из API: снимок O3 +
+SSE O21 с `Last-Event-ID` (И10). Ни одной операции, которой нет в §7.
+
+Экраны (одна страница-проект с шагами, без навигации по разделам):
+
+| Шаг | Что видит и делает владелец | Операции |
+|---|---|---|
+| 1. Проект | список проектов, «Новый»: название, формат кадра (16:9 / 9:16), идея текстом | O1, O2 |
+| 2. Герой | загрузить фото героя (или пропустить), тег, описание по-русски → EN-описание | O6, O5 |
+| 3. Сценарий | «Предложить сцены» → две карточки (действие, игра, звук, режим, длительность); правка текста в карточке; находки линта у поля; «Применить» | O25, O26, O8, O9 |
+| 4. Первый кадр | для сцены 1 в режиме `from_frame`: «Сделать кадр» (Krea 2) → картинка → «Взять в сцену 1»; или режим `refs` с фото героя | O12 (план + подтверждение), O8 |
+| 5. Эскизы | «Снять эскизы» → план (минуты GPU, смены чекпойнта, находки) → «Подтвердить»; прогресс по шагам, ожидание карты с причиной («Qwen держит карту» + кнопка «Освободить») | O10, O11, O13, O23, O14 |
+| 6. Выбор | дубли сцены с `<video controls>`, кадры 0/2/4/8 с, «Выбрать»; конфликт цепочки показан словами и кнопкой «Переснять сцену 2 от выбранного» | O18, O16, O10/O11 |
+| 7. Финал | «Снять финалы» → план → подтверждение; после финала 1 сцена 2 помечена «проверьте: кадр изменился» до одобрения | O10, O11, O16 |
+| 8. Сборка | «Собрать» (отказ с перечнем неодобренных сцен) → «Скачать mp4» | O19, O20 |
+
+Плюс: «Повторить» у упавшей задачи (O15) и «Разобраться» у `submit_unknown` (§8.5) с двумя кнопками
+«Поставить заново» / «Отменить». Проверка — прохождением владельца (критерий §1) и
+Playwright-сценарием в S4 на имитациях; скриншоты 1440/390 px — дополнительно, не вместо прохода.
 
 ---
 
@@ -251,25 +288,21 @@ flowchart TB
 
 | Слой | Выбор | Версия | Почему | Отвергнуто |
 |---|---|---|---|---|
-| Язык | Python | 3.12 (`pyproject: requires-python >=3.12`) | весь домен уже на нём | — |
-| HTTP API | FastAPI + Pydantic 2 + uvicorn | `fastapi>=0.143`, `pydantic>=2.9`, `uvicorn>=0.30` (как в ai-writer, проверено там) | STACK §1: модели запросов, единый обработчик ошибок, OpenAPI как источник типов для MCP и клиента | stdlib `http.server` (источник находок волн 1–1.5) |
-| Хранилище | SQLite, `sqlite3` stdlib, WAL, `busy_timeout=5000` | SQLite ≥3.35 (`RETURNING`) | STACK §3; один файл, транзакция «задача + ревизия сцены» | Postgres, SQLAlchemy/Alembic (§3.3) |
-| Миграции | SQL-файлы `studio/migrations/NNN.sql`, `PRAGMA user_version` | — | 11 таблиц, читается глазами | Alembic |
-| Бэкап | `sqlite3.Connection.backup()` раз в час в `<outdir>/backup/studio-<ts>.sqlite`, 7 копий | — | codex: копия файла при WAL несогласованна | `cp` файла |
-| Очередь | таблица `task` в той же БД + `flock worker.lock` | — | STACK §4 | Redis/ARQ, каталоги `pending/running` |
-| События | таблица `event` (seq, монотонный) → SSE `Last-Event-ID` = seq | — | DRAFT (г): один журнал для SSE, MCP, уведомлений, отчёта боя | опрос `/api/state` |
-| HTTP-клиенты к исполнителям | `urllib` в воркере (синхронно, как `ltx.py`/`sglang.py`) | stdlib | один поток, одна задача; меньше зависимостей | httpx/aiohttp |
-| Прогресс ComfyUI | `websockets` (клиент `ws://…/ws?clientId=`) с откатом на опрос `/history` | `websockets>=12` | счётчик шагов для П6 (Н7); опрос — как сейчас | только опрос |
-| MCP | `mcp` (FastMCP, streamable HTTP, монтируется в FastAPI) | `mcp>=2.3` (как в ai-writer) | один процесс с API; тот же паттерн, что `backend/app/mcp_server` ai-writer | отдельный контейнер `h3-mcp` (W1 §7) — лишний процесс |
-| MCP-клиент к ai-writer | тот же `mcp` | — | `clip_*` инструменты | REST с cookie-сессией |
-| LLM | `provider.py` (OpenAI-совместимый, `json_schema`) | — | Р1: идеи ai-writer копируются, общего пакета нет | PydanticAI (codex) — позже, если появится третья роль |
-| Медиа | ffmpeg/ffprobe из `assemble.py` | как в образе | уже есть | — |
-| Хеши | `hashlib.sha256` файлов и канонического JSON входов | stdlib | неизменяемые дубли | — |
-| Тесты | pytest ≥8; имитации `tests/_fake_*.py`; контракт против живых ComfyUI/Draw Things на Маке | — | CLAUDE.md: тест виден красным | Playwright — часть 3 |
-| Клиент | нет (f-string HTML, §4.4) | — | мастер — часть 3 на React (STACK §2) | — |
-
-Зависимости студии добавляются в `requirements-panel.txt`: `fastapi`, `pydantic`, `uvicorn`,
-`websockets`, `mcp`. MLX-стек по-прежнему не импортируется.
+| Язык | Python | 3.12 | весь домен уже на нём | — |
+| HTTP API | FastAPI + Pydantic 2 + uvicorn | `fastapi>=0.143`, `pydantic>=2.9`, `uvicorn>=0.30` (как в ai-writer) | STACK §1: модели запросов, единый обработчик ошибок, OpenAPI → типы мастера и MCP | stdlib `http.server` |
+| Мастер | React + Vite + TypeScript | версии фиксируются в `web/package.json` в S0 | STACK §2; часть 3 наращивает тот же код | f-строки без сборки (§3.3) |
+| Хранилище | SQLite, `sqlite3` stdlib, WAL, `busy_timeout=5000` | ≥3.35 (`RETURNING`) | STACK §3 | Postgres, SQLAlchemy |
+| Миграции | `studio/migrations/NNN.sql`, `PRAGMA user_version` | — | читается глазами; 001 — только таблицы пути S0–S4 | Alembic |
+| Бэкап | `sqlite3.Connection.backup()` раз в час, 7 копий | — | копия файла при WAL несогласованна | `cp` |
+| Очередь | таблица `task` + `flock worker.lock` | — | STACK §4 | Redis/ARQ |
+| События | таблица `event` (seq) → SSE `Last-Event-ID` | — | один журнал для мастера, MCP, отчёта | опрос |
+| HTTP к исполнителю | `urllib` (синхронно, как `ltx.py`) | stdlib | один поток на GPU-задачу | httpx |
+| Прогресс ComfyUI | `websockets`: `ws://…/ws?clientId=<task_id>`, `progress{value,max,prompt_id}` | `websockets>=12` | GPU-DAY п.7: привязка по `prompt_id` надёжна | только опрос |
+| MCP (S5) | `mcp` (FastMCP, streamable HTTP, в процессе API) | `mcp>=2.3` | тот же паттерн, что ai-writer | отдельный контейнер |
+| LLM | `provider.py` | — | Р1 | PydanticAI |
+| Медиа | ffmpeg/ffprobe (`assemble.concat_clips`, `framemd5` в тестах) | как в образе | уже есть | — |
+| Хеши | `hashlib.sha256` файлов и канонического JSON | stdlib | неизменяемые дубли | — |
+| Тесты | pytest ≥8; Playwright для мастера (S4, на имитациях) | — | CLAUDE.md: тест виден красным | — |
 
 ---
 
@@ -277,256 +310,259 @@ flowchart TB
 
 ```mermaid
 erDiagram
-  PROJECT ||--o{ SCENE : "сцены по idx"
+  PROJECT ||--o{ SCENE : "scene_id, порядок idx"
   PROJECT ||--o{ CAST_MEMBER : "кастинг"
+  PROJECT ||--o{ PROPOSAL : "предложения сценариста"
+  PROJECT ||--o{ RENDER_PLAN : "сухие планы"
   PROJECT ||--o{ ASSEMBLY : "сборки"
-  PROJECT ||--o{ EVENT : "журнал"
-  CAST_MEMBER }o--o{ ASSET : "CAST_ASSET: картинки, голос, трек, LoRA"
-  SCENE ||--o{ SCENE_REF : "референсы сцены"
+  CAST_MEMBER ||--o{ CAST_ASSET : ""
+  CAST_ASSET }o--|| ASSET : ""
+  SCENE ||--o{ SCENE_REF : "референсы"
   SCENE_REF }o--|| CAST_MEMBER : ""
   SCENE ||--o{ TAKE : "дубли"
-  SCENE }o--o| TAKE : "selected_take_id"
-  SCENE }o--o| SCENE : "source_scene_id (от кадра N-1)"
-  SCENE }o--o| ASSET : "source_frame_asset_id / end_frame_asset_id"
+  SCENE }o--o| TAKE : "approved_sketch / approved_final"
+  SCENE }o--o| SCENE : "source_scene_id"
+  SCENE }o--o| ASSET : "source_frame_asset_id"
   TAKE ||--|| TASK : "task_id"
-  TAKE }o--o| ASSET : "output_asset_id, last_frame_asset_id"
-  TAKE }o--o| WORKFLOW_TEMPLATE : "inputs.workflow"
-  ASSET }o--o| TAKE : "origin_take_id"
-  ASSET }o--o| ASSET : "origin_asset_id (кадр из ролика)"
+  TAKE }o--o| TAKE : "upstream_take_id (кадр от него)"
+  TAKE }o--o| ASSET : "output / last_frame"
   TASK }o--o| TASK : "depends_on_task_id"
-  TASK ||--o{ EVENT : ""
   ASSEMBLY }o--|| ASSET : "output_asset_id"
 
   PROJECT {
     text id PK
-    int revision
+    int revision "O2/O4/O5/O7/O26"
     text title
-    text status "draft|rendering|done"
-    text frame_format "16:9|9:16|1:1|3:2|2:3"
-    int target_seconds
+    text frame_format "16:9|9:16"
+    text style_block
     text created_at
-    text updated_at
   }
   SCENE {
-    text id PK
+    text id PK "устойчивый scene_id"
     text project_id FK
-    int idx
-    int revision "растёт при любой правке отпечатка"
-    text mode "text|from_frame|to_frame|between_frames|refs|refs_frame"
+    int idx "порядок, меняется перестановкой"
+    int revision "содержание: растёт при правке отпечатка"
+    int state_version "одобрения и review_state"
+    text mode "from_frame|refs|text"
     text action_text
-    text performance_text "эмоция и игра — обязательное"
+    text performance_text
     text sound_text
     text music_text
-    text prompt_final "кэш собранного промпта"
-    real duration_s "3..15"
-    int frames "17n+5"
+    text prompt_final
+    real requested_s
+    int frames "17n+5 в [73,345]"
     int seed
-    text source_frame_kind "none|prev_last_frame|upload|library|keyframe_take"
+    text source_frame_kind "none|prev_last_frame|asset"
     text source_scene_id FK
     text source_frame_asset_id FK
-    text end_frame_asset_id FK
-    text selected_take_id FK
     text approved_sketch_take_id FK
     text approved_final_take_id FK
     text review_state "none|needs_review|ok"
-    text state_in
-    text state_out
-  }
-  SCENE_REF {
-    text scene_id FK
-    text cast_id FK
-    int ord
-    text role "person|place|object|style|voice|track"
-  }
-  CAST_MEMBER {
-    text id PK
-    text project_id FK
-    text tag "@tag, library.TAG_RE"
-    text role
-    text description_ru
-    text description_en
-    text portrait_phrase "дословная EN-фраза для всех сцен"
-  }
-  ASSET {
-    text id PK
-    text kind "image|video|audio|frame|lora|workflow|scenario"
-    text path
-    text sha256
-    int bytes
-    int width
-    int height
-    real duration_s
-    text origin_kind "upload|library|take_output|extracted_frame|trained|imported"
-    text origin_take_id FK
-    text origin_asset_id FK
-    text meta_json "LoRA: base_model, trigger; сценарий: format_version"
-    text created_at
+    text deleted_at
   }
   TAKE {
     text id PK
     text scene_id FK
-    int scene_revision "ревизия сцены в момент постановки"
+    int scene_revision
     text tier "sketch|final"
-    text executor "sglang_h3|comfy|drawthings|fake"
-    text inputs_json "замороженный снимок, §6.2"
+    text executor
+    text template "h3-fl2va|h3-ref2va"
+    text upstream_take_id FK
+    text inputs_json "NULL до материализации, затем навсегда"
     text inputs_sha256
-    text status "queued|running|done|failed|cancelled|stale"
+    text keyframe_sha256
+    text status "pending_input|queued|running|done|failed|cancelled|stale"
     text task_id FK
     text output_asset_id FK
     text last_frame_asset_id FK
-    text created_at
-    text finished_at
   }
   TASK {
     text id PK
-    text kind "render|image|upscale|assemble|extract_frame|lint|import"
+    text kind "render|image|assemble|extract_frame"
     text executor
-    text gpu_scope "dispatcher:h3-fl2va|dispatcher:h3-ref2va|dispatcher:comfy|dispatcher:dt|local-mac|none"
+    text gpu_scope "dispatcher:comfy-studio|local-mac|none"
     text payload_json
     text idempotency_key "UNIQUE"
-    text status "queued|waiting_gpu|waiting_ready|submitting|submit_unknown|running|downloading|verifying|succeeded|failed|cancelled"
+    text status "см. 8.5"
     text wait_reason
     text engine_ref
+    real submit_attempt_at
     real engine_submitted_at
+    real cancel_requested_at
     int attempts
     int progress_step
     int progress_total
     text error
     text depends_on_task_id FK
-    int priority
+  }
+  PROPOSAL {
+    text id PK
+    text project_id FK
+    int project_revision
+    text idea_text
+    text scenes_json
+    text llm_json "модель, промпт-версия, сырой ответ"
     text created_at
-    text started_at
-    text finished_at
+    text applied_at
+  }
+  RENDER_PLAN {
+    text id PK
+    text project_id FK
+    text tier
+    text items_json
+    text versions_json "scene_id → revision, state_version (план и источники)"
+    text expires_at
+  }
+  ESTIMATE_SAMPLE {
+    int id PK
+    text executor
+    text template
+    text machine
+    int width
+    int height
+    int frames
+    int steps
+    real wall_s
+  }
+  CAST_MEMBER {
+    text id PK
+    text project_id FK
+    text tag
+    text description_ru
+    text description_en
+    text portrait_phrase
+  }
+  CAST_ASSET {
+    text cast_id FK
+    text asset_id FK
+    text role "image|voice"
+    int ord
+  }
+  ASSET {
+    text id PK
+    text kind "image|video|audio|frame|lora|scenario"
+    text path
+    text sha256
+    text origin_kind "upload|take_output|extracted_frame|imported"
+    text origin_take_id FK
+    text origin_asset_id FK
   }
   ASSEMBLY {
     text id PK
     text project_id FK
-    text takes_json "список final take_id по idx"
+    text inputs_json "[{scene_id, take_id, path, sha256, head_drop_frames}]"
+    text dir "assembly/<assembly_id>/"
     text status
     text output_asset_id FK
   }
-  WORKFLOW_TEMPLATE {
-    text id PK
-    text executor "comfy"
-    text name "ltx-upscale|h3-fl2va|h3-ref2va|krea2-t2i|sdturbo-contract"
-    text path
-    text sha256
-    text bindings_json "узел.поле ← параметр"
-    text requires_json "class_types, модели"
-    text verified_on "дата и машина последней проверки"
-  }
-  EVENT {
-    int seq PK
-    text ts
-    text kind
-    text project_id
-    text scene_id
-    text task_id
-    text payload_json
-  }
-  SETTING {
-    text key PK
-    text value
-  }
-  OP_LOG {
-    text idempotency_key PK
-    text request_sha256
-    text response_json
-    int http_status
-    text created_at
-  }
 ```
 
-### 6.1. Инварианты (каждый — тест точным равенством)
+Таблицы `SCENE_REF` (scene_id, cast_id, ord, role), `EVENT` (seq, ts, kind, project_id, scene_id,
+task_id, payload_json), `SETTING` (key, value), `OP_LOG` (idempotency_key, request_sha256,
+response_json, http_status, created_at), `WORKFLOW_TEMPLATE` (id, executor, name, path, sha256,
+bindings_json, requires_json, verified_on) — как в редакции 1. `requires_json.limits` теперь несёт
+`frames: [min, max]` и `ref_images_by_frames: [[max_frames, max_images], …]` (§10 L7b).
+
+### 6.1. Инварианты (каждый — тест точным равенством, каждый показан красным)
 
 | # | Инвариант | Где держится |
 |---|---|---|
-| И1 | `scene.revision` растёт на 1 при изменении любого поля отпечатка: `mode, action_text, performance_text, sound_text, music_text, duration_s, seed, source_frame_*, end_frame_asset_id, SCENE_REF, tier-независимые параметры`. Правка `title` проекта ревизию сцены не трогает | `ops.update_scene` в одной транзакции |
-| И2 | `TAKE.inputs_json` пишется один раз при постановке и **никогда не обновляется**; `UPDATE take SET inputs_json` запрещён триггером `RAISE(ABORT)` | миграция 001 |
-| И3 | Результат крепится к дублю, не к сцене. `scene.selected_take_id` может указывать только на дубль с `scene_revision = scene.revision`; при росте ревизии выбор очищается и пишется событие `selection_cleared` | триггер + `ops.update_scene` |
-| И4 | Поздний результат: задача завершилась, а `take.scene_revision < scene.revision` → дубль сохраняется со `status='stale'`, не выбирается автоматически, событие `take_stale` (П5, Н9) | `worker._finish_take` |
-| И5 | `task.idempotency_key` UNIQUE; повтор постановки с тем же ключом возвращает ту же задачу (200, не 201) | `ops.enqueue` |
-| И6 | Постановка задачи и запись дубля — одна транзакция (`BEGIN IMMEDIATE`) | `ops.render` |
-| И7 | Ресурс неизменяем: `asset.path` + `sha256` фиксируются при создании; новая версия = новый ресурс с `origin_asset_id` | `ops.import_asset` |
-| И8 | `event.seq` монотонный, пишется в той же транзакции, что и изменение | все `ops.*` |
-| И9 | `task.engine_ref` пишется **до** первого опроса и **сразу после** ответа исполнителя (как `sglang.py:272`) | воркер |
-| И10 | Снимок проекта (`GET /api/studio/projects/<id>`) и SSE-хвост согласованы по `seq`: ответ несёт `last_seq`, клиент подписывается с `Last-Event-ID=last_seq` | `app.py` |
+| И1 | `scene.revision` растёт на 1 при изменении любого поля отпечатка: `mode, action_text, performance_text, sound_text, music_text, frames, seed, source_frame_kind, source_scene_id, source_frame_asset_id, SCENE_REF`. Одобрение, `review_state`, `title` проекта ревизию сцены не трогают | `ops.update_scene` в одной транзакции |
+| И2 | `take.inputs_json` пишется **ровно один раз**: из `NULL` в значение при материализации; любое другое `UPDATE` поля — `RAISE(ABORT)` триггером | миграция 001 |
+| И3 | Дубль материализуется только когда все его входы существуют: для продолжения — `upstream_take.status='done'` и `last_frame_asset_id` задан; `keyframe_sha256 = sha256(upstream.last_frame)` | `worker._materialize` в `BEGIN IMMEDIATE` |
+| И4 | Поздний результат: `take.scene_revision < scene.revision` → дубль `stale`, одобрить нельзя (409 `take_stale`), событие `take_stale` | `worker._finish_take`, `ops.approve` |
+| И5 | `task.idempotency_key` UNIQUE; повтор с тем же ключом и телом → та же задача (200) | `ops.enqueue` |
+| И6 | Постановка задач и дублей плана — одна транзакция | `ops.render` |
+| И7 | Ресурс неизменяем; новая версия = новый ресурс с `origin_asset_id` | `ops.import_asset` |
+| И8 | `event.seq` монотонный, в той же транзакции, что изменение | все `ops.*` |
+| И9 | `task.engine_ref` пишется сразу после ответа исполнителя и до первого опроса; `submit_attempt_at` — до отправки | воркер |
+| И10 | Снимок O3 несёт `last_seq`; клиент подписывается с `Last-Event-ID=last_seq` | `app.py` |
+| И11 | **Одобрение действительно**, только если: `take.scene_id = scene.id`, `take.scene_revision = scene.revision`, `take.status='done'`, и для продолжения `take.upstream_take_id = source_scene.approved_<tier>_take_id`. Недействительное одобрение снимается (`approved_*=NULL`, `review_state='needs_review'`, `state_version+1`, событие `approval_revoked{reason}`) | `ops.recompute_cascade` — вызывается из O7, O8, O16 и `worker._finish_take` в той же транзакции |
+| И12 | Сборка ставится только при действительных И11 одобрениях `final` всех неудалённых сцен; список входов замораживается в `assembly.inputs_json` при постановке; каталог сборки уникален | `ops.assemble` |
 
-### 6.2. Снимок входов дубля (`inputs_json`)
+### 6.2. Длительность и снимок входов дубля
+
+**Длительность (Codex-13, проверено кодом).** Сетка `frames = 17n+5` (`sglang_args.py:81`), FPS 24.
+8 с = 192 кадра — уже на сетке; пример редакции 1 «197» был ошибкой. 15 с = 360 → `grid_frames_up`
+даёт 362 = 15,083 с, это выше `MAX_SECONDS`, и старый `parse()` такой длительности не примет
+(`:166`, `:170-177`); 3 с = 72 → 73 = 3,042 с. Правило студии: `requested_s` хранится как ввёл
+человек/сценарист; `frames` = ближайшая точка сетки к `requested_s × 24`, при равенстве — вверх,
+затем зажим в `[73, 345]` (3,042–14,375 с). Фактическая длительность = `frames / 24` — её показывают
+мастер и план. Граница 345 — для обоих исполнителей, пока §15 п.1 не покажет, что ComfyUI держит больше.
 
 Канонический JSON (ключи отсортированы, `ensure_ascii=False`), `inputs_sha256` — хеш этой строки:
 
 ```json
-{"executor":"sglang_h3","variant":"fl2va","task":"fl2va","tier":"sketch","steps":20,"seed":12,
- "prompt":"<prompt_final дословно>","duration_s":8.0,"frames":197,"canvas":[896,512],"aspect":"auto",
- "keyframes":[{"position":0,"asset_id":"a_…","sha256":"…"}],
+{"executor":"comfy","template":{"id":"h3-fl2va","sha256":"…"},"tier":"sketch","steps":20,"seed":12,
+ "prompt":"<prompt_final дословно>","requested_s":8.0,"frames":192,"canvas":[896,512],
+ "keyframes":[{"position":0,"asset_id":"a_…","sha256":"…","upstream_take_id":"t_…"}],
  "refs":[{"ord":1,"role":"person","asset_id":"a_…","sha256":"…","label":"<Picture 1>"}],
- "audio":[],"lora":[{"asset_id":"a_…","sha256":"…","weight":0.8}],
- "workflow":{"template_id":"h3-fl2va","sha256":"…"},
- "scene_revision":3,"engine_version":"sglang afe90a8bc9"}
+ "audio":[],"scene_revision":3,"engine_version":"ComfyUI v0.42.0 b1a247c9"}
 ```
 
-Два дубля с одинаковым `inputs_sha256` — это «пересъёмка с тем же сидом»: разрешена (модель не
-детерминирована на 100 %), но инструмент предупреждает: «такой дубль уже есть, take_…».
-
-### 6.3. LoRA как ресурс
-
-`asset.kind='lora'`, `meta_json={"base_model":"krea2|zimage|ltx","trigger":"…","trained_from":[asset_id…]}`,
-`origin_kind='trained'|'upload'`. Подключается к кастингу через `CAST_ASSET(role='lora')` и попадает
-в `inputs.lora[]` дубля. Обучение — не в части 1; импорт файла `.safetensors` — да.
+Два дубля с одинаковым `inputs_sha256` — «пересъёмка с тем же сидом»: разрешена, мастер предупреждает.
 
 ---
 
 ## 7. API явных операций
 
-Все под `/api/studio`. Тело ошибки — как у старой панели: `{"error":{"code","message","detail"}}`
-(DRAFT (а)), свой обработчик `RequestValidationError` → 400 `args_invalid`; проверки «проект есть /
-не занят» — зависимостями **до** разбора тела (DRAFT (а) риск 1). Один и тот же набор операций
-вызывают MCP (§11) и страница (§4.4).
+Все под `/api/studio`. Тело ошибки — `{"error":{"code","message","detail"}}` (DRAFT (а)), свой
+обработчик `RequestValidationError` → 400 `args_invalid`; проверки «проект есть» — зависимостями до
+разбора тела. Одни и те же операции вызывают мастер (§4.4) и MCP (§11).
 
-Семантика общих параметров:
-- **`expected_revision`** (обязателен в каждой мутации проекта/сцены): сравнивается с текущей
-  ревизией сущности в `BEGIN IMMEDIATE`; не совпало → 409 `revision_conflict`,
-  `detail={"current": <снимок сущности>}` — клиент перечитывает и повторяет сознательно.
-- **`Idempotency-Key`** (заголовок, обязателен для `POST` с побочным эффектом на GPU/диск:
-  render, image, upscale, assemble, import): `OP_LOG` хранит `sha256` тела и ответ 24 ч. Тот же ключ
-  + то же тело → тот же ответ (тот же `task_id`, 200). Тот же ключ + другое тело → 422
-  `idempotency_mismatch`. Ключ генерирует клиент (`uuid4`); MCP-сервер генерирует его из
-  `(tool, project_id, scene_ids, tier, plan_id)` — двойной вызов хостом не ставит вторую задачу
-  (fable §4, «двойной POST с телефона»).
+Версии и ключи:
+- **`expected_revision`** — для операций над содержимым: проекта (O4, O5, O7, O26) и сцены (O8).
+  Не совпало → 409 `revision_conflict`, `detail.current` — снимок.
+- **`expected_state_version`** — для одобрения (O16). Не совпало → 409 `state_conflict`.
+- **Правила роста.** `project.revision` +1: O4, O5, O7, O26 (структура и состав сцен). Сцена:
+  `revision` +1 по И1; `state_version` +1 при одобрении, снятии одобрения, смене `review_state`.
+  O8 и O16 проект не трогают — поэтому правка одной сцены не делает устаревшим план другой.
+- **План (O10)** запоминает `revision` и `state_version` каждой сцены плана и каждой сцены-источника
+  кадра; O11 сверяет их, не `project.revision`; расхождение → 409 `plan_stale` с перечнем.
+- **`Idempotency-Key`** (заголовок, обязателен для O11, O12, O15, O19, O24): `OP_LOG` хранит sha256 тела
+  и ответ 24 ч; тот же ключ + другое тело → 422 `idempotency_mismatch`. Мастер генерирует `uuid4` на
+  нажатие; MCP — из `(tool, plan_id)`.
 
-| # | Операция | Метод и путь | Вход | Выход | Ревизия |
-|---|---|---|---|---|---|
-| O1 | Список проектов | `GET /projects` | — | `[{id,title,status,revision,scenes_done/total}]` | — |
-| O2 | Создать проект | `POST /projects` | `title, frame_format, target_seconds, idea_text?` | проект (201) | — |
-| O3 | Снимок проекта | `GET /projects/{id}` | — | проект + сцены + кастинг + выбранные дубли + `last_seq` + план очереди | — |
-| O4 | Изменить проект | `PATCH /projects/{id}` | `expected_revision, title?, target_seconds?` (`frame_format` после первого done-дубля — 409 `format_locked`) | проект | +1 |
-| O5 | Добавить в кастинг | `POST /projects/{id}/cast` | `tag, role, description_ru, assets[asset_id], expected_revision` | cast_member c `description_en` (перевод LLM, ставка CJM в.2) | проект +1 |
-| O6 | Импорт ресурса | `POST /assets` (multipart) | файл, `kind?` | asset с sha256, размерами, длительностью (ffprobe) | — |
-| O7 | Добавить/заменить сцены | `PUT /projects/{id}/scenes` | `expected_revision, scenes[{idx, mode, action_text, performance_text, sound_text, music_text?, duration_s, seed?, source_frame{kind,…}, refs[tag]}]` | сцены; **сцены с неизменённым отпечатком сохраняют ревизию и дубли** (П5), ответ несёт `diff: {added, unchanged, changed:[{idx, resets_takes:true}]}` | проект +1, изменённые сцены +1 |
-| O8 | Изменить сцену | `PATCH /scenes/{id}` | `expected_revision` сцены + поля | сцена + `cascade:[scene_id…]` (сцены «от кадра» от неё) | сцена +1, каскад: `review_state='needs_review'` |
-| O9 | Линт | `POST /projects/{id}/lint` | `scene_ids?` | `[{scene_id, ok, findings:[{rule, severity, message, fix?}]}]` + план очереди `{order, variant_switches, estimate_s}` | — |
-| O10 | План рендера (сухой) | `POST /projects/{id}/render/plan` | `scene_ids, tier` | `plan_id, items:[{scene_id, executor, variant, estimate_s}], total_s, gpu_switches, lint` (TTL 10 мин) | — |
-| O11 | Рендер | `POST /projects/{id}/render` + `Idempotency-Key` | `plan_id, expected_revision` | `tasks:[{task_id, take_id, scene_id}]` (201 / 200 при повторе) ; план устарел (ревизия ушла) → 409 `plan_stale` | — |
-| O12 | Кадр (картинка) | `POST /projects/{id}/image` + ключ | `cast_tag?, prompt, size, executor?, lora?, expected_revision` | `task_id, asset_id (после)` | — |
-| O13 | Статус задачи | `GET /tasks/{id}` | — | task с `progress_step/total`, `wait_reason`, `log_tail` | — |
-| O14 | Отмена | `POST /tasks/{id}/cancel` | `reason` | task | — |
-| O15 | Повтор упавшей | `POST /tasks/{id}/retry` + ключ | — | новая задача с теми же входами (новый дубль) | — |
-| O16 | Выбрать дубль | `POST /scenes/{id}/select` | `take_id, expected_revision` | сцена; дубль другой ревизии → 409 `take_stale` | сцена +0 (выбор не часть отпечатка), проект +1 |
-| O17 | Одобрить сцену | `POST /scenes/{id}/approve` | `tier, take_id, expected_revision` | сцена (`approved_*_take_id`, `review_state='ok'`) | проект +1 |
-| O18 | Дубли сцены | `GET /scenes/{id}/takes` | — | `[{take, asset_url, frames_urls[0,2,4,8 с]}]` | — |
-| O19 | Сборка | `POST /projects/{id}/assemble` + ключ | `expected_revision, upscale:bool` | task; отказ 409 `scenes_not_approved` с `missing:[idx]` | — |
-| O20 | Результат | `GET /projects/{id}/result` | — | `asset_url, duration, resolution, bytes, takes[]`; файл удалён → 410 `asset_missing` | — |
-| O21 | События | `GET /events?after=<seq>` (SSE) | `Last-Event-ID` | `id: seq`, `event: kind`, `data: json` | — |
-| O22 | Исполнители | `GET /executors` | — | `[{name, address, alive, ready, variant, detail, checked_at}]` | — |
-| O23 | GPU | `GET /gpu`, `POST /gpu/release` | — | как `/api/gpu` старой панели (диспетчер) | — |
-| O24 | Импорт сценария ai-writer | `POST /projects/{id}/import/ai-writer` + ключ | `clip_id` или файл `.h3.json`, `expected_revision` | сцены (через O7) + asset(kind=scenario) | проект +1 |
-| O25 | Идея → сцены | `POST /projects/{id}/director/propose` | `idea_text, scenes_count?, expected_revision` | `proposal_id, scenes[]` (сохраняется, не применяется) | — |
-| O26 | Применить предложение | `POST /projects/{id}/director/apply` | `proposal_id, expected_revision` | как O7 (с diff) | как O7 |
+| # | Операция | Метод и путь | Вход | Выход |
+|---|---|---|---|---|
+| O1 | Список проектов | `GET /projects` | — | `[{id,title,revision,scenes_done/total}]` |
+| O2 | Создать проект | `POST /projects` | `title, frame_format, idea_text?` | проект (201) |
+| O3 | Снимок | `GET /projects/{id}` | — | проект + сцены (с `revision`, `state_version`, действительностью одобрений, конфликтами цепочки) + кастинг + дубли + задачи + `last_seq` |
+| O4 | Изменить проект | `PATCH /projects/{id}` | `expected_revision, title?` (`frame_format` после первого done-дубля — 409 `format_locked`) | проект |
+| O5 | Кастинг | `POST /projects/{id}/cast` | `tag, description_ru, assets[{asset_id, role}], expected_revision` | cast_member с `description_en` |
+| O6 | Импорт ресурса | `POST /assets` (multipart) | файл, `kind?` | asset |
+| O7 | Заменить набор сцен | `PUT /projects/{id}/scenes` | `expected_revision, scenes[{scene_id?, mode, action_text, performance_text, sound_text, music_text?, requested_s, seed?, source_frame{kind, scene_id?, asset_id?}, refs[tag]}]` — порядок массива задаёт `idx` | сцены + `diff{added, unchanged, changed, moved, deleted}` |
+| O8 | Изменить сцену | `PATCH /scenes/{id}` | `expected_revision` + поля (в т.ч. `source_frame{kind:"asset", asset_id}` — подключение кадра) | сцена + `cascade[scene_id]` |
+| O9 | Линт | `POST /projects/{id}/lint` | `scene_ids?` | находки по сценам |
+| O10 | План (сухой) | `POST /projects/{id}/plan` | `kind: render\|image, scene_ids, tier` или `prompt, size` для image | `plan_id, items[{scene_id, template, depends_on_scene?, estimate_s}], total_s, checkpoint_switches, lint, blocked[]` (TTL 10 мин) |
+| O11 | Рендер по плану | `POST /projects/{id}/render` + ключ | `plan_id` | `tasks[{task_id, take_id, scene_id, status}]` — дубли продолжений в `pending_input` |
+| O12 | Кадр по плану | `POST /projects/{id}/image` + ключ | `plan_id` | `task_id`; `asset_id` — в событии и O13 |
+| O13 | Статус задачи | `GET /tasks/{id}` | — | task с `progress_step/total`, `wait_reason`, `log_tail` |
+| O14 | Отмена | `POST /tasks/{id}/cancel` | `reason` | task (`cancel_requested_at`; см. §8.5 «логическая и фактическая отмена») |
+| O15 | Повтор | `POST /tasks/{id}/retry` + ключ | — | новая задача и новый дубль с тем же намерением; входы продолжения материализуются заново |
+| O16 | **Выбрать дубль** (= одобрить для tier) | `POST /scenes/{id}/approve` | `tier, take_id, expected_state_version` | сцена + `cascade`; 409 `take_stale` (И4), 409 `chain_mismatch` с `{upstream_take_id, approved_upstream}` (И11) |
+| O17 | Снять выбор | `POST /scenes/{id}/unapprove` | `tier, expected_state_version` | сцена + `cascade` |
+| O18 | Дубли сцены | `GET /scenes/{id}/takes` | — | `[{take, asset_url, frames_urls[0,2,4,8 с], upstream_take_id, valid_for_approval, reason?}]` |
+| O19 | Сборка | `POST /projects/{id}/assemble` + ключ | — | task; 409 `scenes_not_approved` с `missing[{scene_id, idx, reason}]` |
+| O20 | Результат | `GET /projects/{id}/result` | — | `asset_url, duration, resolution, bytes, inputs`; файл удалён → 410 |
+| O21 | События | `GET /events?after=<seq>` (SSE) | `Last-Event-ID` | `id: seq`, `event: kind`, `data` |
+| O22 | Исполнители | `GET /executors` | — | `[{name, address, alive, ready, capabilities, detail}]` |
+| O23 | GPU | `GET /gpu`; `POST /gpu/release`; `POST /gpu/qwen/unload` | — | состояние диспетчера; выгрузка Qwen — через ручку диспетчера `/qwen/unload` (`dispatcher.py:590`) |
+| O24 | Импорт ai-writer (S7) | `POST /projects/{id}/import/ai-writer` + ключ | `clip_id` или файл `.h3.json`, `expected_revision` | как O7 + asset(kind=scenario) |
+| O25 | Сценарист: предложить | `POST /projects/{id}/director/propose` | `idea_text, scenes_count=2` | `proposal_id, scenes[]` — сохраняется в `proposal`, не применяется |
+| O26 | Применить предложение | `POST /projects/{id}/director/apply` | `proposal_id, expected_revision` | как O7 |
+| O27 | Разрешить `submit_unknown` | `POST /tasks/{id}/resolve` | `action: resubmit\|cancel` | task |
 
-Состояния сцены для планировщика (производные, не хранятся): `ready` — все входы есть (для
-`from_frame`: у `source_scene` есть выбранный дубль нужного tier); `blocked` — ждёт предыдущую;
-`invalid` — линт ✕.
+**Сопоставление сцен в O7 (Codex-11).** Идентичность — `scene_id`. Сцена без `scene_id` — новая.
+Сцена с `scene_id` и тем же отпечатком сохраняет `revision` и дубли, даже если сменился `idx`
+(`moved`). Отсутствующая в массиве — `deleted_at` (дубли и ресурсы остаются, сцена не видна плану и
+сборке). Если перестановка меняет, от какой сцены идёт `prev_last_frame`, у продолжения меняется
+`source_scene_id` → это правка отпечатка (И1), `changed`, каскад И11.
+
+Производные состояния сцены для планировщика: `ready` — все входы есть; `blocked` — кадр
+предыдущей сцены ещё не существует, но в этом же плане есть задача, которая его даст (дубль
+создаётся в `pending_input`); `invalid` — линт `error` или источник кадра не будет получен ни этим
+планом, ни одобренным дублем.
 
 ---
 
@@ -535,360 +571,412 @@ erDiagram
 ### 8.1. Протокол (`h3_48gb/studio/executors/base.py`)
 
 ```python
+class Capabilities(TypedDict):
+    find: Literal["exact", "none"]          # можно ли найти нашу задачу без engine_ref
+    restart_evidence: bool                  # может ли сказать, что процесс перезапущен после момента t
+    progress: bool                          # (шаг, всего) во время работы
+    cancel: Literal["hard", "soft", "none"] # hard — останавливает вычисление; soft — только убирает результат
+    async_submit: bool                      # submit возвращает ref быстро, работа идёт отдельно
+
 class Probe(TypedDict):
-    alive: bool            # процесс отвечает (GET /system_stats, /v1/models, pid)
-    ready: bool            # модель/вариант загружены и чужих задач нет
-    variant: str | None    # fl2va | ref2va | krea2 | …
-    detail: str            # человеку: «поднимается ref2va», «нет модели X»
+    alive: bool
+    ready: bool            # шаблон/модели spec доступны и чужих задач нет
+    detail: str
 
 class EngineStatus(TypedDict):
-    state: Literal["queued", "running", "done", "failed", "lost"]
-    progress: tuple[int, int] | None   # (шаг, всего) — П6
+    state: Literal["queued", "running", "done", "failed", "cancelled", "lost"]
+    progress: tuple[int, int] | None
     error: str | None
 
 class Executor(Protocol):
     name: str
-    gpu_scope: str | None                       # §8.4
-    def probe(self) -> Probe: ...
+    capabilities: Capabilities
+    def gpu_scope(self, spec: TaskSpec) -> str: ...
+    def probe(self, spec: TaskSpec) -> Probe: ...           # Codex-9: readiness зависит от spec
     def estimate_s(self, spec: TaskSpec) -> float: ...
-    def submit(self, spec: TaskSpec) -> str: ...           # engine_ref; spec.task_id передаётся движку
-    def find(self, task_id: str) -> str | None: ...        # восстановление: наш task_id → engine_ref
+    def submit(self, spec: TaskSpec) -> str: ...            # engine_ref; spec.task_id передаётся движку
+    def find(self, spec: TaskSpec) -> str | None: ...       # только при capabilities.find == "exact"
+    def restarted_since(self, t: float) -> bool | None: ... # только при restart_evidence
     def status(self, ref: str) -> EngineStatus: ...
-    def result(self, ref: str, dest: Path) -> list[Path]: ... # скачать выходы
+    def result(self, ref: str, dest: Path) -> list[Path]: ...
     def cancel(self, ref: str) -> None: ...
 ```
 
-`TaskSpec` — Pydantic-модель, собранная из `inputs_json` дубля (§6.2) плюс `task_id`, `dest_dir`.
-Исполнитель **не читает БД** и не знает про сцены.
+`TaskSpec` — Pydantic-модель из материализованного `inputs_json` плюс `task_id`, `dest_dir`.
+Исполнитель не читает БД и не знает про сцены.
 
-Readiness ≠ liveness (codex): `alive=True, ready=False` → задача в `waiting_ready` с `wait_reason`
-из `detail`, опрос каждые 5 с до 450 с (как `start_timeout` H3 в диспетчере), потом `failed`
-с причиной «движок не готов за 450 с».
+**Контрактный тест проверяет каждую заявленную возможность и только её** (Codex-9): `find` — если
+`exact`; `progress` монотонен — если `True`; после `cancel` при `hard` статус `cancelled` и движок
+свободен, при `soft` — результат не забирается. Адаптер с `find="none"` обязан проходить сценарий
+`submit_unknown → ручное разрешение` (§8.5).
 
-### 8.2. Три адаптера
+Readiness ≠ liveness: `alive=True, ready=False` → `waiting_ready` с `wait_reason` из `detail`, опрос
+каждые 5 с до 600 с (`start_timeout` ComfyUI в диспетчере, `dispatcher.py:83`), потом `failed`.
 
-| | ComfyUI `executors/comfy.py` | Draw Things `executors/drawthings.py` | sglang H3 `executors/sglang_h3.py` |
-|---|---|---|---|
-| Адрес (SETTING) | `comfy.url` = `http://127.0.0.1:8188`; `comfy.output_dir` | `dt.mode` = `local` \| `remote`; `dt.remote_url`, `dt.remote_port=7859`, `dt.shared_secret` | `sglang.url` = `http://127.0.0.1:30020` |
-| `probe` | alive: `GET /system_stats`; ready: `GET /object_info` содержит `requires_json.class_types` шаблона **и** `GET /models/<folder>` содержит файлы из `requires_json.models` **и** `GET /queue` без чужих `running` | alive: `draw-things-cli --version` (local) / TCP-порт gRPC (remote); ready: `models list --downloaded-only` содержит `spec.model` | alive: `GET /v1/models`; ready: вариант из `dispatcher /status → engines.h3.variant` равен `spec.variant` (сервер сам вариант не сообщает, MATRIX §1) |
-| `submit` | `POST /upload/image` входов (`overwrite=true`, имя `<task_id>-<n>.<ext>`) → шаблон из `WORKFLOW_TEMPLATE` + `bindings_json` → `POST /prompt {prompt, client_id: task_id, extra_data: {studio_task_id}}`; `filename_prefix = studio/<task_id>/f` → `prompt_id` | local: `subprocess.Popen(["draw-things-cli","generate","--model",…,"--prompt-file",…,"--width","--height","--steps","--seed","--config-json",{"loras":[…]},"--output",<dest>/<task_id>.png, "--disable-preview","--offline"])` в своей сессии; ref = pid. remote: те же флаги + `--remote --remote-url --remote-port --no-remote-tls` (TLS включается `dt.remote_tls`) | `sglang.build_payload` → `POST /v1/videos` → `id` (как `sglang.py:272`) |
-| `find` | `GET /queue` (running+pending) и `GET /history` — запись с `extra_data.studio_task_id == task_id` | local: pid из `task.engine_ref` жив и `cmdline` содержит `--output …/<task_id>.png`; выходной файл есть → done. remote: нет id → `None` | **нет API списка** (проверить `GET /v1/videos` в день с GPU, §15 п.5); до тех пор `None` |
-| `status` | WS `/ws?clientId=<task_id>` события `progress {value,max}` → `(шаг, всего)`; `executing node=None` → done; откат — `GET /history/<id>` c `MAX_ODD_HISTORY_POLLS=12` (`ltx.py:31,165`) | local: процесс жив → running (прогресса нет); код 0 и файл есть → done. remote: синхронный вызов — running до возврата | `GET /v1/videos/<id>`: `queued`/`completed`/`failed`; прогресса нет → `progress=None` (Н7 честно «шаг неизвестен»); **ставка:** читать `logs/serve-panel-*.log` tqdm через диспетчер `/status.progress` — день с GPU |
-| `result` | файлы из `comfy.output_dir/studio/<task_id>/` (PNG-кадры → mp4 через ffmpeg как `ltx.py:178-183`, или готовый mp4 узла `SaveVideo`) | `<dest>/<task_id>.png` | `client.download` → mp4 → `_flat_frames` проверка (`sglang.py:321`) |
-| `cancel` | `POST /interrupt` если наш `prompt_id` выполняется; `POST /queue {"delete":[prompt_id]}` если ждёт | `killpg(SIGTERM)`, 10 с, `SIGKILL` | `DELETE /v1/videos/<id>` (сервер досчитает впустую — предупреждение как в `sglang.py:288`) |
-| `estimate_s` | по `WORKFLOW_TEMPLATE.name` из `estimate_sample` (история), первая оценка — из `requires_json.estimate_s` | Krea 2 Turbo 8 шагов 1344×768: **ставка 30 с** на Маке (замер DT на alex-neuro 33–41 с, E-draw-things) | `estimate.estimate_seconds` (формула переносится) + холодный старт 180 с + смена варианта 150 с |
-| Шаблоны / модели | `ltx-upscale` (= `engines/ltx_workflow.json`, 25 узлов, привязки `10.file, 20.text, 2.strength_model, 33.noise_seed, 42.filename_prefix` — ровно `ltx.py:47-51`), `sdturbo-contract` (Мак), `h3-fl2va`, `h3-ref2va`, `krea2-t2i` — последние три **не проверены**, день с GPU | `krea_2_turbo_q8p.ckpt`, `z_image_turbo_1.0_q8p.ckpt`, `z_image_1.0_q8p.ckpt` (скачаны на Маке) | вариант `fl2va` (t2va, fl2va) / `ref2va` |
-| Лимиты (линтер §10) | по шаблону `requires_json.limits` | `width/height` кратны 64 | §10 L7 |
-| Сейчас на Маке | ComfyUI 0.39.0 MPS, `sd_turbo.safetensors` — только контракт API | **настоящий** Krea 2 / Z-Image | имитация |
-| На alex-neuro | `:8188`, движок диспетчера `comfy` (сейчас `ltx`) | gRPC `:7859` под диспетчером `dt` — **проверить наличие сервера** (замер 25–26.09 был, конфигурация неизвестна) | `:30020`, движки `h3-fl2va`/`h3-ref2va` |
+### 8.2. Адаптер ComfyUI (`executors/comfy.py`) — единственный в части 1
 
-Старый код `ltx.upscale_part` переводится на `executors.comfy.ComfyClient` (тот же интерфейс
-`upload/prompt/history/interrupt` + новые `queue/object_info/ws`): 22 теста `test_ltx_upscale.py`
-остаются зелёными без правок — это и есть доказательство, что обобщение не сломало LTX.
+| Пункт | Как |
+|---|---|
+| Адрес (`SETTING`) | `comfy.url` = `http://127.0.0.1:8189`; `comfy.output_dir` = `/home/alex/Outputs/comfy-h3`; `comfy.scope` = `dispatcher:comfy-studio` (на Маке `local-mac`) |
+| Возможности | `find=exact`, `restart_evidence=True`, `progress=True`, `cancel=hard`, `async_submit=True` |
+| `probe(spec)` | alive: `GET /system_stats`; ready: `GET /object_info` содержит `requires_json.class_types` шаблона spec, `GET /models/<folder>` содержит `requires_json.models`, `GET /queue` без чужих `running` |
+| `submit` | `POST /upload/image` входов (имя `<task_id>-<n>.<ext>`, `overwrite=true`) → граф из `WORKFLOW_TEMPLATE` + `bindings_json` → `POST /prompt {prompt, client_id: task_id, extra_data: {studio_task_id}}`, `filename_prefix = studio/<task_id>/f` → `prompt_id` |
+| `find(spec)` | 1) `GET /queue` и `GET /history` — запись с `extra_data.studio_task_id == task_id`; 2) иначе файлы в `output_dir/studio/<task_id>/` → ref `file:<task_id>` (готово); 3) иначе `None` |
+| `restarted_since(t)` | время старта процесса движка из `dispatcher /status → own["comfy-studio"].started_at` (поле есть, `dispatcher.py:390-393`) `> t`, или записи движка нет / процесс не жив (тогда очередь ComfyUI, живущая в памяти, потеряна) |
+| `status` | WS `/ws?clientId=<task_id>`: `progress {value, max, prompt_id}` → `(шаг, всего)` по нашему `prompt_id`; `executing node=null` → done (GPU-DAY п.7). Откат — `GET /history/<id>` с `MAX_ODD_HISTORY_POLLS=12` (`ltx.py:31`) |
+| `result` | готовый mp4 узла сохранения или PNG (Krea 2) из `output_dir/studio/<task_id>/` |
+| `cancel` | `POST /interrupt`, если выполняется наш `prompt_id`; `POST /queue {"delete":[prompt_id]}`, если ждёт |
+| `estimate_s` | `estimate_sample` по `(executor, template, machine, canvas, frames, steps)`; до истории — `requires_json.estimate_s` |
 
-### 8.3. Шов для `engines/sglang.py`
+Шаблоны (`WORKFLOW_TEMPLATE`), источник графа — `h3-bench/gpu_day_comfy.py` и `gpu_day_krea.py`
+(ветка `probe/gpu-day-20261020`, коммит 403d840) по официальным `video_minimax_h3_i2v` / `_r2v` и
+шаблону Krea 2:
 
-`run_generate(job, *, root, outdir, client, gate, …)` читает отмену и пишет `engine_ref` через
-`q.cancel_reason(root, job.id)` / `q.set_running_fields(root, job.id, …)` (`sglang.py:253,272,282`).
-Правка: параметр `store` с двумя методами `cancel_reason(job_id)` и `set_running_fields(job_id, **f)`;
-по умолчанию `store = QueueStore(root)` — обёртка над `queue.py`, старые 22 теста без изменений.
-Студия передаёт `SqliteStore`. `sglang_estimate.record` — через `store.record_estimate`.
+| Шаблон | Узлы (ядро) | Привязки | Проверен | Лимиты |
+|---|---|---|---|---|
+| `h3-fl2va` | MiniMaxH3ImageToVideo, BasicScheduler simple, res_multistep, SamplerCustomAdvanced | prompt, seed, steps, length=`frames`, start_image, width/height | 3 с/20 шагов, 896×512, 88,5/72 с (GPU-DAY п.1) | frames [73, 345] (ставка до §15 п.1) |
+| `h3-ref2va` | MiniMaxH3ReferenceToVideo, те же | prompt (с `subject_definitions`), seed, steps, length, ref_images[1..k] | 3 с/20 шагов, одна картинка | `ref_images_by_frames` §10 L7b |
+| `krea2-t2i` | Krea 2 Turbo, 8 шагов euler/simple, cfg 1 | prompt, seed, width/height | 1344×768, 5,3–5,6 с, 18 ГБ (GPU-DAY п.2) | стороны кратны 64 |
+| `sdturbo-contract` | sd_turbo, 1 шаг 512×288 | prompt, seed | Мак, только контракт API | — |
 
-### 8.4. Общий GPU-lock (SUMMARY п.8)
+`verified_on` у H3-шаблонов ставится после §15 п.1 (8 с/50 шагов) и п.8 (контракт), не раньше.
 
-Один GPU-scope на машину, задачи в одном scope строго последовательны, независимо от исполнителя
-(ComfyUI и sglang на одной карте — codex §4 «очередь по узлу не предотвращает одновременный запуск»).
+Старый `ltx.upscale_part` переводится на обобщённый `ComfyClient`: 22 теста `test_ltx_upscale.py`
+остаются зелёными без правок.
+
+### 8.3. Голова продолжения при сборке
+
+У sglang продолжение повторяет кадр-источник в кадре 0, сборка срезает 1 кадр
+(`SGLANG_OVERLAP_FRAMES = 1`, `assemble.py:184`). Для `h3-fl2va` в ComfyUI GPU-DAY п.1 видел глазами
+«начинается ровно с кадра Krea», числом не проверено. До проверки §15 п.3 `head_drop_frames = 1`
+для `from_frame`-дублей с `upstream_take_id` (ставка), 0 для остальных; значение пишется в
+`inputs_json` дубля при материализации и в `assembly.inputs_json` — сборка его не выводит.
+
+### 8.4. Общий GPU-lock
+
+Один GPU-scope на машину, задачи одного scope строго последовательны.
 
 | Scope | Машина | Кто держит замок | Как берётся |
 |---|---|---|---|
-| `dispatcher:h3-fl2va`, `dispatcher:h3-ref2va` | alex-neuro | диспетчер (`generation.lock`) | `acquire("h3-fl2va")` — диспетчер гасит другой вариант и поднимает нужный (сейчас `engine_specs()` знает только `ref2va`, `dispatcher.py:69-75` — **правка диспетчера: два EngineSpec с одним портом 30020 и маркерами `--model-variant fl2va|ref2va`**) |
-| `dispatcher:comfy` | alex-neuro | диспетчер | `acquire("comfy")` (переименованный `ltx`, `dispatcher.py:76-84`; `acquire("ltx")` остаётся синонимом для старой панели) |
-| `dispatcher:dt` | alex-neuro | диспетчер | новый EngineSpec: команда запуска gRPC-сервера Draw Things — **неизвестна, день с GPU** |
-| `local-mac` | Мак | `studio-worker` (`flock <outdir>/gpu-mac.lock`) | DT local и ComfyUI MPS по очереди; `provider.LlamaLocal` тоже считается держателем (`provider.shares_gpu`) |
-| `none` | любая | — | `assemble`, `extract_frame`, `lint`, `import` — без GPU, могут идти параллельно одной GPU-задаче (второй поток воркера) |
+| `dispatcher:comfy-studio` | alex-neuro | диспетчер (`generation.lock`) | `acquire("comfy-studio")`. **Правка диспетчера части 1:** новый EngineSpec `comfy-studio` — `~/Projects/comfy-h3/.venv/bin/python main.py --port 8189 --output-directory /home/alex/Outputs/comfy-h3 --listen 127.0.0.1`, `ready_url=:8189/system_stats`, `markers=("main.py","--port 8189")`, `start_timeout=600`. Порт отличается от `ltx` и `h3`, поэтому проверка «чужой на порту» (`:469`) срабатывает только на настоящего чужака |
+| `local-mac` | Мак | `studio-worker` (`flock <outdir>/gpu-mac.lock`) | ComfyUI MPS контракт; `studio-api` берёт тот же flock на вызов LLM, если `provider.shares_gpu(cfg)` истинно (`provider.py:309`) — с таймаутом 5 с и ответом 409 `gpu_busy` «сценарист ждёт карту», а не ожиданием в запросе (Codex-14) |
+| `none` | любая | — | `assemble`, `extract_frame` — второй поток воркера |
 
-Порядок в очереди: `priority DESC, created_at ASC`, **группировка по варианту внутри проекта** там,
-где `depends_on` позволяет (Р9; ставка CJM в.5: между проектами — порядок постановки). Планировщик
-O10 показывает число смен варианта и их цену (150 с каждая).
+На alex-neuro LLM сценариста по умолчанию CAILA (вне карты). Если в настройках выбран локальный Qwen,
+он чужой процесс для диспетчера: `acquire` отвечает `wait_qwen`, мастер показывает «Qwen держит
+карту» и кнопку O23 «Освободить» (Codex-12).
 
-Воркер после задачи **не** освобождает движок: `_IdleRelease` через `H3_IDLE_RELEASE_MIN=15` мин
-простоя (как `worker.py:603`).
+Порядок очереди: `priority DESC, created_at ASC`, внутри проекта — группировка по шаблону там, где
+`depends_on` позволяет. Смена чекпойнта fl2va↔ref2va в ComfyUI ≈16 с (GPU-DAY п.1); смена Krea 2 ↔ H3
+внутри процесса не замерена (§15 п.4) — план O10 показывает её как «≈ ? с» до замера.
+
+Воркер после задачи не освобождает движок: свой аналог `_IdleRelease` (15 мин простоя).
 
 ### 8.5. Жизненный цикл задачи и дубля
 
 ```mermaid
 stateDiagram-v2
-  [*] --> queued : O11 render / O12 image (транзакция с TAKE)
-  queued --> waiting_gpu : воркер взял (depends_on done)
-  waiting_gpu --> waiting_gpu : acquire → wait / starting / wait_qwen<br/>(30 с, 5 с при starting), wait_reason
+  [*] --> blocked : O11, дубль pending_input (ждёт кадр предыдущей сцены)
+  [*] --> queued : O11 / O12 без зависимостей
+  blocked --> queued : зависимость done → материализация inputs_json (И2, И3)
+  blocked --> cancelled : зависимость failed / cancelled → upstream_failed
+  queued --> waiting_gpu : воркер взял
+  waiting_gpu --> waiting_gpu : acquire → wait / starting / wait_qwen (30 с, 5 с при starting)
   waiting_gpu --> waiting_ready : acquire → ready
-  waiting_ready --> waiting_ready : probe.ready=false (5 с, ≤450 с)
-  waiting_ready --> submitting : probe.ready=true
-  submitting --> running : engine_ref получен и записан (И9)
+  waiting_ready --> waiting_ready : probe.ready=false (5 с, ≤600 с)
+  waiting_ready --> submitting : probe.ready=true, submit_attempt_at записан
+  submitting --> running : engine_ref записан (И9)
   submitting --> submit_unknown : таймаут / обрыв без ответа
-  submit_unknown --> running : find(task_id) нашёл
-  submit_unknown --> waiting_gpu : find=None и движок пуст<br/>(ComfyUI: /queue пуст. sglang: GPU util ниже 10 проц 60 с по диспетчеру)<br/>attempts+1, не больше 2
-  submit_unknown --> failed : attempts>2 или find невозможен (DT remote) → «Повторить» руками
-  running --> running : status → progress (П6)
+  submit_unknown --> running : find нашёл (только find=exact)
+  submit_unknown --> queued : find=None и restarted_since(submit_attempt_at)=True, attempts+1 ≤ 2
+  submit_unknown --> submit_unknown : иначе — ждёт человека (O27)
+  submit_unknown --> queued : O27 resubmit (риск дубля показан)
+  submit_unknown --> cancelled : O27 cancel
+  running --> running : status → progress
   running --> downloading : status.done
   running --> failed : status.failed (текст движка)
-  running --> lost : status.lost (404 после рестарта движка)
-  lost --> waiting_gpu : attempts<2 (1 автоповтор, CJM 3.5)
+  running --> lost : status.lost
+  lost --> queued : attempts<2 (один автоповтор)
   lost --> failed : второй раз
   downloading --> verifying : файлы на диске
-  verifying --> succeeded : _flat_frames ок, sha256, asset создан,<br/>TAKE.done или TAKE.stale (И4)
-  verifying --> failed : кадры залиты / файл пуст
+  verifying --> succeeded : кадры, sha256, asset, TAKE done или stale (И4), каскад И11
+  verifying --> failed : кадры залиты / файл пуст / число кадров ≠ frames
   queued --> cancelled : O14
   waiting_gpu --> cancelled : O14
   waiting_ready --> cancelled : O14
-  running --> cancelled : O14 → executor.cancel
+  running --> cancelling : O14 → executor.cancel
+  cancelling --> cancelled : status.cancelled или 30 с (engine_stop=unconfirmed)
   failed --> [*]
   succeeded --> [*]
   cancelled --> [*]
-
-  state "Воркер упал и перезапущен: reconcile" as R
-  note right of R
-    running с engine_ref → продолжить status() (как queue.reconcile resumable)
-    submitting без engine_ref → submit_unknown → find()
-    downloading/verifying → повторить с результата
-    waiting_* → queued (ничего не потеряно)
-  end note
 ```
 
-Таблица `reconcile` при старте воркера (перенос `queue.py:1161-1250` на SQLite, те же тесты):
+**`submit_unknown` (Codex-4, принято).** Автоматический повтор без положительной находки разрешён в
+одном случае: движок доказуемо перезапущен после попытки постановки (`restarted_since`), а `find` не
+нашёл ни записи, ни файлов — задача не могла выжить в процессе, которого больше нет. Во всех
+остальных случаях задача ждёт человека: мастер показывает «Не знаю, принял ли ComfyUI задачу» и две
+кнопки (O27). Правило «GPU util < 10 % 60 с» удалено: низкая загрузка совместима с задачей, которая
+ждёт в очереди, качает входы или уже завершилась.
+
+**Логическая и фактическая отмена (Codex-9).** O14 пишет `cancel_requested_at` — это логическая
+отмена: результат такой задачи никогда не крепится к дублю, даже если придёт. Фактическая —
+`executor.cancel` у `running`; без подтверждения за 30 с задача `cancelled` с
+`engine_stop=unconfirmed`, и следующая GPU-задача ждёт, пока `probe.ready` (очередь движка пуста).
+Отмена в `submit_unknown` — логическая; если `find` позже найдёт задачу, воркер вызовет `cancel`.
+
+Таблица `reconcile` при старте воркера (перенос `queue.py:1161-1250`, тесты точным равенством):
 
 | `status` в БД | `engine_ref` | Действие |
 |---|---|---|
-| `running` | есть | продолжить опрос; `engine_submitted_at` сохраняется для `wall_s` |
-| `submitting` | нет | `submit_unknown` → `find()` |
-| `downloading`/`verifying` | есть | повторить скачивание/проверку |
-| `waiting_gpu`/`waiting_ready` | нет | `queued` |
-| `queued` c `cancel` отметкой | — | `cancelled` |
+| `running` / `cancelling` | есть | продолжить опрос / отмену |
+| `submitting` | нет | `submit_unknown` → один вызов `find` и `restarted_since` по правилу выше |
+| `submit_unknown` | нет | то же; без находки остаётся `submit_unknown` (не теряется после падения воркера) |
+| `downloading` / `verifying` | есть | повторить скачивание/проверку |
+| `waiting_gpu` / `waiting_ready` | нет | `queued` |
+| `blocked` | — | проверить зависимость: `done` → материализовать; `failed/cancelled` → `cancelled` |
+| любой с `cancel_requested_at` и без `engine_ref` | — | `cancelled` |
 
-Падение API-процесса на задачи не влияет; падение движка посреди задачи → `lost` → один
-автоповтор, второй — `failed` (CJM 3.5).
+### 8.6. План Б: sglang H3 (вне части 1, специфицировано для перехода)
+
+Включается, если §15 п.1 провалится (8 с/50 шагов или несколько референсов не идут в ComfyUI).
+Тогда до реализации адаптера (Codex-3, Codex-7, проверено по коду):
+
+1. **Диспетчер.** Два EngineSpec `h3-fl2va`/`h3-ref2va` на одном порту 30020 нельзя добавить одной
+   правкой `engine_specs()`: в `acquire` проверка «чужой на порту» (`dispatcher.py:469-471`) идёт
+   **до** остановки другого собственного движка (`:477-479`), работающий ref2va будет признан чужим
+   для fl2va, и `acquire` вечно ответит `wait`. Правка: сначала исключить порты собственных
+   записей из проверки «чужой на порту» (или останавливать собственные движки того же порта до неё),
+   канонизировать старое имя `h3` → `h3-ref2va` при чтении сохранённого состояния, `/status` уже
+   отдаёт вариант как `own.<engine>.variant` (`:390-393`), а не `engines.h3.variant`, как писала
+   редакция 1. Тесты: оба направления смены, рестарт диспетчера с записью `h3` в состоянии, чужой
+   владелец на том же порту.
+2. **Адаптер** строится на `SglangClient` (`sglang.py:87`) и `normalize_h3_conditions` (`:61`), со
+   своим payload: `build_payload` (`:160-178`) знает только кадр `[0]`, без конечного кадра и
+   видео-референсов; `run_generate` не берётся (отмена через файловую очередь `:184,:253,:282`,
+   отчёт `:236`, оценка `:331`). Возможности: `find=none` до проверки, есть ли в `GET /v1/videos`
+   поле, связывающее элемент с нашим запросом (GPU-DAY п.5: список есть, но живёт в памяти, и наш
+   `task_id` в нём не виден), `restart_evidence=True` (через диспетчер), `progress` — tqdm из лога
+   (GPU-DAY п.7, привязка по времени), `cancel=soft` (`DELETE` не останавливает вычисление,
+   `sglang.py:288`).
+3. Старый CLI-контракт `sglang_args.parse` остаётся как есть для старой панели.
 
 ---
 
 ## 9. Режиссёр
 
-Два пути, одна целевая форма — сцены O7 с полями `action/performance/sound/music, mode, duration_s,
-state_in/out, refs`.
+Два пути, одна целевая форма — сцены O7 с полями `action/performance/sound/music, mode, requested_s,
+state_in/out, refs`. **Основной — свой «Сценарист»; ai-writer — дополнительный** (решение владельца 4).
 
-### 9.1. «Глава → клип»: ai-writer как сервис через MCP
+### 9.1. «Идея → сцены»: LLM-роль «Сценарист» (`studio/director/scenarist.py`) — основной путь
 
-Клиент `studio/director/aw_client.py` к `http://<aw>/mcp` (bearer `MCP_AUTH_TOKEN`; без токена
-ai-writer `/mcp` не монтирует — D §4): `clip_create(chapter_id, duration_seconds)` → `clip_generate` →
-опрос `clip_status` (ARQ-фон, 10–60 с) → `clip_get_scenario(format="h3")` → O24.
+Как Scenario mode старой панели (`docs/h3-prompt-system.md:232` «Scenario mode: a multi-scene video
+project», схема `provider.PROMPT_SCHEMA` `:32`, ветка `project.scenes`), но со своей строгой схемой
+`STUDIO_SCENES_SCHEMA` и через `provider.chat` (`:937`):
 
-Импорт `.h3.json` (`{scenario_scenes[], style_block}`, 8 ключей на сцену, `h3_export.py:60`):
+- вход: идея, число сцен (в мастере части 1 — 2), формат кадра, кастинг (тег, EN-описание,
+  `portrait_phrase`), `style_block` проекта;
+- выход LLM на сцену: `action`, `performance` (состояние, его смена, мимика, взгляд, руки —
+  PROMPT-FORMAT «Вывод для спеки»), `sound` (материал + контакт + что не звучит, GAIT-SOUND),
+  `music`, `state_in`, `state_out`, `cast_tags`, `requested_s` в пределах 3–15;
+- **код считает арифметику**: число сцен, снап длительности (§6.2), режимы по правилу CJM этап 4 —
+  первая сцена с героем → `refs` (или `from_frame`, если владелец сделает кадр), каждая следующая →
+  `from_frame` с `prev_last_frame`; дословная `portrait_phrase` вклеивается кодом, не LLM;
+- системный промпт — `studio/director/prompts/scenarist.md`, версия пишется в `proposal.llm_json`;
+- результат — `proposal` (переживает рестарт API), применяется O26 через тот же путь, что O7.
 
-| Поле ai-writer | Поле сцены студии | Примечание |
-|---|---|---|
-| `tag`, `start`, `end`, `duration` | `idx`, `duration_s` | длительность снапится на 17n+5; 5–10 с у AW укладывается в наши 3–15 |
-| `prompt` (три лейбла) | `action_text` ← `integrated_multimodal_description`, `sound_text` ← `overall_soundscape`, `music_text` ← `non_diegetic_music` | разбор по лейблам; `performance_text` **пустой** → линт L1 warning и предложение O25 «дописать игру» |
-| `fresh_start` | `source_frame_kind`: `true` → `none`, `false` → `prev_last_frame` | режим: первая сцена с героем → `refs`, продолжение → `from_frame` (CJM этап 4, правило по умолчанию) |
-| `state_in`/`state_out` | те же | паспорт непрерывности показывается у сцены |
-| `style_block` | `project.style_block` (SETTING проекта) | вклеивается в `prompt_final` каждой сцены |
-| `characters` (из `format=json`) | кастинг: `tag`=`@latin_name`, `portrait_phrase` | второй вызов `clip_get_scenario(format="json")` ради `portrait_phrase` |
+Шаблон кадра Krea 2 — `director/keyframe_prompt.py`: `style_block` + `portrait_phrase` + `state_in`
+сцены + кадрирование («medium shot, eye level»), без звука; размер по формату: 16:9 → 1344×768,
+9:16 → 768×1344 (кратно 64; 1344×768 замерен, GPU-DAY п.2).
 
-Совместимость: статически проверена (К4), живой `PUT` не делался (К5). Тест студии: импорт
-`…/ai-writer 2.0/docs/reports/2026-09-14-clip-live-acceptance-ozero.h3.json` (14 сцен, 75 с) → 14
-сцен, суммарная длительность 75 ± сетка, линт без ошибок класса `error` (warning по L1 допускаются).
+### 9.2. «Глава → клип»: ai-writer, дополнительный путь (S7, вне критерия)
 
-### 9.2. «Идея → клип»: модуль `studio/director/`
-
-Порт чистого домена ai-writer `backend/app/domain/clip/{normalize,validator,h3_export,pasted_fields}.py`
-(1659 строк без БД) в `studio/director/clip/` с указанием коммита-источника и тестами-золотыми
-векторами из `backend/tests/unit/clip`. Две стадии промптов (`clip_director`, `clip_scene_prompt_builder`,
-124 и 148 строк) переносятся как `studio/director/prompts/*.md` и вызываются через `provider.chat_scenario`
-со строгой схемой (`provider.py:117 SCENARIO_SCHEMA` расширяется полями ниже).
-
-Принцип AW сохраняется: **код считает арифметику** (число сцен, длительности, паспорт состояний
-`derive_passport`), LLM — только содержание.
+Для сложных сцен владелец пишет клип-сценарий в ai-writer и импортирует его: O24 по `clip_id`
+(MCP-клиент `director/aw_import.py`: `clip_get_scenario(format="h3")`, bearer `MCP_AUTH_TOKEN`) или
+файлом `.h3.json`. Генерацию клипа студия у ai-writer **не** запускает. Таблица полей (как в
+редакции 1): `prompt` → три поля по лейблам; `performance_text` пустой → L1 warning и кнопка
+«дописать игру» (вызов сценариста на одну сцену); `fresh_start` → `source_frame_kind`;
+`duration` → `requested_s` со снапом §6.2 (5–10 с AW укладываются в 3,042–14,375). Тест: импорт
+`…/ai-writer 2.0/docs/reports/2026-09-14-clip-live-acceptance-ozero.h3.json` → 14 сцен, линт без `error`.
 
 ### 9.3. Пробелы и где закрываются
 
-| Пробел (D §5) | Закрытие в студии (путь B) | Для пути A (ai-writer, владелец тот же) |
+| Пробел | Студия (Сценарист) | ai-writer (позже, задача владельца) |
 |---|---|---|
-| Сцена 3–15 с (у AW 5–10: `normalize.py:29-30`, `clip_director.py:28 ge=5 le=10`) | константы → `SETTING scene.min_s=3, max_s=15`; ритм-зоны «удар 5–6 / выдержка 9–10» пересчитаны в доли диапазона | предложение: вынести в профиль модели (D §5) — вопрос 4 §17 |
-| Режим сцены | поле `mode` у сцены; промпт режим не содержит (`mode:` в тексте — L10 error) | не нужно: режим выводит студия |
-| Эмоция и игра | обязательное `performance_text`: состояние, его смена, мимика, взгляд, руки (PROMPT-FORMAT «Вывод для спеки»); в схему режиссёра — поле `performance` | прокинуть `emotional_turn/subtext/physical_business` Scene Card в `dramatic_content` |
-| Звук через походку и материал | правило в промпт сборщика: материал + контакт + что **не** звучит; громкость — манерой походки (GAIT-SOUND); L2/L3 | то же правило в `clip_scene_prompt_builder.md:91-92` |
-| Шаблон под Krea 2 (кадр) | `director/keyframe_prompt.py`: `style_block` + `portrait_phrase` + `state_in` + кадрирование («medium shot, eye level») + без звука/музыки; размер по `frame_format`: 16:9 → 1344×768, 9:16 → 768×1344, 1:1 → 1024×1024, 3:2 → 1344×896, 2:3 → 896×1344 (**ставка**, кратно 64) | нет в AW; остаётся у нас |
-| Обратная связь рендера | часть 2 | — |
-| Несколько глав | не в части 1 | — |
+| Сцена 3–15 с (у AW 5–10) | `SETTING scene.min_s/max_s`, снап §6.2 | вынести в профиль модели |
+| Режим сцены | поле `mode`, выводит код; `mode:` в тексте — L10 error | не нужно |
+| Эмоция и игра | обязательное поле схемы `performance` | прокинуть `emotional_turn/physical_business` |
+| Звук через материал и походку | правило в промпте сценариста; L2/L3 | то же правило в `clip_scene_prompt_builder.md` |
+| Кадр Krea 2 | `keyframe_prompt.py` | нет в AW |
 
 ### 9.4. Сборка `prompt_final`
 
 `prompt_final = style_clause + integrated(action + performance) + overall_soundscape(sound) + non_diegetic_music(music)`
-в трёхполевом формате (PROMPT-FORMAT §4: шесть секций не дают измеримой разницы); для `refs`-режимов
-впереди `subject_definitions` из `library.build_ref2va`. Пересборка при каждом изменении отпечатка;
+в трёхполевом формате (PROMPT-FORMAT §4); для `refs` впереди `subject_definitions` из
+`library.number_references` над карточками кастинга (§3.1). Пересборка при каждой правке отпечатка;
 кэш в `scene.prompt_final`, в дубль попадает дословно.
 
 ---
 
 ## 10. Линтер промпта (`studio/lint.py`)
 
-Запускается в O7/O8 (находки к полю), O9 (сводка), O10 (блокирует `plan_id` при `error`).
-Каждое правило — функция `(scene, project, executor_limits) -> list[Finding]`; тест на правило:
-удалить/инвертировать строку → красный (CLAUDE.md).
+Запускается в O7/O8 (находки к полю), O9, O10 (блокирует план при `error`). Каждое правило — функция
+`(scene, project, template_limits) -> list[Finding]`; тест на правило: удалить/инвертировать строку →
+красный (CLAUDE.md).
 
-| Правило | Серьёзность | Условие | Источник | Подсказка |
-|---|---|---|---|---|
-| L1 performance | warning | `performance_text` пуст или < 2 из {взгляд, мимика, руки, смена состояния} по словарю EN | PROMPT-FORMAT, прослушка 09.10 («зомби», «парализованные руки») | «добавьте состояние и его смену, взгляд, руки» |
-| L2 глухой звук | warning | `sound_text` содержит `no music|no speech|silence` и **ни одного** положительного источника (словарь: footsteps, wind, birds, creak, …) | PROMPT-FORMAT §2: «нет музыки» → RMS −42…−56 дБ | «назовите, что звучит» |
-| L3 материал и контакт | info | в `sound_text` есть шаги/действие, но нет материала (`wood|gravel|pine needles|asphalt|…`) | память «звук описывать физически», GAIT-SOUND | «материал + контакт; громкость — манерой походки, не обувью» |
-| L4 кириллица | error | кириллица в `action/performance/sound/music` или `description_en` | CJM этап 2 (Н6) | «переведите / автоперевод» |
-| L5 тег не в том режиме | error | `@tag` в тексте при `mode in {text, from_frame, to_frame, between_frames}` | CJM этап 4 | два действия: «в Референсы» / «вставить описание текстом» |
-| L6 дрейф описания | warning | `portrait_phrase` героя отличается между сценами цепочки (дословное сравнение, идея `pasted_fields.py`) | README режимов §2.6: «одинаковые описания героев» | «вставить фразу кастинга дословно» |
-| L7a длительность | error | `duration_s` вне `[3, 15]` или `frames != grid_frames_up` | `sglang_args.py:18-19,81` | снап к сетке с показом |
-| L7b картинки-референсы | error | `len(refs images) > limit(duration)`: ≤5 с → 6; 5–10 с → 5; 10–15 с → **4 (ставка, §15 п.4)** | README §2.3 (8 картинок при 3 с — OOM; 6 — 63,8 ГБ), `sglang_args.py:24` (6 портретов при 10 с — 63,6 ГБ) | «уберите N» |
-| L7c медиа-референсы | error | видео/аудио не в `[2, 15]` с или сумма по типу > 15 с | README §2.7 (сервер не проверяет) | — |
-| L7d кадр и формат | error | ориентация кадра ≠ `frame_format` проекта; портретный `[0]` в `refs*` | README §2.4 (A8/A8b: молча игнорируется) | — |
-| L7e кадр в середине / `[-1,0]` | error | `end_frame` без режима `to_frame|between_frames` | MATRIX F× | — |
-| L8 «измерительные» формулы | warning | `calm neutral expression|lips stay closed|eyes look straight ahead|arms swinging loosely` | PROMPT-FORMAT прослушка: модель исполнила буквально | «замените живым действием» |
-| L9 счёт | warning | числительные > 3 для объектов/людей | SPEC-scene-prompt-structure AW («счёт ≤3») | — |
-| L10 `mode:` в тексте | error | `^mode:` в любом поле | `clip_scene_prompt_builder.md:44` | режим задаётся полем |
-| L11 длина | warning | `integrated` < 40 или > 500 слов | гайд ref2va 350–500 слов; проба P3 396 слов | — |
-| L12 цепочка | error | `source_frame_kind=prev_last_frame` и у `source_scene` нет выбранного дубля нужного tier, или `source_scene.idx >= idx` | CJM этап 5 | — |
-| L13 шаги | info | `steps < 20` | README §3: меньше 20 портит звук | — |
-| L14 дубликат входов | info | есть дубль с тем же `inputs_sha256` | §6.2 | — |
-
-`error` блокирует постановку; `warning`/`info` — показываются и в MCP-ответе, и на странице.
-
----
-
-## 11. MCP-сервер, слой 1 (`studio/mcp.py`)
-
-Транспорт streamable HTTP `POST /mcp` в процессе `studio-api`; bearer обязателен (fail-closed, как
-ai-writer). Правила: **ни одного инструмента «только для виджета»**; каждый ответ = `structuredContent`
-+ текст по-русски + (где есть медиа) `ImageContent` кадров 0/2/4/8 с + ссылка на страницу §4.4 +
-строка `MEDIA:<путь>` для Hermes (`gateway/run.py:1412`, путь должен быть виден с Мака — SMB-путь
-alex-neuro или локальный на Маке). Описания инструментов проверяются прогоном Hermes и Claude Desktop,
-а не чтением (DRAFT (е)).
-
-| Инструмент | → Операция | Подтверждение | Возврат |
+| Правило | Серьёзность | Условие | Источник |
 |---|---|---|---|
-| `studio_list_projects` | O1 | — | список |
-| `studio_get_project` | O3 | — | снимок + план очереди + ссылка |
-| `studio_create_project` | O2 | — | проект, `revision` |
-| `studio_add_cast` | O5, O6 (файл по пути или base64 ≤ 10 МиБ) | — | карточка с EN-описанием |
-| `studio_propose_scenes` | O25 | — | список сцен-карточек (не применяет) |
-| `studio_apply_scenes` | O26 / O7 | — (без GPU) | diff: что сбросит дубли |
-| `studio_update_scene` | O8 | — | сцена + каскад |
-| `studio_lint` | O9 | — | находки, план |
-| `studio_render` | O10 → O11 | **двухшаговый:** без `confirm` возвращает `plan_id`, оценку минут GPU, смены варианта, находки; с `confirm=true, plan_id` ставит. Ключ идемпотентности = hash(tool, plan_id) | задачи и дубли |
-| `studio_make_keyframe` | O12 | как `studio_render` (Krea 2 ≈ 0,5 мин — тоже подтверждается, единообразно) | task → asset + ImageContent |
-| `studio_status` | O13 (+O22, O23) | — | «ждёт карту: Qwen» — результат, не ошибка |
-| `studio_takes` | O18 | — | дубли + кадры + ссылка на страницу |
-| `studio_select_take` | O16 / O17 | — | сцена |
-| `studio_assemble` | O19 | подтверждение, если `upscale=true` (минуты GPU) | task → результат O20 с `MEDIA:` |
-| `studio_cancel` | O14 | — | task |
+| L1 performance | warning | `performance_text` пуст или < 2 из {взгляд, мимика, руки, смена состояния} | PROMPT-FORMAT; память «игру героя писать явно» |
+| L2 глухой звук | warning | `no music\|no speech\|silence` без положительного источника | PROMPT-FORMAT §2 |
+| L3 материал и контакт | info | шаги без материала | GAIT-SOUND |
+| L4 кириллица | error | кириллица в EN-полях | CJM этап 2 |
+| L5 тег не в том режиме | error | `@tag` в тексте при `mode in {text, from_frame}` | CJM этап 4 |
+| L6 дрейф описания | warning | `portrait_phrase` различается между сценами цепочки | README режимов §2.6 |
+| L7a длительность | info | `requested_s` снапнут: показать `frames` и фактические секунды (§6.2); error только если `requested_s` вне `[3, 15]` | `sglang_args.py:18-19,81` |
+| L7b картинки-референсы | error | `len(ref images) > limit(template, frames)` по `requires_json.limits.ref_images_by_frames` | GPU-DAY п.4, README §2.3 |
+| L7d кадр и формат | error | ориентация кадра ≠ `frame_format`; портретный кадр в `refs` | README §2.4 |
+| L8 «измерительные» формулы | warning | `calm neutral expression\|lips stay closed\|…` | PROMPT-FORMAT |
+| L9 счёт | warning | числительные > 3 | SPEC-scene-prompt-structure AW |
+| L10 `mode:` в тексте | error | `^mode:` | `clip_scene_prompt_builder.md:44` |
+| L11 длина | warning | `integrated` < 40 или > 500 слов | гайд ref2va |
+| L12 цепочка | error | `prev_last_frame`, а `source_scene.idx >= idx`, или источник кадра не даст ни одобренный дубль нужного tier, ни задача того же плана. **Ожидание кадра от задачи плана — не находка**, а состояние `blocked` (Codex-1) | CJM этап 5 |
+| L13 шаги | info | `steps < 20` | README §3 |
+| L14 дубликат входов | info | есть дубль с тем же `inputs_sha256` (проверяется при материализации) | §6.2 |
 
-Ошибки `revision_conflict` возвращаются как результат с текущим снимком: хост обязан перечитать
-(codex-2 §4). Таймаут инструмента — 30 с; долгие задачи живут в воркере, хост опрашивает `studio_status`.
+**Лимит картинок как функция длительности (L7b).** Таблица в карточке шаблона, `[max_frames, max_images]`:
 
-Проверка медиа из хоста: Claude Desktop показывает `ImageContent`; видео — ссылкой на страницу §4.4
-(HTTP в LAN). Telegram через Hermes — `MEDIA:` (fable 2а). Это и есть «чат-проводник» части 1.
-
----
-
-## 12. Имитации и контрактные тесты
-
-### 12.1. Имитации (`studio/executors/fake.py`, `tests/_fake_*.py`)
-
-| Имитация | Поведение | Чем управляется |
+| До кадров (секунд) | Картинок | Основание |
 |---|---|---|
-| `FakeH3` (расширение `tests/_fake_sglang.py`) | `POST /v1/videos` → `queued`; через `t = estimate × H3_FAKE_SPEED` (по умолчанию 0,01: 8 с/50 шагов ref2va 970 с → 9,7 с) → `completed`; `download` отдаёт ролик проб по правилу: `ref2va` → `samples-50steps/S1-ref2va-ref.mp4`, `fl2va [0]` → `S5-fl2va-kf0.mp4`, `[0,-1]` → `S6-fl2va-kf0-last.mp4`, `t2va` → `S4-t2va-full.mp4`, `steps=20` → `drafts-20steps/*`; чужая задача для варианта → `200`, потом `failed` «task 't2va' is not served by partition 'ref2va'» (MATRIX §1) | сценарии: `drop_gets`, `lost_after_restart` (404), `post_timeout` (не отвечает на POST — для `submit_unknown`) |
-| `FakeComfy` (`tests/_fake_comfy.py`) | + `GET /queue`, `/object_info`, `/models/*`, WS `progress`; `history` с `extra_data` | `history_pending`, `fail`, `drop_ws` |
-| `FakeDispatcher` (`tests/_fake_dispatcher.py`) | + движки `h3-fl2va`, `comfy`, `dt`; `variant` в `/status`; смена варианта: `starting` 3 опроса | `acquire` сценарий |
-| `FakeDrawThings` | подменяет `draw-things-cli` скриптом, пишущим PNG 64×64 за 0,2 с | `exit_code`, `hang` |
-| Тайминги | все имитации пишут `estimate_sample`, чтобы план O10 давал те же цифры, что CJM (ref2va 8 с/50 — 945–975 с; fl2va — 620–685 с; 3 с/20 — 65–80 / ~150 с; смена варианта 150 с; холодный старт 180 с) | таблица `fake_timings.json` |
+| 90 (3,75 с) | 6 | README §2.3: 6 при 3 с — 63,8 ГБ; 8 — OOM |
+| 345 (14,375 с) | 4 | GPU-DAY п.4: 15 с/4 — прошёл (63,5 из 64 ГБ); 10 с/5 — OOM. 4 на 10 с не замерено, но память растёт с длительностью, а 4 прошли на 15 с |
 
-Режим `--fakes` у `studio-worker` поднимает их для прохода владельца на Маке.
+Промежуток 3,75–10 с с 5 картинками не замерен — до проверки (§15 п.2) действует 4, это
+консервативно. Замеры сделаны на sglang; для ComfyUI таблица — ставка до §15 п.2. Расхождение с
+пробой 07.10 (`sglang_args.py:24`: «6 портретов при 10 с = 63,6 ГБ») — вопрос §17.4.
 
-### 12.2. Контрактные тесты против настоящих исполнителей на Маке
+---
 
-| Тест | Исполнитель | Что проверяет | Гейт |
+## 11. MCP-сервер, слой 1 (`studio/mcp.py`, срез S5)
+
+Транспорт streamable HTTP `POST /mcp` в процессе `studio-api`; bearer обязателен (fail-closed).
+Правила: ни одного инструмента «только для хоста»; каждый инструмент = одна операция §7; ответ =
+`structuredContent` + текст по-русски + (где есть медиа) `ImageContent` кадров + ссылка на мастер +
+строка `MEDIA:<путь>` для Hermes. Описания проверяются прогоном Hermes и Claude Desktop.
+
+| Инструмент | → Операции | Подтверждение |
+|---|---|---|
+| `studio_list_projects` | O1 | — |
+| `studio_get_project` | O3 (сцены, конфликты цепочки, задачи, ссылка на мастер) | — |
+| `studio_create_project` | O2 | — |
+| `studio_add_cast` | O6 + O5 | — |
+| `studio_propose_scenes` | O25 | — |
+| `studio_apply_scenes` | O26 / O7 | — |
+| `studio_update_scene` | O8 (в т.ч. подключение кадра `source_frame{kind:"asset"}`) | — |
+| `studio_lint` | O9 | — |
+| `studio_make_keyframe` | O10(kind=image) → O12 | двухшаговый: без `confirm` — план; с `confirm, plan_id` — ставит |
+| `studio_render` | O10(kind=render) → O11 | двухшаговый, как выше |
+| `studio_status` | O13 + O22 + O23(GET) | — |
+| `studio_takes` | O18 | — |
+| `studio_approve_take` | O16 / O17 (`unapprove=true`) | — |
+| `studio_retry` | O15 | — |
+| `studio_resolve_unknown` | O27 | обязательный выбор `resubmit\|cancel` |
+| `studio_free_gpu` | O23 (`release` / `qwen/unload`) | да |
+| `studio_assemble` | O19 → O20 | — |
+| `studio_cancel` | O14 | — |
+
+Итого **18 инструментов**. `revision_conflict`/`state_conflict`/`plan_stale` возвращаются результатом
+с текущим снимком: хост перечитывает. Таймаут инструмента 30 с; долгие задачи — в воркере.
+
+---
+
+## 12. Имитации и тесты
+
+### 12.1. Имитации
+
+| Имитация | Поведение | Управление |
+|---|---|---|
+| `FakeComfy` (`tests/_fake_comfy.py`, расширение) | `/upload/image` сохраняет байты; `/prompt` **пишет в журнал фактический граф и `extra_data`**; `/queue`, `/history`, `/object_info`, `/models/*`, WS `progress{value,max,prompt_id}`; результат — ролик проб, выбранный по шаблону, **но с вшитыми в метаданные mp4 `seed`, `steps`, `length` и sha256 загруженного кадра** — подмена любого входа меняет результат | сценарии `post_timeout`, `restart` (новый `started_at` у FakeDispatcher, пустые history/queue), `history_pending`, `fail`, `drop_ws`, `oom` |
+| `FakeDispatcher` | + `comfy-studio`; `own.<engine>.started_at`; `wait_qwen` | `acquire` сценарий |
+| `_fake_llama` | ответы сценариста по схеме `STUDIO_SCENES_SCHEMA` | — |
+| Тайминги | `fake_timings.json`: H3 ComfyUI 3 с/20 — 72 с, смена чекпойнта 16 с, холодный старт +25 с, Krea 2 5,4 с (GPU-DAY); 8 с/50 — пока числа sglang (ref2va 966 с, fl2va 660 с, GPU-DAY п.3), заменяются после §15 п.1 | — |
+
+Режим `--fakes` у `studio-worker` поднимает их для разработки на Маке.
+
+### 12.2. Контрактные тесты исполнителя
+
+| Тест | Где | Что проверяет | Гейт |
 |---|---|---|---|
-| `tests/contract/test_comfy_live.py` | ComfyUI 0.39.0 MPS `~/Research/studio-eval/shared/ComfyUI` (`sd_turbo.safetensors`), шаблон `sdturbo-contract` 512×288 1 шаг | `probe` (alive/ready по `object_info`+`models`), `submit` с `extra_data`, `find` по `/queue` и `/history`, WS-прогресс, `result` PNG, `cancel` (`/interrupt`), обрыв: убить соединение после `POST /prompt` → `find` находит | `STUDIO_LIVE_COMFY=1`, иначе skip; на Маке в S4 обязателен |
-| `tests/contract/test_drawthings_live.py` | `draw-things-cli` local, `krea_2_turbo_q8p.ckpt`, 512×512, 4 шага | `probe`, `submit`, `status`, `result`, `cancel` (SIGTERM), файл + sha256 + asset с происхождением | `STUDIO_LIVE_DT=1` |
-| `tests/contract/test_executor_contract.py` | параметризован по всем исполнителям (имитации + живые при флагах) | один набор утверждений о договоре §8.1: `submit → status → result`, `find` после `submit`, идемпотентность `find`, `cancel` → `cancelled` | всегда |
-
-Тот же `test_executor_contract.py` в день с GPU запускается с `STUDIO_LIVE_SGLANG=1`, `STUDIO_LIVE_COMFY=1`
-на alex-neuro — без изменения кода.
+| `tests/contract/test_executor_contract.py` | имитация всегда; живой ComfyUI при `STUDIO_LIVE_COMFY=<url>` | каждую заявленную возможность §8.1: `submit → status → result`; `find` после `submit` и после обрыва соединения сразу после `POST /prompt`; `restarted_since`; монотонный `progress`; `cancel` (hard) → `cancelled` и пустая очередь; **фактический граф в `/history` содержит наши prompt, seed, steps, length и имя загруженного файла, а байты загруженного файла равны sha256 входа** | всегда (имитация) |
+| то же, живой | Мак: ComfyUI MPS `sdturbo-contract` под `caffeinate -dimsu`; alex-neuro: `comfy-studio` с `h3-fl2va`, `h3-ref2va`, `krea2-t2i` | как выше на настоящем движке | `STUDIO_LIVE_COMFY` |
 
 ### 12.3. Сквозной тест пути (`tests/test_studio_path.py`)
 
-На имитациях + FakeDrawThings: O2 → O5 → O25/O26 (LLM — `tests/_fake_llama.py`) → O9 → O12 (кадр)
-→ O10/O11 sketch → события SSE → O16 → O11 final → O19 → O20: проверяется **содержимое**, не форма
-— sha256 итогового mp4 равен sha256 склейки ожидаемых роликов проб, число событий по видам, что
-`inputs_json` второй сцены содержит `sha256` кадра из `last_frame_asset_id` выбранного дубля первой.
-Мутации, которые тест обязан ловить (каждая показывается красной в отчёте среза): убрать запись
-`engine_ref` до опроса; снять триггер И2; дать позднему результату стать `selected`; сломать снап
-17n+5; поставить вторую задачу при том же `Idempotency-Key`.
+На имитациях: O2 → O6/O5 → O25/O26 → O9 → O10/O12 (кадр) → O8 (подключить) → O10/O11 sketch
+(обе сцены, вторая `blocked` до первой) → SSE → O16 ×2 → O10/O11 final → каскад → O16 ×2 → O19 → O20.
+Проверяется **содержимое**: (1) журнал FakeComfy: для каждого `/prompt` — ожидаемые prompt, seed,
+steps, length, и для сцены 2 загруженный файл побайтно равен `last_frame` дубля-источника; (2)
+`take.inputs_json` сцены 2 содержит `keyframe_sha256` и `upstream_take_id` того самого дубля сцены 1;
+(3) итоговый mp4 сравнивается **по декодированным кадрам** (`ffmpeg -f framemd5`) с ожидаемой склейкой
+роликов с отрезанной головой продолжения, а не по sha256 файла (кодировщик и версия ffmpeg меняют
+байты); (4) число и порядок событий по видам.
+
+Мутации, которые тест обязан ловить (каждая показана красной в отчёте среза, с текстом ошибки):
+1. убрать запись `engine_ref` до опроса; 2. снять триггер И2; 3. материализовать дубль сцены 2 до
+готовности сцены 1; 4. подставить первый кадр вместо последнего; 5. подставить сид сцены 1 в сцену 2;
+6. сломать снап 17n+5; 7. поставить вторую задачу при том же ключе; 8. дать `stale`-дублю стать
+одобренным; 9. не снимать одобрение сцены 2 после одобрения нового финала сцены 1 (И11); 10.
+переставить сцены при сборке; 11. пропустить проверку одобрений в O19; 12. `head_drop_frames=0` у
+продолжения.
 
 ### 12.4. Последовательность основного пути
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant H as Хост (Hermes/Claude)
-  participant M as studio/mcp.py
+  participant B as Мастер (браузер)
   participant O as studio/ops.py
   participant DB as studio.sqlite
-  participant D as director/ (+provider.py)
+  participant S as director/scenarist (+provider)
   participant W as studio/worker.py
   participant G as gpu-dispatcher :8790
-  participant DT as Draw Things (Krea 2)
-  participant H3 as sglang H3 / FakeH3
-  participant A as assemble.run
+  participant C as ComfyUI comfy-studio :8189
+  participant A as assemble.concat_clips
 
-  H->>M: studio_create_project(идея, 16:9, 32 с)
-  M->>O: O2
-  O->>DB: INSERT project, event
-  H->>M: studio_add_cast(@girl, фото)
-  M->>O: O5/O6 (перевод описания через provider)
-  H->>M: studio_propose_scenes
-  M->>O: O25
-  O->>D: две стадии промптов, код считает сцены/паспорт
-  D-->>O: 4 сцены 8 с, режимы, performance
-  O->>DB: proposal
-  H->>M: studio_apply_scenes(proposal_id, expected_revision)
-  M->>O: O26→O7 (diff, ревизии сцен)
-  H->>M: studio_make_keyframe(@girl, сцена 1)
-  M->>O: O12 (Idempotency-Key)
-  O->>DB: TASK image + ASSET-происхождение
-  W->>DB: взять задачу, scope local-mac
-  W->>DT: draw-things-cli generate … --output <task>.png
-  DT-->>W: png
+  B->>O: O2 проект (идея, 16:9)
+  B->>O: O6/O5 герой с фото
+  B->>O: O25 предложить 2 сцены
+  O->>S: идея + кастинг → STUDIO_SCENES_SCHEMA
+  S-->>O: 2 сцены: игра, звук, 8 с
+  O->>DB: proposal (код: снап 192 кадра, режимы from_frame / from_frame)
+  B->>O: O26 применить (expected_revision)
+  B->>O: O10 план кадра → O12 (ключ)
+  W->>G: acquire(comfy-studio) → starting… ready
+  W->>C: krea2-t2i, client_id=task_id
+  C-->>W: WS progress… png
   W->>DB: ASSET(origin=take_output), event
-  H->>M: studio_render(сцены 1–4, sketch) — без confirm
-  M->>O: O10 план: ref2va №1 → смена 150 с → fl2va №2–№4, ≈27 мин, L1 warning
-  H->>M: studio_render(confirm, plan_id)
-  M->>O: O11 → 4 TAKE(sketch, inputs_json заморожен) + 4 TASK (depends_on по кадру)
-  W->>G: acquire(h3-ref2va) → starting… ready
-  W->>H3: POST /v1/videos (№1)
-  H3-->>W: id → engine_ref в БД (И9)
-  W->>H3: GET … completed → download → _flat_frames
-  W->>DB: TAKE №1 done, last_frame ASSET (extract_valid_last_frame)
-  W->>G: acquire(h3-fl2va) — смена варианта
-  W->>H3: №2 с keyframe = last_frame №1 … №3, №4
-  H->>M: studio_takes(№2) / studio_select_take
-  M->>O: O18 / O16 / O17 (approve sketch)
-  H->>M: studio_render(final, confirm)
-  W->>H3: те же сиды, steps=50, цепочка строго по порядку
-  W->>DB: сцены 2–4 review_state=needs_review (кадр финала №1 ≠ кадр эскиза)
-  H->>M: studio_takes(№2 final) → одобрить
-  H->>M: studio_assemble
-  W->>A: assemble.run над выбранными final-дублями
+  B->>O: O8 сцена 1: source_frame = кадр
+  B->>O: O10 план эскизов: 2 × h3-fl2va, ≈ N мин
+  B->>O: O11 (ключ) → TAKE 1s queued, TAKE 2s pending_input (blocked)
+  W->>C: h3-fl2va №1, start_image = кадр Krea
+  C-->>W: WS progress, mp4
+  W->>DB: TAKE 1s done, last_frame A1s (_extract_valid_last_frame)
+  W->>DB: материализация TAKE 2s: keyframe = A1s, upstream = 1s
+  W->>C: h3-fl2va №2, start_image = A1s
+  W->>DB: TAKE 2s done
+  B->>O: O16 approve(1, sketch, 1s), O16 approve(2, sketch, 2s)
+  B->>O: O10/O11 финалы: TAKE 1f queued, 2f pending_input
+  W->>C: №1 final (тот же сид, 50 шагов)
+  W->>DB: TAKE 1f done, A1f, материализация 2f от 1f
+  W->>C: №2 final от A1f
+  B->>O: O16 approve(1, final, 1f)
+  B->>O: O16 approve(2, final, 2f) — upstream 1f = одобренный → ок
+  B->>O: O19 сборка (ключ)
+  W->>A: concat_clips([1f, 2f с head_drop 1]) в assembly/<id>/
   A-->>W: final.mp4
   W->>DB: ASSEMBLY done, ASSET, event
-  H->>M: studio_status → MEDIA:/…/final.mp4 + ссылка
+  B->>O: O20 → «Скачать mp4»
 ```
 
-### 12.5. Цепочка «от кадра» и повторное одобрение (codex, SUMMARY «Расхождения»)
+### 12.5. Цепочка «от кадра» и повторное одобрение
 
 ```mermaid
 sequenceDiagram
@@ -896,88 +984,110 @@ sequenceDiagram
   participant O as ops.py
   participant DB as studio.sqlite
   participant W as worker.py
-  participant X as исполнитель H3
+  participant X as ComfyUI H3
 
-  Note over O,X: Эскизы. Сцена 2 (from_frame) ждёт sketch-дубль сцены 1
+  Note over O,X: Эскизы одним планом. Дубль 2s создан в pending_input
   W->>X: sketch №1 (seed 11, 20 шагов)
-  X-->>W: клип №1s
-  W->>DB: TAKE №1s done, last_frame A1s (sha256 a1s)
-  W->>X: sketch №2 с keyframe A1s
-  W->>DB: TAKE №2s.inputs.keyframes[0].sha256 = a1s
-  O->>DB: approve(№1, sketch, №1s) и approve(№2, sketch, №2s)
+  W->>DB: TAKE 1s done, last_frame A1s
+  W->>DB: TAKE 2s: inputs_json записан один раз (keyframe A1s, upstream 1s)
+  W->>X: sketch №2 от A1s
+  O->>DB: approve(1, sketch, 1s), approve(2, sketch, 2s): upstream 1s = одобренный → ок
 
-  Note over O,X: Финал. Кадр сцены 1 станет другим (DRAFT-VS-FINAL, SSIM 0,42–0,80)
+  Note over O,X: Владелец переснял эскиз 1 (1s') и выбрал его
+  O->>DB: approve(1, sketch, 1s') → каскад И11: одобрение 2s снято (upstream 1s ≠ 1s'), approval_revoked
+  O-->>O: мастер: «сцена 2 снята от другого дубля сцены 1» + «Переснять от выбранного»
+
+  Note over O,X: Финалы. Кадр сцены 1 станет другим (GPU-DAY п.3: SSIM 0,51)
   W->>X: final №1 (seed 11, 50 шагов)
-  X-->>W: клип №1f
-  W->>DB: TAKE №1f done, last_frame A1f (sha256 a1f ≠ a1s)
-  W->>DB: сцена 2: review_state = needs_review, событие chain_input_changed {from: a1s, to: a1f, ssim}
-  W->>X: final №2 с keyframe A1f (та же сцена-ревизия, другой вход → новый inputs_sha256)
-  X-->>W: клип №2f
-  W->>DB: TAKE №2f done, approved_final_take_id пуст — требуется одобрение
-  O->>DB: approve(№2, final, №2f) → review_state ok
-  Note over O,X: O19 assemble отвечает 409 scenes_not_approved, пока есть needs_review
+  W->>DB: TAKE 1f done, A1f, материализация 2f от 1f
+  W->>X: final №2 от A1f
+  W->>DB: TAKE 2f done, сцена 2 review_state = needs_review, событие chain_input_changed {from A1s', to A1f}
+  O->>DB: approve(1, final, 1f)
+  O->>DB: approve(2, final, 2f): upstream 1f = одобренный final → ок
+  Note over O,X: O19 отвечает 409 scenes_not_approved, пока хоть одно final-одобрение недействительно (И12)
 ```
 
 Правило: финал продолжения всегда идёт от **финального** кадра предыдущей сцены (ставка CJM в.1 (а)
-принята), сцена получает `needs_review`, сборка ждёт одобрения. Опция «⋯ сразу финал» (CJM (б)) —
-`tier=final` без эскиза для выбранных сцен, поддерживается O10 (`items[].tier`).
+принята); `needs_review` — предупреждение, а не блокировка генерации (GPU-DAY п.3: SSIM S2 эскиз/финал
+0,49 ≥ 0,4), но одобрение и сборка требуют действительной цепочки (И11, И12). Опция «сразу финал»
+(CJM (б)) по умолчанию не нужна (GPU-DAY п.3) и в часть 1 не входит.
 
 ---
 
 ## 13. Миграция и сосуществование со старой панелью
 
-- Новая БД `studio.sqlite` в `$H3_OUTDIR` (на Маке `~/Research/TestVideo/studio/`), медиа в
-  `<outdir>/studio/projects/<id>/{assets,takes,keyframes,assembly}`. Старые `projects/<id>/project.json`
-  студия не читает и не пишет.
-- Общие ресурсы с alex-neuro: диспетчер (клиент `studio-worker`), ComfyUI, sglang. Две панели не могут
-  занять карту одновременно — диспетчер отвечает `wait` второму клиенту (`dispatcher.py:431-432`).
-- Библиотека референсов старой панели (`library/<tag>/card.json`) импортируется в кастинг по запросу
-  (O5 с `from_library_tag`), копией, не ссылкой.
-- Hermes-скилл `h3-video` продолжает ходить в :8765; новый скилл/конфиг `mcp_servers` → :8766.
+- Новая БД `studio.sqlite` в `$H3_OUTDIR/studio/` (на alex-neuro `/home/alex/Outputs/studio/`),
+  медиа в `<outdir>/studio/projects/<id>/{assets,takes,keyframes,assembly/<assembly_id>}`. Старые
+  `project.json` студия не читает и не пишет; импорта нет (решение владельца 3). `H3_OUTDIR` не может
+  указывать внутрь `~/models` (CLAUDE.md).
+- Ресурсы дублей (кадры, ролики) студия не убирает автоматически: `concat_clips` уборки не делает,
+  удаление — явной операцией части 3.
+- Общие ресурсы alex-neuro: диспетчер (клиенты `panel-worker`, `panel-web`, `studio-worker`).
+  Две панели не займут карту одновременно — второму клиенту диспетчер отвечает `wait` (`dispatcher.py:430-432` для того же движка, `:472-476` для другого).
+- Библиотека старой панели (`library/<tag>/card.json`) — импорт в кастинг копией (O5 с
+  `from_library_tag`), после S4.
+- Hermes-скилл `h3-video` продолжает ходить в :8765; новый конфиг `mcp_servers` → :8766 (S5).
 
 ---
 
-## 14. Вертикальные срезы (10 дней, 11–20.10) и приёмка
+## 14. Вертикальные срезы и приёмка
 
-Каждый срез: спека-часть → план → проверка плана не автором → реализация → ревью с мутациями →
-**проход владельца** (гейт, fable §5). Старая панель и её тесты зелёные после каждого среза
-(`pytest -q`, сейчас 2105 `def test_`; число фиксируется в отчёте среза до/после).
+Каждый срез: план → проверка плана не автором (`/codex` план против спеки) → реализация → ревью с
+мутациями (красный вывод в отчёте) → **проход владельца**. Старая панель зелёная после каждого среза
+(`pytest -q`, 2103 `def test_` на 20.10; число до/после в отчёте) — это регрессия, не доказательство
+новых инвариантов.
 
-| Срез | День | Содержание | Приёмка владельцем | Технический гейт |
+| Срез | Дни | Содержание | Приёмка владельцем | Технический гейт |
 |---|---|---|---|---|
-| S0 | 1 | `h3_48gb/studio/`: `app.py` на :8766, `db.py` + миграция 001 (все таблицы §6, триггеры И2/И3), `event` + SSE O21, `SETTING`, бэкап `backup()` | открывает `http://mac:8766/studio` — пустой список проектов | тесты И2, И3, И8, И10 красные→зелёные; старый `pytest -q` зелёный |
-| S1 | 2 | O1–O8, O16–O18 без исполнителей; `expected_revision`, `Idempotency-Key`/`OP_LOG`; линтер L4, L5, L7a–e, L10, L12 | — (нет пути) | тест 409 `revision_conflict` с `current`; тест «тот же ключ + другое тело → 422»; каждое правило линта — мутация |
-| S2 | 3 | договор §8.1, `fake.py`, `worker.py` с состояниями §8.5, `reconcile`, GPU-scope `local-mac`, O13–O15; таблица `reconcile` тестами точным равенством | — | сценарии: обрыв после POST (`submit_unknown→find`), падение воркера с `engine_ref`, повтор постановки, поздний результат → `stale` (И4) |
-| S3 | 4 | `drawthings.py` (local), O12, ASSET-происхождение, **MCP слой 1** (все инструменты, подтверждение двухшаговое), страница §4.4 | **из Claude Desktop/Hermes:** создаёт проект, добавляет героиню с фото, получает кадр Krea 2, видит его в хосте и на странице | `test_drawthings_live.py`; прогон описаний инструментов в двух хостах (скриншоты) |
-| S4 | 5 | `comfy.py` из `ltx.py` + `WORKFLOW_TEMPLATE` (`ltx-upscale`, `sdturbo-contract`), WS-прогресс, `find` по `extra_data`; `upscale_part` на новом клиенте | — | `test_ltx_upscale.py` 22/22 без правок; `test_comfy_live.py` на Маке (включая обрыв) |
-| S5 | 6 | `sglang_h3.py` (шов `store`), варианты → scope `dispatcher:h3-*`, `FakeH3` с роликами проб и таймингами, план O10 со сменами варианта, tier sketch/final, цепочка `prev_last_frame` (`_extract_valid_last_frame`), линтер L7b/L13/L14; правка диспетчера (`h3-fl2va`, `comfy`) + `test_gpu_dispatcher` | **на имитациях:** ставит 2 сцены (refs → from_frame), видит план «ref2va → смена → fl2va», прогресс и дубли | `test_sglang_adapter.py` 22/22; `test_gpu_gate.py` 26/26; мутация «убрать `engine_ref` до опроса» красная |
-| S6 | 7 | режиссёр B: порт `domain/clip`, две стадии промптов, O25/O26, `performance`, звук по материалу, шаблон кадра Krea 2; линтер L1–L3, L6, L8, L9, L11 | **идея → 4 сцены по 8 с** с режимами и игрой, линт зелёный, кадр героини по шаблону | золотые векторы AW; L1 ловит «calm neutral expression» промпт пробы P3 |
-| S7 | 8 | повторное одобрение цепочки §12.5, O17, O19/O20 через `assemble.run`, `MEDIA:` в MCP, `--fakes` режим воркера | **полный путь критерия §1** на Маке: Krea 2 настоящий, H3 имитация, mp4 скачан | `test_studio_path.py` с 5 мутациями §12.3; скриншоты страницы 1440/390 |
-| S8 | 9 | режиссёр A: MCP-клиент ai-writer, O24, импорт `ozero.h3.json`; bearer на `/mcp`; Hermes в Telegram и десктопе проходит S3+S7 текстом | **из Telegram через Hermes:** импортирует главу «Озеро», ставит эскизы (имитация), получает `MEDIA:` | тест импорта 14 сцен/75 с; негатив: без токена `/mcp` → 401 |
-| S9 | 10 | независимая приёмка (не автор; `/codex` по спеке и коду), ревью мутаций всех срезов, скрипт дня с GPU §15, правки спек | владелец повторяет S7 без подсказок, журнал прохода | список открытых дефектов ≤ 5, ни одного класса «потеря состояния» |
+| S0 | 1 | `studio/app.py` :8766, `db.py` + миграция 001 (таблицы пути: project, scene, cast_member, cast_asset, asset, proposal, event, setting, op_log), SSE O21, каркас мастера (React+Vite), шаг 1 | открывает `http://alex-neuro:8766/studio`, создаёт проект, видит его в списке после перезагрузки | И8, И10 красные→зелёные |
+| S1 | 2 | шаги 2–3 мастера: O5/O6, сценарист O25/O26 (`STUDIO_SCENES_SCHEMA`, промпт, снап §6.2), O7/O8 с `scene_id`, `expected_revision`, линтер L1–L6, L7a, L8–L12 | **из идеи получает две сцены**, правит текст, видит находки линта, перезагружает страницу — правки на месте | 409 `revision_conflict`; сопоставление O7 (вставка/удаление/перестановка); каждое правило линта — мутация; И1 |
+| S2 | 2 | воркер (§8.5 без `submit_unknown`-сценариев), GPU-гейт, правка диспетчера `comfy-studio`, `comfy.py` с шаблоном `krea2-t2i`, O10(image)/O12/O13/O14, O23, шаг 4 мастера | **получает кадр Krea 2** на alex-neuro, видит прогресс и ожидание карты с причиной, подключает кадр к сцене 1 | контракт имитации; `test_ltx_upscale.py` 22/22 без правок; `test_gpu_dispatcher` +`comfy-studio`; живой контракт `krea2-t2i` |
+| S3 | 2 | шаблоны `h3-fl2va`/`h3-ref2va` (после §15 п.1–3), O10/O11 render, `pending_input`/материализация (И2, И3), O16/O17, O18, `estimate_sample`, шаги 5–6 мастера | **снимает эскизы двух сцен** (2-я от кадра 1-й), выбирает, видит конфликт после пересъёмки 1-й и пересъёмку 2-й от выбранной | мутации 1, 3, 4, 5, 6, 7 §12.3; И11 при одобрении |
+| S4 | 2 | финалы, каскад И11 на завершении дубля, `concat_clips` (выделение из `assemble.py`), O19/O20, шаги 7–8, Playwright-сценарий мастера на имитациях | **полный путь критерия §1** на настоящем ComfyUI, mp4 скачан; журнал прохода | `test_studio_path.py` со всеми 12 мутациями; `test_assemble.py` 68/68 без правок; И12 |
+| S5 | 2 | устойчивость: `submit_unknown` (O27, `restarted_since`), `lost`, `cancelling`, reconcile-таблица целиком; **MCP слой 1** (18 инструментов) | из Claude Desktop или Hermes находит проект из S4, смотрит дубли, ставит пересъёмку сцены 2 | сценарии §12.1 `post_timeout`, `restart`; reconcile точными равенствами; без токена `/mcp` → 401 |
+| S6 | 1 | независимая приёмка (`/codex` по спеке и коду), ревью мутаций всех срезов | владелец повторяет S4 на новой идее без подсказок | открытых дефектов ≤ 5, ни одного класса «потеря состояния» |
+| S7 (опция) | 1 | импорт ai-writer O24 (файл и `clip_id`) | импортирует «Озеро», ставит эскизы двух первых сцен | тест импорта 14 сцен |
 
-Что не входит в 10 дней и честно переносится: обучение LoRA, DT remote под диспетчером (день с
-GPU), прогресс sglang по логу, React.
+Итого 12 рабочих дней до S6 (+1 на S7). После части 1, по решению владельца: LTX-апскейл из студии,
+DT на Маке, LoRA, план Б sglang (если не понадобился раньше).
 
 ---
 
-## 15. Первый день с GPU (после ~19.10)
+## 15. Проверки на GPU
 
-Скрипт `scripts/studio_gpu_day.sh` (пишется в S9), каждый пункт — отдельная запись в
-`docs/h3-modes/GPU-DAY-<дата>.md` с числами. Все прогоны под `caffeinate` не нужны (alex-neuro), логи
-в `~/Research/TestVideo/_логи/`.
+### 15.1. Сделано 20.10 (GPU-DAY)
+
+| # | Проверка | Итог | Что записано в спеку |
+|---|---|---|---|
+| 1 | H3 в ComfyUI, 3 с/20 шагов | идёт: 72 с, смена чекпойнта ≈16 с, 53 ГБ (nvidia-smi) | ComfyUI основной, sglang план Б (Р2-1) |
+| 2 | Krea 2 на alex-neuro | DT нет; ComfyUI 5,3–5,6 с, 18 ГБ | шаблон `krea2-t2i` (Р2-2) |
+| 3 | Эскиз → финал с новым кадром (sglang) | SSIM S2 0,49 | `needs_review` — предупреждение; «сразу финал» не нужен |
+| 4 | Лимит референсов (sglang) | 15 с/4 — да; 15 с/5–6, 10 с/5–6 — OOM | таблица L7b |
+| 5 | Восстановление sglang | `GET /v1/videos` есть, в памяти процесса | §8.6: `find=none` до проверки связи с запросом |
+| 7 | Прогресс | ComfyUI WS по `prompt_id`; sglang tqdm в логе | §8.2, §8.6 |
+
+### 15.2. До реализации адаптера (перед S3) — первыми
+
+Все прогоны — на alex-neuro под диспетчером, очередь старой панели на паузе; логи
+`~/Projects/h3-bench/logs/`, копия итогов в `docs/h3-modes/GPU-DAY-<дата>.md`.
 
 | # | Проверка | Как | Решение по исходу |
 |---|---|---|---|
-| 1 | **H3 в ComfyUI** | официальные workflow fl2va/ref2va (Comfy-Org репак, `pruned_int8_convrot` уже на диске — MATRIX §1), 3 с / 20 шагов, 896×512; замер времени, пиковой VRAM, смены чекпойнта fl2va↔ref2va внутри ComfyUI | идёт и смена < 150 с → шаблоны `h3-fl2va`/`h3-ref2va` становятся основным исполнителем видео, sglang — план Б; не идёт (Ampere без fp8, OOM) → sglang остаётся, `verified_on` пустой |
-| 2 | **Krea 2 на alex-neuro** | есть ли gRPC-сервер Draw Things (`:7859`) и как он запускается; иначе Krea 2 workflow в ComfyUI; замер 1344×768 8 шагов | DT есть → EngineSpec `dt` в диспетчере; нет → `krea2-t2i` шаблон ComfyUI, DT остаётся исполнителем Мака (вопрос 5 §17) |
-| 3 | **Цепочка эскиз → финал с новым кадром** | 2 сцены: #1 `refs`, #2 `from_frame`; sketch обеих, final обеих; SSIM кадра A1s/A1f и кадров 0/2/4/8 с #2s/#2f | SSIM #2 ≥ 0,4 → `needs_review` остаётся предупреждением; < 0,3 → опция (б) «сразу финал» по умолчанию для продолжений |
-| 4 | **Лимит референсов от длительности** | 15 с с 4/5/6 картинками, 10 с с 5/6 — пик VRAM (`peak_memory_mb` из ответа sglang) | заполнить L7b фактами вместо ставки |
-| 5 | **Восстановление sglang** | есть ли `GET /v1/videos` (список); обрыв соединения после POST (`iptables`/`kill -STOP`), затем `find` | есть → `find` по списку; нет → остаётся правило «GPU util < 10 % 60 с» |
-| 6 | **Ingest ai-writer** | импорт `ozero.h3.json` и рендер сцены 1 эскизом на живом H3 (К5 закрывается) | — |
-| 7 | **Прогресс** | WS ComfyUI для H3-узлов; tqdm sglang в `serve-panel-*.log` → ручка `/status.progress` диспетчера | закрыть Н7 |
-| 8 | **Контракт** | `test_executor_contract.py` с `STUDIO_LIVE_SGLANG=1 STUDIO_LIVE_COMFY=1` | зелёный — исполнители приняты |
-| 9 | **Путь целиком** | S7 на настоящем H3: 2 сцены по 8 с (≈ 1,5 ч машинного времени по CJM) | владелец получает первый ролик из студии |
+| 1 | **H3 в ComfyUI на 8 с / 50 шагов** | `h3-fl2va` и `h3-ref2va`, 896×512, 192 кадра; время, пик VRAM (`torch.cuda.max_memory_allocated` в узле или журнал ComfyUI, не только nvidia-smi); число кадров в mp4 = 192 | идёт → `verified_on` для шаблонов, тайминги в `fake_timings.json`; OOM/ошибка → план Б §8.6 до S3 |
+| 2 | **Несколько референсов в ComfyUI** | `h3-ref2va`: 2, 4, 6 картинок при 3,75 / 8 / 10,125 / 14,375 с (2 шага достаточно для памяти) | заполнить `ref_images_by_frames` шаблона фактами ComfyUI |
+| 3 | **Голова продолжения** | `h3-fl2va` от PNG: SSIM/побайтное сравнение кадра 0 с входным кадром; кадров на выходе ровно `length` | `head_drop_frames` для ComfyUI (§8.3) |
+| 4 | **Krea 2 и H3 в одном процессе** | в `comfy-studio`: Krea 2 → H3 fl2va → Krea 2; время каждой смены, пик памяти; каким экземпляром ComfyUI шёл замер Krea 2 20.10 (уточнить по `gpu_day_krea.py`) | цена смены в планировщик O10; если H3 не помещается после Krea 2 без выгрузки — явный `POST /free` между задачами разных моделей |
+| 5 | **Рестарт ComfyUI** | убить процесс во время задачи и после `POST /prompt`; `history`/`queue` пусты, файлы `studio/<task_id>/`; `started_at` в `/status` диспетчера | подтверждает `find` и `restarted_since` §8.2 |
+| 6 | **Обрыв после `POST /prompt`** | `kill -STOP` клиента сразу после запроса, затем `find` по `extra_data` | `find=exact` для ComfyUI подтверждён |
+
+### 15.3. После кода
+
+| # | Проверка | Когда |
+|---|---|---|
+| 7 | контракт `test_executor_contract.py` с `STUDIO_LIVE_COMFY=http://127.0.0.1:8189` на трёх шаблонах | S2 (Krea 2), S3 (H3) |
+| 8 | путь целиком: 2 сцены по 8 с, эскизы и финалы | S4 — это и есть проход владельца |
+| 9 | ingest ai-writer: импорт `ozero.h3.json` и эскиз сцены 1 | S7 |
+| 10 | LTX-апскейл в `comfy-studio` (модели, узлы, 22 теста против живого) | после части 1 |
 
 ---
 
@@ -985,43 +1095,80 @@ GPU), прогресс sglang по логу, React.
 
 | Риск | Вероятность | Снятие |
 |---|---|---|
-| H3 в ComfyUI не идёт на Ampere без fp8 (fable §5) | средняя | sglang остаётся первым исполнителем видео в части 1; ComfyUI для H3 — только после п.1 §15 |
-| Dispatcher-правка (вариант fl2va) ломает старую панель | низкая | `acquire("h3")` остаётся синонимом `h3-ref2va`; `test_gpu_dispatcher` расширяется, не меняется |
-| Имитация подменяет совместимость (codex §5) | средняя | контрактные тесты на живых ComfyUI и DT на Маке уже в S3/S4; один набор тестов для имитаций и железа |
-| ai-writer: `MCP_AUTH_TOKEN`, запущенные uvicorn+arq+redis, профиль модели — путь A хрупок | средняя | путь B не зависит от AW; импорт файла `.h3.json` как запасной вход O24 |
-| Владелец в части 1 работает через MCP-хост, а не мастер — неудобно | высокая (ожидаемо) | это и есть ответ «чат-проводник бесплатно»; неудобства — вход для части 3; страница §4.4 даёт просмотр |
-| Порт DT gRPC на alex-neuro вне диспетчера → две задачи на карте | средняя | DT remote не включается, пока нет EngineSpec `dt` (п.2 §15) |
-| Объём 10 дней | высокая | S0–S7 обязательны для критерия; S8 (путь A) может уехать на день с GPU без потери критерия |
-| SQLite по SMB с Мака | — | запрещено спекой (только API); бэкап — `backup()` |
-| Поздний результат после правки сцены съедает диск | низкая | `stale` дубли показываются с «удалить»; дисковый бюджет — часть 3 |
+| 8 с/50 шагов или несколько референсов не идут в ComfyUI на CMP 170HX | средняя | проверка §15.2 п.1–2 **до** S3; план Б §8.6 специфицирован |
+| Krea 2 + H3 в одном процессе ComfyUI не помещаются в 64 ГБ без выгрузки | средняя | §15.2 п.4; явная выгрузка между задачами разных моделей |
+| Отдельный экземпляр `comfy-studio` расходится по версиям с рабочим ComfyUI | средняя | `engine_version` в `inputs_json`; слияние после §15.3 п.10 |
+| Правка диспетчера ломает старую панель | низкая | только новый EngineSpec; `h3`, `ltx` не меняются; `test_gpu_dispatcher` расширяется |
+| Имитация подменяет совместимость (codex §5) | средняя | живой контракт уже в S2/S3 на alex-neuro; FakeComfy проверяет payload и байты |
+| `submit_unknown` копится и требует человека | низкая | ComfyUI `find=exact` по `extra_data` и файлам; ручное разрешение одной кнопкой |
+| Сценарист на CAILA недоступен | средняя | ручной ввод двух сцен в мастере (O7) — путь не зависит от LLM |
+| Объём 12 дней | высокая | критерий в S4; S5–S7 могут сдвинуться без потери критерия |
+| SQLite по SMB с Мака | — | запрещено (только API) |
+| `stale`-дубли и ресурсы съедают диск | низкая | показываются; дисковый бюджет — часть 3 |
 
 ---
 
-## 17. Открытые вопросы владельцу (ставки)
+## 17. Решения владельца и открытые вопросы
 
-1. **Канал прохода в части 1.** Путь критерия §1 проходится из MCP-хоста (Claude Desktop/Hermes) плюс
-   страница дублей §4.4 без React. **Ставка: да** — иначе часть 1 нельзя принять до части 3.
-2. **Порт и сосуществование.** Студия на :8766 до приёмки части 3, старая панель остаётся на :8765
-   (Hermes-скилл `h3-video` не ломается); при приёмке меняются местами. **Ставка: да.**
-3. **Хранилище части 1.** Новая `studio.sqlite`, без импорта старых `project.json` (импорт — часть 3 с
-   мастером, Р8). **Ставка: да.**
-4. **Пробелы ai-writer (3–15 с, `performance`, звук по материалу).** Закрывать в нашем модуле (путь B)
-   сейчас; в ai-writer — отдельной задачей владельца, когда понадобится путь A для длинных сцен.
-   **Ставка: в нашем модуле сейчас, в AW позже.**
-5. **Draw Things на alex-neuro.** Если gRPC-сервера нет или он не ставится под диспетчер за день с GPU —
-   Krea 2 на alex-neuro идёт через шаблон ComfyUI, DT остаётся исполнителем Мака. **Ставка: ComfyUI на
-   alex-neuro, DT на Маке.**
+### 17.1. Принятые решения владельца (20.10)
+
+1. **Первый срез — минимальный мастер на две сцены.** Принято: §4.4, критерий §1, срезы S0–S4.
+2. **Студия на порту 8766, старая панель остаётся на 8765.** Принято: §4.2–4.3.
+3. **Новая база, без импорта старых проектов.** Принято: §13.
+4. **ai-writer — не основной путь, а дополнительный, для сложных сцен.** Простой путь «идея → сцены»
+   — своя LLM-роль «Сценарист» в студии (§9.1); импорт клип-сценария (`clip_*`, `?format=h3`) —
+   опция S7, не на критическом пути.
+5. **Krea 2 на alex-neuro — через ComfyUI** (замер 5,4 с на кадр 1344×768). Принято: §8.2.
+
+### 17.2. Решения редакции 2 (приняты автором по замерам и ревью; не требуют ответа)
+
+- ComfyUI — основной исполнитель видео, sglang — план Б (GPU-DAY п.1).
+- Отдельный экземпляр `comfy-studio` (:8189) до проверки LTX в нём.
+- Мастер сразу на React + Vite (STACK §2), без промежуточного HTML на f-строках.
+- «Выбрать дубль» = одобрить для tier; отдельного «выбора» нет.
+
+### 17.3. Находки Codex: закрыты / отклонены
+
+| № | Решение |
+|---|---|
+| 1 | закрыта: `pending_input`, материализация, `blocked` (§6.1 И2–И3, §7, §8.5, L12) |
+| 2 | закрыта: `state_version`, И11–И12, каскад на O7/O8/O16/завершении дубля (§6.1, §7, §12.5) |
+| 3 | переоценена: не блокер части 1 (ComfyUI-основной, один EngineSpec без вариантов); правка диспетчера для плана Б специфицирована (§8.6); факт `/status → own`, а не `engines.h3.variant`, учтён |
+| 4 | закрыта: правило GPU util удалено; автоповтор только при доказанном рестарте (§8.5); отмена в `submit_unknown` и его переживание падения воркера — в таблице reconcile |
+| 5 | закрыта: `concat_clips` без `Project`, стадий и уборки; уникальный каталог сборки (§3.1, И12). Апскейл как отдельная задача — отложен вместе с LTX (§2) |
+| 6 | закрыта решением владельца 1 (§4.4, §1); скриншоты не вместо прохода |
+| 7 | закрыта сужением: sglang вне части 1; полный шов перечислен в §8.6 |
+| 8 | закрыта: `number_references` над переданными карточками; видео/трек/LoRA не нумеруются (§3.1) |
+| 9 | закрыта: `probe(spec)`, `Capabilities`, `cancelled` в `EngineStatus`, логическая/фактическая отмена; DT remote убран (§8.1, §8.5) |
+| 10 | закрыта: журнал payload и байтов, `framemd5`, 12 мутаций (§12) |
+| 11 | закрыта: `proposal`, `render_plan`, `estimate_sample`, `cast_asset`, `scene_id`, мягкое удаление, правила ревизий (§6, §7) |
+| 12 | закрыта: подключение кадра через O8, сухой план для кадра, раздельные approve/unapprove, retry, resolve, free_gpu (§7, §11) |
+| 13 | закрыта: `requested_s`/`frames`, снап к ближайшей точке в [73, 345], ключ оценки с шаблоном и машиной (§6.2, §3.1) |
+| 14 | закрыта: срезы перестроены, критерий в S4; AW, LoRA, DT, sglang отложены; `caffeinate` для Мака; LLM на Маке под тем же flock (§8.4, §14). Довод «живые контракты Мака не снимают рисков CMP» снят переносом живого контракта на alex-neuro (S2–S3) |
+| 15 | закрыта: числа исправлены (482 / 2103 / 18 инструментов), регрессия отделена от новых инвариантов |
+
+Отклонённых находок нет; частично изменены по существу №3 (снижен вес) и №7 (закрыта сужением
+объёма, а не расширением шва в части 1).
+
+### 17.4. Новые вопросы (не блокируют план)
+
+1. **Лимит референсов в старой панели.** `DEFAULT_MAX_REF_IMAGES = 5` (`sglang_args.py:24`) по GPU-DAY
+   п.4 даёт OOM уже на 10 с. Снизить до 4 в старой панели отдельной задачей? Расхождение с пробой
+   07.10 (6 портретов при 10 с прошли) — гипотеза: другой размер картинок; проверить, повторив
+   07.10 с теми же файлами.
+2. **Старая панель на ComfyUI H3.** Переводить ли старую панель с sglang на ComfyUI до части 3?
+3. **Один экземпляр ComfyUI.** После §15.3 п.10 — слить `ltx` и `comfy-studio` в один (v0.42)?
+4. **Длительность больше 14,375 с.** Нужна ли сцена до 15 с ровно (362 кадра — выше текущей границы)?
 
 ---
 
 ## 18. Правки к исходным документам
 
-- Видение §6: «ComfyUI можно поднять на Маке» — уже поднят: `~/Research/studio-eval/shared/ComfyUI`
-  0.39.0 с `sd_turbo.safetensors`; §7 порядок частей заменён срезами §14.
+- Видение §7: порядок частей заменён срезами §14; мастер — в части 1 (минимальный).
 - Видение §3 «Узлы… карточкой», «цепочка — граф задач»: снято ревью; здесь — `SETTING`-адреса и `depends_on`.
-- DRAFT (е) «контейнер `h3-mcp`», W1 §7 список из 8 инструментов: заменено на `/mcp` в процессе API и
-  список §11 (14 инструментов с подтверждением).
-- `tools/gpu-dispatcher/README.md`: ручка `/acquire` принимает `h3-fl2va`, `h3-ref2va`, `comfy`
-  (синонимы `h3`, `ltx` сохраняются) — после S5.
-- `docs/h3-modes/README.md` §2.3: лимит картинок как функция длительности — после п.4 §15.
-- CJM Н7 «источник счётчика шагов»: ComfyUI — WS; sglang — ставка на лог через диспетчер (п.7 §15).
+- Ландшафт, итог 10.10 «исполнители ComfyUI / Draw Things / sglang; режиссёр ai-writer 2.0»: в части 1 —
+  только ComfyUI; режиссёр — свой сценарист, ai-writer дополнительный.
+- DRAFT (е) «контейнер `h3-mcp`», W1 §7: заменено на `/mcp` в процессе API, 18 инструментов §11.
+- `tools/gpu-dispatcher/README.md`: ручка `/acquire` принимает `comfy-studio` — после S2.
+- `docs/h3-modes/README.md` §2.3: лимит картинок как функция длительности — таблица L7b §10.
+- CJM Н7 «источник счётчика шагов»: закрыт GPU-DAY п.7 (ComfyUI — WS, sglang — tqdm).
