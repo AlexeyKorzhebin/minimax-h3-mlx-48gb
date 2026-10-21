@@ -61,13 +61,13 @@
   @layer components {
     .eyebrow{font-family:var(--font-mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3)}
     .h-display{font-family:var(--font-display);font-weight:600;letter-spacing:-.025em}
-    .btn{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border:1px solid var(--line2);background:var(--bg);color:var(--ink);border-radius:var(--radius-md);font-weight:500;font-size:13px;cursor:pointer;white-space:nowrap}
+    .btn{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border:1px solid var(--line2);background:var(--bg);color:var(--ink);border-radius:999px;font-weight:500;font-size:13px;cursor:pointer;white-space:nowrap;transition:filter .12s,transform .12s}
     .btn:hover{background:var(--surface)}
-    .btn-pri{background:var(--cobalt);border-color:var(--cobalt);color:var(--cobalt-ink)}
-    .btn-pri:hover{background:var(--cobalt);filter:brightness(.93)}
+    .btn-pri{background:linear-gradient(135deg,var(--cobalt),color-mix(in srgb,var(--cobalt) 70%,#5fa8ff));border-color:transparent;color:var(--cobalt-ink);font-weight:600;box-shadow:0 10px 24px -12px var(--cobalt)}
+    .btn-pri:hover{filter:brightness(1.05);transform:translateY(-1px)}
     .btn-ink{background:var(--ink);border-color:var(--ink);color:var(--bg)}
     .btn-ink:hover{background:var(--ink);filter:opacity(.88)}
-    .btn-lg{height:44px;padding:0 18px;font-size:14px}
+    .btn-lg{height:46px;padding:0 22px;font-size:14px}
     .chip{white-space:nowrap;display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border:1px solid var(--line);border-radius:999px;font-family:var(--font-mono);font-size:11px;color:var(--ink2);background:var(--bg)}
     .chip-cobalt{background:var(--cobalt-soft);border-color:var(--cobalt-line);color:var(--cobalt)}
     .chip-ok{background:var(--ok-soft);border-color:transparent;color:var(--ok)}
@@ -87,9 +87,9 @@
     .inp{width:100%;border:1px solid var(--line2);border-radius:var(--radius-md);background:var(--bg);color:var(--ink);padding:8px 10px;font:inherit;font-size:13.5px;line-height:1.45;resize:vertical}
     .inp:focus{outline:none;border-color:var(--cobalt);box-shadow:0 0 0 3px var(--cobalt-soft)}
     .hint{margin-top:6px;font-size:12px;color:var(--ink3);line-height:1.4}
-    .seg{display:inline-flex;border:1px solid var(--line2);border-radius:var(--radius-md);padding:2px;background:var(--surface)}
-    .seg button{white-space:nowrap;height:28px;padding:0 12px;border-radius:4px;font-size:13px;font-weight:500;color:var(--ink2);cursor:pointer}
-    .seg button[aria-pressed=true]{background:var(--bg);color:var(--ink);box-shadow:0 0 0 1px var(--line2)}
+    .seg{display:inline-flex;border:1px solid var(--line2);border-radius:999px;padding:2px;background:var(--surface)}
+    .seg button{white-space:nowrap;height:30px;padding:0 14px;border-radius:999px;font-size:13px;font-weight:500;color:var(--ink2);cursor:pointer}
+    .seg button[aria-pressed=true]{background:var(--bg);color:var(--ink);box-shadow:0 2px 10px -3px rgba(23,71,230,.28),0 0 0 1px var(--line)}
     .shot{position:relative;background:var(--surface2);overflow:hidden;border-radius:var(--radius-md)}
     .shot img{display:block;width:100%;height:100%;object-fit:cover}
     .stat{font-variant-numeric:tabular-nums}
@@ -106,7 +106,7 @@
   .take{background:var(--film);border:1px solid var(--film-line);border-radius:6px;overflow:hidden}
   .take.on{border-color:var(--film-cobalt);box-shadow:0 0 0 1px var(--film-cobalt)}
   .take .tmeta{font-family:var(--font-mono);font-size:11px;color:var(--film-ink2);display:flex;justify-content:space-between}
-  .tbtn{height:36px;width:100%;border-radius:6px;border:1px solid var(--film-btn-line);background:var(--film-btn);color:var(--film-ink);font-size:13px;font-weight:500;display:inline-flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;white-space:nowrap}
+  .tbtn{height:36px;width:100%;border-radius:999px;border:1px solid var(--film-btn-line);background:var(--film-btn);color:var(--film-ink);font-size:13px;font-weight:500;display:inline-flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;white-space:nowrap}
   .tbtn:hover{border-color:var(--film-ink)}
   .tbtn.ok{background:var(--film-cobalt);border-color:var(--film-cobalt);color:var(--film-cobalt-ink);font-weight:600}
   .ovl{background:rgba(11,13,18,.62);color:#fff;backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.14)}
