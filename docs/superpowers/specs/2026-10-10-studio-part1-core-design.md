@@ -541,6 +541,10 @@ bindings_json, requires_json, verified_on) — как в редакции 1. `re
   `detail.scene_id`). Конфликт правок по `revision` не решается: И1 не растит её на `requested_s`
   с теми же кадрами и на `state_in_text`/`state_out_text`. Для O7 версия — на каждой сцене, а не
   общий счётчик проекта: O8 проект не трогает (ниже), иначе правка одной сцены ломала бы чужой O7.
+  **Удаление — тоже правка:** O7 и O26 несут `deleted: [{scene_id, expected_edit_version}]` — сцены,
+  которые вкладка убирает, с прочитанной версией; живая сцена ни среди оставленных, ни среди
+  удаляемых → 409 (молчание о сцене — не согласие на удаление), удаляемая со старой версией → 409
+  с `detail {scene_id, current}`. Проверка — в той же транзакции.
 - **`expected_state_version`** — для одобрения (O16). Не совпало → 409 `state_conflict`.
 - **Правила роста.** `project.revision` +1: O4, O5, O7, O26 (структура и состав сцен). Сцена:
   `revision` +1 по И1; `edit_version` +1 по И1a; `state_version` +1 при одобрении, снятии одобрения,
@@ -560,7 +564,7 @@ bindings_json, requires_json, verified_on) — как в редакции 1. `re
 | O4 | Изменить проект | `PATCH /projects/{id}` | `expected_revision, title?` (`frame_format` после первого done-дубля — 409 `format_locked`) | проект |
 | O5 | Кастинг | `POST /projects/{id}/cast` | `tag, description_ru, assets[{asset_id, role}], expected_revision` | cast_member с `description_en` |
 | O6 | Импорт ресурса | `POST /assets` (multipart) | файл, `kind?` | asset |
-| O7 | Заменить набор сцен | `PUT /projects/{id}/scenes` | `expected_revision, scenes[{scene_id?, expected_edit_version? (обязателен при scene_id), mode, action_text, performance_text, sound_text, music_text?, requested_s, seed?, source_frame{kind, scene_id?, asset_id?}, refs[tag]}]` — порядок массива задаёт `idx` | сцены + `diff{added, unchanged, changed, moved, deleted}` |
+| O7 | Заменить набор сцен | `PUT /projects/{id}/scenes` | `expected_revision, scenes[{scene_id?, expected_edit_version? (обязателен при scene_id), mode, action_text, performance_text, sound_text, music_text?, requested_s, seed?, source_frame{kind, scene_id?, asset_id?}, refs[tag]}], deleted[{scene_id, expected_edit_version}]` — порядок массива задаёт `idx`; каждая живая сцена — либо в `scenes`, либо в `deleted` | сцены + `diff{added, unchanged, changed, moved, deleted}` |
 | O8 | Изменить сцену | `PATCH /scenes/{id}` | `expected_edit_version` + поля (в т.ч. `source_frame{kind:"asset", asset_id}` — подключение кадра) | сцена + `cascade[scene_id]` |
 | O9 | Линт | `POST /projects/{id}/lint` | `scene_ids?` | находки по сценам |
 | O10 | План (сухой) | `POST /projects/{id}/plan` | `kind: render\|image, scene_ids, tier` или `prompt, size` для image | `plan_id, items[{scene_id, template, depends_on_scene?, estimate_s}], total_s, checkpoint_switches, lint, blocked[]` (TTL 10 мин) |
@@ -579,7 +583,7 @@ bindings_json, requires_json, verified_on) — как в редакции 1. `re
 | O23 | GPU | `GET /gpu`; `POST /gpu/release`; `POST /gpu/qwen/unload` | — | состояние диспетчера; выгрузка Qwen — через ручку диспетчера `/qwen/unload` (`dispatcher.py:590`) |
 | O24 | Импорт ai-writer (S7) | `POST /projects/{id}/import/ai-writer` + ключ | `clip_id` или файл `.h3.json`, `expected_revision` | как O7 + asset(kind=scenario) |
 | O25 | Сценарист: предложить | `POST /projects/{id}/director/propose` | `idea_text, scenes_count=2` | `proposal_id, scenes[]` — сохраняется в `proposal`, не применяется |
-| O26 | Применить предложение | `POST /projects/{id}/director/apply` | `proposal_id, expected_revision` | как O7 |
+| O26 | Применить предложение | `POST /projects/{id}/director/apply` | `proposal_id, expected_revision, deleted[{scene_id, expected_edit_version}]` — весь заменяемый набор с прочитанными версиями | как O7 |
 | O27 | Разрешить `submit_unknown` | `POST /tasks/{id}/resolve` | `action: resubmit\|cancel` | task |
 
 **Сопоставление сцен в O7 (Codex-11).** Идентичность — `scene_id`. Сцена без `scene_id` — новая.
