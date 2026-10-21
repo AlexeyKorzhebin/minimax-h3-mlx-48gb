@@ -129,10 +129,12 @@ CREATE TABLE take (
   created_at TEXT NOT NULL
 );
 
+-- `INSERT OR REPLACE` (and REPLACE conflict clauses) on `take` and `asset` is forbidden by the `ops`
+-- convention: REPLACE deletes and re-inserts, which dodges the UPDATE triggers below. Spec: UPDATE.
 -- И2: the only allowed UPDATE of these columns is NULL -> value (materialization). A value never
 -- changes, and NULL -> NULL is refused too, so no code path "touches" an unmaterialized take.
 CREATE TRIGGER take_inputs_write_once BEFORE UPDATE OF inputs_json, inputs_sha256 ON take
-WHEN OLD.inputs_json IS NOT NULL OR NEW.inputs_json IS NULL
+WHEN OLD.inputs_json IS NOT NULL OR NEW.inputs_json IS NULL OR NEW.inputs_sha256 IS NULL
 BEGIN
   SELECT RAISE(ABORT, 'take.inputs_json is write-once (И2)');
 END;

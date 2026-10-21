@@ -64,9 +64,15 @@ def tx(conn: sqlite3.Connection):
     try:
         yield conn
     except BaseException:
-        conn.execute("ROLLBACK")
+        if conn.in_transaction:             # the body may have closed it; keep ITS exception
+            conn.execute("ROLLBACK")
         raise
-    conn.execute("COMMIT")
+    try:
+        conn.execute("COMMIT")
+    except BaseException:                   # a failed COMMIT can leave the transaction open
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 @contextmanager
@@ -85,6 +91,8 @@ def read(conn: sqlite3.Connection):
 def backup_once(db_path: Path, dest_dir: Path, *, now: datetime, keep: int = 7) -> Path:
     """Consistent copy through `Connection.backup()` (a plain file copy of a WAL database is not
     consistent, spec §5); keeps the newest `keep` copies by name."""
+    if not db_path.exists():                # sqlite3.connect() would silently create an empty one
+        raise FileNotFoundError(f"studio database not found: {db_path}")
     dest_dir.mkdir(parents=True, exist_ok=True)
     target = dest_dir / f"studio-{now:%Y%m%d-%H%M%S}.sqlite"
     src = sqlite3.connect(db_path)
@@ -95,6 +103,8 @@ def backup_once(db_path: Path, dest_dir: Path, *, now: datetime, keep: int = 7) 
         dst.close()
         src.close()
     copies = sorted(dest_dir.glob("studio-*.sqlite"))
-    for old in copies[:-keep]:
-        old.unlink()
+    # keep=0 means "no older copies"; the one just made is never deleted (the caller gets its path).
+    for old in copies[:max(len(copies) - keep, 0)]:
+        if old != target:
+            old.unlink()
     return target
