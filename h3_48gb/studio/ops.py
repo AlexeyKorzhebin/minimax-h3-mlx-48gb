@@ -28,8 +28,15 @@ def project_out(row: sqlite3.Row) -> dict:
             "style_block": row["style_block"], "created_at": row["created_at"]}
 
 
+def _check_frame_format(frame_format: str) -> None:
+    if frame_format not in FRAME_FORMATS:
+        raise StudioError(422, "bad_request", "Формат кадра: 16:9 или 9:16",
+                          {"frame_format": frame_format, "allowed": list(FRAME_FORMATS)})
+
+
 def create_project(conn: sqlite3.Connection, *, title: str, frame_format: str,
                    idea_text: str = "") -> dict:
+    _check_frame_format(frame_format)
     project_id = ids.new_id("p")
     with db.tx(conn):
         conn.execute(
@@ -62,6 +69,8 @@ def _check_revision(row: sqlite3.Row, expected: int, current: dict) -> None:
 
 def update_project(conn: sqlite3.Connection, project_id: str, *, expected_revision: int,
                    title: str | None = None, frame_format: str | None = None) -> dict:
+    if frame_format is not None:
+        _check_frame_format(frame_format)
     with db.tx(conn):
         row = _project_row(conn, project_id)
         _check_revision(row, expected_revision, project_out(row))

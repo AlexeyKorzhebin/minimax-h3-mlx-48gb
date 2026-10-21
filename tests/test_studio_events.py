@@ -16,23 +16,39 @@ def _count(conn, table):
     return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
-def test_event_is_emitted_inside_the_uncommitted_change(tmp_path, monkeypatch):
+def _spy_case(conn, kind):
+    if kind == "project_created":
+        return lambda: ops.create_project(conn, title="Лес", frame_format="16:9")
+    p = ops.create_project(conn, title="Лес", frame_format="16:9")
+    return lambda: ops.update_project(conn, p["id"], expected_revision=1, title="Бор")
+
+
+@pytest.mark.parametrize("kind, own_title, other_title, own_events, other_events", [
+    ("project_created", "Лес", None, 1, 0),
+    ("project_updated", "Бор", "Лес", 2, 1),
+])
+def test_event_is_emitted_inside_the_uncommitted_change(
+        tmp_path, monkeypatch, kind, own_title, other_title, own_events, other_events):
     conn = _conn(tmp_path)
+    call = _spy_case(conn, kind)
     seen = {}
     real_emit = events.emit
 
-    def spy(c, kind, **kw):
+    def spy(c, k, **kw):
+        seq = real_emit(c, k, **kw)         # measure right after the event row is written
         other = db.connect(tmp_path / "s.sqlite")
         try:
-            seen.update(kind=kind, in_tx=c.in_transaction,
-                        own=_count(c, "project"), other=_count(other, "project"))
+            t = lambda cn: (cn.execute("SELECT title FROM project").fetchone() or [None])[0]
+            seen.update(kind=k, in_tx=c.in_transaction, own=t(c), other=t(other),
+                        own_events=_count(c, "event"), other_events=_count(other, "event"))
         finally:
             other.close()
-        return real_emit(c, kind, **kw)
+        return seq
 
     monkeypatch.setattr(events, "emit", spy)
-    ops.create_project(conn, title="Лес", frame_format="16:9")
-    assert seen == {"kind": "project_created", "in_tx": True, "own": 1, "other": 0}
+    call()
+    assert seen == {"kind": kind, "in_tx": True, "own": own_title, "other": other_title,
+                    "own_events": own_events, "other_events": other_events}
 
 
 def test_a_failure_after_the_event_leaves_neither_change_nor_event(tmp_path, monkeypatch):
