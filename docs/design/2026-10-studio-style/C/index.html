@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ru" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Студия — Воздух</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700&display=swap&subset=cyrillic" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.1.13"></script>
+<style>
+:root{
+  --c-ink:#171a3a; --c-ink2:#4a4f78; --c-ink3:#5d6288;
+  --c-bg1:#f3eefe; --c-bg2:#e7f0ff; --c-bg3:#ffffff;
+  --c-glass:rgba(255,255,255,.62); --c-glass-strong:rgba(255,255,255,.82); --c-edge:rgba(255,255,255,.9);
+  --c-line:rgba(70,70,150,.14);
+  --c-accent:#5a48d8; --c-accent-ink:#ffffff; --c-accent-soft:rgba(110,90,240,.12);
+  --c-sky:#2d7fe6; --c-ok:#066248; --c-ok-soft:rgba(16,170,120,.14); --c-warn:#8a4b00; --c-warn-soft:rgba(240,170,40,.2);
+  --c-field:rgba(255,255,255,.75);
+  --blob1:rgba(190,170,255,.55); --blob2:rgba(150,200,255,.55); --blob3:rgba(220,190,255,.4);
+  --shadow-glass:0 10px 40px -12px rgba(80,70,180,.25);
+}
+[data-theme=dark]{
+  --c-ink:#eef0ff; --c-ink2:#b9bde0; --c-ink3:#a2a7d0;
+  --c-bg1:#14122b; --c-bg2:#0f1a33; --c-bg3:#0d0f22;
+  --c-glass:rgba(34,32,70,.55); --c-glass-strong:rgba(40,38,82,.8); --c-edge:rgba(170,160,255,.16);
+  --c-line:rgba(170,170,255,.16);
+  --c-accent:#a396ff; --c-accent-ink:#0f0d28; --c-accent-soft:rgba(140,125,255,.18);
+  --c-sky:#7db4ff; --c-ok:#59d9ad; --c-ok-soft:rgba(60,210,160,.16); --c-warn:#ffcb80; --c-warn-soft:rgba(255,190,90,.16);
+  --c-field:rgba(20,18,48,.6);
+  --blob1:rgba(110,90,230,.35); --blob2:rgba(50,120,230,.3); --blob3:rgba(150,80,220,.25);
+  --shadow-glass:0 10px 40px -12px rgba(0,0,0,.6);
+}
+</style>
+<style type="text/tailwindcss">
+@theme {
+  --font-sans: "Onest", ui-sans-serif, system-ui, sans-serif;
+  --color-ink: var(--c-ink); --color-ink2: var(--c-ink2); --color-ink3: var(--c-ink3);
+  --color-glass: var(--c-glass); --color-glassx: var(--c-glass-strong); --color-edge: var(--c-edge);
+  --color-line: var(--c-line); --color-accent: var(--c-accent); --color-accentink: var(--c-accent-ink);
+  --color-accentsoft: var(--c-accent-soft); --color-sky: var(--c-sky);
+  --color-ok: var(--c-ok); --color-oksoft: var(--c-ok-soft); --color-warn: var(--c-warn); --color-warnsoft: var(--c-warn-soft);
+  --color-field: var(--c-field);
+  --radius-xl2: 1.75rem;
+  --shadow-glass: var(--shadow-glass);
+}
+html{background:var(--c-bg3)}
+body{font-family:var(--font-sans);color:var(--c-ink);min-height:100vh;background:
+  radial-gradient(60rem 40rem at 8% -10%,var(--blob1),transparent 60%),
+  radial-gradient(55rem 38rem at 100% 0%,var(--blob2),transparent 60%),
+  radial-gradient(50rem 40rem at 50% 110%,var(--blob3),transparent 60%),
+  linear-gradient(180deg,var(--c-bg1),var(--c-bg2) 70%,var(--c-bg3));
+  -webkit-font-smoothing:antialiased}
+.glass{background:var(--c-glass);backdrop-filter:blur(22px) saturate(1.4);-webkit-backdrop-filter:blur(22px) saturate(1.4);border:1px solid var(--c-edge);box-shadow:var(--shadow-glass)}
+.glassx{background:var(--c-glass-strong);backdrop-filter:blur(24px) saturate(1.4);-webkit-backdrop-filter:blur(24px) saturate(1.4);border:1px solid var(--c-line)}
+.btn-main{background:linear-gradient(135deg,var(--c-accent),color-mix(in srgb,var(--c-accent) 65%,var(--c-sky)));color:var(--c-accent-ink);box-shadow:0 10px 26px -10px var(--c-accent)}
+.field{background:var(--c-field);border:1px solid var(--c-line);border-radius:1rem;padding:.7rem .9rem;width:100%;color:var(--c-ink);font:inherit;font-size:.95rem;line-height:1.45;resize:none}
+.field:focus{outline:2px solid var(--c-accent);outline-offset:1px}
+.seg button[aria-pressed=true]{background:var(--c-glass-strong);color:var(--c-ink);box-shadow:0 2px 10px -3px rgba(60,50,160,.3)}
+.seg button{color:var(--c-ink2)}
+.step-on{background:var(--c-accent);color:var(--c-accent-ink)}
+details>summary::-webkit-details-marker{display:none}
+details[open] .chev{transform:rotate(180deg)}
+.view{display:none}.view.on{display:block}
+:focus-visible{outline:2px solid var(--c-accent);outline-offset:2px}
+</style>
+</head>
+<body class="text-[15px]">
+
+<header class="sticky top-0 z-30 px-3 sm:px-6 pt-3">
+  <div class="glass mx-auto max-w-[1280px] rounded-full flex items-center gap-2 sm:gap-4 pl-4 sm:pl-6 pr-2 py-2">
+    <a href="#projects" class="flex items-center gap-2 font-semibold text-lg tracking-tight">
+      <span class="grid place-items-center w-8 h-8 rounded-full" style="background:linear-gradient(135deg,#a89bff,#7fb8ff)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4l14 8-14 8z"/></svg>
+      </span>Студия
+    </a>
+    <div class="flex-1"></div>
+    <div id="gpu" class="hidden md:flex items-center gap-2 rounded-full bg-oksoft text-ok px-3 py-1.5 text-sm font-medium">
+      <span class="relative flex w-2 h-2"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-ok opacity-60"></span><span class="relative inline-flex w-2 h-2 rounded-full bg-ok"></span></span>
+      Видеокарта: считает эскиз сцены 2 · 4:12
+    </div>
+    <a href="#projects" class="hidden sm:inline-flex items-center gap-1.5 rounded-full px-3.5 py-2 text-sm font-medium text-ink2 hover:bg-accentsoft">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>Готовое</a>
+    <button id="theme" aria-label="Переключить тему" class="grid place-items-center w-10 h-10 rounded-full text-ink2 hover:bg-accentsoft">
+      <svg class="sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      <svg class="moon hidden" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+    </button>
+  </div>
+  <div class="md:hidden mx-auto max-w-[1280px] mt-2 flex justify-center">
+    <div class="glass rounded-full bg-oksoft text-ok px-3 py-1.5 text-[13px] font-medium flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-ok"></span>Видеокарта: считает эскиз сцены 2 · 4:12</div>
+  </div>
+</header>
+
+<main class="mx-auto max-w-[1280px] px-3 sm:px-6 pb-32 lg:pb-16">
+
+<!-- ПРОЕКТЫ -->
+<section id="v-projects" class="view">
+  <div class="pt-10 sm:pt-14 pb-8 flex flex-col sm:flex-row sm:items-end gap-5 justify-between">
+    <div>
+      <p class="text-sm font-medium text-accent mb-2">Четыре проекта</p>
+      <h1 class="text-4xl sm:text-5xl font-semibold tracking-tight leading-[1.08]">Что снимаем сегодня</h1>
+    </div>
+    <div class="flex flex-wrap gap-2.5">
+      <button class="btn-main rounded-full px-5 py-3 font-semibold inline-flex items-center gap-2">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Новый проект</button>
+      <button class="glass rounded-full px-5 py-3 font-semibold inline-flex items-center gap-2 text-ink">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Одна сцена</button>
+    </div>
+  </div>
+  <div id="cards" class="grid gap-5 lg:grid-cols-2"></div>
+</section>
+
+<!-- РЕДАКТОР -->
+<section id="v-scene" class="view">
+  <div class="pt-8 sm:pt-10 pb-6">
+    <nav class="flex items-center gap-1.5 text-sm text-ink2 mb-3">
+      <a href="#projects" class="hover:text-accent inline-flex items-center gap-1"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>Проекты</a>
+      <span>/</span><span>Утро в лесу</span>
+    </nav>
+    <div class="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+      <div>
+        <h1 class="text-3xl sm:text-5xl font-semibold tracking-tight leading-[1.08]">Сцена 2 <span class="text-ink3 font-medium">из 2</span></h1>
+        <p class="text-ink2 mt-2">Утро в лесу · героиня выходит на тропу</p>
+      </div>
+      <div class="flex gap-1.5" aria-label="Маршрут проекта" id="route-mini"></div>
+    </div>
+  </div>
+
+  <div class="grid gap-5 lg:grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)] items-start">
+    <div class="glass rounded-xl2 p-5 sm:p-7 space-y-6">
+      <div>
+        <div class="flex flex-wrap items-center gap-3 mb-3">
+          <span class="text-sm font-semibold">Режим</span>
+          <span class="rounded-full bg-accentsoft text-accent px-3 py-1 text-[13px] font-semibold inline-flex items-center gap-1.5">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9z"/></svg>быстро · fl2va</span>
+        </div>
+        <div class="seg glassx rounded-full p-1 grid grid-cols-3 gap-1" role="group" aria-label="Режим">
+          <button aria-pressed="true" class="rounded-full py-2.5 text-sm font-semibold">От кадра</button>
+          <button aria-pressed="false" class="rounded-full py-2.5 text-sm font-semibold">Референсы</button>
+          <button aria-pressed="false" class="rounded-full py-2.5 text-sm font-semibold">Текст</button>
+        </div>
+      </div>
+
+      <div>
+        <span class="text-sm font-semibold block mb-2">Первый кадр</span>
+        <figure class="relative rounded-3xl overflow-hidden">
+          <img src="img/s1-final-last.png" alt="Последний кадр сцены 1: героиня идёт по лесу" class="w-full aspect-video object-cover">
+          <figcaption class="absolute left-3 bottom-3 glassx rounded-full px-3 py-1.5 text-[13px] font-semibold text-ink inline-flex items-center gap-1.5">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>из сцены 1</figcaption>
+        </figure>
+      </div>
+
+      <label class="block"><span class="text-sm font-semibold block mb-2">Действие</span>
+        <textarea class="field" rows="3">Героиня выходит из-за дерева на тропу, останавливается, оглядывается и делает шаг к свету.</textarea></label>
+
+      <label class="block"><span class="text-sm font-semibold mb-2 flex items-center gap-2">Эмоция и игра <span class="rounded-full bg-warnsoft text-warn px-2 py-0.5 text-[12px] font-semibold">обязательно</span></span>
+        <textarea class="field" rows="3">Осторожное любопытство сменяется тихой радостью: взгляд скользит по стволам, уголки губ дрожат, руки расслаблены.</textarea>
+        <span class="text-[13px] text-ink3 mt-1.5 block">Состояние и его смена, мимика, взгляд, руки. Без этого герои выходят «как зомби».</span></label>
+
+      <label class="block"><span class="text-sm font-semibold block mb-2">Звук действий</span>
+        <textarea class="field" rows="2">Мягкие шаги по влажной траве, редкий хруст веток, шорох платья.</textarea>
+        <span class="text-[13px] text-ink3 mt-1.5 block">Материал и контакт. Громкость шагов задаёт походка: крадётся / идёт тихо / топает — не обувь.</span></label>
+
+      <div class="grid grid-cols-3 gap-3">
+        <div class="glassx rounded-2xl px-4 py-3"><small class="text-ink3 block text-[12px]">Длительность</small><b class="text-lg">8 с</b></div>
+        <div class="glassx rounded-2xl px-4 py-3"><small class="text-ink3 block text-[12px]">Сид</small><b class="text-lg tabular-nums">482913</b></div>
+        <div class="glassx rounded-2xl px-4 py-3"><small class="text-ink3 block text-[12px]">Шаги</small><b class="text-lg">20 · 50</b></div>
+      </div>
+
+      <details class="glassx rounded-2xl">
+        <summary class="cursor-pointer list-none px-4 py-3.5 flex items-center justify-between font-semibold text-sm">
+          <span>Промпт для H3 <span class="font-normal text-ink3">· fl2va, 3 поля · только чтение</span></span>
+          <svg class="chev transition-transform" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+        </summary>
+        <pre class="px-4 pb-4 text-[13px] leading-relaxed text-ink2 whitespace-pre-wrap font-sans">action: a young woman steps out from behind a pine onto a forest path, pauses, looks around, steps toward the light
+emotion_and_performance: cautious curiosity turning into quiet joy…
+sound: soft steps on damp grass, sparse twig crunch, dress rustle</pre>
+      </details>
+    </div>
+
+    <aside class="space-y-5 lg:sticky lg:top-28">
+      <div class="glass rounded-xl2 p-5 sm:p-6">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-lg font-semibold">Дубли эскиза</h2>
+          <span class="text-sm text-ink3">3 из 3</span>
+        </div>
+        <div id="takes" class="grid gap-4 sm:grid-cols-3 lg:grid-cols-1 xl:grid-cols-1"></div>
+      </div>
+      <div class="hidden lg:block">
+        <button class="btn-main w-full rounded-full px-6 py-4 text-lg font-semibold inline-flex items-center justify-center gap-2.5">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4l14 8-14 8z"/></svg>Снять эскиз ≈ 4,5 мин</button>
+      </div>
+    </aside>
+  </div>
+
+  <div class="lg:hidden fixed inset-x-0 bottom-0 z-40 p-3">
+    <button class="btn-main w-full rounded-full px-6 py-4 text-base font-semibold inline-flex items-center justify-center gap-2.5">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4l14 8-14 8z"/></svg>Снять эскиз ≈ 4,5 мин</button>
+  </div>
+</section>
+</main>
+
+<script>
+const STEPS=['Идея','Кастинг','Сценарий','Эскизы','Финал','Сборка'];
+const P=[
+ {t:'Венок на воде',img:'krea2-s3',step:3,sc:4,dur:'0:32',st:'эскизы 2 из 4',kind:'work'},
+ {t:'Утро в лесу',img:'s1-final-last',step:4,sc:2,dur:'0:16',st:'финал считается 38 %',kind:'run',pct:38},
+ {t:'Тропа',img:'krea2-s1',step:5,sc:3,dur:'0:24',st:'готово',kind:'ok'},
+ {t:'Проба: Krea 2',img:'krea2-s2',step:0,sc:1,dur:'0:08',st:'черновик',kind:'draft'}
+];
+const I=(d)=>`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
+function route(cur,ok){return `<ol class="flex items-center gap-1" aria-label="Маршрут">${STEPS.map((s,i)=>{
+  const done=ok||i<cur, on=!ok&&i===cur;
+  return `<li class="flex items-center ${i? 'flex-1':''} gap-1 min-w-0">${i?`<span class="h-px flex-1 ${done||on?'bg-accent/50':'bg-line'}"></span>`:''}<span title="${s}" class="shrink-0 grid place-items-center rounded-full w-[22px] h-[22px] text-[11px] font-semibold ${on?'step-on ring-4 ring-accent/20':done?'bg-accentsoft text-accent':'bg-glassx text-ink3 border border-line'}">${done?I('<path d="M20 6 9 17l-5-5"/>').replace('14','11').replace('14','11'):i+1}</span></li>`}).join('')}</ol>
+  <div class="flex justify-between text-[11px] text-ink3 mt-1.5 hidden sm:flex">${STEPS.map((s,i)=>`<span class="${!ok&&i===cur?'text-accent font-semibold':''}">${s}</span>`).join('')}</div>`}
+document.getElementById('cards').innerHTML=P.map(p=>{
+  const badge={work:'bg-accentsoft text-accent',run:'bg-accentsoft text-accent',ok:'bg-oksoft text-ok',draft:'bg-glassx text-ink2 border border-line'}[p.kind];
+  return `<article class="glass rounded-xl2 p-3 sm:p-4 grid sm:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)] gap-4 items-center hover:-translate-y-0.5 transition-transform">
+   <div class="relative rounded-2xl overflow-hidden"><img src="img/${p.img}.png" alt="Кадр проекта «${p.t}»" class="w-full aspect-video object-cover">
+    ${p.kind==='run'?`<div class="absolute inset-x-0 bottom-0 h-1.5 bg-black/20"><div class="h-full bg-white/90" style="width:${p.pct}%"></div></div>`:''}</div>
+   <div class="px-1 pb-1 sm:py-2 min-w-0">
+    <span class="inline-block rounded-full px-2.5 py-1 text-[12px] font-semibold mb-2 ${badge}">${p.st}</span>
+    <h2 class="text-xl sm:text-2xl font-semibold tracking-tight leading-tight">${p.t}</h2>
+    <p class="text-sm text-ink2 mt-1.5 mb-4 flex items-center gap-3"><span class="inline-flex items-center gap-1.5">${I('<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3z"/>')}${p.sc} ${p.sc===1?'сцена':p.sc<5?'сцены':'сцен'}</span><span class="inline-flex items-center gap-1.5">${I('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>')}${p.dur}</span></p>
+    ${route(p.step,p.kind==='ok')}
+   </div></article>`}).join('');
+document.getElementById('route-mini').innerHTML=STEPS.map((s,i)=>`<span class="rounded-full px-3 py-1.5 text-[12px] font-semibold ${i===3?'step-on':i<3?'bg-accentsoft text-accent':'glassx text-ink3'} ${i===3||i===2||i===4?'':'hidden sm:inline-block'}">${s}</span>`).join('');
+const T=[['s1-draft-last','Дубль 1'],['krea2-s1','Дубль 2'],['krea2-s3','Дубль 3']];
+document.getElementById('takes').innerHTML=T.map(([im,n],i)=>`<figure class="min-w-0">
+  <img src="img/${im}.png" alt="${n}" class="w-full aspect-video object-cover rounded-2xl ${i===1?'ring-2 ring-accent ring-offset-2 ring-offset-transparent':''}">
+  <figcaption class="mt-2 flex items-center justify-between gap-2"><span class="text-sm font-semibold">${n}</span>
+   <span class="flex gap-1.5"><button class="rounded-full bg-oksoft text-ok px-3 py-1.5 text-[13px] font-semibold inline-flex items-center gap-1">${I('<path d="M20 6 9 17l-5-5"/>')}Годится</button>
+   <button class="rounded-full glassx text-ink2 px-3 py-1.5 text-[13px] font-semibold inline-flex items-center gap-1">${I('<path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/>')}Пересъёмка</button></span></figcaption></figure>`).join('');
+
+const q=new URLSearchParams(location.search);
+function applyTheme(t){document.documentElement.dataset.theme=t;document.querySelector('.sun').classList.toggle('hidden',t==='dark');document.querySelector('.moon').classList.toggle('hidden',t!=='dark')}
+applyTheme(q.get('theme')==='dark'?'dark':'light');
+document.getElementById('theme').onclick=()=>applyTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');
+function show(){const h=(location.hash||'#projects').slice(1);const v=h==='scene'?'scene':'projects';
+ document.querySelectorAll('.view').forEach(e=>e.classList.toggle('on',e.id==='v-'+v));scrollTo(0,0)}
+addEventListener('hashchange',show);show();
+</script>
+</body>
+</html>

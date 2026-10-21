@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="ru" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Студия — монтажный стол</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap&subset=cyrillic" rel="stylesheet">
+<script>
+  (function () {
+    var t = new URLSearchParams(location.search).get('theme');
+    document.documentElement.setAttribute('data-theme', t === 'dark' ? 'dark' : 'light');
+  })();
+</script>
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.1.13"></script>
+<style type="text/tailwindcss">
+  @theme inline {
+    --font-sans: "Manrope", ui-sans-serif, system-ui, sans-serif;
+    --color-bg: var(--bg);
+    --color-card: var(--card);
+    --color-sunk: var(--sunk);
+    --color-line: var(--line);
+    --color-ink: var(--ink);
+    --color-ink2: var(--ink2);
+    --color-ink3: var(--ink3);
+    --color-ac: var(--ac);
+    --color-ac-ink: var(--ac-ink);
+    --color-ac-soft: var(--ac-soft);
+    --color-ac-text: var(--ac-text);
+    --color-good: var(--good);
+    --color-warn: var(--warn);
+    --radius-card: 20px;
+    --radius-media: 14px;
+    --shadow-card: var(--sh-card);
+    --shadow-lift: var(--sh-lift);
+  }
+  @layer base {
+    :root {
+      --bg: #e9eef2;
+      --card: #ffffff;
+      --sunk: #f3f6f8;
+      --line: #dbe3e9;
+      --ink: #0f1b24;
+      --ink2: #4a5b68;
+      --ink3: #66767f;
+      --ac: #0e7c86;
+      --ac-ink: #ffffff;
+      --ac-soft: #d9f1f2;
+      --ac-text: #0a6670;
+      --good: #12724b;
+      --warn: #8a5a00;
+      --film: #17232b;
+      --sh-card: 0 1px 2px rgba(18,38,52,.06), 0 8px 24px -8px rgba(18,38,52,.14);
+      --sh-lift: 0 2px 4px rgba(18,38,52,.08), 0 18px 40px -12px rgba(18,38,52,.28);
+    }
+    :root[data-theme="dark"] {
+      --bg: #0c1317;
+      --card: #141d23;
+      --sunk: #0f171c;
+      --line: #25333c;
+      --ink: #eaf1f5;
+      --ink2: #a7b7c2;
+      --ink3: #8496a2;
+      --ac: #2cc4c9;
+      --ac-ink: #05262a;
+      --ac-soft: #123b40;
+      --ac-text: #5ed8dc;
+      --good: #4cd19a;
+      --warn: #e5b04c;
+      --film: #070c0f;
+      --sh-card: 0 1px 2px rgba(0,0,0,.4), 0 10px 28px -10px rgba(0,0,0,.6);
+      --sh-lift: 0 2px 4px rgba(0,0,0,.5), 0 20px 44px -14px rgba(0,0,0,.8);
+    }
+    html { color-scheme: light; }
+    html[data-theme="dark"] { color-scheme: dark; }
+    body { font-family: var(--font-sans); background: var(--bg); color: var(--ink); -webkit-font-smoothing: antialiased; }
+    button, input, textarea { font: inherit; color: inherit; }
+    :focus-visible { outline: 2px solid var(--ac); outline-offset: 2px; }
+  }
+  @layer components {
+    .btn { display:inline-flex; align-items:center; justify-content:center; gap:8px; height:44px; padding:0 18px; border-radius:12px; font-weight:700; font-size:14px; border:1px solid var(--line); background:var(--card); box-shadow:var(--sh-card); cursor:pointer; white-space:nowrap; }
+    .btn:hover { border-color: var(--ac); }
+    .btn-pri { background: var(--ac); color: var(--ac-ink); border-color: transparent; }
+    .btn-pri:hover { filter: brightness(1.07); }
+    .lbl { font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--ink3); }
+    .field { width:100%; border:1px solid var(--line); background:var(--sunk); border-radius:12px; padding:12px 14px; font-size:15px; line-height:1.5; resize:none; field-sizing:content; }
+    .field:focus { border-color: var(--ac); background: var(--card); }
+    .hint { font-size:13px; line-height:1.45; color:var(--ink2); }
+    .view { display:none; }
+    .view.on { display:block; }
+    .seg { display:flex; padding:4px; background:var(--sunk); border:1px solid var(--line); border-radius:14px; gap:2px; }
+    .seg button { flex:1; height:40px; border-radius:10px; font-weight:700; font-size:14px; color:var(--ink2); display:flex; align-items:center; justify-content:center; gap:6px; }
+    .seg button.on { background:var(--card); color:var(--ink); box-shadow:var(--sh-card); }
+    .seg button.on svg { color: var(--ac-text); }
+    .route { display:grid; grid-template-columns:repeat(6,1fr); gap:4px; }
+    .route i { height:5px; border-radius:3px; background:var(--line); display:block; }
+    .route i.d { background: var(--ac); }
+    .route i.c { background: linear-gradient(90deg, var(--ac) var(--p,50%), var(--line) var(--p,50%)); }
+    .route span { display:none; }
+    .film { background: var(--film); border-radius: 16px; padding: 22px 14px; position: relative; box-shadow: var(--sh-card); }
+    .film::before, .film::after { content:""; position:absolute; left:10px; right:10px; height:8px; background: repeating-linear-gradient(90deg, rgba(255,255,255,.34) 0 10px, transparent 10px 20px); border-radius:2px; }
+    .film::before { top:7px; } .film::after { bottom:7px; }
+    .take { background:#0b1318; border-radius:8px; overflow:hidden; border:2px solid transparent; }
+    .take.on { border-color: var(--ac); }
+    .tbtn { height:36px; border-radius:9px; font-weight:700; font-size:13px; display:inline-flex; align-items:center; justify-content:center; gap:6px; flex:1; border:1px solid rgba(255,255,255,.22); color:#e6eef2; background:rgba(255,255,255,.07); }
+    .tbtn:hover { border-color:#5ed8dc; }
+    .tbtn.ok { background:#5ed8dc; color:#04262a; border-color:transparent; }
+    .chip { display:inline-flex; align-items:center; gap:6px; height:26px; padding:0 10px; border-radius:999px; font-size:12px; font-weight:700; background:var(--ac-soft); color:var(--ac-text); }
+    details summary { list-style:none; cursor:pointer; }
+    details summary::-webkit-details-marker { display:none; }
+    details[open] .chev { transform: rotate(180deg); }
+  }
+  @media (min-width: 640px) {
+    .route span { display:block; font-size:11px; font-weight:600; color:var(--ink3); margin-top:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .route span.c { color: var(--ac-text); font-weight:800; }
+  }
+</style>
+</head>
+<body class="min-h-screen bg-bg text-ink antialiased">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-film" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 3v18M17 3v18M3 12h18M3 7.5h4M3 16.5h4M17 7.5h4M17 16.5h4"/></g></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></g></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/></g></symbol>
+    <symbol id="i-cpu" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></g></symbol>
+    <symbol id="i-chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-frame" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v18M19 3v18M2 8h3M2 16h3M19 8h3M19 16h3"/><rect x="5" y="3" width="14" height="18"/></g></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 10 5-10 5L2 7z"/><path d="m2 12 10 5 10-5"/><path d="m2 17 10 5 10-5"/></g></symbol>
+    <symbol id="i-type" viewBox="0 0 24 24"><path d="M4 7V5h16v2M9 19h6M12 5v14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l13-7.5z" fill="currentColor"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></g></symbol>
+    <symbol id="i-camera" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7 16 12l7 5z"/><rect x="1" y="5" width="15" height="14" rx="2"/></g></symbol>
+  </defs>
+</svg>
+
+<!-- ============ ШАПКА ============ -->
+<header class="sticky top-0 z-30 border-b border-line bg-bg/90 backdrop-blur">
+  <div class="mx-auto flex max-w-[1360px] flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3 md:px-8">
+    <a href="#projects" class="flex items-center gap-2.5 text-[22px] font-extrabold tracking-tight">
+      <span class="grid h-9 w-9 place-items-center rounded-[11px] bg-ac text-ac-ink"><svg class="h-5 w-5"><use href="#i-film"/></svg></span>
+      Студия
+    </a>
+    <div class="order-3 flex w-full items-center gap-2 rounded-full border border-line bg-card px-3.5 py-2 text-[13px] font-semibold shadow-card md:order-none md:ml-4 md:w-auto" role="status">
+      <span class="relative flex h-2.5 w-2.5"><span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-ac opacity-60"></span><span class="relative inline-flex h-2.5 w-2.5 rounded-full bg-ac"></span></span>
+      <svg class="h-4 w-4 shrink-0 text-ac-text"><use href="#i-cpu"/></svg>
+      <span class="min-w-0 truncate">Видеокарта: считает эскиз сцены 2 · 4:12</span>
+    </div>
+    <div class="ml-auto flex items-center gap-2">
+      <button id="themeBtn" class="btn !h-10 !w-10 !px-0" aria-label="Переключить тему" title="Тема">
+        <svg class="h-[18px] w-[18px]" id="icMoon"><use href="#i-moon"/></svg>
+        <svg class="hidden h-[18px] w-[18px]" id="icSun"><use href="#i-sun"/></svg>
+      </button>
+      <a href="#projects" class="btn !h-10"><svg class="h-4 w-4 text-ac-text"><use href="#i-check"/></svg>Готовое</a>
+    </div>
+  </div>
+</header>
+
+<main class="mx-auto max-w-[1360px] px-4 pb-28 pt-6 md:px-8 md:pb-16 md:pt-9">
+
+<!-- ============ ПРОЕКТЫ ============ -->
+<section id="v-projects" class="view">
+  <div class="mb-6 flex flex-wrap items-end justify-between gap-4 md:mb-8">
+    <div>
+      <h1 class="text-[30px] font-extrabold leading-tight tracking-tight md:text-[40px]">Проекты</h1>
+      <p class="mt-1 text-[15px] text-ink2">4 проекта · один идёт на видеокарте прямо сейчас</p>
+    </div>
+    <div class="flex w-full gap-2.5 sm:w-auto">
+      <a href="#projects" class="btn btn-pri flex-1 sm:flex-none"><svg class="h-4 w-4"><use href="#i-plus"/></svg>Новый проект</a>
+      <a href="#scene" class="btn flex-1 sm:flex-none"><svg class="h-4 w-4 text-ac-text"><use href="#i-plus"/></svg>Одна сцена</a>
+    </div>
+  </div>
+
+  <div id="cards" class="grid gap-5 md:grid-cols-2 md:gap-7"></div>
+</section>
+
+<!-- ============ РЕДАКТОР СЦЕНЫ ============ -->
+<section id="v-scene" class="view">
+  <div class="mb-5 flex flex-wrap items-center gap-x-4 gap-y-2 md:mb-7">
+    <a href="#projects" class="btn !h-10 !px-3" aria-label="К проектам"><svg class="h-4 w-4"><use href="#i-back"/></svg><span class="hidden sm:inline">Проекты</span></a>
+    <div class="min-w-0">
+      <div class="text-[13px] font-semibold text-ink3">Утро в лесу</div>
+      <h1 class="text-[26px] font-extrabold leading-tight tracking-tight md:text-[34px]">Сцена 2 <span class="font-semibold text-ink3">из 2</span></h1>
+    </div>
+  </div>
+
+  <div class="grid gap-5 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)] lg:grid-rows-[auto_1fr] lg:gap-7">
+
+    <!-- герой: первый кадр -->
+    <div class="lg:col-start-1 lg:row-start-1">
+      <figure class="relative overflow-hidden rounded-card bg-[#0b1318] shadow-lift">
+        <img src="img/s1-final-last.png" alt="Последний кадр сцены 1" class="block aspect-video w-full object-cover">
+        <figcaption class="absolute left-3 top-3 flex items-center gap-2 md:left-5 md:top-5">
+          <span class="chip !h-8 !bg-black/55 !text-white backdrop-blur"><svg class="h-3.5 w-3.5"><use href="#i-frame"/></svg>Первый кадр</span>
+          <span class="chip !h-8 !bg-[#5ed8dc] !text-[#04262a]">из сцены 1</span>
+        </figcaption>
+        <div class="absolute bottom-3 right-3 rounded-lg bg-black/55 px-2.5 py-1 text-[12px] font-bold text-white backdrop-blur md:bottom-5 md:right-5">16:9 · 8 с</div>
+      </figure>
+      <p class="hint mt-3">Кадр взят из последнего кадра сцены 1 — сцена продолжит движение с него.</p>
+    </div>
+
+    <!-- форма -->
+    <div class="lg:col-start-2 lg:row-span-2 lg:row-start-1">
+      <div class="rounded-card bg-card p-5 shadow-card md:p-7">
+        <div class="lbl mb-2">Режим</div>
+        <div class="seg" role="tablist" id="modeSeg">
+          <button class="on" role="tab"><svg class="h-4 w-4"><use href="#i-frame"/></svg>От кадра</button>
+          <button role="tab"><svg class="h-4 w-4"><use href="#i-layers"/></svg>Референсы</button>
+          <button role="tab"><svg class="h-4 w-4"><use href="#i-type"/></svg>Текст</button>
+        </div>
+        <div class="mt-3 flex flex-wrap items-center gap-2">
+          <span class="chip"><svg class="h-3.5 w-3.5"><use href="#i-bolt"/></svg>быстро · fl2va</span>
+          <span class="hint">Кадр задан — модель продолжает его.</span>
+        </div>
+
+        <div class="mt-6">
+          <label class="lbl" for="f-act">Действие</label>
+          <textarea id="f-act" class="field mt-2" rows="3">Героиня опускается на колени у кромки воды, что-то шепчет венку и пускает его по течению.</textarea>
+        </div>
+
+        <div class="mt-5">
+          <label class="lbl" for="f-emo">Эмоция и игра <span class="ml-1 normal-case tracking-normal text-ac-text">· обязательно</span></label>
+          <textarea id="f-emo" class="field mt-2" rows="3">Сосредоточенность, переходящая в мягкую грусть: губы беззвучно шепчут, пальцы чуть дрожат, взгляд не отрывается от венка.</textarea>
+          <p class="hint mt-1.5">Состояние и его смена, мимика, взгляд, руки. Без этого герои выходят «как зомби».</p>
+        </div>
+
+        <div class="mt-5">
+          <label class="lbl" for="f-snd">Звук действий</label>
+          <textarea id="f-snd" class="field mt-2" rows="2">Колени глухо стукают о мокрую гальку, ладонь плещет по воде, капли стекают с венка.</textarea>
+          <p class="hint mt-1.5">Материал и контакт. Громкость шагов задаёт походка: крадётся / идёт тихо / топает — не обувь.</p>
+        </div>
+
+        <div class="mt-6 grid grid-cols-3 gap-2.5">
+          <div class="rounded-xl border border-line bg-sunk p-3"><div class="lbl !text-[10.5px] !tracking-normal">Длительность</div><div class="mt-1 text-[20px] font-extrabold">8 с</div></div>
+          <div class="rounded-xl border border-line bg-sunk p-3"><div class="lbl !text-[10.5px] !tracking-normal">Сид</div><div class="mt-1 text-[20px] font-extrabold tabular-nums">88310</div></div>
+          <div class="rounded-xl border border-line bg-sunk p-3"><div class="lbl !text-[10.5px] !tracking-normal">Шаги</div><div class="mt-1 text-[20px] font-extrabold">20</div></div>
+        </div>
+
+        <details class="mt-5 rounded-xl border border-line">
+          <summary class="flex items-center justify-between px-4 py-3 text-[14px] font-bold">
+            <span>Промпт для H3 <span class="ml-1 font-medium text-ink3">· только чтение</span></span>
+            <svg class="chev h-4 w-4 text-ink3 transition-transform"><use href="#i-chev"/></svg>
+          </summary>
+          <pre class="overflow-x-auto whitespace-pre-wrap border-t border-line bg-sunk px-4 py-3 text-[12.5px] leading-relaxed text-ink2">scene: kneels at the water's edge, whispers to the wreath, sets it afloat
+emotion_and_performance: focused, then softly sad; lips move silently, fingers tremble
+sound: knees thud on wet pebbles, palm splashes the water, droplets</pre>
+        </details>
+
+        <div class="mt-6 hidden md:block">
+          <button class="btn btn-pri !h-14 w-full !text-[16px]"><svg class="h-5 w-5"><use href="#i-camera"/></svg>Снять эскиз <span class="font-semibold opacity-80">≈ 4,5 мин</span></button>
+        </div>
+      </div>
+    </div>
+
+    <!-- лента дублей -->
+    <div class="lg:col-start-1 lg:row-start-2 lg:self-start">
+      <div class="mb-3 flex items-baseline justify-between">
+        <h2 class="text-[18px] font-extrabold tracking-tight">Дубли</h2>
+        <span class="text-[13px] font-semibold text-ink3">3 эскиза этой сцены</span>
+      </div>
+      <div class="film">
+        <div class="grid grid-cols-1 gap-3 sm:grid-cols-3" id="takes"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- главная кнопка, закреплена на мобильном -->
+  <div class="fixed inset-x-0 bottom-0 z-40 border-t border-line bg-bg/92 p-3 backdrop-blur md:hidden" style="background: color-mix(in srgb, var(--bg) 92%, transparent)">
+    <button class="btn btn-pri !h-14 w-full !text-[16px]"><svg class="h-5 w-5"><use href="#i-camera"/></svg>Снять эскиз <span class="font-semibold opacity-80">≈ 4,5 мин</span></button>
+  </div>
+</section>
+
+</main>
+
+<script>
+  var STEPS = ['Идея','Кастинг','Сценарий','Эскизы','Финал','Сборка'];
+  var PROJECTS = [
+    { name:'Венок на воде', img:'s1-final-last', step:4, p:50, scenes:4, dur:'0:32', state:'эскизы 2 из 4', tone:'run' },
+    { name:'Утро в лесу',   img:'krea2-s1',      step:4, p:38, scenes:2, dur:'0:16', state:'финал считается 38 %', tone:'run', cur:5 },
+    { name:'Тропа',         img:'krea2-s2',      step:6, p:100, scenes:3, dur:'0:24', state:'готово', tone:'done' },
+    { name:'Проба: Krea 2', img:'krea2-s3',      step:2, p:30, scenes:1, dur:'0:08', state:'черновик', tone:'draft' }
+  ];
+  // текущий шаг (1..6) и прогресс внутри него
+  PROJECTS[0].cur = 4; PROJECTS[0].p = 50;
+  PROJECTS[1].cur = 5; PROJECTS[1].p = 38;
+  PROJECTS[2].cur = 7; PROJECTS[3].cur = 2; PROJECTS[3].p = 30;
+  var ICO = function (n, c) { return '<svg class="' + c + '"><use href="#i-' + n + '"/></svg>'; };
+  var TONE = {
+    run:   'bg-ac-soft text-ac-text',
+    done:  'bg-[color-mix(in_srgb,var(--good)_16%,transparent)] text-good',
+    draft: 'bg-sunk text-ink2 border border-line'
+  };
+  document.getElementById('cards').innerHTML = PROJECTS.map(function (p) {
+    var bars = '', labels = '';
+    STEPS.forEach(function (s, i) {
+      var n = i + 1, cls = '', lc = '';
+      if (n < p.cur) cls = 'd'; else if (n === p.cur) { cls = 'c'; lc = 'c'; }
+      bars += '<div><i class="' + cls + '" style="--p:' + p.p + '%"></i><span class="' + lc + '">' + s + '</span></div>';
+    });
+    var cur = p.cur > 6 ? 'Всё собрано' : 'Шаг ' + p.cur + ' из 6 · ' + STEPS[p.cur - 1];
+    return '<a href="#scene" class="group block overflow-hidden rounded-card bg-card shadow-card transition hover:-translate-y-0.5 hover:shadow-lift">' +
+      '<div class="relative overflow-hidden bg-[#0b1318]">' +
+        '<img src="img/' + p.img + '.png" alt="" class="block aspect-video w-full object-cover transition duration-500 group-hover:scale-[1.03]">' +
+        '<div class="absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-black/55 to-transparent"></div>' +
+        '<div class="absolute bottom-3 left-4 right-4 flex items-end justify-between text-white">' +
+          '<span class="flex items-center gap-1.5 text-[13px] font-bold">' + ICO('film', 'h-4 w-4') + p.scenes + ' ' + (p.scenes === 1 ? 'сцена' : (p.scenes < 5 ? 'сцены' : 'сцен')) + '</span>' +
+          '<span class="flex items-center gap-1.5 rounded-md bg-black/50 px-2 py-0.5 text-[13px] font-bold tabular-nums backdrop-blur">' + ICO('clock', 'h-3.5 w-3.5') + p.dur + '</span>' +
+        '</div>' +
+      '</div>' +
+      '<div class="p-5 md:p-6">' +
+        '<div class="flex items-start justify-between gap-3">' +
+          '<h2 class="text-[21px] font-extrabold leading-tight tracking-tight md:text-[23px]">' + p.name + '</h2>' +
+          '<span class="chip shrink-0 ' + TONE[p.tone] + '">' + (p.tone === 'done' ? ICO('check', 'h-3.5 w-3.5') : '') + p.state + '</span>' +
+        '</div>' +
+        '<div class="route mt-5">' + bars + '</div>' +
+        '<div class="mt-3 text-[13px] font-semibold text-ink2 sm:hidden">' + cur + '</div>' +
+      '</div></a>';
+  }).join('');
+
+  var TAKES = [
+    { img:'s1-draft-last', t:'Дубль 1', seed:'41552' },
+    { img:'krea2-s2',      t:'Дубль 2', seed:'88310', on:true },
+    { img:'krea2-s3',      t:'Дубль 3', seed:'90127' }
+  ];
+  document.getElementById('takes').innerHTML = TAKES.map(function (k) {
+    return '<div class="take' + (k.on ? ' on' : '') + '">' +
+      '<div class="relative"><img src="img/' + k.img + '.png" alt="" class="block aspect-video w-full object-cover">' +
+      '<span class="absolute left-2 top-2 flex h-6 w-6 items-center justify-center rounded-md bg-black/60 text-white">' + ICO('play', 'h-3 w-3') + '</span></div>' +
+      '<div class="px-2.5 pb-2.5 pt-2"><div class="flex items-baseline justify-between text-[13px] font-bold text-[#e6eef2]"><span>' + k.t + '</span><span class="font-medium tabular-nums text-[#9fb2bd]">сид ' + k.seed + '</span></div>' +
+      '<div class="mt-2 flex gap-1.5"><button class="tbtn' + (k.on ? ' ok' : '') + '">' + ICO('check', 'h-3.5 w-3.5') + 'Годится</button><button class="tbtn">' + ICO('redo', 'h-3.5 w-3.5') + 'Пересъёмка</button></div></div></div>';
+  }).join('');
+
+  function route() {
+    var h = location.hash === '#scene' ? 'scene' : 'projects';
+    document.getElementById('v-projects').classList.toggle('on', h === 'projects');
+    document.getElementById('v-scene').classList.toggle('on', h === 'scene');
+    window.scrollTo(0, 0);
+  }
+  window.addEventListener('hashchange', route);
+  route();
+
+  function paintTheme() {
+    var d = document.documentElement.getAttribute('data-theme') === 'dark';
+    document.getElementById('icMoon').style.display = d ? 'none' : 'block';
+    document.getElementById('icSun').style.display = d ? 'block' : 'none';
+  }
+  document.getElementById('themeBtn').addEventListener('click', function () {
+    var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    var u = new URL(location.href); u.searchParams.set('theme', next);
+    history.replaceState(null, '', u);
+    paintTheme();
+  });
+  paintTheme();
+
+  document.querySelectorAll('#modeSeg button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      document.querySelectorAll('#modeSeg button').forEach(function (x) { x.classList.remove('on'); });
+      b.classList.add('on');
+    });
+  });
+</script>
+</body>
+</html>
