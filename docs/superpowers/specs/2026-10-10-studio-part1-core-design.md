@@ -45,6 +45,7 @@
 | Р2-19 | **Число сцен — от 1 и больше**; две сцены — только сценарий приёмки (на них проверяется цепочка), а не ограничение мастера | решение владельца 21.10 | §17.1 п.6 |
 | Р2-20 | **Вёрстка — Tailwind CSS v4** (токены в `@theme`), компоненты — shadcn/ui на Radix со своими токенами; мобильный 390 px первым | решение владельца 21.10 | §5, §17.1 п.7 |
 | Р2-21 | **Дизайн-система «AB»**: визуальный язык направления A (холодный белый, кобальт, Inter Tight / Inter / JetBrains Mono, линии 1px), компоновка и оформление кадров направления B (кадр-герой, дубли лентой-плёнкой, карточки 16:9); не похоже на Anthropic | выбор владельца 21.10 из трёх направлений | §4.4, `docs/design/2026-10-studio-style/AB/` |
+| Р2-22 | **Версия правок сцены `edit_version`** (И1a): +1 на любое изменение любого редактируемого поля, атомарно; O8 и существующие сцены в O7 проверяют `expected_edit_version`; `revision` сохраняет смысл И1 (отпечаток для дублей) | И1 не растит `revision`, когда меняется только `requested_s` (те же кадры) или `state_in_text`/`state_out_text` — устаревший PATCH другой вкладки затирал сохранённую правку (воспроизведено) | ревью плана S0–S1 r6, решение координатора 22.10 |
 
 Отклонённые части находок — в тексте разделов с причиной; сводка — §17.3.
 
@@ -363,6 +364,7 @@ erDiagram
     int idx "порядок, меняется перестановкой"
     int revision "содержание: растёт при правке отпечатка"
     int state_version "одобрения и review_state"
+    int edit_version "И1a: любая правка редактируемого поля (O7/O8)"
     text mode "from_frame|refs|text"
     text action_text
     text performance_text
@@ -488,6 +490,7 @@ bindings_json, requires_json, verified_on) — как в редакции 1. `re
 | # | Инвариант | Где держится |
 |---|---|---|
 | И1 | `scene.revision` растёт на 1 при изменении любого поля отпечатка: `mode, action_text, performance_text, sound_text, music_text, frames, seed, source_frame_kind, source_scene_id, source_frame_asset_id, SCENE_REF`. Одобрение, `review_state`, `title` проекта ревизию сцены не трогают | `ops.update_scene` в одной транзакции |
+| И1a | `scene.edit_version` растёт **ровно на 1** при изменении любого редактируемого поля сцены — `mode`, `action_text`, `performance_text`, `sound_text`, `music_text`, `state_in_text`, `state_out_text`, `requested_s`, `seed`, источник кадра, `SCENE_REF` — в той же транзакции, что и запись; запись без изменений версию не трогает; новая сцена — 0. Тест точным равенством, по случаю на поле | `ops.update_scene`, `ops.replace_scenes` |
 | И2 | `take.inputs_json` пишется **ровно один раз**: из `NULL` в значение при материализации; любое другое `UPDATE` поля — `RAISE(ABORT)` триггером | миграция 001 |
 | И3 | Дубль материализуется только когда все его входы существуют: для продолжения — `upstream_take.status='done'` и `last_frame_asset_id` задан; `keyframe_sha256 = sha256(upstream.last_frame)` | `worker._materialize` в `BEGIN IMMEDIATE` |
 | И4 | Поздний результат: `take.scene_revision < scene.revision` → дубль `stale`, одобрить нельзя (409 `take_stale`), событие `take_stale` | `worker._finish_take`, `ops.approve` |
@@ -531,11 +534,17 @@ bindings_json, requires_json, verified_on) — как в редакции 1. `re
 разбора тела. Одни и те же операции вызывают мастер (§4.4) и MCP (§11).
 
 Версии и ключи:
-- **`expected_revision`** — для операций над содержимым: проекта (O4, O5, O7, O26) и сцены (O8).
-  Не совпало → 409 `revision_conflict`, `detail.current` — снимок.
+- **`expected_revision`** проекта — для операций над его содержимым и составом сцен (O4, O5, O7,
+  O26). Не совпало → 409 `revision_conflict`, `detail.current` — снимок.
+- **`expected_edit_version`** сцены (И1a) — для правки сцены: O8 и каждая сцена с `scene_id` в O7
+  (у новой сцены его нет). Не совпало → 409 `revision_conflict`, `detail.current` — сцена (в O7 ещё
+  `detail.scene_id`). Конфликт правок по `revision` не решается: И1 не растит её на `requested_s`
+  с теми же кадрами и на `state_in_text`/`state_out_text`. Для O7 версия — на каждой сцене, а не
+  общий счётчик проекта: O8 проект не трогает (ниже), иначе правка одной сцены ломала бы чужой O7.
 - **`expected_state_version`** — для одобрения (O16). Не совпало → 409 `state_conflict`.
 - **Правила роста.** `project.revision` +1: O4, O5, O7, O26 (структура и состав сцен). Сцена:
-  `revision` +1 по И1; `state_version` +1 при одобрении, снятии одобрения, смене `review_state`.
+  `revision` +1 по И1; `edit_version` +1 по И1a; `state_version` +1 при одобрении, снятии одобрения,
+  смене `review_state`.
   O8 и O16 проект не трогают — поэтому правка одной сцены не делает устаревшим план другой.
 - **План (O10)** запоминает `revision` и `state_version` каждой сцены плана и каждой сцены-источника
   кадра; O11 сверяет их, не `project.revision`; расхождение → 409 `plan_stale` с перечнем.
@@ -551,8 +560,8 @@ bindings_json, requires_json, verified_on) — как в редакции 1. `re
 | O4 | Изменить проект | `PATCH /projects/{id}` | `expected_revision, title?` (`frame_format` после первого done-дубля — 409 `format_locked`) | проект |
 | O5 | Кастинг | `POST /projects/{id}/cast` | `tag, description_ru, assets[{asset_id, role}], expected_revision` | cast_member с `description_en` |
 | O6 | Импорт ресурса | `POST /assets` (multipart) | файл, `kind?` | asset |
-| O7 | Заменить набор сцен | `PUT /projects/{id}/scenes` | `expected_revision, scenes[{scene_id?, mode, action_text, performance_text, sound_text, music_text?, requested_s, seed?, source_frame{kind, scene_id?, asset_id?}, refs[tag]}]` — порядок массива задаёт `idx` | сцены + `diff{added, unchanged, changed, moved, deleted}` |
-| O8 | Изменить сцену | `PATCH /scenes/{id}` | `expected_revision` + поля (в т.ч. `source_frame{kind:"asset", asset_id}` — подключение кадра) | сцена + `cascade[scene_id]` |
+| O7 | Заменить набор сцен | `PUT /projects/{id}/scenes` | `expected_revision, scenes[{scene_id?, expected_edit_version? (обязателен при scene_id), mode, action_text, performance_text, sound_text, music_text?, requested_s, seed?, source_frame{kind, scene_id?, asset_id?}, refs[tag]}]` — порядок массива задаёт `idx` | сцены + `diff{added, unchanged, changed, moved, deleted}` |
+| O8 | Изменить сцену | `PATCH /scenes/{id}` | `expected_edit_version` + поля (в т.ч. `source_frame{kind:"asset", asset_id}` — подключение кадра) | сцена + `cascade[scene_id]` |
 | O9 | Линт | `POST /projects/{id}/lint` | `scene_ids?` | находки по сценам |
 | O10 | План (сухой) | `POST /projects/{id}/plan` | `kind: render\|image, scene_ids, tier` или `prompt, size` для image | `plan_id, items[{scene_id, template, depends_on_scene?, estimate_s}], total_s, checkpoint_switches, lint, blocked[]` (TTL 10 мин) |
 | O11 | Рендер по плану | `POST /projects/{id}/render` + ключ | `plan_id` | `tasks[{task_id, take_id, scene_id, status}]` — дубли продолжений в `pending_input` |
@@ -1060,7 +1069,7 @@ sequenceDiagram
 | Срез | Дни | Содержание | Приёмка владельцем | Технический гейт |
 |---|---|---|---|---|
 | S0 | 1 | `studio/app.py` :8766, `db.py` + миграция 001 (таблицы пути: project, scene, cast_member, cast_asset, asset, proposal, event, setting, op_log), SSE O21, каркас мастера (React+Vite), шаг 1 | открывает `http://alex-neuro:8766/studio`, создаёт проект, видит его в списке после перезагрузки | И8, И10 красные→зелёные |
-| S1 | 2 | шаги 2–3 мастера: O5/O6, сценарист O25/O26 (`STUDIO_SCENES_SCHEMA`, промпт, снап §6.2), O7/O8 с `scene_id`, `expected_revision`, линтер L1–L6, L7a, L8–L12 | **из идеи получает две сцены**, правит текст, видит находки линта, перезагружает страницу — правки на месте | 409 `revision_conflict`; сопоставление O7 (вставка/удаление/перестановка); каждое правило линта — мутация; И1 |
+| S1 | 2 | шаги 2–3 мастера: O5/O6, сценарист O25/O26 (`STUDIO_SCENES_SCHEMA`, промпт, снап §6.2), O7/O8 с `scene_id`, `expected_revision` / `expected_edit_version` (И1a), линтер L1–L6, L7a, L8–L12 | **из идеи получает две сцены**, правит текст, видит находки линта, перезагружает страницу — правки на месте | 409 `revision_conflict`; сопоставление O7 (вставка/удаление/перестановка); каждое правило линта — мутация; И1 |
 | S2 | 2 | воркер (§8.5 без `submit_unknown`-сценариев), GPU-гейт, правка диспетчера `comfy-studio`, `comfy.py` с шаблоном `krea2-t2i`, O10(image)/O12/O13/O14, O23, шаг 4 мастера | **получает кадр Krea 2** на alex-neuro, видит прогресс и ожидание карты с причиной, подключает кадр к сцене 1 | контракт имитации; `test_ltx_upscale.py` 22/22 без правок; `test_gpu_dispatcher` +`comfy-studio`; живой контракт `krea2-t2i` |
 | S3 | 2 | шаблоны `h3-fl2va`/`h3-ref2va` (после §15 п.1–3), O10/O11 render, `pending_input`/материализация (И2, И3), O16/O17, O18, `estimate_sample`, шаги 5–6 мастера | **снимает эскизы двух сцен** (2-я от кадра 1-й), выбирает, видит конфликт после пересъёмки 1-й и пересъёмку 2-й от выбранной | мутации 1, 3, 4, 5, 6, 7 §12.3; И11 при одобрении |
 | S4 | 2 | финалы, каскад И11 на завершении дубля, `concat_clips` (выделение из `assemble.py`), O19/O20, шаги 7–8, Playwright-сценарий мастера на имитациях | **полный путь критерия §1** на настоящем ComfyUI, mp4 скачан; журнал прохода | `test_studio_path.py` со всеми 12 мутациями; `test_assemble.py` 68/68 без правок; И12 |
