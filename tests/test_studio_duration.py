@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from h3_48gb.studio.duration import snap_frames
+from h3_48gb.studio import duration
+from h3_48gb.studio.duration import seconds, snap_frames
 
 
 @pytest.mark.parametrize("requested_s, frames", [
@@ -15,6 +16,19 @@ from h3_48gb.studio.duration import snap_frames
     (15.0, 345),     # 360 -> 362 is above the bound -> clamped
     (0.5, 73),       # below the bound -> clamped
     (60.0, 345),
+    (6.9375, 175),   # 166.5 frames: tie between 158 and 175 -> up
+    (9.0625, 226),   # 217.5 frames: tie between 209 and 226 -> up
 ])
 def test_snap(requested_s, frames):
     assert snap_frames(requested_s) == frames
+
+
+def test_seconds():
+    assert seconds(192) == 8.0
+    assert seconds(345) == 14.375
+    assert seconds(73) == 73 / 24
+
+
+def test_bounds():
+    assert (duration.MIN_SECONDS, duration.MAX_SECONDS) == (3.0, 15.0)
+    assert (duration.MIN_FRAMES, duration.MAX_FRAMES) == (73, 345)
