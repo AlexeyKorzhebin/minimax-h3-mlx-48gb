@@ -179,13 +179,24 @@ def l6_portrait_drift(scene, project, limits):
     return out
 
 
+def ru_frames(n: int) -> str:
+    """«1 кадр», «2–4 кадра», «5+ кадров», «11–14 кадров»."""
+    if 11 <= n % 100 <= 14:
+        return "кадров"
+    if n % 10 == 1:
+        return "кадр"
+    if 2 <= n % 10 <= 4:
+        return "кадра"
+    return "кадров"
+
+
 def l7a_duration(scene, project, limits):
     if not (MIN_SECONDS <= scene.requested_s <= MAX_SECONDS):
         return [finding("L7a", "error", scene, "requested_s",
                         f"Длительность {scene.requested_s:g} с вне 3–15 с")]
     if scene.frames / 24 != scene.requested_s:
         return [finding("L7a", "info", scene, "requested_s",
-                        f"{scene.frames} кадров = {scene.frames / 24:.3f} с")]
+                        f"{scene.frames} {ru_frames(scene.frames)} = {scene.frames / 24:.3f} с")]
     return []
 
 
