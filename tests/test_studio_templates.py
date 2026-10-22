@@ -103,3 +103,56 @@ def test_an_absent_lora_removes_the_node_and_leaves_the_wiring_alone():
     assert with_lora["prompt"]["lora"]["inputs"] == {
         "model": ["1", 0], "lora_name": "x.safetensors", "strength_model": 0.5}
     assert with_lora["prompt"]["7"]["inputs"]["model"] == ["lora", 0]
+
+
+def test_the_sha256_changes_with_the_card_alone(tmp_path, monkeypatch):
+    """The card carries limits and estimate_s; editing only it must change the recorded hash."""
+    before = templates.load("krea2-t2i").sha256
+    for name in ("krea2-t2i.card.json", "krea2-t2i.graph.json"):
+        (tmp_path / name).write_bytes((PACKAGE / name).read_bytes())
+    card = json.loads((tmp_path / "krea2-t2i.card.json").read_text())
+    card["requires_json"]["estimate_s"] = 7.0
+    (tmp_path / "krea2-t2i.card.json").write_text(json.dumps(card))
+    monkeypatch.setattr(templates, "TEMPLATE_DIR", tmp_path)
+    templates.load.cache_clear()
+    try:
+        assert templates.load("krea2-t2i").sha256 != before
+    finally:
+        templates.load.cache_clear()
+
+
+@pytest.mark.parametrize("template_id", ["h3-fl2va", "h3-ref2va"])
+def test_the_frame_grid_is_17n_plus_5(template_id):
+    t = templates.load(template_id)
+    extra = {"first_frame": "a.png"} if template_id == "h3-fl2va" else {"ref_images": ["a.png"]}
+    base = {"task_id": "T1", "prompt": "p", "seed": 1, "steps": 20, "width": 896, "height": 512,
+            **extra}
+    for ok in (73, 90):
+        payload = t.build_payload({**base, "length": ok})
+        assert payload["prompt"]["6"]["inputs"]["length"] == ok
+    with pytest.raises(TemplateError, match="off the 17k\\+5 grid"):
+        t.build_payload({**base, "length": 78})
+
+
+def _payload_for(template_id, **extra):
+    base = {"task_id": "T1", "prompt": "p", "seed": 1, "width": 896, "height": 512}
+    if template_id == "h3-fl2va":
+        base.update(steps=20, length=73, first_frame="a.png")
+    elif template_id == "h3-ref2va":
+        base.update(steps=20, length=73, ref_images=["a.png", "b.png"])
+    else:
+        base.update(width=768, height=1344)
+    return templates.load(template_id).build_payload({**base, **extra})["prompt"]
+
+
+@pytest.mark.parametrize("template_id,extra", [
+    ("h3-fl2va", {}), ("h3-ref2va", {}), ("krea2-t2i", {}), ("krea2-t2i", {"lora": None}),
+    ("krea2-t2i", {"lora": {"name": "x.safetensors", "strength": 0.5}})])
+def test_every_link_of_the_payload_graph_points_at_an_existing_node(template_id, extra):
+    graph = _payload_for(template_id, **extra)
+    links = [(nid, field, v) for nid, n in graph.items() for field, v in n["inputs"].items()
+             if isinstance(v, list) and len(v) == 2 and isinstance(v[0], str)
+             and isinstance(v[1], int)]
+    assert links, template_id
+    dangling = [(nid, field, v) for nid, field, v in links if v[0] not in graph]
+    assert dangling == []
