@@ -57,3 +57,61 @@ class CastCreate(_Body):
         if len(set(ids)) != len(ids):
             raise ValueError("один и тот же файл указан дважды")
         return value
+
+
+Mode = Literal["from_frame", "refs", "text"]
+_TEXT = Field(default="", max_length=8000)
+
+
+class SourceFrame(_Body):
+    kind: Literal["none", "prev_last_frame", "asset"] = "none"
+    scene_id: str | None = None
+    asset_id: str | None = None
+
+
+class SceneIn(_Body):
+    scene_id: str | None = None
+    # И1a: required for an existing scene (scene_id given) — the edit_version this copy was read at
+    expected_edit_version: int | None = None
+    mode: Mode
+    action_text: str = _TEXT
+    performance_text: str = _TEXT
+    sound_text: str = _TEXT
+    music_text: str = _TEXT
+    state_in_text: str = _TEXT
+    state_out_text: str = _TEXT
+    requested_s: float = Field(gt=0, le=60)
+    seed: int | None = Field(default=None, ge=1, le=2**31 - 1)
+    source_frame: SourceFrame = Field(default_factory=SourceFrame)
+    refs: list[str] = Field(default_factory=list, max_length=12)
+
+
+class DeletedScene(_Body):
+    """A scene the tab removes, at the edit_version it read (И1a): a deletion is an edit too."""
+    scene_id: str
+    expected_edit_version: int
+
+
+class ScenesReplace(_Body):
+    expected_revision: int
+    deleted: list[DeletedScene] = Field(default_factory=list)
+    scenes: list[SceneIn]          # no upper bound: a project may grow without limit (§4.4)
+
+
+class ScenePatch(_Body):
+    expected_edit_version: int
+    mode: Mode | None = None
+    action_text: str | None = Field(default=None, max_length=8000)
+    performance_text: str | None = Field(default=None, max_length=8000)
+    sound_text: str | None = Field(default=None, max_length=8000)
+    music_text: str | None = Field(default=None, max_length=8000)
+    state_in_text: str | None = Field(default=None, max_length=8000)
+    state_out_text: str | None = Field(default=None, max_length=8000)
+    requested_s: float | None = Field(default=None, gt=0, le=60)
+    seed: int | None = Field(default=None, ge=1, le=2**31 - 1)
+    source_frame: SourceFrame | None = None
+    refs: list[str] | None = Field(default=None, max_length=12)
+
+
+class LintRequest(_Body):
+    scene_ids: list[str] | None = None

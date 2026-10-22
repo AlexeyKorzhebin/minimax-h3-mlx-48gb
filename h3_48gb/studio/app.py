@@ -258,6 +258,24 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
                             description_en=body.description_en,
                             portrait_phrase=body.portrait_phrase, llm=llm)
 
+    @app.put(f"{api}/projects/{{project_id}}/scenes")
+    def replace_scenes(body: schemas.ScenesReplace, project_id: str = Depends(project_exists),
+                       conn=Depends(get_conn)):
+        return ops.replace_scenes(conn, project_id, expected_revision=body.expected_revision,
+                                  scenes=[s.model_dump() for s in body.scenes],
+                                  deleted=[d.model_dump() for d in body.deleted])
+
+    @app.patch(f"{api}/scenes/{{scene_id}}")
+    def patch_scene(scene_id: str, body: schemas.ScenePatch, conn=Depends(get_conn)):
+        changes = body.model_dump(exclude={"expected_edit_version"}, exclude_none=True)
+        return ops.update_scene(conn, scene_id, expected_edit_version=body.expected_edit_version,
+                                changes=changes)
+
+    @app.post(f"{api}/projects/{{project_id}}/lint")
+    def lint_project(body: schemas.LintRequest, project_id: str = Depends(project_exists),
+                     conn=Depends(get_conn)):
+        return {"findings": ops.lint_project(conn, project_id, body.scene_ids)}
+
     @app.get(f"{api}/events")
     async def stream_events(request: Request, after: int = 0,
                             last_event_id: int | None = Header(default=None)):
