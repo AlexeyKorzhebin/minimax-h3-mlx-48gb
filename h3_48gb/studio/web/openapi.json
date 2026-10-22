@@ -1,6 +1,32 @@
 {
   "components": {
     "schemas": {
+      "ApplyRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "deleted": {
+            "items": {
+              "$ref": "#/components/schemas/DeletedScene"
+            },
+            "title": "Deleted",
+            "type": "array"
+          },
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "proposal_id": {
+            "title": "Proposal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "expected_revision"
+        ],
+        "title": "ApplyRequest",
+        "type": "object"
+      },
       "Body_import_asset_api_studio_assets_post": {
         "properties": {
           "file": {
@@ -230,6 +256,28 @@
           "expected_revision"
         ],
         "title": "ProjectPatch",
+        "type": "object"
+      },
+      "ProposeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "idea_text": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Idea Text",
+            "type": "string"
+          },
+          "scenes_count": {
+            "default": 2,
+            "minimum": 1.0,
+            "title": "Scenes Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "idea_text"
+        ],
+        "title": "ProposeRequest",
         "type": "object"
       },
       "SceneIn": {
@@ -945,6 +993,100 @@
           }
         },
         "summary": "Add Cast"
+      }
+    },
+    "/api/studio/projects/{project_id}/director/apply": {
+      "post": {
+        "operationId": "apply_api_studio_projects__project_id__director_apply_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Apply"
+      }
+    },
+    "/api/studio/projects/{project_id}/director/propose": {
+      "post": {
+        "operationId": "propose_api_studio_projects__project_id__director_propose_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProposeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Propose"
       }
     },
     "/api/studio/projects/{project_id}/lint": {

@@ -2,11 +2,13 @@
 Every write is one `db.tx` that also writes its event (И8)."""
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
 
 from h3_48gb.studio import db, duration, events, ids, lint
 from h3_48gb.studio.director import cast as cast_card
+from h3_48gb.studio.director import scenarist
 from h3_48gb.studio.errors import StudioError
 from h3_48gb.studio.llm import Llm
 
@@ -467,3 +469,59 @@ def replace_scenes(conn: sqlite3.Connection, project_id: str, *, expected_revisi
         project = project_out(_project_row(conn, project_id))
     return {"project": project, "scenes": out, "diff": diff,
             "lint": lint_project(conn, project_id)}
+
+
+# --- slice S1: scenarist (task 11) ------------------------------------------------------------
+
+
+def propose_scenes(conn: sqlite3.Connection, project_id: str, *, llm: Llm,
+                   idea_text: str, scenes_count: int) -> dict:
+    """O25. Saved as a `proposal`, not applied. The LLM call runs outside any transaction."""
+    prow = _project_row(conn, project_id)
+    cast = []
+    for c in _cast_rows(conn, project_id):
+        has_image = conn.execute("SELECT 1 FROM cast_asset WHERE cast_id = ? AND role = 'image'",
+                                 (c["id"],)).fetchone() is not None
+        cast.append({"tag": c["tag"], "description_en": c["description_en"],
+                     "portrait_phrase": c["portrait_phrase"], "has_image": has_image})
+    scenes, llm_json, dropped = scenarist.propose(
+        llm, idea_text=idea_text, scenes_count=scenes_count, frame_format=prow["frame_format"],
+        style_block=prow["style_block"], cast=cast)
+    proposal_id = ids.new_id("r")
+    with db.tx(conn):
+        conn.execute(
+            "INSERT INTO proposal (id, project_id, project_revision, idea_text, scenes_json, "
+            "llm_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (proposal_id, project_id, prow["revision"], idea_text,
+             json.dumps(scenes, ensure_ascii=False), json.dumps(llm_json, ensure_ascii=False),
+             ids.now_iso()))
+        events.emit(conn, "proposal_created", project_id=project_id,
+                    payload={"proposal_id": proposal_id, "scenes": len(scenes)})
+    # `durations`: what the grid makes of each requested length (§6.2), shown in the preview.
+    durations = [{"frames": f, "duration_s": round(duration.seconds(f), 3)}
+                 for f in (duration.snap_frames(s["requested_s"]) for s in scenes)]
+    return {"proposal_id": proposal_id, "scenes": scenes, "durations": durations,
+            "dropped_tags": dropped}
+
+
+def apply_proposal(conn: sqlite3.Connection, project_id: str, *, proposal_id: str,
+                   expected_revision: int, deleted: list[dict] | None = None) -> dict:
+    """O26: the proposal's scenes replace the project's set through the O7 path."""
+    row = conn.execute("SELECT * FROM proposal WHERE id = ? AND project_id = ?",
+                       (proposal_id, project_id)).fetchone()
+    if row is None:
+        raise StudioError(404, "proposal_not_found", "Предложение не найдено",
+                          {"proposal_id": proposal_id})
+    if row["applied_at"] is not None:
+        raise StudioError(409, "proposal_already_applied", "Это предложение уже применено",
+                          {"proposal_id": proposal_id, "applied_at": row["applied_at"]})
+
+    def mark_applied(c):
+        # Two clicks racing past the check above cannot both land: the second one's
+        # expected_revision is stale by then and replace_scenes refuses it with 409.
+        c.execute("UPDATE proposal SET applied_at = ? WHERE id = ?", (ids.now_iso(), proposal_id))
+
+    return replace_scenes(conn, project_id, expected_revision=expected_revision,
+                          scenes=json.loads(row["scenes_json"]), deleted=deleted,
+                          event_kind="proposal_applied",
+                          event_payload={"proposal_id": proposal_id}, in_tx_hook=mark_applied)

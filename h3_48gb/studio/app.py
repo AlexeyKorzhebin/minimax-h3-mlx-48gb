@@ -276,6 +276,19 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
                      conn=Depends(get_conn)):
         return {"findings": ops.lint_project(conn, project_id, body.scene_ids)}
 
+    @app.post(f"{api}/projects/{{project_id}}/director/propose")
+    def propose(body: schemas.ProposeRequest, project_id: str = Depends(project_exists),
+                conn=Depends(get_conn)):
+        return ops.propose_scenes(conn, project_id, llm=llm, idea_text=body.idea_text,
+                                  scenes_count=body.scenes_count)
+
+    @app.post(f"{api}/projects/{{project_id}}/director/apply")
+    def apply(body: schemas.ApplyRequest, project_id: str = Depends(project_exists),
+              conn=Depends(get_conn)):
+        return ops.apply_proposal(conn, project_id, proposal_id=body.proposal_id,
+                                  expected_revision=body.expected_revision,
+                                  deleted=[d.model_dump() for d in body.deleted])
+
     @app.get(f"{api}/events")
     async def stream_events(request: Request, after: int = 0,
                             last_event_id: int | None = Header(default=None)):
