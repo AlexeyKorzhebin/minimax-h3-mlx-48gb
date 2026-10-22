@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -101,7 +102,8 @@ code = 0
 if args[0] == "ps":                                  # ps -q --no-trunc --filter name=^NAME$
     name = args[-1].split("=^", 1)[1].rstrip("$")
     if name in st["containers"]:
-        print(name)
+        for _ in range(st.get("ps_count", 1)):
+            print(name)
 elif args[0] == "inspect":                           # inspect -f {{.Image}} CONTAINER
     print(st["containers"][args[-1]])
 elif args[:2] == ["image", "inspect"]:               # image inspect -f {{.Id}} REF
@@ -110,6 +112,9 @@ elif args[0] == "tag":
     st["tags"][args[2]] = st["tags"].get(args[1], args[1])
 elif args[0] == "build":
     code = st.get("build_rc", 0)
+    ctx = args[-1]                                   # what the build would send as its context
+    st["build_ctx"] = sorted(os.path.relpath(os.path.join(d, f), ctx)
+                             for d, _, fs in os.walk(ctx) for f in fs)
 elif args[0] == "run":
     code = st.get("run_rc", 1)
 json.dump(st, open(path, "w"))
@@ -153,6 +158,14 @@ def test_rollback_returns_to_the_image_that_was_running_after_a_failed_build_and
     _, st = docker_state(["docker", "tag", "h3-studio:prev", "h3-studio:latest"])   # DEPLOY: Откат
     assert st["tags"] == {"h3-studio:latest": A, "h3-studio:prev": A,
                           "h3-studio:prev-20261021-1200": A, "h3-studio:prev-20261021-1230": A}
+
+
+def test_two_running_studio_containers_fail_and_tag_nothing(docker_state):
+    done, st = docker_state(["bash", str(PREV), "20261021-1200"],
+                            {"containers": {STUDIO: A}, "tags": {}, "ps_count": 2})
+    assert (done.returncode, done.stdout, done.stderr) == (
+        1, "", "expected one studio container, found 2\n")
+    assert st["tags"] == {}
 
 
 def test_prev_on_the_first_deploy_tags_nothing(docker_state):
@@ -200,3 +213,51 @@ def test_a_failed_build_is_a_failed_check(docker_state, tree):
                            cwd=tree)
     assert done.returncode != 0
     assert "no planted secret" not in done.stdout
+
+
+DECOYS = {f"{d}{f}" for d in ("", "conf/")
+          for f in (".env", ".env.local", "providers.json", "decoy.env", "decoy.pem", "decoy.key",
+                    "decoy.sqlite", "decoy.sqlite3", "decoy.db")}
+
+
+def _ignored(pattern: str, path: str) -> bool:
+    """Docker .dockerignore matching for the forms used here: `**/` = any directories (or none),
+    `*` = anything but `/`, no leading `**` = anchored at the context root."""
+    rx = ""
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            rx += "(?:.*/)?"
+            i += 3
+        elif pattern[i] == "*":
+            rx += "[^/]*"
+            i += 1
+        else:
+            rx += re.escape(pattern[i])
+            i += 1
+    return re.fullmatch(rx, path) is not None
+
+
+def test_only_the_committed_tree_is_the_build_context(docker_state, tree):
+    """`git archive HEAD`, not a copy of the working tree: an uncommitted file never reaches it."""
+    (tree / "uncommitted-decoy.txt").write_text("not committed\n")
+    done, st = docker_state(["bash", str(SECRETS)], {"containers": {}, "tags": {}, "run_rc": 1},
+                            cwd=tree)
+    assert done.returncode == 0
+    assert "uncommitted-decoy.txt" not in st["build_ctx"]
+    assert sorted(set(st["build_ctx"]) - DECOYS) == [
+        ".dockerignore", ".gitignore", "Dockerfile.studio", "h3_48gb/studio/web/dist/index.html"]
+
+
+def test_the_planted_decoys_are_exactly_the_expected_set(docker_state, tree):
+    done, st = docker_state(["bash", str(SECRETS)], {"containers": {}, "tags": {}, "run_rc": 1},
+                            cwd=tree)
+    assert {p for p in st["build_ctx"] if p.startswith("conf/") or "/" not in p} & DECOYS == DECOYS
+    assert DECOYS - set(st["build_ctx"]) == set()
+
+
+def test_the_real_dockerignore_ignores_every_decoy():
+    rules = [r.strip() for r in (ROOT / ".dockerignore").read_text().splitlines()
+             if r.strip() and not r.startswith("#")]
+    ignored = {p for p in DECOYS if any(_ignored(r, p) for r in rules)}
+    assert ignored == DECOYS

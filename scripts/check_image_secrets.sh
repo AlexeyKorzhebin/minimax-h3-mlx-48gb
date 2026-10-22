@@ -17,12 +17,16 @@ git -C "$repo" archive HEAD | tar -x -C "$tmp"
 mkdir -p "$tmp/h3_48gb/studio/web/dist"
 cp -R "$dist/." "$tmp/h3_48gb/studio/web/dist/"
 marker="sk-SYNTHETIC-$$-$(date +%s)-CHECK"
-printf 'CAILA_API_KEY=%s\n' "$marker" > "$tmp/.env"
+# Decoys: every name a secret or state file could have, at the root and one directory down.
+# The test reads this list back from the build context and matches it against .dockerignore.
 mkdir -p "$tmp/conf"
-printf 'KEY=%s\n' "$marker" > "$tmp/conf/.env"
-printf '{"key": "%s"}\n' "$marker" > "$tmp/conf/providers.json"
+for d in . conf; do
+  for f in .env .env.local providers.json decoy.env decoy.pem decoy.key decoy.sqlite decoy.sqlite3 decoy.db; do
+    printf 'KEY=%s\n' "$marker" > "$tmp/$d/$f"
+  done
+done
 if [ "${MUTATE_DOCKERIGNORE:-0}" = 1 ]; then
-  grep -v -E '^(\.env|\*\*/\.env|\*\*/\.env\.\*|\*\*/providers\.json)$' "$tmp/.dockerignore" \
+  grep -v -E '^(\.env|\*\*/\.env|\*\*/\.env\.\*|\*\*/providers\.json|\*\*/\*\.(pem|key|sqlite|sqlite-\*|sqlite3|db|env))$' "$tmp/.dockerignore" \
     > "$tmp/.dockerignore.mutated" || true
   mv "$tmp/.dockerignore.mutated" "$tmp/.dockerignore"
 fi
