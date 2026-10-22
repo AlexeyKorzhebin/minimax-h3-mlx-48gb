@@ -39,7 +39,7 @@ def test_migration_001_creates_the_path_tables_and_sets_the_version(tmp_path):
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
         "ORDER BY name")]
     assert names == TABLES
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -48,7 +48,7 @@ def test_migration_001_creates_the_path_tables_and_sets_the_version(tmp_path):
 def test_migrate_twice_is_a_no_op(tmp_path):
     conn = _fresh(tmp_path)
     conn.execute("INSERT INTO setting (key, value) VALUES ('k', 'v')")
-    assert db.migrate(conn) == 1
+    assert db.migrate(conn) == 2
     assert [tuple(r) for r in conn.execute("SELECT value FROM setting")] == [("v",)]
 
 
@@ -320,3 +320,22 @@ def test_studio_error_body_is_the_envelope():
                                     "detail": {"scene_id": "s"}}}
     assert StudioError(404, "nf", "m").body() == {"error": {"code": "nf", "message": "m",
                                                             "detail": {}}}
+
+
+def test_migration_002_adds_source_auto_to_a_database_made_by_001_and_keeps_its_rows(tmp_path):
+    only_001 = tmp_path / "mig"
+    only_001.mkdir()
+    (only_001 / "001_core.sql").write_text((db.MIGRATIONS / "001_core.sql").read_text())
+    conn = db.connect(tmp_path / "old.sqlite")
+    assert db.migrate(conn, only_001) == 1
+    _seed_scene(conn)
+    conn.execute("UPDATE scene SET source_frame_kind = 'prev_last_frame', action_text = 'walks' "
+                 "WHERE id = 's'")
+    conn.commit()
+    assert "source_auto" not in [r[1] for r in conn.execute("PRAGMA table_info(scene)")]
+    assert db.migrate(conn) == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    row = conn.execute("SELECT id, idx, action_text, source_frame_kind, seed, source_auto "
+                       "FROM scene").fetchall()
+    assert [tuple(r) for r in row] == [("s", 0, "walks", "prev_last_frame", 11, 0)]
+    assert conn.execute("SELECT COUNT(*) FROM take").fetchone()[0] == 1

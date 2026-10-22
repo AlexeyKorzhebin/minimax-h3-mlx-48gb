@@ -179,8 +179,10 @@ TEXT_FIELDS = lint.TEXT_FIELDS
 FINGERPRINT_FIELDS = ("mode", "action_text", "performance_text", "sound_text", "music_text",
                       "frames", "seed", "source_frame_kind", "source_scene_id",
                       "source_frame_asset_id")
+#: `source_auto` (derived from the order, not named) is stored and counts as an edit, but is not in
+#: the fingerprint: only WHICH scene is the source changes the content.
 STORED_FIELDS = ("mode", *TEXT_FIELDS, "requested_s", "frames", "seed", "source_frame_kind",
-                 "source_scene_id", "source_frame_asset_id")
+                 "source_scene_id", "source_frame_asset_id", "source_auto")
 
 
 def _new_seed() -> int:
@@ -206,7 +208,8 @@ def scene_out(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
             "requested_s": row["requested_s"], "frames": row["frames"],
             "duration_s": round(duration.seconds(row["frames"]), 3), "seed": row["seed"],
             "source_frame": {"kind": row["source_frame_kind"], "scene_id": row["source_scene_id"],
-                             "asset_id": row["source_frame_asset_id"]},
+                             "asset_id": row["source_frame_asset_id"],
+                             "auto": bool(row["source_auto"])},
             "refs": _ref_tags(conn, row["id"]), "review_state": row["review_state"],
             "approved_sketch_take_id": row["approved_sketch_take_id"],
             "approved_final_take_id": row["approved_final_take_id"]}
@@ -230,22 +233,25 @@ def _fingerprint(fields, refs: list[tuple[str, int, str]]) -> tuple:
 
 
 def _resolve_source(conn: sqlite3.Connection, source: dict, *, prev_id: str | None,
-                    allowed_scene_ids: set[str]) -> tuple[str, str | None, str | None]:
+                    allowed_scene_ids: set[str]) -> tuple[str, str | None, str | None, int]:
+    """(kind, scene, asset, auto). `prev_last_frame` without a scene is derived from the order
+    (auto=1); with a named scene it is the owner's choice (auto=0)."""
     kind = source["kind"]
     if kind == "none":
-        return "none", None, None
+        return "none", None, None, 0
     if kind == "prev_last_frame":
-        scene_id = source.get("scene_id") or prev_id
+        named = source.get("scene_id")
+        scene_id = named or prev_id
         if scene_id is not None and scene_id not in allowed_scene_ids:
             raise StudioError(400, "source_scene_unknown", "Источник кадра — не сцена этого проекта",
                               {"scene_id": scene_id})
-        return "prev_last_frame", scene_id, None
+        return "prev_last_frame", scene_id, None, 0 if named else 1
     asset_id = source.get("asset_id")
     row = conn.execute("SELECT kind FROM asset WHERE id = ?", (asset_id,)).fetchone()
     if row is None or row["kind"] not in ("image", "frame"):
         raise StudioError(400, "asset_unknown", "Кадр для сцены не найден",
                           {"asset_id": asset_id})
-    return "asset", None, asset_id
+    return "asset", None, asset_id, 0
 
 
 def _refs_from_tags(cast_by_tag: dict, tags: list[str]) -> list[tuple[str, int, str]]:
@@ -307,11 +313,11 @@ def update_scene(conn: sqlite3.Connection, scene_id: str, *, expected_edit_versi
         live = _live_scenes(conn, row["project_id"])
         if changes.get("source_frame") is not None:
             earlier = [r["id"] for r in live if r["idx"] < row["idx"]]
-            kind, src_scene, src_asset = _resolve_source(
+            kind, src_scene, src_asset, src_auto = _resolve_source(
                 conn, changes["source_frame"], prev_id=earlier[-1] if earlier else None,
                 allowed_scene_ids={r["id"] for r in live} - {scene_id})
             fields.update(source_frame_kind=kind, source_scene_id=src_scene,
-                          source_frame_asset_id=src_asset)
+                          source_frame_asset_id=src_asset, source_auto=src_auto)
         old_refs = _refs(conn, scene_id)
         refs = old_refs
         if changes.get("refs") is not None:
@@ -367,6 +373,10 @@ def replace_scenes(conn: sqlite3.Connection, project_id: str, *, expected_revisi
             if sid not in live:
                 raise StudioError(400, "scene_unknown", "Такой сцены в проекте нет",
                                   {"scene_id": sid})
+        gone = [d["scene_id"] for d in (deleted or [])]
+        if len(gone) != len(set(gone)):
+            raise StudioError(400, "args_invalid", "scene_id повторяется среди удаляемых",
+                              {"scene_ids": gone})
         removing = {d["scene_id"]: d["expected_edit_version"] for d in (deleted or [])}
         for sid, expected in removing.items():
             if sid not in live:
@@ -388,6 +398,9 @@ def replace_scenes(conn: sqlite3.Connection, project_id: str, *, expected_revisi
         for item in scenes:
             sid = item.get("scene_id")
             if sid is None:
+                if item.get("expected_edit_version") is not None:
+                    raise StudioError(400, "args_invalid", "expected_edit_version нужен только "
+                                      "существующей сцене", {"scene": item.get("action_text")})
                 continue
             if item.get("expected_edit_version") is None:
                 raise StudioError(400, "args_invalid", "Для существующей сцены нужен "
@@ -405,7 +418,7 @@ def replace_scenes(conn: sqlite3.Connection, project_id: str, *, expected_revisi
         conn.execute("UPDATE scene SET idx = -1 - idx WHERE project_id = ? AND deleted_at IS NULL",
                      (project_id,))
         for idx, (sid, item) in enumerate(zip(final_ids, scenes)):
-            kind, src_scene, src_asset = _resolve_source(
+            kind, src_scene, src_asset, src_auto = _resolve_source(
                 conn, item["source_frame"], prev_id=final_ids[idx - 1] if idx else None,
                 allowed_scene_ids=set(final_ids) - {sid})
             refs = _refs_from_tags(cast_by_tag, item["refs"])
@@ -415,7 +428,7 @@ def replace_scenes(conn: sqlite3.Connection, project_id: str, *, expected_revisi
                       "frames": duration.snap_frames(item["requested_s"]),
                       "seed": item["seed"] or (old["seed"] if old else _new_seed()),
                       "source_frame_kind": kind, "source_scene_id": src_scene,
-                      "source_frame_asset_id": src_asset}
+                      "source_frame_asset_id": src_asset, "source_auto": src_auto}
             names = ", ".join(STORED_FIELDS)
             marks = ", ".join("?" for _ in STORED_FIELDS)
             if old is None:

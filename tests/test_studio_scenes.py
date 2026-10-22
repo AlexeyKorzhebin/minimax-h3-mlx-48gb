@@ -62,7 +62,9 @@ def test_put_creates_scenes_in_array_order_with_derived_sources(client):
     assert [(s["idx"], s["revision"], s["frames"], s["duration_s"], s["seed"]) for s in (one, two)] \
         == [(0, 1, 192, 8.0, 101), (1, 1, 124, 5.167, 102)]
     assert two["source_frame"] == {"kind": "prev_last_frame", "scene_id": one["id"],
-                                   "asset_id": None}
+                                   "asset_id": None, "auto": True}
+    assert one["source_frame"] == {"kind": "none", "scene_id": None, "asset_id": None,
+                                   "auto": False}
     assert client.get(f"/api/studio/projects/{p['id']}").json()["scenes"] == body["scenes"]
 
 
@@ -124,7 +126,8 @@ def test_put_with_a_stale_project_revision_is_409(client):
     ("requested_s", 10.0, {"requested_s": 10.0, "frames": 243, "duration_s": 10.125}),
     ("seed", 7, {"seed": 7}),
     ("source_frame", {"kind": "prev_last_frame"},
-     {"source_frame": {"kind": "prev_last_frame", "scene_id": "<first>", "asset_id": None}}),
+     {"source_frame": {"kind": "prev_last_frame", "scene_id": "<first>", "asset_id": None,
+                       "auto": True}}),
     ("refs", ["anna"], {"refs": ["anna"]}),
 ])
 def test_each_fingerprint_field_bumps_the_revision_and_is_stored(client, field, value, stored):
@@ -211,7 +214,7 @@ def test_deleting_the_first_scene_of_a_chain_leaves_an_l12_error_not_a_crash(cli
     assert r.status_code == 200
     (only,) = r.json()["scenes"]
     assert (only["idx"], only["revision"], only["source_frame"]) == (
-        0, 2, {"kind": "prev_last_frame", "scene_id": None, "asset_id": None})
+        0, 2, {"kind": "prev_last_frame", "scene_id": None, "asset_id": None, "auto": True})
     assert [(f["rule"], f["severity"]) for f in r.json()["lint"][b["id"]]] == [("L12", "error")]
 
 
@@ -276,9 +279,9 @@ def test_switching_the_frame_from_one_asset_to_another_is_a_content_change(clien
     r = client.patch(f"/api/studio/scenes/{scene['id']}", json={
         "expected_edit_version": 0, "source_frame": {"kind": "asset", "asset_id": a2}})
     assert (r.json()["scene"]["revision"], r.json()["scene"]["source_frame"]) == (
-        2, {"kind": "asset", "scene_id": None, "asset_id": a2})
+        2, {"kind": "asset", "scene_id": None, "asset_id": a2, "auto": False})
     assert client.get(f"/api/studio/projects/{p['id']}").json()["scenes"][0]["source_frame"] == {
-        "kind": "asset", "scene_id": None, "asset_id": a2}
+        "kind": "asset", "scene_id": None, "asset_id": a2, "auto": False}
 
 
 def test_a_branch_of_frame_sources_is_saved_and_linted(client):
@@ -415,3 +418,275 @@ def test_a_live_scene_neither_kept_nor_deleted_is_409(client):
     assert (stranger.status_code, stranger.json()["error"]["code"]) == (400, "scene_unknown")
     assert [x["id"] for x in client.get(f"/api/studio/projects/{p['id']}").json()["scenes"]] \
         == [s["id"], t["id"]]
+
+
+# --- review of task 10, round 1: content, not form --------------------------------------------
+
+def _event_rows(tmp_path, kinds=None):
+    import sqlite3
+    from h3_48gb.studio import events
+    conn = sqlite3.connect(tmp_path / "out" / "studio" / "studio.sqlite")
+    conn.row_factory = sqlite3.Row
+    try:
+        return [e for e in events.read_after(conn, 0, 1000) if kinds is None or e["kind"] in kinds]
+    finally:
+        conn.close()
+
+
+def _keep(scene, **over):
+    """The scene as the master sends it back through O7: its id and the version it read."""
+    body = {**_scene(action_text=scene["action_text"]), "scene_id": scene["id"],
+            "expected_edit_version": scene["edit_version"]}
+    return {**body, **over}
+
+
+#: (field, new value) — one editable field changed through O7, nothing else.
+O7_FIELDS = [
+    ("mode", "text"), ("action_text", ACTION + " Then she smiles."),
+    ("performance_text", PERF + " Then she laughs."), ("sound_text", "Wind in the reeds."),
+    ("music_text", "A single cello."), ("state_in_text", "She stands."),
+    ("state_out_text", "She leaves."), ("requested_s", 8.1), ("seed", 7),
+    ("source_frame", {"kind": "prev_last_frame"}), ("refs", ["anna"]),
+]
+
+
+@pytest.mark.parametrize("field, value", O7_FIELDS, ids=[f for f, _ in O7_FIELDS])
+def test_o7_bumps_edit_version_by_exactly_one_for_a_single_field_change(client, field, value):
+    """И1a through O7 (review r1, 1): the field the tab changed -> +1 on that scene only; the
+    same body again -> no bump (fields written back unchanged do not count)."""
+    p = _project(client)
+    _with_cast(client, p["id"])
+    one, two = _put(client, p["id"], 2, [_scene(), _scene()]).json()["scenes"]
+    r = _put(client, p["id"], 3, [_keep(one), _keep(two, **{field: value})]).json()["scenes"]
+    assert [s["edit_version"] for s in r] == [0, 1]
+    again = _put(client, p["id"], 4, [_keep(r[0]), _keep(r[1], **{field: value})]).json()["scenes"]
+    assert [s["edit_version"] for s in again] == [0, 1]
+    assert _value(again[1], field) == _value(r[1], field)
+
+
+def test_o8_scene_updated_event_body_is_exact_and_a_noop_emits_nothing(client, tmp_path):
+    p = _project(client)
+    (scene,) = _put(client, p["id"], 1, [_scene()]).json()["scenes"]
+    sid = scene["id"]
+    client.patch(f"/api/studio/scenes/{sid}", json={"expected_edit_version": 0,
+                                                    "state_in_text": "She stands."})
+    client.patch(f"/api/studio/scenes/{sid}", json={"expected_edit_version": 1,
+                                                    "action_text": ACTION + " X"})
+    before = _event_rows(tmp_path)
+    client.patch(f"/api/studio/scenes/{sid}", json={"expected_edit_version": 2,
+                                                    "action_text": ACTION + " X"})   # no change
+    assert _event_rows(tmp_path) == before
+    updated = [(e["project_id"], e["scene_id"], e["payload"])
+               for e in _event_rows(tmp_path, {"scene_updated"})]
+    assert updated == [(p["id"], sid, {"revision": 1, "edit_version": 1,
+                                       "fields": ["state_in_text"]}),
+                       (p["id"], sid, {"revision": 2, "edit_version": 2,
+                                       "fields": ["action_text"]})]
+
+
+def test_o7_emits_scenes_replaced_with_the_exact_diff(client, tmp_path):
+    p = _project(client)
+    a, b = _put(client, p["id"], 1, [_scene(), _scene(action_text=ACTION + " B")]).json()["scenes"]
+    r = _put(client, p["id"], 2, [_keep(b), _scene(action_text=ACTION + " N")], _gone(a)).json()
+    (_, first), = [(e["seq"], e) for e in _event_rows(tmp_path, {"scenes_replaced"})][:1]
+    assert first["payload"] == {"diff": {"added": [a["id"], b["id"]], "unchanged": [],
+                                         "changed": [], "moved": [], "deleted": []}}
+    second = _event_rows(tmp_path, {"scenes_replaced"})[1]
+    assert (second["project_id"], second["scene_id"], second["payload"]) == (
+        p["id"], None, {"diff": r["diff"]})
+    assert r["diff"] == {"added": [r["scenes"][1]["id"]], "unchanged": [], "changed": [],
+                         "moved": [b["id"]], "deleted": [a["id"]]}
+
+
+@pytest.mark.parametrize("method, path, body, loc", [
+    ("patch", "/scenes/{sid}", {"expected_edit_version": 0, "requsted_s": 9},
+     ["body", "requsted_s"]),
+    ("patch", "/scenes/{sid}", {"expected_edit_version": 0,
+                                "source_frame": {"kind": "none", "auto": True}},
+     ["body", "source_frame", "auto"]),
+    ("put", "/projects/{pid}/scenes", {"expected_revision": 2, "scenes": [], "stray": 1},
+     ["body", "stray"]),
+    ("put", "/projects/{pid}/scenes", {"expected_revision": 2, "scenes": [
+        {"mode": "text", "requested_s": 8, "requsted_s": 9}]},
+     ["body", "scenes", 0, "requsted_s"]),
+    ("put", "/projects/{pid}/scenes", {"expected_revision": 2, "scenes": [
+        {"mode": "text", "requested_s": 8, "source_frame": {"kind": "none", "auto": True}}]},
+     ["body", "scenes", 0, "source_frame", "auto"]),
+    ("put", "/projects/{pid}/scenes", {"expected_revision": 2, "scenes": [], "deleted": [
+        {"scene_id": "s", "expected_edit_version": 0, "why": 1}]},
+     ["body", "deleted", 0, "why"]),
+    ("post", "/projects/{pid}/lint", {"scene_idz": []}, ["body", "scene_idz"]),
+], ids=["patch", "patch-source", "put-top", "put-scene", "put-source", "put-deleted", "lint"])
+def test_unknown_fields_are_a_400_naming_the_field_and_nothing_is_written(
+        client, method, path, body, loc):
+    """extra=forbid (review r1, 3): a typo in a field name must not be silently dropped — and
+    the `auto` of a source is the server's to set, never the client's."""
+    p = _project(client)
+    (scene,) = _put(client, p["id"], 1, [_scene()]).json()["scenes"]
+    r = getattr(client, method)("/api/studio" + path.format(sid=scene["id"], pid=p["id"]),
+                                json=body)
+    assert (r.status_code, r.json()["error"]["code"]) == (400, "args_invalid")
+    assert [e["loc"] for e in r.json()["error"]["detail"]["errors"]] == [loc]
+    assert client.get(f"/api/studio/projects/{p['id']}").json()["scenes"] == [scene]
+
+
+def test_seed_bounds_in_o8_and_o7_and_an_explicit_seed_is_kept(client):
+    p = _project(client)
+    (scene,) = _put(client, p["id"], 1, [_scene()]).json()["scenes"]
+    url = f"/api/studio/scenes/{scene['id']}"
+    top = client.patch(url, json={"expected_edit_version": 0, "seed": 2**31 - 1})
+    assert (top.status_code, top.json()["scene"]["seed"]) == (200, 2**31 - 1)
+    for bad in (2**31, 0):
+        r = client.patch(url, json={"expected_edit_version": 1, "seed": bad})
+        assert (r.status_code, r.json()["error"]["code"]) == (400, "args_invalid")
+        r = _put(client, p["id"], 2, [_keep(top.json()["scene"], seed=bad)])
+        assert (r.status_code, r.json()["error"]["code"]) == (400, "args_invalid")
+    ok = _put(client, p["id"], 2, [_keep(top.json()["scene"], seed=2**31 - 1),
+                                   _scene(seed=424242)]).json()["scenes"]
+    assert [s["seed"] for s in ok] == [2**31 - 1, 424242]
+    moved = _put(client, p["id"], 3, [_keep(ok[0], seed=77), _keep(ok[1])]).json()["scenes"]
+    assert [s["seed"] for s in moved] == [77, 424242]       # given seed wins, absent one is kept
+
+
+def test_o8_prev_last_frame_is_the_previous_live_scene_and_never_the_scene_itself(client):
+    p = _project(client)
+    a, b, c, d = _put(client, p["id"], 1, [_scene(action_text=ACTION + f" {n}")
+                                           for n in "ABCD"]).json()["scenes"]
+    _put(client, p["id"], 2, [_keep(a), _keep(c), _keep(d)], _gone(b))
+    r = client.patch(f"/api/studio/scenes/{d['id']}", json={
+        "expected_edit_version": 0, "source_frame": {"kind": "prev_last_frame"}})
+    assert r.json()["scene"]["source_frame"] == {"kind": "prev_last_frame", "scene_id": c["id"],
+                                                 "asset_id": None, "auto": True}
+    me = client.patch(f"/api/studio/scenes/{c['id']}", json={
+        "expected_edit_version": 0, "source_frame": {"kind": "prev_last_frame",
+                                                     "scene_id": c["id"]}})
+    assert (me.status_code, me.json()["error"]["code"], me.json()["error"]["detail"]) == (
+        400, "source_scene_unknown", {"scene_id": c["id"]})
+    first = client.patch(f"/api/studio/scenes/{a['id']}", json={
+        "expected_edit_version": 0, "source_frame": {"kind": "prev_last_frame"}})
+    assert first.json()["scene"]["source_frame"] == {
+        "kind": "prev_last_frame", "scene_id": None, "asset_id": None, "auto": True}
+
+
+def test_lint_gets_the_scenes_cast_tags_from_their_refs(client):
+    """L6 only looks at scenes with the hero on screen: with refs it is a finding on scene 2,
+    with the same texts and no refs there is none (review r1, 6)."""
+    p = _project(client)
+    _with_cast(client, p["id"])                       # anna: «a woman with a braid»
+    braid = ACTION.replace("A woman", "A woman with a braid")
+    hat = ACTION.replace("A woman", "A woman with a red hat")
+    chain = lambda refs: [_scene(action_text=braid, refs=refs),            # noqa: E731
+                          _scene(action_text=hat, refs=refs,
+                                 source_frame={"kind": "prev_last_frame"})]
+    one, two = _put(client, p["id"], 2, chain(["anna"])).json()["scenes"]
+    found = client.post(f"/api/studio/projects/{p['id']}/lint", json={}).json()["findings"]
+    assert found[one["id"]] == []
+    assert [(f["rule"], f["severity"], f["field"]) for f in found[two["id"]]] == [
+        ("L6", "warning", "action_text")]
+    assert found[two["id"]][0]["message"] == (
+        "Описание @anna расходится с другими сценами цепочки: вставьте дословно "
+        "«a woman with a braid»")
+    bare = _put(client, p["id"], 3, [_keep(one, refs=[]), _keep(two, refs=[], source_frame={
+        "kind": "prev_last_frame"})]).json()
+    assert bare["lint"] == {one["id"]: [], two["id"]: []}
+    again = client.post(f"/api/studio/projects/{p['id']}/lint", json={}).json()["findings"]
+    assert again == {one["id"]: [], two["id"]: []}
+
+
+def test_the_409_of_o7_carries_the_whole_current_scene(client):
+    p = _project(client)
+    s, t = _put(client, p["id"], 1, [_scene(), _scene()]).json()["scenes"]
+    client.patch(f"/api/studio/scenes/{s['id']}", json={"expected_edit_version": 0, "seed": 5})
+    now = client.get(f"/api/studio/projects/{p['id']}").json()["scenes"]
+    kept = _put(client, p["id"], 2, [_keep(s), _keep(t)])        # s read at version 0
+    assert (kept.status_code, kept.json()["error"]["detail"]) == (
+        409, {"scene_id": s["id"], "current": now[0]})
+    silent = _put(client, p["id"], 2, [_keep(t)])               # s in neither list
+    assert (silent.status_code, silent.json()["error"]["detail"]) == (
+        409, {"scene_id": s["id"], "current": now[0]})
+    deleting = _put(client, p["id"], 2, [_keep(t)], _gone(s))
+    assert (deleting.status_code, deleting.json()["error"]["detail"]) == (
+        409, {"scene_id": s["id"], "current": now[0]})
+
+
+def test_duplicate_deletions_and_a_version_on_a_new_scene_are_400(client):
+    p = _project(client)
+    s, t = _put(client, p["id"], 1, [_scene(), _scene()]).json()["scenes"]
+    dup = _put(client, p["id"], 2, [_keep(t)], _gone(s) + _gone(s))
+    assert (dup.status_code, dup.json()["error"]["code"], dup.json()["error"]["detail"]) == (
+        400, "args_invalid", {"scene_ids": [s["id"], s["id"]]})
+    fresh = _put(client, p["id"], 2, [_keep(s), _keep(t), _scene(expected_edit_version=0)])
+    assert (fresh.status_code, fresh.json()["error"]["code"]) == (400, "args_invalid")
+    assert [x["id"] for x in client.get(f"/api/studio/projects/{p['id']}").json()["scenes"]] \
+        == [s["id"], t["id"]]
+
+
+# --- the frame source derived from the order is remembered as derived (coordinator ruling) ----
+
+def _src(scene):
+    return (scene["source_frame"]["scene_id"], scene["source_frame"]["auto"])
+
+
+def test_an_auto_source_follows_the_order_and_an_explicit_one_stays_put(client):
+    p = _project(client)
+    a, b, c = _put(client, p["id"], 1, [
+        _scene(), _scene(source_frame={"kind": "prev_last_frame"}, action_text=ACTION + " B"),
+        _scene(source_frame={"kind": "prev_last_frame", "scene_id": None},
+               action_text=ACTION + " C")]).json()["scenes"]
+    assert [_src(x) for x in (a, b, c)] == [(None, False), (a["id"], True), (b["id"], True)]
+    # the master sends the auto source back WITHOUT a scene_id; the order is now a, c, b
+    r = _put(client, p["id"], 2, [_keep(a), _keep(c, source_frame={"kind": "prev_last_frame"}),
+                                  _keep(b, source_frame={"kind": "prev_last_frame"})]).json()
+    assert [(x["id"], *_src(x)) for x in r["scenes"]] == [
+        (a["id"], None, False), (c["id"], a["id"], True), (b["id"], c["id"], True)]
+    # an explicit source names its scene: it does not move with the order and is not auto
+    a2, c2, b2 = r["scenes"]
+    auto = {"source_frame": {"kind": "prev_last_frame"}}
+    e = _put(client, p["id"], 3, [_keep(a2), _keep(c2, **auto), _keep(b2, source_frame={
+        "kind": "prev_last_frame", "scene_id": a["id"]})]).json()["scenes"]
+    assert [_src(x) for x in e] == [(None, False), (a["id"], True), (a["id"], False)]
+    # reorder to a, b, c: b keeps naming a (explicit); c, derived, now follows b
+    again = _put(client, p["id"], 4, [_keep(e[0]), _keep(e[2], source_frame={
+        "kind": "prev_last_frame", "scene_id": a["id"]}), _keep(e[1], source_frame={
+            "kind": "prev_last_frame"})]).json()["scenes"]
+    assert [(x["id"], *_src(x)) for x in again] == [
+        (a["id"], None, False), (b["id"], a["id"], False), (c["id"], b["id"], True)]
+    stored = client.get(f"/api/studio/projects/{p['id']}").json()["scenes"]
+    assert stored == again                       # the flag is stored, not recomputed on read
+
+
+def test_deleting_the_middle_scene_moves_an_auto_source_back_and_refuses_an_explicit_one(client):
+    p = _project(client)
+    a, b, c = _put(client, p["id"], 1, [
+        _scene(), _scene(source_frame={"kind": "prev_last_frame"}, action_text=ACTION + " B"),
+        _scene(source_frame={"kind": "prev_last_frame"}, action_text=ACTION + " C")]).json()["scenes"]
+    auto = _put(client, p["id"], 2, [_keep(a), _keep(c, source_frame={
+        "kind": "prev_last_frame"})], _gone(b))
+    assert auto.status_code == 200
+    (_, moved) = auto.json()["scenes"]
+    assert (moved["id"], moved["revision"], _src(moved)) == (c["id"], 2, (a["id"], True))
+    explicit = _put(client, p["id"], 3, [_keep(a), _keep(moved, source_frame={
+        "kind": "prev_last_frame", "scene_id": a["id"]})])
+    assert explicit.status_code == 200
+    x, y = explicit.json()["scenes"]
+    assert _src(y) == (a["id"], False)
+    # a second middle scene to delete, the next one pointing at it explicitly
+    z = _put(client, p["id"], 4, [_keep(x), _keep(y), _scene(source_frame={
+        "kind": "prev_last_frame"})]).json()["scenes"]
+    cut = _put(client, p["id"], 5, [_keep(z[0]), _keep(z[2], source_frame={
+        "kind": "prev_last_frame", "scene_id": z[1]["id"]})], _gone(z[1]))
+    assert (cut.status_code, cut.json()["error"]["code"], cut.json()["error"]["detail"]) == (
+        400, "source_scene_unknown", {"scene_id": z[1]["id"]})
+
+
+def test_editing_another_scene_leaves_an_auto_source_alone(client):
+    p = _project(client)
+    a, b = _put(client, p["id"], 1, [_scene(), _scene(source_frame={
+        "kind": "prev_last_frame"})]).json()["scenes"]
+    client.patch(f"/api/studio/scenes/{a['id']}", json={"expected_edit_version": 0, "seed": 9})
+    (_, kept) = client.get(f"/api/studio/projects/{p['id']}").json()["scenes"]
+    assert (kept["revision"], kept["edit_version"], _src(kept)) == (1, 0, (a["id"], True))
+    pinned = client.patch(f"/api/studio/scenes/{b['id']}", json={
+        "expected_edit_version": 0, "source_frame": {"kind": "prev_last_frame",
+                                                     "scene_id": a["id"]}}).json()["scene"]
+    assert (pinned["revision"], pinned["edit_version"], _src(pinned)) == (1, 1, (a["id"], False))

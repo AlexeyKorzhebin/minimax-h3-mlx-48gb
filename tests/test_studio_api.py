@@ -221,7 +221,8 @@ def test_an_sse_read_in_flight_keeps_its_connection_until_it_returns(tmp_path, m
 
 def test_health_body_is_exact(tmp_path):
     r = make_client(tmp_path).get("/api/studio/health")
-    assert (r.status_code, r.json()) == (200, {"ok": True, "schema_version": 1})
+    # schema_version is the migration level: 002_scene_source_auto raised it from 1 to 2
+    assert (r.status_code, r.json()) == (200, {"ok": True, "schema_version": 2})
 
 
 def test_root_redirects_to_the_master(tmp_path):
