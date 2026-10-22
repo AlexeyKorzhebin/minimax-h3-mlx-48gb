@@ -2,9 +2,12 @@ import { ChevronLeft } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/api/client";
 import type { Snapshot } from "@/api/types";
+import { MobileActionProvider } from "@/mobileAction";
 import { useEvents } from "@/useEvents";
+import { HeroStep } from "./HeroStep";
+import { ScenarioStep } from "./ScenarioStep";
 
-const RELOAD_ON = ["project_updated"];
+const RELOAD_ON = ["project_updated", "cast_added", "scenes_replaced", "scene_updated", "proposal_applied"];
 
 export function ProjectScreen({ id }: { id: string }) {
   const [snap, setSnap] = useState<Snapshot | null>(null);
@@ -35,6 +38,10 @@ export function ProjectScreen({ id }: { id: string }) {
         <h1 className="h-display mt-2 text-[30px] leading-[1.05] md:text-[44px]">{p.title}</h1>
         {p.idea_text && <p className="mt-3 max-w-[60ch] text-[15px] text-ink2">{p.idea_text}</p>}
       </div>
+      <MobileActionProvider>
+        <HeroStep snap={snap} onChanged={load} />
+        <ScenarioStep snap={snap} onChanged={load} />
+      </MobileActionProvider>
     </main>
   );
 }

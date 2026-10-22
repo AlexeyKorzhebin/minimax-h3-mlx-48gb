@@ -1,6 +1,15 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
 const H = 844;
+const PROJECT = { id: "p_1", revision: 3, title: "Лес", frame_format: "16:9", idea_text: "девушка у озера", style_block: "", created_at: "2026-10-21T10:00:00.000+00:00" };
+const scene = (id: string, idx: number, over: object = {}) => ({
+  id, idx, revision: 1, state_version: 1, edit_version: 1, mode: "from_frame", action_text: "She walks to the lake.",
+  performance_text: "Her gaze drops, then she smiles.", sound_text: "Bare heels on wet planks.", music_text: "none",
+  state_in_text: "", state_out_text: "", requested_s: 8, frames: 192, duration_s: 8, seed: 11,
+  source_frame: { kind: "none", scene_id: null, asset_id: null }, refs: [], review_state: "none",
+  approved_sketch_take_id: null, approved_final_take_id: null, ...over,
+});
+
 type Reply = [number, unknown];
 type Route = Reply | ((body: unknown) => Reply);
 
@@ -35,7 +44,7 @@ async function expectPinned(page: Page, button: Locator) {
   const atEnd = await button.boundingBox();
   expect(Math.round(atEnd!.y + atEnd!.height)).toBe(H - 12);
   const last = await page.locator("main input, main textarea").last().boundingBox();
-  const barTop = (await page.locator("form[aria-label='Новый проект'] > div.fixed").first().boundingBox())!.y;
+  const barTop = (await page.locator("[data-testid=mobile-action-bar], form[aria-label='Новый проект'] > div.fixed").first().boundingBox())!.y;
   expect(last!.y + last!.height).toBeLessThanOrEqual(barTop);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
   await page.evaluate(() => window.scrollTo(0, 0));
@@ -46,6 +55,91 @@ test("step 1: «Создать проект» is pinned", async ({ page }) => {
   await page.goto("/studio/");
   await page.getByRole("button", { name: "Новый проект" }).click();
   await expectPinned(page, page.getByRole("button", { name: "Создать проект" }));
+});
+
+test("steps 2–3: the bar carries — and performs — the main action of the step in hand", async ({ page }) => {
+  // a server with state for two scenes; every snapshot keeps last_seq 5, so the stream is
+  // always opened at exactly ?after=5
+  const scenes: Record<string, ReturnType<typeof scene>> = { s_1: scene("s_1", 0), s_2: scene("s_2", 1) };
+  let conflictOnce = false;
+  const patch = (id: string) => (body: unknown): Reply => {
+    const { expected_edit_version, ...fields } = body as { expected_edit_version: number };
+    if (conflictOnce && id === "s_1") {
+      conflictOnce = false;
+      scenes.s_1 = { ...scenes.s_1, music_text: "other", edit_version: scenes.s_1.edit_version + 1 };
+      return [409, { error: { code: "revision_conflict", message: "x", detail: { current: scenes.s_1 } } }];
+    }
+    if (expected_edit_version !== scenes[id].edit_version) return [409, { error: { code: "revision_conflict", message: "x", detail: { current: scenes[id] } } }];
+    scenes[id] = { ...scenes[id], ...fields, edit_version: scenes[id].edit_version + 1 };
+    return [200, { scene: scenes[id], cascade: [], lint: [] }];
+  };
+  const snapshot = (): Reply => [200, { project: PROJECT, scenes: [scenes.s_1, scenes.s_2], cast: [], takes: [], tasks: [], last_seq: 5 }];
+  const log = await api(page, {
+    "GET /api/studio/projects/p_1": snapshot,
+    "GET /api/studio/events?after=5": [204, null],
+    "POST /api/studio/projects/p_1/lint": [200, { findings: {} }],
+    "POST /api/studio/projects/p_1/cast": [201, {}],
+    "PATCH /api/studio/scenes/s_1": patch("s_1"),
+    "PATCH /api/studio/scenes/s_2": patch("s_2"),
+    "POST /api/studio/projects/p_1/director/propose": [200, {
+      proposal_id: "r_1", dropped_tags: [], durations: [{ frames: 192, duration_s: 8 }],
+      scenes: [{ ...scene("x", 0), scene_id: null, seed: null, source_frame: { kind: "none" } }] }],
+    "POST /api/studio/projects/p_1/director/apply": [200, { project: PROJECT, scenes: [], diff: {}, lint: {} }],
+  });
+  const sent = (key: string) => log.filter((r) => r.key === key).map((r) => r.body);
+  const bar = page.getByTestId("mobile-action-bar");
+  const music = (n: number) => page.getByRole("article", { name: `Сцена ${n}` }).getByLabel("Музыка");
+  await page.goto("/studio/#/p/p_1");
+  await expectPinned(page, bar.getByRole("button", { name: "Предложить сцены" }));
+
+  // step 2 from the bar
+  await page.getByLabel("Тег").fill("anna");
+  await page.getByLabel("Кто это").fill("женщина");
+  await expectPinned(page, bar.getByRole("button", { name: "Сохранить героя" }));
+  await bar.getByRole("button", { name: "Сохранить героя" }).click();
+  await expect(bar.getByRole("button", { name: "Предложить сцены" })).toBeVisible();
+  expect(sent("POST /api/studio/projects/p_1/cast")).toEqual([
+    { expected_revision: 3, tag: "anna", description_ru: "женщина", assets: [] }]);
+
+  // two edited cards: the bar saves the one edited last, then the other
+  await music(1).fill("cello");
+  await music(2).fill("flute");
+  await expectPinned(page, bar.getByRole("button", { name: "Сохранить сцену 2" }));
+  await bar.getByRole("button", { name: "Сохранить сцену 2" }).click();
+  await expect(bar.getByRole("button", { name: "Сохранить сцену 1" })).toBeVisible();
+  await bar.getByRole("button", { name: "Сохранить сцену 1" }).click();
+  await expect(bar.getByRole("button", { name: "Предложить сцены" })).toBeVisible();
+  expect([sent("PATCH /api/studio/scenes/s_2"), sent("PATCH /api/studio/scenes/s_1")]).toEqual([
+    [{ expected_edit_version: 1, music_text: "flute" }], [{ expected_edit_version: 1, music_text: "cello" }]]);
+
+  // a conflict: the bar offers both choices and performs «Сохранить моё»
+  conflictOnce = true;
+  await music(1).fill("mine");
+  await bar.getByRole("button", { name: "Сохранить сцену 1" }).click();
+  await expectPinned(page, bar.getByRole("button", { name: "Сохранить моё" }));
+  await expectPinned(page, bar.getByRole("button", { name: "Взять с сервера" }));
+  await bar.getByRole("button", { name: "Сохранить моё" }).click();
+  await expect(bar.getByRole("button", { name: "Предложить сцены" })).toBeVisible();
+  expect(sent("PATCH /api/studio/scenes/s_1").slice(1)).toEqual([
+    { expected_edit_version: 2, music_text: "mine" }, { expected_edit_version: 3, music_text: "mine" }]);
+  expect(scenes.s_1.music_text).toBe("mine");
+
+  // «Взять с сервера» from the bar
+  conflictOnce = true;
+  await music(1).fill("mine again");
+  await bar.getByRole("button", { name: "Сохранить сцену 1" }).click();
+  await bar.getByRole("button", { name: "Взять с сервера" }).click();
+  await expect(music(1)).toHaveValue("other");
+
+  // step 3 from the bar
+  await bar.getByRole("button", { name: "Предложить сцены" }).click();
+  await expectPinned(page, bar.getByRole("button", { name: "Применить" }));
+  await bar.getByRole("button", { name: "Применить" }).click();
+  await expect(page.getByRole("region", { name: "Предложение сценариста" })).toHaveCount(0);   // applied: the proposal is gone
+  expect(sent("POST /api/studio/projects/p_1/director/apply")).toEqual([{
+    proposal_id: "r_1", expected_revision: 3,
+    deleted: [{ scene_id: "s_1", expected_edit_version: 5 }, { scene_id: "s_2", expected_edit_version: 2 }],
+  }]);
 });
 
 const ITEM = (n: number) => ({
