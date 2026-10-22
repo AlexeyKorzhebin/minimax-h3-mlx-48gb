@@ -86,7 +86,13 @@ class ProviderLlm:
         self.lock_timeout_s = lock_timeout_s
 
     def _config(self) -> tuple[str, dict]:
-        roster = provider.load_providers(self.home)
+        try:
+            roster = provider.load_providers(self.home)
+        except (ValueError, OSError, AttributeError, TypeError):
+            # The file's own text (a JSON error quotes a slice of it) stays out of the refusal.
+            raise StudioError(503, "llm_not_configured",
+                              "Сценарист не настроен: studio/providers.json не читается",
+                              {"provider": self.provider_name}) from None
         name = self.provider_name or roster["active"]
         cfg = roster["providers"].get(name) if name else None
         if cfg is None:
@@ -96,6 +102,11 @@ class ProviderLlm:
         if not cfg["available"]:
             raise StudioError(503, "llm_not_configured",
                               f"Сценарист не настроен: {cfg['reason']}", {"provider": name})
+        needed = "base_url" if cfg.get("type") == "openai" else "port"
+        if not cfg.get(needed):
+            raise StudioError(503, "llm_not_configured",
+                              f"Сценарист не настроен: у провайдера {name} нет {needed}",
+                              {"provider": name})
         return name, cfg
 
     @property
@@ -114,7 +125,9 @@ class ProviderLlm:
                 return provider.chat_with_schema(cfg, provider.load_env(self.home), messages,
                                                  schema, retry_reminder)
             except provider.ProviderError as err:
-                message = SAFE_PROVIDER_MESSAGES.get(err.code, "Сценарист не ответил")
-                # `from None`: the provider's text must not ride along as __cause__ either.
-                raise StudioError(502, "llm_failed", message,
-                                  {"provider": name, "provider_code": err.code}) from None
+                code = err.code      # only the code leaves the handler: not `err`, not its text
+            # Raised outside the `except`: inside it, `__context__` would carry the ProviderError
+            # (its message can quote the model's raw reply or an echoed token) into any traceback.
+            raise StudioError(502, "llm_failed",
+                              SAFE_PROVIDER_MESSAGES.get(code, "Сценарист не ответил"),
+                              {"provider": name, "provider_code": code})
