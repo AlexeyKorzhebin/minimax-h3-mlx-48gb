@@ -304,3 +304,119 @@ def test_the_master_never_serves_a_file_outside_dist(tmp_path):
     for path in ("/studio/..%2Fsecret.txt", "/studio/../secret.txt", "/studio/%2e%2e/secret.txt"):
         assert "SECRET" not in client.get(path).text, path
     assert client.get("/studio/..%2Fsecret.txt").text == "INDEX"
+
+
+# --- fix round 1: the stream, the middleware order, the edges --------------------------------
+
+def _three_events(client):
+    p = client.post("/api/studio/projects", json={"title": "Лес", "frame_format": "16:9"}).json()
+    client.patch(f"/api/studio/projects/{p['id']}", json={"expected_revision": 1, "title": "Б"})
+    client.patch(f"/api/studio/projects/{p['id']}", json={"expected_revision": 2, "title": "В"})
+
+
+def _client_of(app):
+    from fastapi.testclient import TestClient
+    return TestClient(app, base_url="http://127.0.0.1:8766")
+
+
+def test_the_stream_delivers_several_events_once_each_in_order(tmp_path):
+    """A stream that forgets how far it got would send 1, 2, 3, 1, ...: ask for one more event
+    than exist and compare the whole list."""
+    app = create_app(tmp_path / "out")
+    with LiveServer(app) as live:
+        _three_events(_client_of(app))
+        got = read_sse(live.port, "/api/studio/events", count=4, timeout=1.5)
+    assert [(e["id"], e["event"]) for e in got] == [
+        (1, "project_created"), (2, "project_updated"), (3, "project_updated")]
+
+
+def test_an_event_written_after_subscribing_is_delivered_live(tmp_path):
+    import threading
+    app = create_app(tmp_path / "out")
+    with LiveServer(app) as live:
+        box: list = []
+        reader = threading.Thread(target=lambda: box.extend(
+            read_sse(live.port, "/api/studio/events", count=1, timeout=4)))
+        reader.start()
+        time.sleep(0.6)                              # subscribed and idle on an empty journal
+        _client_of(app).post("/api/studio/projects", json={"title": "Лес", "frame_format": "16:9"})
+        reader.join(6)
+    assert [(e["id"], e["event"]) for e in box] == [(1, "project_created")]
+
+
+def test_an_idle_stream_sends_a_ping_comment(tmp_path, monkeypatch):
+    import http.client
+
+    from h3_48gb.studio import app as app_module
+    monkeypatch.setattr(app_module, "SSE_POLL_S", 0.05)
+    monkeypatch.setattr(app_module, "SSE_HEARTBEAT_S", 0.3)
+    app = create_app(tmp_path / "out")
+    with LiveServer(app) as live:
+        conn = http.client.HTTPConnection("127.0.0.1", live.port, timeout=3)
+        conn.request("GET", "/api/studio/events")
+        resp = conn.getresponse()
+        lines = [resp.readline().decode() for _ in range(2)]
+        conn.close()
+    assert lines == [": ping\n", "\n"]
+
+
+def test_after_and_last_event_id_together_take_the_larger(tmp_path):
+    app = create_app(tmp_path / "out")
+    with LiveServer(app) as live:
+        _three_events(_client_of(app))
+        a = read_sse(live.port, "/api/studio/events?after=1", headers={"Last-Event-ID": "2"},
+                     count=3, timeout=1.0)
+        b = read_sse(live.port, "/api/studio/events?after=2", headers={"Last-Event-ID": "1"},
+                     count=3, timeout=1.0)
+    assert ([e["id"] for e in a], [e["id"] for e in b]) == ([3], [3])
+
+
+def test_validation_messages_and_405_and_503_texts(tmp_path):
+    client = make_client(tmp_path, web_dist=tmp_path / "nothing")
+    r = client.post("/api/studio/projects", json={"title": "x", "frame_format": "4:3"})
+    assert r.json()["error"]["detail"]["errors"] == [
+        {"loc": ["body", "frame_format"], "msg": "Input should be '16:9' or '9:16'"}]
+    r = client.put("/api/studio/projects")
+    assert (r.status_code, r.json()) == (405, {"error": {
+        "code": "http_error", "message": "Method Not Allowed", "detail": {}}})
+    r = client.get("/studio/")
+    assert (r.status_code, r.json()) == (503, {"error": {
+        "code": "web_not_built", "message": "Мастер не собран: npm --prefix h3_48gb/studio/web run build",
+        "detail": {}}})
+
+
+def test_the_413_is_json(tmp_path):
+    r = make_client(tmp_path).post("/api/studio/projects", content=b" " * (2 * 1024 * 1024 + 1))
+    assert (r.status_code, r.headers["content-type"]) == (413, "application/json")
+
+
+_VALID = b'{"title": "x", "frame_format": "16:9"}'
+
+
+def test_a_body_of_exactly_the_limit_passes_and_one_byte_more_does_not(tmp_path):
+    limit = 2 * 1024 * 1024
+    client = make_client(tmp_path)
+    hdr = {"Content-Type": "application/json"}
+    at = client.post("/api/studio/projects", content=_VALID + b" " * (limit - len(_VALID)),
+                     headers=hdr)
+    over = client.post("/api/studio/projects", content=_VALID + b" " * (limit + 1 - len(_VALID)),
+                       headers=hdr)
+    assert (at.status_code, over.status_code) == (201, 413)
+
+    def chunked(size):
+        yield _VALID
+        yield b" " * (size - len(_VALID))
+
+    at = client.post("/api/studio/projects", content=chunked(limit), headers=hdr)
+    over = client.post("/api/studio/projects", content=chunked(limit + 1), headers=hdr)
+    assert (at.status_code, over.status_code) == (201, 413)
+
+
+def test_the_master_does_not_serve_a_sibling_directory_sharing_the_prefix(tmp_path):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("INDEX")
+    (tmp_path / "dist-evil").mkdir()
+    (tmp_path / "dist-evil" / "secret.txt").write_text("SECRET")
+    r = make_client(tmp_path, web_dist=dist).get("/studio/..%2Fdist-evil%2Fsecret.txt")
+    assert r.text == "INDEX"

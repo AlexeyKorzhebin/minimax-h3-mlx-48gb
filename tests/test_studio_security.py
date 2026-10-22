@@ -132,3 +132,50 @@ def test_the_default_port_is_part_of_the_origin(app):
     zero = client.post("/api/studio/projects", json={"title": "x", "frame_format": "16:9"},
                        headers={"Origin": "http://localhost:0"})      # port 0 is not port 80
     assert (ok.status_code, no.status_code, zero.status_code) == (201, 403, 403)
+
+
+# --- fix round 1 -----------------------------------------------------------------------------
+
+def test_default_hosts_apply_without_an_explicit_allow_list(tmp_path, monkeypatch):
+    monkeypatch.delenv("STUDIO_ALLOWED_HOSTS", raising=False)
+    app = create_app(tmp_path / "out")
+    assert _client(app, "evil.example").get("/api/studio/health").status_code == 400
+    assert _client(app, "alex-neuro:8766").get("/api/studio/health").status_code == 200
+
+
+def test_middleware_order_is_host_then_guard_then_body_limit(app):
+    big = b"x" * (27 * 1024 * 1024)
+    # guard before the body limit: a foreign origin with a body over even the upload limit -> 403
+    r = _client(app, "alex-neuro:8766").post("/api/studio/assets", content=big, headers=CROSS)
+    assert (r.status_code, r.json()["error"]["code"]) == (403, "cross_origin")
+    # host before the guard: foreign host and an origin that differs from it -> 400, not 403
+    # (an Origin equal to the foreign Host would pass the guard and prove nothing)
+    r = _client(app, "evil.example").post(
+        "/api/studio/projects", json={"title": "x", "frame_format": "16:9"},
+        headers={"Origin": "http://other.example"})
+    assert (r.status_code, r.text) == (400, "Invalid host header")
+    # host before the body limit
+    r = _client(app, "evil.example").post("/api/studio/assets", content=big)
+    assert (r.status_code, r.text) == (400, "Invalid host header")
+
+
+def test_the_403_is_json(app):
+    r = _post_with(app, CROSS)
+    assert (r.status_code, r.headers["content-type"]) == (403, "application/json")
+
+
+@pytest.mark.parametrize("origin", [
+    "http://alex-neuro:8766?a=1",         # query
+    "http://alex-neuro:8766#x",           # fragment
+    "http://:pass@alex-neuro:8766",       # password only (empty user name)
+    "http://user:pass@alex-neuro:8766",   # user and password
+    "http://:8766",                       # empty host name
+])
+def test_more_malformed_origins_are_403(app, origin):
+    r = _post_with(app, {"Origin": origin})
+    assert (r.status_code, r.json()["error"]["detail"]["origin"]) == (403, origin)
+
+
+def test_origin_scheme_and_host_compare_case_insensitively(app):
+    r = _post_with(app, {"Origin": "HTTP://ALEX-NEURO:8766"})
+    assert r.status_code == 201
