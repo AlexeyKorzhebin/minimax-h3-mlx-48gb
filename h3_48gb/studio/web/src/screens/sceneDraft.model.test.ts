@@ -3,7 +3,7 @@ import type { Scene } from "@/api/types";
 import { FakeSceneServer } from "@/test/sceneServer";
 import { scene as makeScene } from "@/test/snapshot";
 import {
-  conflictPairs, dirtyFields, fromScene, init, input, isDirtyField, received, save, saveMine,
+  conflictPairs, dirtyFields, fromScene, init, input, isDirty, isDirtyField, received, save, saveMine,
   sceneSeen, takeServer, type DraftState, type Field, type Outcome, type Request,
 } from "./sceneDraft";
 
@@ -140,6 +140,10 @@ class Run {
       }
       this.ok(dirty === this.justified(f), () => `${f}: dirty=${dirty} but holds an unacknowledged owner's value=${this.justified(f)}`);
     }
+    // invariant 9 (r1): a card that holds nothing unsaved and waits for nothing sits exactly on the
+    // server state it shows — a base left behind would send the next edit with a stale version
+    this.ok(isDirty(s) || s.inflight !== null || s.base === s.server.edit_version,
+      () => `clean card, nothing in flight, base ${s.base} != shown server state ${s.server.edit_version}`);
     // invariant 6: a conflict is only shown while the server is really ahead of the base, and
     // there is something to choose about; its «Сервер» side is the state shown
     if (s.conflict) {

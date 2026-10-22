@@ -70,7 +70,8 @@ describe("ProjectScreen — snapshot, SSE, unsaved edits, conflicts", () => {
     const studio = fakeStudio();
     render(<ProjectScreen id="p_1" />);
     await screen.findByRole("article", { name: "Сцена 2" });
-    expect(FakeEventSource.last!.url).toBe("/api/studio/events?after=5");
+    // the subscription is made in a passive effect, which may run just after the cards appear
+    await until(() => expect(FakeEventSource.last?.url).toBe("/api/studio/events?after=5"));
     await userEvent.type(field(2, /Музыка/), " and a flute");
     await studio.otherWindow("s_1", { expected_edit_version: 1, action_text: "Edited elsewhere." });
     studio.event("s_1");
@@ -247,6 +248,34 @@ const snap = (title: string, revision: number, last_seq: number) => ({
   project: project(title, revision), scenes: [], cast: [], takes: [], tasks: [], last_seq,
 });
 
+
+describe("ProjectScreen — review r1", () => {
+  it("reloads the snapshot on cast_added, scenes_replaced and proposal_applied of its own project", async () => {
+    const calls = stubFetch({ ...LINT, "GET /api/studio/projects/p_1": { body: snapshot({ scenes: [scene()] }) } });
+    render(<ProjectScreen id="p_1" />);
+    await screen.findByRole("article", { name: "Сцена 1" });
+    const gets = () => calls.filter((c) => c.key === "GET /api/studio/projects/p_1").length;
+    let seen = gets();
+    for (const kind of ["cast_added", "scenes_replaced", "proposal_applied"]) {
+      FakeEventSource.last!.emit(kind, { project_id: "p_1" }, 6);
+      await until(() => expect(gets()).toBe(seen + 1));
+      seen += 1;
+    }
+  });
+
+  it("cards are kept by scene id: when the middle scene is deleted elsewhere, S3 keeps its own draft and does not inherit S2's", async () => {
+    let scenes = [scene({ id: "s_1", idx: 0 }), scene({ id: "s_2", idx: 1, music_text: "two" }), scene({ id: "s_3", idx: 2, music_text: "three" })];
+    stubFetch({ ...LINT, "GET /api/studio/projects/p_1": () => ({ body: snapshot({ scenes }) }) });
+    render(<ProjectScreen id="p_1" />);
+    await screen.findByRole("article", { name: "Сцена 3" });
+    await userEvent.type(field(3, /Действие/), " Then she sits.");
+    scenes = [scenes[0], { ...scenes[2], idx: 1 }];
+    FakeEventSource.last!.emit("scenes_replaced", { project_id: "p_1" }, 6);
+    await until(() => expect(screen.queryByRole("article", { name: "Сцена 3" })).toBeNull());
+    expect([field(2, /Действие/).value, field(2, /Музыка/).value]).toEqual(["She walks to the lake. Then she sits.", "three"]);
+    expect(screen.queryByText(/Сцену удалили в другом окне/)).toBeNull();
+  });
+});
 
 describe("ProjectScreen — S0 (snapshot, events, errors)", () => {
   it("subscribes after the snapshot's last_seq and reloads on its own project's event", async () => {

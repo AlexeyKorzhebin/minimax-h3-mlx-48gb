@@ -1,5 +1,5 @@
 import { Plus, Sparkles } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/api/client";
 import type { LintMap, Proposal, Scene, SceneIn, ScenesResult, Snapshot } from "@/api/types";
 import { Field } from "@/components/Field";
@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useIsPhone, useMobileAction } from "@/mobileAction";
 import { SceneCard } from "./SceneCard";
+import { toBody, type Draft, FIELDS } from "./sceneDraft";
 
 const MODE_LABEL = { from_frame: "От кадра", refs: "Референсы", text: "Текст" } as const;
 
@@ -61,6 +62,12 @@ export function afterDelete(scenes: Scene[], removed: Scene): SceneIn[] {
  *  edit another tab saved meanwhile (spec §7 O7/O26, review r7). */
 export const gone = (s: Scene) => ({ scene_id: s.id, expected_edit_version: s.edit_version });
 
+/** The number of the scene this one continues from — by the named scene, not by position. */
+function sourceNo(scenes: Scene[], s: Scene): number | null {
+  const at = s.source_frame.scene_id ? scenes.findIndex((x) => x.id === s.source_frame.scene_id) : -1;
+  return at >= 0 ? at + 1 : null;
+}
+
 const seconds = (s: number) => s.toFixed(3).replace(".", ",");
 
 export function ScenarioStep({ snap, onChanged }: { snap: Snapshot; onChanged: () => void }) {
@@ -73,9 +80,36 @@ export function ScenarioStep({ snap, onChanged }: { snap: Snapshot; onChanged: (
   const [busy, setBusy] = useState(false);
   const castTags = snap.cast.map((c) => c.tag);
 
+  // A late answer of an older lint request must not replace a newer one: cleanup retires it.
   useEffect(() => {
-    api<{ findings: LintMap }>("POST", `/projects/${pid}/lint`, {}).then((r) => setLint(r.findings), () => setLint({}));
+    let current = true;
+    api<{ findings: LintMap }>("POST", `/projects/${pid}/lint`, {}).then(
+      (r) => { if (current) setLint(r.findings); },
+      () => { if (current) setLint({}); },
+    );
+    return () => { current = false; };
   }, [pid, snap.last_seq]);
+
+  // A scene deleted in another window while this card holds unsaved text stays as a card — the
+  // owner decides what to do with the draft. Found during render (before the card unmounts).
+  const dirtyIds = useRef(new Set<string>());
+  const ownDeleted = useRef(new Set<string>());
+  const onDirty = (id: string, dirty: boolean) => { if (dirty) dirtyIds.current.add(id); else dirtyIds.current.delete(id); };
+  const [seen, setSeen] = useState(snap.scenes);
+  const [orphans, setOrphans] = useState<Scene[]>([]);
+  if (seen !== snap.scenes) {
+    setSeen(snap.scenes);
+    const alive = new Set(snap.scenes.map((x) => x.id));
+    for (const id of ownDeleted.current) if (alive.has(id)) ownDeleted.current.delete(id);   // the deletion did not happen
+    const lost = seen.filter((x) => !alive.has(x.id) && dirtyIds.current.has(x.id) && !ownDeleted.current.has(x.id) && !orphans.some((o) => o.id === x.id));
+    if (lost.length > 0 || orphans.some((o) => alive.has(o.id))) {
+      setOrphans((all) => [...all.filter((o) => !alive.has(o.id)), ...lost]);
+    }
+  }
+  const dismiss = (id: string) => {
+    dirtyIds.current.delete(id);
+    setOrphans((all) => all.filter((o) => o.id !== id));
+  };
 
   async function run(action: () => Promise<void>) {
     setBusy(true);
@@ -100,12 +134,27 @@ export function ScenarioStep({ snap, onChanged }: { snap: Snapshot; onChanged: (
     setProposal(null);
     onChanged();
   });
-  const replace = (scenes: SceneIn[], deleted: Scene[] = []) => run(async () => {
+  const replace = (scenes: SceneIn[], deleted: Scene[] = [], after?: () => void) => run(async () => {
     await api<ScenesResult>("PUT", `/projects/${pid}/scenes`, {
       expected_revision: snap.project.revision, scenes, deleted: deleted.map(gone),
     });
+    after?.();
     onChanged();
   });
+  /** «Вернуть как новую сцену»: the draft of a scene deleted elsewhere goes to the end, its frame derived from the order. */
+  const restore = (orphan: Scene, draft: Draft) => {
+    const { expected_edit_version: _v, ...fields } = toBody(draft, [...FIELDS], 0);
+    void _v;
+    return replace([
+      ...snap.scenes.map(toSceneIn),
+      { ...fields, source_frame: { kind: snap.scenes.length ? "prev_last_frame" : "none" } } as SceneIn,
+    ], [], () => dismiss(orphan.id));
+  };
+  const remove = (s: Scene) => {
+    if (dirtyIds.current.has(s.id) && !window.confirm(`В сцене ${s.idx + 1} есть несохранённые правки. Удалить сцену?`)) return;
+    ownDeleted.current.add(s.id);
+    return replace(afterDelete(snap.scenes, s), [s]);
+  };
   const addScene = () => replace([
     ...snap.scenes.map(toSceneIn),
     { mode: "from_frame", requested_s: 8, source_frame: { kind: snap.scenes.length ? "prev_last_frame" : "none" }, refs: [] },
@@ -163,15 +212,21 @@ export function ScenarioStep({ snap, onChanged }: { snap: Snapshot; onChanged: (
       )}
 
       <div className="mt-6 grid gap-4">
-        {snap.scenes.map((s) => (
+        {[...snap.scenes, ...orphans].map((s) => (
           <SceneCard
             key={s.id}
             scene={s}
             castTags={castTags}
             findings={lint[s.id] ?? []}
+            sourceNo={sourceNo(snap.scenes, s)}
+            deleteDisabled={busy}
+            removed={orphans.some((o) => o.id === s.id)}
+            onDirty={onDirty}
+            onRestore={(draft) => restore(s, draft)}
+            onDismiss={() => dismiss(s.id)}
             onSaved={onChanged}
             onConflict={onChanged}
-            onDelete={() => replace(afterDelete(snap.scenes, s), [s])}
+            onDelete={() => remove(s)}
           />
         ))}
         <Button variant="outline" onClick={addScene} disabled={busy} className="justify-self-start">

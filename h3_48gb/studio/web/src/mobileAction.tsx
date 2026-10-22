@@ -44,8 +44,12 @@ export function MobileActionProvider({ children }: { children: ReactNode }) {
         const { [id]: _gone, ...rest } = all;
         return rest;
       }
-      clock.now += 1;
-      return { ...all, [id]: { ...action, at: clock.now } };
+      // Only input moves an action ahead of its equals: a new label or number (a scene moved in
+      // the list) re-registers it with the same `touched` and keeps its place.
+      const prev = all[id];
+      const same = prev && prev.touched === action.touched && prev.priority === action.priority;
+      if (!same) clock.now += 1;
+      return { ...all, [id]: { ...action, at: same ? prev.at : clock.now } };
     });
   }, [clock]);
   const top = useMemo(

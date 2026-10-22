@@ -91,4 +91,26 @@ describe("phone bar: the main action of the step in hand", () => {
     }
     expect(patched()).toHaveLength(5);
   });
+
+  it("r1 №5: after the scenes are reordered the bar still saves the card edited last, by scene id (S1, then S2; order becomes S2, S1)", async () => {
+    phone(true);
+    let scenes = [scene({ id: "s_1", idx: 0 }), scene({ id: "s_2", idx: 1 })];
+    const calls = stubFetch({
+      "GET /api/studio/projects/p_1": () => ({ body: snapshot({ scenes }) }),
+      "POST /api/studio/projects/p_1/lint": { body: { findings: {} } },
+      "PATCH /api/studio/scenes/s_1": { body: { scene: scene({ id: "s_1", edit_version: 1 }), cascade: [], lint: [] } },
+      "PATCH /api/studio/scenes/s_2": { body: { scene: scene({ id: "s_2", edit_version: 1 }), cascade: [], lint: [] } },
+    });
+    render(<ProjectScreen id="p_1" />);
+    const music = async (name: string) => within(await screen.findByRole("article", { name })).getByLabelText(/Музыка/);
+    await userEvent.type(await music("Сцена 1"), "a");      // s_1
+    await userEvent.type(await music("Сцена 2"), "b");      // s_2, edited last
+    await barLabel("Сохранить сцену 2");
+    scenes = [{ ...scenes[1], idx: 0 }, { ...scenes[0], idx: 1 }];
+    FakeEventSource.last!.emit("scenes_replaced", { project_id: "p_1" }, 6);
+    await barLabel("Сохранить сцену 1");                     // s_2 is now the first scene — and still the card in hand
+    await userEvent.click(within(screen.getByTestId("mobile-action-bar")).getByRole("button"));
+    await vi.waitFor(() => expect(calls.some((c) => c.key.startsWith("PATCH"))).toBe(true));
+    expect(calls.filter((c) => c.key.startsWith("PATCH")).map((c) => c.key)).toEqual(["PATCH /api/studio/scenes/s_2"]);
+  });
 });

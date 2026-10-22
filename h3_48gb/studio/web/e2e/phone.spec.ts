@@ -135,6 +135,7 @@ test("steps 2–3: the bar carries — and performs — the main action of the s
   await bar.getByRole("button", { name: "Предложить сцены" }).click();
   await expectPinned(page, bar.getByRole("button", { name: "Применить" }));
   await bar.getByRole("button", { name: "Применить" }).click();
+  await expect(page.getByRole("region", { name: "Предложение сценариста" })).toHaveCount(0);   // applied: the proposal is gone
   expect(sent("POST /api/studio/projects/p_1/director/apply")).toEqual([{
     proposal_id: "r_1", expected_revision: 3,
     deleted: [{ scene_id: "s_1", expected_edit_version: 5 }, { scene_id: "s_2", expected_edit_version: 2 }],

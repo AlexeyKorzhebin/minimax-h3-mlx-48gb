@@ -9,8 +9,8 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useIsPhone, useMobileAction } from "@/mobileAction";
 import {
-  conflictPairs, init, input, isDirty, isStale, received, save, saveMine, sceneSeen, takeServer,
-  type Field as DraftField,
+  conflictPairs, init, isDirtyField, input, isDirty, isStale, received, save, saveMine, sceneSeen, takeServer,
+  type Draft, type Field as DraftField,
 } from "./sceneDraft";
 
 const TEXTS = [
@@ -46,10 +46,22 @@ export function FindingList({ findings }: { findings: Finding[] }) {
   );
 }
 
-export function SceneCard({ scene, castTags, findings, onSaved, onConflict, onDelete }: {
+const badNumber = (v: string) => v.trim() === "" || !Number.isFinite(Number(v));
+export const NUMBER_HINT = "Укажите число — пустое поле не сохраняется";
+export const REMOVED_NOTICE = "Сцену удалили в другом окне. Ваш черновик сохранён здесь — верните его как новую сцену или уберите.";
+
+export function SceneCard({ scene, castTags, findings, sourceNo, deleteDisabled, removed, onDirty, onRestore, onDismiss, onSaved, onConflict, onDelete }: {
   scene: Scene;
   castTags: string[];
   findings: Finding[];
+  /** Number of the scene this one continues from (by `source_frame.scene_id`), if it is in the project. */
+  sourceNo: number | null;
+  deleteDisabled: boolean;
+  /** The scene is gone from the server (deleted in another window) but this card holds unsaved text. */
+  removed: boolean;
+  onDirty: (id: string, dirty: boolean) => void;
+  onRestore: (draft: Draft) => void;
+  onDismiss: () => void;
   onSaved: (r: SceneResult) => void;
   onConflict: () => void;
   onDelete: () => void;
@@ -87,13 +99,27 @@ export function SceneCard({ scene, castTags, findings, onSaved, onConflict, onDe
   const dirty = isDirty(state);
   const refs = draft.refs ? draft.refs.split(",") : [];
 
+  const onDirtyRef = useRef(onDirty);
+  onDirtyRef.current = onDirty;
+  useEffect(() => onDirtyRef.current(scene.id, dirty), [dirty, scene.id]);
+
+  // An empty or non-numeric duration/seed is not sent: the field says so instead.
+  const requestedBad = isDirtyField(state, "requested_s") && (badNumber(draft.requested_s) || Number(draft.requested_s) <= 0);
+  const seedBad = isDirtyField(state, "seed") && (badNumber(draft.seed) || !Number.isInteger(Number(draft.seed)) || Number(draft.seed) < 1);
+  const invalid = requestedBad || seedBad;
+  const doSave = () => { if (!invalid) setState(save); };
+  const doSaveMine = () => { if (!invalid) setState(saveMine); };
+
   const phone = useIsPhone();
-  useMobileAction(`scene-${scene.id}`, conflict
-    ? { label: "Сохранить моё", onClick: () => setState(saveMine), priority: 4, touched: state.inputs,
-        secondary: { label: "Взять с сервера", onClick: () => setState(takeServer) } }
-    : dirty
-      ? { label: `Сохранить сцену ${scene.idx + 1}`, onClick: () => setState(save), priority: 3, touched: state.inputs }
-      : null);
+  useMobileAction(`scene-${scene.id}`, removed
+    ? { label: "Вернуть как новую сцену", onClick: () => onRestore(draft), priority: 3, touched: state.inputs,
+        secondary: { label: "Убрать", onClick: onDismiss } }
+    : conflict
+      ? { label: "Сохранить моё", onClick: doSaveMine, disabled: invalid, priority: 4, touched: state.inputs,
+          secondary: { label: "Взять с сервера", onClick: () => setState(takeServer) } }
+      : dirty
+        ? { label: `Сохранить сцену ${scene.idx + 1}`, onClick: doSave, disabled: invalid, priority: 3, touched: state.inputs }
+        : null);
 
   const byField = (name: string) => findings.filter((f) => f.field === name);
   return (
@@ -101,8 +127,8 @@ export function SceneCard({ scene, castTags, findings, onSaved, onConflict, onDe
       <header className="flex flex-wrap items-center gap-2">
         <h3 className="h-display text-[20px]">Сцена {scene.idx + 1}</h3>
         <Badge variant="outline">{scene.frames} кадров · {scene.duration_s.toFixed(3).replace(".", ",")} с</Badge>
-        {scene.source_frame.kind === "prev_last_frame" && scene.idx > 0 && <Badge variant="outline">от кадра сцены {scene.idx}</Badge>}
-        <Button variant="ghost" size="icon" aria-label={`Удалить сцену ${scene.idx + 1}`} className="ml-auto" onClick={onDelete}>
+        {scene.source_frame.kind === "prev_last_frame" && sourceNo !== null && <Badge variant="outline">от кадра сцены {sourceNo}</Badge>}
+        <Button variant="ghost" size="icon" aria-label={`Удалить сцену ${scene.idx + 1}`} className="ml-auto" disabled={deleteDisabled || removed} onClick={onDelete}>
           <Trash2 />
         </Button>
       </header>
@@ -152,14 +178,19 @@ export function SceneCard({ scene, castTags, findings, onSaved, onConflict, onDe
             <Field text="Длительность, с">
               <Input type="number" min={3} max={15} step={0.5} value={draft.requested_s} onChange={(e) => edit("requested_s", e.target.value)} />
             </Field>
+            {requestedBad && <p className="mt-1 text-[12px] text-danger">{NUMBER_HINT}</p>}
             <FindingList findings={byField("requested_s")} />
           </div>
-          <Field text="Сид">
-            <Input type="number" min={1} value={draft.seed} onChange={(e) => edit("seed", e.target.value)} />
-          </Field>
+          <div>
+            <Field text="Сид">
+              <Input type="number" min={1} value={draft.seed} onChange={(e) => edit("seed", e.target.value)} />
+            </Field>
+            {seedBad && <p className="mt-1 text-[12px] text-danger">{NUMBER_HINT}</p>}
+          </div>
         </div>
         <FindingList findings={findings.filter((f) => f.field === "source_frame" || f.field === null)} />
-        {isStale(state) && <p className="text-[13px] text-warn">{STALE_NOTICE}</p>}
+        {removed && <p role="status" className="text-[13px] text-warn">{REMOVED_NOTICE}</p>}
+        {!removed && isStale(state) && <p className="text-[13px] text-warn">{STALE_NOTICE}</p>}
         {conflict && (
           <div role="group" aria-label="Конфликт правок" className="grid gap-2 rounded-md border border-warn p-3 text-[13px]">
             <p role="alert" className="font-medium">{CONFLICT_MESSAGE}</p>
@@ -173,15 +204,21 @@ export function SceneCard({ scene, castTags, findings, onSaved, onConflict, onDe
             </dl>
             {!phone && (
               <div className="flex flex-wrap gap-2">
-                <Button onClick={() => setState(saveMine)}>Сохранить моё</Button>
+                <Button disabled={invalid} onClick={doSaveMine}>Сохранить моё</Button>
                 <Button variant="outline" onClick={() => setState(takeServer)}>Взять с сервера</Button>
               </div>
             )}
           </div>
         )}
         {error && <p role="alert" className="text-[13px] text-danger">{error}</p>}
-        {!phone && (
-          <Button disabled={!dirty || conflict} onClick={() => setState(save)} className="justify-self-start">
+        {!phone && removed && (
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={() => onRestore(draft)}>Вернуть как новую сцену</Button>
+            <Button variant="outline" onClick={onDismiss}>Убрать</Button>
+          </div>
+        )}
+        {!phone && !removed && (
+          <Button disabled={!dirty || conflict || invalid} onClick={doSave} className="justify-self-start">
             Сохранить сцену
           </Button>
         )}
