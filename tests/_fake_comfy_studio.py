@@ -76,7 +76,9 @@ class FakeComfyStudio:
                  step_s: float = 0.002, fail: str | None = None, hold: bool = False,
                  drop_ws: bool = False, flat: bool = False, comfyui_version: str = "0.42.0",
                  no_prompt_id: bool = False, non_json: bool = False, post_timeout: float = 0.0,
-                 history_pending: int = 0, rename_to: str | None = None):
+                 history_pending: int = 0, rename_to: str | None = None,
+                 torch_version: str = "2.9.1+cu128",
+                 gpu: str = "cuda:0 NVIDIA CMP 170HX 64GB : cudaMallocAsync"):
         self.output_dir = Path(output_dir)
         self.classes = list(classes)
         self.models = {k: list(v) for k, v in models.items()}
@@ -86,6 +88,8 @@ class FakeComfyStudio:
         self.drop_ws = drop_ws
         self.flat = flat
         self.comfyui_version = comfyui_version
+        self.torch_version = torch_version
+        self.gpu = gpu
         self.no_prompt_id = no_prompt_id
         self.non_json = non_json
         self.post_timeout = post_timeout
@@ -333,8 +337,11 @@ class FakeComfyStudio:
                 if path == "/ws":
                     return self._websocket(parse_qs(parts.query).get("clientId", [""])[0])
                 if path == "/system_stats":
-                    return self._send(200, {"system": {"comfyui_version": fake.comfyui_version},
-                                            "devices": []})
+                    system = {"comfyui_version": fake.comfyui_version,
+                              "pytorch_version": fake.torch_version}
+                    system = {k: v for k, v in system.items() if v is not None}
+                    return self._send(200, {"system": system, "devices": [
+                        {"name": fake.gpu, "type": "cuda", "index": 0}] if fake.gpu else []})
                 if path == "/object_info":
                     return self._send(200, {c: {"input": {}} for c in fake.classes})
                 if path.startswith("/models/"):
