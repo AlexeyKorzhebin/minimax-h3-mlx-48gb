@@ -741,6 +741,18 @@ def test_the_panels_engines_are_exactly_what_they_were():
         log_prefix="comfy-panel", start_timeout=600.0, label="ComfyUI")
 
 
+def test_the_studio_engine_is_exactly_the_spec():
+    """Studio spec §8.4: the whole EngineSpec as a literal — start_timeout included (review S2 t1)."""
+    comfy = Path("/home/alex/Projects/comfy-h3")
+    assert gd.engine_specs()["comfy-studio"] == gd.EngineSpec(
+        name="comfy-studio",
+        cmd=("/home/alex/Projects/comfy-h3/.venv/bin/python", "main.py", "--port", "8189",
+             "--output-directory", "/home/alex/Outputs/comfy-h3", "--listen", "127.0.0.1"),
+        cwd=comfy, ready_url=STUDIO_READY, port=8189, markers=("main.py", "--port 8189"),
+        log_dir=comfy / "logs", log_prefix="comfy-studio", start_timeout=600.0,
+        label="ComfyUI студии")
+
+
 def test_acquire_comfy_studio_starts_the_measured_command(tmp_path, host):
     d = _dispatcher(tmp_path, host)
     answer = d.acquire("comfy-studio", "studio-worker")
