@@ -4,6 +4,17 @@ import type { components } from "./schema";
 
 export type ProjectCreate = components["schemas"]["ProjectCreate"];
 export type ProjectPatch = components["schemas"]["ProjectPatch"];
+export type CastCreate = components["schemas"]["CastCreate"];
+export type SceneIn = components["schemas"]["SceneIn"];
+export type ScenePatch = components["schemas"]["ScenePatch"];
+// O25/O26 (task 11) are not in the generated schema.d.ts yet: written out by hand from the plan's
+// contract. After task 11 is merged, take them from `components["schemas"]` again.
+export type ProposeRequest = { idea_text: string; scenes_count: number };
+export type ApplyRequest = {
+  proposal_id: string;
+  expected_revision: number;
+  deleted: { scene_id: string; expected_edit_version: number }[];
+};
 
 export type Project = {
   id: string;
@@ -16,10 +27,63 @@ export type Project = {
 };
 export type ProjectListItem = Project & { scenes_total: number; scenes_done: number };
 
+export type Asset = { id: string; kind: string; sha256: string; bytes: number; mime: string; url: string };
+
+export type CastMember = {
+  id: string;
+  tag: string;
+  description_ru: string;
+  description_en: string;
+  portrait_phrase: string;
+  assets: { asset_id: string; role: "image"; ord: number; url: string }[];
+};
+
+/** What the server ANSWERS. `auto`: a `prev_last_frame` derived from the order, not named by the
+ *  owner. On input the field is forbidden (400): see `toSceneIn`. */
+export type SourceFrame = { kind: "none" | "prev_last_frame" | "asset"; scene_id: string | null; asset_id: string | null; auto: boolean };
+
+export type Scene = {
+  id: string;
+  idx: number;
+  revision: number;
+  state_version: number;
+  /** И1a: +1 on every change of any editable field — the version O7/O8 check. */
+  edit_version: number;
+  mode: "from_frame" | "refs" | "text";
+  action_text: string;
+  performance_text: string;
+  sound_text: string;
+  music_text: string;
+  state_in_text: string;
+  state_out_text: string;
+  requested_s: number;
+  frames: number;
+  duration_s: number;
+  seed: number;
+  source_frame: SourceFrame;
+  refs: string[];
+  review_state: string;
+  approved_sketch_take_id: string | null;
+  approved_final_take_id: string | null;
+};
+
+export type Finding = { rule: string; severity: "error" | "warning" | "info"; scene_id: string; field: string | null; message: string };
+export type LintMap = Record<string, Finding[]>;
+
+export type ProposedScene = Omit<SceneIn, "scene_id">;
+export type Proposal = {
+  proposal_id: string;
+  scenes: ProposedScene[];
+  durations: { frames: number; duration_s: number }[];
+  dropped_tags: string[];
+};
+export type ScenesResult = { project: Project; scenes: Scene[]; diff: Record<string, string[]>; lint: LintMap };
+export type SceneResult = { scene: Scene; cascade: string[]; lint: Finding[] };
+
 export type Snapshot = {
   project: Project;
-  scenes: unknown[];
-  cast: unknown[];
+  scenes: Scene[];
+  cast: CastMember[];
   takes: unknown[];
   tasks: unknown[];
   last_seq: number;
