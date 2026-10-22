@@ -27,6 +27,10 @@ def require_project(conn: sqlite3.Connection, project_id: str) -> None:
     _project_row(conn, project_id)
 
 
+def require_scene(conn: sqlite3.Connection, scene_id: str) -> None:
+    _scene_row(conn, scene_id)
+
+
 def project_out(row: sqlite3.Row) -> dict:
     return {"id": row["id"], "revision": row["revision"], "title": row["title"],
             "frame_format": row["frame_format"], "idea_text": row["idea_text"],
@@ -330,7 +334,7 @@ def update_scene(conn: sqlite3.Connection, scene_id: str, *, expected_edit_versi
             changed.append("refs")
         if changed:
             bump = 0 if _fingerprint(fields, refs) == _fingerprint(row, old_refs) else 1
-            edit_bump = 1 if changed else 0          # И1a: every editable field counts
+            edit_bump = 1                            # И1a: every editable field counts
             sets = ", ".join(f"{name} = ?" for name in STORED_FIELDS)
             conn.execute(f"UPDATE scene SET {sets}, revision = revision + ?, "
                          f"edit_version = edit_version + ? WHERE id = ?",

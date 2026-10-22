@@ -265,8 +265,14 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
                                   scenes=[s.model_dump() for s in body.scenes],
                                   deleted=[d.model_dump() for d in body.deleted])
 
+    def scene_exists(scene_id: str, conn=Depends(get_conn)) -> str:
+        # Like project_exists: a missing scene answers 404 before the body is validated.
+        ops.require_scene(conn, scene_id)
+        return scene_id
+
     @app.patch(f"{api}/scenes/{{scene_id}}")
-    def patch_scene(scene_id: str, body: schemas.ScenePatch, conn=Depends(get_conn)):
+    def patch_scene(body: schemas.ScenePatch, scene_id: str = Depends(scene_exists),
+                    conn=Depends(get_conn)):
         changes = body.model_dump(exclude={"expected_edit_version"}, exclude_none=True)
         return ops.update_scene(conn, scene_id, expected_edit_version=body.expected_edit_version,
                                 changes=changes)

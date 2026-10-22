@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 
 from h3_48gb.studio.duration import MAX_SECONDS, MIN_SECONDS
+from h3_48gb.studio.texts import CYRILLIC
 
 TEXT_FIELDS = ("action_text", "performance_text", "sound_text", "music_text", "state_in_text",
                "state_out_text")
@@ -106,12 +107,9 @@ def l3_material(scene, project, limits):
     return []
 
 
-_CYRILLIC = re.compile(r"[А-Яа-яЁё]")
-
-
 def l4_cyrillic(scene, project, limits):
     return [finding("L4", "error", scene, name, "Кириллица в поле промпта: H3 ждёт английский")
-            for name in TEXT_FIELDS if _CYRILLIC.search(getattr(scene, name))]
+            for name in TEXT_FIELDS if CYRILLIC.search(getattr(scene, name))]
 
 
 _TAG = re.compile(r"@[\w-]+")

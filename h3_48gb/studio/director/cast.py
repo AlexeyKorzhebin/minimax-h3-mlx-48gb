@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 from h3_48gb.studio.errors import StudioError
 from h3_48gb.studio.llm import Llm, validate_reply
+from h3_48gb.studio.texts import CYRILLIC
 
 PROMPT = Path(__file__).parent / "prompts" / "cast.md"
-_CYRILLIC = re.compile(r"[А-Яа-яЁё]")
 MAX_PORTRAIT_WORDS = 30
 
 CAST_SCHEMA = {
@@ -29,7 +28,7 @@ def check_card(description_en: str, portrait_phrase: str) -> None:
     for name, text in (("description_en", description_en), ("portrait_phrase", portrait_phrase)):
         if not text.strip():
             raise StudioError(400, "cast_card_invalid", f"Пустое поле {name}", {"field": name})
-        if _CYRILLIC.search(text):
+        if CYRILLIC.search(text):
             raise StudioError(400, "cast_card_invalid", f"Кириллица в {name}: нужен английский",
                               {"field": name})
     if len(portrait_phrase.split()) > MAX_PORTRAIT_WORDS:
