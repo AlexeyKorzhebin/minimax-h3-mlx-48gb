@@ -59,7 +59,7 @@ class ComfyApi:
         return self._open("GET", "/queue")
 
     def history(self, prompt_id: str) -> dict | None:
-        return self._open("GET", f"/history/{prompt_id}").get(prompt_id)
+        return self._open("GET", f"/history/{urllib.parse.quote(prompt_id, safe='')}").get(prompt_id)
 
     def all_history(self) -> dict:
         return self._open("GET", "/history")
@@ -80,6 +80,8 @@ class ComfyApi:
     def upload_image(self, data: bytes, name: str) -> str:
         """`POST /upload/image` into ComfyUI's input folder under exactly `name`
         (`overwrite=true`: a retried upload replaces its own earlier copy)."""
+        if any(ch in name for ch in '"\r\n/\\') or not name:
+            raise self.error(f"ComfyUI: недопустимое имя файла для загрузки: {name!r}")
         boundary = self.boundary or uuid.uuid4().hex
         b = boundary.encode()
         mime = (mimetypes.guess_type(name)[0] or "application/octet-stream").encode()
@@ -99,10 +101,12 @@ class ComfyApi:
             raise self.error(f"ComfyUI отклонил воркфлоу: {json.dumps(answer)[:2000]}")
         return answer["prompt_id"]
 
-    def interrupt(self) -> None:
-        """Stop the prompt ComfyUI is executing now (triage of task 10/11: a cancelled part
-        otherwise runs its 3.5 min to the end and the next job queues behind it)."""
-        self._open("POST", "/interrupt", b"{}", {"Content-Type": "application/json"})
+    def interrupt(self, prompt_id: str | None = None) -> None:
+        """Stop what ComfyUI is executing (triage of task 10/11: a cancelled part otherwise runs
+        its 3.5 min to the end and the next job queues behind it). With `prompt_id` only that
+        prompt, and only if it runs now (server.py `post_interrupt`); without — whatever runs."""
+        body = json.dumps({"prompt_id": prompt_id}).encode() if prompt_id else b"{}"
+        self._open("POST", "/interrupt", body, {"Content-Type": "application/json"})
 
     def delete_queued(self, prompt_ids: list[str]) -> None:
         self._post_json("/queue", {"delete": list(prompt_ids)})

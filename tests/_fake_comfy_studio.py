@@ -14,7 +14,18 @@ fake unchanged. What this one adds, per §12.1:
 - pictures are read through the graph's links (`first_frame`, `ref_images.ref_image_<i>` of the
   H3 node, in that order) — an unconnected or swapped LoadImage changes the result;
 - `upload_fields` — the form fields of each upload (`type`, `overwrite`); `GET /view` serves
-  an uploaded input back.
+  an uploaded input back (only `type=input`, no subfolder, as an upload lands);
+- as ComfyUI's server.py answers (0.36): `POST /interrupt` and `POST /queue` reply 200 with an
+  EMPTY body, a targeted interrupt (`{"prompt_id": ...}`) only touches the prompt that runs now,
+  `extra_data` gets the top-level `client_id` over its own and no `client_id` key without one;
+  a graph with no save node or a LoadImage the server never received is a 400 on `/prompt`;
+- more scenarios: `no_prompt_id` (200 without `prompt_id`), `non_json` (200, body not JSON),
+  `post_timeout=s` (the prompt is accepted, the answer comes `s` seconds late),
+  `history_pending=n` (the first `n` polls of a finished prompt find no entry yet),
+  `rename_to` (an upload is stored and answered under another name);
+- WebSocket, in ComfyUI's order: `status` on connect, `execution_start`, `executing` with the
+  node, `progress` + a binary preview frame per step, `executed`, `executing` with `node: null`;
+  `restart()` closes the sockets.
 """
 from __future__ import annotations
 
@@ -49,6 +60,7 @@ STUDIO_MODELS = {
             "qwen_image_vae.safetensors"],
 }
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_PREVIEW = b"\xff\xd8preview"
 
 
 def read_comment(mp4: Path) -> dict:
@@ -62,7 +74,9 @@ def read_comment(mp4: Path) -> dict:
 class FakeComfyStudio:
     def __init__(self, output_dir: Path, *, classes=STUDIO_CLASSES, models=STUDIO_MODELS,
                  step_s: float = 0.002, fail: str | None = None, hold: bool = False,
-                 drop_ws: bool = False, flat: bool = False, comfyui_version: str = "0.42.0"):
+                 drop_ws: bool = False, flat: bool = False, comfyui_version: str = "0.42.0",
+                 no_prompt_id: bool = False, non_json: bool = False, post_timeout: float = 0.0,
+                 history_pending: int = 0, rename_to: str | None = None):
         self.output_dir = Path(output_dir)
         self.classes = list(classes)
         self.models = {k: list(v) for k, v in models.items()}
@@ -72,6 +86,19 @@ class FakeComfyStudio:
         self.drop_ws = drop_ws
         self.flat = flat
         self.comfyui_version = comfyui_version
+        self.no_prompt_id = no_prompt_id
+        self.non_json = non_json
+        self.post_timeout = post_timeout
+        self.history_pending = history_pending
+        self.rename_to = rename_to
+        self.upload_bodies: list[bytes] = []
+        self.upload_content_types: list[str] = []
+        self.upload_mimes: dict[str, str] = {}
+        self.view_requests: list[dict] = []
+        self.interrupt_bodies: list[dict] = []
+        self.requests: list[tuple[str, str]] = []
+        self._history_polls: dict[str, int] = {}
+        self._ws_lock = threading.Lock()
         self.upload_fields: dict[str, dict] = {}
         self.uploads: dict[str, bytes] = {}
         self.prompts: list[dict] = []
@@ -117,6 +144,14 @@ class FakeComfyStudio:
             self._interrupt = True
             self._lock.notify_all()
         self._released.set()
+        with self._ws_lock:
+            sockets = [s for socks in self._sockets.values() for s in socks]
+            self._sockets.clear()
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def wait_idle(self, timeout: float = 30.0) -> None:
         deadline = time.monotonic() + timeout
@@ -138,7 +173,12 @@ class FakeComfyStudio:
                 job = self._pending.pop(0)
                 self._running = job
                 self._interrupt = False
-            self._run(job)
+            try:
+                self._run(job)
+            except Exception as exc:  # a graph the fake cannot run is a failed prompt, not a dead thread
+                self._finish(job, {"status_str": "error", "completed": False, "messages": [
+                    ["execution_error", {"prompt_id": job["prompt_id"],
+                                         "exception_message": f"{type(exc).__name__}: {exc}"}]]}, {})
             with self._lock:
                 self._lock.notify_all()
 
@@ -146,13 +186,20 @@ class FakeComfyStudio:
         pid, graph = job["prompt_id"], job["prompt"]
         self._send(job["client_id"], {"type": "execution_start", "data": {"prompt_id": pid}})
         steps = _steps(graph)
+        sampler = next((k for k, n in graph.items()
+                        if n["class_type"] in ("BasicScheduler", "KSampler")), None)
+        node_id = sampler or next(k for k, n in graph.items()
+                                  if n["class_type"] in ("SaveImage", "SaveVideo"))
+        self._send(job["client_id"], {"type": "executing",
+                                      "data": {"node": node_id, "prompt_id": pid}})
         for value in range(1, steps + 1):
             if self.hold and not self._released.is_set():
                 self._released.wait()
             if self._interrupted(job):
                 return
             self._send(job["client_id"], {"type": "progress", "data": {
-                "value": value, "max": steps, "prompt_id": pid, "node": "11"}})
+                "value": value, "max": steps, "prompt_id": pid, "node": node_id}})
+            self._send_binary(job["client_id"], struct.pack(">II", 1, 1) + _PREVIEW)
             time.sleep(self.step_s)
         if self._interrupted(job):
             return
@@ -163,6 +210,9 @@ class FakeComfyStudio:
             self._finish(job, status, {})
             return
         outputs = self._write_outputs(graph)
+        for save_id, output in outputs.items():
+            self._send(job["client_id"], {"type": "executed", "data": {
+                "node": save_id, "display_node": save_id, "output": output, "prompt_id": pid}})
         self._finish(job, {"status_str": "success", "completed": True, "messages": [
             ["execution_start", {"prompt_id": pid}], ["execution_success", {"prompt_id": pid}]]},
             outputs)
@@ -231,19 +281,25 @@ class FakeComfyStudio:
                  "-pix_fmt", "yuv420p", "-c:a", "aac",
                  "-metadata", f"comment={json.dumps(record, sort_keys=True)}",
                  str(folder / name)], check=True)
-        sub = str(Path(prefix).parent)
+        sub = "" if str(Path(prefix).parent) == "." else str(Path(prefix).parent)
         return {save_id: {"images": [{"filename": name, "subfolder": sub, "type": "output"}]}}
 
     # -- websocket --------------------------------------------------------------------------
     def _send(self, client_id: str, message: dict) -> None:
-        payload = json.dumps(message).encode()
-        header = bytes([0x81]) + (bytes([len(payload)]) if len(payload) < 126
-                                  else bytes([126]) + struct.pack(">H", len(payload)))
-        for sock in list(self._sockets.get(client_id, [])):
-            try:
-                sock.sendall(header + payload)
-            except OSError:
-                self._sockets[client_id].remove(sock)
+        self._frame(client_id, 0x81, json.dumps(message).encode())
+
+    def _send_binary(self, client_id: str, payload: bytes) -> None:
+        self._frame(client_id, 0x82, payload)
+
+    def _frame(self, client_id: str, opcode: int, payload: bytes) -> None:
+        header = bytes([opcode]) + (bytes([len(payload)]) if len(payload) < 126
+                                    else bytes([126]) + struct.pack(">H", len(payload)))
+        with self._ws_lock:
+            for sock in list(self._sockets.get(client_id, [])):
+                try:
+                    sock.sendall(header + payload)
+                except OSError:
+                    self._sockets[client_id].remove(sock)
 
     def _handler(fake):  # noqa: N805
         class Handler(BaseHTTPRequestHandler):
@@ -260,10 +316,18 @@ class FakeComfyStudio:
                 self.end_headers()
                 self.wfile.write(raw)
 
+            def _raw(self, status, raw, content_type="application/json"):
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
             def _queue_entry(self, job):
                 return [job["number"], job["prompt_id"], job["prompt"], job["extra_data"], []]
 
             def do_GET(self):
+                fake.requests.append(("GET", self.path))
                 parts = urlsplit(self.path)
                 path = parts.path
                 if path == "/ws":
@@ -283,8 +347,13 @@ class FakeComfyStudio:
                         pending = [self._queue_entry(j) for j in fake._pending]
                     return self._send(200, {"queue_running": running, "queue_pending": pending})
                 if path == "/view":
-                    name = parse_qs(parts.query).get("filename", [""])[0]
-                    if name not in fake.uploads:
+                    query = parse_qs(parts.query, keep_blank_values=True)
+                    name = query.get("filename", [""])[0]
+                    fake.view_requests.append({"filename": name,
+                                               "type": query.get("type", [""])[0],
+                                               "subfolder": query.get("subfolder", [""])[0]})
+                    if (name not in fake.uploads or query.get("type", ["output"])[0] != "input"
+                            or query.get("subfolder", [""])[0] != ""):
                         return self._send(404, {})
                     raw = fake.uploads[name]
                     self.send_response(200)
@@ -297,13 +366,24 @@ class FakeComfyStudio:
                     return self._send(200, dict(fake.history))
                 if path.startswith("/history/"):
                     pid = path[len("/history/"):]
+                    if pid in fake.history:
+                        polls = fake._history_polls.get(pid, 0)
+                        fake._history_polls[pid] = polls + 1
+                        if polls < fake.history_pending:
+                            return self._send(200, {})
                     return self._send(200, {pid: fake.history[pid]} if pid in fake.history else {})
                 self._send(404, {})
 
             def do_POST(self):
+                fake.requests.append(("POST", self.path))
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 if self.path == "/upload/image":
                     name = re.search(rb'filename="([^"]+)"', body).group(1).decode()
+                    fake.upload_bodies.append(body)
+                    fake.upload_content_types.append(self.headers["Content-Type"])
+                    mime = re.search(rb'Content-Type: ([^\r]+)', body).group(1).decode()
+                    name = fake.rename_to or name
+                    fake.upload_mimes[name] = mime
                     boundary = self.headers["Content-Type"].split("boundary=")[1].encode()
                     parts_ = body.split(b"--" + boundary)[1:-1]
                     fields = {}
@@ -319,35 +399,57 @@ class FakeComfyStudio:
                 if self.path == "/prompt":
                     payload = json.loads(body)
                     graph = payload["prompt"]
-                    unknown = sorted({n["class_type"] for n in graph.values()} - set(fake.classes))
+                    if fake.no_prompt_id:
+                        return self._send(200, {"node_errors": {}})
+                    if fake.non_json:
+                        return self._raw(200, b"<html>not json</html>", "text/html")
+                    unknown = sorted({n.get("class_type") for n in graph.values()
+                                      if isinstance(n, dict)} - set(fake.classes) - {None})
                     if unknown:
                         return self._send(400, {"error": {"type": "invalid_prompt",
                                                           "message": f"unknown {unknown}"},
                                                 "node_errors": {}})
+                    bad = _invalid(graph, fake.uploads)
+                    if bad:
+                        return self._send(400, {"error": {"type": "prompt_outputs_failed_validation",
+                                                          "message": bad}, "node_errors": {}})
                     with fake._lock:
                         fake._number += 1
                         job = {"prompt_id": str(uuid.uuid4()), "number": fake._number,
                                "prompt": graph, "client_id": payload.get("client_id"),
-                               "extra_data": {"client_id": payload.get("client_id"),
-                                              **(payload.get("extra_data") or {})}}
+                               "extra_data": dict(payload.get("extra_data") or {})}
+                        if "client_id" in payload:
+                            job["extra_data"]["client_id"] = payload["client_id"]
                         fake.prompts.append(job)
                         fake._pending.append(job)
                         fake._lock.notify_all()
+                    if fake.post_timeout:
+                        time.sleep(fake.post_timeout)
                     return self._send(200, {"prompt_id": job["prompt_id"],
                                             "number": job["number"], "node_errors": {}})
                 if self.path == "/interrupt":
+                    try:
+                        asked = json.loads(body or b"{}")
+                    except ValueError:
+                        asked = {}
                     with fake._lock:
                         fake.interrupts += 1
-                        fake._interrupt = True
-                    fake._released.set()
-                    return self._send(200, {})
+                        fake.interrupt_bodies.append(asked)
+                        target = asked.get("prompt_id")
+                        hit = (fake._running is not None
+                               and (not target or fake._running["prompt_id"] == target))
+                        if hit:
+                            fake._interrupt = True
+                    if hit:
+                        fake._released.set()
+                    return self._raw(200, b"", "text/plain")
                 if self.path == "/queue":
                     delete = json.loads(body).get("delete", [])
                     with fake._lock:
                         fake.deleted.extend(delete)
                         fake._pending = [j for j in fake._pending if j["prompt_id"] not in delete]
                         fake._lock.notify_all()
-                    return self._send(200, {})
+                    return self._raw(200, b"", "text/plain")
                 self._send(404, {})
 
             def _websocket(self, client_id):
@@ -364,7 +466,12 @@ class FakeComfyStudio:
                     sock.close()
                     self.close_connection = True
                     return
-                fake._sockets.setdefault(client_id, []).append(sock)
+                with fake._ws_lock:
+                    fake._sockets.setdefault(client_id, []).append(sock)
+                with fake._lock:
+                    remaining = len(fake._pending) + (1 if fake._running else 0)
+                fake._send(client_id, {"type": "status", "data": {
+                    "status": {"exec_info": {"queue_remaining": remaining}}, "sid": client_id}})
                 try:
                     while True:
                         head = self.rfile.read(2)
@@ -385,10 +492,29 @@ class FakeComfyStudio:
                 except (OSError, socket.timeout):
                     pass
                 finally:
-                    if sock in fake._sockets.get(client_id, []):
-                        fake._sockets[client_id].remove(sock)
+                    with fake._ws_lock:
+                        if sock in fake._sockets.get(client_id, []):
+                            fake._sockets[client_id].remove(sock)
                     self.close_connection = True
         return Handler
+
+
+def _invalid(graph, uploads) -> str | None:
+    """What ComfyUI's validate_prompt would refuse that the fake can see: no save node, a node
+    without a class, a picture input that is not a LoadImage the server holds the file of."""
+    if not isinstance(graph, dict) or not all(isinstance(n, dict) and "class_type" in n
+                                              and isinstance(n.get("inputs"), dict)
+                                              for n in graph.values()):
+        return "malformed graph"
+    if not any(n["class_type"] in ("SaveImage", "SaveVideo") for n in graph.values()):
+        return "Prompt has no outputs"
+    for link in _picture_links(graph):
+        source = graph.get(link[0]) if isinstance(link, list) and link else None
+        if source is None or source["class_type"] != "LoadImage":
+            return f"picture input {link} is not a LoadImage"
+        if source["inputs"].get("image") not in uploads:
+            return f"Invalid image file: {source['inputs'].get('image')}"
+    return None
 
 
 def _picture_links(graph) -> list[list]:
