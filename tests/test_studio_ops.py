@@ -139,16 +139,16 @@ def test_noop_update_keeps_revision_and_writes_no_event(tmp_path):
     assert (ops.snapshot(conn, p["id"])["project"]["revision"], _count(conn, "event")) == (1, 1)
 
 
-def test_bad_frame_format_is_422_and_changes_nothing(tmp_path):
+def test_bad_frame_format_is_400_args_invalid_and_changes_nothing(tmp_path):
     conn = _conn(tmp_path)
     with pytest.raises(StudioError) as e:
         ops.create_project(conn, title="A", frame_format="4:3")
-    assert (e.value.status, e.value.code) == (422, "bad_request")
+    assert (e.value.status, e.value.code) == (400, "args_invalid")
     assert (_count(conn, "project"), _count(conn, "event")) == (0, 0)
     p = ops.create_project(conn, title="A", frame_format="16:9")
     with pytest.raises(StudioError) as e:
         ops.update_project(conn, p["id"], expected_revision=1, frame_format="1:1")
-    assert (e.value.status, e.value.code) == (422, "bad_request")
+    assert (e.value.status, e.value.code) == (400, "args_invalid")
     assert ops.snapshot(conn, p["id"])["project"]["revision"] == 1
 
 

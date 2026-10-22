@@ -30,7 +30,7 @@ def project_out(row: sqlite3.Row) -> dict:
 
 def _check_frame_format(frame_format: str) -> None:
     if frame_format not in FRAME_FORMATS:
-        raise StudioError(422, "bad_request", "Формат кадра: 16:9 или 9:16",
+        raise StudioError(400, "args_invalid", "Формат кадра: 16:9 или 9:16",
                           {"frame_format": frame_format, "allowed": list(FRAME_FORMATS)})
 
 
