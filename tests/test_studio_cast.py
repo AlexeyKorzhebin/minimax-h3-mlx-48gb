@@ -212,3 +212,237 @@ def test_the_provider_text_does_not_reach_the_api_body_or_the_log(tmp_path, capl
     assert secret not in caplog.text
     events = client.get(f"/api/studio/projects/{p['id']}").json()["last_seq"]
     assert events == 1                          # nothing was journaled for the failed call
+
+
+# --- review round 1 (task 9) ------------------------------------------------------------------
+
+import sqlite3
+import struct
+import zlib
+
+import pytest
+
+from h3_48gb.studio.llm import ProviderLlm
+
+MAX_PIXELS = 50_000_000
+
+
+def _mono_png(width: int, height: int) -> bytes:
+    """A valid 1-bit PNG of any size, a few hundred KB at most: all-zero rows deflate to nothing."""
+    def chunk(kind, body):
+        return (struct.pack(">I", len(body)) + kind + body
+                + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF))
+    row = b"\x00" * (1 + (width + 7) // 8)
+    packer = zlib.compressobj(9)
+    idat = b"".join(packer.compress(row) for _ in range(height)) + packer.flush()
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 1, 0, 0, 0, 0))
+            + chunk(b"IDAT", idat) + chunk(b"IEND", b""))
+
+
+def _db(tmp_path):
+    conn = sqlite3.connect(tmp_path / "out" / "studio" / "studio.sqlite")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _cast(client, pid, revision=1, **card):
+    body = {"expected_revision": revision, "tag": "anna", "description_ru": "ж", **card}
+    return client.post(f"/api/studio/projects/{pid}/cast", json=body)
+
+
+def test_a_picture_over_50_megapixels_is_413_and_exactly_50_is_taken(tmp_path):
+    """Review I1: a 680 KB file that decodes to 700 MB must not reach `load()`."""
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    assert _upload(client, data=_mono_png(10000, 5000)).status_code == 201
+    r = _upload(client, data=_mono_png(16666667, 3))
+    assert r.status_code == 413
+    assert r.json() == {"error": {"code": "asset_pixels_too_large",
+                                  "message": "Картинка слишком большая по числу пикселей",
+                                  "detail": {"pixels": 50_000_001, "max": MAX_PIXELS}}}
+    assert len(list((tmp_path / "out" / "studio" / "assets").glob("*"))) == 1   # only the 50 MP one
+
+
+def test_pillows_own_bomb_error_is_413_too(tmp_path):
+    """Above 2x Pillow's default limit Image.open itself refuses; that is a size refusal, not
+    a broken file."""
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    r = _upload(client, data=_mono_png(200_000_000 // 3 + 1, 3))
+    assert (r.status_code, r.json()["error"]["code"]) == (413, "asset_pixels_too_large")
+
+
+def test_a_file_of_exactly_25_mb_is_taken(tmp_path):
+    from h3_48gb.studio.assets import MAX_ASSET_BYTES
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    r = _upload(client, data=TINY_PNG + b"\x00" * (MAX_ASSET_BYTES - len(TINY_PNG)))
+    assert (r.status_code, r.json()["bytes"]) == (201, MAX_ASSET_BYTES)
+
+
+def test_the_same_asset_twice_in_one_card_is_400_not_500(tmp_path):
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    p = _project(client)
+    a = _upload(client).json()["id"]
+    r = _cast(client, p["id"], description_en="A woman.", portrait_phrase="a woman",
+              assets=[{"asset_id": a, "role": "image"}, {"asset_id": a, "role": "image"}])
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "args_invalid"
+    assert r.json()["error"]["detail"]["errors"][0]["loc"] == ["body", "assets"]
+
+
+def test_a_manual_phrase_is_normalised_before_it_is_checked(tmp_path):
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    p = _project(client)
+    r = _cast(client, p["id"], description_en="A woman.", portrait_phrase="...")
+    assert (r.status_code, r.json()["error"]["code"], r.json()["error"]["detail"]) == \
+        (400, "cast_card_invalid", {"field": "portrait_phrase"})
+    r = _cast(client, p["id"], description_en="  A woman.  ", portrait_phrase=" a woman. ")
+    card = r.json()["cast_member"]
+    assert (card["description_en"], card["portrait_phrase"]) == ("A woman.", "a woman")
+
+
+@pytest.mark.parametrize("given, missing", [({"description_en": "A woman."}, "portrait_phrase"),
+                                            ({"portrait_phrase": "a woman"}, "description_en")])
+def test_half_a_manual_card_is_refused_not_sent_to_the_llm(tmp_path, given, missing):
+    llm = ScriptedLlm([])
+    client = make_client(tmp_path, llm=llm)
+    p = _project(client)
+    r = _cast(client, p["id"], **given)
+    assert (r.status_code, r.json()["error"]["code"], r.json()["error"]["detail"]) == \
+        (400, "cast_card_invalid", {"field": missing})
+    assert llm.calls == []
+
+
+def test_lowercase_and_yo_cyrillic_are_refused_in_both_fields(tmp_path):
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    p = _project(client)
+    for en, phrase, field in (("a женщина", "a woman", "description_en"),
+                              ("A woman.", "a ёж", "portrait_phrase"),
+                              ("A Ёж.", "a woman", "description_en")):
+        r = _cast(client, p["id"], description_en=en, portrait_phrase=phrase)
+        assert (r.status_code, r.json()["error"]["detail"]) == (400, {"field": field}), (en, phrase)
+
+
+def test_portrait_phrase_limit_is_30_words(tmp_path):
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    p = _project(client)
+    r = _cast(client, p["id"], description_en="A woman.", portrait_phrase=" ".join(["word"] * 31))
+    assert (r.status_code, r.json()["error"]["detail"]) == (400, {"field": "portrait_phrase"})
+    r = _cast(client, p["id"], description_en="A woman.", portrait_phrase=" ".join(["word"] * 30))
+    assert r.status_code == 201
+
+
+def test_a_stale_revision_is_refused_before_the_llm_is_asked(tmp_path):
+    llm = ScriptedLlm([])
+    client = make_client(tmp_path, llm=llm)
+    p = _project(client)
+    r = _cast(client, p["id"], revision=7)
+    assert (r.status_code, r.json()["error"]["code"]) == (409, "revision_conflict")
+    assert llm.calls == []
+
+
+def test_an_edit_during_the_llm_call_is_a_409_and_writes_nothing(tmp_path):
+    """The model takes minutes; the project can move meanwhile (И5)."""
+    box = {}
+
+    class EditingLlm:
+        label = "editing"
+
+        def json_turn(self, messages, schema, retry_reminder):
+            box["patch"] = box["client"].patch(f"/api/studio/projects/{box['pid']}", json={
+                "expected_revision": 1, "title": "Другой"})
+            return {"description_en": "A woman.", "portrait_phrase": "a woman"}
+
+    client = make_client(tmp_path, llm=EditingLlm())
+    box.update(client=client, pid=_project(client)["id"])
+    r = _cast(client, box["pid"])
+    assert box["patch"].status_code == 200
+    assert (r.status_code, r.json()["error"]["code"]) == (409, "revision_conflict")
+    assert client.get(f"/api/studio/projects/{box['pid']}").json()["cast"] == []
+
+
+def test_the_journal_bodies_of_asset_and_cast(tmp_path):
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    p = _project(client)
+    a = _upload(client).json()
+    _cast(client, p["id"], description_en="A woman.", portrait_phrase="a woman")
+    rows = [(r["kind"], r["project_id"], r["payload_json"]) for r in _db(tmp_path).execute(
+        "SELECT kind, project_id, payload_json FROM event WHERE kind IN "
+        "('asset_imported', 'cast_added') ORDER BY seq")]
+    assert rows == [("asset_imported", None, json.dumps({"asset_id": a["id"], "kind": "image"},
+                                                         sort_keys=True)),
+                    ("cast_added", p["id"], '{"tag": "anna"}')]
+
+
+def test_a_model_card_in_cyrillic_is_a_clear_502(tmp_path):
+    client = make_client(tmp_path, llm=ScriptedLlm([
+        {"description_en": "Женщина с косой.", "portrait_phrase": "a woman"}]))
+    p = _project(client)
+    r = _cast(client, p["id"])
+    assert r.status_code == 502
+    assert r.json() == {"error": {
+        "code": "llm_failed",
+        "message": "Карточка героя от модели не годится: Кириллица в description_en: нужен английский",
+        "detail": {"field": "description_en"}}}
+    assert client.get(f"/api/studio/projects/{p['id']}").json()["cast"] == []
+
+
+def test_a_blank_russian_description_is_refused(tmp_path):
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    p = _project(client)
+    r = _cast(client, p["id"], description_ru="   ", description_en="A woman.",
+              portrait_phrase="a woman")
+    assert (r.status_code, r.json()["error"]["code"]) == (400, "args_invalid")
+    assert r.json()["error"]["detail"]["errors"][0]["loc"] == ["body", "description_ru"]
+
+
+def test_a_failed_database_write_removes_the_stored_file(tmp_path, monkeypatch):
+    from h3_48gb.studio import assets as assets_module
+
+    def boom(*args, **kwargs):
+        raise StudioError(503, "disk_gone", "x")
+    monkeypatch.setattr(assets_module.events, "emit", boom)
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    r = _upload(client)
+    assert (r.status_code, r.json()["error"]["code"]) == (503, "disk_gone")
+    assert list((tmp_path / "out" / "studio" / "assets").glob("*")) == []
+    assert _db(tmp_path).execute("SELECT COUNT(*) FROM asset").fetchone()[0] == 0
+
+
+def test_the_asset_path_is_stored_relative_to_the_studio_home(tmp_path):
+    """Moving `<outdir>` must not orphan every picture."""
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    a = _upload(client).json()
+    stored = _db(tmp_path).execute("SELECT path FROM asset WHERE id = ?", (a["id"],)).fetchone()[0]
+    assert stored == f"assets/{a['id']}.png"
+    assert client.get(a["url"]).content == TINY_PNG
+
+
+def test_cast_without_a_configured_provider_is_503(tmp_path):
+    client = make_client(tmp_path)
+    p = _project(client)
+    r = _cast(client, p["id"])
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "llm_not_configured"
+    assert r.json()["error"]["message"] == "Сценарист не настроен: нет провайдера в studio/providers.json"
+    assert r.json()["error"]["detail"] == {"provider": None}
+
+
+def test_cast_while_the_render_holds_the_gpu_is_409(tmp_path):
+    import fcntl
+    import os
+    home = tmp_path / "out" / "studio"
+    home.mkdir(parents=True)
+    (home / "providers.json").write_text(json.dumps({"active": "f", "providers": {"f": {
+        "type": "openai", "base_url": "http://127.0.0.1:9", "model": "m",
+        "api_key_env": "KEY", "shares_gpu": True}}}))
+    (home / ".env").write_text("KEY=synthetic\n")
+    client = make_client(tmp_path, llm=ProviderLlm(home, home / "gpu-mac.lock", lock_timeout_s=0.2))
+    p = _project(client)
+    fd = os.open(home / "gpu-mac.lock", os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        r = _cast(client, p["id"])
+    finally:
+        os.close(fd)
+    assert (r.status_code, r.json()["error"]["code"]) == (409, "gpu_busy")
+    assert r.json()["error"]["message"] == "Сценарист ждёт видеокарту: её занял рендер"
+    assert r.json()["error"]["detail"] == {"lock": str(home / "gpu-mac.lock")}

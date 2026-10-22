@@ -246,7 +246,7 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
 
     @app.get(f"{api}/assets/{{asset_id}}/file")
     def asset_file(asset_id: str, conn=Depends(get_conn)):
-        path, mime = assets.asset_file(conn, asset_id)
+        path, mime = assets.asset_file(conn, home, asset_id)
         return FileResponse(path, media_type=mime)
 
     @app.post(f"{api}/projects/{{project_id}}/cast", status_code=201)

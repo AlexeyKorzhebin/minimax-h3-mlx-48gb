@@ -132,10 +132,15 @@ def add_cast(conn: sqlite3.Connection, project_id: str, *, expected_revision: in
     write transaction, so a slow model never holds the database."""
     row = _project_row(conn, project_id)
     _check_revision(row, expected_revision, project_out(row))
+    if (description_en is None) != (portrait_phrase is None):
+        missing = "description_en" if description_en is None else "portrait_phrase"
+        raise StudioError(400, "cast_card_invalid",
+                          f"Карточка вручную — оба поля или ни одного: нет {missing}",
+                          {"field": missing})
     if description_en is not None and portrait_phrase is not None:
-        cast_card.check_card(description_en, portrait_phrase)
         card = {"description_en": description_en.strip(),
-                "portrait_phrase": portrait_phrase.strip().rstrip(".")}
+                "portrait_phrase": portrait_phrase.strip().rstrip(".").strip()}
+        cast_card.check_card(card["description_en"], card["portrait_phrase"])
     else:
         card = cast_card.describe(llm, tag=tag, description_ru=description_ru)
     cast_id = ids.new_id("c")

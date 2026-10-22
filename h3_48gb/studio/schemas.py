@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 FrameFormat = Literal["16:9", "9:16"]
 
@@ -42,3 +42,18 @@ class CastCreate(_Body):
     assets: list[CastAssetIn] = Field(default_factory=list, max_length=8)
     description_en: str | None = Field(default=None, max_length=4000)
     portrait_phrase: str | None = Field(default=None, max_length=400)
+
+    @field_validator("description_ru")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("описание не может быть пустым")
+        return value
+
+    @field_validator("assets")
+    @classmethod
+    def _no_repeats(cls, value: list[CastAssetIn]) -> list[CastAssetIn]:
+        ids = [a.asset_id for a in value]
+        if len(set(ids)) != len(ids):
+            raise ValueError("один и тот же файл указан дважды")
+        return value

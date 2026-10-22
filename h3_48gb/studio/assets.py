@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import sqlite3
+import warnings
 from pathlib import Path
 
 from PIL import Image
@@ -13,10 +14,9 @@ from h3_48gb.studio import db, events, ids
 from h3_48gb.studio.errors import StudioError
 
 MAX_ASSET_BYTES = 25 * 1024 * 1024
-
-#: Slice S1 takes pictures only (the hero's photo); voice, video and tracks arrive later (§2).
-_PIL_FORMATS = {"png": "PNG", "jpg": "JPEG", "webp": "WEBP"}
-
+#: A 680 KB PNG can declare 13376x13376 and take 700 MB to decode; 50 MP lets a 48 MP phone
+#: photo through and nothing bigger.
+MAX_ASSET_PIXELS = 50_000_000
 
 def sniff(data: bytes) -> tuple[str, str, str] | None:
     """(family, ext, mime) by leading bytes."""
@@ -29,17 +29,33 @@ def sniff(data: bytes) -> tuple[str, str, str] | None:
     return None
 
 
+def _too_many_pixels(pixels: int | None) -> StudioError:
+    detail = {"max": MAX_ASSET_PIXELS} if pixels is None else {"pixels": pixels,
+                                                               "max": MAX_ASSET_PIXELS}
+    return StudioError(413, "asset_pixels_too_large",
+                       "Картинка слишком большая по числу пикселей", detail)
+
+
 def check_decodes(data: bytes, ext: str) -> None:
-    """A right signature on broken content is still a broken picture: decode it fully."""
+    """A right signature on broken content is still a broken picture: decode it fully — but only
+    after the declared size says the decode will fit in memory.
+
+    `ext` comes from `sniff` by the same leading bytes Pillow reads to pick its decoder, so a
+    decoder of another format can never be chosen; there is no format cross-check to make."""
     try:
-        with Image.open(io.BytesIO(data)) as image:
-            image.load()
-            decoded_as = image.format
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                width, height = image.size
+                if width * height > MAX_ASSET_PIXELS:
+                    raise _too_many_pixels(width * height)
+                image.load()
+    except StudioError:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+        raise _too_many_pixels(None) from None
     except Exception:                       # Pillow raises half a dozen types for bad input
         raise StudioError(400, "asset_corrupt", "Картинка повреждена или не читается") from None
-    if decoded_as != _PIL_FORMATS[ext]:
-        raise StudioError(400, "asset_corrupt", "Картинка повреждена или не читается",
-                          {"decoded_as": decoded_as})
 
 
 def asset_out(row: sqlite3.Row) -> dict:
@@ -63,7 +79,8 @@ def import_asset(conn: sqlite3.Connection, home: Path, *, data: bytes,
     asset_id = ids.new_id("a")
     folder = home / "assets"
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{asset_id}.{ext}"
+    name = f"{asset_id}.{ext}"
+    path = folder / name
     with open(path, "xb") as fh:          # "x": never overwrite an existing asset file (И7)
         fh.write(data)
     try:
@@ -71,7 +88,7 @@ def import_asset(conn: sqlite3.Connection, home: Path, *, data: bytes,
             conn.execute(
                 "INSERT INTO asset (id, kind, path, sha256, bytes, mime, origin_kind, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, 'upload', ?)",
-                (asset_id, family, str(path), hashlib.sha256(data).hexdigest(), len(data), mime,
+                (asset_id, family, f"assets/{name}", hashlib.sha256(data).hexdigest(), len(data), mime,
                  ids.now_iso()))
             events.emit(conn, "asset_imported", payload={"asset_id": asset_id, "kind": family})
             return asset_out(conn.execute("SELECT * FROM asset WHERE id = ?",
@@ -81,8 +98,10 @@ def import_asset(conn: sqlite3.Connection, home: Path, *, data: bytes,
         raise
 
 
-def asset_file(conn: sqlite3.Connection, asset_id: str) -> tuple[Path, str]:
+def asset_file(conn: sqlite3.Connection, home: Path, asset_id: str) -> tuple[Path, str]:
+    """`asset.path` is relative to the studio home, so moving `<outdir>` keeps every picture."""
     row = conn.execute("SELECT path, mime FROM asset WHERE id = ?", (asset_id,)).fetchone()
-    if row is None or not Path(row["path"]).is_file():
+    path = home / row["path"] if row is not None else None
+    if path is None or not path.is_file():
         raise StudioError(404, "asset_not_found", "Файл не найден", {"asset_id": asset_id})
-    return Path(row["path"]), row["mime"]
+    return path, row["mime"]
