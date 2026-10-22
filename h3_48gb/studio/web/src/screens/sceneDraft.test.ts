@@ -143,6 +143,21 @@ describe("scene draft — queue, stale snapshots, the owner's choice", () => {
     expect(s.queued).toBe(false);
   });
 
+  it("a late copy of an answer to a finished request does not free the slot of the request in flight", () => {
+    const server = new FakeSceneServer(INITIAL);
+    let s = save(input(init(INITIAL), "music_text", "mine"));
+    const first = s.inflight!;
+    const answer = server.patch(first.body, "us");
+    s = received(s, first, answer);
+    s = save(input(s, "seed", "7"));
+    const second = s.inflight!;
+    expect(second.id).not.toBe(first.id);
+    s = received(s, first, answer);                                    // the first answer arrives again
+    expect(s.inflight).toEqual(second);                                // «Сохранить» still waits for the second
+    s = save(s);
+    expect([s.inflight, s.queued]).toEqual([second, true]);            // and a press does not start a third
+  });
+
   it("a snapshot older than the one shown is ignored; a newer one updates the «Сервер» side of an open conflict", () => {
     const server = new FakeSceneServer(INITIAL);
     let s = input(init(INITIAL), "music_text", "mine");
