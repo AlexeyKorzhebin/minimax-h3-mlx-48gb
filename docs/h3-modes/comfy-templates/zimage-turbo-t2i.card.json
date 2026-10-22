@@ -35,7 +35,7 @@
    "shift": 3.0,
    "uses_negative": false
   },
-  "estimate_s": 8
+  "estimate_s": 4
  },
  "inputs": {
   "task_id": {
@@ -127,5 +127,18 @@
   "node": "10",
   "kind": "image",
   "dir": "studio/<task_id>/"
- }
+ },
+ "verified_on": [
+  {
+   "date": "2026-10-22",
+   "machine": "alex-neuro",
+   "comfyui": "0.42.0",
+   "comfyui_commit": "b1a247c9",
+   "measure": "1344x768, 8 steps, cfg 1, seed 12, warm",
+   "secs": 2.9,
+   "device_peak_mib": 14573,
+   "prompt_id": "a846ada5-f02e-4e81-8962-980063e82460",
+   "script": "image_models_probe.py (h3-bench, probe/image-models-20261022)"
+  }
+ ]
 }
