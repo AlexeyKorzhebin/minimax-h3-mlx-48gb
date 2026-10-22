@@ -27,7 +27,8 @@ class ProjectPatch(_Body):
 
 # --- slice S1 ---------------------------------------------------------------------------------
 
-Tag = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
+TAG_PATTERN = r"^[a-z][a-z0-9_-]{0,31}$"
+Tag = Field(pattern=TAG_PATTERN)
 
 
 class CastAssetIn(_Body):

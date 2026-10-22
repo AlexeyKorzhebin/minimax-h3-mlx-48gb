@@ -55,7 +55,7 @@ SCENES_SCHEMA = {
                 "action": _STR, "performance": _STR, "sound": _STR, "music": _STR,
                 "state_in": _STR, "state_out": _STR,
                 "cast_tags": {"type": "array", "items": _STR},
-                "requested_s": {"type": "number", "minimum": 3.0, "maximum": 15.0},
+                "requested_s": {"type": "number"},
             },
             "required": ["action", "performance", "sound", "music", "state_in", "state_out",
                          "cast_tags", "requested_s"],
@@ -295,3 +295,156 @@ def test_applying_a_proposal_over_a_scene_edited_elsewhere_is_409(tmp_path, seed
         "proposal_id": proposal_id, "expected_revision": 3,
         "deleted": [{"scene_id": old["id"], "expected_edit_version": 1}]})
     assert (fresh.status_code, fresh.json()["diff"]["deleted"]) == (200, [old["id"]])
+
+
+# --- review r1 ----------------------------------------------------------------------------------
+
+def _db(tmp_path):
+    c = sqlite3.connect(tmp_path / "out" / "studio" / "studio.sqlite")
+    c.row_factory = sqlite3.Row
+    return c
+
+
+def _events(tmp_path, kind):
+    return [(r["scene_id"], json.loads(r["payload_json"])) for r in _db(tmp_path).execute(
+        "SELECT scene_id, payload_json FROM event WHERE kind = ? ORDER BY seq", (kind,))]
+
+
+def _propose(client, pid, n=1):
+    return client.post(f"/api/studio/projects/{pid}/director/propose",
+                       json={"idea_text": "x", "scenes_count": n})
+
+
+def test_requested_seconds_outside_3_to_15_are_clamped_not_refused(tmp_path, seeds):
+    reply = {"scenes": [_llm_scene(1, seconds=16), _llm_scene(2, seconds=1)]}
+    client = make_client(tmp_path, llm=ScriptedLlm([reply]))
+    pid = _project_with_hero(client)
+    r = _propose(client, pid, 2)
+    assert r.status_code == 200
+    assert ([s["requested_s"] for s in r.json()["scenes"]], r.json()["durations"]) == (
+        [15.0, 3.0], [{"frames": 345, "duration_s": 14.375}, {"frames": 73, "duration_s": 3.042}])
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_length_is_a_named_502_and_leaves_nothing_behind(tmp_path, seeds, bad):
+    client = make_client(tmp_path, llm=ScriptedLlm([{"scenes": [_llm_scene(1, seconds=bad)]}]))
+    pid = _project_with_hero(client)
+    r = _propose(client, pid)
+    assert (r.status_code, r.json()["error"]["code"], r.json()["error"]["detail"]["path"]) == (
+        502, "llm_failed", "/scenes/0/requested_s")
+    assert _db(tmp_path).execute("SELECT COUNT(*) FROM proposal").fetchone()[0] == 0
+    assert _events(tmp_path, "proposal_created") == []
+
+
+def test_a_scene_the_scene_schema_refuses_is_a_named_502(tmp_path, seeds):
+    """Review r1 minor 4: every scene goes through SceneIn before it is saved. A scene text
+    over the 8000-character limit cannot be applied later, so they are refused now."""
+    scene = {**_llm_scene(1), "sound": "x" * 9000}
+    client = make_client(tmp_path, llm=ScriptedLlm([{"scenes": [scene]}]))
+    pid = _project_with_hero(client)
+    r = _propose(client, pid)
+    assert (r.status_code, r.json()["error"]["detail"]["path"]) == (502, "/scenes/0/sound_text")
+    assert _db(tmp_path).execute("SELECT COUNT(*) FROM proposal").fetchone()[0] == 0
+
+
+def test_a_proposal_of_another_project_is_404(tmp_path, seeds):
+    client = make_client(tmp_path, llm=ScriptedLlm([{"scenes": [_llm_scene(1)]}]))
+    pid = _project_with_hero(client)
+    other = client.post("/api/studio/projects", json={"title": "Б", "frame_format": "16:9"}).json()
+    proposal_id = _propose(client, pid).json()["proposal_id"]
+    r = client.post(f"/api/studio/projects/{other['id']}/director/apply",
+                    json={"proposal_id": proposal_id, "expected_revision": 1})
+    assert (r.status_code, r.json()["error"]["code"]) == (404, "proposal_not_found")
+
+
+@pytest.mark.parametrize("action, expected", [
+    (f"{PHRASE} walks to the lake.", f"{PHRASE} walks to the lake."),          # already first
+    (f"She stops. {PHRASE} looks up.", f"{PHRASE}. She stops. looks up."),    # inside -> front
+    ("She walks.", f"{PHRASE}. She walks."),
+])
+def test_the_portrait_phrase_stands_once_at_the_start(tmp_path, seeds, action, expected):
+    scene = {**_llm_scene(1), "action": action}
+    client = make_client(tmp_path, llm=ScriptedLlm([{"scenes": [scene]}]))
+    pid = _project_with_hero(client)
+    (got,) = _propose(client, pid).json()["scenes"]
+    assert got["action_text"] == expected
+
+
+def test_dropped_tags_are_unique_name_shaped_and_capped(tmp_path, seeds):
+    tags = ["ghost", "@ghost", "Ghost", "not a tag!", "x" * 40, *[f"g{i}" for i in range(20)]]
+    client = make_client(tmp_path, llm=ScriptedLlm([{"scenes": [_llm_scene(1, tuple(tags))]}]))
+    pid = _project_with_hero(client)
+    dropped = _propose(client, pid).json()["dropped_tags"]
+    assert dropped == ["ghost", *[f"g{i}" for i in range(11)]]
+
+
+def test_tags_match_without_regard_to_case(tmp_path, seeds):
+    client = make_client(tmp_path, llm=ScriptedLlm([{"scenes": [_llm_scene(1, ("@ANNA",))]}]))
+    pid = _project_with_hero(client)
+    body = _propose(client, pid).json()
+    assert (body["scenes"][0]["refs"], body["dropped_tags"]) == (["anna"], [])
+
+
+def test_refs_mode_needs_a_hero_on_screen_who_has_a_picture(tmp_path, seeds):
+    client = make_client(tmp_path, llm=ScriptedLlm([{"scenes": [_llm_scene(1, ("boris",))]}]))
+    pid = _project_with_hero(client)                     # anna has a picture
+    client.post(f"/api/studio/projects/{pid}/cast", json={
+        "expected_revision": 2, "tag": "boris", "description_ru": "м",
+        "description_en": "A man.", "portrait_phrase": "a tall man"})
+    (scene,) = _propose(client, pid).json()["scenes"]
+    assert (scene["mode"], scene["refs"]) == ("from_frame", ["boris"])
+
+
+def test_the_events_and_the_row_carry_exact_content(tmp_path, seeds):
+    client = make_client(tmp_path, llm=ScriptedLlm([{"scenes": [_llm_scene(1), _llm_scene(2)]}]))
+    pid = _project_with_hero(client)
+    proposal_id = _propose(client, pid, 2).json()["proposal_id"]
+    assert _events(tmp_path, "proposal_created") == [
+        (None, {"proposal_id": proposal_id, "scenes": 2})]
+    assert _db(tmp_path).execute("SELECT idea_text FROM proposal").fetchone()[0] == "x"
+    r = client.post(f"/api/studio/projects/{pid}/director/apply",
+                    json={"proposal_id": proposal_id, "expected_revision": 2})
+    assert _events(tmp_path, "proposal_applied") == [
+        (None, {"proposal_id": proposal_id, "diff": r.json()["diff"]})]
+    assert _events(tmp_path, "scenes_replaced") == []
+
+
+def test_twelve_scenes_pass_and_thirteen_do_not(tmp_path, seeds):
+    llm = ScriptedLlm([{"scenes": [_llm_scene(i) for i in range(12)]}])
+    client = make_client(tmp_path, llm=llm)
+    pid = _project_with_hero(client)
+    assert (_propose(client, pid, 12).status_code,
+            _propose(client, pid, 13).status_code) == (200, 400)
+
+
+def test_the_projects_style_block_reaches_the_model(tmp_path, seeds):
+    llm = ScriptedLlm([{"scenes": [_llm_scene(1)]}])
+    client = make_client(tmp_path, llm=llm)
+    pid = _project_with_hero(client)
+    c = _db(tmp_path)
+    c.execute("UPDATE project SET style_block = ? WHERE id = ?", ("soft overcast light", pid))
+    c.commit()
+    _propose(client, pid)
+    assert json.loads(llm.calls[0]["messages"][1]["content"])["style_block"] == "soft overcast light"
+
+
+def test_a_proposal_consumed_between_the_check_and_the_write_is_409_and_changes_nothing(
+        tmp_path, seeds, monkeypatch):
+    client = make_client(tmp_path, llm=ScriptedLlm([{"scenes": [_llm_scene(1)]}]))
+    pid = _project_with_hero(client)
+    proposal_id = _propose(client, pid).json()["proposal_id"]
+    real = ops.replace_scenes
+
+    def raced(conn, *a, **kw):
+        other = sqlite3.connect(tmp_path / "out" / "studio" / "studio.sqlite")
+        other.execute("UPDATE proposal SET applied_at = 'earlier' WHERE id = ?", (proposal_id,))
+        other.commit()
+        other.close()
+        return real(conn, *a, **kw)
+
+    monkeypatch.setattr(ops, "replace_scenes", raced)
+    r = client.post(f"/api/studio/projects/{pid}/director/apply",
+                    json={"proposal_id": proposal_id, "expected_revision": 2})
+    assert (r.status_code, r.json()["error"]["code"]) == (409, "proposal_already_applied")
+    assert client.get(f"/api/studio/projects/{pid}").json()["scenes"] == []
+    assert _db(tmp_path).execute("SELECT applied_at FROM proposal").fetchone()[0] == "earlier"

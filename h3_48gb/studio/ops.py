@@ -487,6 +487,10 @@ def propose_scenes(conn: sqlite3.Connection, project_id: str, *, llm: Llm,
     scenes, llm_json, dropped = scenarist.propose(
         llm, idea_text=idea_text, scenes_count=scenes_count, frame_format=prow["frame_format"],
         style_block=prow["style_block"], cast=cast)
+    # `durations` is computed before anything is written: a scene that cannot be snapped must
+    # leave neither a `proposal` row nor an event.
+    durations = [{"frames": f, "duration_s": round(duration.seconds(f), 3)}
+                 for f in (duration.snap_frames(s["requested_s"]) for s in scenes)]
     proposal_id = ids.new_id("r")
     with db.tx(conn):
         conn.execute(
@@ -497,9 +501,6 @@ def propose_scenes(conn: sqlite3.Connection, project_id: str, *, llm: Llm,
              ids.now_iso()))
         events.emit(conn, "proposal_created", project_id=project_id,
                     payload={"proposal_id": proposal_id, "scenes": len(scenes)})
-    # `durations`: what the grid makes of each requested length (§6.2), shown in the preview.
-    durations = [{"frames": f, "duration_s": round(duration.seconds(f), 3)}
-                 for f in (duration.snap_frames(s["requested_s"]) for s in scenes)]
     return {"proposal_id": proposal_id, "scenes": scenes, "durations": durations,
             "dropped_tags": dropped}
 
@@ -519,7 +520,11 @@ def apply_proposal(conn: sqlite3.Connection, project_id: str, *, proposal_id: st
     def mark_applied(c):
         # Two clicks racing past the check above cannot both land: the second one's
         # expected_revision is stale by then and replace_scenes refuses it with 409.
-        c.execute("UPDATE proposal SET applied_at = ? WHERE id = ?", (ids.now_iso(), proposal_id))
+        done = c.execute("UPDATE proposal SET applied_at = ? WHERE id = ? AND applied_at IS NULL",
+                         (ids.now_iso(), proposal_id)).rowcount
+        if done != 1:
+            raise StudioError(409, "proposal_already_applied", "Это предложение уже применено",
+                              {"proposal_id": proposal_id})
 
     return replace_scenes(conn, project_id, expected_revision=expected_revision,
                           scenes=json.loads(row["scenes_json"]), deleted=deleted,

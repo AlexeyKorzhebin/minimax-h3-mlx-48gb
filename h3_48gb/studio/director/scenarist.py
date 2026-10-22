@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from h3_48gb.studio.errors import StudioError
-from h3_48gb.studio import duration
+from h3_48gb.studio import duration, schemas
 from h3_48gb.studio.llm import Llm, validate_reply
 
 PROMPT = Path(__file__).parent / "prompts" / "scenarist.md"
@@ -29,8 +33,8 @@ STUDIO_SCENES_SCHEMA = {
                         "action": _STR, "performance": _STR, "sound": _STR, "music": _STR,
                         "state_in": _STR, "state_out": _STR,
                         "cast_tags": {"type": "array", "items": _STR},
-                        "requested_s": {"type": "number", "minimum": duration.MIN_SECONDS,
-                                        "maximum": duration.MAX_SECONDS},
+                        # No bounds here: a model that answers 16 or 1 is clamped by the code (R6), not refused.
+                        "requested_s": {"type": "number"},
                     },
                     "required": ["action", "performance", "sound", "music", "state_in",
                                  "state_out", "cast_tags", "requested_s"],
@@ -50,11 +54,28 @@ def prompt_version() -> str:
     return hashlib.sha256(PROMPT.read_bytes()).hexdigest()[:12]
 
 
+_TAG = re.compile(schemas.TAG_PATTERN)
+MAX_DROPPED_TAGS = 12
+
+
+def _move_to_front(text: str, phrase: str) -> str:
+    i = text.index(phrase)
+    before, after = text[:i].rstrip(), text[i + len(phrase):].lstrip(" .,;")
+    if before and after:
+        return before + ("" if before[-1] in ".!?" else ".") + " " + after
+    return before or after
+
+
 def _with_portraits(action: str, phrases: list[str]) -> str:
-    missing = [p for p in phrases if p and p not in action]
-    if not missing:
-        return action
-    return ". ".join(missing) + ". " + action
+    """Each phrase verbatim at the start of the action, in cast order, exactly once: absent -> put
+    in front; already at the start -> left alone; somewhere inside -> moved to the front."""
+    for phrase in reversed([p for p in phrases if p]):
+        if action.startswith(phrase):
+            continue
+        if phrase in action:
+            action = _move_to_front(action, phrase)
+        action = phrase + ". " + action if action else phrase + "."
+    return action
 
 
 def propose(llm: Llm, *, idea_text: str, scenes_count: int, frame_format: str,
@@ -82,14 +103,21 @@ def propose(llm: Llm, *, idea_text: str, scenes_count: int, frame_format: str,
         raise StudioError(502, "llm_failed",
                           f"Сценарист вернул {len(got)} сцен вместо {scenes_count}",
                           {"got": len(got), "wanted": scenes_count})
+    for i, s in enumerate(got):
+        # json.loads accepts NaN and Infinity; they pass `type: number` and then poison the row.
+        if not math.isfinite(s["requested_s"]):
+            raise StudioError(502, "llm_failed", "Модель ответила не по схеме",
+                              {"schema": STUDIO_SCENES_SCHEMA["name"],
+                               "path": f"/scenes/{i}/requested_s", "rule": "finite"})
     by_tag = {c["tag"]: c for c in cast}
     scenes, dropped = [], []
     for i, s in enumerate(got):
         tags: list[str] = []
         for raw_tag in s["cast_tags"]:
-            tag = raw_tag.lstrip("@")
+            tag = raw_tag.lstrip("@").lower()          # cast tags are lowercase (schemas.Tag)
             if tag not in by_tag:
-                if tag not in dropped:
+                if (_TAG.fullmatch(tag) and tag not in dropped
+                        and len(dropped) < MAX_DROPPED_TAGS):
                     dropped.append(tag)
             elif tag not in tags:
                 tags.append(tag)
@@ -110,5 +138,12 @@ def propose(llm: Llm, *, idea_text: str, scenes_count: int, frame_format: str,
             "state_out_text": s["state_out"].strip(), "requested_s": requested, "seed": None,
             "source_frame": source, "refs": tags,
         })
+        try:
+            schemas.SceneIn.model_validate(scenes[-1])
+        except ValidationError as err:
+            loc = err.errors()[0]["loc"]
+            raise StudioError(502, "llm_failed", "Модель ответила не по схеме",
+                              {"schema": "SceneIn",
+                               "path": "/".join(["", "scenes", str(i), *map(str, loc)])}) from None
     llm_json = {"provider": llm.label, "prompt_version": prompt_version(), "raw": raw}
     return scenes, llm_json, dropped
