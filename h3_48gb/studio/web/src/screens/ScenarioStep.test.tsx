@@ -329,6 +329,29 @@ describe("ScenarioStep", () => {
     await vi.waitFor(() => expect(screen.queryByRole("article", { name: "Сцена 2" })).toBeNull());
   });
 
+  it("final M1: a dirty card replaced by the owner's own «Применить» says the proposal replaced it, not another window", async () => {
+    stubFetch({
+      ...LINT_EMPTY,
+      "POST /api/studio/projects/p_1/director/propose": {
+        body: { proposal_id: "r_1", scenes: [PROPOSED], durations: [{ frames: 192, duration_s: 8 }], dropped_tags: [] },
+      },
+      "POST /api/studio/projects/p_1/director/apply": { body: { project: {}, scenes: [], diff: {}, lint: {} } },
+    });
+    const one = scene({ id: "s_1", idx: 0 });
+    const onChanged = vi.fn();
+    const { rerender } = render(<ScenarioStep snap={snapshot({ scenes: [one], last_seq: 5 })} onChanged={onChanged} />);
+    await userEvent.type(within(screen.getByRole("article", { name: "Сцена 1" })).getByLabelText(/Музыка/), "!");
+    await userEvent.click(screen.getByRole("button", { name: "Предложить сцены" }));
+    const region = await screen.findByRole("region", { name: "Предложение сценариста" });
+    await userEvent.click(within(region).getByRole("button", { name: "Применить" }));
+    await vi.waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    rerender(<ScenarioStep snap={snapshot({ scenes: [scene({ id: "s_9", idx: 0 })], last_seq: 6 })} onChanged={onChanged} />);
+    const kept = screen.getAllByRole("status").map((n) => n.textContent);
+    expect(kept).toEqual(["Сцену заменило предложение сценариста. Ваш черновик сохранён здесь — верните его как новую сцену или уберите."]);
+    expect(screen.getAllByRole("button", { name: "Вернуть как новую сцену" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Убрать" })).toHaveLength(1);
+  });
+
   it("r1 №1: «Убрать» drops the orphan card; a clean card of a deleted scene just disappears", async () => {
     stubFetch({ ...LINT_EMPTY });
     const [one, two, three] = [scene({ id: "s_1", idx: 0 }), scene({ id: "s_2", idx: 1 }), scene({ id: "s_3", idx: 2 })];

@@ -22,7 +22,6 @@ const TEXTS = [
 
 // «Текст» is not offered: no ComfyUI template of part 1 renders it (spec §8.2).
 const MODES = [["from_frame", "От кадра"], ["refs", "Референсы"]] as const;
-const MODE_LABEL = { from_frame: "От кадра", refs: "Референсы", text: "Текст" } as const;
 const VARIANT = { error: "destructive", warning: "warn", info: "outline" } as const;
 export const CONFLICT_MESSAGE = "Сцену изменили в другом окне. Сравните и выберите, что оставить.";
 export const STALE_NOTICE = "Сцену изменили в другом окне — при сохранении покажу, что различается.";
@@ -48,9 +47,11 @@ export function FindingList({ findings }: { findings: Finding[] }) {
 
 const badNumber = (v: string) => v.trim() === "" || !Number.isFinite(Number(v));
 export const NUMBER_HINT = "Укажите число — пустое поле не сохраняется";
+export const MODE_LABEL = { from_frame: "От кадра", refs: "Референсы", text: "Текст" } as const;
+export const REPLACED_NOTICE = "Сцену заменило предложение сценариста. Ваш черновик сохранён здесь — верните его как новую сцену или уберите.";
 export const REMOVED_NOTICE = "Сцену удалили в другом окне. Ваш черновик сохранён здесь — верните его как новую сцену или уберите.";
 
-export function SceneCard({ scene, castTags, findings, sourceNo, deleteDisabled, removed, onDirty, onRestore, onDismiss, onSaved, onConflict, onDelete }: {
+export function SceneCard({ scene, castTags, findings, sourceNo, deleteDisabled, removed, removedNotice = REMOVED_NOTICE, onDirty, onRestore, onDismiss, onSaved, onConflict, onDelete }: {
   scene: Scene;
   castTags: string[];
   findings: Finding[];
@@ -59,6 +60,7 @@ export function SceneCard({ scene, castTags, findings, sourceNo, deleteDisabled,
   deleteDisabled: boolean;
   /** The scene is gone from the server (deleted in another window) but this card holds unsaved text. */
   removed: boolean;
+  removedNotice?: string;
   onDirty: (id: string, dirty: boolean) => void;
   onRestore: (draft: Draft) => void;
   onDismiss: () => void;
@@ -189,7 +191,7 @@ export function SceneCard({ scene, castTags, findings, sourceNo, deleteDisabled,
           </div>
         </div>
         <FindingList findings={findings.filter((f) => f.field === "source_frame" || f.field === null)} />
-        {removed && <p role="status" className="text-[13px] text-warn">{REMOVED_NOTICE}</p>}
+        {removed && <p role="status" className="text-[13px] text-warn">{removedNotice}</p>}
         {!removed && isStale(state) && <p className="text-[13px] text-warn">{STALE_NOTICE}</p>}
         {conflict && (
           <div role="group" aria-label="Конфликт правок" className="grid gap-2 rounded-md border border-warn p-3 text-[13px]">

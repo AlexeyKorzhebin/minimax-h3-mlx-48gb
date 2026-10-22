@@ -8,10 +8,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useIsPhone, useMobileAction } from "@/mobileAction";
-import { SceneCard } from "./SceneCard";
+import { MODE_LABEL, REMOVED_NOTICE, REPLACED_NOTICE, SceneCard } from "./SceneCard";
 import { toBody, type Draft, FIELDS } from "./sceneDraft";
 
-const MODE_LABEL = { from_frame: "От кадра", refs: "Референсы", text: "Текст" } as const;
 
 /** The frame source as O7 takes it. A source derived from the order (`auto`) goes as
  *  `{kind: "prev_last_frame"}` WITHOUT a scene_id — the server derives it again, and a named
@@ -94,6 +93,7 @@ export function ScenarioStep({ snap, onChanged }: { snap: Snapshot; onChanged: (
   // owner decides what to do with the draft. Found during render (before the card unmounts).
   const dirtyIds = useRef(new Set<string>());
   const ownDeleted = useRef(new Set<string>());
+  const ownReplaced = useRef(new Set<string>());   // replaced by our own «Применить»: a dirty draft stays, with its own notice
   const onDirty = (id: string, dirty: boolean) => { if (dirty) dirtyIds.current.add(id); else dirtyIds.current.delete(id); };
   const [seen, setSeen] = useState(snap.scenes);
   const [orphans, setOrphans] = useState<Scene[]>([]);
@@ -128,9 +128,16 @@ export function ScenarioStep({ snap, onChanged }: { snap: Snapshot; onChanged: (
     setProposal(await api<Proposal>("POST", `/projects/${pid}/director/propose`, { idea_text: idea, scenes_count: Number(count) }));
   });
   const apply = () => run(async () => {
-    await api<ScenesResult>("POST", `/projects/${pid}/director/apply`, {
-      proposal_id: proposal!.proposal_id, expected_revision: snap.project.revision, deleted: snap.scenes.map(gone),
-    });
+    const ids = snap.scenes.map((x) => x.id);
+    ids.forEach((id) => ownReplaced.current.add(id));
+    try {
+      await api<ScenesResult>("POST", `/projects/${pid}/director/apply`, {
+        proposal_id: proposal!.proposal_id, expected_revision: snap.project.revision, deleted: snap.scenes.map(gone),
+      });
+    } catch (err) {
+      ids.forEach((id) => ownReplaced.current.delete(id));   // nothing was replaced
+      throw err;
+    }
     setProposal(null);
     onChanged();
   });
@@ -221,6 +228,7 @@ export function ScenarioStep({ snap, onChanged }: { snap: Snapshot; onChanged: (
             sourceNo={sourceNo(snap.scenes, s)}
             deleteDisabled={busy}
             removed={orphans.some((o) => o.id === s.id)}
+            removedNotice={ownReplaced.current.has(s.id) ? REPLACED_NOTICE : REMOVED_NOTICE}
             onDirty={onDirty}
             onRestore={(draft) => restore(s, draft)}
             onDismiss={() => dismiss(s.id)}
