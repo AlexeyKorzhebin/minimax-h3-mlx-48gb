@@ -1,0 +1,88 @@
+@import "tailwindcss";
+@import "@fontsource/inter/cyrillic-400.css";
+@import "@fontsource/inter/cyrillic-500.css";
+@import "@fontsource/inter/cyrillic-600.css";
+@import "@fontsource/inter/latin-400.css";
+@import "@fontsource/inter/latin-500.css";
+@import "@fontsource/inter/latin-600.css";
+@import "@fontsource/inter-tight/cyrillic-600.css";
+@import "@fontsource/inter-tight/latin-600.css";
+@import "@fontsource/jetbrains-mono/cyrillic-400.css";
+@import "@fontsource/jetbrains-mono/latin-400.css";
+
+/* Design system AB (docs/design/2026-10-studio-style/AB/README.md): tokens of both themes. */
+:root {
+  --bg: #ffffff; --surface: #f6f7f9; --surface2: #eef0f4; --line: #e3e6ec; --line2: #cfd4de;
+  --ink: #0b0d12; --ink2: #464c5a; --ink3: #6b7280;
+  --cobalt: #1747e6; --cobalt-ink: #ffffff; --cobalt-soft: #eaf0ff; --cobalt-line: #b9ccff;
+  --ok: #0a7a4b; --ok-soft: #e5f6ee; --warn: #a15c00; --warn-soft: #fff3dd;
+  --danger: #b42318; --danger-soft: #fdecea;
+  --scrim: rgba(255, 255, 255, 0.88);
+}
+[data-theme="dark"] {
+  --bg: #0a0c10; --surface: #10131a; --surface2: #171b24; --line: #222833; --line2: #333b4a;
+  --ink: #f2f4f8; --ink2: #b4bbc9; --ink3: #8b93a3;
+  --cobalt: #5b83ff; --cobalt-ink: #06102e; --cobalt-soft: #121d3d; --cobalt-line: #27407f;
+  --ok: #4cd391; --ok-soft: #0d2a1e; --warn: #f2b254; --warn-soft: #2c2108;
+  --danger: #ff8a7a; --danger-soft: #3a1410;
+  --scrim: rgba(10, 12, 16, 0.9);
+}
+
+@theme inline {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Inter Tight", "Inter", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface2: var(--surface2);
+  --color-line: var(--line);
+  --color-line2: var(--line2);
+  --color-ink: var(--ink);
+  --color-ink2: var(--ink2);
+  --color-ink3: var(--ink3);
+  --color-cobalt: var(--cobalt);
+  --color-cobalt-ink: var(--cobalt-ink);
+  --color-cobalt-soft: var(--cobalt-soft);
+  --color-cobalt-line: var(--cobalt-line);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  /* shadcn/ui variables mapped onto AB, so copied components take the AB look */
+  --color-background: var(--bg);
+  --color-foreground: var(--ink);
+  --color-primary: var(--cobalt);
+  --color-primary-foreground: var(--cobalt-ink);
+  --color-secondary: var(--surface);
+  --color-secondary-foreground: var(--ink);
+  --color-muted: var(--surface);
+  --color-muted-foreground: var(--ink3);
+  --color-accent: var(--surface);
+  --color-accent-foreground: var(--ink);
+  --color-destructive: var(--danger);
+  --color-border: var(--line);
+  --color-input: var(--line2);
+  --color-ring: var(--cobalt);
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+}
+
+@layer base {
+  html { background: var(--bg); color: var(--ink); font-family: var(--font-sans);
+         -webkit-font-smoothing: antialiased; }
+  body { background: var(--bg); font-size: 14px; line-height: 1.45; }
+  :focus-visible { outline: 2px solid var(--cobalt); outline-offset: 2px; border-radius: 4px; }
+}
+
+@layer components {
+  .eyebrow { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em;
+             text-transform: uppercase; color: var(--ink3); }
+  .h-display { font-family: var(--font-display); font-weight: 600; letter-spacing: -0.025em; }
+  .route { display: grid; grid-template-columns: repeat(6, 1fr); gap: 3px; }
+  .route i { display: block; height: 3px; background: var(--line2); border-radius: 1px; }
+  .route i.done { background: var(--ink); }
+  .route i.cur { background: var(--cobalt); }
+}

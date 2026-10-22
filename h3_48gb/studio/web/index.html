@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ru" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Студия</title>
+    <script>
+      // theme before first paint (spec §4.4: light is the main one; dark; as in the system)
+      (function () {
+        var t = "light";
+        try { t = localStorage.getItem("studio.theme") || "light"; } catch (e) {}
+        var dark = t === "dark" || (t === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
