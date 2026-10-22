@@ -22,7 +22,9 @@ order. Every field is English (no Cyrillic). For each scene:
 - `music` — non-diegetic music: instruments, tempo, dynamics, or "none".
 - `state_in` — one sentence: the frame at the first moment of the scene.
 - `state_out` — one sentence: the frame at the last moment; the next scene starts from it.
-- `cast_tags` — tags from `cast` who are on screen in this scene.
+- `cast_tags` — the `tag` of every character from `cast` who is in the frame. The owner cast
+  them for this video: the opening scene shows them unless the idea explicitly keeps them out
+  of frame. An empty list means "no one from the cast is visible" — say so in `action`.
 - `requested_s` — length in seconds, 3 to 15; 8 is a good default.
 
 Do not count above three in the action: say "several" instead of a number.

@@ -121,6 +121,12 @@ def propose(llm: Llm, *, idea_text: str, scenes_count: int, frame_format: str,
                     dropped.append(tag)
             elif tag not in tags:
                 tags.append(tag)
+        if i == 0 and not tags:
+            # The opening scene with nobody listed: the model forgot the field (live probe
+            # 23.10, 1 of 5). A pictured hero's face enters the chain only here — every later
+            # scene is from_frame (§9.1) — and the owner cast them for this video (§4.4 шаг 2),
+            # so the opening scene shows the pictured cast unless the model named someone else.
+            tags = [c["tag"] for c in cast if c["has_image"]]
         with_image = [t for t in tags if by_tag[t]["has_image"]]
         if i == 0:
             mode = "refs" if with_image else "from_frame"

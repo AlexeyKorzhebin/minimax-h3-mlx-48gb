@@ -38,12 +38,14 @@ SCENARIST_PROMPT = (
     '- `music` — non-diegetic music: instruments, tempo, dynamics, or "none".\n'
     '- `state_in` — one sentence: the frame at the first moment of the scene.\n'
     '- `state_out` — one sentence: the frame at the last moment; the next scene starts from it.\n'
-    '- `cast_tags` — tags from `cast` who are on screen in this scene.\n'
+    '- `cast_tags` — the `tag` of every character from `cast` who is in the frame. The owner cast\n'
+    '  them for this video: the opening scene shows them unless the idea explicitly keeps them out\n'
+    '  of frame. An empty list means "no one from the cast is visible" — say so in `action`.\n'
     '- `requested_s` — length in seconds, 3 to 15; 8 is a good default.\n'
     '\n'
     'Do not count above three in the action: say "several" instead of a number.\n'
 )
-SCENARIST_PROMPT_VERSION = "bdfb247d800c"     # sha256(SCENARIST_PROMPT)[:12]
+SCENARIST_PROMPT_VERSION = "855cc46f8c89"     # sha256(SCENARIST_PROMPT)[:12]
 _STR = {"type": "string"}
 SCENES_SCHEMA = {
     "name": "studio_scenes",
@@ -160,6 +162,16 @@ def test_first_scene_without_a_hero_picture_waits_for_a_keyframe(tmp_path, seeds
                            json={"idea_text": "x", "scenes_count": 1}).json()["scenes"]
     assert (scene["mode"], scene["refs"], scene["source_frame"]["kind"]) == \
         ("from_frame", ["anna"], "none")
+
+
+def test_the_opening_scene_with_an_empty_cast_list_shows_the_pictured_cast(tmp_path, seeds):
+    llm = ScriptedLlm([{"scenes": [_llm_scene(1, tags=()), _llm_scene(2, tags=("anna",))]}])
+    client = make_client(tmp_path, llm=llm)
+    pid = _project_with_hero(client)                       # anna has a picture
+    s1, s2 = client.post(f"/api/studio/projects/{pid}/director/propose",
+                         json={"idea_text": "x", "scenes_count": 2}).json()["scenes"]
+    assert ((s1["mode"], s1["refs"]), s1["action_text"].startswith(PHRASE)) == (("refs", ["anna"]), True)
+    assert (s2["mode"], s2["refs"]) == ("from_frame", ["anna"])
 
 
 def test_wrong_number_of_scenes_is_502_and_no_proposal(tmp_path, seeds):
