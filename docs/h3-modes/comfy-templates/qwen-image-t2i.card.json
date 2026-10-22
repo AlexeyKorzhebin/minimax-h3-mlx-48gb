@@ -1,0 +1,181 @@
+{
+ "id": "qwen-image-t2i",
+ "executor": "comfyui",
+ "graph": "qwen-image-t2i.graph.json",
+ "comfyui_min_version": "0.42.0",
+ "requires_json": {
+  "class_types": [
+   "CLIPLoader",
+   "CLIPTextEncode",
+   "EmptySD3LatentImage",
+   "KSampler",
+   "ModelSamplingAuraFlow",
+   "SaveImage",
+   "UNETLoader",
+   "VAEDecode",
+   "VAELoader"
+  ],
+  "models": {
+   "diffusion_models": [
+    "qwen_image_2512_fp8_e4m3fn.safetensors"
+   ],
+   "text_encoders": [
+    "qwen_2.5_vl_7b_fp8_scaled.safetensors"
+   ],
+   "vae": [
+    "qwen_image_vae.safetensors"
+   ],
+   "loras": []
+  },
+  "limits": {
+   "sides_multiple_of": 16,
+   "steps_default": 50,
+   "cfg_default": 4.0,
+   "sampler": "euler/simple",
+   "shift": 3.1,
+   "uses_negative": true
+  },
+  "estimate_s": 60
+ },
+ "inputs": {
+  "task_id": {
+   "type": "string",
+   "required": true,
+   "pattern": "[A-Za-z0-9][A-Za-z0-9._-]{0,79}",
+   "targets": [
+    {
+     "node": "10",
+     "field": "filename_prefix",
+     "template": "studio/{task_id}/f"
+    }
+   ]
+  },
+  "prompt": {
+   "type": "string",
+   "targets": [
+    {
+     "node": "4",
+     "field": "text"
+    }
+   ],
+   "required": true
+  },
+  "seed": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "8",
+     "field": "seed"
+    }
+   ],
+   "required": true,
+   "min": 0,
+   "max": 9223372036854775807
+  },
+  "steps": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "8",
+     "field": "steps"
+    }
+   ],
+   "default": 50,
+   "min": 1,
+   "max": 80
+  },
+  "cfg": {
+   "type": "float",
+   "targets": [
+    {
+     "node": "8",
+     "field": "cfg"
+    }
+   ],
+   "default": 4.0,
+   "min": 0.0,
+   "max": 10.0
+  },
+  "width": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "6",
+     "field": "width"
+    }
+   ],
+   "required": true,
+   "min": 256,
+   "max": 2048,
+   "multiple_of": 16
+  },
+  "height": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "6",
+     "field": "height"
+    }
+   ],
+   "required": true,
+   "min": 256,
+   "max": 2048,
+   "multiple_of": 16
+  },
+  "lora": {
+   "type": "lora",
+   "required": false,
+   "node_id": "lora",
+   "after": [
+    "1",
+    0
+   ],
+   "rewire": [
+    {
+     "node": "7",
+     "field": "model"
+    }
+   ],
+   "note": "optional {name, strength}; e.g. Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors with steps=4, cfg=1; inserts LoraLoaderModelOnly between UNETLoader and ModelSamplingAuraFlow"
+  },
+  "negative": {
+   "type": "string",
+   "targets": [
+    {
+     "node": "5",
+     "field": "text"
+    }
+   ],
+   "required": false
+  }
+ },
+ "output": {
+  "node": "10",
+  "kind": "image",
+  "dir": "studio/<task_id>/"
+ },
+ "verified_on": [
+  {
+   "date": "2026-10-22",
+   "machine": "alex-neuro",
+   "comfyui": "0.42.0",
+   "comfyui_commit": "b1a247c9",
+   "measure": "1344x768, 50 steps, cfg 4, seed 12, warm",
+   "secs": 58.5,
+   "device_peak_mib": 48269,
+   "prompt_id": "acb261c5-cfe2-45bd-a5c7-6d1ba31a8440",
+   "script": "image_models_probe.py (h3-bench, probe/image-models-20261022)"
+  },
+  {
+   "date": "2026-10-22",
+   "machine": "alex-neuro",
+   "comfyui": "0.42.0",
+   "comfyui_commit": "b1a247c9",
+   "measure": "1344x768, Lightning 4 steps bf16 LoRA, cfg 1, seed 12, warm",
+   "secs": 2.7,
+   "device_peak_mib": 48269,
+   "prompt_id": "011bce4e-65e2-4473-972c-4d859730daf2",
+   "script": "image_models_probe.py (h3-bench, probe/image-models-20261022)"
+  }
+ ]
+}

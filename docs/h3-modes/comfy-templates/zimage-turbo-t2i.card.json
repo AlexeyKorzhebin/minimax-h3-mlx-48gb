@@ -1,0 +1,144 @@
+{
+ "id": "zimage-turbo-t2i",
+ "executor": "comfyui",
+ "graph": "zimage-turbo-t2i.graph.json",
+ "comfyui_min_version": "0.42.0",
+ "requires_json": {
+  "class_types": [
+   "CLIPLoader",
+   "CLIPTextEncode",
+   "ConditioningZeroOut",
+   "EmptySD3LatentImage",
+   "KSampler",
+   "ModelSamplingAuraFlow",
+   "SaveImage",
+   "UNETLoader",
+   "VAEDecode",
+   "VAELoader"
+  ],
+  "models": {
+   "diffusion_models": [
+    "z_image_turbo_int8_convrot.safetensors"
+   ],
+   "text_encoders": [
+    "qwen_3_4b_fp8_mixed.safetensors"
+   ],
+   "vae": [
+    "ae.safetensors"
+   ]
+  },
+  "limits": {
+   "sides_multiple_of": 64,
+   "steps_default": 8,
+   "cfg_default": 1.0,
+   "sampler": "res_multistep/simple",
+   "shift": 3.0,
+   "uses_negative": false
+  },
+  "estimate_s": 4
+ },
+ "inputs": {
+  "task_id": {
+   "type": "string",
+   "required": true,
+   "pattern": "[A-Za-z0-9][A-Za-z0-9._-]{0,79}",
+   "targets": [
+    {
+     "node": "10",
+     "field": "filename_prefix",
+     "template": "studio/{task_id}/f"
+    }
+   ]
+  },
+  "prompt": {
+   "type": "string",
+   "targets": [
+    {
+     "node": "4",
+     "field": "text"
+    }
+   ],
+   "required": true
+  },
+  "seed": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "8",
+     "field": "seed"
+    }
+   ],
+   "required": true,
+   "min": 0,
+   "max": 9223372036854775807
+  },
+  "steps": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "8",
+     "field": "steps"
+    }
+   ],
+   "default": 8,
+   "min": 1,
+   "max": 20
+  },
+  "cfg": {
+   "type": "float",
+   "targets": [
+    {
+     "node": "8",
+     "field": "cfg"
+    }
+   ],
+   "default": 1.0,
+   "min": 0.0,
+   "max": 3.0
+  },
+  "width": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "6",
+     "field": "width"
+    }
+   ],
+   "required": true,
+   "min": 256,
+   "max": 2048,
+   "multiple_of": 64
+  },
+  "height": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "6",
+     "field": "height"
+    }
+   ],
+   "required": true,
+   "min": 256,
+   "max": 2048,
+   "multiple_of": 64
+  }
+ },
+ "output": {
+  "node": "10",
+  "kind": "image",
+  "dir": "studio/<task_id>/"
+ },
+ "verified_on": [
+  {
+   "date": "2026-10-22",
+   "machine": "alex-neuro",
+   "comfyui": "0.42.0",
+   "comfyui_commit": "b1a247c9",
+   "measure": "1344x768, 8 steps, cfg 1, seed 12, warm",
+   "secs": 2.9,
+   "device_peak_mib": 14573,
+   "prompt_id": "a846ada5-f02e-4e81-8962-980063e82460",
+   "script": "image_models_probe.py (h3-bench, probe/image-models-20261022)"
+  }
+ ]
+}
