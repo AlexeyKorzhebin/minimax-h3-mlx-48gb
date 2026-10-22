@@ -85,3 +85,29 @@ def read_sse(port: int, path: str, *, headers: dict | None = None, count: int,
     finally:
         conn.close()
     return got
+
+
+#: A real 2x2 PNG (Pillow decodes it) — upload tests must not pass on a signature alone.
+TINY_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000002000000020802000000fdd49a73000000124944415478"
+    "9c6314777fc6c0c0c0c40006000e8b01487dba26d80000000049454e44ae426082")
+
+
+class ScriptedLlm:
+    """An `llm.Llm` that answers from a list. Records each call's messages and the whole schema
+    dict; a call past the end of the script fails the test instead of inventing an answer."""
+
+    label = "scripted"
+
+    def __init__(self, replies: list):
+        self.replies = list(replies)
+        self.calls: list[dict] = []
+
+    def json_turn(self, messages: list[dict], schema: dict, retry_reminder: str) -> dict:
+        self.calls.append({"messages": messages, "schema": schema})
+        if not self.replies:
+            raise AssertionError("unexpected LLM call")
+        reply = self.replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply

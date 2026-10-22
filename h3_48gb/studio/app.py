@@ -10,14 +10,15 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from h3_48gb.studio import config, db, events, ops, schemas
+from h3_48gb.studio import assets, config, db, events, ops, schemas
 from h3_48gb.studio.errors import StudioError
+from h3_48gb.studio.llm import Llm, ProviderLlm
 
 WEB_DIST = Path(__file__).parent / "web" / "dist"
 #: Request body limits — the guard against junk instead of a cap on the number of scenes (a project
@@ -149,9 +150,10 @@ class BodyLimit:
 
 
 def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
-               allowed_hosts: list[str] | None = None) -> FastAPI:
+               allowed_hosts: list[str] | None = None, llm: Llm | None = None) -> FastAPI:
     home = config.studio_dir(outdir)
     home.mkdir(parents=True, exist_ok=True)
+    llm = llm or ProviderLlm(home, home / "gpu-mac.lock")
     db_path = home / "studio.sqlite"
     boot = db.connect(db_path)
     try:
@@ -235,6 +237,26 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
                       conn=Depends(get_conn)):
         return ops.update_project(conn, project_id, expected_revision=body.expected_revision,
                                   title=body.title, frame_format=body.frame_format)
+
+    @app.post(f"{api}/assets", status_code=201)
+    async def import_asset(file: UploadFile = File(...), kind: str | None = Form(default=None),
+                           conn=Depends(get_conn)):
+        data = await file.read(assets.MAX_ASSET_BYTES + 1)
+        return await asyncio.to_thread(assets.import_asset, conn, home, data=data, kind=kind)
+
+    @app.get(f"{api}/assets/{{asset_id}}/file")
+    def asset_file(asset_id: str, conn=Depends(get_conn)):
+        path, mime = assets.asset_file(conn, asset_id)
+        return FileResponse(path, media_type=mime)
+
+    @app.post(f"{api}/projects/{{project_id}}/cast", status_code=201)
+    def add_cast(body: schemas.CastCreate, project_id: str = Depends(project_exists),
+                 conn=Depends(get_conn)):
+        return ops.add_cast(conn, project_id, expected_revision=body.expected_revision,
+                            tag=body.tag, description_ru=body.description_ru,
+                            assets=[a.model_dump() for a in body.assets],
+                            description_en=body.description_en,
+                            portrait_phrase=body.portrait_phrase, llm=llm)
 
     @app.get(f"{api}/events")
     async def stream_events(request: Request, after: int = 0,

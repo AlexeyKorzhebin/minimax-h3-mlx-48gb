@@ -1,6 +1,110 @@
 {
   "components": {
     "schemas": {
+      "Body_import_asset_api_studio_assets_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "title": "Body_import_asset_api_studio_assets_post",
+        "type": "object"
+      },
+      "CastAssetIn": {
+        "additionalProperties": false,
+        "properties": {
+          "asset_id": {
+            "title": "Asset Id",
+            "type": "string"
+          },
+          "role": {
+            "const": "image",
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "asset_id",
+          "role"
+        ],
+        "title": "CastAssetIn",
+        "type": "object"
+      },
+      "CastCreate": {
+        "additionalProperties": false,
+        "properties": {
+          "assets": {
+            "items": {
+              "$ref": "#/components/schemas/CastAssetIn"
+            },
+            "maxItems": 8,
+            "title": "Assets",
+            "type": "array"
+          },
+          "description_en": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description En"
+          },
+          "description_ru": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Description Ru",
+            "type": "string"
+          },
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "portrait_phrase": {
+            "anyOf": [
+              {
+                "maxLength": 400,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Portrait Phrase"
+          },
+          "tag": {
+            "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+            "title": "Tag",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "tag",
+          "description_ru"
+        ],
+        "title": "CastCreate",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -149,6 +253,79 @@
           }
         },
         "summary": "Root"
+      }
+    },
+    "/api/studio/assets": {
+      "post": {
+        "operationId": "import_asset_api_studio_assets_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_import_asset_api_studio_assets_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Asset"
+      }
+    },
+    "/api/studio/assets/{asset_id}/file": {
+      "get": {
+        "operationId": "asset_file_api_studio_assets__asset_id__file_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "title": "Asset Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Asset File"
       }
     },
     "/api/studio/events": {
@@ -351,6 +528,53 @@
           }
         },
         "summary": "Patch Project"
+      }
+    },
+    "/api/studio/projects/{project_id}/cast": {
+      "post": {
+        "operationId": "add_cast_api_studio_projects__project_id__cast_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CastCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Cast"
       }
     },
     "/studio": {

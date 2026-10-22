@@ -23,3 +23,22 @@ class ProjectPatch(_Body):
     expected_revision: int
     title: str | None = Field(default=None, min_length=1, max_length=200)
     frame_format: FrameFormat | None = None
+
+
+# --- slice S1 ---------------------------------------------------------------------------------
+
+Tag = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+class CastAssetIn(_Body):
+    asset_id: str
+    role: Literal["image"]        # voice references arrive with audio uploads (after S1)
+
+
+class CastCreate(_Body):
+    expected_revision: int
+    tag: str = Tag
+    description_ru: str = Field(min_length=1, max_length=4000)
+    assets: list[CastAssetIn] = Field(default_factory=list, max_length=8)
+    description_en: str | None = Field(default=None, max_length=4000)
+    portrait_phrase: str | None = Field(default=None, max_length=400)
