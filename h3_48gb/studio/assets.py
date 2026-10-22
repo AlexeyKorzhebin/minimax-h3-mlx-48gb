@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import io
 import sqlite3
-import warnings
 from pathlib import Path
 
 from PIL import Image
@@ -43,16 +42,14 @@ def check_decodes(data: bytes, ext: str) -> None:
     `ext` comes from `sniff` by the same leading bytes Pillow reads to pick its decoder, so a
     decoder of another format can never be chosen; there is no format cross-check to make."""
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(data)) as image:
-                width, height = image.size
-                if width * height > MAX_ASSET_PIXELS:
-                    raise _too_many_pixels(width * height)
-                image.load()
+        with Image.open(io.BytesIO(data)) as image:
+            width, height = image.size
+            if width * height > MAX_ASSET_PIXELS:
+                raise _too_many_pixels(width * height)
+            image.load()
     except StudioError:
         raise
-    except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+    except Image.DecompressionBombError:
         raise _too_many_pixels(None) from None
     except Exception:                       # Pillow raises half a dozen types for bad input
         raise StudioError(400, "asset_corrupt", "Картинка повреждена или не читается") from None

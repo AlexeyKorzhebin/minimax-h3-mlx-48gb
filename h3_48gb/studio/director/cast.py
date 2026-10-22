@@ -47,7 +47,7 @@ def describe(llm: Llm, *, tag: str, description_ru: str) -> dict:
                          "Ответ строго одним JSON-объектом {description_en, portrait_phrase}.")
     validate_reply(card, CAST_SCHEMA)
     description_en = card["description_en"].strip()
-    portrait_phrase = card["portrait_phrase"].strip().rstrip(".")
+    portrait_phrase = card["portrait_phrase"].strip().rstrip(". ")
     try:
         check_card(description_en, portrait_phrase)
     except StudioError as err:

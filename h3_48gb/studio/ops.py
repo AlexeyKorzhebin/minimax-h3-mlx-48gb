@@ -139,7 +139,7 @@ def add_cast(conn: sqlite3.Connection, project_id: str, *, expected_revision: in
                           {"field": missing})
     if description_en is not None and portrait_phrase is not None:
         card = {"description_en": description_en.strip(),
-                "portrait_phrase": portrait_phrase.strip().rstrip(".").strip()}
+                "portrait_phrase": portrait_phrase.strip().rstrip(". ")}
         cast_card.check_card(card["description_en"], card["portrait_phrase"])
     else:
         card = cast_card.describe(llm, tag=tag, description_ru=description_ru)

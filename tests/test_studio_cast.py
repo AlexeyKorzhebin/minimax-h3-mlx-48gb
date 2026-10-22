@@ -446,3 +446,46 @@ def test_cast_while_the_render_holds_the_gpu_is_409(tmp_path):
     assert (r.status_code, r.json()["error"]["code"]) == (409, "gpu_busy")
     assert r.json()["error"]["message"] == "Сценарист ждёт видеокарту: её занял рендер"
     assert r.json()["error"]["detail"] == {"lock": str(home / "gpu-mac.lock")}
+
+
+# --- review round 2 (task 9) ------------------------------------------------------------------
+
+
+@pytest.mark.filterwarnings("ignore::PIL.Image.DecompressionBombWarning")
+def test_between_pillows_warning_and_error_the_refusal_still_names_the_pixels(tmp_path):
+    """100 MP is past Pillow's warning threshold (89 MP): the studio's own check answers, with the
+    exact count, and no process-wide warning filter is involved."""
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    r = _upload(client, data=_mono_png(10000, 10000))
+    assert (r.status_code, r.json()["error"]["detail"]) == (
+        413, {"pixels": 100_000_000, "max": MAX_PIXELS})
+
+
+def test_a_row_without_its_file_is_404_asset_not_found(tmp_path):
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    a = _upload(client).json()
+    (tmp_path / "out" / "studio" / "assets" / f"{a['id']}.png").unlink()
+    r = client.get(a["url"])
+    assert (r.status_code, r.json()) == (404, {"error": {
+        "code": "asset_not_found", "message": "Файл не найден", "detail": {"asset_id": a["id"]}}})
+
+
+def test_the_phrase_is_stripped_again_after_its_trailing_dots(tmp_path):
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    p = _project(client)
+    r = _cast(client, p["id"], description_en="A woman.", portrait_phrase="a woman. .")
+    assert r.json()["cast_member"]["portrait_phrase"] == "a woman"
+
+
+def test_a_multi_frame_jpeg_from_a_phone_is_taken_as_jpg(tmp_path):
+    """Pillow reports a JPEG with an MPF block as `MPO`, not `JPEG`."""
+    from PIL import Image
+    buf = io.BytesIO()
+    frame = Image.new("RGB", (4, 4), (200, 10, 10))
+    frame.save(buf, "MPO", save_all=True, append_images=[Image.new("RGB", (4, 4))])
+    data = buf.getvalue()
+    with Image.open(io.BytesIO(data)) as probe:
+        assert probe.format == "MPO"
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    r = _upload(client, data=data, name="IMG.jpg")
+    assert (r.status_code, r.json()["mime"]) == (201, "image/jpeg")
