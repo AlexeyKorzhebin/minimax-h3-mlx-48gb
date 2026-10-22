@@ -350,10 +350,11 @@ def test_a_scene_the_scene_schema_refuses_is_a_named_502(tmp_path, seeds):
 def test_a_proposal_of_another_project_is_404(tmp_path, seeds):
     client = make_client(tmp_path, llm=ScriptedLlm([{"scenes": [_llm_scene(1)]}]))
     pid = _project_with_hero(client)
-    other = client.post("/api/studio/projects", json={"title": "Б", "frame_format": "16:9"}).json()
+    # The same cast in both projects: only the project check can refuse (re-review r1, M1).
+    other = _project_with_hero(client)
     proposal_id = _propose(client, pid).json()["proposal_id"]
-    r = client.post(f"/api/studio/projects/{other['id']}/director/apply",
-                    json={"proposal_id": proposal_id, "expected_revision": 1})
+    r = client.post(f"/api/studio/projects/{other}/director/apply",
+                    json={"proposal_id": proposal_id, "expected_revision": 2})
     assert (r.status_code, r.json()["error"]["code"]) == (404, "proposal_not_found")
 
 
