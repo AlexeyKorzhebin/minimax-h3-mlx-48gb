@@ -8,3 +8,16 @@
 reference
 upstream
 logs
+**/node_modules
+# secrets and state never go into an image (К-13); the live ones are mounted at run time
+.env
+**/.env
+**/.env.*
+**/providers.json
+**/*.pem
+**/*.key
+**/*.sqlite
+**/*.sqlite-*
+**/*.env
+**/*.sqlite3
+**/*.db

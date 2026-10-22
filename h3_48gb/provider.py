@@ -1044,3 +1044,11 @@ def test_provider(cfg: dict, env: dict, timeout: float = 5.0) -> dict:
                  + (f": {', '.join(names[:20])}" if names else ""),
         "models": names[:20],
     }
+
+
+def chat_with_schema(cfg: dict, env: dict, messages: list[dict], schema: dict,
+                     retry_reminder: str) -> dict:
+    """One turn shaped by the caller's own `schema` (`{"name", "schema"}`, the `PROMPT_SCHEMA`
+    form) -- the studio's scenarist and cast card (studio spec §9.1). Same wire, retry and four
+    named failures as `chat`/`chat_scenario`; only the schema and the reminder are the caller's."""
+    return _chat_turn(cfg, env, messages, schema, retry_reminder)

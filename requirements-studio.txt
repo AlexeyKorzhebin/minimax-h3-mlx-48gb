@@ -1,0 +1,10 @@
+# Studio (docs/superpowers/specs/2026-10-10-studio-part1-core-design.md §5), installed on top of
+# requirements-panel.txt (which already brings jsonschema and pillow, used by the studio too).
+# Exact pins: the master's OpenAPI snapshot (tests/test_studio_openapi.py) changes with
+# FastAPI's own output.
+fastapi==0.156.8
+pydantic==2.14.1
+uvicorn==0.54.0
+python-multipart==0.0.32
+# TestClient transport; Starlette 1.9 deprecates plain httpx for it.
+httpx2==2.16.0
