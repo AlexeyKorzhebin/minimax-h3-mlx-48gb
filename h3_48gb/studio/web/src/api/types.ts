@@ -7,14 +7,8 @@ export type ProjectPatch = components["schemas"]["ProjectPatch"];
 export type CastCreate = components["schemas"]["CastCreate"];
 export type SceneIn = components["schemas"]["SceneIn"];
 export type ScenePatch = components["schemas"]["ScenePatch"];
-// O25/O26 (task 11) are not in the generated schema.d.ts yet: written out by hand from the plan's
-// contract. After task 11 is merged, take them from `components["schemas"]` again.
-export type ProposeRequest = { idea_text: string; scenes_count: number };
-export type ApplyRequest = {
-  proposal_id: string;
-  expected_revision: number;
-  deleted: { scene_id: string; expected_edit_version: number }[];
-};
+export type ProposeRequest = components["schemas"]["ProposeRequest"];
+export type ApplyRequest = components["schemas"]["ApplyRequest"];
 
 export type Project = {
   id: string;
