@@ -1,0 +1,143 @@
+{
+ "id": "krea2-t2i",
+ "executor": "comfyui",
+ "graph": "krea2-t2i.graph.json",
+ "comfyui_min_version": "0.42.0",
+ "requires_json": {
+  "class_types": [
+   "CLIPLoader",
+   "CLIPTextEncode",
+   "ConditioningZeroOut",
+   "EmptyLatentImage",
+   "KSampler",
+   "SaveImage",
+   "UNETLoader",
+   "VAEDecode",
+   "VAELoader"
+  ],
+  "models": {
+   "diffusion_models": [
+    "krea2_turbo_int8_convrot.safetensors"
+   ],
+   "text_encoders": [
+    "qwen3vl_4b_int8_convrot.safetensors"
+   ],
+   "vae": [
+    "qwen_image_vae.safetensors"
+   ]
+  },
+  "limits": {
+   "sides_multiple_of": 64,
+   "steps_default": 8
+  },
+  "estimate_s": 6
+ },
+ "inputs": {
+  "task_id": {
+   "type": "string",
+   "required": true,
+   "pattern": "[A-Za-z0-9][A-Za-z0-9._-]{0,79}",
+   "targets": [
+    {
+     "node": "9",
+     "field": "filename_prefix",
+     "template": "studio/{task_id}/f"
+    }
+   ]
+  },
+  "prompt": {
+   "type": "string",
+   "targets": [
+    {
+     "node": "4",
+     "field": "text"
+    }
+   ],
+   "required": true
+  },
+  "seed": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "7",
+     "field": "seed"
+    }
+   ],
+   "required": true,
+   "min": 0,
+   "max": 9223372036854775807
+  },
+  "steps": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "7",
+     "field": "steps"
+    }
+   ],
+   "default": 8,
+   "min": 1,
+   "max": 50
+  },
+  "width": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "6",
+     "field": "width"
+    }
+   ],
+   "required": true,
+   "min": 256,
+   "max": 2048,
+   "multiple_of": 64
+  },
+  "height": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "6",
+     "field": "height"
+    }
+   ],
+   "required": true,
+   "min": 256,
+   "max": 2048,
+   "multiple_of": 64
+  },
+  "lora": {
+   "type": "lora",
+   "required": false,
+   "node_id": "lora",
+   "after": [
+    "1",
+    0
+   ],
+   "rewire": [
+    {
+     "node": "7",
+     "field": "model"
+    }
+   ],
+   "note": "optional {name, strength}; name from GET /models/loras; inserts LoraLoaderModelOnly between UNETLoader and KSampler"
+  }
+ },
+ "output": {
+  "node": "9",
+  "kind": "image",
+  "dir": "studio/<task_id>/"
+ },
+ "verified_on": [
+  {
+   "date": "2026-10-22",
+   "machine": "alex-neuro",
+   "comfyui": "0.42.0",
+   "comfyui_commit": "b1a247c9",
+   "measure": "1344x768, 8 steps, seed 4242",
+   "secs": 24.0,
+   "device_peak_mib": 18765,
+   "prompt_id": "eb70fb5e-1781-4887-aca7-a52054f433de",
+   "script": "comfy_template_verify.py (h3-bench, probe/comfy-templates-20261022)"
+  }
+ ]
+}
