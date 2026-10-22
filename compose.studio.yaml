@@ -1,0 +1,28 @@
+# Studio API (spec 2026-10-10 §4.2–4.3). The old panel's compose.yaml is not touched; this file is
+# its own compose project: docker compose -f compose.studio.yaml up -d
+name: h3-studio
+services:
+  studio-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.studio
+    image: h3-studio:latest
+    network_mode: host
+    user: "1000:1000"
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/api/studio/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    environment:
+      TZ: Europe/Moscow
+      HOME: /tmp
+      H3_OUTDIR: /home/alex/Outputs
+      # Host names the studio answers to besides alex-neuro/localhost/127.0.0.1 (R26): the LAN IP
+      STUDIO_ALLOWED_HOSTS: "192.168.100.50"
+    volumes:
+      - /home/alex/Outputs/studio:/home/alex/Outputs/studio

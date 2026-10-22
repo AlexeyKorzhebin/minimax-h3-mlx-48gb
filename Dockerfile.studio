@@ -1,0 +1,20 @@
+FROM python:3.12-slim
+# Studio API (docs/superpowers/specs/2026-10-10-studio-part1-core-design.md §4.2). The master is
+# built on the Mac (`npm --prefix h3_48gb/studio/web run build`) and arrives as web/dist: npm
+# registry access from alex-neuro is unverified, PyPI is (the panel image installs from it).
+# Secrets never enter the image: .dockerignore drops .env / providers.json / keys / databases,
+# and the live ones sit in /home/alex/Outputs/studio, mounted at run time.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements-panel.txt requirements-studio.txt /app/
+RUN pip install --no-cache-dir -r requirements-panel.txt -r requirements-studio.txt
+COPY --chown=1000:1000 . /app
+RUN test -f /app/h3_48gb/studio/web/dist/index.html \
+    || (echo "build the master first: npm --prefix h3_48gb/studio/web run build" >&2; exit 1)
+RUN pip install --no-cache-dir --no-deps -e .
+ENV PYTHONDONTWRITEBYTECODE=1
+USER 1000:1000
+ENTRYPOINT ["python", "-m", "h3_48gb.studio"]
+CMD ["api", "--host", "0.0.0.0", "--port", "8766"]
