@@ -22,4 +22,19 @@ describe("useEvents", () => {
     renderHook(() => useEvents("p_1", null, ["project_updated"], () => {}));
     expect(FakeEventSource.last).toBeNull();
   });
+
+  it("closes the previous connection when it re-subscribes after a new last_seq, and on unmount", () => {
+    const { rerender, unmount } = renderHook(
+      ({ seq }) => useEvents("p_1", seq, ["project_updated"], () => {}),
+      { initialProps: { seq: 5 } },
+    );
+    const first = FakeEventSource.last!;
+    expect([first.url, first.closed]).toEqual(["/api/studio/events?after=5", false]);
+    rerender({ seq: 6 });
+    const second = FakeEventSource.last!;
+    expect(second).not.toBe(first);
+    expect([first.closed, second.url, second.closed]).toEqual([true, "/api/studio/events?after=6", false]);
+    unmount();
+    expect(second.closed).toBe(true);
+  });
 });

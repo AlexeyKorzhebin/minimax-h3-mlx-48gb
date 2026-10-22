@@ -57,4 +57,30 @@ describe("ProjectScreen (S0)", () => {
     render(<ProjectScreen id="p_1" />);
     expect((await screen.findByRole("alert")).textContent).toBe("Проект не найден");
   });
+
+  it("a late answer to an older request does not overwrite a newer snapshot", async () => {
+    let releaseOld!: () => void;
+    const heldOld = new Promise<void>((r) => (releaseOld = r));
+    stubFetch({
+      "GET /api/studio/projects/p_1": [
+        { body: snap("Лес", 1, 5) },
+        async () => {            // the reload started by the event: slow
+          await heldOld;
+          return { body: snap("Старое", 1, 5) };
+        },
+        { body: snap("Новое", 2, 6) },
+      ],
+    });
+    render(<ProjectScreen id="p_1" />);
+    await screen.findByRole("heading", { name: "Лес" });
+    await waitFor(() => expect(FakeEventSource.last).not.toBeNull());
+    const first = FakeEventSource.last!;
+    first.emit("project_updated", { project_id: "p_1" }, 6);       // request 2 (held)
+    first.emit("project_updated", { project_id: "p_1" }, 7);       // request 3 (fast, newer)
+    await screen.findByRole("heading", { name: "Новое" });
+    releaseOld();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.getByRole("heading", { name: "Новое" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Старое" })).toBeNull();
+  });
 });

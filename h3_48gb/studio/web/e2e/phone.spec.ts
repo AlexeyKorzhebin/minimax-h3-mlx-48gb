@@ -47,3 +47,70 @@ test("step 1: «Создать проект» is pinned", async ({ page }) => {
   await page.getByRole("button", { name: "Новый проект" }).click();
   await expectPinned(page, page.getByRole("button", { name: "Создать проект" }));
 });
+
+const ITEM = (n: number) => ({
+  id: `p_${n}`, revision: 1, title: `Проект ${n}`, frame_format: "16:9", idea_text: "", style_block: "",
+  created_at: "2026-10-21T10:00:00.000+00:00", scenes_total: n, scenes_done: 0,
+});
+
+async function openFormWithThreeCards(page: Page) {
+  await api(page, { "GET /api/studio/projects": [200, [ITEM(1), ITEM(2), ITEM(3)]] });
+  await page.goto("/studio/");
+  await page.getByRole("link", { name: /Проект 3/ }).waitFor();
+  await page.getByRole("button", { name: "Новый проект" }).click();
+  await page.mouse.move(0, 0);
+}
+
+test("step 1 with three cards: the last card ends above the pinned bar, and the bar stays on top of the cards", async ({ page }) => {
+  await openFormWithThreeCards(page);
+  const button = page.getByRole("button", { name: "Создать проект" });
+  const bar = page.locator("form[aria-label='Новый проект'] > div.fixed").first();
+  const barTop = (await bar.boundingBox())!.y;
+  const height = await page.evaluate(() => document.documentElement.scrollHeight);
+  // walk the page down in 150 px steps: wherever a card is behind the bar, the bar is
+  // what a finger would hit (z-index), not the card. (The button itself is disabled while the
+  // title is empty, so the hit is checked against the whole bar.)
+  let covered = 0;
+  for (let y = 0; y <= height; y += 150) {
+    await page.evaluate((to) => window.scrollTo(0, to), y);
+    const hit = await button.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const top = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      const card = [...document.querySelectorAll("a[href^='#/p/']")].some((a) => {
+        const c = a.getBoundingClientRect();
+        return c.bottom > r.top && c.top < r.bottom;
+      });
+      return { onBar: !!top && el.closest("div.fixed")!.contains(top), card, top: top?.outerHTML.slice(0, 120), y: scrollY };
+    });
+    expect(hit.onBar, JSON.stringify(hit)).toBe(true);
+    if (hit.card) covered++;
+  }
+  expect(covered).toBeGreaterThan(0);   // the walk really passed cards under the bar
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  const last = (await page.getByRole("link", { name: /Проект 3/ }).boundingBox())!;
+  expect(Math.round(last.y + last.height)).toBeLessThanOrEqual(Math.round(barTop));
+});
+
+test("the primary button is a cobalt-gradient pill the width of the phone minus the 12 px gutters", async ({ page }) => {
+  await openFormWithThreeCards(page);
+  const button = page.getByRole("button", { name: "Создать проект" });
+  const style = await button.evaluate((el) => {
+    const s = getComputedStyle(el);
+    return { radius: s.borderTopLeftRadius, image: s.backgroundImage, height: el.getBoundingClientRect().height };
+  });
+  expect(parseFloat(style.radius)).toBeGreaterThanOrEqual(style.height / 2);   // a pill, not rounded-md (6 px)
+  expect(style.image).toContain("linear-gradient(");
+  // the light cobalt #1747e6 (23, 71, 230) is the first stop; the orange #d97757 would not match
+  expect(style.image).toMatch(/rgb\(23, 71, 230\)|color\(srgb 0\.0*9\d* 0\.27\d* 0\.90\d*\)/);
+  expect((await button.boundingBox())!.width).toBe(390 - 2 * 12);
+});
+
+test("the dark theme tells the browser it is dark (native controls, scrollbars)", async ({ page }) => {
+  await api(page, { "GET /api/studio/projects": [200, []] });
+  await page.goto("/studio/");
+  const scheme = () => page.evaluate(() => getComputedStyle(document.documentElement).colorScheme);
+  expect(await scheme()).toBe("light");
+  await page.getByRole("button", { name: "Тема: Светлая" }).click();
+  expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe("dark");
+  expect(await scheme()).toBe("dark");
+});

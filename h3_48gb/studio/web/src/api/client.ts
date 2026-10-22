@@ -16,8 +16,21 @@ export class ApiError extends Error {
 
 async function parse<T>(res: Response): Promise<T> {
   const text = await res.text();
-  const body = text ? JSON.parse(text) : null;
-  if (res.ok) return body as T;
+  // An empty body (204) is a valid success; a body that is not JSON (a proxy's HTML page) must
+  // become an ApiError, not a SyntaxError the screens would show as "Unexpected token".
+  let body: unknown = null;
+  let parsed = true;
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      parsed = false;
+    }
+  }
+  if (res.ok) {
+    if (parsed) return body as T;
+    throw new ApiError(res.status, "bad_response", "Сервер ответил не в том формате", {});
+  }
   const err = (body as ApiErrorBody | null)?.error;
   if (err) throw new ApiError(res.status, err.code, err.message, err.detail ?? {});
   throw new ApiError(res.status, "http_error", `Сервер ответил ${res.status}`, {});

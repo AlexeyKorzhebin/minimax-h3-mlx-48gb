@@ -18,6 +18,7 @@
   --ok: #0a7a4b; --ok-soft: #e5f6ee; --warn: #a15c00; --warn-soft: #fff3dd;
   --danger: #b42318; --danger-soft: #fdecea;
   --scrim: rgba(255, 255, 255, 0.88);
+  color-scheme: light;
 }
 [data-theme="dark"] {
   --bg: #0a0c10; --surface: #10131a; --surface2: #171b24; --line: #222833; --line2: #333b4a;
@@ -26,6 +27,7 @@
   --ok: #4cd391; --ok-soft: #0d2a1e; --warn: #f2b254; --warn-soft: #2c2108;
   --danger: #ff8a7a; --danger-soft: #3a1410;
   --scrim: rgba(10, 12, 16, 0.9);
+  color-scheme: dark; /* native controls, scrollbars and autofill follow the theme */
 }
 
 @theme inline {

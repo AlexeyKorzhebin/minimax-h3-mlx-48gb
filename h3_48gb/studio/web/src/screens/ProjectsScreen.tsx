@@ -25,7 +25,9 @@ function ProjectCard({ p, n }: { p: ProjectListItem; n: number }) {
         </span>
         <span className="absolute bottom-3 left-3 flex items-center gap-1.5 font-mono text-[12px] text-ink2">
           <Film className="h-3.5 w-3.5" />
-          <span data-testid="card-meta">{`${p.scenes_total} ${plural(p.scenes_total)} · ${p.frame_format}`}</span>
+          <span data-testid="card-meta">
+            {`${p.scenes_total === 0 ? "сцен пока нет" : `${p.scenes_total} ${plural(p.scenes_total)}`} · ${p.frame_format}`}
+          </span>
         </span>
       </div>
       <div className="p-5">

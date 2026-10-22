@@ -1,5 +1,5 @@
 import { ChevronLeft } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/api/client";
 import type { Snapshot } from "@/api/types";
 import { useEvents } from "@/useEvents";
@@ -9,9 +9,14 @@ const RELOAD_ON = ["project_updated"];
 export function ProjectScreen({ id }: { id: string }) {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Replies may arrive out of order (an event reload racing the first load): only the answer to
+  // the latest request is shown, an older one must not overwrite a newer snapshot.
+  const latest = useRef(0);
   const load = useCallback(() => {
-    api<Snapshot>("GET", `/projects/${id}`).then(setSnap, (err) =>
-      setError(err instanceof ApiError ? err.message : "Сервер не ответил"),
+    const mine = ++latest.current;
+    api<Snapshot>("GET", `/projects/${id}`).then(
+      (next) => { if (mine === latest.current) setSnap(next); },
+      (err) => { if (mine === latest.current) setError(err instanceof ApiError ? err.message : "Сервер не ответил"); },
     );
   }, [id]);
   useEffect(load, [load]);
