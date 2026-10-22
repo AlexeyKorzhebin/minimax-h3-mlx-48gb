@@ -112,7 +112,7 @@ def test_a_provider_without_its_token_is_a_named_503(tmp_path):
     with pytest.raises(StudioError) as err:
         ProviderLlm(home, tmp_path / "gpu-mac.lock").json_turn([], SCHEMA, "r")
     assert (err.value.status, err.value.code, err.value.message) == (
-        503, "llm_not_configured", "Сценарист не настроен: нет токена CAILA_API_KEY")
+        503, "llm_not_configured", "Сценарист не настроен: нет токена в .env")
 
 
 SECRET = "sk-SYNTHETIC-SECRET-0042"
@@ -333,5 +333,75 @@ def test_an_openai_provider_without_base_url_is_a_named_503(tmp_path):
     with pytest.raises(StudioError) as err:
         llm.json_turn([], SCHEMA, "r")
     assert (err.value.status, err.value.code, err.value.message) == (
-        503, "llm_not_configured", "Сценарист не настроен: у провайдера f нет base_url")
+        503, "llm_not_configured", "Сценарист не настроен: у провайдера нет base_url")
     assert llm.label == "none"
+
+
+PASTED = "sk-SYNTH-9999"
+
+
+def _turn_error(home, tmp_path, **kw) -> StudioError:
+    with pytest.raises(StudioError) as err:
+        ProviderLlm(home, tmp_path / "gpu-mac.lock", **kw).json_turn([], SCHEMA, "r")
+    return err.value
+
+
+def test_a_key_pasted_into_api_key_env_never_leaves_the_studio(tmp_path):
+    home = _home_with(tmp_path, {"active": "f", "providers": {"f": {
+        "type": "openai", "base_url": "http://127.0.0.1:9", "model": "m", "api_key_env": PASTED}}})
+    e = _turn_error(home, tmp_path)
+    assert e.body() == {"error": {
+        "code": "llm_not_configured", "message": "Сценарист не настроен: нет токена в .env",
+        "detail": {"provider": "f", "api_key_env": "invalid"}}}
+    assert (e.__context__, e.__cause__) == (None, None)
+    assert PASTED not in _everything_printable(e)
+
+
+def test_a_real_env_name_is_shown_in_detail(tmp_path):
+    home = _home_with(tmp_path, {"active": "caila", "providers": {"caila": {
+        "type": "openai", "base_url": "http://127.0.0.1:9", "model": "m",
+        "api_key_env": "CAILA_API_KEY"}}})
+    assert _turn_error(home, tmp_path).detail == {"provider": "caila",
+                                                  "api_key_env": "CAILA_API_KEY"}
+
+
+@pytest.mark.parametrize("providers, kw, detail", [
+    # a key used as the provider's name, entry without base_url
+    ({"active": PASTED, "providers": {PASTED: {"type": "openai", "model": "m"}}}, {},
+     {"provider": "invalid"}),
+    # the active name points at nothing and is the key
+    ({"active": PASTED, "providers": {}}, {}, {"provider": "invalid"}),
+    # a key handed in as provider_name
+    ({"active": "f", "providers": {"f": {"type": "openai", "model": "m"}}},
+     {"provider_name": PASTED}, {"provider": "invalid"}),
+    # active is not even a string
+    ({"active": {"k": PASTED}, "providers": {}}, {}, {"provider": "invalid"}),
+])
+def test_a_key_in_a_provider_name_never_leaves_the_studio(tmp_path, providers, kw, detail):
+    e = _turn_error(_home_with(tmp_path, providers), tmp_path, **kw)
+    assert (e.status, e.code, e.detail) == (503, "llm_not_configured", detail)
+    assert PASTED not in _everything_printable(e)
+
+
+def test_a_key_as_provider_name_in_a_failed_call_is_not_echoed(tmp_path):
+    home = _home_with(tmp_path, {"active": PASTED, "providers": {PASTED: {
+        "type": "openai", "base_url": "http://127.0.0.1:9", "model": "m", "shares_gpu": False}}})
+    e = _turn_error(home, tmp_path)
+    assert (e.status, e.code, e.detail) == (
+        502, "llm_failed", {"provider": "invalid", "provider_code": "chat_unreachable"})
+    assert PASTED not in _everything_printable(e)
+
+
+def test_a_key_in_a_broken_roster_call_is_not_echoed(tmp_path):
+    home = tmp_path / "studio"
+    home.mkdir()
+    (home / "providers.json").write_text("{")
+    e = _turn_error(home, tmp_path, provider_name=PASTED)
+    assert (e.status, e.detail) == (503, {"provider": "invalid"})
+    assert PASTED not in _everything_printable(e)
+
+
+def test_the_label_does_not_echo_a_non_name_model(tmp_path):
+    home = _home_with(tmp_path, {"active": "f", "providers": {"f": {
+        "type": "openai", "base_url": "http://127.0.0.1:9", "model": f"{PASTED} and more"}}})
+    assert ProviderLlm(home, tmp_path / "gpu-mac.lock").label == "f:invalid"

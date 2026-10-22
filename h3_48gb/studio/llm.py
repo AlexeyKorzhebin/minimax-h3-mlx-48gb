@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -77,6 +78,28 @@ SAFE_PROVIDER_MESSAGES = {
 }
 
 
+_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
+_PROVIDER_NAME = re.compile(r"[a-z][a-z0-9_]*(-[a-z0-9_]+)*")
+_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:@+-]*")
+
+
+def _shown(value, pattern: re.Pattern, *, limit: int) -> str | None:
+    """A value that came from providers.json or the caller may go into a message or `detail`
+    only when it is shaped like a name. The file is the owner's and a key pasted into the wrong
+    field (`api_key_env`, a provider name, a model) is a secret: whatever is not name-shaped is
+    shown as "invalid", never echoed. `None` stays `None` (nothing was configured)."""
+    if value is None:
+        return None
+    if (isinstance(value, str) and len(value) <= limit and pattern.fullmatch(value)
+            and not value.startswith("sk-")):
+        return value
+    return "invalid"
+
+
+def _provider_shown(name):
+    return _shown(name, _PROVIDER_NAME, limit=32)
+
+
 class ProviderLlm:
     def __init__(self, home: Path, lock_path: Path, *, provider_name: str | None = None,
                  lock_timeout_s: float = 5.0):
@@ -92,21 +115,26 @@ class ProviderLlm:
             # The file's own text (a JSON error quotes a slice of it) stays out of the refusal.
             raise StudioError(503, "llm_not_configured",
                               "Сценарист не настроен: studio/providers.json не читается",
-                              {"provider": self.provider_name}) from None
+                              {"provider": _provider_shown(self.provider_name)}) from None
         name = self.provider_name or roster["active"]
-        cfg = roster["providers"].get(name) if name else None
+        cfg = roster["providers"].get(name) if isinstance(name, str) and name else None
         if cfg is None:
             raise StudioError(503, "llm_not_configured",
                               "Сценарист не настроен: нет провайдера в studio/providers.json",
-                              {"provider": name})
+                              {"provider": _provider_shown(name)})
         if not cfg["available"]:
+            # `cfg["reason"]` is built by `load_providers` around the raw `api_key_env` text;
+            # the owner may have pasted the key itself there. Fixed text, vetted name in detail.
             raise StudioError(503, "llm_not_configured",
-                              f"Сценарист не настроен: {cfg['reason']}", {"provider": name})
+                              "Сценарист не настроен: нет токена в .env",
+                              {"provider": _provider_shown(name),
+                               "api_key_env": _shown(cfg.get("api_key_env"), _ENV_NAME,
+                                                     limit=64)})
         needed = "base_url" if cfg.get("type") == "openai" else "port"
         if not cfg.get(needed):
             raise StudioError(503, "llm_not_configured",
-                              f"Сценарист не настроен: у провайдера {name} нет {needed}",
-                              {"provider": name})
+                              f"Сценарист не настроен: у провайдера нет {needed}",
+                              {"provider": _provider_shown(name)})
         return name, cfg
 
     @property
@@ -115,7 +143,8 @@ class ProviderLlm:
             name, cfg = self._config()
         except StudioError:
             return "none"
-        return f"{name}:{cfg.get('model', cfg.get('preset', ''))}"
+        model = _shown(cfg.get("model", cfg.get("preset", "")) or "", _MODEL_NAME, limit=80)
+        return f"{_provider_shown(name)}:{model}"
 
     def json_turn(self, messages: list[dict], schema: dict, retry_reminder: str) -> dict:
         name, cfg = self._config()
@@ -130,4 +159,4 @@ class ProviderLlm:
             # (its message can quote the model's raw reply or an echoed token) into any traceback.
             raise StudioError(502, "llm_failed",
                               SAFE_PROVIDER_MESSAGES.get(code, "Сценарист не ответил"),
-                              {"provider": name, "provider_code": code})
+                              {"provider": _provider_shown(name), "provider_code": code})
