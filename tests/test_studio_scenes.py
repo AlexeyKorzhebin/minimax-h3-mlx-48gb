@@ -196,6 +196,11 @@ def test_patch_of_a_deleted_scene_is_404(client):
     assert (r.status_code, r.json()["error"]["code"]) == (404, "scene_not_found")
 
 
+def test_patch_of_a_missing_scene_is_404_before_the_body_is_read(client):
+    r = client.patch("/api/studio/scenes/s_nope", json={"seed": "мусор", "refs": 5})
+    assert (r.status_code, r.json()["error"]["code"]) == (404, "scene_not_found")
+
+
 def test_unknown_cast_tag_in_refs_is_400(client):
     p = _project(client)
     r = _put(client, p["id"], 1, [_scene(mode="refs", refs=["ghost"])])

@@ -1,8 +1,10 @@
 # Студия, часть 1: ядро, исполнитель ComfyUI, минимальный мастер, сценарист — спека
 
-Дата: 2026-10-10, **редакция 2 — 2026-10-20**. Статус: **спека на проверку не автором** (CLAUDE.md:
-план против спеки проверяет тот, кто его не писал). Код не написан. Автор редакции 1: Claude Fable 5.1;
-редакции 2: Claude Opus 5.5 по заданию владельца (`BRIEF-spec-part1-rev2.md`).
+Дата: 2026-10-10, редакция 2 — 2026-10-20, редакция 3 — 2026-10-22 (режим «Картинка», §19),
+редакция 3.1 — 2026-10-23 (ревью Codex ред. 3), редакция 3.2 — 2026-10-23 (сверка Codex ред. 3.1), **редакция 3.3 — 2026-10-23** (по ревью реализации S0–S1).
+Статус: **спека на проверку не автором** (CLAUDE.md: план против спеки проверяет тот, кто его не
+писал). Код S0–S1 в работе, S2–S3 — план. Автор редакции 1: Claude Fable 5.1; редакций 2 и 3: Claude
+Opus 5.5 по заданию владельца (`BRIEF-spec-part1-rev2.md`; ред. 3 — решения владельца 22.10, §17.1 п.10).
 
 Источники решений, которые здесь не пересматриваются:
 - видение `2026-10-09-studio-vision.md` (+§5а) и его ревью `vision-review/{SUMMARY,codex,codex-2-hermes,fable}.md`
@@ -13,14 +15,100 @@
 - факты о H3: `docs/h3-modes/{README,MATRIX,DRAFT-VS-FINAL,PROMPT-FORMAT,GAIT-SOUND}.md`;
 - **замеры первого дня с GPU** `docs/h3-modes/GPU-DAY-20261020.md` (далее GPU-DAY);
 - **ревью спеки** `vision-review/codex-3-spec-part1.md` (далее «Codex-N» — номер находки);
-- **решения владельца 20.10** (§17, п. 1–5).
+- **решения владельца 20.10** (§17, п. 1–5);
+- **замеры моделей картинок** `docs/h3-modes/IMAGE-MODELS-20261022.md` (далее IMG-22) и карточки
+  шаблонов `docs/h3-modes/comfy-templates/` (источник правды о пределах моделей);
+- **решения владельца 22.10** о режиме «Картинка» (§17.1 п.10).
 
 Обозначения: «ч» — человек (владелец), «с» — система. Пути без корня — относительно этого репо.
 Пометка **(ставка)** — решение без замера, проверяется в срезе или проверкой §15.
 
 ---
 
-## 0. Редакция 2: что изменилось и почему
+## 0. Журнал редакций
+
+### Редакция 3.3 (23.10): по финальному ревью реализации S0–S1
+
+Спека приведена к коду S0–S1 (решения координатора 23.10).
+
+| # | Изменение | Почему | Где |
+|---|---|---|---|
+| Р3.3-1 | `scene.source_auto INTEGER NOT NULL DEFAULT 0` (миграция 002 `scene_source_auto`): `prev_last_frame` без `scene_id` на входе — **авто-источник** (предыдущая живая сцена), пересчитывается при перестановке и удалении; с `scene_id` — явный, закреплён. Ответ сцены в O3/O7/O8 несёт `source_frame.auto: bool` и `duration_s`; `auto` на входе запрещён (400 `args_invalid`), мастер шлёт авто-источник без `scene_id` | «+ Сцена» и перестановка не должны оставлять продолжение привязанным к чужой сцене; так сделано в S1 (задача 10) | §6, §7 |
+| Р3.3-2 | Сцена 1 без героя: если модель вернула пустой `cast_tags` у сцены 1, код ставит в неё героев кастинга с фото; названный моделью состав остаётся; состав остальных сцен решает модель | живая проба 23.10: 1 из 5 ответов без героя в сцене 1 | §9.1 |
+| Р3.3-3 | O25: отказ по схеме, NaN или модели `SceneIn` → 502 `llm_failed` с `detail.path`, в базе ни `proposal`, ни события; `requested_s` зажимается кодом в [3, 15] (в схеме ответа модели min/max нет) | так сделано в S1; строгие min/max в схеме давали отказ провайдера, а не исправимое значение | §7, §9.1 |
+
+### Редакция 3.2 (23.10): сверка Codex ред. 3.1
+
+Сверка: `vision-review/codex-5-spec-rev3-1.md` (коммит d8752413): 13 закрыто, 6 частично (№1, 3, 6, 7, 11,
+16), 4 новых блокера. Решения по блокерам — координатора 23.10; частичные — автора. Отклонённых нет.
+
+| № | Находка | Что стало | Где |
+|---|---|---|---|
+| НБ1 / №3 | И13 проверял `payload.values.seed` при плоском payload | везде одна форма: `task.payload_json.seed` (плоско) | §19.7 |
+| НБ2 / №3 | Нет ветки совместимости весов с задачами S2 | `task.weights_sha256` — **колонка задачи** (миграция 004) для всех задач `image`, включая кадр S2 (O12 пишет её с S2b); у строк до S2b — NULL; сверка перед отправкой и «веса изменились» при повторе — только когда поле не NULL | §19.3, §19.4 |
+| НБ3 / №11 | При `installed=null` план разрешён, а отпечатка ещё нет | O10 `image_set` при непроверенном инвентаре — 409 `models_unchecked` «Проверяю модели, ≈1 мин» (LI7 info в линте остаётся); хеши воркер считает при старте в фоне, кэш по (путь, размер, mtime); кадр S2 (O10 `image`) при непроверенном инвентаре ставится как в S2, с `weights_sha256 = NULL` | §19.4, §19.9 |
+| НБ4 | Повтор после обновления карточки не перепроверялся | сохранённые входы сверяются с **текущей** карточкой (профиль есть, `lora.name` = LoRA профиля сейчас, размер/шаги/cfg в пределах, файлы на месте); несовместимо — 409 `repeat_incompatible` с причиной; O3 отдаёт у варианта `repeatable{ok, reason}`, «Повторить» показывает причину | §19.4, §19.6 |
+| O8 | Линт в S1 идёт после транзакции (`ops.py:345`) | отказ L7d `frame_shape_mismatch` — **проверка в транзакции O8 до `UPDATE`**, отдельно от информационного линта после неё | §10, §14 |
+| №1 | И14 требовал `prompt_en` черновика и у повтора | И14: у партии из черновика — `prompt_en` на момент плана; у повтора — копия `inputs_json` исходного варианта | §19.7 |
+| №6 | И15 без окружения | гарантия пикселей ограничена **проверенным окружением**: `task.engine_version` расширена до `ComfyUI <ver> · torch <ver> · <GPU>` из `/system_stats`, плюс машина; иначе `differs:["engine"]` | §19.7 |
+| №7 | В §8.4 остался старый порядок `created_at ASC` | заменён ссылкой на `queue_order` | §8.4 |
+| №11 | Устаревшее отсутствие **узлов** блокировало план навсегда | узлы влияют только на warning LI7 («узлы не найдены при опросе HH:MM»); блокируют только файлы и `enabled=false`; задача без узлов падает сразу по `Probe.missing`, и этот же probe обновляет сведения | §10, §19.9 |
+| №16 | §8.2 утверждал +38 с для Qwen → H3 без оговорки | помечено ставкой (§15.4 п.20) | §8.2 |
+
+### Редакция 3.1 (23.10): ревью Codex ред. 3
+
+Ревью: `vision-review/codex-4-spec-rev3.md` (коммит e075490a): 6 блокеров, 10 важных, 3 мелких. Решения
+по блокерам — координатора 23.10; важные и мелкие — автора. Отклонённых нет; №7 и №11 закрыты иначе,
+чем предлагало ревью (причина в строке).
+
+| № | Находка | Что стало | Где |
+|---|---|---|---|
+| Б1 | Повтор несовместим с O30 и `NOT NULL` у партии; LI8 черновика мешал повтору | повтор берёт **сохранённые входы варианта**, черновик не читает: `image_batch.draft_edit_version` NULL только у повтора (CHECK), O30 сверяет версию черновика только у партии из черновика, LI8 к повтору не применяется | §19.3, §19.4, §10 |
+| Б2 | `lora: null` → `TemplateError` подстановщика | контракт `comfy_template.build_payload` (правка в S2b): необязательный вход со значением `null` = отсутствие; узел LoRA не вставляется, а если стоит в графе — убирается с перешивкой связей; Krea и Qwen «Полное» проходят | §8.2 |
+| Б3 | `payload.values` ломает задачи S2 (плоский payload) | payload остаётся **плоским, как в плане S2** (`plans.enqueue_image`), режим картинки дописывает ключи в корень; точный список полей — §19.3 | §19.3, §19.9 |
+| Б4 | Квадрат проходит L7e, но падает в L7d плана S3; предпросмотра нет | в сцену — **только картинка с соотношением `frame_format` проекта** (допуск 2 %), иначе L7d error «сделайте вариант 16:9», O8 отказывает 409 `frame_shape_mismatch`; квадрат и прочие — только в кастинг. L7e удалено (влито в L7d). Предпросмотр — в мастере по размерам варианта и `frame_format` из O1 (кнопка «В сцену…» неактивна с причиной); O8 возвращает находки как раньше | §10, §19.1, §19.4 |
+| Б5 | `provider.chat` не принимает схему и обходит защиту секретов | «Сценарист картинки» — через существующий `Llm.json_turn(messages, schema, retry_reminder)` (`ProviderLlm`, `studio/llm.py:149`) + `validate_reply` (`:26`); наружу — только `SAFE_PROVIDER_MESSAGES` (`:72`), сырой текст — только в `prompt_llm_json` | §19.8 |
+| Б6 | Одинаковые входы и `engine_version` не гарантируют пикселей (веса под тем же именем) | **отпечаток весов**: в карточке `model_files[{folder, name, bytes, sha256}]` (с LoRA профиля); воркер сверяет размер+mtime, полный sha256 кэширует по (путь, размер, mtime) в `model_file_hash`; несовпадение с карточкой — модель недоступна; `weights_sha256` входит во входы варианта; повтор при другом отпечатке пишет «веса изменились» | §8.2, §19.3, §19.7, §19.9 |
+| 7 | Два порядка очереди | один порядок `queue_order` для воркера и расчёта смен: `priority DESC`; у картинок — FIFO по партиям; «сначала загруженная модель» — только среди рендера (ревью предлагало выбрать одно; выбрано разделение по виду: картинки интерактивны, порядок нажатий важнее 10–26 с) | §8.4, §19.9 |
+| 8 | Автоповтор перевода затирает ручной EN | автоперевод только при `prompt_en_state='stale'`; O28 `translate` при `owner` — 409 `translation_owner`, перезапись — только явной кнопкой (`overwrite_owner:true`) | §19.4 |
+| 9 | Ручной сид S+k выходит за 2^53−1 | проверяется `S + N − 1 ≤ min(card seed.max, 2^53−1)` | §19.4 |
+| 10 | Надписи сверяются со списком от того же LLM | эталон надписей — **код извлекает из текста владельца** (`idea_text`/`prompt_ru`), внешняя пара кавычек, вложенные кавычки — часть надписи; список LLM не используется для проверки | §19.8 |
+| 11 | Инвентарь до первого probe и выход из `installed=false` | инвентарь — по файлам на диске (каталог моделей смонтирован воркеру только на чтение): при старте и каждые 60 с, движок не нужен; `null` — LI7 info, не error; узлы (`class_types`) — по `object_info` при probe (ревью предлагало отдельный probe движка; файловый путь не требует GPU) | §19.9, §10 |
+| 12 | Зависимости профиля «Быстро» не проверяются | `profiles.<id>.requires{class_types, model_files}`; доступность — по профилю; «Полное» доступно без Lightning | §8.2, §19.4 |
+| 13 | Оценка без профиля | `estimate_sample.profile` (миграция 004) и `estimate_s` по профилю | §8.2, §19.9 |
+| 14 | «Тесты S2 без правок» недостижимо | поведенческие тесты S2 без правок; литералы списка файлов шаблонов и хеша карточки Krea обновляются с причиной в отчёте | §14 |
+| 15 | Имитация не чувствительна к negative и LoRA | PNG имитации зависит и от `negative`, `lora.name`, `lora.strength`, `weights_sha256`; мутация 14 разделена на две изолированные + мутации negative | §19.11 |
+| 16 | Z-Image `estimate_s=8` против карточки 4; «независимо» при непроверенном H3 после Qwen | `estimate_s` Z-Image = 4 (карточка); возврат H3 после Qwen помечен ставкой (§15.4 п.20) везде, включая интерфейс («≈») | §8.2, §8.4 |
+| 17 | «Не задерживает» против «+2 дня» | §1 исправлен: S2b стоит до S3 и сдвигает критерий на 2 дня | §1 |
+| 18 | ГБ вместо ГиБ | пики устройства — в ГиБ (МиБ из nvidia-smi / 1024), объёмы файлов — в ГБ (HF) | §8.2, §8.4, §15.4, §19.9 |
+| 19 | O10 `image_set` над видеопроектом не в перечне | добавлен в `project_kind_mismatch` | §19.6 |
+
+### Редакция 3 (22.10): режим «Картинка»
+
+Номера разделов 1–18 не менялись (на них ссылаются планы S0–S1 и S2–S3); новое — §19 и вставки в
+существующие разделы.
+
+| # | Изменение | Почему | Где |
+|---|---|---|---|
+| Р3-1 | **Режим «Картинка»**: идея → промпт от «Сценариста картинки» (правится) → модель (Krea 2 / Z-Image Turbo / Qwen-Image 2512) → N вариантов → «Годится» / «Ещё» / «Повторить» | решение владельца 22.10 | §19.1, §19.2 |
+| Р3-2 | Картинки живут в **проекте с `kind='image'`**, а не в отдельной сущности; три новые таблицы `image_draft`, `image_batch`, `image_variant`; миграция 004 (Р3-17) | задачи, события, снимок, список проектов и ключи идемпотентности уже привязаны к проекту (план S2–S3 R-S2-1); ресурс (`asset`) глобален, поэтому «взять в видео» — существующие O8/O5 без новых операций | §19.3 |
+| Р3-3 | Операции **O28–O32**, расширение O1, O2, O3, O10 (`kind:"image_set"`, `repeat_variant_id`) | новые действия режима; передача в видео — существующими O8 и O5 | §7, §19.4 |
+| Р3-4 | **Один вариант = одна задача = один сид**, без `batch_size>1` в графе | в пакете ComfyUI шум k-го элемента зависит от позиции в пакете: повтор одиночной задачей с тем же сидом его не воспроизводит | §19.4, И15 |
+| Р3-5 | Инварианты **И13–И18**: сид записан до постановки и равен сиду в графе; входы варианта пишутся один раз; повтор по сиду даёт те же входы и, на проверенной модели, те же пиксели (IMG-22: разница 0 у Krea 2, Z-Image и Qwen-Image); «Годится» только у готового; изоляция видов проекта | требование владельца «повторить по сиду» | §19.7 |
+| Р3-6 | Шаблоны `zimage-turbo-t2i` и `qwen-image-t2i` (оба замерены, `verified_on` 22.10) в §8.2; **карточка — единственный источник пределов модели**: кратность, мин/макс, пиксели, предустановки, шаги, cfg, число вариантов, русский, кириллица в надписях, цена смены модели | разрешение «своё в пределах модели»; Krea пишет кириллицу, Z-Image нет (IMG-22) | §8.2 |
+| Р3-7 | Цена смены модели берётся из карточки (`switch_in_s`), а не из пары «krea/h3» | с третьей и четвёртой моделью пара «семейств» плана S2–S3 (`_family`) неверна: Z-Image считалась бы H3 | §8.4, §19.9 |
+| Р3-8 | Линтер картинки **LI1–LI8** (LI8 — Р3-16) и правило передачи **L7e** | надпись кириллицей на модели без кириллицы — warning; размер вне карточки — error | §10 |
+| Р3-9 | Срез **S2b** между S2 и S3, 2 дня, своя приёмка владельцем | решение владельца 22.10 | §14 |
+| Р3-10 | Проверки **§15.4**: Qwen-Image fp8 на Ampere, время, память, смена моделей, живой Z-Image — сделаны 22.10 (см. Р3-13); осталось п.18–20 в живом контракте S2b | — | §15 |
+| Р3-11 | Не-цели режима: правка/дорисовка, референсы и image-to-image, выбор LoRA, апскейл, negative/cfg/сэмплер в интерфейсе, общая галерея | §2 | §2 |
+| Р3-12 | Диаграммы §4.1, §6 обновлены; новая последовательность §19.10 | — | — |
+| Р3-13 | **Qwen-Image 2512 замерена**: строки «ждёт §15.4» заменены фактами — fp8_e4m3fn идёт на Ampere; 50 шагов 58,5–59,3 с тёпло, 84 с холодно, ≈2 МП 131 с; Lightning 4 шага 2,7 с; пик 47,1–48,5 ГиБ; кратность 16; кириллица в надписях и русский промпт — да; сид воспроизводим; `verified_on` записан у Z-Image и Qwen | замер 22.10 (IMG-22, main 7cc4ae3e) | §8.2, §15.4 |
+| Р3-14 | **Qwen по умолчанию — профиль «Быстро» (Lightning 4 шага, cfg 1)**, «Полное» (50 шагов, cfg 4) — переключатель у модели. Профиль — свойство карточки, а не выбор LoRA: файл LoRA и сила зашиты в карточку, в интерфейсе списка LoRA нет | 2,7 с против 58,5 с, качество близкое на глаз, кириллица верна в обоих (IMG-22) | §2, §8.2, §19 |
+| Р3-15 | **Qwen и H3 не помещаются на карте вместе** (Qwen ≈48 ГиБ, H3 ≈51,4 ГиБ, карта 63,4 ГиБ): каждая смена между ними — полная загрузка; смена работает без `/free` (худший пик 52,7 ГиБ). Цена: Qwen +26 с (50 шагов) / +19 с (Lightning), возврат H3 ≈+38 с (ставка: замерено после Krea, §15.4 п.20); план O10 считает и возврат к очереди рендера | замер цепочки Qwen → Z → Krea → H3 → Qwen | §8.2, §8.4, §19.9 |
+| Р3-16 | **Ответы владельца 22.10** (§17.1 п.11): место под Qwen освобождено (старые комплекты Z-Image DT и Qwen 2.1 GGUF удалены, LoRA сохранены, свободно 87 ГБ); правило «Qwen не годится → S2b с двумя моделями» остаётся; **промпт правится по-русски, в модель уходит английский перевод от «Сценариста», он виден и правится** — черновик хранит `prompt_ru` и `prompt_en`, новое правило LI8 | §17.6 ред. 3-черновика закрыт | §17, §19 |
+| Р3-17 | **Нумерация миграций**: 002 — `scene_source_auto` (S1, задача 10, в коде), 003 — связи задач и `engine_version` (S2; в плане S2–S3 файл назван `002_tasks.sql` — переименовать), **004 — таблицы картинки (S2b)** | координатор 22.10 | §5, §6, §14, §18, §19.3 |
+
+### Редакция 2 (20.10–22.10): что изменилось и почему
 
 | # | Изменение | Почему | Находка / источник |
 |---|---|---|---|
@@ -67,6 +155,8 @@
 ComfyUI alex-neuro. Тест доказывает, что путь есть; проход владельца — что им можно пользоваться.
 
 Срезы §14 — каждый со своей приёмкой владельцем; критерий достигается в S4, часть сделана после S6.
+Режим «Картинка» (§19, срез S2b) — отдельный путь со своей приёмкой; в критерий §1 не входит, но стоит
+по решению владельца между S2 и S3 и поэтому сдвигает достижение критерия на 2 дня (§14).
 
 ## 2. Не-цели части 1
 
@@ -85,6 +175,19 @@ ComfyUI alex-neuro. Тест доказывает, что путь есть; п�
 | Перенос старых `project.json` в SQLite | не делается (решение владельца 3); старая панель живёт |
 | Авторизация и доступ из интернета | до любого мобильного хоста (fable §2б); в части 1 — LAN и bearer на MCP |
 | Свой чат | не пишем (SUMMARY п.3) |
+
+**Не входит в режим «Картинка» (§19), ред. 3:**
+
+| Не делаем | Почему | Где это будет |
+|---|---|---|
+| Правка картинки: inpaint/outpaint, «измени фон», Qwen-Image-Edit, Z-Image Edit | весов Edit на alex-neuro нет (IMG-22, инвентарь); другой ввод — маска и холст, свой экран и свои проверки | часть 3, после замера Edit-моделей |
+| Картинка по референсу (image-to-image, «мой герой с фото») | t2i не держит лицо; нужен Edit или IP-адаптер — тот же класс моделей, что выше. Кадр с героем для сцены по-прежнему даёт режим `refs` H3 | вместе с Edit |
+| Выбор LoRA в интерфейсе | импорт LoRA вне части 1 (строка выше); вход `lora` в карточке Krea студия не передаёт. Lightning у Qwen — **профиль карточки** «Быстро» (файл и сила LoRA зашиты в карточку, в интерфейсе — переключатель «Быстро / Полное», не список LoRA; §8.2) | после части 1 |
+| Апскейл картинки (SeedVR2, hires-fix) | предустановки ≈2 МП (1920×1088) и 4 МП (2048²) уже замерены: 12 / 30 с у Krea, 7 / 18 с у Z-Image (IMG-22) — увеличение не на критическом пути | вместе с апскейлом видео |
+| negative, cfg, сэмплер, shift в интерфейсе | значения — из карточки (официальные параметры моделей); у Turbo-моделей cfg 1 и negative не действует. В интерфейсе только шаги, под «Ещё настройки» | часть 3, если попросят |
+| Одна партия на нескольких моделях («сравнить модели») | две партии подряд дают то же; смешанная партия усложняет порядок очереди и цену смены | часть 3 |
+| Общая галерея картинок, теги, удаление, вытягивание картинки из шага 4 видеопроекта | передача идёт из режима «Картинка» в видео (O8/O5); удаления нет во всей части 1 | часть 3 |
+| Картинки на Маке (Draw Things) | исполнитель Мака — после части 1 (решение владельца 5) | после части 1 |
 
 ---
 
@@ -153,17 +256,17 @@ flowchart LR
     CLD["Claude Desktop"]
   end
   subgraph STUDIO["h3_48gb/studio/ — процесс API + процесс воркера"]
-    WEB["web/ (React+Vite, статика)<br/>мастер на две сцены"]
+    WEB["web/ (React+Vite, статика)<br/>мастер сцен + режим «Картинка»"]
     API["app.py FastAPI<br/>/api/studio/* явные операции<br/>SSE /api/studio/events"]
     MCP["mcp.py<br/>/mcp, bearer"]
     OPS["ops.py<br/>expected_revision / state_version,<br/>Idempotency-Key, каскад"]
     LINT["lint.py"]
-    DIR["director/scenarist.py<br/>LLM-роль «Сценарист»"]
+    DIR["director/scenarist.py<br/>LLM-роль «Сценарист»<br/>+ image_prompt.py (§19.8)"]
     AWI["director/aw_import.py<br/>(опция, S7)"]
     DB[("db.py SQLite WAL<br/>studio.sqlite")]
     WRK["worker.py<br/>цикл задач, материализация,<br/>GPU-гейт, reconcile"]
     EXB["executors/base.py<br/>договор + возможности"]
-    EXC["executors/comfy.py<br/>H3 fl2va/ref2va, Krea 2"]
+    EXC["executors/comfy.py<br/>H3 fl2va/ref2va, Krea 2,<br/>Z-Image Turbo, Qwen-Image"]
     EXF["FakeComfy (тесты, --fakes)"]
   end
   subgraph LEGACY["Переиспользуемые модули h3_48gb/"]
@@ -174,7 +277,7 @@ flowchart LR
     DCL["engines/dispatcher_client"]
   end
   subgraph NEURO["alex-neuro"]
-    CMF["ComfyUI comfy-studio :8189<br/>v0.42, H3 + Krea 2"]
+    CMF["ComfyUI comfy-studio :8189<br/>v0.42, H3 + Krea 2 + Z-Image + Qwen-Image"]
     GPU["gpu-dispatcher :8790<br/>generation.lock"]
     SGL["sglang H3 :30020<br/>(план Б, вне части 1)"]
   end
@@ -236,7 +339,7 @@ flowchart TB
     N_OLD["контейнер h3-panel :8765 (старая панель)"]
     N_DB[("/home/alex/Outputs/studio/studio.sqlite<br/>только через API, не по SMB")]
     N_DISP["gpu-dispatcher :8790 (systemd)<br/>engines: h3 (ref2va), ltx, comfy-studio"]
-    N_CS["ComfyUI comfy-studio :8189<br/>~/Projects/comfy-h3, v0.42<br/>H3 fl2va/ref2va, Krea 2"]
+    N_CS["ComfyUI comfy-studio :8189<br/>~/Projects/comfy-h3, v0.42<br/>H3 fl2va/ref2va, Krea 2,<br/>Z-Image Turbo, Qwen-Image 2512"]
     N_LTX["ComfyUI ltx :8188 (старая панель)"]
     N_SGL["sglang H3 :30020 (старая панель, план Б студии)"]
     N_QWEN["Qwen :8000 (чужой, гасится по просьбе)"]
@@ -296,6 +399,11 @@ Inter, метки и числа JetBrains Mono. Компоновка: кадр-�
 | 7. Финал | «Снять финалы» → план → подтверждение; после финала 1 сцена 2 помечена «проверьте: кадр изменился» до одобрения | O10, O11, O16 |
 | 8. Сборка | «Собрать» (отказ с перечнем неодобренных сцен) → «Скачать mp4» | O19, O20 |
 
+**Режим «Картинка» (ред. 3).** Второй вид проекта: «Новый» спрашивает тип — «Видео» (шаги выше) или
+«Картинка» (§19: идея → промпт → модель → варианты, отдельный экран без шагов 2–8). В списке проектов
+оба вида рядом, у картинки — метка «Картинка» и превью отобранного варианта. Отобранная картинка
+уходит в видеопроект кнопками «В сцену…» (O8, шаг 4 получает её как готовый кадр) и «В кастинг…» (O5).
+
 Плюс: «Повторить» у упавшей задачи (O15) и «Разобраться» у `submit_unknown` (§8.5) с двумя кнопками
 «Поставить заново» / «Отменить». Проверка — прохождением владельца (критерий §1) и
 Playwright-сценарием в S4 на имитациях; скриншоты 1440/390 px — дополнительно, не вместо прохода.
@@ -313,7 +421,7 @@ Playwright-сценарием в S4 на имитациях; скриншоты 
 | Компоненты | shadcn/ui (копируется в `web/src/components/ui/`) на Radix Primitives; иконки lucide-react | фиксируются в S0 | доступные диалоги, меню, шторки, клавиатура; код свой, перекрашивается токенами | MUI, Chakra (чужой визуальный язык) |
 | Шрифты | Inter Tight, Inter, JetBrains Mono (кириллица), самохостинг через `@fontsource` | — | alex-neuro может работать без внешней сети | Google Fonts по сети |
 | Хранилище | SQLite, `sqlite3` stdlib, WAL, `busy_timeout=5000` | ≥3.35 (`RETURNING`) | STACK §3 | Postgres, SQLAlchemy |
-| Миграции | `studio/migrations/NNN.sql`, `PRAGMA user_version` | — | читается глазами; 001 — только таблицы пути S0–S4 | Alembic |
+| Миграции | `studio/migrations/NNN.sql`, `PRAGMA user_version` | — | читается глазами; 001 — только таблицы пути S0–S4; ред. 3: 002 `scene_source_auto` (S1), 003 связи задач и `engine_version` (S2), 004 картинка (S2b) | Alembic |
 | Бэкап | `sqlite3.Connection.backup()` раз в час, 7 копий | — | копия файла при WAL несогласованна | `cp` |
 | Очередь | таблица `task` + `flock worker.lock` | — | STACK §4 | Redis/ARQ |
 | События | таблица `event` (seq) → SSE `Last-Event-ID` | — | один журнал для мастера, MCP, отчёта | опрос |
@@ -349,12 +457,19 @@ erDiagram
   TAKE }o--o| ASSET : "output / last_frame"
   TASK }o--o| TASK : "depends_on_task_id"
   ASSEMBLY }o--|| ASSET : "output_asset_id"
+  PROJECT ||--o| IMAGE_DRAFT : "kind=image (§19.3)"
+  PROJECT ||--o{ IMAGE_BATCH : "партии"
+  IMAGE_BATCH ||--o{ IMAGE_VARIANT : "варианты"
+  IMAGE_VARIANT ||--|| TASK : "task_id (kind=image)"
+  TASK }o--o| ASSET : "result_asset_id (план S2–S3 R-S2-1)"
+  IMAGE_BATCH }o--o| IMAGE_VARIANT : "repeat_of_variant_id"
 
   PROJECT {
     text id PK
+    text kind "video|image (ред. 3, миграция 004)"
     int revision "O2/O4/O5/O7/O26"
     text title
-    text frame_format "16:9|9:16"
+    text frame_format "16:9|9:16, у image — начальная ориентация"
     text style_block
     text created_at
   }
@@ -375,6 +490,7 @@ erDiagram
     int frames "17n+5 в [73,345]"
     int seed
     text source_frame_kind "none|prev_last_frame|asset"
+    int source_auto "0|1, миграция 002: авто-источник prev_last_frame"
     text source_scene_id FK
     text source_frame_asset_id FK
     text approved_sketch_take_id FK
@@ -477,6 +593,46 @@ erDiagram
     text status
     text output_asset_id FK
   }
+  IMAGE_DRAFT {
+    text project_id PK
+    int edit_version "+1 на любую правку (O28/O29)"
+    text idea_text
+    text prompt_ru "правит владелец"
+    text prompt_en "уходит в модель, виден и правится"
+    text prompt_en_state "none|fresh|stale|owner"
+    text template "krea2-t2i|zimage-turbo-t2i|qwen-image-t2i"
+    text profile "NULL или профиль карточки (Qwen: fast|full)"
+    int width
+    int height
+    int steps "NULL = по карточке"
+    text seed_mode "auto|manual"
+    int seed "обязателен при manual"
+    int count "1..8"
+  }
+  IMAGE_BATCH {
+    text id PK
+    text project_id FK
+    int ord "№ партии"
+    int draft_edit_version
+    text template
+    text template_sha256
+    text profile
+    text prompt_ru "для показа, в модель не идёт"
+    text seed_mode
+    int count
+    text repeat_of_variant_id FK
+    text plan_id
+  }
+  IMAGE_VARIANT {
+    text id PK
+    text batch_id FK
+    int ord
+    int seed "NOT NULL, И13"
+    text inputs_json "NOT NULL, неизменяем (И14)"
+    text inputs_sha256
+    text task_id FK "UNIQUE"
+    text kept_at "«Годится»"
+  }
 ```
 
 Таблицы `SCENE_REF` (scene_id, cast_id, ord, role), `EVENT` (seq, ts, kind, project_id, scene_id,
@@ -484,6 +640,8 @@ task_id, payload_json), `SETTING` (key, value), `OP_LOG` (idempotency_key, reque
 response_json, http_status, created_at), `WORKFLOW_TEMPLATE` (id, executor, name, path, sha256,
 bindings_json, requires_json, verified_on) — как в редакции 1. `requires_json.limits` теперь несёт
 `frames: [min, max]` и `ref_images_by_frames: [[max_frames, max_images], …]` (§10 L7b).
+Таблицы режима «Картинка» (`image_draft`, `image_batch`, `image_variant`, колонка `project.kind`) —
+миграция 004, полностью в §19.3.
 
 ### 6.1. Инварианты (каждый — тест точным равенством, каждый показан красным)
 
@@ -502,6 +660,7 @@ bindings_json, requires_json, verified_on) — как в редакции 1. `re
 | И10 | Снимок O3 несёт `last_seq`; клиент подписывается с `Last-Event-ID=last_seq` | `app.py` |
 | И11 | **Одобрение действительно**, только если: `take.scene_id = scene.id`, `take.scene_revision = scene.revision`, `take.status='done'`, и для продолжения `take.upstream_take_id = source_scene.approved_<tier>_take_id`. Недействительное одобрение снимается (`approved_*=NULL`, `review_state='needs_review'`, `state_version+1`, событие `approval_revoked{reason}`) | `ops.recompute_cascade` — вызывается из O7, O8, O16 и `worker._finish_take` в той же транзакции |
 | И12 | Сборка ставится только при действительных И11 одобрениях `final` всех неудалённых сцен; список входов замораживается в `assembly.inputs_json` при постановке; каталог сборки уникален | `ops.assemble` |
+| И13–И18 | Режим «Картинка»: сид записан и равен сиду в графе; входы варианта неизменяемы; повтор по сиду; сиды партии различны; «Годится» только у готового; изоляция видов проекта | §19.7 |
 
 ### 6.2. Длительность и снимок входов дубля
 
@@ -552,7 +711,7 @@ bindings_json, requires_json, verified_on) — как в редакции 1. `re
   O8 и O16 проект не трогают — поэтому правка одной сцены не делает устаревшим план другой.
 - **План (O10)** запоминает `revision` и `state_version` каждой сцены плана и каждой сцены-источника
   кадра; O11 сверяет их, не `project.revision`; расхождение → 409 `plan_stale` с перечнем.
-- **`Idempotency-Key`** (заголовок, обязателен для O11, O12, O15, O19, O24): `OP_LOG` хранит sha256 тела
+- **`Idempotency-Key`** (заголовок, обязателен для O11, O12, O15, O19, O24, O30): `OP_LOG` хранит sha256 тела
   и ответ 24 ч; тот же ключ + другое тело → 422 `idempotency_mismatch`. Мастер генерирует `uuid4` на
   нажатие; MCP — из `(tool, plan_id)`.
 
@@ -560,12 +719,12 @@ bindings_json, requires_json, verified_on) — как в редакции 1. `re
 |---|---|---|---|---|
 | O1 | Список проектов | `GET /projects` | — | `[{id,title,revision,scenes_done/total}]` |
 | O2 | Создать проект | `POST /projects` | `title, frame_format, idea_text?` | проект (201) |
-| O3 | Снимок | `GET /projects/{id}` | — | проект + сцены (с `revision`, `state_version`, действительностью одобрений, конфликтами цепочки) + кастинг + дубли + задачи + `last_seq` |
+| O3 | Снимок | `GET /projects/{id}` | — | проект + сцены (с `revision`, `state_version`, `source_frame{kind, scene_id, asset_id, auto}`, `duration_s` (ред. 3.3), действительностью одобрений, конфликтами цепочки) + кастинг + дубли + задачи + `last_seq` |
 | O4 | Изменить проект | `PATCH /projects/{id}` | `expected_revision, title?` (`frame_format` после первого done-дубля — 409 `format_locked`) | проект |
 | O5 | Кастинг | `POST /projects/{id}/cast` | `tag, description_ru, assets[{asset_id, role}], expected_revision` | cast_member с `description_en` |
 | O6 | Импорт ресурса | `POST /assets` (multipart) | файл, `kind?` | asset |
-| O7 | Заменить набор сцен | `PUT /projects/{id}/scenes` | `expected_revision, scenes[{scene_id?, expected_edit_version? (обязателен при scene_id), mode, action_text, performance_text, sound_text, music_text?, requested_s, seed?, source_frame{kind, scene_id?, asset_id?}, refs[tag]}], deleted[{scene_id, expected_edit_version}]` — порядок массива задаёт `idx`; каждая живая сцена — либо в `scenes`, либо в `deleted` | сцены + `diff{added, unchanged, changed, moved, deleted}` |
-| O8 | Изменить сцену | `PATCH /scenes/{id}` | `expected_edit_version` + поля (в т.ч. `source_frame{kind:"asset", asset_id}` — подключение кадра) | сцена + `cascade[scene_id]` |
+| O7 | Заменить набор сцен | `PUT /projects/{id}/scenes` | `expected_revision, scenes[{scene_id?, expected_edit_version? (обязателен при scene_id), mode, action_text, performance_text, sound_text, music_text?, requested_s, seed?, source_frame{kind, scene_id?, asset_id?}, refs[tag]}], deleted[{scene_id, expected_edit_version}]` — порядок массива задаёт `idx`; каждая живая сцена — либо в `scenes`, либо в `deleted` | сцены (с `source_frame.auto`, `duration_s`) + `diff{added, unchanged, changed, moved, deleted}`. Ред. 3.3: `source_frame{kind:"prev_last_frame"}` без `scene_id` — авто-источник (`source_auto=1`, предыдущая живая сцена по `idx`, пересчитывается при перестановке/удалении в той же транзакции, И1 при смене источника); с `scene_id` — явный, закреплён; поле `auto` на входе — 400 `args_invalid` |
+| O8 | Изменить сцену | `PATCH /scenes/{id}` | `expected_edit_version` + поля (в т.ч. `source_frame{kind:"asset", asset_id}` — подключение кадра; `prev_last_frame` без `scene_id` — авто-источник, как в O7; `auto` на входе — 400) | сцена (с `source_frame.auto`, `duration_s`) + `cascade[scene_id]` |
 | O9 | Линт | `POST /projects/{id}/lint` | `scene_ids?` | находки по сценам |
 | O10 | План (сухой) | `POST /projects/{id}/plan` | `kind: render\|image, scene_ids, tier` или `prompt, size` для image | `plan_id, items[{scene_id, template, depends_on_scene?, estimate_s}], total_s, checkpoint_switches, lint, blocked[]` (TTL 10 мин) |
 | O11 | Рендер по плану | `POST /projects/{id}/render` + ключ | `plan_id` | `tasks[{task_id, take_id, scene_id, status}]` — дубли продолжений в `pending_input` |
@@ -582,9 +741,19 @@ bindings_json, requires_json, verified_on) — как в редакции 1. `re
 | O22 | Исполнители | `GET /executors` | — | `[{name, address, alive, ready, capabilities, detail}]` |
 | O23 | GPU | `GET /gpu`; `POST /gpu/release`; `POST /gpu/qwen/unload` | — | состояние диспетчера; выгрузка Qwen — через ручку диспетчера `/qwen/unload` (`dispatcher.py:590`) |
 | O24 | Импорт ai-writer (S7) | `POST /projects/{id}/import/ai-writer` + ключ | `clip_id` или файл `.h3.json`, `expected_revision` | как O7 + asset(kind=scenario) |
-| O25 | Сценарист: предложить | `POST /projects/{id}/director/propose` | `idea_text, scenes_count=2` | `proposal_id, scenes[]` — сохраняется в `proposal`, не применяется |
+| O25 | Сценарист: предложить | `POST /projects/{id}/director/propose` | `idea_text, scenes_count=2` | `proposal_id, scenes[]` — сохраняется в `proposal`, не применяется. Ред. 3.3: ответ модели не прошёл схему, содержит NaN или не собирается в `SceneIn` → 502 `llm_failed` с `detail.path` (где сломано), в базе ни `proposal`, ни события; `requested_s` зажимается кодом в [3, 15] (в схеме ответа модели min/max нет) |
 | O26 | Применить предложение | `POST /projects/{id}/director/apply` | `proposal_id, expected_revision, deleted[{scene_id, expected_edit_version}]` — весь заменяемый набор с прочитанными версиями | как O7 |
 | O27 | Разрешить `submit_unknown` | `POST /tasks/{id}/resolve` | `action: resubmit\|cancel` | task |
+| O28 | Сценарист картинки: промпт и перевод | `POST /projects/{id}/image/propose` | `mode: idea\|translate, idea_text?, expected_edit_version` | черновик + `lint` (§19.4) |
+| O29 | Правка черновика картинки | `PATCH /projects/{id}/image/draft` | `expected_edit_version` + поля черновика | черновик + `lint` |
+| O30 | Партия по плану | `POST /projects/{id}/image/batches` + ключ | `plan_id` | `batch{id, ord, variants[{variant_id, task_id, seed, status}]}` |
+| O31 | «Годится» | `POST /image-variants/{id}/keep` | `kept: bool` | вариант |
+| O32 | Модели картинок | `GET /image-models` | — | карточки: пределы, предустановки, языки, `installed` |
+
+**Ред. 3.** O1 отдаёт `kind` и `preview_url`; O2 принимает `kind: video|image` (по умолчанию `video`;
+у `image` `frame_format` необязателен); O3 у проекта `image` вместо сцен отдаёт `image{draft, batches}`;
+O10 принимает `kind: "image_set"` (черновик или `repeat_variant_id`). Полное описание O28–O32 и
+изменённых операций — §19.4.
 
 **Сопоставление сцен в O7 (Codex-11).** Идентичность — `scene_id`. Сцена без `scene_id` — новая.
 Сцена с `scene_id` и тем же отпечатком сохраняет `revision` и дубли, даже если сменился `idx`
@@ -615,6 +784,8 @@ class Probe(TypedDict):
     alive: bool
     ready: bool            # шаблон/модели spec доступны и чужих задач нет
     detail: str
+    missing: list[str]     # ред. 3: файлы моделей шаблона, которых нет в GET /models/<folder>;
+                           # непустой → задача сразу failed «модель не установлена», без ожидания 600 с
 
 class EngineStatus(TypedDict):
     state: Literal["queued", "running", "done", "failed", "cancelled", "lost"]
@@ -669,10 +840,79 @@ Readiness ≠ liveness: `alive=True, ready=False` → `waiting_ready` с `wait_r
 |---|---|---|---|---|
 | `h3-fl2va` | MiniMaxH3ImageToVideo, BasicScheduler simple, res_multistep, SamplerCustomAdvanced | prompt, seed, steps, length=`frames`, start_image, width/height | 3 с/20 шагов, 896×512, 88,5/72 с (GPU-DAY п.1) | frames [73, 345] (ставка до §15 п.1) |
 | `h3-ref2va` | MiniMaxH3ReferenceToVideo, те же | prompt (с `subject_definitions`), seed, steps, length, ref_images[1..k] | 3 с/20 шагов, одна картинка | `ref_images_by_frames` §10 L7b |
-| `krea2-t2i` | Krea 2 Turbo, 8 шагов euler/simple, cfg 1 | prompt, seed, width/height | 1344×768, 5,3–5,6 с, 18 ГБ (GPU-DAY п.2) | стороны кратны 64 |
+| `krea2-t2i` | Krea 2 Turbo INT8-ConvRot, 8 шагов euler/simple, cfg 1 | prompt, seed, steps, width/height | 1344×768: 5,2–5,6 с тёпло, 23,5 с холодно, пик 18,3 ГиБ; `verified_on` 22.10 (IMG-22, карточка) | карточка (ниже) |
+| `zimage-turbo-t2i` (ред. 3) | Z-Image Turbo: UNETLoader int8_convrot, CLIPLoader `lumina2` (qwen_3_4b_fp8_mixed), ModelSamplingAuraFlow shift 3, KSampler 8 шагов res_multistep/simple, cfg 1, ConditioningZeroOut вместо negative, EmptySD3LatentImage | prompt, seed, steps, cfg, width/height | 1344×768: 2,9 с тёпло, 14,4 с холодно, пик 14,2 ГиБ; сид 11 дважды — разница пикселей 0; `verified_on` 22.10 (IMG-22, карточка) | карточка (ниже) |
+| `qwen-image-t2i` (ред. 3) | Qwen-Image 2512 fp8_e4m3fn (Comfy-Org `Qwen-Image_ComfyUI`, split_files), энкодер qwen_2.5_vl_7b_fp8_scaled (CLIPLoader `qwen_image`), qwen_image_vae; ModelSamplingAuraFlow shift 3,1, KSampler euler/simple, **negative есть** (текст blueprint); необязательный `lora` — LoraLoaderModelOnly между UNETLoader и ModelSamplingAuraFlow | prompt, seed, steps, cfg, width/height, negative (из карточки, в интерфейс не выводится), lora (только из профиля карточки) | fp8_e4m3fn на Ampere идёт без ошибок. 1344×768, 50 шагов cfg 4: 58,5 с тёпло, 84,2 с холодно; Lightning 4 шага cfg 1: 2,7 с тёпло, 21,3 с холодно; пик 47,2 ГиБ; `verified_on` 22.10 (оба профиля) (IMG-22, main 7cc4ae3e) | карточка; профиль по умолчанию — «Быстро» |
 | `sdturbo-contract` | sd_turbo, 1 шаг 512×288 | prompt, seed | Мак, только контракт API | — |
 
-`verified_on` у H3-шаблонов ставится после §15 п.1 (8 с/50 шагов) и п.8 (контракт), не раньше.
+`verified_on` у H3-шаблонов ставится после §15 п.1 (8 с/50 шагов) и п.8 (контракт), не раньше. У
+шаблонов картинок — после живого контракта §12.2 **с проверкой повтора по сиду** (§19.11).
+
+**Карточка — единственный источник пределов модели картинки (ред. 3).** Студия не держит своих
+таблиц размеров: мастер (предустановки, поля «Своё», шаги), линтер (LI2, LI3, LI1), план (оценка, цена
+смены) и O32 читают `card.requires_json.limits` и `card.inputs`. Тест: правка числа в карточке меняет
+ответ O32 и находку LI2 без правки кода. Ключи `limits` (в карточках 22.10 есть только
+`sides_multiple_of`, `steps_default`, `cfg_default`, `sampler`, `shift`, `uses_negative`; остальные
+дописывает сборщик h3-bench в S2b, копии в пакете сверяются побайтно, как в плане S2–S3 задача 3).
+Все значения ниже — из замеров IMG-22 (22.10, ComfyUI 0.42.0 b1a247c9, alex-neuro):
+
+| Ключ | Krea 2 (`krea2-t2i`) | Z-Image Turbo (`zimage-turbo-t2i`) | Qwen-Image 2512 (`qwen-image-t2i`) |
+|---|---|---|---|
+| `title` | «Krea 2» | «Z-Image Turbo» | «Qwen-Image 2512» |
+| `sides_multiple_of` | 64 (1000×1000 тоже прошло — 64 консервативно) | 64 (консервативно) | **16**: родное 1328 не кратно 64, шаблон с 64 его отверг |
+| `side_min` / `side_max` | 256 / 2048 | 256 / 2048 | 256 / 2048 (карточка); сверх ≈2 МП не замерено |
+| `max_pixels` | 4 194 304 (2048² замерено: 30,0 с, 22,2 ГиБ) | 4 194 304 (2048²: 17,6 с, 22,1 ГиБ) | 2 088 960 (1920×1088 — наибольший замер: 131 с, 48,5 ГиБ); 4 МП не мерился |
+| `presets` | ≈1 МП: 1:1 1024², 16:9 1344×768, 9:16 768×1344, 4:3 1152×896, 3:4 896×1152; ≈2 МП: 1920×1088, 1088×1920; 4 МП: 2048² — все замерены | те же, все замерены | ≈1 МП: те же пять (50 шагов: 58,5–59,3 с); **родные**: 1:1 1328² (107,8 с), 16:9 1664×928 (92,8 с), 9:16 928×1664 (92,5 с), 4:3 1472×1104 (114,7 с), 3:4 1104×1472 (97,6 с); ≈2 МП: 16:9 1920×1088 (131,0 с). Времена — профиль «Полное»; «Быстро» замерено на 1344×768 и 1024² (2,7 с) |
+| `profiles` / `profile_default` | — | — | **`fast` «Быстро»**: LoRA `Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors` (lightx2v, 0,85 ГБ, в `loras/`), 4 шага, cfg 1 — **по умолчанию**; `full` «Полное»: без LoRA, 50 шагов, cfg 4. Сила LoRA — как в прогоне `verified_on` |
+| `steps_default` / диапазон | 8 / 1–50 | 8 / 1–20 | из профиля (4 / 50) / 1–80 |
+| `cfg_default` | 1 | 1 | из профиля (1 / 4) |
+| `uses_negative` | нет | нет | да (текст из blueprint) |
+| `variants_default` | 4 | 4 | 4 при «Быстро», 2 при «Полное» |
+| `understands_ru` | да (одна проба, IMG-22) | да (одна проба) | да (одна проба) |
+| `text_render.latin` / `.cyrillic` | да / **да** («ЛЕСНАЯ ТРОПА» без ошибок, одна проба) | да / **нет** («ЛЕСНАЯ ТРОПА» → «ЛЕРОНА») | да / **да** — верно и на 50 шагах, и с Lightning; лучшая из трёх по кириллице |
+| `seed_reproducible` | да: сид 11 дважды, разница пикселей 0 | да: разница 0 | да: пиксели идентичны |
+| `estimate_s` (до истории; по профилю у Qwen) | 6 | 4 (карточка; тёпло 2,9–3,2 с, холодно 14,4 с) | 3 «Быстро» / 60 «Полное» |
+| `switch_in_s` (цена загрузки в процесс сверх тёплого времени) | 17 (после H3 +16,7; после Z +16) | 10,5 (после Krea +10; после H3 +10,5; после Qwen +12) | 19 «Быстро» (21,3 − 2,7) / 26 «Полное» (84,2 − 58,5; после H3 84,6 — то же) |
+| `vram_peak_gib` (пик устройства, ГиБ) | 18,3 при 1 МП, 19,6 при 2 МП | 14,2 / 16,9 | **47,2 при 1 МП, 48,5 при 2 МП** — веса fp8 20 ГБ + энкодер 9 ГБ лежат на карте целиком, пик почти не зависит от размера |
+| `weights_gb` (диск) | 13,5 + 4,9 + 0,25 | 6,2 + 5,6 + 0,34 = 12,2 | 20,4 + 9,4 + 0,25 = 30,1 (+ LoRA 0,85) |
+| `model_files` (ред. 3.1, Б6) | `[{folder, name, bytes, sha256}]` трёх файлов | то же | то же; у профиля `fast` — ещё файл LoRA в `profiles.fast.requires.model_files` |
+| `profiles.<id>.requires` (ред. 3.1, №12) | — | — | `fast`: `class_types: [LoraLoaderModelOnly]`, `model_files: [Lightning]`; `full`: пусто. Доступность считается по профилю: без файла Lightning «Быстро» недоступно, «Полное» — доступно |
+
+**Qwen и H3 на одной карте (63,4 ГиБ = 64 911 МиБ) вместе не держатся**: Qwen ≈48 ГиБ, H3 fl2va ≈51,4 ГиБ. ComfyUI сам
+вытесняет одну модель другой — смена работает без `/free`, OOM не было ни разу, худший пик 52,7 ГиБ (Qwen
+после H3). Поэтому каждая смена Qwen ↔ H3 — полная загрузка в обе стороны (+19/26 с и ≈+38 с — возврат H3 после Qwen не замерен, ставка §15.4 п.20); планировщик
+это учитывает (§8.4, §19.9). `vram_peak_gib` в карточке — для показа и для этого правила, а не для
+отказа.
+
+**Отпечаток весов (ред. 3.1, Б6).** `model_files` карточки — эталон: путь в каталоге моделей, размер,
+sha256 (сборщик h3-bench пишет их из проверенного прогона). Воркер видит каталог моделей только на
+чтение (`comfy.model_roots` в `SETTING`, том в compose) и при старте, затем каждые 60 с, сверяет размер и
+mtime; при изменении пары — пересчитывает sha256 и кэширует в `model_file_hash(path, bytes, mtime_ns,
+sha256)`. Несовпадение с карточкой → модель (или профиль) недоступна с причиной «файл … отличается от
+проверенного» (LI7). `weights_sha256` = sha256 канонической строки из отсортированных `folder/name:sha256`
+всех файлов шаблона и профиля; входит во входы варианта (§19.3). Подмена весов под тем же именем без
+новой карточки модель блокирует, а с новой карточкой даёт другой отпечаток — повтор пишет «веса
+изменились — картинка может отличаться».
+
+**Необязательные входы подстановщика (ред. 3.1, Б2).** `comfy_template.build_payload` в S2b: значение
+`null` у необязательного входа (`required: false`) равно отсутствию. Для входа вида `lora` (вставка узла):
+`null`/нет — узел не вставляется, связи графа не трогаются; объект — вставляется `LoraLoaderModelOnly`
+между `after` и целями `rewire`. Если в будущем графе узел необязательного входа стоит изначально,
+`null` **убирает** его и перешивает все связи, шедшие из него, на его вход `after`. Тесты подстановщика:
+Krea без LoRA и Qwen «Полное» с `lora: null` дают граф, равный литералу без узла LoRA; Qwen «Быстро» —
+литерал с узлом и перешитым `model`; `null` у обязательного входа — `TemplateError`. Копия в пакете и
+источник в `docs/h3-modes/comfy-templates/` правятся вместе (побайтное равенство, план S2–S3 задача 3).
+
+**Рекомендация (ред. 3): Qwen по умолчанию — «Быстро» (Lightning 4 шага).** В 20 раз быстрее (2,7 с
+против 58,5 с) при качестве, близком на глаз; кириллица в надписях верна в обоих профилях (IMG-22).
+«Полное» — переключатель у модели, для финальной картинки, когда 1–2 минуты на вариант оправданы.
+Профиль — не выбор LoRA (§2): файл и сила зашиты в карточку, в `inputs_json` уходит `lora{name,
+strength}` профиля, поэтому повтор по сиду воспроизводит и профиль. Замер «Быстро» есть только на
+1344×768 и 1024², родные размеры и 2 МП в «Быстро» — проверить в живом контракте S2b (§15.4 п.19).
+
+`unknown` в карточке — законное значение (для будущих моделей; у трёх нынешних все поля замерены):
+линтер выдаёт по нему не `error`, а `info`/`warning` со словами «не проверено» (LI3, LI1). Значение
+карточки становится числом только из отчёта замера, не из README модели.
 
 Старый `ltx.upscale_part` переводится на обобщённый `ComfyClient`: 22 теста `test_ltx_upscale.py`
 остаются зелёными без правок.
@@ -699,9 +939,23 @@ Readiness ≠ liveness: `alive=True, ready=False` → `waiting_ready` с `wait_r
 он чужой процесс для диспетчера: `acquire` отвечает `wait_qwen`, мастер показывает «Qwen держит
 карту» и кнопку O23 «Освободить» (Codex-12).
 
-Порядок очереди: `priority DESC, created_at ASC`, внутри проекта — группировка по шаблону там, где
-`depends_on` позволяет. Смена чекпойнта fl2va↔ref2va в ComfyUI ≈16 с (GPU-DAY п.1); смена Krea 2 ↔ H3
-внутри процесса не замерена (§15 п.4) — план O10 показывает её как «≈ ? с» до замера.
+Порядок очереди — `queue_order` (ниже, ред. 3.2; прежнее правило «`created_at ASC`, группировка по
+шаблону внутри проекта» снято). Смена чекпойнта fl2va↔ref2va в ComfyUI ≈16 с (GPU-DAY п.1); ~~смена Krea 2 ↔ H3
+внутри процесса не замерена~~ **ред. 3:** замерено (GPU-DAY-20261021 п.4, IMG-22): загрузка модели в
+процесс стоит H3 fl2va +38 с, Krea 2 +17 с, Z-Image +10,5 с, Qwen-Image +19 с («Быстро») / +26 с
+(«Полное»); замеры не показали зависимости от предыдущей модели, кроме непроверенной пары «H3 сразу
+после Qwen» — там +38 с ставка (§15.4 п.20), и план показывает её как «≈+38 с»; OOM ни разу, `POST /free` не нужен (худший пик 52,7 ГиБ —
+Qwen после H3). Поэтому цена смены — свойство **целевого** шаблона (`switch_in_s` карточки,
+§8.2), а не пары «семейств»; fl2va↔ref2va — 16 с. Задачи картинок (`kind='image'`) идут с
+`priority=10`, рендер — 0: картинка, поставленная во время длинного рендера, ждёт только текущую
+задачу (выполняемая не прерывается). **Порядок очереди (ред. 3.1, №7) — одна функция
+`queue_order` для воркера и для расчёта смен в O10:** `priority DESC`; затем у картинок (`kind='image'`)
+— строго по постановке (`rowid`: партии FIFO, внутри партии `ord`), у рендера — сначала задача на
+загруженной модели, потом `rowid` (план S2–S3 R-S2-14). SQL воркера: `ORDER BY priority DESC,
+CASE WHEN kind = 'image' THEN 0 ELSE (json_extract(payload_json, '$.template') IS ?) END DESC, rowid`
+(план S2–S3 `_claim` — правка в ред. 4). **Qwen и H3 вместе на карте не держатся** (§8.2): картинка Qwen, вставшая
+перед ждущим рендером, стоит рендеру ещё +38 с на возврат H3, и план O10 партии Qwen показывает обе
+смены — «загрузка Qwen +19 с, возврат H3 для очереди рендера ≈+38 с» (§19.9).
 
 Воркер после задачи не освобождает движок: свой аналог `_IdleRelease` (15 мин простоя).
 
@@ -804,7 +1058,7 @@ state_in/out, refs`. **Основной — свой «Сценарист»; ai-
 
 Как Scenario mode старой панели (`docs/h3-prompt-system.md:232` «Scenario mode: a multi-scene video
 project», схема `provider.PROMPT_SCHEMA` `:32`, ветка `project.scenes`), но со своей строгой схемой
-`STUDIO_SCENES_SCHEMA` и через `provider.chat` (`:937`):
+`STUDIO_SCENES_SCHEMA` и через `provider.chat` (`:937`) (ред. 3.1: в коде S1 — через обёртку `ProviderLlm.json_turn`, `studio/llm.py:149`, она и есть точка вызова; см. §19.8):
 
 - вход: идея, число сцен (в мастере части 1 — 2), формат кадра, кастинг (тег, EN-описание,
   `portrait_phrase`), `style_block` проекта;
@@ -813,7 +1067,10 @@ project», схема `provider.PROMPT_SCHEMA` `:32`, ветка `project.scenes
   `music`, `state_in`, `state_out`, `cast_tags`, `requested_s` в пределах 3–15;
 - **код считает арифметику**: число сцен, снап длительности (§6.2), режимы по правилу CJM этап 4 —
   первая сцена с героем → `refs` (или `from_frame`, если владелец сделает кадр), каждая следующая →
-  `from_frame` с `prev_last_frame`; дословная `portrait_phrase` вклеивается кодом, не LLM;
+  `from_frame` с `prev_last_frame` (авто-источник, ред. 3.3). **Ред. 3.3:** если модель вернула пустой
+  `cast_tags` у сцены 1, код ставит в неё героев кастинга с фото (живая проба 23.10: 1 из 5 ответов без
+  героя); если модель кого-то назвала — её выбор остаётся; состав остальных сцен решает модель;
+  `requested_s` вне [3, 15] код зажимает, а не отвергает; дословная `portrait_phrase` вклеивается кодом, не LLM;
 - системный промпт — `studio/director/prompts/scenarist.md`, версия пишется в `proposal.llm_json`;
 - результат — `proposal` (переживает рестарт API), применяется O26 через тот же путь, что O7.
 
@@ -866,7 +1123,7 @@ project», схема `provider.PROMPT_SCHEMA` `:32`, ветка `project.scenes
 | L6 дрейф описания | warning | `portrait_phrase` различается между сценами цепочки | README режимов §2.6 |
 | L7a длительность | info | `requested_s` снапнут: показать `frames` и фактические секунды (§6.2); error только если `requested_s` вне `[3, 15]` | `sglang_args.py:18-19,81` |
 | L7b картинки-референсы | error | `len(ref images) > limit(template, frames)` по `requires_json.limits.ref_images_by_frames` | GPU-DAY п.4, README §2.3 |
-| L7d кадр и формат | error | ориентация кадра ≠ `frame_format`; портретный кадр в `refs` | README §2.4 |
+| L7d кадр и формат | error | ориентация кадра ≠ `frame_format`; портретный кадр в `refs`. **Ред. 3.1 (Б4):** у кадра-ресурса (`source_frame.kind=asset`) отношение сторон должно совпадать с `frame_format` с допуском 2 % (`|(w/h)/(16/9) − 1| ≤ 0,02`, для 9:16 — `9/16`): 1344×768 (1,6 %), 1920×1088, 1664×928 проходят; квадрат, 4:3, 3:4 — error «сделайте вариант 16:9». O8 с таким ресурсом отказывает 409 `frame_shape_mismatch` — **проверкой внутри транзакции O8 до `UPDATE`** (ред. 3.2), отдельно от информационного линта, который в коде S1 идёт после транзакции (`ops.py:345`), ничего не пишет; план O10 render проверяет то же | README §2.4 |
 | L8 «измерительные» формулы | warning | `calm neutral expression\|lips stay closed\|…` | PROMPT-FORMAT |
 | L9 счёт | warning | числительные > 3 | SPEC-scene-prompt-structure AW |
 | L10 `mode:` в тексте | error | `^mode:` | `clip_scene_prompt_builder.md:44` |
@@ -881,6 +1138,22 @@ project», схема `provider.PROMPT_SCHEMA` `:32`, ветка `project.scenes
 |---|---|---|
 | 90 (3,75 с) | 6 | README §2.3: 6 при 3 с — 63,8 ГБ; 8 — OOM |
 | 345 (14,375 с) | 4 | GPU-DAY п.4: 15 с/4 — прошёл (63,5 из 64 ГБ); 10 с/5 — OOM. 4 на 10 с не замерено, но память растёт с длительностью, а 4 прошли на 15 с |
+
+**Правила картинки (ред. 3, режим §19).** Функция `(draft, card, project, history) -> list[Finding]`;
+запускается в O28, O29 (находки к полю) и O10 `image_set` (`error` блокирует план). Пределы — только из
+карточки выбранной модели (§8.2); смена модели в черновике пересчитывает находки.
+
+| Правило | Серьёзность | Условие | Источник |
+|---|---|---|---|
+| LI1 надпись кириллицей | warning | в `prompt_en` есть надпись — текст в кавычках `"…"`, `«…»`, `“…”` — с кириллицей, а у модели `text_render.cyrillic = false` («Z-Image не пишет кириллицу: надпись выйдет с ошибками; Krea 2 и Qwen-Image пишут») или `unknown` («не проверено») | IMG-22: Z-Image «ЛЕСНАЯ ТРОПА» → «ЛЕРОНА» |
+| LI2 размер вне карточки | error | `width`/`height` вне `[side_min, side_max]`, не кратны `sides_multiple_of`, или `width × height > max_pixels`; находка несёт ближайший допустимый размер той же ориентации («Округлить до 1344×768») | карточка §8.2 |
+| LI3 язык промпта | warning / info | кириллица в `prompt_en` вне кавычек (перевод неполон или владелец вписал русский в английское поле): при `understands_ru = false` — warning, при `true`/`unknown` — info «в модель уйдёт русский текст» | IMG-22 (все три модели поняли русский) |
+| LI4 пустой промпт | error | `prompt_en` пуст или только пробелы | — |
+| LI8 перевод устарел | error | (только для партии из черновика; к повтору не применяется — у него свои замороженные входы, Б1) `prompt_en_state = 'stale'`: `prompt_ru` правили после перевода, а английский текст не обновлён и не правлен руками. Мастер переводит сам после паузы ввода (O28 `mode:"translate"`); находка видна, пока перевод не пришёл, и блокирует план — в модель не уходит текст, которого владелец не видел | решение владельца 22.10 (§17.1 п.11 в) |
+| LI5 шаги | error / info | `steps` вне диапазона `card.inputs.steps` — error; ниже `steps_default` — info «качество ниже официального» | карточка |
+| LI6 повтор входов | info | собранные входы варианта (И14) уже есть у варианта этого проекта: «совпадёт с вариантом №k партии №n» (для ручного сида и неизменённого промпта — кнопка «Ещё» называется «Повторить») | как L14 |
+| LI7 модель недоступна | error / warning / info | error: файлов модели или профиля нет либо они не совпадают с `model_files` (§8.2), или `card.enabled=false` (правило §17.1 п.11 б); warning (ред. 3.2): узлов шаблона/профиля не было в `object_info` при последнем опросе движка («узлы не найдены при опросе HH:MM») — план не блокируется, задача без узлов падает сразу по `Probe.missing`, и тот же probe обновляет сведения; info: `installed=null` — воркер ещё не проверил диск (сам план тогда отвечает 409 `models_unchecked`, §19.4) | §8.1 `Probe.missing`, §19.9 |
+| ~~L7e кадр в сцену~~ | — | ред. 3.1: удалено, влито в L7d (Б4): несовпадающая картинка в сцену не подключается вовсе, а не с предупреждением | — |
 
 Промежуток 3,75–10 с с 5 картинками не замерен — до проверки (§15 п.2) действует 4, это
 консервативно. Замеры сделаны на sglang; для ComfyUI таблица — ставка до §15 п.2. Расхождение с
@@ -916,7 +1189,11 @@ project», схема `provider.PROMPT_SCHEMA` `:32`, ветка `project.scenes
 | `studio_assemble` | O19 → O20 | — |
 | `studio_cancel` | O14 | — |
 
-Итого **18 инструментов**. `revision_conflict`/`state_conflict`/`plan_stale` возвращаются результатом
+Итого **18 инструментов**. Ред. 3: в S5 добавляются пять инструментов режима «Картинка» —
+`studio_image_models` (O32), `studio_image_propose` (O28), `studio_image_update` (O29),
+`studio_image_make` (O10 `image_set` → O30, двухшаговый с `confirm`), `studio_image_keep` (O31); передача в
+видео — уже существующими `studio_update_scene` и `studio_add_cast`. Всего 23.
+`revision_conflict`/`state_conflict`/`plan_stale` возвращаются результатом
 с текущим снимком: хост перечитывает. Таймаут инструмента 30 с; долгие задачи — в воркере.
 
 ---
@@ -1075,14 +1352,33 @@ sequenceDiagram
 | S0 | 1 | `studio/app.py` :8766, `db.py` + миграция 001 (таблицы пути: project, scene, cast_member, cast_asset, asset, proposal, event, setting, op_log), SSE O21, каркас мастера (React+Vite), шаг 1 | открывает `http://alex-neuro:8766/studio`, создаёт проект, видит его в списке после перезагрузки | И8, И10 красные→зелёные |
 | S1 | 2 | шаги 2–3 мастера: O5/O6, сценарист O25/O26 (`STUDIO_SCENES_SCHEMA`, промпт, снап §6.2), O7/O8 с `scene_id`, `expected_revision` / `expected_edit_version` (И1a), линтер L1–L6, L7a, L8–L12 | **из идеи получает две сцены**, правит текст, видит находки линта, перезагружает страницу — правки на месте | 409 `revision_conflict`; сопоставление O7 (вставка/удаление/перестановка); каждое правило линта — мутация; И1 |
 | S2 | 2 | воркер (§8.5 без `submit_unknown`-сценариев), GPU-гейт, правка диспетчера `comfy-studio`, `comfy.py` с шаблоном `krea2-t2i`, O10(image)/O12/O13/O14, O23, шаг 4 мастера | **получает кадр Krea 2** на alex-neuro, видит прогресс и ожидание карты с причиной, подключает кадр к сцене 1 | контракт имитации; `test_ltx_upscale.py` 22/22 без правок; `test_gpu_dispatcher` +`comfy-studio`; живой контракт `krea2-t2i` |
+| **S2b** (ред. 3) | 2 | режим «Картинка» §19: миграция 004 (`project.kind`, `image_draft` с `prompt_ru`/`prompt_en`, `image_batch`, `image_variant`, триггер И14); шаблоны `zimage-turbo-t2i` и `qwen-image-t2i` (с профилями «Быстро»/«Полное») с расширенными карточками §8.2; `templates`: список моделей картинок вместо одной константы, `switch_in_s` из карточки; `ImageKind` берёт значения по `card.inputs` шаблона (cfg, negative), каталог `projects/<pid>/images/<task_id>/`; `Probe.missing`; O1/O2/O3 с `kind`, O28 «Сценарист картинки» (идея → русский текст + английский перевод; перевод правки), O29, O10 `image_set` (+ `repeat_variant_id`), O30, O31, O32; LI1–LI8, L7d с допуском 2 % (O8 409 `frame_shape_mismatch`); экран §19.2; «В сцену…» (O8) и «В кастинг…» (O5) | **из идеи получает картинку на выбранной модели** (Krea 2, Z-Image Turbo, Qwen-Image 2512), правит промпт по-русски и видит английский, уходящий в модель, видит сид каждого варианта, **повторяет вариант по сиду** — та же картинка, **берёт отобранную в сцену 1** видеопроекта и видит её кадром в шаге 4; на телефоне 390 px проходит то же | И13–И18 красные→зелёные; 26 мутаций §19.11; контракт имитации для каждого шаблона картинок — граф литералами теста (узлы, связи, сид, шаги, cfg, размер, shift); живой контракт `krea2-t2i`, `zimage-turbo-t2i` и `qwen-image-t2i` (оба профиля) с повтором по сиду — **равенство декодированных пикселей**; поведенческие тесты S2 без правок (кадр сцены шага 4 не меняется); литералы, которые S2b меняет по существу, — список файлов шаблонов (`test_studio_templates.py`) и хеш карточки Krea (`test_studio_keyframe_api.py`, карточка получила `model_files`/`presets`) — обновляются с причиной в отчёте, без правки проверяемого поведения; Vitest экрана §19.2 против мини-сервера |
 | S3 | 2 | шаблоны `h3-fl2va`/`h3-ref2va` (после §15 п.1–3), O10/O11 render, `pending_input`/материализация (И2, И3), O16/O17, O18, `estimate_sample`, шаги 5–6 мастера | **снимает эскизы двух сцен** (2-я от кадра 1-й), выбирает, видит конфликт после пересъёмки 1-й и пересъёмку 2-й от выбранной | мутации 1, 3, 4, 5, 6, 7 §12.3; И11 при одобрении |
 | S4 | 2 | финалы, каскад И11 на завершении дубля, `concat_clips` (выделение из `assemble.py`), O19/O20, шаги 7–8, Playwright-сценарий мастера на имитациях | **полный путь критерия §1** на настоящем ComfyUI, mp4 скачан; журнал прохода | `test_studio_path.py` со всеми 12 мутациями; `test_assemble.py` 68/68 без правок; И12 |
 | S5 | 2 | устойчивость: `submit_unknown` (O27, `restarted_since`), `lost`, `cancelling`, reconcile-таблица целиком; **MCP слой 1** (18 инструментов) | из Claude Desktop или Hermes находит проект из S4, смотрит дубли, ставит пересъёмку сцены 2 | сценарии §12.1 `post_timeout`, `restart`; reconcile точными равенствами; без токена `/mcp` → 401 |
 | S6 | 1 | независимая приёмка (`/codex` по спеке и коду), ревью мутаций всех срезов | владелец повторяет S4 на новой идее без подсказок | открытых дефектов ≤ 5, ни одного класса «потеря состояния» |
 | S7 (опция) | 1 | импорт ai-writer O24 (файл и `clip_id`) | импортирует «Озеро», ставит эскизы двух первых сцен | тест импорта 14 сцен |
 
-Итого 12 рабочих дней до S6 (+1 на S7). После части 1, по решению владельца: LTX-апскейл из студии,
-DT на Маке, LoRA, план Б sglang (если не понадобился раньше).
+Итого 14 рабочих дней до S6 с S2b (+1 на S7). Критерий §1 сдвигается на 2 дня, потому что S2b стоит
+до S3 по решению владельца. После части 1, по решению владельца: LTX-апскейл из студии, DT на Маке,
+LoRA, план Б sglang (если не понадобился раньше).
+
+**S2b и план S2–S3 (ред. 3).** S2b — отдельный план поверх кода S2, без правки задач части C. Часть D
+плана S2–S3 (S3) перед стартом сверяется с S2b по трём швам, и это делает автор плана S3, а не S2b:
+(1) константа `templates.IMAGE_TEMPLATE` и функция `estimates._family` (план S2–S3, задачи 3 и 7)
+заменены на `templates.KEYFRAME_TEMPLATE = "krea2-t2i"` (кадр шага 4 остаётся на Krea 2) и
+`switch_in_s` карточки. С третьей моделью `_family("zimage-turbo-t2i")` вернула бы `"h3"`, а
+`SWITCH_S[("zimage-turbo-t2i", "h3-fl2va")]` бросила бы `KeyError`. (2) Версия схемы после S2b — 4: S3
+своей миграции не вводит (проверено по тексту плана). Нумерация (ред. 3): 001 — S0, 002 —
+`scene_source_auto` (S1, задача 10, уже в коде), 003 — связи задач и `engine_version` (S2; в плане S2–S3
+это файл `002_tasks.sql` и проверки `user_version == 2` — переименовать в `003_tasks.sql` и `== 3`), 004 —
+картинка (S2b, `user_version = 4`). (3) `ImageKind.spec` читает значения по
+`card.inputs`, а не по фиксированному списку `prompt, seed, steps, width, height`. Порядок S2 → S2b → S3
+задан владельцем. Код `render` S2b не трогает, поэтому план S3 переписывать не нужно — только
+перепроверить эти три места. **Ред. 3.1 — ещё три стыка для ред. 4 плана S2–S3:** (4) плоский payload
+задачи `image` (§19.3) — план S2 не меняется, S2b дописывает ключи; (5) `_claim` воркера — порядок
+`queue_order` §8.4 (FIFO у картинок); (6) L7d в `plan_render` (план S3, проверка `_orientation`) —
+допуск 2 % по отношению сторон, а не только ориентация, и O8 — 409 `frame_shape_mismatch` (§10) проверкой в транзакции до `UPDATE` (правка `ops.update_scene` S1).
 
 ---
 
@@ -1122,6 +1418,30 @@ DT на Маке, LoRA, план Б sglang (если не понадобился
 | 9 | ingest ai-writer: импорт `ozero.h3.json` и эскиз сцены 1 | S7 |
 | 10 | LTX-апскейл в `comfy-studio` (модели, узлы, 22 теста против живого) | после части 1 |
 
+### 15.4. Модели картинок (ред. 3)
+
+Сделано 22.10 на alex-neuro в `~/Projects/comfy-h3` (v0.42.0 b1a247c9, :8189) по правилам GPU-дня; память —
+пик устройства (nvidia-smi), не `torch.cuda.max_memory_allocated`. Отчёт — IMG-22, логи h3-bench
+`logs/image-models-20261022-*.log`, удаление старых комплектов — `logs/delete-old-image-models-20261022.log`.
+
+| # | Проверка | Итог | Что записано в спеку |
+|---|---|---|---|
+| 11 | Z-Image через `build_payload` живьём | идёт; `verified_on` 22.10 | §8.2 |
+| 12 | Qwen-Image fp8_e4m3fn на Ampere (CMP 170HX) | **идёт без ошибок**; скачано 29 ГБ (sha256 = HF) + Lightning 0,85 ГБ; свободно 87 ГБ после удаления старых комплектов (решение владельца) | Qwen в S2b; правило «не годится → две модели» осталось (§17.1 п.11 б) |
+| 13 | Время и память Qwen | 50 шагов: 58,5–59,3 с тёпло при ≈1 МП, 84,2 с холодно, родные 92,5–114,7 с, 1920×1088 131,0 с; пик 47,1–48,5 ГиБ | `estimate_s`, `presets`, `vram_peak_gib` |
+| 14 | Смена моделей с Qwen; Lightning | цепочка Qwen → Z → Krea → H3 → Qwen без `/free`: Z после Qwen 15,1 с, Qwen после H3 84,6 с, худший пик 52,7 ГиБ, OOM нет, `/free` ничего не даёт. Lightning 4 шага cfg 1: 2,7 с тёпло, 21,3 с холодно, качество близкое | `switch_in_s`; Qwen и H3 вместе не держатся (§8.2, §8.4); профиль «Быстро» по умолчанию; флаг `free_before_switch` не нужен |
+| 15 | Повтор по сиду Qwen | сид 11 дважды — пиксели идентичны | `seed_reproducible = true` |
+| 16 | Русский и надписи у Qwen | русский промпт понят; «FOREST TRAIL» и «ЛЕСНАЯ ТРОПА» верно на 50 шагах и с Lightning | `understands_ru`, `text_render.cyrillic = true` |
+| 17 | Пределы Qwen | кратность 16 (1328 не кратно 64); замерено до 1920×1088 | `sides_multiple_of = 16`, `max_pixels` = 1920×1088 |
+
+Осталось (в живом контракте S2b, не блокирует план):
+
+| # | Проверка | Как | Решение по исходу |
+|---|---|---|---|
+| 18 | **Кадр в пределах допуска L7d в H3** (ред. 3.1: несовпадающие формы в сцену не попадают) | `h3-fl2va` от PNG 1920×1088 и 1664×928 (отклонение 0,7–0,9 % от 16:9) при холсте 896×512: кадр 0 обрезан или растянут, заметно ли | допуск 2 % L7d остаётся или сужается |
+| 19 | **Qwen «Быстро» на родных размерах и ≈2 МП** | 1328², 1664×928, 1920×1088 с Lightning: время, пик, вид | `estimate_s` профиля; если хуже на глаз — «Быстро» ограничить ≈1 МП в `presets` профиля |
+| 20 | **H3 сразу после Qwen** | Qwen → H3 fl2va без промежуточных моделей: время и пик (в цепочке 22.10 между ними стояли Z и Krea) | цена возврата H3 (сейчас ставка +38 с, как после Krea) |
+
 ---
 
 ## 16. Риски
@@ -1138,6 +1458,11 @@ DT на Маке, LoRA, план Б sglang (если не понадобился
 | Объём 12 дней | высокая | критерий в S4; S5–S7 могут сдвинуться без потери критерия |
 | SQLite по SMB с Мака | — | запрещено (только API) |
 | `stale`-дубли и ресурсы съедают диск | низкая | показываются; дисковый бюджет — часть 3 |
+| Qwen по умолчанию «Быстро»: на родных размерах и 2 МП качество Lightning не проверено | низкая | §15.4 п.19 в живом контракте S2b; «Полное» — одним переключателем |
+| Qwen ↔ H3 вытесняют друг друга: чередование картинок Qwen и рендера дорожает (+19–26 с и +38 с за круг) | средняя | цена обеих смен в плане O10 (§19.9); `/free` не нужен (52,7 ГиБ худший пик) |
+| После удаления старых комплектов сломаны Hermes (доска image-studio) на Маке и `zimage.sh`/`smoke.sh` | факт | вне студии; перевод Hermes на ComfyUI — отдельная задача владельца |
+| Картинки съедают диск быстрее видео (4 варианта на нажатие) | средняя | PNG ≈ 1–3 МБ: 1000 вариантов — несколько ГБ; удаление и бюджет — часть 3 |
+| Картинка, поставленная во время длинного рендера, прибавляет к следующей H3-задаче смену модели (+38 с) | низкая | план O10 показывает цену смены; приоритет картинок §8.4 |
 
 ---
 
@@ -1159,6 +1484,18 @@ DT на Маке, LoRA, план Б sglang (если не понадобился
 9. **(21.10) Вопросы §17.4 — по ставкам автора:** 1) повторить пробу 07.10 с теми же файлами, потом
    решать о лимите старой панели; 2) старую панель на ComfyUI не переводить; 3) слить два ComfyUI
    после проверки LTX на v0.42; 4) сцена ровно 15 с не нужна, граница 14,375 с.
+10. **(22.10) Режим «Картинка»**: отдельный путь «идея → картинка» без видео; промпт от своего
+    «Сценариста» (LLM, как в S1), правится; модели Krea 2, Z-Image Turbo, Qwen-Image 2512; несколько
+    вариантов → «Годится / Ещё»; сид авто (случайный, записывается и виден) или ручной; разрешение —
+    предустановки по соотношению сторон и своё в пределах модели; всё через `comfy-studio` на
+    alex-neuro; срез сразу после S2, до S3; готовая картинка берётся в видео первым кадром сцены
+    (`source_frame.kind=asset`) или референсом героя в кастинг. Принято: §19, S2b в §14.
+11. **(22.10) Ответы на вопросы черновика ред. 3:** (а) место под Qwen-Image — вопрос снят: старые
+    комплекты Z-Image (Draw Things) и Qwen 2.1 (GGUF) удалены 22.10 по решению владельца, LoRA
+    сохранены, свободно 87 ГБ; (б) если Qwen не годится — S2b выходит с двумя моделями (Krea 2, Z-Image);
+    сейчас неактуально, Qwen работает (§15.4), но правило остаётся (`card.enabled=false`, LI7); (в) язык
+    промпта: **владелец правит по-русски, в модель уходит английский перевод от «Сценариста», он виден и
+    правится**. Принято: §19.3 (`prompt_ru`/`prompt_en`), §19.4 (O28 `translate`), §19.8, LI8.
 
 ### 17.2. Решения редакции 2 (приняты автором по замерам и ревью; не требуют ответа)
 
@@ -1200,6 +1537,34 @@ DT на Маке, LoRA, план Б sglang (если не понадобился
 3. **Один экземпляр ComfyUI.** После §15.3 п.10 — слить `ltx` и `comfy-studio` в один (v0.42)?
 4. **Длительность больше 14,375 с.** Нужна ли сцена до 15 с ровно (362 кадра — выше текущей границы)?
 
+### 17.5. Решения редакции 3 (приняты автором; не требуют ответа)
+
+- **Проект `kind='image'`, а не отдельная сущность** (§19.3): задачи, события, снимок, список и
+  идемпотентность уже привязаны к проекту; ресурс глобален, поэтому передача в видео обходится без
+  новых операций.
+- **Один вариант — одна задача — один сид**, без `batch_size` (Р3-4).
+- **Авто-сид генерирует план (O10)**, а не воркер: сид виден до подтверждения и записан до постановки
+  (И13). Ручной сид S даёт сиды S, S+1, …, S+N−1, так что вариант 1 — ровно S.
+- **«Ещё» — новая партия из черновика**: при авто-сиде — новые сиды; при ручном и неизменённом
+  промпте — те же входы, кнопка называется «Повторить» (LI6). «Повторить» у варианта — партия из одного
+  с его входами (И15).
+- **Мастер ставит партию одним нажатием**: сухой план O10 запрашивается заранее (при каждой правке
+  черновика) и показан в кнопке «Сделать 4 варианта · ≈ 25 с»; нажатие — O30 с этим `plan_id`. Отдельный
+  экран плана только при `error`/`blocked`. MCP — двухшаговый, как кадр.
+- ~~Промпт по умолчанию — по-английски~~ — заменено ответом владельца §17.1 п.11 (в): правится русский
+  текст, в модель уходит английский перевод, надписи в кавычках — дословно на языке надписи (§19.8).
+- **Qwen по умолчанию — профиль «Быстро» (Lightning 4 шага)**, «Полное» — переключатель (§8.2).
+- **Кадр шага 4 видеопроекта остаётся на Krea 2** (`KEYFRAME_TEMPLATE`); выбор модели — в режиме
+  «Картинка», откуда кадр приходит через «В сцену…».
+- **`frame_format` у проекта `image` не стал NULL**: миграция 004 не пересобирает таблицу `project`
+  (CHECK `16:9|9:16`, на неё ссылаются внешние ключи). Поле означает начальную ориентацию предустановки,
+  блокировка `format_locked` (O4) к картинке не применяется.
+
+### 17.6. Открытые вопросы владельцу
+
+Три вопроса черновика ред. 3 (место под Qwen, запасной путь, язык промпта) закрыты ответами владельца
+22.10 — §17.1 п.11. **Вопросов, блокирующих план S2b, нет.**
+
 ---
 
 ## 18. Правки к исходным документам
@@ -1212,3 +1577,381 @@ DT на Маке, LoRA, план Б sglang (если не понадобился
 - `tools/gpu-dispatcher/README.md`: ручка `/acquire` принимает `comfy-studio` — после S2.
 - `docs/h3-modes/README.md` §2.3: лимит картинок как функция длительности — таблица L7b §10.
 - CJM Н7 «источник счётчика шагов»: закрыт GPU-DAY п.7 (ComfyUI — WS, sglang — tqdm).
+- (ред. 3) `docs/h3-modes/comfy-templates/README.md`: добавить `zimage-turbo-t2i`, `qwen-image-t2i` и
+  новые ключи `limits` (§8.2) — после S2b; сборщик h3-bench `image_models_build.py` пишет их в карточки.
+- (ред. 3) План S2–S3, часть D: три шва с S2b (§14, абзац под таблицей).
+- (ред. 3) План S2–S3, задача 5: миграция `002_tasks.sql` → `003_tasks.sql`, `user_version` 2 → 3 (002
+  занята `scene_source_auto` из S1, задача 10).
+
+---
+
+## 19. Режим «Картинка» (срез S2b, ред. 3)
+
+Решение владельца 22.10 (§17.1 п.10). Отдельный путь «идея → картинка» без видео, на тех же ядре,
+воркере, адаптере ComfyUI и `comfy-studio`, что S2. Новый код — вид проекта, три таблицы, пять
+операций, роль LLM, правила линтера и один экран; исполнение — существующий вид задачи `image`.
+
+### 19.1. Сценарий владельца
+
+| Шаг | Что видит и делает владелец | Операции |
+|---|---|---|
+| 1. Новый | «Проекты» → «Новый» → тип **«Картинка»**, название. Формат кадра не спрашивается | O2 `kind=image` |
+| 2. Идея → промпт | пишет идею по-русски («афиша деревенского кино, надпись „Клуб «Заря»“, вечер») → «Предложить промпт» → **«Промпт» по-русски** (развёрнутое описание кадра) и под ним **«В модель уйдёт» — английский перевод** (§19.8); надписи в кавычках дословно на своём языке в обоих полях; находки линта у полей. Владелец правит русский — перевод обновляется сам после паузы ввода (до прихода — LI8 «перевод устарел»); английский тоже можно поправить руками. Можно и без идеи — написать промпт сразу | O28, O29 |
+| 3. Модель | таблетки **Krea 2 · Z-Image Turbo · Qwen-Image 2512** с моно-метками из карточки («≈5 с · кириллица», «≈3 с · латиница», «≈3 с · кириллица»); у Qwen-Image — переключатель профиля **«Быстро» (4 шага, по умолчанию) / «Полное» (50 шагов, ≈1 мин)**. Недоступная — серая с причиной («не установлена на alex-neuro») | O32, O29 |
+| 4. Формат | чипы **1:1 · 16:9 · 9:16 · 4:3 · 3:4** и класс размера из `presets` карточки (**≈1 МП / ≈2 МП**, у Qwen ещё **«родное»**; показываются только те, что есть для выбранного соотношения); «Своё» — поля Ш × В; вне пределов — `error` у поля и кнопка «Округлить до 1344×768» (LI2) | O29 |
+| 5. Сид и число | сид **«Авто»** (по умолчанию) / **«Свой»** + число; «Вариантов» 1–8 (по умолчанию из карточки); под «Ещё настройки» — шаги в пределах карточки | O29 |
+| 6. Сделать | главная кнопка **«Сделать 4 варианта · ≈ 25 с»** (оценка и цена смены модели — из сухого плана, запрошенного заранее) → варианты появляются по мере готовности: у каждого прогресс шагов, затем картинка и **сид моно-цифрами**; ожидание карты — с причиной и «Освободить», как в S2 | O10 `image_set` → O30; O13, O21, O23 |
+| 7. Выбор | на варианте **«Годится»** — вариант в «Отобранных», крупно в кадре-герое; меню «⋯»: **«Повторить»** (тот же сид и входы, И15), «Сид в поле» (включает «Свой» и вставляет сид), «Скачать PNG». Под лентой **«Ещё 4»** — новая партия из текущего черновика (при ручном сиде и том же промпте кнопка называется «Повторить», LI6) | O31; O10 `repeat_variant_id` → O30; O29 |
+| 8. В видео | у отобранной: **«В сцену…»** (активна, только если соотношение варианта совпадает с `frame_format` видеопроекта с допуском 2 % — L7d; иначе неактивна с причиной «кадр 1:1, а проект 16:9 — сделайте вариант 16:9» и подсказкой «В кастинг…»; проекты в выборе — из O1 с `frame_format`) → видеопроект и сцена (по умолчанию 1) → «Подключить»: O8 `{mode:"from_frame", source_frame:{kind:"asset", asset_id}}` с `expected_edit_version`; **«В кастинг…»** → видеопроект, тег, описание по-русски → O5 `assets:[{asset_id, role:"image"}]` с `expected_revision` | O1, O3, O8, O5 |
+
+Отмена: у ждущего варианта «×» — O14; «Отменить партию» — O14 по каждой незавершённой задаче партии.
+
+### 19.2. Экран (дизайн-система «AB»)
+
+Язык и токены — `docs/design/2026-10-studio-style/AB/README.md`: холодный белый, линии 1px без теней,
+кобальт — единственный акцент; Inter Tight — заголовки и крупные цифры, Inter — текст, JetBrains Mono —
+метки, сиды, размеры; кнопки — таблетки, главная с кобальтовым градиентом и свечением (из C). Маршрут
+вверху — три сегмента по 3px с моно-подписями **ИДЕЯ · ПРОМПТ · ВАРИАНТЫ** (вместо шести сегментов
+видеопроекта); шапка 56px с плашкой видеокарты.
+
+**Десктоп 1440.** Сетка `1.3fr / 1fr`, как в редакторе сцены.
+- Слева — **кадр-герой**: выбранный (или последний готовый) вариант в своей пропорции, рамка 10px
+  радиуса; метки поверх кадра тёмным стеклом — «Krea 2», «1344×768», «сид 1847263», у отобранного
+  кобальтовая «Годится». Кнопки «В сцену…» / «В кастинг…» под кадром, вторичные таблетки.
+- Под кадром — **лента вариантов-плёнка** (ink-подложка, перфорация цветом фона): партии сверху вниз,
+  новая первой, подпись партии моно «№ 3 · Z-IMAGE · 16:9 · 4 ВАР.»; кадр варианта ≈ 220px, под ним
+  моно-сид и кнопка «Годится» на всю ширину (36px), в углу «⋯». Ждущий вариант — серый кадр с
+  прогрессом «шаг 5/8» и «×». Отобранный — рамка кобальта (`film-cobalt`). «Ещё 4» — в конце ленты.
+- Справа — **панель полей** (рамка 1px): «Идея» (textarea, растёт по тексту) + «Предложить промпт»;
+  «Промпт» (textarea по-русски) с находками линта под полем (warning — `warn`, error — красная рамка
+  поля); под ним блок **«В модель уйдёт · EN»** — английский текст на `surface`, моно-метка состояния
+  («ПЕРЕВЕДЕНО» / «ПЕРЕВОЖУ…» / «ПРАВЛЕНО ВРУЧНУЮ»), по щелчку становится полем; «Модель» —
+  сегмент-таблетки, под ними метки карточки, у Qwen — второй сегмент «Быстро / Полное»; «Формат» —
+  чипы соотношения, переключатель класса размера, «Своё» раскрывает Ш × В (моно); «Сид» — сегмент
+  «Авто / Свой», крупное число Inter Tight 30px (как сид/шаги в редакторе сцены), при «Авто» вместо
+  числа «случайный»; «Вариантов» — шаговый счётчик 1–8; «Ещё настройки» — шаги. Внизу панели — главная
+  кнопка 48px «Сделать 4 варианта · ≈ 25 с»; при `error` она неактивна, рядом причина словами.
+
+**Телефон 390.** Одна колонка, поля страницы 16px, без горизонтального переполнения (scrollWidth = 390,
+проверка Playwright, как S4).
+- Сверху кадр-герой на всю ширину; под ним **варианты сеткой в 2 колонки** (не лентой: дубли на
+  телефоне идут друг под другом, README AB), моно-сид под каждым, «Годится» — таблетка на всю ширину
+  ячейки.
+- Ниже — свёрнутые секции «Промпт» (русский, под ним свёрнутая строка «В модель уйдёт · EN» —
+  раскрывается и правится), «Модель и формат», «Сид и число» (открыта первая незаполненная);
+  находки линта — внутри секции и счётчиком на её заголовке.
+- **Главная кнопка закреплена снизу** (scrim): «Сделать 4 · ≈ 25 с»; после «Годится» нижняя панель
+  показывает две кнопки «В сцену…» / «В кастинг…»; выбор проекта и сцены — шторка снизу (Radix Dialog).
+
+Запрещено то же, что в §4.4: кремовые фоны, терракота, serif-заголовки, вид shadcn по умолчанию.
+Эталон экрана рисуется в `AB/index.html#image` (1440 и 390) до кода S2b, как `#projects` и `#scene`.
+
+### 19.3. Данные
+
+**Решение: картинки живут в проекте `kind='image'`.**
+
+| Вариант | За | Против | Итог |
+|---|---|---|---|
+| **Проект с `kind='image'`** | `task.project_id`, фильтр SSE по проекту, снимок O3, список O1, каталог `projects/<id>/`, `Idempotency-Key` уже есть (план S2–S3 R-S2-1); владелец видит работу над картинкой как именованный, возвращаемый проект; `asset` глобален (у таблицы нет `project_id`), поэтому вариант идёт в любую сцену и в кастинг любого видеопроекта существующими O8/O5 | у проекта есть поля видео (`frame_format`, сцены): нужна изоляция видов (И18) | **принято** |
+| Отдельная сущность `image_board` | чистая модель без полей видео | второй список, второй снимок, свой фильтр событий, `task.project_id` пришлось бы делать nullable или дублировать; два понятия «проект» у владельца | отвергнут |
+| Картинки внутри видеопроекта (вкладка) | нет нового вида | владелец просил путь **без видео**; картинка до видеопроекта (сначала кадр, потом решаю, в какой ролик) некуда положить | отвергнут |
+
+**Миграция `004_images.sql`** (после 002 `scene_source_auto` из S1 и 003 связей задач S2; `PRAGMA user_version = 4`):
+
+```sql
+ALTER TABLE project ADD COLUMN kind TEXT NOT NULL DEFAULT 'video'
+  CHECK (kind IN ('video', 'image'));
+
+CREATE TABLE image_draft (
+  project_id TEXT PRIMARY KEY REFERENCES project(id),
+  edit_version INTEGER NOT NULL DEFAULT 0,
+  idea_text TEXT NOT NULL DEFAULT '',
+  prompt_ru TEXT NOT NULL DEFAULT '',      -- то, что правит владелец (§17.1 п.11 в)
+  prompt_en TEXT NOT NULL DEFAULT '',      -- то, что уходит в модель; виден и правится
+  prompt_en_state TEXT NOT NULL DEFAULT 'none'
+    CHECK (prompt_en_state IN ('none', 'fresh', 'stale', 'owner')),
+    -- fresh: перевод текущего prompt_ru; stale: prompt_ru правили после перевода (LI8);
+    -- owner: английский правлен руками (следующая правка prompt_ru снова делает stale)
+  prompt_ru_version INTEGER NOT NULL DEFAULT 0,  -- +1 на правку prompt_ru; перевод помнит, с какой снят
+  prompt_llm_json TEXT,                    -- модель, версия промпта роли, сырой ответ (как proposal.llm_json)
+  template TEXT NOT NULL,                  -- id шаблона картинки (§8.2)
+  profile TEXT,                            -- профиль карточки (Qwen: 'fast' | 'full'); NULL у моделей без профилей
+  width INTEGER NOT NULL, height INTEGER NOT NULL,
+  steps INTEGER,                           -- NULL = card.limits.steps_default
+  seed_mode TEXT NOT NULL DEFAULT 'auto' CHECK (seed_mode IN ('auto', 'manual')),
+  seed INTEGER,
+  count INTEGER NOT NULL CHECK (count BETWEEN 1 AND 8),
+  updated_at TEXT NOT NULL,
+  CHECK (seed_mode = 'auto' OR seed IS NOT NULL)
+);
+
+CREATE TABLE image_batch (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES project(id),
+  ord INTEGER NOT NULL,                    -- № партии в проекте, с 1
+  draft_edit_version INTEGER,              -- версия черновика, из которой собран план; NULL только у повтора
+  template TEXT NOT NULL, template_sha256 TEXT NOT NULL, profile TEXT,
+  prompt_ru TEXT NOT NULL,                 -- для показа у партии; в модель не идёт и во входы не входит
+  seed_mode TEXT NOT NULL, count INTEGER NOT NULL,
+  repeat_of_variant_id TEXT REFERENCES image_variant(id),
+  plan_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (project_id, ord),
+  CHECK ((repeat_of_variant_id IS NULL) = (draft_edit_version IS NOT NULL))   -- Б1
+);
+
+CREATE TABLE image_variant (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES image_batch(id),
+  ord INTEGER NOT NULL,
+  seed INTEGER NOT NULL,                   -- И13
+  inputs_json TEXT NOT NULL,               -- И14, канонический JSON ниже
+  inputs_sha256 TEXT NOT NULL,
+  task_id TEXT NOT NULL UNIQUE REFERENCES task(id),
+  kept_at TEXT,                            -- «Годится»; NULL — не отобран
+  UNIQUE (batch_id, ord), UNIQUE (batch_id, seed)   -- И16
+);
+
+CREATE TABLE model_file_hash (            -- Б6: кэш sha256 весов; пишет только воркер
+  path TEXT PRIMARY KEY, bytes INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+  sha256 TEXT NOT NULL, hashed_at TEXT NOT NULL
+);
+
+ALTER TABLE estimate_sample ADD COLUMN profile TEXT;   -- №13: ключ оценки различает профили
+ALTER TABLE task ADD COLUMN weights_sha256 TEXT;      -- ред. 3.2: NULL у задач до S2b и у кадра при непроверенном инвентаре
+
+CREATE TRIGGER image_variant_inputs_are_frozen BEFORE UPDATE OF
+  batch_id, ord, seed, inputs_json, inputs_sha256, task_id ON image_variant
+BEGIN SELECT RAISE(ABORT, 'image variant inputs are immutable (И14)'); END;
+```
+
+Статус и результат варианта **не хранятся дважды**: статус — `task.status`, картинка —
+`task.result_asset_id` → `asset` (`kind='image'`, `origin_kind='take_output'`, `origin_task_id`, как кадр
+Krea в плане S2–S3 R-S2-7). Ресурс неизменяем (И7), поэтому сцена или кастинг, получившие `asset_id`,
+держат ровно те байты, что владелец отобрал.
+
+Канонический JSON входов варианта (ключи отсортированы, `ensure_ascii=False`; `inputs_sha256` — хеш
+строки). Это ровно то, что подставляется в граф, плюс версия шаблона:
+
+```json
+{"executor":"comfy","template":{"id":"qwen-image-t2i","sha256":"…"},"profile":"fast",
+ "prompt":"<prompt_en дословно>","negative":"<текст карточки>",
+ "lora":{"name":"Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors","strength":1.0},
+ "weights_sha256":"…","width":1344,"height":768,"steps":4,"cfg":1.0,"seed":1847263}
+```
+
+`prompt` — `prompt_en` дословно (русский текст во входы не входит: в модель он не уходит). `negative`
+— текст карточки у моделей с `uses_negative` (Qwen), иначе `null`; `cfg`, `steps` по умолчанию и `lora`
+— из профиля карточки (`lora` у Krea 2 и Z-Image — `null`; сила в примере — заглушка, значение берётся
+из карточки). Профиль входит во входы, поэтому повтор по сиду воспроизводит и Lightning. `weights_sha256` — отпечаток
+весов §8.2 на момент плана (из `model_file_hash`); без готового отпечатка план партии не строится
+(409 `models_unchecked`, §19.4), так что входы никогда не дописываются при исполнении.
+
+**Payload задачи (ред. 3.1, Б3) — плоский, как в плане S2 (`plans.enqueue_image`).** Кадр шага 4 S2
+пишет ровно `{template, template_sha256, prompt, width, height, seed, steps, scene_id}` — без изменений.
+Партия режима «Картинка» (O30) пишет те же ключи в корень (`scene_id: null`) и дописывает:
+`cfg`, `negative`, `lora` (`null`, если нет), `profile`, `variant_id`, `batch_id`. **Отпечаток весов —
+не в payload, а колонка `task.weights_sha256`** (ред. 3.2, миграция 004): её пишут O30 (из плана) и O12 кадра
+S2 (с S2b — из инвентаря; если инвентарь ещё не проверен — NULL); у задач, поставленных до S2b, — NULL.
+`ImageKind.spec`: `values = {k: payload[k] for k in card.inputs if k != "task_id" and payload.get(k) is not None}`
+— задачи S2, уже стоящие в очереди, читаются так же, как раньше. Воркер перед отправкой сверяет
+`task.weights_sha256` с текущим отпечатком **только если поле не NULL** (иначе `failed` «веса изменились после
+постановки», как с `template_sha256`); NULL — поведение S2 без сверки.
+Версия движка (`engine_version`) во входы не входит, а пишется в `task.engine_version` перед отправкой
+(план S2–S3 R-S3-3): известна только к отправке.
+
+Каталог файлов: `<outdir>/studio/projects/<pid>/images/<task_id>/f_00001_.png`.
+
+### 19.4. Операции
+
+| # | Операция | Вход | Выход и правила |
+|---|---|---|---|
+| O1* | Список | — | + `kind`, `frame_format`, `preview_url` (последний отобранный вариант, иначе последний готовый; у видео — как было) |
+| O2* | Создать | `title, kind?: video\|image, frame_format?, idea_text?` | у `image`: создаёт `image_draft` (модель — первая установленная из `krea2-t2i, zimage-turbo-t2i, qwen-image-t2i`; размер — предустановка ≈1 МП ориентации `frame_format`, по умолчанию 16:9; `profile = profile_default` карточки (Qwen — `fast`); `count = variants_default`; `seed_mode='auto'`) |
+| O3* | Снимок | — | у `image`: `image{draft, lint, inventory_checked, batches[{id, ord, template, seed_mode, repeat_of_variant_id, variants[{id, ord, seed, inputs_sha256, repeatable{ok, reason}, task{status, progress, error, engine_version}, asset_url, kept}]}]}` (новые первыми, 20 партий; дальше — `?batches_before=<ord>`), `tasks`, `last_seq`; сцен нет |
+| O28 | Сценарист картинки | `mode`, `idea_text?`, `expected_edit_version` | `mode:"idea"` — из идеи: `prompt_ru` + `prompt_en` (§19.8); `mode:"translate"` — перевод текущего `prompt_ru` в `prompt_en` (мастер зовёт сам после паузы ввода ≈1,5 с, **только пока `prompt_en_state='stale'`**; при `owner` — 409 `translation_owner`, перезапись ручного английского — только кнопкой «Перевести заново» с подтверждением, `overwrite_owner: true`; после 409 `revision_conflict` мастер перечитывает черновик и повторяет, только если состояние всё ещё `stale`). LLM → в одной транзакции **после** ответа: сверка `edit_version` (иначе 409 `revision_conflict` с текущим черновиком — правка владельца, сделанная во время ожидания, не затирается, перевод перезапрашивается), запись полей, `prompt_en_state='fresh'`, `prompt_llm_json`, `edit_version+1`; ответ — черновик + `lint`. Предложенное соотношение сторон — подсказка в ответе (`suggested_aspect`), размер не меняется |
+| O29 | Правка черновика | `expected_edit_version` + любые из `idea_text, prompt_ru, prompt_en, template, profile, width, height, steps, seed_mode, seed, count` | `edit_version+1`, если что-то изменилось (как И1a); правка `prompt_ru` → `prompt_ru_version+1`, `prompt_en_state='stale'` (LI8); правка `prompt_en` → `prompt_en_state='owner'`; смена `template` ставит `profile` по умолчанию новой карточки, `profile` не из карточки — 400 `profile_unknown`. Хранит и недопустимое (размер вне карточки), находки — в ответе; блокирует только план. Смена модели **не** подгоняет размер молча: LI2 предлагает округление. Сид: целое, и **вся партия** в пределах: `S + count − 1 ≤ min(card.inputs.seed.max, 2^53−1)` (JS-безопасно; проверяется и при смене `count`), иначе 400 `seed_invalid` с наибольшим допустимым S |
+| O10* | План | `kind:"image_set"`, `repeat_variant_id?` | **из черновика**: N элементов, у каждого `seed`, `inputs`, `inputs_sha256`, `estimate_s`, `same_as?` (LI6); сиды: `auto` — `new_seed()` (как S2, `[1, 2^31−1]`), различные (И16); `manual` — S, S+1, …, S+N−1. **Инвентарь не проверен** (`installed=null` у модели, ред. 3.2): 409 `models_unchecked` «Проверяю модели, ≈1 мин» — без отпечатка весов план не строится (И14). **Повтор** (`repeat_variant_id`, ред. 3.1 Б1): черновик **не читается** — один элемент с сохранёнными `inputs_json` исходного варианта (промпт, профиль, LoRA, размер, сид). **Совместимость с текущей карточкой (ред. 3.2):** профиль варианта есть в карточке, `lora.name` варианта = LoRA этого профиля сейчас, размер/шаги/cfg в текущих пределах, файлы на месте; иначе 409 `repeat_incompatible` с причиной («профиль „Быстро“ теперь использует другую LoRA», «1328 больше не кратно …»). Если `template.sha256` или `weights_sha256` изменились (сравнение весов — только когда у исходной задачи поле не NULL) — элемент несёт текущие и `differs:["template"|"weights"|"engine"]`, мастер пишет «шаблон обновлён / веса изменились — картинка может отличаться». LI1–LI6, LI8 к повтору не применяются. План из черновика запоминает `draft_edit_version`, повтор — нет; `checkpoint_switches` по `switch_in_s` (§8.4) — **включая возврат к очереди рендера**, если в ней ждут задачи модели, которую партия вытеснит (§19.9); `lint` (LI*, LI8 блокирует); `blocked` — LI7. TTL 10 мин |
+| O30 | Партия по плану | `plan_id` + `Idempotency-Key` | одна транзакция (как И6): сверка плана (404/409 `plan_used`/`plan_expired` — как O12), у партии из черновика — `draft.edit_version = plan.draft_edit_version` (иначе 409 `plan_stale`), у повтора проверки черновика нет (`draft_edit_version = NULL`, `prompt_ru` — копия из партии исходного варианта), нет `error` (иначе 409 `plan_invalid`) → `image_batch` + N `image_variant` + N `task` (`kind='image'`, `priority=10`, `payload_json` — плоский, §19.3); события §19.5. Повтор ключа — тот же ответ (И5) |
+| O31 | «Годится» | `kept: bool` | `kept_at = now` / `NULL`; идемпотентно (повтор того же значения — 200 без события); только у варианта с `task.status='succeeded'` и `result_asset_id` (И17), иначе 409 `variant_not_ready`. Отобранных может быть несколько |
+| O32 | Модели картинок | — | `[{template, title, enabled, installed: true\|false\|null, reason, profiles[{id, title, installed, reason, estimate_s}], installed_checked_at, limits(§8.2), inputs.steps, switch_in_s}]`; `installed` — из инвентаря воркера (`SETTING comfy.inventory`, §19.9: файлы на диске против `model_files`, узлы — из последнего `object_info`), `null` — воркер ещё не проверял |
+
+Передача в видео — **существующие** операции, ничего нового: O8 на сцене видеопроекта
+(`source_frame{kind:"asset", asset_id}`, `mode:"from_frame"`, `expected_edit_version`; И1 растит ревизию,
+каскад И11 как при любом подключении кадра), O5 в видеопроекте (`assets:[{asset_id, role:"image"}]`,
+`expected_revision`). Мастер берёт список видеопроектов из O1 (`kind='video'`), сцены — из O3.
+
+### 19.5. События
+
+| Событие | Когда | `payload` |
+|---|---|---|
+| `image_draft_changed` | O28, O29 (только при изменении) | `{edit_version, fields:[…], origin}` |
+| `image_batch_queued` | O30 | `{batch_id, ord, template, repeat_of_variant_id, variants:[{variant_id, task_id, seed}]}` |
+| `task_queued`, `task_waiting`, `task_running`, `task_progress`, `task_succeeded`, `task_failed`, `task_cancelled` | как S2 | у `task_succeeded` вид задачи добавляет `{kind:"image", asset_id, variant_id}` |
+| `image_variant_kept` | O31 при изменении | `{variant_id, kept}` |
+| `inventory_checked` (ред. 3.2) | воркер закончил проход инвентаря и состояние изменилось (первый проход — всегда) | `{templates:{id:{installed, profiles}}, checked_at}` |
+
+### 19.6. Ошибки (формат §7)
+
+| HTTP / `code` | Когда |
+|---|---|
+| 409 `project_kind_mismatch` | операция сцен/кадра/рендера/сборки (O5, O7–O9, O10 `render`/`image`, O11, O12, O16–O20, O25, O26) над проектом `image` или O10 `image_set`, O28–O30 над проектом `video` (И18). O5 и O8 с `asset_id` варианта картинки в видеопроекте — разрешены |
+| 409 `revision_conflict` | O28/O29 с устаревшим `expected_edit_version`; `detail.current` — черновик |
+| 400 `seed_invalid` | сид не целое или вне `[0, min(card.seed.max, 2^53−1)]` |
+| 400 `template_unknown` | `template` не из списка шаблонов картинок |
+| 400 `profile_unknown` | `profile` не из `profiles` карточки выбранной модели |
+| 409 `frame_shape_mismatch` | O8: ресурс-кадр с соотношением, отличным от `frame_format` больше чем на 2 % (L7d, Б4); `detail: {width, height, frame_format}` |
+| 409 `translation_owner` | O28 `translate` при `prompt_en_state='owner'` без `overwrite_owner` |
+| 409 `models_unchecked` | O10 `image_set`, пока воркер не закончил первый проход инвентаря («Проверяю модели, ≈1 мин»); мастер повторяет запрос плана по событию `inventory_checked` |
+| 409 `repeat_incompatible` | O10 `repeat_variant_id`: сохранённые входы не проходят текущую карточку; `detail.reason` |
+| 400 `count_invalid` | `count` вне 1–8 |
+| 409 `plan_stale` | черновик изменён после O10 (`detail: {planned, current}`) |
+| 409 `plan_invalid` | в плане есть `error` линта или `blocked` |
+| 409 `variant_not_ready` | O31 у варианта без готовой картинки |
+| 404 `variant_not_found` | O31, O10 `repeat_variant_id` чужого проекта или несуществующий |
+| задача `failed` «модель … не установлена на alex-neuro» | `Probe.missing` непуст (§8.1); без ожидания 600 с |
+
+### 19.7. Инварианты (каждый — тест точным равенством, каждый показан красным)
+
+| # | Инвариант | Где держится |
+|---|---|---|
+| И13 | **Сид всегда записан.** У каждого варианта `seed NOT NULL` записан в той же транзакции, что задача (O30), до постановки; `task.payload_json.seed` (плоский payload, §19.3) = `image_variant.seed` = `inputs_json.seed` = сид в графе, ушедшем в ComfyUI (журнал имитации; в живом контракте — `/history`). Авто-сид порождает план, не воркер и не движок: ни одна задача не уходит с сидом по умолчанию графа | `plans.plan_image_set`, `images.enqueue_batch`; контракт |
+| И14 | **Входы варианта неизменяемы.** `inputs_json`, `inputs_sha256`, `seed`, `task_id` пишутся один раз при вставке; любое `UPDATE` этих полей — `RAISE(ABORT)` триггером; `inputs_sha256 = sha256(canonical(inputs_json))`; `inputs_json.prompt` = `prompt_en` черновика на момент плана — у партии из черновика; у повтора `inputs_json` — побайтная копия входов исходного варианта (с текущими `template`/`weights_sha256`, если они изменились, И15); `prompt_ru` в граф не попадает никогда | миграция 004 |
+| И15 | **Повтор по сиду.** План `repeat_variant_id=v` даёт элемент с `inputs_json` побайтно равным входам `v` (тот же `inputs_sha256`), пока не изменились `template.sha256` и `weights_sha256` (отпечаток весов и LoRA, §8.2); граф, ушедший в ComfyUI, равен графу `v`, кроме полей, привязанных к задаче (`filename_prefix`, `client_id`, `extra_data.studio_task_id`). Равенство декодированных пикселей обещается **только в проверенном окружении**: модель с `seed_reproducible=true`, тот же `weights_sha256` (оба не NULL), та же машина и та же `task.engine_version` — с ред. 3.2 это строка `ComfyUI <comfyui_version> · torch <pytorch_version> · <devices[0].name>` из `/system_stats` (окружение, в котором IMG-22 видел разницу 0 у Krea 2, Z-Image и Qwen-Image). Проверяется живым контрактом, а не утверждается кодом. Вне этих условий система **говорит** `differs:["weights"|"engine"|"template"]` и равенства не обещает | `plans`, контракт §12.2 |
+| И16 | **Сиды партии различны**: `UNIQUE (batch_id, seed)`; авто — перегенерация при совпадении внутри плана; ручной — S+k | миграция 004, `plans` |
+| И17 | **«Годится» только у готового**: O31 `kept=true` требует `task.status='succeeded'` и `result_asset_id`; отбор не меняет входов и ресурса | `images.keep` |
+| И18 | **Виды проекта изолированы**: операции §19.6 `project_kind_mismatch` отказывают в своей проверке до любой записи; ни одной сцены у проекта `image`, ни одного `image_draft` у проекта `video` | `ops`, тест по каждой операции |
+
+### 19.8. «Сценарист картинки» (`studio/director/image_prompt.py`)
+
+Ред. 3.1 (Б5): через **существующий** `Llm` студии — `ProviderLlm.json_turn(messages, schema,
+retry_reminder)` (`h3_48gb/studio/llm.py:149`, как сценарист сцен S1) со схемами
+`STUDIO_IMAGE_PROMPT_SCHEMA` / `STUDIO_IMAGE_TRANSLATE_SCHEMA` и локальной `validate_reply` (`:26`); GPU-замок
+Мака — внутри обёртки. Ошибка наружу (ответ API, событие, мастер, MCP) — только текст из
+`SAFE_PROVIDER_MESSAGES` (`:72`); сырой ответ модели — только в `image_draft.prompt_llm_json`. `provider.chat`
+(`provider.py:937`) не используется: его схема жёстко своя. Системные промпты —
+`studio/director/prompts/image_prompt.md`, `image_translate.md` (версия — в `prompt_llm_json`).
+Язык (решение владельца §17.1 п.11 в): **владелец читает и правит русский, в модель уходит английский
+перевод от «Сценариста»**, он виден и правится. Две схемы, один модуль:
+- `mode:"idea"` — вход: идея, выбранная модель и её `text_render` из карточки, текущее соотношение
+  сторон. Выход LLM: `prompt_ru` (развёрнутое описание кадра по-русски: объект, действие, окружение,
+  свет, камера/объектив, фактура — словами устройства и сюжетной съёмки, а не «плёнка/зерно» — память
+  «словарь реализма H3»), `prompt_en` (перевод того же текста, не пересказ), `inscriptions[{text, lang}]`
+  (надписи дословно, на языке идеи), `suggested_aspect`.
+- `mode:"translate"` — вход: `prompt_ru` и прежний `prompt_en` (чтобы перевод менял только изменённые
+  места, а не переписывал всё); выход: `prompt_en`, `inscriptions`.
+- **Эталон надписей — из текста владельца, а не из ответа LLM** (ред. 3.1, №10): код извлекает надписи
+  из `idea_text` (режим `idea`) или `prompt_ru` (`translate`) — содержимое **внешней** пары кавычек
+  `«…»`, `„…“`, `“…”`, `"…"`; кавычки внутри (пример §19.1 `„Клуб «Заря»“` → `Клуб «Заря»`) — часть надписи.
+  Список `inscriptions` от LLM для проверки не используется. Текст внутри кавычек — данные, не
+  инструкции (промпт перевода это требует, тест — надпись «ignore previous instructions» переходит
+  дословно).
+- **Код, а не LLM**: проверяет, что каждая эталонная надпись стоит в обоих текстах дословно в кавычках и **не
+  переведена** (кириллическая надпись остаётся кириллицей в `prompt_en`, иначе дописывает
+  `with the text "<надпись>"`); соотношение сторон не применяет; находки LI1/LI3/LI8 считает линтер.
+- Перевод, пришедший к уже изменённому `prompt_ru` (номер `prompt_ru_version` разошёлся), не пишется —
+  409, мастер перезапрашивает; так английский всегда соответствует русскому, который владелец видит.
+- CAILA недоступна → 502 `llm_unavailable` (как O25); путь от LLM не зависит: английский промпт
+  пишется руками в поле «В модель уйдёт» (O29, `prompt_en_state='owner'`).
+
+### 19.9. Исполнение
+
+- Вид задачи — существующий `image` (план S2–S3 задача 8): `ImageKind.spec` берёт из **плоского**
+  payload ключи `card.inputs`, которые есть и не `null` (§19.3), `dest_dir` — `projects/<pid>/images/<task_id>/`
+  (у кадра S2 — прежний `keyframes/`); проверка результата та же: один PNG ровно запрошенного размера,
+  иначе `failed` (`VerifyError`); `estimate_sample` пишется по `(executor, template, profile, machine, w, h,
+  0, steps)`, оценка до истории — `estimate_s` профиля (№13).
+- **Инвентарь моделей (ред. 3.1, №11; ред. 3.2)** — без движка: воркер при старте **в фоновом потоке** (не задерживая задачи) и затем каждые 60 с проходит файлы
+  `model_files` всех шаблонов картинок по каталогу моделей (только чтение), сверяет размер+mtime, при
+  изменении пересчитывает sha256 (`model_file_hash`), пишет `SETTING comfy.inventory`
+  (`{template: {installed, profiles: {…}, reason}, checked_at}`). Узлы (`class_types` шаблона и профиля) —
+  из `object_info` при каждом `probe` движка, там же `missing` (§8.1). До конца первого прохода (первый полный sha256 30 ГБ весов —
+  порядка минуты, дальше — только stat) `installed=null`: LI7 info, O2 берёт первый шаблон списка, O10
+  `image_set` — 409 `models_unchecked`; по окончании — событие `inventory_checked`. Устаревшее `false` по
+  файлам исправляется само в течение минуты после установки модели; по узлам — первым же probe (LI7 по
+  узлам — warning, не блокирует).
+- Порядок — `queue_order` §8.4 (ред. 3.1, №7): картинки `priority=10`, строго FIFO по партиям, варианты
+  партии подряд; модель, загруженная сейчас, порядок картинок не меняет (порядок на экране = порядок
+  нажатий). Тот же `queue_order` даёт план O10 для расчёта смен — числа плана и фактический порядок
+  совпадают (тест: план и журнал воркера на одной очереди).
+- **Вытеснение.** На карте 63,4 ГиБ Qwen (≈48 ГиБ) и H3 (≈51,4 ГиБ) вместе не держатся; ComfyUI сам выгружает
+  одну, загружая другую (§8.2). Поэтому цена смены считается по фактической последовательности задач,
+  включая очередь рендера: партия Qwen, вставшая перед ждущим рендером, получает в плане две строки —
+  «загрузка Qwen +19 с» («Полное» +26) и «возврат H3 для очереди рендера ≈+38 с» (ставка, §15.4 п.20). Мастер показывает обе в
+  кнопке («≈ 11 с + смены 57 с»), чтобы владелец видел, что картинка задержит ролик. Krea 2 и Z-Image
+  тоже вытесняют H3 (пик H3 + Krea выше карты), их цена — та же формула со своим `switch_in_s`.
+- `POST /free` между моделями не шлётся: в цепочке Qwen → Z → Krea → H3 → Qwen OOM не было, худший пик
+  52,7 ГиБ, `/free` время не меняет (IMG-22). Флаг карточки `free_before_switch` есть в договоре на
+  будущие модели, у трёх нынешних — `false`.
+
+### 19.10. Последовательность
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant B as Мастер — режим «Картинка»
+  participant O as studio/ops.py
+  participant S as director/image_prompt (+provider)
+  participant DB as studio.sqlite
+  participant W as studio/worker.py
+  participant C as ComfyUI comfy-studio :8189
+
+  B->>O: O2 kind=image «Афиша»
+  O->>DB: project(kind=image) + image_draft(Krea 2, 1344×768, auto, 4)
+  B->>O: O28 идея (expected_edit_version=0)
+  O->>S: mode=idea, идея + text_render модели
+  S-->>O: prompt_ru + prompt_en + inscriptions
+  O->>DB: draft: prompt_ru, prompt_en (fresh), edit_version=1
+  B->>O: O29 правка prompt_ru (edit_version=1)
+  O->>DB: prompt_en_state=stale, LI8
+  B->>O: O28 mode=translate (edit_version=2)
+  S-->>O: prompt_en, надпись осталась кириллицей
+  O->>DB: prompt_en fresh, edit_version=3
+  B->>O: O29 модель Z-Image (edit_version=3)
+  O-->>B: lint: LI1 warning «Z-Image не пишет кириллицу»
+  B->>O: O29 модель Krea 2 (edit_version=4)
+  B->>O: O10 image_set (заранее, при правке)
+  O-->>B: план: 4 сида, ≈ 22 с + смена 17 с
+  B->>O: O30 plan_id (ключ)
+  O->>DB: batch №1 + 4 variant(seed) + 4 task(image, priority 10), одна транзакция
+  W->>C: krea2-t2i, seed=s1 … s4, client_id=task_id
+  C-->>W: WS progress, png
+  W->>DB: asset, task succeeded, event {variant_id, asset_id}
+  B->>O: O31 keep(v3)
+  B->>O: O10 repeat_variant_id=v3 → O30
+  W->>C: тот же граф, seed=s3
+  W->>DB: asset' (пиксели = v3: И15)
+  B->>O: O8 сцена 1 видеопроекта: source_frame{asset, v3.asset_id}
+  O->>DB: scene.revision+1, каскад И11
+```
+
+### 19.11. Тесты и мутации S2b
+
+На имитациях (`FakeComfyStudio` плана S2–S3 + шаблоны картинок): PNG имитации детерминирован по
+`(template, prompt, negative, lora.name, lora.strength, weights_sha256, seed, steps, cfg, width, height)` и несёт эти значения в метаданных, поэтому смена
+любого входа меняет пиксели. Сравнение повтора — **по декодированным пикселям**, не по sha256 файла.
+Контракт шаблона — граф литералами теста (узлы, связи `positive ← 4`, `latent ← 6`, `model ← 7 ← 1` у
+Z-Image, сид, шаги, cfg, shift, размер, `filename_prefix`), а не сравнение с `build_payload` (урок
+блокера ред. 3 плана S2–S3).
+
+Мутации, которые тесты обязаны ловить (каждая показана красной в отчёте среза, с текстом ошибки):
+1. повтор генерирует новый сид вместо сида варианта; 2. авто-сид не передаётся — в граф уходит сид
+по умолчанию шаблона; 3. партия одной задачей с `batch_size=N`; 4. снять триггер И14; 5. поменять
+местами `width`/`height` при подстановке; 6. инвертировать условие LI1 (кириллица у Krea даёт warning,
+у Z-Image — нет); 7. LI2 пропускает сторону, равную `side_max + sides_multiple_of`, или не проверяет
+`max_pixels`; 8. O30 не сверяет `draft_edit_version`; 9. O31 отбирает вариант с `failed`-задачей; 10.
+O28 над видеопроектом проходит; 11. шаблон варианта берётся из текущего черновика, а не из плана;
+12. в граф уходит `prompt_ru` вместо `prompt_en`; 13. правка `prompt_ru` не делает перевод `stale`
+(LI8 молчит, план проходит со старым английским); 14а. повтор «Быстро» уходит без LoRA при тех же
+4 шагах и cfg 1 (изолированная ошибка LoRA); 14б. сила LoRA подменена (1,0 → 0,8); 15. `negative`
+карточки не подставляется у Qwen; 16. `lora: null` вставляет узел LoRA с пустым именем (Б2); 17. повтор
+читает текущий черновик вместо входов варианта (Б1); 18. `weights_sha256` не сверяется перед отправкой —
+задача уходит с подменёнными весами (Б6); 19. O8 подключает кадр 1:1 к проекту 16:9 (Б4); 20. автоперевод
+затирает `prompt_en_state='owner'` (№8); 21. ручной сид S = 2^53−2 при `count=4` принят (№9); 22. повтор с `lora.name`, которого больше нет
+в профиле карточки, проходит план (НБ4); 23. O10 `image_set` при `installed=null` строит план с пустым
+отпечатком (НБ3); 24. сверка весов падает на задаче S2 с `weights_sha256 = NULL` (НБ2); 25. O8 с кадром 1:1
+пишет сцену и только потом выдаёт находку (отказ после `UPDATE`).
+
+Сквозной тест (`tests/test_studio_image_path.py`): O2 image → O28 (ScriptedLlm) → O29 → O10 → O30 →
+воркер → O31 → O10 repeat → O30 → воркер → пиксели равны → O2 video → O7 одна сцена → O8 с `asset_id`
+варианта → O3 видеопроекта показывает кадр; события по видам и порядку — точным списком.

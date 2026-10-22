@@ -265,8 +265,14 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
                                   scenes=[s.model_dump() for s in body.scenes],
                                   deleted=[d.model_dump() for d in body.deleted])
 
+    def scene_exists(scene_id: str, conn=Depends(get_conn)) -> str:
+        # Like project_exists: a missing scene answers 404 before the body is validated.
+        ops.require_scene(conn, scene_id)
+        return scene_id
+
     @app.patch(f"{api}/scenes/{{scene_id}}")
-    def patch_scene(scene_id: str, body: schemas.ScenePatch, conn=Depends(get_conn)):
+    def patch_scene(body: schemas.ScenePatch, scene_id: str = Depends(scene_exists),
+                    conn=Depends(get_conn)):
         changes = body.model_dump(exclude={"expected_edit_version"}, exclude_none=True)
         return ops.update_scene(conn, scene_id, expected_edit_version=body.expected_edit_version,
                                 changes=changes)
@@ -275,6 +281,19 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
     def lint_project(body: schemas.LintRequest, project_id: str = Depends(project_exists),
                      conn=Depends(get_conn)):
         return {"findings": ops.lint_project(conn, project_id, body.scene_ids)}
+
+    @app.post(f"{api}/projects/{{project_id}}/director/propose")
+    def propose(body: schemas.ProposeRequest, project_id: str = Depends(project_exists),
+                conn=Depends(get_conn)):
+        return ops.propose_scenes(conn, project_id, llm=llm, idea_text=body.idea_text,
+                                  scenes_count=body.scenes_count)
+
+    @app.post(f"{api}/projects/{{project_id}}/director/apply")
+    def apply(body: schemas.ApplyRequest, project_id: str = Depends(project_exists),
+              conn=Depends(get_conn)):
+        return ops.apply_proposal(conn, project_id, proposal_id=body.proposal_id,
+                                  expected_revision=body.expected_revision,
+                                  deleted=[d.model_dump() for d in body.deleted])
 
     @app.get(f"{api}/events")
     async def stream_events(request: Request, after: int = 0,

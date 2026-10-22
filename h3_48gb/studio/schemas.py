@@ -27,7 +27,8 @@ class ProjectPatch(_Body):
 
 # --- slice S1 ---------------------------------------------------------------------------------
 
-Tag = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
+TAG_PATTERN = r"^[a-z][a-z0-9_-]{0,31}$"
+Tag = Field(pattern=TAG_PATTERN)
 
 
 class CastAssetIn(_Body):
@@ -115,3 +116,15 @@ class ScenePatch(_Body):
 
 class LintRequest(_Body):
     scene_ids: list[str] | None = None
+
+
+class ProposeRequest(_Body):
+    idea_text: str = Field(min_length=1, max_length=20000)
+    scenes_count: int = Field(default=2, ge=1)
+
+
+class ApplyRequest(_Body):
+    proposal_id: str
+    expected_revision: int
+    # every scene the proposal replaces, at the edit_version the tab read (O26 deletes them all)
+    deleted: list[DeletedScene] = Field(default_factory=list)

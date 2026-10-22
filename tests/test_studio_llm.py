@@ -51,6 +51,8 @@ def test_provider_llm_talks_to_the_active_provider(tmp_path):
         llm = ProviderLlm(home, tmp_path / "gpu-mac.lock")
         assert llm.json_turn([{"role": "user", "content": "q"}], SCHEMA, "r") == {"x": "да"}
         assert llm.label == "f:m"
+        # the door hands the caller's schema to the wire, not an empty or a default one
+        assert fake.requests[0]["body"]["response_format"] == {"type": "json_schema", "json_schema": SCHEMA}
     finally:
         fake.close()
 
