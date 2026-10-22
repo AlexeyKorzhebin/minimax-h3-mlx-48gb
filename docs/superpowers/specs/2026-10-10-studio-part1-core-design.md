@@ -1,7 +1,7 @@
 # Студия, часть 1: ядро, исполнитель ComfyUI, минимальный мастер, сценарист — спека
 
 Дата: 2026-10-10, редакция 2 — 2026-10-20, редакция 3 — 2026-10-22 (режим «Картинка», §19),
-редакция 3.1 — 2026-10-23 (ревью Codex ред. 3), **редакция 3.2 — 2026-10-23** (сверка Codex ред. 3.1).
+редакция 3.1 — 2026-10-23 (ревью Codex ред. 3), редакция 3.2 — 2026-10-23 (сверка Codex ред. 3.1), **редакция 3.3 — 2026-10-23** (по ревью реализации S0–S1).
 Статус: **спека на проверку не автором** (CLAUDE.md: план против спеки проверяет тот, кто его не
 писал). Код S0–S1 в работе, S2–S3 — план. Автор редакции 1: Claude Fable 5.1; редакций 2 и 3: Claude
 Opus 5.5 по заданию владельца (`BRIEF-spec-part1-rev2.md`; ред. 3 — решения владельца 22.10, §17.1 п.10).
@@ -26,6 +26,16 @@ Opus 5.5 по заданию владельца (`BRIEF-spec-part1-rev2.md`; р�
 ---
 
 ## 0. Журнал редакций
+
+### Редакция 3.3 (23.10): по финальному ревью реализации S0–S1
+
+Спека приведена к коду S0–S1 (решения координатора 23.10).
+
+| # | Изменение | Почему | Где |
+|---|---|---|---|
+| Р3.3-1 | `scene.source_auto INTEGER NOT NULL DEFAULT 0` (миграция 002 `scene_source_auto`): `prev_last_frame` без `scene_id` на входе — **авто-источник** (предыдущая живая сцена), пересчитывается при перестановке и удалении; с `scene_id` — явный, закреплён. Ответ сцены в O3/O7/O8 несёт `source_frame.auto: bool` и `duration_s`; `auto` на входе запрещён (400 `args_invalid`), мастер шлёт авто-источник без `scene_id` | «+ Сцена» и перестановка не должны оставлять продолжение привязанным к чужой сцене; так сделано в S1 (задача 10) | §6, §7 |
+| Р3.3-2 | Сцена 1 без героя: если модель вернула пустой `cast_tags` у сцены 1, код ставит в неё героев кастинга с фото; названный моделью состав остаётся; состав остальных сцен решает модель | живая проба 23.10: 1 из 5 ответов без героя в сцене 1 | §9.1 |
+| Р3.3-3 | O25: отказ по схеме, NaN или модели `SceneIn` → 502 `llm_failed` с `detail.path`, в базе ни `proposal`, ни события; `requested_s` зажимается кодом в [3, 15] (в схеме ответа модели min/max нет) | так сделано в S1; строгие min/max в схеме давали отказ провайдера, а не исправимое значение | §7, §9.1 |
 
 ### Редакция 3.2 (23.10): сверка Codex ред. 3.1
 
@@ -480,6 +490,7 @@ erDiagram
     int frames "17n+5 в [73,345]"
     int seed
     text source_frame_kind "none|prev_last_frame|asset"
+    int source_auto "0|1, миграция 002: авто-источник prev_last_frame"
     text source_scene_id FK
     text source_frame_asset_id FK
     text approved_sketch_take_id FK
@@ -708,12 +719,12 @@ bindings_json, requires_json, verified_on) — как в редакции 1. `re
 |---|---|---|---|---|
 | O1 | Список проектов | `GET /projects` | — | `[{id,title,revision,scenes_done/total}]` |
 | O2 | Создать проект | `POST /projects` | `title, frame_format, idea_text?` | проект (201) |
-| O3 | Снимок | `GET /projects/{id}` | — | проект + сцены (с `revision`, `state_version`, действительностью одобрений, конфликтами цепочки) + кастинг + дубли + задачи + `last_seq` |
+| O3 | Снимок | `GET /projects/{id}` | — | проект + сцены (с `revision`, `state_version`, `source_frame{kind, scene_id, asset_id, auto}`, `duration_s` (ред. 3.3), действительностью одобрений, конфликтами цепочки) + кастинг + дубли + задачи + `last_seq` |
 | O4 | Изменить проект | `PATCH /projects/{id}` | `expected_revision, title?` (`frame_format` после первого done-дубля — 409 `format_locked`) | проект |
 | O5 | Кастинг | `POST /projects/{id}/cast` | `tag, description_ru, assets[{asset_id, role}], expected_revision` | cast_member с `description_en` |
 | O6 | Импорт ресурса | `POST /assets` (multipart) | файл, `kind?` | asset |
-| O7 | Заменить набор сцен | `PUT /projects/{id}/scenes` | `expected_revision, scenes[{scene_id?, expected_edit_version? (обязателен при scene_id), mode, action_text, performance_text, sound_text, music_text?, requested_s, seed?, source_frame{kind, scene_id?, asset_id?}, refs[tag]}], deleted[{scene_id, expected_edit_version}]` — порядок массива задаёт `idx`; каждая живая сцена — либо в `scenes`, либо в `deleted` | сцены + `diff{added, unchanged, changed, moved, deleted}` |
-| O8 | Изменить сцену | `PATCH /scenes/{id}` | `expected_edit_version` + поля (в т.ч. `source_frame{kind:"asset", asset_id}` — подключение кадра) | сцена + `cascade[scene_id]` |
+| O7 | Заменить набор сцен | `PUT /projects/{id}/scenes` | `expected_revision, scenes[{scene_id?, expected_edit_version? (обязателен при scene_id), mode, action_text, performance_text, sound_text, music_text?, requested_s, seed?, source_frame{kind, scene_id?, asset_id?}, refs[tag]}], deleted[{scene_id, expected_edit_version}]` — порядок массива задаёт `idx`; каждая живая сцена — либо в `scenes`, либо в `deleted` | сцены (с `source_frame.auto`, `duration_s`) + `diff{added, unchanged, changed, moved, deleted}`. Ред. 3.3: `source_frame{kind:"prev_last_frame"}` без `scene_id` — авто-источник (`source_auto=1`, предыдущая живая сцена по `idx`, пересчитывается при перестановке/удалении в той же транзакции, И1 при смене источника); с `scene_id` — явный, закреплён; поле `auto` на входе — 400 `args_invalid` |
+| O8 | Изменить сцену | `PATCH /scenes/{id}` | `expected_edit_version` + поля (в т.ч. `source_frame{kind:"asset", asset_id}` — подключение кадра; `prev_last_frame` без `scene_id` — авто-источник, как в O7; `auto` на входе — 400) | сцена (с `source_frame.auto`, `duration_s`) + `cascade[scene_id]` |
 | O9 | Линт | `POST /projects/{id}/lint` | `scene_ids?` | находки по сценам |
 | O10 | План (сухой) | `POST /projects/{id}/plan` | `kind: render\|image, scene_ids, tier` или `prompt, size` для image | `plan_id, items[{scene_id, template, depends_on_scene?, estimate_s}], total_s, checkpoint_switches, lint, blocked[]` (TTL 10 мин) |
 | O11 | Рендер по плану | `POST /projects/{id}/render` + ключ | `plan_id` | `tasks[{task_id, take_id, scene_id, status}]` — дубли продолжений в `pending_input` |
@@ -730,7 +741,7 @@ bindings_json, requires_json, verified_on) — как в редакции 1. `re
 | O22 | Исполнители | `GET /executors` | — | `[{name, address, alive, ready, capabilities, detail}]` |
 | O23 | GPU | `GET /gpu`; `POST /gpu/release`; `POST /gpu/qwen/unload` | — | состояние диспетчера; выгрузка Qwen — через ручку диспетчера `/qwen/unload` (`dispatcher.py:590`) |
 | O24 | Импорт ai-writer (S7) | `POST /projects/{id}/import/ai-writer` + ключ | `clip_id` или файл `.h3.json`, `expected_revision` | как O7 + asset(kind=scenario) |
-| O25 | Сценарист: предложить | `POST /projects/{id}/director/propose` | `idea_text, scenes_count=2` | `proposal_id, scenes[]` — сохраняется в `proposal`, не применяется |
+| O25 | Сценарист: предложить | `POST /projects/{id}/director/propose` | `idea_text, scenes_count=2` | `proposal_id, scenes[]` — сохраняется в `proposal`, не применяется. Ред. 3.3: ответ модели не прошёл схему, содержит NaN или не собирается в `SceneIn` → 502 `llm_failed` с `detail.path` (где сломано), в базе ни `proposal`, ни события; `requested_s` зажимается кодом в [3, 15] (в схеме ответа модели min/max нет) |
 | O26 | Применить предложение | `POST /projects/{id}/director/apply` | `proposal_id, expected_revision, deleted[{scene_id, expected_edit_version}]` — весь заменяемый набор с прочитанными версиями | как O7 |
 | O27 | Разрешить `submit_unknown` | `POST /tasks/{id}/resolve` | `action: resubmit\|cancel` | task |
 | O28 | Сценарист картинки: промпт и перевод | `POST /projects/{id}/image/propose` | `mode: idea\|translate, idea_text?, expected_edit_version` | черновик + `lint` (§19.4) |
@@ -1056,7 +1067,10 @@ project», схема `provider.PROMPT_SCHEMA` `:32`, ветка `project.scenes
   `music`, `state_in`, `state_out`, `cast_tags`, `requested_s` в пределах 3–15;
 - **код считает арифметику**: число сцен, снап длительности (§6.2), режимы по правилу CJM этап 4 —
   первая сцена с героем → `refs` (или `from_frame`, если владелец сделает кадр), каждая следующая →
-  `from_frame` с `prev_last_frame`; дословная `portrait_phrase` вклеивается кодом, не LLM;
+  `from_frame` с `prev_last_frame` (авто-источник, ред. 3.3). **Ред. 3.3:** если модель вернула пустой
+  `cast_tags` у сцены 1, код ставит в неё героев кастинга с фото (живая проба 23.10: 1 из 5 ответов без
+  героя); если модель кого-то назвала — её выбор остаётся; состав остальных сцен решает модель;
+  `requested_s` вне [3, 15] код зажимает, а не отвергает; дословная `portrait_phrase` вклеивается кодом, не LLM;
 - системный промпт — `studio/director/prompts/scenarist.md`, версия пишется в `proposal.llm_json`;
 - результат — `proposal` (переживает рестарт API), применяется O26 через тот же путь, что O7.
 
