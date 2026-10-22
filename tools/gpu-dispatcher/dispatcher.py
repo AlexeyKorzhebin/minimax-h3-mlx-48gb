@@ -36,6 +36,8 @@ MODELS = Path(os.environ.get("ALEX_MODELS_ROOT", "/home/alex/Models"))
 OUTPUTS = Path(os.environ.get("ALEX_OUTPUTS_ROOT", "/home/alex/Outputs"))
 H3_BENCH = PROJECTS / "h3-bench"
 COMFY = PROJECTS / "comfy"
+#: The studio's own ComfyUI (studio spec §4.3, §8.4): v0.42 with H3 and Krea 2, port 8189.
+COMFY_H3 = PROJECTS / "comfy-h3"
 QWEN_SH = PROJECTS / "qwen" / "qwen.sh"
 GENERATION_LOCK = PROJECTS / "qwen-image21-lab" / "generation.lock"
 SERVER_OUTPUTS = OUTPUTS / "h3-bench" / "server-outputs"
@@ -81,6 +83,16 @@ def engine_specs() -> dict[str, EngineSpec]:
             cwd=COMFY / "ComfyUI", ready_url="http://127.0.0.1:8188/system_stats", port=8188,
             markers=("main.py", "--port 8188"), log_dir=COMFY / "logs", log_prefix="comfy-panel",
             start_timeout=600.0, label="ComfyUI"),
+        # Studio spec §8.4: the command gpu_day21_srv.sh started it with on 21.10 (h3-bench
+        # ae4df6a). Its own port, so the "foreign on the port" check in acquire() only fires on a
+        # real stranger, and the markers never match the panel's ComfyUI on 8188.
+        "comfy-studio": EngineSpec(
+            name="comfy-studio",
+            cmd=(str(COMFY_H3 / ".venv/bin/python"), "main.py", "--port", "8189",
+                 "--output-directory", str(OUTPUTS / "comfy-h3"), "--listen", "127.0.0.1"),
+            cwd=COMFY_H3, ready_url="http://127.0.0.1:8189/system_stats", port=8189,
+            markers=("main.py", "--port 8189"), log_dir=COMFY_H3 / "logs",
+            log_prefix="comfy-studio", start_timeout=600.0, label="ComfyUI студии"),
     }
 
 
@@ -583,7 +595,8 @@ def make_server(dispatcher: Dispatcher, host: str = "127.0.0.1", port: int = 879
                 engine = body.get("engine")
                 if engine not in dispatcher.specs:
                     return self._send(400, {"ok": False, "error": {
-                        "code": "unknown_engine", "message": f"движок {engine!r}: h3 или ltx"}})
+                        "code": "unknown_engine",
+                        "message": f"движок {engine!r}: {', '.join(sorted(dispatcher.specs))}"}})
                 return self._send(200, dispatcher.acquire(engine, client))
             if self.path == "/release":
                 return self._send(200, dispatcher.release(client, body.get("all") is True))

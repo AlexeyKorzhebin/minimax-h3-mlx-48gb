@@ -16,8 +16,14 @@
 поэтому замок живёт, пока жив движок, даже при перезапуске диспетчера.
 
 ## Ручки
-`GET /status`, `POST /acquire {"engine": "h3"|"ltx"}`, `POST /release`, `POST /qwen/unload`,
-`POST /qwen/restore`.
+`GET /status`, `POST /acquire {"engine": "h3"|"ltx"|"comfy-studio", "client": "…"}`,
+`POST /release`, `POST /qwen/unload`, `POST /qwen/restore`.
+
+## comfy-studio (студия, спека студии §8.4)
+ComfyUI студии: `~/Projects/comfy-h3` (v0.42, H3 и Krea 2), порт 8189, вывод
+`/home/alex/Outputs/comfy-h3`, лог `~/Projects/comfy-h3/logs/comfy-studio-*.log`. Клиент — `studio-worker`.
+Диспетчер держит на карте один движок: пока ComfyUI панели (`ltx`) или H3 занят клиентом
+`panel-worker`, студия ждёт (`wait`, «карту держит … клиента panel-worker»), и наоборот.
 
 ## Установка
     sudo cp h3-gpu-dispatcher.service /etc/systemd/system/ && sudo systemctl daemon-reload \
