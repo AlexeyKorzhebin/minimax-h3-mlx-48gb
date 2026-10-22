@@ -174,6 +174,16 @@ def test_the_opening_scene_with_an_empty_cast_list_shows_the_pictured_cast(tmp_p
     assert (s2["mode"], s2["refs"]) == ("from_frame", ["anna"])
 
 
+def test_a_later_scene_with_an_empty_cast_list_stays_empty(tmp_path, seeds):
+    llm = ScriptedLlm([{"scenes": [_llm_scene(1), _llm_scene(2, tags=())]}])
+    client = make_client(tmp_path, llm=llm)
+    pid = _project_with_hero(client)
+    _, s2 = client.post(f"/api/studio/projects/{pid}/director/propose",
+                        json={"idea_text": "x", "scenes_count": 2}).json()["scenes"]
+    assert (s2["mode"], s2["refs"], s2["action_text"]) == (
+        "from_frame", [], "She walks to the lake, shot 2.")
+
+
 def test_wrong_number_of_scenes_is_502_and_no_proposal(tmp_path, seeds):
     client = make_client(tmp_path, llm=ScriptedLlm([{"scenes": [_llm_scene(1)]}]))
     pid = _project_with_hero(client)

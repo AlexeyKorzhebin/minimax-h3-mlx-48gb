@@ -352,6 +352,26 @@ describe("ScenarioStep", () => {
     expect(screen.getAllByRole("button", { name: "Убрать" })).toHaveLength(1);
   });
 
+  it("final M1b: when «Применить» fails, a scene that later vanishes elsewhere is reported as deleted in another window", async () => {
+    stubFetch({
+      ...LINT_EMPTY,
+      "POST /api/studio/projects/p_1/director/propose": {
+        body: { proposal_id: "r_1", scenes: [PROPOSED], durations: [{ frames: 192, duration_s: 8 }], dropped_tags: [] },
+      },
+      "POST /api/studio/projects/p_1/director/apply": ERR(500, "internal", "Сбой"),
+    });
+    const onChanged = vi.fn();
+    const { rerender } = render(<ScenarioStep snap={snapshot({ scenes: [scene({ id: "s_1", idx: 0 })], last_seq: 5 })} onChanged={onChanged} />);
+    await userEvent.type(within(screen.getByRole("article", { name: "Сцена 1" })).getByLabelText(/Музыка/), "!");
+    await userEvent.click(screen.getByRole("button", { name: "Предложить сцены" }));
+    const region = await screen.findByRole("region", { name: "Предложение сценариста" });
+    await userEvent.click(within(region).getByRole("button", { name: "Применить" }));
+    await screen.findByRole("alert");
+    rerender(<ScenarioStep snap={snapshot({ scenes: [], last_seq: 6 })} onChanged={onChanged} />);
+    expect(screen.getAllByRole("status").map((n) => n.textContent)).toEqual([
+      "Сцену удалили в другом окне. Ваш черновик сохранён здесь — верните его как новую сцену или уберите."]);
+  });
+
   it("r1 №1: «Убрать» drops the orphan card; a clean card of a deleted scene just disappears", async () => {
     stubFetch({ ...LINT_EMPTY });
     const [one, two, three] = [scene({ id: "s_1", idx: 0 }), scene({ id: "s_2", idx: 1 }), scene({ id: "s_3", idx: 2 })];
