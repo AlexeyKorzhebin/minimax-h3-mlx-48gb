@@ -504,3 +504,17 @@ def test_a_scene_and_a_free_prompt_are_refused_by_the_schema_and_by_the_plan(rig
     with pytest.raises(StudioError) as caught:
         plans.plan_image(rig.conn, p["id"], scene_id=s1["id"], prompt="x", width=None, height=None)
     assert (caught.value.status, caught.value.code) == (400, "args_invalid")
+
+
+def test_the_executors_cache_follows_the_settings(rig, tmp_path):
+    [first] = rig.client.get("/api/studio/executors").json()
+    assert first["address"] == rig.comfy.url
+    other = FakeComfyStudio(tmp_path / "comfy-out-2", classes=["KSampler"])
+    try:
+        settings.put(rig.conn, "comfy.url", other.url)
+        [second] = rig.client.get("/api/studio/executors").json()
+        assert second["address"] == other.url
+        assert second["ready"] is False
+        assert [r for r in other.requests if r[1] == "/object_info"] == [("GET", "/object_info")]
+    finally:
+        other.close()
