@@ -470,6 +470,29 @@ def test_a_row_without_its_file_is_404_asset_not_found(tmp_path):
         "code": "asset_not_found", "message": "Файл не найден", "detail": {"asset_id": a["id"]}}})
 
 
+@pytest.mark.parametrize("escape", ["../secret.txt", "ABSOLUTE"])
+def test_a_row_whose_path_leaves_the_home_is_404_not_the_file(tmp_path, escape):
+    """Final review: `asset_file` goes through `files.asset_path`, so a row pointing outside the
+    studio home (`..` or an absolute path) is refused even when that file exists."""
+    import sqlite3
+    client = make_client(tmp_path, llm=ScriptedLlm([]))
+    a = _upload(client).json()
+    secret = tmp_path / "out" / "secret.txt"
+    secret.write_text("not for the browser")
+    target = str(secret) if escape == "ABSOLUTE" else escape
+    conn = sqlite3.connect(tmp_path / "out" / "studio" / "studio.sqlite")
+    conn.row_factory = sqlite3.Row
+    row = dict(conn.execute("SELECT * FROM asset WHERE id = ?", (a["id"],)).fetchone())
+    row.update(id="a_escape", path=target)          # asset rows are immutable: a new one
+    conn.execute(f"INSERT INTO asset ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
+                 list(row.values()))
+    conn.commit()
+    conn.close()
+    r = client.get(a["url"].replace(a["id"], "a_escape"))
+    assert (r.status_code, r.json()) == (404, {"error": {
+        "code": "asset_not_found", "message": "Файл не найден", "detail": {"asset_id": "a_escape"}}})
+
+
 def test_the_phrase_is_stripped_again_after_its_trailing_dots(tmp_path):
     client = make_client(tmp_path, llm=ScriptedLlm([]))
     p = _project(client)

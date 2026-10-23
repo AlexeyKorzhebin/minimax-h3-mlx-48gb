@@ -10,6 +10,7 @@ from pathlib import Path
 from PIL import Image
 
 from h3_48gb.studio import db, events, ids
+from h3_48gb.studio import files as asset_files
 from h3_48gb.studio.errors import StudioError
 
 MAX_ASSET_BYTES = 25 * 1024 * 1024
@@ -98,7 +99,10 @@ def import_asset(conn: sqlite3.Connection, home: Path, *, data: bytes,
 def asset_file(conn: sqlite3.Connection, home: Path, asset_id: str) -> tuple[Path, str]:
     """`asset.path` is relative to the studio home, so moving `<outdir>` keeps every picture."""
     row = conn.execute("SELECT path, mime FROM asset WHERE id = ?", (asset_id,)).fetchone()
-    path = home / row["path"] if row is not None else None
+    try:
+        path = asset_files.asset_path(conn, row["path"]) if row is not None else None
+    except ValueError:                  # an absolute path or `..`: never a file outside the home
+        path = None
     if path is None or not path.is_file():
         raise StudioError(404, "asset_not_found", "Файл не найден", {"asset_id": asset_id})
     return path, row["mime"]
