@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { useIsPhone, useMobileAction } from "@/mobileAction";
+import { useIsPhone, useIsTopAction, useMobileAction } from "@/mobileAction";
 import { MODE_LABEL, REMOVED_NOTICE, REPLACED_NOTICE, SceneCard } from "./SceneCard";
 import { toBody, type Draft, FIELDS } from "./sceneDraft";
 
@@ -168,6 +168,7 @@ export function ScenarioStep({ snap, onChanged }: { snap: Snapshot; onChanged: (
   ]);
 
   const phone = useIsPhone();
+  const onBar = useIsTopAction("scenario");
   useMobileAction("scenario", proposal
     ? { label: "Применить", onClick: apply, disabled: busy, priority: 1 }
     : { label: "Предложить сцены", onClick: propose, disabled: busy || !idea.trim(), priority: 0 });
@@ -184,7 +185,7 @@ export function ScenarioStep({ snap, onChanged }: { snap: Snapshot; onChanged: (
           <Field text="Сцен">
             <Input type="number" min={1} value={count} onChange={(e) => setCount(e.target.value)} className="w-24" />
           </Field>
-          {!phone && (
+          {(!phone || !onBar) && (
             <Button onClick={propose} disabled={busy || !idea.trim()} size="lg">
               <Sparkles />
               Предложить сцены

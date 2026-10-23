@@ -1,6 +1,7 @@
 """The studio's door to an LLM (spec §9.1, §8.4). `Llm` is what ops and the director depend on;
 `ProviderLlm` is the real one over `provider.chat_with_schema`, configured by
-`<outdir>/studio/providers.json` + `.env` (the same roster format as the old panel)."""
+`<outdir>/studio/providers.json` + `.env` (the same roster format as the old panel); the token file
+is `$STUDIO_ENV_FILE` when set (alex-neuro mounts it at /run/secrets/studio.env)."""
 from __future__ import annotations
 
 import fcntl
@@ -100,6 +101,30 @@ def _provider_shown(name):
     return _shown(name, _PROVIDER_NAME, limit=32)
 
 
+#: Names the token file when it lives outside `<outdir>/studio/` (compose.studio.yaml mounts the
+#: old panel's `.env` read-only at /run/secrets/studio.env). Unset — `<outdir>/studio/.env`.
+ENV_FILE_VAR = "STUDIO_ENV_FILE"
+
+
+def read_env(home: Path) -> dict[str, str]:
+    """The provider tokens, in `provider.load_env`'s format, from `$STUDIO_ENV_FILE` or
+    `<home>/.env`. A named file that is missing means no tokens — never a fallback to `<home>`."""
+    raw = os.environ.get(ENV_FILE_VAR)
+    if not raw:
+        return provider.load_env(home)
+    path = Path(raw)
+    if not path.is_file():
+        return {}
+    env: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        env[name.strip()] = value.strip()
+    return env
+
+
 class ProviderLlm:
     def __init__(self, home: Path, lock_path: Path, *, provider_name: str | None = None,
                  lock_timeout_s: float = 5.0):
@@ -122,6 +147,11 @@ class ProviderLlm:
             raise StudioError(503, "llm_not_configured",
                               "Сценарист не настроен: нет провайдера в studio/providers.json",
                               {"provider": _provider_shown(name)})
+        if cfg.get("type") == "openai":
+            # load_providers judged the token against <home>/.env; the studio's file may be
+            # elsewhere ($STUDIO_ENV_FILE), so the same rule is applied to the file actually used.
+            wanted = cfg.get("api_key_env", "")
+            cfg = {**cfg, "available": not wanted or wanted in read_env(self.home)}
         if not cfg["available"]:
             # `cfg["reason"]` is built by `load_providers` around the raw `api_key_env` text;
             # the owner may have pasted the key itself there. Fixed text, vetted name in detail.
@@ -151,7 +181,7 @@ class ProviderLlm:
         with gpu_lock(self.lock_path, enabled=provider.shares_gpu(cfg) is True,
                       timeout_s=self.lock_timeout_s):
             try:
-                return provider.chat_with_schema(cfg, provider.load_env(self.home), messages,
+                return provider.chat_with_schema(cfg, read_env(self.home), messages,
                                                  schema, retry_reminder)
             except provider.ProviderError as err:
                 code = err.code      # only the code leaves the handler: not `err`, not its text

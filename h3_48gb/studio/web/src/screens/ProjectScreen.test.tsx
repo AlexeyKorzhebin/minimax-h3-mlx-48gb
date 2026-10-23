@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Scene } from "@/api/types";
 import { FakeEventSource, stubFetch } from "@/test/fetchStub";
 import { scene, snapshot } from "@/test/snapshot";
+import { task } from "@/test/task";
 import { ProjectScreen } from "./ProjectScreen";
 
 /** waitFor with room: the model test runs in the same Vitest process and can starve a 1 s
@@ -261,6 +262,38 @@ describe("ProjectScreen — review r1", () => {
       await until(() => expect(gets()).toBe(seen + 1));
       seen += 1;
     }
+  });
+
+  it("reloads the snapshot on every task event of its own project (the worker's progress reaches step 4)", async () => {
+    const calls = stubFetch({ ...LINT, "GET /api/studio/projects/p_1": { body: snapshot({ scenes: [scene()] }) } });
+    render(<ProjectScreen id="p_1" />);
+    await screen.findByRole("article", { name: "Сцена 1" });
+    const gets = () => calls.filter((c) => c.key === "GET /api/studio/projects/p_1").length;
+    let seen = gets();
+    for (const kind of ["task_queued", "task_status", "task_waiting", "task_running", "task_progress", "task_succeeded", "task_failed",
+                        "task_cancelled", "task_cancel_requested", "task_requeued", "task_submit_unknown"]) {
+      FakeEventSource.last!.emit(kind, { project_id: "p_1" }, 6);
+      await until(() => expect(gets()).toBe(seen + 1));
+      seen += 1;
+    }
+  });
+
+  it("task_status turns the task line to the new status and drops the old wait reason", async () => {
+    const waiting = task({ status: "waiting_gpu", wait_reason: "ждём GPU: Qwen держит карту" });
+    const running = task({ status: "running", wait_reason: null, progress_step: 1, progress_total: 8 });
+    stubFetch({
+      ...LINT,
+      "GET /api/studio/projects/p_1": [
+        { body: snapshot({ scenes: [scene({ mode: "from_frame" })], tasks: [waiting] }) },
+        { body: snapshot({ scenes: [scene({ mode: "from_frame" })], tasks: [running] }) },
+      ],
+    });
+    render(<ProjectScreen id="p_1" />);
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("ждём GPU: Qwen держит карту"));
+    await waitFor(() => expect(FakeEventSource.last?.url).toBe("/api/studio/events?after=5"));
+    FakeEventSource.last!.emit("task_status", { project_id: "p_1", task_id: "k_1", status: "running", wait_reason: null }, 6);
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Шаг 1 из 8"));
+    expect(screen.queryByText("ждём GPU: Qwen держит карту")).toBeNull();
   });
 
   it("cards are kept by scene id: when the middle scene is deleted elsewhere, S3 keeps its own draft and does not inherit S2's", async () => {

@@ -407,3 +407,42 @@ def test_the_label_does_not_echo_a_non_name_model(tmp_path):
     home = _home_with(tmp_path, {"active": "f", "providers": {"f": {
         "type": "openai", "base_url": "http://127.0.0.1:9", "model": f"{PASTED} and more"}}})
     assert ProviderLlm(home, tmp_path / "gpu-mac.lock").label == "f:invalid"
+
+
+def _keyed_home(tmp_path, port: int):
+    return _home_with(tmp_path, {"active": "f", "providers": {"f": {
+        "type": "openai", "base_url": f"http://127.0.0.1:{port}", "model": "m",
+        "api_key_env": "KEY", "shares_gpu": False}}})
+
+
+@pytest.mark.parametrize("stale", [None, "KEY=sk-STALE-IN-THE-DATA-FOLDER\n"])
+def test_the_token_comes_from_studio_env_file_and_wins_over_the_data_folder(tmp_path, monkeypatch,
+                                                                            stale):
+    """Task 10: on alex-neuro the token is mounted at /run/secrets/studio.env, outside the data
+    folder, and STUDIO_ENV_FILE names it. A `.env` left in <home> is not read then; with none
+    there at all (the deployed case) the provider is still available."""
+    fake = _FakeLlama(chat_payload=_reply({"x": "ok"}))
+    try:
+        home = _keyed_home(tmp_path, fake.port)
+        if stale is not None:
+            (home / ".env").write_text(stale)
+        secret = tmp_path / "secrets" / "studio.env"
+        secret.parent.mkdir()
+        secret.write_text(f"# token\n\nKEY = {SECRET}\n")
+        monkeypatch.setenv("STUDIO_ENV_FILE", str(secret))
+        got = ProviderLlm(home, tmp_path / "gpu-mac.lock").json_turn([], SCHEMA, "r")
+    finally:
+        fake.close()
+    assert got == {"x": "ok"}
+    assert fake.requests[0]["headers"]["Authorization"] == f"Bearer {SECRET}"
+
+
+def test_a_missing_studio_env_file_is_no_token_even_with_a_data_folder_env(tmp_path, monkeypatch):
+    home = _keyed_home(tmp_path, 9)
+    (home / ".env").write_text(f"KEY={SECRET}\n")
+    monkeypatch.setenv("STUDIO_ENV_FILE", str(tmp_path / "nowhere" / "studio.env"))
+    with pytest.raises(StudioError) as err:
+        ProviderLlm(home, tmp_path / "gpu-mac.lock").json_turn([], SCHEMA, "r")
+    assert (err.value.status, err.value.code, err.value.message, err.value.detail) == (
+        503, "llm_not_configured", "Сценарист не настроен: нет токена в .env",
+        {"provider": "f", "api_key_env": "KEY"})

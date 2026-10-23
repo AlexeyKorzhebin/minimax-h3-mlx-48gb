@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 FrameFormat = Literal["16:9", "9:16"]
 
@@ -128,3 +128,32 @@ class ApplyRequest(_Body):
     expected_revision: int
     # every scene the proposal replaces, at the edit_version the tab read (O26 deletes them all)
     deleted: list[DeletedScene] = Field(default_factory=list)
+
+
+# --- slice S2 ---------------------------------------------------------------------------------
+
+class PlanRequest(_Body):
+    """O10. `image`: `scene_id` (the scene's keyframe) or `prompt` + `width` + `height`.
+    `render` (slice S3): `scene_ids` and `tier`."""
+    kind: Literal["image", "render"]
+    scene_id: str | None = None
+    prompt: str | None = Field(default=None, min_length=1, max_length=4000)
+    width: int | None = None
+    height: int | None = None
+    scene_ids: list[str] | None = None
+    tier: Literal["sketch", "final"] | None = None
+
+    @model_validator(mode="after")
+    def _one_source(self):
+        if self.scene_id is not None and (self.prompt is not None or self.width is not None
+                                          or self.height is not None):
+            raise ValueError("scene_id excludes prompt, width and height")
+        return self
+
+
+class PlanConfirm(_Body):
+    plan_id: str
+
+
+class CancelRequest(_Body):
+    reason: str = Field(default="", max_length=500)

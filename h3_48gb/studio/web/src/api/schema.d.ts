@@ -72,6 +72,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/studio/executors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Executors */
+        get: operations["executors_api_studio_executors_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/studio/gpu": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Gpu Status */
+        get: operations["gpu_status_api_studio_gpu_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/studio/gpu/qwen/unload": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Gpu Qwen Unload */
+        post: operations["gpu_qwen_unload_api_studio_gpu_qwen_unload_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/studio/gpu/release": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Gpu Release */
+        post: operations["gpu_release_api_studio_gpu_release_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/studio/health": {
         parameters: {
             query?: never;
@@ -176,6 +244,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/studio/projects/{project_id}/image": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Confirm Image */
+        post: operations["confirm_image_api_studio_projects__project_id__image_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/studio/projects/{project_id}/lint": {
         parameters: {
             query?: never;
@@ -187,6 +272,23 @@ export interface paths {
         put?: never;
         /** Lint Project */
         post: operations["lint_project_api_studio_projects__project_id__lint_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/studio/projects/{project_id}/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Make Plan */
+        post: operations["make_plan_api_studio_projects__project_id__plan_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -225,6 +327,40 @@ export interface paths {
         head?: never;
         /** Patch Scene */
         patch: operations["patch_scene_api_studio_scenes__scene_id__patch"];
+        trace?: never;
+    };
+    "/api/studio/tasks/{task_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Task */
+        get: operations["get_task_api_studio_tasks__task_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/studio/tasks/{task_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel Task */
+        post: operations["cancel_task_api_studio_tasks__task_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/studio": {
@@ -281,6 +417,14 @@ export interface components {
             /** Kind */
             kind?: string | null;
         };
+        /** CancelRequest */
+        CancelRequest: {
+            /**
+             * Reason
+             * @default
+             */
+            reason?: string;
+        };
         /** CastAssetIn */
         CastAssetIn: {
             /** Asset Id */
@@ -325,6 +469,35 @@ export interface components {
         LintRequest: {
             /** Scene Ids */
             scene_ids?: string[] | null;
+        };
+        /** PlanConfirm */
+        PlanConfirm: {
+            /** Plan Id */
+            plan_id: string;
+        };
+        /**
+         * PlanRequest
+         * @description O10. `image`: `scene_id` (the scene's keyframe) or `prompt` + `width` + `height`.
+         *     `render` (slice S3): `scene_ids` and `tier`.
+         */
+        PlanRequest: {
+            /** Height */
+            height?: number | null;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "image" | "render";
+            /** Prompt */
+            prompt?: string | null;
+            /** Scene Id */
+            scene_id?: string | null;
+            /** Scene Ids */
+            scene_ids?: string[] | null;
+            /** Tier */
+            tier?: ("sketch" | "final") | null;
+            /** Width */
+            width?: number | null;
         };
         /** ProjectCreate */
         ProjectCreate: {
@@ -596,6 +769,86 @@ export interface operations {
             };
         };
     };
+    executors_api_studio_executors_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    gpu_status_api_studio_gpu_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    gpu_qwen_unload_api_studio_gpu_qwen_unload_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    gpu_release_api_studio_gpu_release_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
     health_api_studio_health_get: {
         parameters: {
             query?: never;
@@ -840,6 +1093,43 @@ export interface operations {
             };
         };
     };
+    confirm_image_api_studio_projects__project_id__image_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "idempotency-key"?: string | null;
+            };
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlanConfirm"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     lint_project_api_studio_projects__project_id__lint_post: {
         parameters: {
             query?: never;
@@ -852,6 +1142,41 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["LintRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    make_plan_api_studio_projects__project_id__plan_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlanRequest"];
             };
         };
         responses: {
@@ -922,6 +1247,72 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["ScenePatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_task_api_studio_tasks__task_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_task_api_studio_tasks__task_id__cancel_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CancelRequest"];
             };
         };
         responses: {

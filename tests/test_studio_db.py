@@ -39,7 +39,7 @@ def test_migration_001_creates_the_path_tables_and_sets_the_version(tmp_path):
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
         "ORDER BY name")]
     assert names == TABLES
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3     # 001 + 002 (S1) + 003 (S2)
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -48,7 +48,7 @@ def test_migration_001_creates_the_path_tables_and_sets_the_version(tmp_path):
 def test_migrate_twice_is_a_no_op(tmp_path):
     conn = _fresh(tmp_path)
     conn.execute("INSERT INTO setting (key, value) VALUES ('k', 'v')")
-    assert db.migrate(conn) == 2
+    assert db.migrate(conn) == 3
     assert [tuple(r) for r in conn.execute("SELECT value FROM setting")] == [("v",)]
 
 
@@ -333,9 +333,63 @@ def test_migration_002_adds_source_auto_to_a_database_made_by_001_and_keeps_its_
                  "WHERE id = 's'")
     conn.commit()
     assert "source_auto" not in [r[1] for r in conn.execute("PRAGMA table_info(scene)")]
-    assert db.migrate(conn) == 2
+    # up to 002 only: later migrations (003 in S2, 004 in S2b) must not change this test
+    (only_001 / "002_scene_source_auto.sql").write_text(
+        (db.MIGRATIONS / "002_scene_source_auto.sql").read_text())
+    assert db.migrate(conn, only_001) == 2
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
     row = conn.execute("SELECT id, idx, action_text, source_frame_kind, seed, source_auto "
                        "FROM scene").fetchall()
     assert [tuple(r) for r in row] == [("s", 0, "walks", "prev_last_frame", 11, 0)]
     assert conn.execute("SELECT COUNT(*) FROM take").fetchone()[0] == 1
+
+
+def test_migration_003_adds_the_task_links_of_slice_s2_and_keeps_the_rows(tmp_path):
+    """Plan S2–S3 R-S2-1 (revision 4: file 003, after S1's 002): task.project_id,
+    task.result_asset_id, task.engine_version, task.template_sha256, asset.origin_task_id,
+    render_plan.used_at — exact column lists, so a dropped column fails here. Migrated over a
+    database made by 001 + 002 with a row in it, and only up to 003, so S2b's 004 does not touch
+    this test."""
+    upto = tmp_path / "mig"
+    upto.mkdir()
+    names = ["001_core.sql", "002_scene_source_auto.sql", "003_tasks.sql"]
+    for name in names[:2]:
+        (upto / name).write_text((db.MIGRATIONS / name).read_text())
+    conn = db.connect(tmp_path / "old.sqlite")
+    assert db.migrate(conn, upto) == 2
+    _seed_scene(conn)
+    conn.commit()
+    (upto / names[2]).write_text((db.MIGRATIONS / names[2]).read_text())
+    assert db.migrate(conn, upto) == 3
+
+    def columns(table):
+        return [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+    assert columns("task")[-4:] == ["project_id", "result_asset_id", "engine_version",
+                                    "template_sha256"]
+    assert columns("asset")[-1:] == ["origin_task_id"]
+    assert columns("render_plan")[-1:] == ["used_at"]
+    assert [r[1] for r in conn.execute("PRAGMA index_list(task)") if r[1].startswith("task_")] \
+        == ["task_by_project", "task_by_status"]
+    assert [tuple(r) for r in conn.execute(
+        "SELECT id, status, project_id, result_asset_id, engine_version, template_sha256 "
+        "FROM task")] == [("k", "blocked", None, None, None, None)]
+
+
+def test_migration_003_indexes_have_the_exact_columns_in_order(tmp_path):
+    conn = _fresh(tmp_path)
+
+    def index_columns(name):
+        return [r[2] for r in conn.execute(f"PRAGMA index_info({name})")]
+    assert index_columns("task_by_status") == ["status", "priority", "created_at"]
+    assert index_columns("task_by_project") == ["project_id", "created_at"]
+
+
+def test_migration_003_task_result_asset_id_is_a_foreign_key_to_asset(tmp_path):
+    conn = _fresh(tmp_path)
+    _seed_scene(conn)
+    conn.commit()
+    refs = {r["from"]: (r["table"], r["to"]) for r in conn.execute("PRAGMA foreign_key_list(task)")}
+    assert refs["result_asset_id"] == ("asset", "id")
+    assert refs["project_id"] == ("project", "id")
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
+        conn.execute("UPDATE task SET result_asset_id = 'no-such-asset' WHERE id = 'k'")

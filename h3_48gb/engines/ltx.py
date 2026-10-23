@@ -10,13 +10,12 @@ import os
 import shutil
 import subprocess
 import time
-import urllib.error
-import urllib.request
 import uuid
 from pathlib import Path
 
 from h3_48gb import project as project_module
 from h3_48gb.engines import motion
+from h3_48gb.engines.comfy_api import ComfyApi
 
 DEFAULT_COMFY_URL = "http://127.0.0.1:8188"
 DEFAULT_COMFY_OUTPUT = "/home/alex/Outputs/comfy/output"
@@ -52,23 +51,12 @@ def build_workflow(*, input_name: str, prompt: str, strength: float, prefix: str
     return workflow
 
 
-class ComfyClient:
-    def __init__(self, base_url: str, timeout: float = 60.0, boundary: str | None = None):
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        self.boundary = boundary
+class ComfyClient(ComfyApi):
+    """The panel's LTX client: `ComfyApi` with its own failure type, a video upload and the
+    panel's `client_id`. Requests are byte-for-byte what they were before the split (22 tests of
+    test_ltx_upscale.py, unchanged)."""
 
-    def _open(self, method, path, data=None, headers=None):
-        request = urllib.request.Request(self.base_url + path, data=data, method=method,
-                                         headers=headers or {})
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read() or b"{}")
-        except urllib.error.HTTPError as exc:
-            raise UpscaleError(f"ComfyUI {method} {path}: HTTP {exc.code}: "
-                               f"{exc.read().decode('utf-8', 'replace')[:2000]}") from None
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            raise UpscaleError(f"ComfyUI {method} {path} недоступен: {exc}") from None
+    error = UpscaleError
 
     def upload(self, path: Path, name: str) -> str:
         boundary = self.boundary or uuid.uuid4().hex
@@ -83,20 +71,7 @@ class ComfyClient:
         return answer["name"]
 
     def prompt(self, workflow: dict) -> str:
-        answer = self._open("POST", "/prompt",
-                            json.dumps({"prompt": workflow, "client_id": "h3-panel"}).encode(),
-                            {"Content-Type": "application/json"})
-        if "prompt_id" not in answer:
-            raise UpscaleError(f"ComfyUI отклонил воркфлоу: {json.dumps(answer)[:2000]}")
-        return answer["prompt_id"]
-
-    def history(self, prompt_id: str) -> dict | None:
-        return self._open("GET", f"/history/{prompt_id}").get(prompt_id)
-
-    def interrupt(self) -> None:
-        """Stop the prompt ComfyUI is executing now (triage of task 10/11: a cancelled part
-        otherwise runs its 3.5 min to the end and the next job queues behind it)."""
-        self._open("POST", "/interrupt", b"{}", {"Content-Type": "application/json"})
+        return self.submit_prompt({"prompt": workflow, "client_id": "h3-panel"})
 
 
 def _count_frames(path, *, run) -> int:

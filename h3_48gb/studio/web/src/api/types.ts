@@ -9,6 +9,7 @@ export type SceneIn = components["schemas"]["SceneIn"];
 export type ScenePatch = components["schemas"]["ScenePatch"];
 export type ProposeRequest = components["schemas"]["ProposeRequest"];
 export type ApplyRequest = components["schemas"]["ApplyRequest"];
+export type PlanRequest = components["schemas"]["PlanRequest"];
 
 export type Project = {
   id: string;
@@ -74,12 +75,67 @@ export type Proposal = {
 export type ScenesResult = { project: Project; scenes: Scene[]; diff: Record<string, string[]>; lint: LintMap };
 export type SceneResult = { scene: Scene; cascade: string[]; lint: Finding[] };
 
+export type TaskStatus =
+  | "queued" | "blocked" | "waiting_gpu" | "waiting_ready" | "submitting" | "submit_unknown"
+  | "running" | "cancelling" | "downloading" | "verifying" | "succeeded" | "failed" | "cancelled";
+
+/** O13 — `h3_48gb/studio/tasks.py: task_out`. */
+export type Task = {
+  id: string;
+  kind: "image" | "render" | "assemble" | "extract_frame";
+  project_id: string;
+  status: TaskStatus;
+  template: string | null;
+  wait_reason: string | null;
+  progress_step: number | null;
+  progress_total: number | null;
+  error: string | null;
+  attempts: number;
+  engine_stop: string | null;
+  engine_version: string | null;
+  template_sha256: string | null;
+  cancel_requested: boolean;
+  depends_on_task_id: string | null;
+  result_asset_id: string | null;
+  result_url: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type PlanItem = {
+  kind: "image" | "render";
+  scene_id: string | null;
+  template: string;
+  estimate_s: number;
+  status: "ready" | "blocked" | "invalid";
+  reasons: string[];
+  prompt?: string;
+  width?: number;
+  height?: number;
+  seed?: number;
+  steps?: number;
+  [extra: string]: unknown;
+};
+
+/** O10 — `h3_48gb/studio/plans.py`. */
+export type Plan = {
+  plan_id: string;
+  expires_at: string;
+  kind: "image" | "render";
+  items: PlanItem[];
+  total_s: number;
+  checkpoint_switches: { from: string | null; to: string; seconds: number }[];
+  lint: LintMap;
+  blocked: string[];
+  invalid: string[];
+};
+
 export type Snapshot = {
   project: Project;
   scenes: Scene[];
   cast: CastMember[];
   takes: unknown[];
-  tasks: unknown[];
+  tasks: Task[];
   last_seq: number;
 };
 

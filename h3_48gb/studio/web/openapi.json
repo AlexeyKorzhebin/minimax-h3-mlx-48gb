@@ -52,6 +52,19 @@
         "title": "Body_import_asset_api_studio_assets_post",
         "type": "object"
       },
+      "CancelRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "title": "CancelRequest",
+        "type": "object"
+      },
       "CastAssetIn": {
         "additionalProperties": false,
         "properties": {
@@ -183,6 +196,114 @@
           }
         },
         "title": "LintRequest",
+        "type": "object"
+      },
+      "PlanConfirm": {
+        "additionalProperties": false,
+        "properties": {
+          "plan_id": {
+            "title": "Plan Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plan_id"
+        ],
+        "title": "PlanConfirm",
+        "type": "object"
+      },
+      "PlanRequest": {
+        "additionalProperties": false,
+        "description": "O10. `image`: `scene_id` (the scene's keyframe) or `prompt` + `width` + `height`.\n`render` (slice S3): `scene_ids` and `tier`.",
+        "properties": {
+          "height": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
+          },
+          "kind": {
+            "enum": [
+              "image",
+              "render"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "scene_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scene Id"
+          },
+          "scene_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scene Ids"
+          },
+          "tier": {
+            "anyOf": [
+              {
+                "enum": [
+                  "sketch",
+                  "final"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tier"
+          },
+          "width": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Width"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "PlanRequest",
         "type": "object"
       },
       "ProjectCreate": {
@@ -800,6 +921,70 @@
         "summary": "Stream Events"
       }
     },
+    "/api/studio/executors": {
+      "get": {
+        "operationId": "executors_api_studio_executors_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Executors"
+      }
+    },
+    "/api/studio/gpu": {
+      "get": {
+        "operationId": "gpu_status_api_studio_gpu_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Gpu Status"
+      }
+    },
+    "/api/studio/gpu/qwen/unload": {
+      "post": {
+        "operationId": "gpu_qwen_unload_api_studio_gpu_qwen_unload_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Gpu Qwen Unload"
+      }
+    },
+    "/api/studio/gpu/release": {
+      "post": {
+        "operationId": "gpu_release_api_studio_gpu_release_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Gpu Release"
+      }
+    },
     "/api/studio/health": {
       "get": {
         "operationId": "health_api_studio_health_get",
@@ -1089,6 +1274,69 @@
         "summary": "Propose"
       }
     },
+    "/api/studio/projects/{project_id}/image": {
+      "post": {
+        "operationId": "confirm_image_api_studio_projects__project_id__image_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanConfirm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm Image"
+      }
+    },
     "/api/studio/projects/{project_id}/lint": {
       "post": {
         "operationId": "lint_project_api_studio_projects__project_id__lint_post",
@@ -1134,6 +1382,53 @@
           }
         },
         "summary": "Lint Project"
+      }
+    },
+    "/api/studio/projects/{project_id}/plan": {
+      "post": {
+        "operationId": "make_plan_api_studio_projects__project_id__plan_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Make Plan"
       }
     },
     "/api/studio/projects/{project_id}/scenes": {
@@ -1228,6 +1523,90 @@
           }
         },
         "summary": "Patch Scene"
+      }
+    },
+    "/api/studio/tasks/{task_id}": {
+      "get": {
+        "operationId": "get_task_api_studio_tasks__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Task"
+      }
+    },
+    "/api/studio/tasks/{task_id}/cancel": {
+      "post": {
+        "operationId": "cancel_task_api_studio_tasks__task_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Task"
       }
     },
     "/studio": {

@@ -1,0 +1,195 @@
+{
+ "id": "h3-ref2va",
+ "executor": "comfyui",
+ "graph": "h3-ref2va.graph.json",
+ "comfyui_min_version": "0.42.0",
+ "requires_json": {
+  "class_types": [
+   "BasicGuider",
+   "BasicScheduler",
+   "CLIPLoader",
+   "CreateVideo",
+   "KSamplerSelect",
+   "LoadImage",
+   "MiniMaxH3ReferenceToVideo",
+   "RandomNoise",
+   "SamplerCustomAdvanced",
+   "SaveVideo",
+   "UNETLoader",
+   "VAEDecode",
+   "VAEDecodeAudio",
+   "VAELoader"
+  ],
+  "models": {
+   "diffusion_models": [
+    "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+   ],
+   "text_encoders": [
+    "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+   ],
+   "vae": [
+    "minimax_h3_audio_vae_fp32.safetensors",
+    "minimax_h3_video_vae_fp16.safetensors"
+   ]
+  },
+  "limits": {
+   "frames": [
+    73,
+    345
+   ],
+   "ref_images_by_frames": [
+    [
+     345,
+     6
+    ]
+   ],
+   "grid": {
+    "step": 17,
+    "offset": 5,
+    "fps": 24
+   },
+   "side_multiple_of": 32
+  },
+  "estimate_s": 100
+ },
+ "inputs": {
+  "task_id": {
+   "type": "string",
+   "required": true,
+   "pattern": "[A-Za-z0-9][A-Za-z0-9._-]{0,79}",
+   "targets": [
+    {
+     "node": "15",
+     "field": "filename_prefix",
+     "template": "studio/{task_id}/f"
+    }
+   ]
+  },
+  "prompt": {
+   "type": "string",
+   "targets": [
+    {
+     "node": "6",
+     "field": "prompt"
+    }
+   ],
+   "required": true
+  },
+  "seed": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "10",
+     "field": "noise_seed"
+    }
+   ],
+   "required": true,
+   "min": 0,
+   "max": 9223372036854775807
+  },
+  "steps": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "7",
+     "field": "steps"
+    }
+   ],
+   "required": true,
+   "min": 2,
+   "max": 100
+  },
+  "width": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "6",
+     "field": "width"
+    }
+   ],
+   "required": true,
+   "min": 64,
+   "max": 1344,
+   "multiple_of": 32
+  },
+  "height": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "6",
+     "field": "height"
+    }
+   ],
+   "required": true,
+   "min": 64,
+   "max": 1344,
+   "multiple_of": 32
+  },
+  "length": {
+   "type": "int",
+   "targets": [
+    {
+     "node": "6",
+     "field": "length"
+    }
+   ],
+   "required": true,
+   "min": 73,
+   "max": 345,
+   "grid": {
+    "step": 17,
+    "offset": 5
+   }
+  },
+  "ref_image_size": {
+   "type": "enum",
+   "targets": [
+    {
+     "node": "6",
+     "field": "ref_image_size"
+    }
+   ],
+   "default": "match",
+   "options": [
+    "match",
+    "max"
+   ]
+  },
+  "ref_images": {
+   "type": "image_list",
+   "required": true,
+   "min": 1,
+   "max": 9,
+   "limit_by": "length",
+   "load_node": {
+    "id_template": "5_{i}",
+    "proto": "5_0",
+    "field": "image"
+   },
+   "target": {
+    "node": "6",
+    "field_template": "ref_images.ref_image_{i}"
+   },
+   "note": "file names in the ComfyUI input folder (POST /upload/image); order = <Picture 1..N>"
+  }
+ },
+ "output": {
+  "node": "15",
+  "kind": "video",
+  "dir": "studio/<task_id>/"
+ },
+ "head_drop_frames": 0,
+ "verified_on": [
+  {
+   "date": "2026-10-22",
+   "machine": "alex-neuro",
+   "comfyui": "0.42.0",
+   "comfyui_commit": "b1a247c9",
+   "measure": "896x512, length 73 (3 s), 20 steps, 2 reference images, seed 4244, frames in mp4 == 73",
+   "secs": 100.1,
+   "device_peak_mib": 53223,
+   "prompt_id": "db1d52aa-0564-4ab0-80f8-90751579cc45",
+   "script": "comfy_template_verify.py (h3-bench, probe/comfy-templates-20261022)"
+  }
+ ]
+}

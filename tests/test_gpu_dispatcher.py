@@ -35,7 +35,8 @@ class FakeHost:
         self.smi_down = None
         self.stats = {"temperature_c": 44, "memory_used_mb": 15, "memory_total_mb": 65536}
         self.exec_cmdlines = {"h3": "/home/alex/Projects/h3-lab/.venv312/bin/python3 /home/alex/Projects/h3-lab/.venv312/bin/sglang serve --model-type diffusion --model-path /home/alex/Models/Video/MiniMax-H3/model-package --model-id minimax-h3 --model-variant ref2va --num-gpus 1 --host 127.0.0.1 --port 30020",
-                              "ltx": "/home/alex/Projects/comfy/.venv/bin/python main.py --port 8188 --output-directory /home/alex/Outputs/comfy/output --listen 127.0.0.1"}
+                              "ltx": "/home/alex/Projects/comfy/.venv/bin/python main.py --port 8188 --output-directory /home/alex/Outputs/comfy/output --listen 127.0.0.1",
+                              "comfy-studio": "/home/alex/Projects/comfy-h3/.venv/bin/python main.py --port 8189 --output-directory /home/alex/Outputs/comfy-h3 --listen 127.0.0.1"}
 
     def gpu_apps(self):
         if self.smi_down:
@@ -709,3 +710,120 @@ def test_every_engine_switch_is_on_the_record(tmp_path, host, capsys):
                if line.startswith("gpu-dispatcher: ")]
     assert [json.loads(line[len("gpu-dispatcher: "):]) for line in journal] == events
     assert json.loads((tmp_path / "state.json").read_text())["engines"] == {}
+
+
+# -- the studio's ComfyUI (studio spec §8.4, slice S2) ----------------------------------------------
+
+STUDIO_READY = "http://127.0.0.1:8189/system_stats"
+
+
+def test_the_panels_engines_are_exactly_what_they_were():
+    """Studio spec §8.4: the only change for the studio is a new engine; h3 and ltx stay as the
+    old panel runs them (literals, not read from the module under test)."""
+    specs = gd.engine_specs()
+    assert sorted(specs) == ["comfy-studio", "h3", "ltx"]
+    assert specs["h3"] == gd.EngineSpec(
+        name="h3", cmd=("bash", "/home/alex/Projects/h3-bench/serve.sh"),
+        cwd=Path("/home/alex/Projects/h3-bench"),
+        env={"VARIANT": "ref2va", "TE": "/home/alex/Models/Video/MiniMax-H3/runtime-components/"
+             "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"},
+        ready_url=H3_READY, port=30020,
+        markers=("sglang", " serve ", "--model-variant ref2va", "--port 30020"),
+        log_dir=Path("/home/alex/Projects/h3-bench/logs"), log_prefix="serve-panel",
+        start_timeout=450.0, variant="ref2va", label="H3")
+    assert specs["ltx"] == gd.EngineSpec(
+        name="ltx",
+        cmd=("/home/alex/Projects/comfy/.venv/bin/python", "main.py", "--port", "8188",
+             "--output-directory", "/home/alex/Outputs/comfy/output", "--listen", "127.0.0.1",
+             "--fast-disk", "--disable-auto-launch"),
+        cwd=Path("/home/alex/Projects/comfy/ComfyUI"), ready_url=LTX_READY, port=8188,
+        markers=("main.py", "--port 8188"), log_dir=Path("/home/alex/Projects/comfy/logs"),
+        log_prefix="comfy-panel", start_timeout=600.0, label="ComfyUI")
+
+
+def test_the_studio_engine_is_exactly_the_spec():
+    """Studio spec §8.4: the whole EngineSpec as a literal — start_timeout included (review S2 t1)."""
+    comfy = Path("/home/alex/Projects/comfy-h3")
+    assert gd.engine_specs()["comfy-studio"] == gd.EngineSpec(
+        name="comfy-studio",
+        cmd=("/home/alex/Projects/comfy-h3/.venv/bin/python", "main.py", "--port", "8189",
+             "--output-directory", "/home/alex/Outputs/comfy-h3", "--listen", "127.0.0.1"),
+        cwd=comfy, ready_url=STUDIO_READY, port=8189, markers=("main.py", "--port 8189"),
+        log_dir=comfy / "logs", log_prefix="comfy-studio", start_timeout=600.0,
+        label="ComfyUI студии")
+
+
+def test_acquire_comfy_studio_starts_the_measured_command(tmp_path, host):
+    d = _dispatcher(tmp_path, host)
+    answer = d.acquire("comfy-studio", "studio-worker")
+    assert answer == {"ok": True, "state": "starting", "engine": "comfy-studio",
+                      "log": host.spawned[0][4]}
+    assert host.spawned[0][:4] == (
+        "comfy-studio", ("/home/alex/Projects/comfy-h3/.venv/bin/python", "main.py", "--port",
+                         "8189", "--output-directory", "/home/alex/Outputs/comfy-h3", "--listen",
+                         "127.0.0.1"),
+        "/home/alex/Projects/comfy-h3", {})
+    assert host.spawned[0][4].startswith("/home/alex/Projects/comfy-h3/logs/comfy-studio-")
+    assert host.spawned[0][5] == 1                       # generation.lock fd inherited
+    host.ok_urls.add(STUDIO_READY)
+    assert d.acquire("comfy-studio", "studio-worker") == {
+        "ok": True, "state": "ready", "engine": "comfy-studio"}
+
+
+def test_status_gives_the_studio_comfy_started_at_for_restart_evidence(tmp_path, host):
+    """Studio spec §8.2 `restarted_since`: the adapter reads own["comfy-studio"].started_at."""
+    d = _dispatcher(tmp_path, host)
+    d.acquire("comfy-studio", "studio-worker")
+    host.t = 1500.0
+    host.ok_urls.add(STUDIO_READY)
+    assert d.status()["own"] == {"comfy-studio": {
+        "pid": 4242, "variant": None, "owner": "studio-worker", "started_at": 1000.0,
+        "log": host.spawned[0][4], "ready": True}}
+
+
+def test_the_panel_and_the_studio_never_take_the_card_from_each_other(tmp_path, host):
+    d = _dispatcher(tmp_path, host)
+    d.acquire("ltx", "panel-worker")
+    host.ok_urls.add(LTX_READY)
+    assert d.acquire("comfy-studio", "studio-worker") == {
+        "ok": True, "state": "wait", "engine": "comfy-studio", "foreign": [],
+        "reason": "карту держит ComfyUI клиента panel-worker"}
+    assert (host.killed, [s[0] for s in host.spawned]) == ([], ["ltx"])
+    assert d.release("panel-worker") == {"ok": True, "stopped": ["ltx"]}
+    assert d.acquire("comfy-studio", "studio-worker")["state"] == "starting"
+    host.ok_urls.add(STUDIO_READY)
+    assert d.acquire("h3", "panel-worker") == {
+        "ok": True, "state": "wait", "engine": "h3", "foreign": [],
+        "reason": "карту держит ComfyUI студии клиента studio-worker"}
+
+
+def test_a_foreign_comfy_on_8189_means_wait(tmp_path, host):
+    host.ok_urls.add(STUDIO_READY)
+    answer = _dispatcher(tmp_path, host).acquire("comfy-studio", "studio-worker")
+    assert (answer["state"], answer["reason"]) == ("wait", "чужой ComfyUI студии на :8189")
+    assert host.spawned == []
+
+
+def test_the_panels_comfy_at_the_studio_pid_is_not_ours(tmp_path, host):
+    _dispatcher(tmp_path, host).acquire("comfy-studio", "studio-worker")
+    host.cmdlines[4242] = host.exec_cmdlines["ltx"]
+    reborn = _dispatcher(tmp_path, host)
+    assert reborn.release("studio-worker") == {"ok": True, "stopped": []}
+    assert host.killed == []
+
+
+def test_http_unknown_engine_names_the_three(tmp_path, host):
+    server = gd.make_server(_dispatcher(tmp_path, host), host="127.0.0.1", port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{server.server_address[1]}/acquire", method="POST",
+        data=json.dumps({"engine": "sd", "client": "w"}).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with pytest.raises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(request, timeout=5)
+        assert (err.value.code, json.loads(err.value.read())) == (400, {"ok": False, "error": {
+            "code": "unknown_engine", "message": "движок 'sd': comfy-studio, h3, ltx"}})
+    finally:
+        server.shutdown()
+        server.server_close()

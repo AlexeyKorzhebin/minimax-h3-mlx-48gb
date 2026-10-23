@@ -36,11 +36,14 @@ async function parse<T>(res: Response): Promise<T> {
   throw new ApiError(res.status, "http_error", `Сервер ответил ${res.status}`, {});
 }
 
-export async function api<T>(method: string, path: string, body?: unknown): Promise<T> {
+export async function api<T>(method: string, path: string, body?: unknown,
+                             headers: Record<string, string> = {}): Promise<T> {
   const init: RequestInit = { method };
   if (body !== undefined) {
-    init.headers = { "Content-Type": "application/json" };
+    init.headers = { "Content-Type": "application/json", ...headers };
     init.body = JSON.stringify(body);
+  } else if (Object.keys(headers).length) {
+    init.headers = headers;
   }
   return parse<T>(await fetch(`${API}${path}`, init));
 }

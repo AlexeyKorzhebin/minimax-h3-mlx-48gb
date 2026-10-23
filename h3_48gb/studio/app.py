@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +17,11 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from h3_48gb.studio import assets, config, db, events, ops, schemas
+from h3_48gb.engines.dispatcher_client import DispatcherClient, DispatcherUnavailable
+from h3_48gb.studio import (assets, config, db, events, idempotency, ops, plans, schemas,
+                            settings, tasks)
+from h3_48gb.engines.comfy_api import ComfyApi
+from h3_48gb.studio.executors.comfy import PROBE_TASK_ID, ComfyExecutor
 from h3_48gb.studio.errors import StudioError
 from h3_48gb.studio.llm import Llm, ProviderLlm
 
@@ -149,8 +154,19 @@ class BodyLimit:
         await send({"type": "http.response.body", "body": payload})
 
 
+#: Who the API is to the dispatcher (O23): it reads the status and releases only the studio
+#: worker's engine — never the old panel's (`release_all` is the panel's own button).
+STUDIO_WEB = "studio-web"
+STUDIO_WORKER = "studio-worker"
+#: O22 asks ComfyUI often (the screen polls it): a short timeout, one `/object_info` per request
+#: and the answer kept for a few seconds.
+EXECUTORS_TTL_S = 10.0
+EXECUTORS_TIMEOUT_S = 5.0
+
+
 def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
-               allowed_hosts: list[str] | None = None, llm: Llm | None = None) -> FastAPI:
+               allowed_hosts: list[str] | None = None, llm: Llm | None = None,
+               dispatcher_factory=None) -> FastAPI:
     home = config.studio_dir(outdir)
     home.mkdir(parents=True, exist_ok=True)
     llm = llm or ProviderLlm(home, home / "gpu-mac.lock")
@@ -214,6 +230,8 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
         return project_id
 
     api = "/api/studio"
+    make_dispatcher = dispatcher_factory or (
+        lambda url, client: DispatcherClient(url, client=client, timeout=30.0))
 
     @app.get(f"{api}/health")
     def health(conn=Depends(get_conn)):
@@ -294,6 +312,104 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
         return ops.apply_proposal(conn, project_id, proposal_id=body.proposal_id,
                                   expected_revision=body.expected_revision,
                                   deleted=[d.model_dump() for d in body.deleted])
+
+    # --- slice S2: plans, keyframe, tasks, executor, GPU (§7 O10, O12–O14, O22, O23) ----------
+    @app.post(f"{api}/projects/{{project_id}}/plan")
+    def make_plan(body: schemas.PlanRequest, project_id: str = Depends(project_exists),
+                  conn=Depends(get_conn)):
+        if body.kind == "image":
+            return plans.plan_image(conn, project_id, scene_id=body.scene_id, prompt=body.prompt,
+                                    width=body.width, height=body.height)
+        raise StudioError(400, "plan_kind_unsupported", "План рендера появится в срезе S3")
+
+    @app.post(f"{api}/projects/{{project_id}}/image")
+    def confirm_image(body: schemas.PlanConfirm, project_id: str = Depends(project_exists),
+                      idempotency_key: str | None = Header(default=None), conn=Depends(get_conn)):
+        sha = idempotency.request_sha256(f"image:{project_id}", body.model_dump())
+        status, answer = idempotency.run_once(
+            conn, idempotency_key, sha,
+            lambda c: plans.enqueue_image(c, project_id, body.plan_id, idempotency_key))
+        return JSONResponse(answer, status_code=status)
+
+    @app.get(f"{api}/tasks/{{task_id}}")
+    def get_task(task_id: str, conn=Depends(get_conn)):
+        return tasks.get_task(conn, task_id)
+
+    @app.post(f"{api}/tasks/{{task_id}}/cancel")
+    def cancel_task(task_id: str, body: schemas.CancelRequest, conn=Depends(get_conn)):
+        return tasks.cancel_task(conn, task_id, reason=body.reason)
+
+    executors_cache: dict = {}
+
+    @app.get(f"{api}/executors")
+    def executors(conn=Depends(get_conn)):
+        conf = settings.all_settings(conn)
+        key = (conf["comfy.url"], conf["comfy.output_dir"], conf["comfy.scope"])
+        hit = executors_cache.get("hit")
+        if hit and hit[0] == key and time.monotonic() - hit[1] < EXECUTORS_TTL_S:
+            return hit[2]
+        comfy = ComfyApi(conf["comfy.url"], timeout=EXECUTORS_TIMEOUT_S)
+        object_info = comfy.object_info
+        seen: list = []
+
+        def object_info_once():
+            if not seen:
+                seen.append(object_info())
+            return seen[0]
+        comfy.object_info = object_info_once            # three templates, one request
+        executor = ComfyExecutor(url=conf["comfy.url"], output_dir=Path(conf["comfy.output_dir"]),
+                                 scope=conf["comfy.scope"], api=comfy)
+        from h3_48gb.studio import templates
+        from h3_48gb.studio.executors.base import TaskSpec
+        probes = {t: executor.probe(TaskSpec(task_id=PROBE_TASK_ID, template=t, values={},
+                                             dest_dir=home))
+                  for t in templates.IDS}
+        alive = all(p["alive"] for p in probes.values())
+        ready = all(p["ready"] for p in probes.values())
+        detail = "; ".join(f"{t}: {p['detail']}" for t, p in probes.items() if not p["ready"])
+        answer = [{"name": executor.name, "address": conf["comfy.url"],
+                   "scope": conf["comfy.scope"], "alive": alive, "ready": ready,
+                   "capabilities": executor.capabilities, "detail": detail or "готов",
+                   "templates": probes}]
+        executors_cache["hit"] = (key, time.monotonic(), answer)
+        return answer
+
+    def dispatcher_for(conn, client: str):
+        conf = settings.all_settings(conn)
+        if not conf["comfy.scope"].startswith("dispatcher:"):
+            raise StudioError(409, "no_dispatcher", "На этой машине карту держит не диспетчер",
+                              {"scope": conf["comfy.scope"]})
+        return make_dispatcher(conf["dispatcher.url"], client)
+
+    def dispatcher_call(call):
+        try:
+            return call()
+        except DispatcherUnavailable as err:
+            raise StudioError(503, "dispatcher_unavailable", "Диспетчер GPU не отвечает",
+                              {"reason": str(err)}) from None
+
+    @app.get(f"{api}/gpu")
+    def gpu_status(conn=Depends(get_conn)):
+        client = dispatcher_for(conn, STUDIO_WEB)
+        return dispatcher_call(client.status)
+
+    @app.post(f"{api}/gpu/release")
+    def gpu_release(conn=Depends(get_conn)):
+        marks = ", ".join("?" for _ in tasks.ON_ENGINE)
+        busy = conn.execute(f"SELECT id FROM task WHERE status IN ({marks}) ORDER BY rowid",
+                            tasks.ON_ENGINE).fetchall()
+        if busy:
+            raise StudioError(409, "task_running",
+                              "Идёт рендер — сначала отмените задачу",
+                              {"task_ids": [r["id"] for r in busy]})
+        client = dispatcher_for(conn, STUDIO_WORKER)
+        return dispatcher_call(lambda: client.release(everything=False))
+
+    @app.post(f"{api}/gpu/qwen/unload")
+    def gpu_qwen_unload(conn=Depends(get_conn)):
+        client = dispatcher_for(conn, STUDIO_WEB)
+        status, body = dispatcher_call(client.qwen_unload)
+        return JSONResponse(body, status_code=status)
 
     @app.get(f"{api}/events")
     async def stream_events(request: Request, after: int = 0,

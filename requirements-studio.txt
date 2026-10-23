@@ -8,3 +8,5 @@ uvicorn==0.54.0
 python-multipart==0.0.32
 # TestClient transport; Starlette 1.9 deprecates plain httpx for it.
 httpx2==2.16.0
+# ComfyUI progress over its WebSocket (spec §5, §8.2), sync client; the worker passes proxy=None.
+websockets==15.0.1

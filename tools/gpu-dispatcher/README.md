@@ -16,8 +16,30 @@
 поэтому замок живёт, пока жив движок, даже при перезапуске диспетчера.
 
 ## Ручки
-`GET /status`, `POST /acquire {"engine": "h3"|"ltx"}`, `POST /release`, `POST /qwen/unload`,
-`POST /qwen/restore`.
+`GET /status`, `POST /acquire {"engine": "h3"|"ltx"|"comfy-studio", "client": "…"}`,
+`POST /release`, `POST /qwen/unload`, `POST /qwen/restore`.
+
+## comfy-studio (студия, спека студии §8.4)
+ComfyUI студии: `~/Projects/comfy-h3` (v0.42, H3 и Krea 2), порт 8189, вывод
+`/home/alex/Outputs/comfy-h3`, лог `~/Projects/comfy-h3/logs/comfy-studio-*.log`. Клиент — `studio-worker`.
+Диспетчер держит на карте один движок: пока ComfyUI панели (`ltx`) или H3 занят клиентом
+`panel-worker`, студия ждёт (`wait`, «карту держит … клиента panel-worker»), и наоборот.
+Кнопка «Освободить карту» старой панели (`release(everything=True)`, `web.py:5899`; также
+`released_by_user`, `qwen_restore`) гасит `comfy-studio` посреди задачи студии. Принято (решение
+23.10, финальное ревью S2): при живом воркере обрыв движка — это `submit_unknown`, без автоповтора
+(порт закрыт, ComfyUI не спросить, «потеряна» не доказано); владелец отменяет задачу и ставит
+заново. Автоповтор (один раз, §8.5) — только после рестарта воркера: `recover()` подхватывает
+задачу, движок поднят заново, `lost` доказан записью диспетчера. Спросить диспетчер о живости pid
+и тем самым получить `lost` без рестарта воркера — слайс S5.
+
+Остановка воркера под задачей (`docker compose stop studio-worker`, выкладка) штатно кончается
+SIGKILL через `stop_grace_period: 40s`: воркер не дожидается конца задачи. Это не потеря —
+при старте `recover()` ведёт задачу дальше с места, где она была (`engine_ref` записан).
+
+На alex-neuro юнит запускает этот файл из клона студии через override
+(`/etc/systemd/system/h3-gpu-dispatcher.service.d/override.conf`); откат — только
+`scripts/studio_dispatcher_rollback.py` (просто снять override нельзя: старый `dispatcher.py`
+падает `KeyError` на записи `comfy-studio` в `state.json`).
 
 ## Установка
     sudo cp h3-gpu-dispatcher.service /etc/systemd/system/ && sudo systemctl daemon-reload \

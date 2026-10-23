@@ -6,7 +6,7 @@ import json
 import secrets
 import sqlite3
 
-from h3_48gb.studio import db, duration, events, ids, lint
+from h3_48gb.studio import db, duration, events, ids, lint, tasks
 from h3_48gb.studio.director import cast as cast_card
 from h3_48gb.studio.director import scenarist
 from h3_48gb.studio.errors import StudioError
@@ -112,7 +112,8 @@ def snapshot(conn: sqlite3.Connection, project_id: str) -> dict:
         return {"project": project,
                 "scenes": [scene_out(conn, r) for r in _live_scenes(conn, project_id)],
                 "cast": [cast_out(conn, r) for r in _cast_rows(conn, project_id)],
-                "takes": [], "tasks": [], "last_seq": events.last_seq(conn)}
+                "takes": [], "tasks": tasks.project_tasks(conn, project_id),
+                "last_seq": events.last_seq(conn)}
 
 
 # --- slice S1: cast (task 9) ------------------------------------------------------------------

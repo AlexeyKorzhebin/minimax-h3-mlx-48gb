@@ -4,10 +4,14 @@ import { api, ApiError } from "@/api/client";
 import type { Snapshot } from "@/api/types";
 import { MobileActionProvider } from "@/mobileAction";
 import { useEvents } from "@/useEvents";
+import { FrameStep } from "./FrameStep";
 import { HeroStep } from "./HeroStep";
 import { ScenarioStep } from "./ScenarioStep";
 
-const RELOAD_ON = ["project_updated", "cast_added", "scenes_replaced", "scene_updated", "proposal_applied"];
+const RELOAD_ON = ["project_updated", "cast_added", "scenes_replaced", "scene_updated", "proposal_applied",
+  // slice S2: the worker's task events (spec §8.5)
+  "task_queued", "task_status", "task_waiting", "task_running", "task_progress", "task_succeeded", "task_failed",
+  "task_cancelled", "task_cancel_requested", "task_requeued", "task_submit_unknown"];
 
 export function ProjectScreen({ id }: { id: string }) {
   const [snap, setSnap] = useState<Snapshot | null>(null);
@@ -41,6 +45,7 @@ export function ProjectScreen({ id }: { id: string }) {
       <MobileActionProvider>
         <HeroStep snap={snap} onChanged={load} />
         <ScenarioStep snap={snap} onChanged={load} />
+        <FrameStep snap={snap} onChanged={load} />
       </MobileActionProvider>
     </main>
   );

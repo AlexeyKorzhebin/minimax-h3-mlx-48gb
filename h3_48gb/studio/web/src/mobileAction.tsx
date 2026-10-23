@@ -20,6 +20,13 @@ type Registered = MobileAction & { at: number };
 
 const PHONE_QUERY = "(max-width: 767px)";
 const Ctx = createContext<((id: string, action: MobileAction | null) => void) | null>(null);
+const TopCtx = createContext<string | null>(null);
+
+/** Whether this step's action is the one the phone bar shows right now. A step whose action lost
+ *  the bar to a higher priority shows its button inline instead, so it stays reachable. */
+export function useIsTopAction(id: string): boolean {
+  return useContext(TopCtx) === id;
+}
 
 export function useIsPhone(): boolean {
   const [phone, setPhone] = useState(() => typeof matchMedia === "function" && matchMedia(PHONE_QUERY).matches);
@@ -52,13 +59,14 @@ export function MobileActionProvider({ children }: { children: ReactNode }) {
       return { ...all, [id]: { ...action, at: same ? prev.at : clock.now } };
     });
   }, [clock]);
-  const top = useMemo(
-    () => Object.values(actions).sort((a, b) => b.priority - a.priority || b.at - a.at)[0] ?? null,
+  const topEntry = useMemo(
+    () => Object.entries(actions).sort(([, a], [, b]) => b.priority - a.priority || b.at - a.at)[0] ?? null,
     [actions],
   );
+  const top = topEntry?.[1] ?? null;
   return (
     <Ctx.Provider value={register}>
-      {children}
+      <TopCtx.Provider value={topEntry?.[0] ?? null}>{children}</TopCtx.Provider>
       {phone && top && (
         <div data-testid="mobile-action-bar" className="fixed inset-x-0 bottom-0 z-20 flex gap-2 border-t border-line bg-[var(--scrim)] p-3 backdrop-blur-md">
           <Button size="lg" className="flex-1" onClick={top.onClick} disabled={top.disabled}>
