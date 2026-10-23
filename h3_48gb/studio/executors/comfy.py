@@ -23,6 +23,8 @@ from h3_48gb.studio.executors.comfy_template import TemplateError
 #: `ltx.py:31`: a /history entry without a final status is tolerated this many reads, then failed.
 MAX_ODD_HISTORY_POLLS = 12
 FILE_REF = "file:"
+#: The socket thread wakes this often to see whether anyone still waits for its prompt.
+WS_IDLE_S = 5.0
 
 
 class ComfyExecutor:
@@ -41,6 +43,8 @@ class ComfyExecutor:
         self._ws_connect = ws_connect
         self._progress: dict[str, tuple[int, int]] = {}
         self._odd: dict[str, int] = {}
+        self._sockets: dict[str, object] = {}       # task id -> its open progress socket
+        self._refs: dict[str, str] = {}             # task id -> prompt_id once ComfyUI accepted it
         self._lock = threading.Lock()
 
     # -- contract ---------------------------------------------------------------------------
@@ -103,11 +107,15 @@ class ComfyExecutor:
             raise ExecutorError(str(err)) from None
         self._watch(spec.task_id)
         try:
-            return self.api.submit_prompt(payload)
+            ref = self.api.submit_prompt(payload)
         except ComfyError as err:
-            if ": HTTP 4" in str(err) or "отклонил" in str(err):
+            self._unwatch(spec.task_id)
+            status = err.status
+            if (status is not None and 400 <= status < 500) or "отклонил" in str(err):
                 raise ExecutorError(str(err)) from None        # refused: it never ran
             raise SubmitUncertain(str(err)) from None          # may have reached the engine
+        self._refs[spec.task_id] = ref
+        return ref
 
     def engine_version(self) -> str | None:
         """«ComfyUI <ver> · torch <ver> · <GPU>» as `/system_stats` reports it now (spec rev 3.2,
@@ -178,6 +186,7 @@ class ComfyExecutor:
                     return {"state": "queued", "progress": None, "error": None}
                 entry = self.api.history(ref)           # it may have finished between the reads
                 if entry is None:
+                    self._forget(ref)
                     return {"state": "lost", "progress": None, "error": None}
         except ComfyError as err:
             raise ExecutorError(str(err)) from None
@@ -187,23 +196,30 @@ class ComfyExecutor:
             return {"state": "done", "progress": self._progress.get(ref), "error": None}
         if status.get("status_str") == "error":
             if any(m and m[0] == "execution_interrupted" for m in messages):
+                self._forget(ref)
                 return {"state": "cancelled", "progress": None, "error": None}
             message = next((m[1].get("exception_message") for m in messages
                             if m and m[0] == "execution_error"), "ошибка исполнения")
+            self._forget(ref)
             return {"state": "failed", "progress": None, "error": f"ComfyUI: {message}"}
         with self._lock:
             self._odd[ref] = self._odd.get(ref, 0) + 1
             odd = self._odd[ref]
         if odd >= MAX_ODD_HISTORY_POLLS:
+            self._forget(ref)
             return {"state": "failed", "progress": None,
                     "error": f"ComfyUI: запись /history без итогового статуса после {odd} опросов"}
         return {"state": "running", "progress": self._progress.get(ref), "error": None}
 
     def result(self, ref: str, dest: Path) -> list[Path]:
         if ref.startswith(FILE_REF):
-            sources = self._files(ref[len(FILE_REF):])
+            task_id = ref[len(FILE_REF):]
+            sources = self._files(task_id)
         else:
             entry = self.api.history(ref) or {}
+            task_id = _studio_task_id(entry.get("prompt") or [])
+            if not task_id:
+                raise ExecutorError("в записи ComfyUI нет studio_task_id — чужой файл не отдаём")
             sources = []
             for output in (entry.get("outputs") or {}).values():
                 for items in output.values():
@@ -211,17 +227,27 @@ class ComfyExecutor:
                         if isinstance(item, dict) and "filename" in item:
                             sources.append(self.output_dir / item.get("subfolder", "")
                                            / item["filename"])
+        # Only what ComfyUI wrote into this task's own folder: a name from /history is data from
+        # outside and may point anywhere (absolute path, `..`, another task's folder).
+        home = (self.output_dir / "studio" / task_id).resolve()
+        if home.parent != (self.output_dir / "studio").resolve():       # "", ".", "..", "a/b"
+            raise ExecutorError(f"файл вне папки задачи {task_id}: недопустимый id задачи")
+        for src in sources:
+            if not src.resolve().is_relative_to(home):
+                raise ExecutorError(f"файл вне папки задачи {task_id}: {src}")
         dest = Path(dest)
-        dest.mkdir(parents=True, exist_ok=True)
-        copied = []
         for src in sources:
             if not src.is_file():
                 raise ExecutorError(f"ComfyUI назвал файл, которого нет: {src}")
+        if not sources:
+            raise ExecutorError("ComfyUI не отдал ни одного файла")
+        dest.mkdir(parents=True, exist_ok=True)
+        copied = []
+        for src in sources:
             target = dest / src.name
             shutil.copy2(src, target)
             copied.append(target)
-        if not copied:
-            raise ExecutorError("ComfyUI не отдал ни одного файла")
+        self._forget(ref)
         return copied
 
     def cancel(self, ref: str) -> None:
@@ -233,6 +259,7 @@ class ComfyExecutor:
                 self.api.interrupt(ref)          # revision 4: only our prompt (35cd037c)
             elif any(e[1] == ref for e in queue.get("queue_pending", [])):
                 self.api.delete_queued([ref])
+                self._unwatch_ref(ref)
         except ComfyError as err:
             raise ExecutorError(str(err)) from None
 
@@ -244,8 +271,46 @@ class ComfyExecutor:
         folder = self.output_dir / "studio" / task_id
         return sorted(p for p in folder.glob("*") if p.is_file()) if folder.is_dir() else []
 
+    def _forget(self, ref: str) -> None:
+        with self._lock:
+            self._progress.pop(ref, None)
+            self._odd.pop(ref, None)
+
+    def _unwatch(self, task_id: str) -> None:
+        """Close the progress socket of a task that will not run (refused, taken off the queue)."""
+        with self._lock:
+            socket = self._sockets.pop(task_id, None)
+            self._refs.pop(task_id, None)
+        if socket is not None:
+            try:
+                socket.close()
+            except Exception:                 # noqa: BLE001
+                pass
+
+    def _unwatch_ref(self, ref: str) -> None:
+        for task_id, known in list(self._refs.items()):
+            if known == ref:
+                self._unwatch(task_id)
+
+    def _alive(self, task_id: str) -> bool:
+        """Does anyone still wait for this task's prompt: it is queued or in the history. When
+        the engine cannot be asked, assume yes — the socket is never dropped on a guess."""
+        ref = self._refs.get(task_id)
+        if ref is None:
+            return task_id in self._sockets
+        try:
+            queue = self.api.queue()
+            if any(e[1] == ref for e in (*queue.get("queue_running", []),
+                                         *queue.get("queue_pending", []))):
+                return True
+            return self.api.history(ref) is not None
+        except ComfyError:
+            return True
+
     def _watch(self, task_id: str) -> None:
-        """Follow `progress` over the socket for this client id; best effort."""
+        """Follow `progress` over the socket for this client id; best effort. The socket is
+        kept in `self._sockets` so a task that will not run can close it, and the thread leaves
+        by itself when its prompt is nowhere any more."""
         connect = self._ws_connect
         if connect is None:
             from websockets.sync.client import connect
@@ -256,24 +321,37 @@ class ComfyExecutor:
             socket = connect(ws_url, open_timeout=5, proxy=None)
         except Exception:                     # noqa: BLE001 -- no socket, no progress bar
             return
+        with self._lock:
+            self._sockets[task_id] = socket
 
         def follow():
             try:
-                for raw in socket:
+                while True:
+                    try:
+                        raw = socket.recv(timeout=WS_IDLE_S)
+                    except TimeoutError:
+                        if self._sockets.get(task_id) is not socket or not self._alive(task_id):
+                            break
+                        continue
                     if not isinstance(raw, str):
                         continue
                     message = json.loads(raw)
                     data = message.get("data") or {}
                     if message.get("type") == "progress" and data.get("prompt_id"):
-                        self._progress[data["prompt_id"]] = (int(data["value"]), int(data["max"]))
+                        with self._lock:
+                            self._progress[data["prompt_id"]] = (int(data["value"]),
+                                                                 int(data["max"]))
                     if message.get("type") == "executing" and data.get("node") is None \
                             and data.get("prompt_id"):
                         break
                     if message.get("type") in ("execution_error", "execution_interrupted"):
                         break
-            except Exception:                 # noqa: BLE001 -- the socket dropped
+            except Exception:                 # noqa: BLE001 -- the socket dropped or was closed
                 pass
             finally:
+                with self._lock:
+                    if self._sockets.get(task_id) is socket:
+                        del self._sockets[task_id]
                 try:
                     socket.close()
                 except Exception:             # noqa: BLE001

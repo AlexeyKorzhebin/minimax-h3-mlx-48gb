@@ -17,7 +17,8 @@ _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class ComfyError(Exception):
-    pass
+    #: The HTTP status when ComfyUI answered with an error code; None for «no answer» and the like.
+    status: int | None = None
 
 
 class ComfyApi:
@@ -36,8 +37,10 @@ class ComfyApi:
             with _DIRECT.open(request, timeout=self.timeout) as response:
                 return json.loads(response.read() or b"{}")
         except urllib.error.HTTPError as exc:
-            raise self.error(f"ComfyUI {method} {path}: HTTP {exc.code}: "
-                             f"{exc.read().decode('utf-8', 'replace')[:2000]}") from None
+            error = self.error(f"ComfyUI {method} {path}: HTTP {exc.code}: "
+                               f"{exc.read().decode('utf-8', 'replace')[:2000]}")
+            error.status = exc.code
+            raise error from None
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise self.error(f"ComfyUI {method} {path} недоступен: {exc}") from None
 

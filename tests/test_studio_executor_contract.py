@@ -420,7 +420,7 @@ def test_a_task_that_the_engine_runs_past_the_history_is_failed_after_twelve_odd
 
 def test_result_names_a_missing_file_and_an_empty_output(fake, tmp_path):
     executor = _fake_executor(fake, tmp_path)
-    fake.history["gone"] = {"prompt": [1, "gone", {}, {}, []], "status": {
+    fake.history["gone"] = {"prompt": [1, "gone", {}, {"studio_task_id": "x"}, []], "status": {
         "status_str": "success", "completed": True, "messages": []},
         "outputs": {"9": {"images": [{"filename": "nope.png", "subfolder": "studio/x",
                                       "type": "output"}]}}}
@@ -428,7 +428,7 @@ def test_result_names_a_missing_file_and_an_empty_output(fake, tmp_path):
         executor.result("gone", tmp_path / "d1")
     assert str(missing.value) == \
         f"ComfyUI назвал файл, которого нет: {fake.output_dir}/studio/x/nope.png"
-    fake.history["empty"] = {"prompt": [2, "empty", {}, {}, []], "outputs": {}, "status": {
+    fake.history["empty"] = {"prompt": [2, "empty", {}, {"studio_task_id": "x"}, []], "outputs": {}, "status": {
         "status_str": "success", "completed": True, "messages": []}}
     with pytest.raises(ExecutorError) as empty:
         executor.result("empty", tmp_path / "d2")
@@ -486,3 +486,201 @@ def test_a_finished_task_that_shows_in_the_history_only_on_the_second_read_is_do
         assert executor.status(ref)["state"] == "done"
     finally:
         comfy.close()
+
+
+# -- review round 1 ---------------------------------------------------------------------------
+
+def _ws_threads(task_id: str) -> list[str]:
+    import threading
+    return [t.name for t in threading.enumerate() if t.name == f"comfy-ws-{task_id}"]
+
+
+@pytest.fixture(autouse=True)
+def _long_socket_idle(monkeypatch):
+    """The sockets' own exit (the safety net) must not be what ends them in these tests."""
+    import h3_48gb.studio.executors.comfy as module
+    monkeypatch.setattr(module, "WS_IDLE_S", 60.0)
+
+
+def _wait_no_socket(task_id: str, timeout: float = 5.0) -> list[str]:
+    deadline = time.monotonic() + timeout
+    while _ws_threads(task_id) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return _ws_threads(task_id)
+
+
+def test_no_socket_thread_outlives_a_refused_graph(fake, tmp_path):
+    executor = _fake_executor(fake, tmp_path)
+    fake.classes.remove("KSampler")
+    spec = _spec(tmp_path, "krea2-t2i")
+    with pytest.raises(ExecutorError):
+        executor.submit(spec)
+    assert _wait_no_socket(spec.task_id) == []
+
+
+def test_no_socket_thread_outlives_a_lost_answer(tmp_path):
+    from h3_48gb.studio.executors.base import SubmitUncertain
+    comfy = FakeComfyStudio(tmp_path / "out")
+    try:
+        executor = ComfyExecutor(url=comfy.url, output_dir=comfy.output_dir, scope="x",
+                                 api=ComfyApi(comfy.url, timeout=5.0))
+        comfy.prompt_status = 503
+        spec = _spec(tmp_path, "krea2-t2i")
+        with pytest.raises(SubmitUncertain):
+            executor.submit(spec)
+        assert _wait_no_socket(spec.task_id) == []
+    finally:
+        comfy.close()
+
+
+def test_no_socket_thread_outlives_a_task_taken_out_of_the_queue(fake, tmp_path):
+    executor = _fake_executor(fake, tmp_path)
+    fake.hold = True
+    first, second = _spec(tmp_path, "krea2-t2i"), _spec(tmp_path, "krea2-t2i")
+    first_ref = executor.submit(first)
+    ref = executor.submit(second)
+    assert _ws_threads(second.task_id) == [f"comfy-ws-{second.task_id}"]
+    executor.cancel(ref)
+    assert _wait_no_socket(second.task_id) == []
+    assert _ws_threads(first.task_id) == [f"comfy-ws-{first.task_id}"]     # the running one stays
+    executor.cancel(first_ref)
+    fake.release()
+    assert _wait_no_socket(first.task_id) == []
+
+
+def test_a_socket_whose_prompt_is_nowhere_ends_by_itself(tmp_path, monkeypatch):
+    """Safety net: the engine restarted (queue and history empty) and sent nothing more."""
+    import h3_48gb.studio.executors.comfy as module
+    monkeypatch.setattr(module, "WS_IDLE_S", 0.2)     # after the autouse fixture: this one wins
+    comfy = FakeComfyStudio(tmp_path / "out", hold=True)
+    try:
+        executor = _fake_executor(comfy, tmp_path)
+        spec = _spec(tmp_path, "krea2-t2i")
+        executor.submit(spec)
+        comfy.history.clear()
+        with comfy._lock:
+            comfy._pending.clear()
+            comfy._running = None
+        comfy.release()
+        assert _wait_no_socket(spec.task_id) == []
+    finally:
+        comfy.close()
+
+
+def test_the_socket_is_open_before_the_prompt_is_posted(fake, tmp_path):
+    """A socket opened after the POST would miss the first steps."""
+    seen = []
+
+    def spy(url, **kwargs):
+        from websockets.sync.client import connect
+        seen.append(len(fake.prompts))
+        return connect(url, **kwargs)
+
+    executor = ComfyExecutor(url=fake.url, output_dir=fake.output_dir, scope="x", ws_connect=spy)
+    _wait(executor, executor.submit(_spec(tmp_path, "krea2-t2i")))
+    assert seen == [0]
+
+
+def _history_entry(task_id, filename, subfolder):
+    return {"prompt": [1, "p", {}, {"studio_task_id": task_id}, []],
+            "status": {"status_str": "success", "completed": True, "messages": []},
+            "outputs": {"9": {"images": [{"filename": filename, "subfolder": subfolder,
+                                          "type": "output"}]}}}
+
+
+def test_result_copies_only_files_of_the_tasks_own_folder(fake, tmp_path):
+    executor = _fake_executor(fake, tmp_path)
+    (tmp_path / "comfy-out").mkdir(exist_ok=True)
+    (fake.output_dir.parent / "secret.txt").write_text("SECRET")
+    other = fake.output_dir / "studio" / "OTHER"
+    other.mkdir(parents=True)
+    (other / "f_00001_.png").write_bytes(b"other")
+    own = fake.output_dir / "studio" / "mine"
+    own.mkdir(parents=True)
+    (own / "f_00001_.png").write_bytes(b"mine")
+    fake.history["dots"] = _history_entry("mine", "secret.txt", "..")
+    fake.history["absolute"] = _history_entry("mine", "secret.txt", str(fake.output_dir.parent))
+    fake.history["slash"] = _history_entry("mine", "../../secret.txt", "studio/mine")
+    fake.history["foreign"] = _history_entry("mine", "f_00001_.png", "studio/OTHER")
+    fake.history["noid"] = {**_history_entry("mine", "f_00001_.png", "studio/mine"),
+                            "prompt": [1, "p", {}, {}, []]}
+    (fake.output_dir / "top.png").write_bytes(b"top")
+    fake.history["updir"] = _history_entry("..", "top.png", "")          # task id that is the root
+    fake.history["nested"] = _history_entry("a/b", "f.png", "studio/a/b")
+    for ref in ("dots", "absolute", "slash", "foreign", "updir", "nested"):
+        with pytest.raises(ExecutorError, match="^файл вне папки задачи (mine|\\.\\.|a/b): "):
+            executor.result(ref, tmp_path / f"dest-{ref}")
+        assert not (tmp_path / f"dest-{ref}").exists()
+    with pytest.raises(ExecutorError, match="^в записи ComfyUI нет studio_task_id"):
+        executor.result("noid", tmp_path / "dest-noid")
+    fake.history["ok"] = _history_entry("mine", "f_00001_.png", "studio/mine")
+    [copied] = executor.result("ok", tmp_path / "dest-ok")
+    assert (copied, copied.read_bytes()) == (tmp_path / "dest-ok" / "f_00001_.png", b"mine")
+    with pytest.raises(ExecutorError, match="^файл вне папки задачи"):
+        executor.result("file:../OTHER", tmp_path / "dest-file")
+
+
+def test_status_of_an_unreachable_engine_is_an_error_not_a_loss(tmp_path):
+    dead = ComfyExecutor(url="http://127.0.0.1:9", output_dir=tmp_path, scope="x")
+    with pytest.raises(ExecutorError, match="недоступен"):
+        dead.status("some-prompt")
+
+
+def test_find_sees_a_task_that_waits_in_the_queue(fake, tmp_path):
+    executor = _fake_executor(fake, tmp_path)
+    fake.hold = True
+    first, second = _spec(tmp_path, "krea2-t2i"), _spec(tmp_path, "krea2-t2i")
+    executor.submit(first)
+    ref = executor.submit(second)
+    assert [e[1] for e in ComfyApi(fake.url).queue()["queue_pending"]] == [ref]
+    assert executor.find(second) == ref
+    fake.release()
+
+
+def test_a_5xx_on_post_is_uncertain_and_a_4xx_is_refused(tmp_path):
+    from h3_48gb.studio.executors.base import SubmitUncertain
+    comfy = FakeComfyStudio(tmp_path / "out")
+    try:
+        executor = _fake_executor(comfy, tmp_path)
+        comfy.prompt_status = 503
+        with pytest.raises(SubmitUncertain, match="HTTP 503"):
+            executor.submit(_spec(tmp_path, "krea2-t2i"))
+        comfy.prompt_status = 429
+        with pytest.raises(ExecutorError, match="HTTP 429") as refused:
+            executor.submit(_spec(tmp_path, "krea2-t2i"))
+        assert type(refused.value) is ExecutorError
+        assert comfy.prompts == []
+    finally:
+        comfy.close()
+
+
+def test_comfy_error_carries_the_http_status(fake):
+    with pytest.raises(Exception) as err:
+        ComfyApi(fake.url)._open("GET", "/nothing")
+    assert (type(err.value).__name__, err.value.status) == ("ComfyError", 404)
+    with pytest.raises(Exception) as down:
+        ComfyApi("http://127.0.0.1:9", timeout=0.5).queue()
+    assert down.value.status is None
+
+
+def test_progress_and_odd_counters_are_dropped_when_the_task_is_collected(fake, tmp_path):
+    executor = _fake_executor(fake, tmp_path)
+    spec = _spec(tmp_path, "krea2-t2i")
+    ref = executor.submit(spec)
+    status, _ = _wait(executor, ref)
+    assert executor.progress(ref) == (8, 8)
+    executor.result(ref, spec.dest_dir)
+    assert executor.progress(ref) is None
+    fake.history["odd"] = {"prompt": [1, "odd", {}, {}, []], "outputs": {},
+                           "status": {"status_str": "success", "completed": False,
+                                      "messages": []}}
+    assert [executor.status("odd")["state"] for _ in range(12)][-1] == "failed"
+    assert executor._odd == {}
+    failed = FakeComfyStudio(tmp_path / "out2", fail="boom")
+    try:
+        ex2 = _fake_executor(failed, tmp_path)
+        ref2 = ex2.submit(_spec(tmp_path, "krea2-t2i"))
+        assert _wait(ex2, ref2)[0]["state"] == "failed"
+        assert ex2.progress(ref2) is None
+    finally:
+        failed.close()

@@ -76,7 +76,7 @@ class FakeComfyStudio:
                  step_s: float = 0.002, fail: str | None = None, hold: bool = False,
                  drop_ws: bool = False, flat: bool = False, comfyui_version: str = "0.42.0",
                  no_prompt_id: bool = False, non_json: bool = False, post_timeout: float = 0.0,
-                 history_pending: int = 0, rename_to: str | None = None,
+                 history_pending: int = 0, rename_to: str | None = None, prompt_status: int = 0,
                  torch_version: str = "2.9.1+cu128",
                  gpu: str = "cuda:0 NVIDIA CMP 170HX 64GB : cudaMallocAsync"):
         self.output_dir = Path(output_dir)
@@ -95,6 +95,7 @@ class FakeComfyStudio:
         self.post_timeout = post_timeout
         self.history_pending = history_pending
         self.rename_to = rename_to
+        self.prompt_status = prompt_status
         self.upload_bodies: list[bytes] = []
         self.upload_content_types: list[str] = []
         self.upload_mimes: dict[str, str] = {}
@@ -406,6 +407,8 @@ class FakeComfyStudio:
                 if self.path == "/prompt":
                     payload = json.loads(body)
                     graph = payload["prompt"]
+                    if fake.prompt_status:
+                        return self._send(fake.prompt_status, {"error": "scripted"})
                     if fake.no_prompt_id:
                         return self._send(200, {"node_errors": {}})
                     if fake.non_json:
