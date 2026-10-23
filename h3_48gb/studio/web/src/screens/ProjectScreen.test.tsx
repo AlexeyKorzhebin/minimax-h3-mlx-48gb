@@ -263,6 +263,20 @@ describe("ProjectScreen — review r1", () => {
     }
   });
 
+  it("reloads the snapshot on every task event of its own project (the worker's progress reaches step 4)", async () => {
+    const calls = stubFetch({ ...LINT, "GET /api/studio/projects/p_1": { body: snapshot({ scenes: [scene()] }) } });
+    render(<ProjectScreen id="p_1" />);
+    await screen.findByRole("article", { name: "Сцена 1" });
+    const gets = () => calls.filter((c) => c.key === "GET /api/studio/projects/p_1").length;
+    let seen = gets();
+    for (const kind of ["task_queued", "task_waiting", "task_running", "task_progress", "task_succeeded", "task_failed",
+                        "task_cancelled", "task_cancel_requested", "task_requeued", "task_submit_unknown"]) {
+      FakeEventSource.last!.emit(kind, { project_id: "p_1" }, 6);
+      await until(() => expect(gets()).toBe(seen + 1));
+      seen += 1;
+    }
+  });
+
   it("cards are kept by scene id: when the middle scene is deleted elsewhere, S3 keeps its own draft and does not inherit S2's", async () => {
     let scenes = [scene({ id: "s_1", idx: 0 }), scene({ id: "s_2", idx: 1, music_text: "two" }), scene({ id: "s_3", idx: 2, music_text: "three" })];
     stubFetch({ ...LINT, "GET /api/studio/projects/p_1": () => ({ body: snapshot({ scenes }) }) });

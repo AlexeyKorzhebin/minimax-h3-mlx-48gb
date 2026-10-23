@@ -208,3 +208,54 @@ test("the dark theme tells the browser it is dark (native controls, scrollbars)"
   expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe("dark");
   expect(await scheme()).toBe("dark");
 });
+
+declare const process: { env: Record<string, string | undefined> };   // no @types/node in this package
+const SHOTS = process.env.S2T9_SHOTS;
+
+test("step 4: the bar carries «Подтвердить» for the plan and «Взять в сцену 1» for the frame", async ({ page }) => {
+  let s1: Record<string, unknown> = scene("s_1", 0);
+  let tasks: object[] = [];
+  const TASK = { id: "k_1", kind: "image", project_id: "p_1", status: "queued", template: "krea2-t2i", wait_reason: null,
+    progress_step: null, progress_total: null, error: null, attempts: 0, engine_stop: null, engine_version: null,
+    template_sha256: null, cancel_requested: false, depends_on_task_id: null, result_asset_id: null, result_url: null,
+    created_at: "2026-10-22T10:00:00.000+00:00", updated_at: "2026-10-22T10:00:00.000+00:00" };
+  const plan = { plan_id: "pl_1", expires_at: "2026-10-22T10:10:00.000+00:00", kind: "image",
+    items: [{ kind: "image", scene_id: "s_1", template: "krea2-t2i", prompt: "A woman at the lake, soft morning light.",
+      width: 1344, height: 768, seed: 7, steps: 8, estimate_s: 6, status: "ready", reasons: [] }],
+    total_s: 23, checkpoint_switches: [{ from: "h3-fl2va", to: "krea2-t2i", seconds: 17 }], lint: {}, blocked: [], invalid: [] };
+  const log = await api(page, {
+    "GET /api/studio/projects/p_1": () => [200, { project: PROJECT, scenes: [s1], cast: [], takes: [], tasks, last_seq: 5 }],
+    "GET /api/studio/events?after=5": [204, null],
+    "POST /api/studio/projects/p_1/lint": [200, { findings: {} }],
+    "POST /api/studio/projects/p_1/plan": [200, plan],
+    "POST /api/studio/projects/p_1/image": () => { tasks = [{ ...TASK, status: "waiting_gpu", wait_reason: "ждём GPU: Qwen держит карту" }]; return [201, { task_id: "k_1", status: "queued" }]; },
+    "PATCH /api/studio/scenes/s_1": (body) => {
+      s1 = { ...s1, edit_version: 2, source_frame: { kind: "asset", scene_id: null, asset_id: "a_9", auto: false } };
+      void body; return [200, { scene: s1, cascade: [], lint: [] }];
+    },
+  });
+  // the frame file itself: a 1x1 PNG (the stub above would fail the test on an unknown URL)
+  await page.route("**/api/studio/assets/a_9/file", (route) => route.fulfill({
+    status: 200, contentType: "image/png",
+    body: Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mO0jwv5DwAEhwI6W1w1RAAAAABJRU5ErkJggg=="), (c) => c.charCodeAt(0)) }));
+  const sent = (key: string) => log.filter((r) => r.key === key).map((r) => r.body);
+  const bar = page.getByTestId("mobile-action-bar");
+  await page.goto("/studio/#/p/p_1");
+  await page.getByRole("button", { name: "Сделать кадр" }).click();
+  await expect(page.getByRole("region", { name: "План кадра" })).toBeVisible();
+  await expectPinned(page, bar.getByRole("button", { name: "Подтвердить" }));
+  if (SHOTS) await page.screenshot({ path: `${SHOTS}/frame-390-plan.png`, fullPage: true });
+  await bar.getByRole("button", { name: "Подтвердить" }).click();
+  expect(sent("POST /api/studio/projects/p_1/image")).toEqual([{ plan_id: "pl_1" }]);
+  await expect(page.getByRole("status")).toHaveText("ждём GPU: Qwen держит карту");
+  await expect(page.getByRole("button", { name: "Освободить" })).toBeVisible();
+  if (SHOTS) await page.screenshot({ path: `${SHOTS}/frame-390-waiting.png`, fullPage: true });
+
+  tasks = [{ ...TASK, status: "succeeded", result_asset_id: "a_9", result_url: "/api/studio/assets/a_9/file" }];
+  await page.reload();
+  await expectPinned(page, bar.getByRole("button", { name: "Взять в сцену 1" }));
+  if (SHOTS) await page.screenshot({ path: `${SHOTS}/frame-390-done.png`, fullPage: true });
+  await bar.getByRole("button", { name: "Взять в сцену 1" }).click();
+  await expect(page.getByAltText("Кадр сцены 1")).toBeVisible();
+  expect(sent("PATCH /api/studio/scenes/s_1")).toEqual([{ expected_edit_version: 1, source_frame: { kind: "asset", asset_id: "a_9" } }]);
+});
