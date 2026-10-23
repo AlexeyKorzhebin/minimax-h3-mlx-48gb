@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 
 from _fake_dispatcher import FakeDispatcher
-from h3_48gb.engines.dispatcher_client import DispatcherClient
+from h3_48gb.engines.dispatcher_client import DispatcherClient, DispatcherUnavailable
 from h3_48gb.studio.gpu import DispatcherGate, GpuEngineFailed, IdleRelease, LocalGate
 
 READY = {"ok": True, "state": "ready", "engine": "comfy-studio"}
@@ -174,3 +174,47 @@ def test_a_restarted_worker_leaves_the_panels_engine_alone():
     finally:
         fake.close()
     assert [c for c in fake.calls if c[1] == "/release"] == []
+
+
+def test_a_second_acquire_of_the_same_mac_gate_keeps_one_descriptor(tmp_path):
+    first, other = LocalGate(tmp_path / "gpu-mac.lock"), LocalGate(tmp_path / "gpu-mac.lock")
+    assert first.acquire(_recorder()[1]) is False
+    assert first.acquire(_recorder(cancel_after=1)[1]) is False     # ours already, no waiting
+    first.done()
+    assert other.acquire(_recorder()[1]) is False                   # a leaked fd would still hold it
+    other.done()
+
+
+def test_a_status_that_failed_is_asked_again_on_the_next_tick():
+    fake = FakeDispatcher(own={"comfy-studio": {"owner": "studio-worker", "ready": True}})
+    clock = [0.0]
+
+    class Flaky(DispatcherClient):
+        failures = 1
+
+        def status(self):
+            if self.failures:
+                self.failures -= 1
+                raise DispatcherUnavailable("down")
+            return super().status()
+    try:
+        client = Flaky(fake.url, client="studio-worker")
+        idle = IdleRelease(client, DispatcherGate(client, "comfy-studio"), clock=lambda: clock[0])
+        idle.tick(busy=False)
+        clock[0] = 900.0
+        assert idle.tick(busy=False) is False        # the first /status failed: nothing known yet
+        clock[0] = 901.0
+        assert idle.tick(busy=False) is True         # the second answered: our engine is released
+    finally:
+        fake.close()
+
+
+def test_every_acquire_after_ready_asks_the_dispatcher_again():
+    fake = FakeDispatcher(acquire=(READY,))
+    try:
+        gate = _gate(fake)
+        assert gate.acquire(_recorder()[1]) is False
+        assert gate.acquire(_recorder()[1]) is False
+    finally:
+        fake.close()
+    assert [c[1] for c in fake.calls if c[1] == "/acquire"] == ["/acquire", "/acquire"]

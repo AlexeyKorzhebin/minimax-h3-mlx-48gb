@@ -96,6 +96,8 @@ class LocalGate:
         self.acquired = threading.Event()
 
     def acquire(self, wait) -> bool:
+        if self.fd is not None:      # already ours: a second fd would leak and hold the lock for ever
+            return False
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         while True:
             fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o664)
@@ -132,11 +134,11 @@ class IdleRelease:
 
     def _owns_an_engine(self) -> bool:
         if not self.gate.acquired.is_set() and not self._asked:
-            self._asked = True
             try:
                 own = self.client.status().get("own") or {}
             except DispatcherUnavailable:
-                return False
+                return False         # ask again on the next tick: only an answer counts as asked
+            self._asked = True
             if any(r.get("owner") == self.client.client for r in own.values()):
                 self.gate.acquired.set()
         return self.gate.acquired.is_set()
