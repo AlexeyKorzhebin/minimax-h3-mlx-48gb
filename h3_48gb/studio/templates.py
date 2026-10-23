@@ -16,7 +16,9 @@ TEMPLATE_DIR = Path(__file__).parent / "comfy_templates"
 IDS = ("krea2-t2i", "h3-fl2va", "h3-ref2va")
 #: Which template renders a scene of each mode (§8.2; `text` has no template in part 1).
 TEMPLATE_FOR_MODE = {"from_frame": "h3-fl2va", "refs": "h3-ref2va"}
-IMAGE_TEMPLATE = "krea2-t2i"
+#: The keyframe of step 4 (§9.1) is a Krea 2 picture. Revision 4 (spec §14 seam 1): named for what
+#: it is — S2b brings more picture templates, and the keyframe stays on this one.
+KEYFRAME_TEMPLATE = "krea2-t2i"
 
 
 class UnknownTemplate(KeyError):

@@ -86,7 +86,7 @@ def test_an_unknown_template_is_refused():
 def test_mode_routing_constants():
     assert templates.IDS == ("krea2-t2i", "h3-fl2va", "h3-ref2va")
     assert templates.TEMPLATE_FOR_MODE == {"from_frame": "h3-fl2va", "refs": "h3-ref2va"}
-    assert templates.IMAGE_TEMPLATE == "krea2-t2i"
+    assert templates.KEYFRAME_TEMPLATE == "krea2-t2i"         # revision 4: was IMAGE_TEMPLATE
 
 
 def test_an_absent_lora_removes_the_node_and_leaves_the_wiring_alone():

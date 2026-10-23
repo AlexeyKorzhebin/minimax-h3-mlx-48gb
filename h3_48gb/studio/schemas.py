@@ -128,3 +128,25 @@ class ApplyRequest(_Body):
     expected_revision: int
     # every scene the proposal replaces, at the edit_version the tab read (O26 deletes them all)
     deleted: list[DeletedScene] = Field(default_factory=list)
+
+
+# --- slice S2 ---------------------------------------------------------------------------------
+
+class PlanRequest(_Body):
+    """O10. `image`: `scene_id` (the scene's keyframe) or `prompt` + `width` + `height`.
+    `render` (slice S3): `scene_ids` and `tier`."""
+    kind: Literal["image", "render"]
+    scene_id: str | None = None
+    prompt: str | None = Field(default=None, min_length=1, max_length=4000)
+    width: int | None = None
+    height: int | None = None
+    scene_ids: list[str] | None = None
+    tier: Literal["sketch", "final"] | None = None
+
+
+class PlanConfirm(_Body):
+    plan_id: str
+
+
+class CancelRequest(_Body):
+    reason: str = Field(default="", max_length=500)
