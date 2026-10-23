@@ -25,8 +25,30 @@ services:
       H3_OUTDIR: /home/alex/Outputs
       # Host names the studio answers to besides alex-neuro/localhost/127.0.0.1 (R26): the LAN IP
       STUDIO_ALLOWED_HOSTS: "192.168.100.50"
+      STUDIO_ENV_FILE: /run/secrets/studio.env
     volumes:
       - /home/alex/Outputs/studio:/home/alex/Outputs/studio
-      # The LLM token: the old panel's .env, read-only, one file. Never copied, never in the image
-      # (.dockerignore) — the studio looks for it at <outdir>/studio/.env (llm.py -> provider.load_env).
-      - /home/alex/Outputs/h3-panel/.env:/home/alex/Outputs/studio/.env:ro
+      # The LLM token: the old panel's .env, read-only, one file, outside the data folder (a bind
+      # mount into it left docker's empty root-owned mount point there). Never copied, never in
+      # the image (.dockerignore); llm.py reads the path from STUDIO_ENV_FILE.
+      - /home/alex/Outputs/h3-panel/.env:/run/secrets/studio.env:ro
+  # Slice S2 (plan 2026-10-22): the task loop. Same image; host network for the dispatcher
+  # (127.0.0.1:8790) and the studio's ComfyUI (127.0.0.1:8189); ComfyUI's output folder read-only —
+  # the worker copies a result into the studio's own tree and never writes there.
+  studio-worker:
+    image: h3-studio:latest
+    network_mode: host
+    user: "1000:1000"
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 40s
+    command: ["worker"]
+    depends_on:
+      - studio-api
+    environment:
+      TZ: Europe/Moscow
+      HOME: /tmp
+      H3_OUTDIR: /home/alex/Outputs
+    volumes:
+      - /home/alex/Outputs/studio:/home/alex/Outputs/studio
+      - /home/alex/Outputs/comfy-h3:/home/alex/Outputs/comfy-h3:ro

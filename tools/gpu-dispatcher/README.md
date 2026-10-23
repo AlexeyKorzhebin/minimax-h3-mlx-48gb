@@ -24,6 +24,15 @@ ComfyUI студии: `~/Projects/comfy-h3` (v0.42, H3 и Krea 2), порт 8189
 `/home/alex/Outputs/comfy-h3`, лог `~/Projects/comfy-h3/logs/comfy-studio-*.log`. Клиент — `studio-worker`.
 Диспетчер держит на карте один движок: пока ComfyUI панели (`ltx`) или H3 занят клиентом
 `panel-worker`, студия ждёт (`wait`, «карту держит … клиента panel-worker»), и наоборот.
+Кнопка «Освободить карту» старой панели (`release(everything=True)`, `web.py:5899`; также
+`released_by_user`, `qwen_restore`) гасит `comfy-studio` посреди задачи студии. Принято (решение
+23.10): воркер студии видит это как рестарт движка (`restarted_since` без записи → True) и
+повторяет задачу один раз (§8.5).
+
+На alex-neuro юнит запускает этот файл из клона студии через override
+(`/etc/systemd/system/h3-gpu-dispatcher.service.d/override.conf`); откат — только
+`scripts/studio_dispatcher_rollback.py` (просто снять override нельзя: старый `dispatcher.py`
+падает `KeyError` на записи `comfy-studio` в `state.json`).
 
 ## Установка
     sudo cp h3-gpu-dispatcher.service /etc/systemd/system/ && sudo systemctl daemon-reload \

@@ -261,3 +261,44 @@ def test_the_real_dockerignore_ignores_every_decoy():
              if r.strip() and not r.startswith("#")]
     ignored = {p for p in DECOYS if any(_ignored(r, p) for r in rules)}
     assert ignored == DECOYS
+
+
+# -- slice S2: the worker container (plan 2026-10-22, task 9) -----------------------------------
+
+def test_the_worker_service_runs_the_worker_on_the_host_network_with_comfy_output_read_only():
+    text = (ROOT / "compose.studio.yaml").read_text()
+    block = text[text.index("  studio-worker:\n"):]
+    assert block == (
+        "  studio-worker:\n"
+        "    image: h3-studio:latest\n"
+        "    network_mode: host\n"
+        "    user: \"1000:1000\"\n"
+        "    restart: unless-stopped\n"
+        "    init: true\n"
+        "    stop_grace_period: 40s\n"
+        "    command: [\"worker\"]\n"
+        "    depends_on:\n"
+        "      - studio-api\n"
+        "    environment:\n"
+        "      TZ: Europe/Moscow\n"
+        "      HOME: /tmp\n"
+        "      H3_OUTDIR: /home/alex/Outputs\n"
+        "    volumes:\n"
+        "      - /home/alex/Outputs/studio:/home/alex/Outputs/studio\n"
+        "      - /home/alex/Outputs/comfy-h3:/home/alex/Outputs/comfy-h3:ro\n")
+    docker = (ROOT / "Dockerfile.studio").read_text()
+    assert "apt-get install -y --no-install-recommends tzdata ffmpeg" in docker
+
+
+def test_the_llm_token_is_mounted_outside_the_data_folder_and_named_by_studio_env_file():
+    """Task 10 (coordinator 23.10): a bind mount into /home/alex/Outputs/studio left docker's
+    empty root-owned `.env` there; the token now sits at /run/secrets/studio.env, read-only, and
+    the API finds it through STUDIO_ENV_FILE. The worker gets neither — it never calls the LLM."""
+    text = (ROOT / "compose.studio.yaml").read_text()
+    api = text[text.index("  studio-api:\n"):text.index("  # Slice S2")]
+    worker = text[text.index("  studio-worker:\n"):]
+    mounts = [line.strip() for line in api.splitlines() if line.strip().startswith("- /")]
+    assert mounts == ["- /home/alex/Outputs/studio:/home/alex/Outputs/studio",
+                      "- /home/alex/Outputs/h3-panel/.env:/run/secrets/studio.env:ro"]
+    assert "      STUDIO_ENV_FILE: /run/secrets/studio.env\n" in api
+    assert ".env" not in worker and "STUDIO_ENV_FILE" not in worker
