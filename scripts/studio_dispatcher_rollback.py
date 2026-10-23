@@ -13,10 +13,8 @@ and answers every /status and /acquire with KeyError while state.json still hold
    the old dispatcher fails EVERY path with KeyError on it; with the unit stopped the new one
    cannot write it back; the other engines' records stay byte-equal in value);
 5. remove the systemd override and restart the unit (the old panel's dispatcher.py, untouched);
-6. check the old dispatcher: /status answers JSON, and /acquire as the panel's client is a GRANT
-   (`ready` / `starting`); `wait` or anything else fails the rollback. The engine asked for is the
-   one the panel already holds (then `ready`, nothing moves), or `ltx` on a free card (then
-   `starting`, released again right away).
+6. check the old dispatcher: /status answers JSON with its `own` map. Nothing more — no /acquire:
+   that would start LTX on a free card, and a check must not move the GPU (final review S2).
 
 Exit 0 — rolled back and checked; 1 — a step failed (the message says which; nothing after it ran).
 """
@@ -34,8 +32,6 @@ import urllib.request
 from pathlib import Path
 
 STUDIO_CLIENT = "studio-worker"
-PANEL_CLIENT = "panel-worker"
-GRANT = ("ready", "starting")
 
 
 class Failed(Exception):
@@ -148,16 +144,7 @@ def rollback(*, base: str, state: Path, compose: str, override: str, unit: str,
         if time.monotonic() > deadline:
             raise Failed(f"старый диспетчер: /status ответил {status}: {body}")
         sleep(1.0)
-    held = [name for name, rec in (body.get("own") or {}).items()
-            if rec.get("owner") == PANEL_CLIENT]
-    engine = held[0] if held else "ltx"
-    status, body = http(base, "POST", "/acquire", {"engine": engine, "client": PANEL_CLIENT})
-    if status != 200 or body.get("state") not in GRANT:
-        raise Failed(f"старый диспетчер не выдал карту панели: /acquire {engine} ответил "
-                     f"{status}: {body}")
-    if not held:                  # we started it on a free card: give the card back
-        http(base, "POST", "/release", {"client": PANEL_CLIENT, "all": False})
-    done.append(f"old dispatcher grants {engine} to the panel ({body.get('state')})")
+    done.append(f"old dispatcher answers /status (own: {sorted(body['own'])})")
     return done
 
 
@@ -166,7 +153,8 @@ def main(argv=None) -> int:
     parser.add_argument("--dispatcher", default="http://127.0.0.1:8790")
     parser.add_argument("--state", type=Path,
                         default=Path.home() / ".local/state/h3-gpu-dispatcher/state.json")
-    parser.add_argument("--compose", default="compose.studio.yaml")
+    parser.add_argument("--compose", default=str(Path(__file__).resolve().parents[1]
+                                                  / "compose.studio.yaml"))
     parser.add_argument("--override",
                         default="/etc/systemd/system/h3-gpu-dispatcher.service.d/override.conf")
     parser.add_argument("--unit", default="h3-gpu-dispatcher")

@@ -123,12 +123,15 @@ case "$*" in *"systemctl restart"*) touch {fake.restarted} ;; esac''')):
     return {"PATH": f"{bin_dir}:{os.environ['PATH']}", "LOG": str(log)}
 
 
-def _run(fake: TwoDispatchers, env: dict, script: Path = SCRIPT):
+def _run(fake: TwoDispatchers, env: dict, script: Path = SCRIPT, *, compose="compose.studio.yaml",
+         cwd=None):
+    flags = ["--compose", compose] if compose else []
     return subprocess.run([sys.executable, str(script), "--dispatcher", fake.url, "--state",
-                           str(fake.state), "--compose", "compose.studio.yaml", "--override",
+                           str(fake.state), *flags, "--override",
                            "/etc/x/override.conf", "--wait", "2", "--studio-port",
                            str(fake.port)],
-                          env={**os.environ, "PATH": env["PATH"]}, capture_output=True, text=True)
+                          env={**os.environ, "PATH": env["PATH"]}, capture_output=True, text=True,
+                          cwd=cwd)
 
 
 @pytest.fixture
@@ -151,25 +154,37 @@ def test_the_rollback_releases_the_studio_engine_before_the_old_dispatcher_retur
     assert done.stdout == ("ok: worker stopped\nok: released ['comfy-studio']\n"
                            "ok: comfy-studio gone\nok: state.json: no comfy-studio record\n"
                            "ok: unit restored\n"
-                           "ok: old dispatcher grants ltx to the panel (starting)\n")
+                           "ok: old dispatcher answers /status (own: [])\n")
     assert Path(env["LOG"]).read_text().splitlines() == [
         "docker compose -f compose.studio.yaml stop studio-worker",
         "sudo systemctl stop h3-gpu-dispatcher",
         "sudo rm -f /etc/x/override.conf", "sudo systemctl daemon-reload",
         "sudo systemctl restart h3-gpu-dispatcher"]
     assert fake.calls == ["new POST /release studio-worker", "new GET /status",
-                          "old GET /status", "old POST /acquire ltx panel-worker",
-                          "old POST /release panel-worker"]
+                          "old GET /status"]          # no /acquire: the check must not start LTX
     assert fake.engines() == {}
     assert fake.engine.poll() is not None              # the process itself is gone
 
 
-def test_the_panels_own_engine_is_asked_for_and_left_running(rollback):
-    fake, env = rollback(acquire_state="ready", panel_holds="h3")
+def test_the_panels_own_engine_is_left_alone_and_named_by_the_final_check(rollback):
+    fake, env = rollback(panel_holds="h3")
     done = _run(fake, env)
     assert (done.returncode, done.stdout.splitlines()[-1]) == (
-        0, "ok: old dispatcher grants h3 to the panel (ready)")
-    assert fake.calls[-1] == "old POST /acquire h3 panel-worker"     # no release after it
+        0, "ok: old dispatcher answers /status (own: ['h3'])")
+    assert fake.calls[-1] == "old GET /status"          # nothing asked for, nothing released
+
+
+def test_without_a_compose_flag_the_repos_own_file_is_used_from_any_directory(rollback, tmp_path):
+    """Final review: the default is `<repo>/compose.studio.yaml`, not a path relative to the
+    caller's cwd (the script is run from anywhere on the server)."""
+    fake, env = rollback()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    done = _run(fake, env, compose=None, cwd=elsewhere)
+    assert (done.returncode, done.stderr) == (0, "")
+    assert Path(env["LOG"]).read_text().splitlines()[0] == (
+        f"docker compose -f {ROOT / 'compose.studio.yaml'} stop studio-worker")
+    assert (ROOT / "compose.studio.yaml").is_file()
 
 
 def test_the_old_order_breaks_the_old_dispatcher_and_the_script_says_so(rollback, tmp_path):
@@ -200,16 +215,15 @@ def test_a_record_left_only_in_state_json_is_removed_while_the_unit_is_stopped(r
     """Revision 4 (coordinator 23.10, review of task 1): the old dispatcher fails every path with
     KeyError on a `comfy-studio` record in state.json — so the script removes it itself, with
     the unit stopped (the new dispatcher cannot write it back), and keeps the panel's record."""
-    fake, env = rollback(drop_record=False, status_record=False, panel_holds="h3",
-                         acquire_state="ready")
+    fake, env = rollback(drop_record=False, status_record=False, panel_holds="h3")
     done = _run(fake, env)
     assert (done.returncode, done.stderr) == (0, "")
     assert done.stdout == ("ok: worker stopped\nok: released ['comfy-studio']\n"
                            "ok: comfy-studio gone\nok: state.json: comfy-studio removed\n"
                            "ok: unit restored\n"
-                           "ok: old dispatcher grants h3 to the panel (ready)\n")
+                           "ok: old dispatcher answers /status (own: ['h3'])\n")
     assert fake.engines() == {"h3": {"pid": 8, "pgid": 8, "owner": "panel-worker"}}
-    assert fake.calls[-2:] == ["old GET /status", "old POST /acquire h3 panel-worker"]
+    assert fake.calls[-1] == "old GET /status"
 
 
 def test_a_record_gone_while_the_process_lives_stops_before_touching_the_unit(rollback):
@@ -236,13 +250,3 @@ def test_a_port_still_taken_stops_before_touching_the_unit(rollback, tmp_path):
         other.close()
     assert (done.returncode, done.stderr) == (
         1, f"ОТКАТ ОСТАНОВЛЕН: comfy-studio не ушёл за 2 с: порт {fake.port} занят\n")
-
-
-def test_an_old_dispatcher_that_only_says_wait_fails_the_rollback(rollback):
-    """Revision 3: `wait` does not prove the panel can get the card back — only a grant does."""
-    fake, env = rollback(acquire_state="wait")
-    done = _run(fake, env)
-    assert done.returncode == 1
-    assert done.stderr == ("ОТКАТ ОСТАНОВЛЕН: старый диспетчер не выдал карту панели: /acquire "
-                           "ltx ответил 200: {'ok': True, 'state': 'wait', 'engine': 'ltx', "
-                           "'reason': 'GPU занята: qwen'}\n")
