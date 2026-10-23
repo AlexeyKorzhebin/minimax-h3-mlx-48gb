@@ -1,4 +1,4 @@
-# Студия, срез S2b «Картинка» — план реализации (редакция 2)
+# Студия, срез S2b «Картинка» — план реализации (редакция 2.1)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -9,6 +9,21 @@
 **Tech Stack:** как в плане S2–S3 (Python 3.12, FastAPI 0.156.8, Pydantic 2.14.1, `sqlite3`, Pillow, pytest; React 19.3.1, Vite 8.3.5, TypeScript 5.9.3, Tailwind 4.3.3, shadcn/ui + Radix (`radix-ui` 1.8.1), Vitest 5.0.5, Playwright 1.64.1). Новых зависимостей нет.
 
 **Spec:** `docs/superpowers/specs/2026-10-10-studio-part1-core-design.md`, редакция 3.3. Читать до первой задачи: §19 целиком (19.1–19.11), §14 строка S2b и абзац «S2b и план S2–S3» (шесть стыков), §8.2 (карточка, отпечаток весов, необязательные входы, рекомендация «Быстро»), §8.4 (`queue_order`, вытеснение), §10 «Правила картинки» и L7d, §15.4, §17.1 п.10–11, §17.5. Строится на `docs/superpowers/plans/2026-10-22-studio-s2-s3.md` ред. 4.1, часть C (задачи 1–10): её интерфейсы здесь не повторяются, а называются (блоки Interfaces). Замеры: `docs/h3-modes/IMAGE-MODELS-20261022.md` (IMG-22), `docs/h3-modes/LLM-PLUS-IMAGE-20261023.md` §7, §9. Дизайн: `docs/design/2026-10-studio-style/AB/README.md`.
+
+## Редакция 2.1 (23.10): сверка Codex ред. 2
+
+Сверка: `docs/superpowers/plans/review-codex-s2b-r2.md` (коммит e14273a4): 8 закрыто, 4 частично (№6, 8, 9, 10), 2 новых блокера и 2 важных в задаче 12. Решения координатора 23.10; уточнение владельца — старая панель не используется, её не защищаем (пункт об остановке чужих `h3`/`ltx` в `qwen_restore` снят). Проверка — та же копия `studio/s2 afe05dcc`, задача 12 переделана и снова показана красной поверх задачи 11; набор — **809 passed, 2 skipped**.
+
+| № | Находка | Что стало | Где | Проверка |
+|---|---|---|---|---|
+| Б1 r2 | Ранний `ready` поднятого ComfyUI шёл до проверки карты: тяжёлая задача проходила, пока LLM поднимается или молчит её `/health` | `Dispatcher._studio_gate` для запросов студии (`beside_qwen` передан) — **до любого `ready`**: чужой GPU-процесс или недоступный nvidia-smi → `wait`; процессы LLM, незавершённый `qwen_restore` (`qwen_starting_since`, ≤ 300 с) или живой `/health` → `wait_qwen`, кроме ответившей LLM нужного профиля | задача 12 | `test_an_llm_coming_back_holds_every_task_even_with_the_engine_ready` (2 случая), `test_llm_processes_without_health_or_a_stranger_or_no_nvidia_smi_mean_wait`; старая проверка «только при `/health`» — красная |
+| Б2 r2 | 200 от `/free` принималось за выгрузку | воркер после `/free` опрашивает память карты (nvidia-smi из `/status` диспетчера) до `≤ 2048 МиБ`, не дольше 30 опросов; иначе LLM не поднимается, событие `llm_not_restored {reason}` | задача 12 | `test_the_llm_comes_back_only_once_the_card_is_really_empty` (память падает на третьем опросе), `test_a_card_that_does_not_empty_keeps_the_llm_down_and_says_why`; две мутации красные |
+| важн. 1 | `qwen_restore` останавливал чужие движки | **снято владельцем** (панель не используется): свои не сохраняемые движки останавливаются, проверки владельца нет | задача 12 | — |
+| важн. 2 | Откат противоречил: задача 12 меняет диспетчер | шаг отката задачи 15: диспетчер возвращается к версии S2 (`git show <коммит S2>:…/dispatcher.py`, перезапуск юнита), без гарантий для панели | задача 15 | — |
+| 6 | Нет теста показа предупреждения повтора | `RepeatNotice.test.tsx` (три текста и пустой `differs`) и сценарий повтора в `ImageScreen.test.tsx` | задача 13 | не прогонялся (мастер) |
+| 8 | Нет теста запоздавшего ответа перевода | «a translation that comes back after a newer edit is not shown»: ответ к правке 4 приходит после правки 5 — не передаётся наверх, перевод повторяется для 5 | задача 13 | не прогонялся (мастер) |
+| 9 | Опознание настоящего sglang не проверено | остаётся живой проверке (задача 15, шаг 1b); безопасное умолчание в коде: не опознанный процесс — чужой (ждать), неизвестный профиль — `wait_qwen`, ответ `/get_server_info` не-объект — `None` без 500 | задачи 12, 15 | `test_the_profile_is_read_from_the_servers_context` (+ `"32768"` и `[]`) |
+| 10 | Мутация `batch_size=N` не прогонялась | прогнана буквально: вход `batch_size` в карточке Krea и одна задача на партию — красная | таблица мутаций | `assert 1 == 3` |
 
 ## Редакция 2 (23.10): ревью Codex ред. 1 и решения координатора
 
@@ -34,7 +49,7 @@
 
 - Ветка `studio/s2b` от `studio/s2` **после приёмки S2** (задачи 1–10 плана S2–S3, включая выкладку задачи 10 и проход владельца). Worktree `~/worktrees/studio-s2b`. Пути — от корня worktree.
 - Кто что делает — как в плане S2–S3: исполнитель пишет код и тесты, гоняет команды, показывает мутации, **не коммитит** (шаг «коммит» = список файлов и сообщение в отчёте), `git add -A` запрещён; выкладка (задача 15) — только координатор и только после «да» владельца.
-- **Как проверен этот план (ред. 2, 23.10).** Копия в scratch — настоящий `studio/s2 afe05dcc` (S2 задачи 1–9 с правками ревью; набор `test_studio_*.py test_comfy_api.py test_gpu_dispatcher.py test_ltx_upscale.py test_gpu_gate.py` — 679 тестов, зелёные). На нём задачи 1–12 этого плана — по коммиту на задачу; тесты задачи поверх предыдущего коммита — красные (вывод — в шаге «увидеть красным»), на её коммите — зелёные; итог — **804 passed, 2 skipped** (+127 тестов S2b). Блоки Create/Apply плана применены скриптом к чистой копии `afe05dcc`: дерево совпало с эталоном побайтно (кроме шагов, которые план велит сделать командой: `cp` копий шаблонов и `limits` карточек, литерал хеша Krea, `openapi.json`), набор снова зелёный. Все мутации, названные в задачах 1–12, внесены и показаны красными. Все Python-файлы — `py_compile`. **Не прогонялись:** мастер (задачи 13–14), выкладка и живые проверки (задача 15).
+- **Как проверен этот план (ред. 2, 23.10).** Копия в scratch — настоящий `studio/s2 afe05dcc` (S2 задачи 1–9 с правками ревью; набор `test_studio_*.py test_comfy_api.py test_gpu_dispatcher.py test_ltx_upscale.py test_gpu_gate.py` — 679 тестов, зелёные). На нём задачи 1–12 этого плана — по коммиту на задачу; тесты задачи поверх предыдущего коммита — красные (вывод — в шаге «увидеть красным»), на её коммите — зелёные; итог — **809 passed, 2 skipped** (+132 теста S2b, ред. 2.1). Блоки Create/Apply плана применены скриптом к чистой копии `afe05dcc`: дерево совпало с эталоном побайтно (кроме шагов, которые план велит сделать командой: `cp` копий шаблонов и `limits` карточек, литерал хеша Krea, `openapi.json`), набор снова зелёный (ред. 2.1 — тоже). Все мутации, названные в задачах 1–12, внесены и показаны красными. Все Python-файлы — `py_compile`. **Не прогонялись:** мастер (задачи 13–14), выкладка и живые проверки (задача 15).
 - **Незакоммиченный фикс S2 задачи 8** (в worktree на 23.10: `task_status`, `plan_stale` у кадра, O14 на `submit_unknown`, `find` после `SubmitUncertain`, `ON_ENGINE`) в базу проверки не входил; его стыки учтены (журнал ред. 2, решение 5). Перед каждой задачей — `git apply --check <дифф>`; при отказе — перенести правку по смыслу по якорям диффа, а не подгонять тест.
 
 ## Global Constraints
@@ -6091,8 +6106,8 @@ index 2efccd85..0135b69c 100644
 **Interfaces:**
 - Consumes: карточки (`limits.coexists_with_llm`, задача 1), `ImageKind` (задача 10), `queued_in_order` (S2).
 - Produces:
-  - Диспетчер: `EngineSpec.coexists_with_qwen: tuple = ()` (у `comfy-studio` — `("shared32",)`, у `h3`/`ltx` — `()`); константы `QWEN_INFO`, `QWEN_PROFILE_BY_CONTEXT = {32768: "shared32"}`, `QWEN_MARKERS = ("sglang", "--port 8000")`, `QWEN_RESTORE_PROFILE = "shared32"`; `Host.qwen_profile() -> str | None` (контекст из `GET :8000/get_server_info`); `Dispatcher.acquire(engine, client, beside_qwen=None)`: при поднятом Qwen и переданном `beside_qwen` задача идёт рядом только если текущий профиль есть и в `beside_qwen`, и в `coexists_with_qwen` (процессы Qwen по `QWEN_MARKERS` не считаются чужими); иначе `wait_qwen` — **даже при уже готовом движке**; без `beside_qwen` — поведение до S2b; `Dispatcher.qwen_restore(keep=())` — движки из `keep`, сосуществующие с `QWEN_RESTORE_PROFILE`, остаются; HTTP: `POST /acquire {…, beside_qwen: [str]}` (не список — 400 `bad_beside_qwen`), `POST /qwen/restore {keep: [str]}`.
-  - Студия: `DispatcherClient.acquire(engine, beside_qwen=None)` (ключ в теле только когда не `None` — тело S2 прежнее), `DispatcherClient.qwen_restore(keep=None)`; `DispatcherGate.acquire(wait, beside_qwen=None)`, `DispatcherGate.qwen_back()` (`qwen_restore(keep=[engine])`, если `/status` говорит `qwen.unloaded_by_us`); `LocalGate.acquire(wait, beside_qwen=None)`, `LocalGate.qwen_back()` — ничего; `ComfyApi.free()` (`POST /free {"unload_models": true, "free_memory": true}`), `ComfyExecutor.free() -> bool`; `ImageKind.beside_qwen(task) -> list[str]` (из карточки), `ImageKind.is_heavy(task)` (список пуст); `Worker._after_heavy(task)`: тяжёлая задача, дошедшая до движка, без тяжёлой задачи следом → `executor.free()`, и при `settings llm.restore_after_heavy == "1"` → `gate.qwen_back()`; `settings.HIDDEN["llm.restore_after_heavy"] = "0"`.
+  - Диспетчер: `EngineSpec.coexists_with_qwen: tuple = ()` (у `comfy-studio` — `("shared32",)`, у `h3`/`ltx` — `()`); константы `QWEN_INFO`, `QWEN_PROFILE_BY_CONTEXT = {32768: "shared32"}`, `QWEN_MARKERS = ("sglang", "--port 8000")`, `QWEN_RESTORE_PROFILE = "shared32"`; `Host.qwen_profile() -> str | None` (контекст из `GET :8000/get_server_info`); `Dispatcher.acquire(engine, client, beside_qwen=None)` — при переданном `beside_qwen` **до любого `ready`** (в том числе для уже поднятого движка, ред. 2.1) `Dispatcher._studio_gate`: чужой GPU-процесс → `wait`; nvidia-smi недоступен → `wait`; признаки LLM (её `/health`, её процессы по `QWEN_MARKERS`, или незавершённый запуск — `state.qwen_starting_since`, не дольше `QWEN_START_TIMEOUT = 300` с без процессов) при молчащем `/health` → `wait_qwen` «Qwen поднимается»; при ответившем — рядом только если профиль есть и в `beside_qwen`, и в `coexists_with_qwen`, иначе `wait_qwen` «Qwen держит карту»; без `beside_qwen` — поведение до S2b; `Dispatcher.qwen_restore(keep=())` — движки из `keep`, сосуществующие с `QWEN_RESTORE_PROFILE`, остаются, прочие свои останавливаются (старую панель не защищаем — решение владельца 23.10), ставит `qwen_starting_since`; `Host.qwen_profile()` — любой ответ, кроме объекта с целым `context_length`, — `None` (никакого 500); HTTP: `POST /acquire {…, beside_qwen: [str]}` (не список — 400 `bad_beside_qwen`), `POST /qwen/restore {keep: [str]}`.
+  - Студия: `DispatcherClient.acquire(engine, beside_qwen=None)` (ключ в теле только когда не `None` — тело S2 прежнее), `DispatcherClient.qwen_restore(keep=None)`; `DispatcherGate.acquire(wait, beside_qwen=None)`, `DispatcherGate.memory_used_mb()` (nvidia-smi из `/status`), `DispatcherGate.qwen_back() -> str | None` (`qwen_restore(keep=[engine])`, если `/status` говорит `qwen.unloaded_by_us`; не-200 — причина словами); `LocalGate.acquire(wait, beside_qwen=None)`, `LocalGate.qwen_back()` — ничего; `ComfyApi.free()` (`POST /free {"unload_models": true, "free_memory": true}`), `ComfyExecutor.free() -> bool`; `ImageKind.beside_qwen(task) -> list[str]` (из карточки), `ImageKind.is_heavy(task)` (список пуст); `Worker._after_heavy(task)`: тяжёлая задача, дошедшая до движка, без тяжёлой задачи следом → `executor.free()`; при `settings llm.restore_after_heavy == "1"` — ред. 2.1: ответ 200 от `/free` не считается выгрузкой — воркер опрашивает память карты (`gate.memory_used_mb()`, раз в `FREE_POLL_SECONDS = 1`, до `FREE_WAIT_POLLS = 30` раз) и только при `≤ FREED_MEMORY_MB = 2048` зовёт `gate.qwen_back()`; иначе (или при отказе диспетчера) LLM не поднимается, событие `llm_not_restored {reason}`; `settings.HIDDEN["llm.restore_after_heavy"] = "0"`.
   - Стык S3: `RenderKind` (H3) объявляет `beside_qwen(task) -> []` и `is_heavy(task) -> True` — автор плана S3 добавляет это в задачу 12 S2–S3; без них рендер ведёт себя как до S2b (ждёт Qwen только при старте движка).
 
 - [ ] **Step 1: Написать падающие тесты**
@@ -6172,6 +6187,31 @@ def test_a_picture_that_lives_beside_the_llm_frees_nothing(make_rig):
     rig.drain()
     assert (rig.comfy.frees, [c for c in rig.dispatcher.calls if c[1] == "/qwen/restore"]) == (
         [], [])
+
+
+
+def test_the_llm_comes_back_only_once_the_card_is_really_empty(make_rig):
+    """ред. 2.1 (Codex r2, блокер 2): `/free` answers 200 at once, the memory falls later — the
+    worker waits for it (here two /status reads still show Qwen-Image's 46 989 MiB)."""
+    rig = make_rig(qwen={"running": False, "unloaded_by_us": True},
+                   memory=(100, 46989, 46989, 471))
+    settings.put(rig.conn, "llm.restore_after_heavy", "1")
+    batch(rig, "qwen-image-t2i", 1)
+    rig.drain()
+    after_task = [c[1] for c in rig.dispatcher.calls][-5:]
+    # the memory polls (busy, busy, empty) come before the restore; qwen_back reads /status once
+    assert after_task == ["/status", "/status", "/status", "/status", "/qwen/restore"]
+    assert (rig.dispatcher._memory, rig.events("llm_not_restored")) == ([471], [])
+
+
+def test_a_card_that_does_not_empty_keeps_the_llm_down_and_says_why(make_rig):
+    rig = make_rig(qwen={"running": False, "unloaded_by_us": True}, memory=(46989,))
+    settings.put(rig.conn, "llm.restore_after_heavy", "1")
+    batch(rig, "qwen-image-t2i", 1)
+    rig.drain()
+    assert [c for c in rig.dispatcher.calls if c[1] == "/qwen/restore"] == []
+    assert rig.events("llm_not_restored") == [("llm_not_restored", {
+        "reason": "память карты не освободилась за 30 с после /free (46989 МиБ)"})]
 ```
 
 Тесты диспетчера (дописаны в конец файла) и литерал S2 (EngineSpec студии целиком, R-S2b-20):
@@ -6180,7 +6220,7 @@ Apply to `tests/test_gpu_dispatcher.py` (`git apply`; контекст — ко�
 
 ```diff
 diff --git a/tests/test_gpu_dispatcher.py b/tests/test_gpu_dispatcher.py
-index 507b221c..16be350b 100644
+index 507b221c..3842cafe 100644
 --- a/tests/test_gpu_dispatcher.py
 +++ b/tests/test_gpu_dispatcher.py
 @@ -750,7 +750,7 @@ def test_the_studio_engine_is_exactly_the_spec():
@@ -6192,7 +6232,7 @@ index 507b221c..16be350b 100644
  
  
  def test_acquire_comfy_studio_starts_the_measured_command(tmp_path, host):
-@@ -827,3 +827,128 @@ def test_http_unknown_engine_names_the_three(tmp_path, host):
+@@ -827,3 +827,179 @@ def test_http_unknown_engine_names_the_three(tmp_path, host):
      finally:
          server.shutdown()
          server.server_close()
@@ -6294,10 +6334,12 @@ index 507b221c..16be350b 100644
 +                                 "beside_qwen": "shared32"}) == (400, {"ok": False, "error": {
 +            "code": "bad_beside_qwen", "message": "beside_qwen: список профилей"}})
 +        assert post("/qwen/restore", {"keep": ["comfy-studio"]})[0] == 200
++        assert post("/qwen/restore", {})[0] == 200                     # the panel's call
 +    finally:
 +        server.shutdown()
 +    assert seen == [("acquire", "comfy-studio", "w", ["shared32"]),
-+                    ("acquire", "comfy-studio", "w", None), ("restore", ("comfy-studio",))]
++                    ("acquire", "comfy-studio", "w", None), ("restore", ("comfy-studio",)),
++                    ("restore", ())]
 +
 +
 +def test_the_profile_is_read_from_the_servers_context(monkeypatch):
@@ -6315,12 +6357,61 @@ index 507b221c..16be350b 100644
 +
 +        def __exit__(self, *exc):
 +            return False
-+    for ctx, profile in ((32768, "shared32"), (262144, None)):
++    for ctx, profile in ((32768, "shared32"), (262144, None), ("32768", None)):
 +        monkeypatch.setattr(gd.urllib.request, "urlopen", lambda url, timeout, c=ctx: Answer(c))
 +        assert gd.Host().qwen_profile() == profile
++
++    class Weird(Answer):                       # ред. 2.1: JSON that is not an object — no 500
++        def read(self):
++            return b"[]"
++    monkeypatch.setattr(gd.urllib.request, "urlopen", lambda url, timeout: Weird(0))
++    assert gd.Host().qwen_profile() is None
 +    monkeypatch.setattr(gd.urllib.request, "urlopen",
 +                        lambda url, timeout: (_ for _ in ()).throw(OSError("down")))
 +    assert gd.Host().qwen_profile() is None
++
++
++
++# ред. 2.1 (Codex r2, блокер 1): our engine already up must not let a task past the LLM
++
++
++def _studio_ready(tmp_path, host):
++    d = _dispatcher(tmp_path, host)
++    d.acquire("comfy-studio", "studio-worker")
++    host.ok_urls.add("http://127.0.0.1:8189/system_stats")
++    assert d.acquire("comfy-studio", "studio-worker", beside_qwen=[])["state"] == "ready"
++    return d
++
++
++@pytest.mark.parametrize("beside", [[], ["shared32"]])
++def test_an_llm_coming_back_holds_every_task_even_with_the_engine_ready(tmp_path, host, beside):
++    """Heavy batch → `/free` → `qwen_restore(keep=…)` → the next task arrives while the LLM has
++    not answered /health yet: it waits, it does not get `ready`."""
++    d = _studio_ready(tmp_path, host)
++    host.ok_urls.add(gd.QWEN_HEALTH)
++    d.qwen_unload()
++    host.ok_urls.discard(gd.QWEN_HEALTH)
++    assert d.qwen_restore(keep=("comfy-studio",))[0] == 200
++    assert d.acquire("comfy-studio", "studio-worker", beside_qwen=beside) == {
++        "ok": True, "state": "wait_qwen", "engine": "comfy-studio", "reason": "Qwen поднимается",
++        "foreign": []}
++    host.t += gd.QWEN_START_TIMEOUT + 1          # no LLM process, no health: the start failed
++    assert d.acquire("comfy-studio", "studio-worker", beside_qwen=beside)["state"] == "ready"
++
++
++def test_llm_processes_without_health_or_a_stranger_or_no_nvidia_smi_mean_wait(tmp_path, host):
++    d = _studio_ready(tmp_path, host)
++    host.apps = [{"pid": 900, "name": "python3", "memory_mb": 30000}]
++    host.cmdlines[900] = QWEN_CMD
++    host.pgids[900] = 900
++    assert d.acquire("comfy-studio", "studio-worker", beside_qwen=["shared32"])["reason"] == \
++        "Qwen поднимается"
++    host.cmdlines[900] = "/usr/bin/python3 other.py"
++    answer = d.acquire("comfy-studio", "studio-worker", beside_qwen=["shared32"])
++    assert (answer["state"], answer["reason"]) == ("wait", "GPU занята: python3 (pid 900, 30000 МБ)")
++    host.smi_down = "nvidia-smi failed"
++    assert d.acquire("comfy-studio", "studio-worker", beside_qwen=[])["state"] == "wait"
++    assert d.acquire("comfy-studio", "studio-worker")["state"] == "ready"   # pre-S2b call
 ```
 
 - [ ] **Step 2: Увидеть красным** — `{'engine': 'comfy-studio', 'client': 'studio-worker'} != {…, 'beside_qwen': ['shared32']}`; `KeyError: "unknown studio setting 'llm.restore_after_heavy'"`; `TypeError: EngineSpec.__init__() got an unexpected keyword argument 'coexists_with_qwen'`.
@@ -6331,10 +6422,10 @@ Apply to `tools/gpu-dispatcher/dispatcher.py` (`git apply`; контекст —
 
 ```diff
 diff --git a/tools/gpu-dispatcher/dispatcher.py b/tools/gpu-dispatcher/dispatcher.py
-index 5d0b2c19..49602508 100644
+index 5d0b2c19..4a7293ba 100644
 --- a/tools/gpu-dispatcher/dispatcher.py
 +++ b/tools/gpu-dispatcher/dispatcher.py
-@@ -44,6 +44,15 @@ SERVER_OUTPUTS = OUTPUTS / "h3-bench" / "server-outputs"
+@@ -44,6 +44,18 @@ SERVER_OUTPUTS = OUTPUTS / "h3-bench" / "server-outputs"
  STATE_PATH = Path(os.environ.get(
      "H3_DISPATCHER_STATE", str(Path.home() / ".local/state/h3-gpu-dispatcher/state.json")))
  QWEN_HEALTH = "http://127.0.0.1:8000/health"
@@ -6347,10 +6438,13 @@ index 5d0b2c19..49602508 100644
 +QWEN_MARKERS = ("sglang", "--port 8000")
 +#: The profile `qwen.sh start-shared32` (Host.start_qwen) brings back.
 +QWEN_RESTORE_PROFILE = "shared32"
++#: After `qwen_restore` the LLM counts as «starting» until /health answers — at most this long
++#: (LLM-PLUS-IMAGE §9.5: 82–153 s to health); past it, with no LLM process on the card, it failed.
++QWEN_START_TIMEOUT = 300.0
  STOP_GRACE_SECONDS = 120.0
  PROC = Path("/proc")
  
-@@ -62,6 +71,9 @@ class EngineSpec:
+@@ -62,6 +74,9 @@ class EngineSpec:
      start_timeout: float = 600.0
      variant: str | None = None
      label: str = ""
@@ -6360,7 +6454,7 @@ index 5d0b2c19..49602508 100644
  
  
  def engine_specs() -> dict[str, EngineSpec]:
-@@ -92,7 +104,8 @@ def engine_specs() -> dict[str, EngineSpec]:
+@@ -92,7 +107,8 @@ def engine_specs() -> dict[str, EngineSpec]:
                   "--output-directory", str(OUTPUTS / "comfy-h3"), "--listen", "127.0.0.1"),
              cwd=COMFY_H3, ready_url="http://127.0.0.1:8189/system_stats", port=8189,
              markers=("main.py", "--port 8189"), log_dir=COMFY_H3 / "logs",
@@ -6370,7 +6464,7 @@ index 5d0b2c19..49602508 100644
      }
  
  
-@@ -169,6 +182,15 @@ class Host:
+@@ -169,6 +185,15 @@ class Host:
          return parse_gpu_stats(self._run("nvidia-smi", "--query-gpu=temperature.gpu,memory.used,"
                                           "memory.total", "--format=csv,noheader,nounits"))
  
@@ -6378,15 +6472,15 @@ index 5d0b2c19..49602508 100644
 +        """The `qwen.sh` profile of the running Qwen-LLM by its context; None if unknown."""
 +        try:
 +            with urllib.request.urlopen(QWEN_INFO, timeout=3) as response:
-+                info = json.loads(response.read())
-+        except Exception:  # noqa: BLE001 -- not answering is "unknown profile"
++                context = json.loads(response.read()).get("context_length")
++            return QWEN_PROFILE_BY_CONTEXT.get(context) if isinstance(context, int) else None
++        except Exception:  # noqa: BLE001 -- not answering, not JSON, not a dict: unknown profile
 +            return None
-+        return QWEN_PROFILE_BY_CONTEXT.get(info.get("context_length"))
 +
      def url_ok(self, url: str) -> bool:
          try:
              with urllib.request.urlopen(url, timeout=3) as response:
-@@ -425,9 +447,21 @@ class Dispatcher:
+@@ -425,9 +450,19 @@ class Dispatcher:
              answer["gpu_error"] = "; ".join(errors)
          return answer
  
@@ -6399,17 +6493,15 @@ index 5d0b2c19..49602508 100644
          with self._ops:
              spec = self.specs[engine]
 +            beside = False
-+            if beside_qwen is not None and self.host.url_ok(QWEN_HEALTH):
-+                profile = self.host.qwen_profile()
-+                if profile is None or profile not in spec.coexists_with_qwen \
-+                        or profile not in beside_qwen:
-+                    return {"ok": True, "state": "wait_qwen", "engine": engine,
-+                            "reason": "Qwen держит карту", "foreign": []}
-+                beside = True
++            if beside_qwen is not None:
++                gate = self._studio_gate(engine, spec, client, beside_qwen)
++                if isinstance(gate, dict):
++                    return gate
++                beside = gate
              state = self._snapshot()
              record = state["engines"].get(engine)
              if record and not self._alive(engine, record):
-@@ -470,7 +504,10 @@ class Dispatcher:
+@@ -470,7 +505,10 @@ class Dispatcher:
              except HostError as exc:
                  return {"ok": True, "state": "wait", "engine": engine,
                          "reason": f"nvidia-smi недоступен: {exc}", "foreign": []}
@@ -6421,27 +6513,69 @@ index 5d0b2c19..49602508 100644
                  return {"ok": True, "state": "wait_qwen", "engine": engine,
                          "reason": "Qwen держит карту", "foreign": foreign}
              if foreign:
-@@ -519,7 +556,9 @@ class Dispatcher:
+@@ -519,7 +557,51 @@ class Dispatcher:
                          seconds=round(self.host.monotonic() - began, 1))
              return 200, {"ok": code == 0, "was_running": True, "exit_code": code}
  
 -    def qwen_restore(self) -> tuple[int, dict]:
++    def _is_qwen(self, pid: int) -> bool:
++        command = self.host.cmdline(pid) or ""
++        return all(marker in command for marker in QWEN_MARKERS)
++
++    def _studio_gate(self, engine: str, spec: EngineSpec, client: str, beside_qwen: list):
++        """Studio S2b, ред. 2.1 (Codex r2, блокер 1): BEFORE any `ready` — our engine may be up
++        already — look at the card: a foreign GPU process, or the LLM in any sign (its /health,
++        its processes, a restart we began and that has not answered yet), means wait, unless the
++        LLM answers and its profile is one this task and engine live beside. Not sure (no
++        nvidia-smi, no /health while LLM processes or a start are there) — wait. Returns the
++        answer to give, or whether the task goes beside the LLM."""
++        state = self._snapshot()
++        own = self._own_records(state)
++        try:
++            apps = self._foreign(own)
++        except HostError as exc:
++            return {"ok": True, "state": "wait", "engine": engine,
++                    "reason": f"nvidia-smi недоступен: {exc}", "foreign": []}
++        llm = [a for a in apps if self._is_qwen(a["pid"])]
++        other = [a for a in apps if not self._is_qwen(a["pid"])]
++        if other:
++            names = ", ".join(f"{a['name']} (pid {a['pid']}, {a['memory_mb']} МБ)" for a in other)
++            return {"ok": True, "state": "wait", "engine": engine,
++                    "reason": f"GPU занята: {names}", "foreign": other}
++        health = self.host.url_ok(QWEN_HEALTH)
++        since = state.get("qwen_starting_since")
++        if since is not None and (health or (not llm and self.host.wall() - since
++                                             > QWEN_START_TIMEOUT)):
++            self._update(lambda st: st.__setitem__("qwen_starting_since", None))
++            since = None
++        if not (health or llm or since is not None):
++            return False
++        if not health:
++            return {"ok": True, "state": "wait_qwen", "engine": engine,
++                    "reason": "Qwen поднимается", "foreign": []}
++        profile = self.host.qwen_profile()
++        if profile is None or profile not in spec.coexists_with_qwen or profile not in beside_qwen:
++            return {"ok": True, "state": "wait_qwen", "engine": engine,
++                    "reason": "Qwen держит карту", "foreign": []}
++        return True
++
 +    def qwen_restore(self, keep: tuple = ()) -> tuple[int, dict]:
 +        """`keep` (studio S2b): own engines that freed their memory (ComfyUI `POST /free`) and
-+        may stay — only those whose spec coexists with the profile `qwen.sh` brings back."""
++        may stay — only those whose spec coexists with the profile `qwen.sh` brings back; the
++        other own engines stop (the old panel is not used any more — owner 23.10)."""
          with self._ops:
              if not self._snapshot()["qwen_was_running"]:
                  return 409, {"ok": False, "error": {"code": "qwen_was_not_running",
-@@ -527,9 +566,18 @@ class Dispatcher:
+@@ -527,10 +609,24 @@ class Dispatcher:
              if self.host.url_ok(QWEN_HEALTH):      # someone already brought it back
                  self._update(lambda st: st.__setitem__("qwen_was_running", False))
                  return 200, {"ok": True, "state": "already_running"}
 -            self._release_all()
 +            kept = [e for e in keep if e in self.specs
 +                    and QWEN_RESTORE_PROFILE in self.specs[e].coexists_with_qwen]
-+            if kept:
-+                state = self._snapshot()
-+                for name, record in list(self._own_records(state).items()):
++            if keep:
++                own = self._own_records(self._snapshot())
++                for name, record in own.items():
 +                    if name not in kept:
 +                        self._stop(name, record)
 +                self._release_lock_if_idle()
@@ -6449,11 +6583,18 @@ index 5d0b2c19..49602508 100644
 +                self._release_all()
              self.host.start_qwen()
 -            self._event("qwen_restore", None)
+-            self._update(lambda st: st.__setitem__("qwen_was_running", False))
 +            self._event("qwen_restore", None, kept=kept)
-             self._update(lambda st: st.__setitem__("qwen_was_running", False))
++            now = self.host.wall()
++
++            def started(st):
++                st["qwen_was_running"] = False
++                st["qwen_starting_since"] = now
++            self._update(started)
              return 200, {"ok": True, "state": "starting"}
  
-@@ -597,13 +645,22 @@ def make_server(dispatcher: Dispatcher, host: str = "127.0.0.1", port: int = 879
+ 
+@@ -597,13 +693,24 @@ def make_server(dispatcher: Dispatcher, host: str = "127.0.0.1", port: int = 879
                      return self._send(400, {"ok": False, "error": {
                          "code": "unknown_engine",
                          "message": f"движок {engine!r}: {', '.join(sorted(dispatcher.specs))}"}})
@@ -6473,8 +6614,10 @@ index 5d0b2c19..49602508 100644
              if self.path == "/qwen/restore":
 -                return self._send(*dispatcher.qwen_restore())
 +                keep = body.get("keep") or []
-+                return self._send(*dispatcher.qwen_restore(tuple(k for k in keep
-+                                                                 if isinstance(k, str))))
++                if not keep:                  # the panel's call, as before S2b
++                    return self._send(*dispatcher.qwen_restore())
++                return self._send(*dispatcher.qwen_restore(
++                    tuple(k for k in keep if isinstance(k, str))))
              self._send(404, {"ok": False, "error": {"code": "not_found", "message": self.path}})
  
      server = ThreadingHTTPServer((host, port), Handler)
@@ -6484,7 +6627,7 @@ Apply to `h3_48gb/engines/dispatcher_client.py` (`git apply`; контекст �
 
 ```diff
 diff --git a/h3_48gb/engines/dispatcher_client.py b/h3_48gb/engines/dispatcher_client.py
-index 194c88a9..71f335c4 100644
+index 194c88a9..0146040c 100644
 --- a/h3_48gb/engines/dispatcher_client.py
 +++ b/h3_48gb/engines/dispatcher_client.py
 @@ -63,8 +63,13 @@ class DispatcherClient:
@@ -6503,14 +6646,15 @@ index 194c88a9..71f335c4 100644
  
      def release(self, everything: bool = False) -> dict:
          """Stop this client's engines; `everything=True` only for "Освободить карту"."""
-@@ -73,5 +78,5 @@ class DispatcherClient:
+@@ -73,5 +78,6 @@ class DispatcherClient:
      def qwen_unload(self) -> tuple[int, dict]:
          return self._call("POST", "/qwen/unload", {})
  
 -    def qwen_restore(self) -> tuple[int, dict]:
 -        return self._call("POST", "/qwen/restore", {})
 +    def qwen_restore(self, keep: list[str] | None = None) -> tuple[int, dict]:
-+        return self._call("POST", "/qwen/restore", {"keep": list(keep)} if keep else {})
++        body = {"keep": list(keep)} if keep else {}
++        return self._call("POST", "/qwen/restore", body)
 ```
 
 Apply to `h3_48gb/engines/comfy_api.py` (`git apply`; контекст — код после предыдущих задач):
@@ -6538,7 +6682,7 @@ Apply to `h3_48gb/studio/gpu.py` (`git apply`; контекст — код по�
 
 ```diff
 diff --git a/h3_48gb/studio/gpu.py b/h3_48gb/studio/gpu.py
-index f8a309d1..38d316ef 100644
+index f8a309d1..709ae3ab 100644
 --- a/h3_48gb/studio/gpu.py
 +++ b/h3_48gb/studio/gpu.py
 @@ -47,11 +47,13 @@ class DispatcherGate:
@@ -6558,23 +6702,36 @@ index f8a309d1..38d316ef 100644
              except DispatcherUnavailable as exc:
                  if wait(f"ждём GPU: диспетчер недоступен ({exc})", ACQUIRE_RETRY_SECONDS):
                      return True
-@@ -84,6 +86,15 @@ class DispatcherGate:
+@@ -84,6 +86,28 @@ class DispatcherGate:
      def done(self) -> None:
          """The engine stays up after a task (§8.4); the idle release gives it back."""
  
-+    def qwen_back(self) -> None:
-+        """S2b: after a heavy batch, ComfyUI freed (`/free`) — bring the LLM back and keep our
-+        engine (the dispatcher keeps only an engine that coexists with that profile)."""
++    def memory_used_mb(self) -> int | None:
++        """The card's used memory by nvidia-smi (the dispatcher's /status), None if unknown."""
 +        try:
-+            if (self.client.status().get("qwen") or {}).get("unloaded_by_us"):
-+                self.client.qwen_restore(keep=[self.engine])
++            gpu = self.client.status().get("gpu") or {}
 +        except DispatcherUnavailable:
-+            pass
++            return None
++        used = gpu.get("memory_used_mb")
++        return used if isinstance(used, int) else None
++
++    def qwen_back(self) -> str | None:
++        """S2b: after a heavy batch, ComfyUI freed (`/free`, memory confirmed by the worker) —
++        bring the LLM back and keep our engine. Returns why it did not, or None."""
++        try:
++            if not (self.client.status().get("qwen") or {}).get("unloaded_by_us"):
++                return None                          # we did not unload it: not ours to start
++            code, body = self.client.qwen_restore(keep=[self.engine])
++        except DispatcherUnavailable as exc:
++            return f"диспетчер недоступен ({exc})"
++        if code != 200:
++            return (body.get("error") or {}).get("message") or f"диспетчер ответил {code}"
++        return None
 +
  
  class LocalGate:
      """`local-mac`: an exclusive flock for the task's duration."""
-@@ -95,7 +106,7 @@ class LocalGate:
+@@ -95,7 +119,7 @@ class LocalGate:
          self.fd: int | None = None
          self.acquired = threading.Event()
  
@@ -6583,12 +6740,16 @@ index f8a309d1..38d316ef 100644
          if self.fd is not None:      # already ours: a second fd would leak and hold the lock for ever
              return False
          self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-@@ -116,6 +127,9 @@ class LocalGate:
+@@ -116,6 +140,13 @@ class LocalGate:
              os.close(self.fd)
              self.fd = None
  
-+    def qwen_back(self) -> None:
++    def memory_used_mb(self) -> int | None:
++        return None
++
++    def qwen_back(self) -> str | None:
 +        """No dispatcher on the Mac."""
++        return None
 +
  
  class IdleRelease:
@@ -6623,7 +6784,7 @@ Apply to `h3_48gb/studio/worker.py` (`git apply`; контекст — код п
 
 ```diff
 diff --git a/h3_48gb/studio/worker.py b/h3_48gb/studio/worker.py
-index 5037c24f..274382c5 100644
+index 5037c24f..ed6309f9 100644
 --- a/h3_48gb/studio/worker.py
 +++ b/h3_48gb/studio/worker.py
 @@ -13,7 +13,7 @@ import threading
@@ -6635,7 +6796,19 @@ index 5037c24f..274382c5 100644
  from h3_48gb.studio.errors import StudioError
  from h3_48gb.studio.executors.base import ExecutorError, SubmitUncertain
  from h3_48gb.studio.gpu import GpuEngineFailed
-@@ -68,8 +68,27 @@ class Worker:
+@@ -27,6 +27,11 @@ READY_TIMEOUT_SECONDS = 600.0      # the dispatcher's start_timeout for ComfyUI
+ CANCEL_WAIT_SECONDS = 30.0         # §8.5: then cancelled with engine_stop=unconfirmed
+ MAX_STATUS_ERRORS = 30             # consecutive failed status reads before submit_unknown
+ MAX_ATTEMPTS = 2                   # §8.5: lost -> one automatic retry
++#: S2b ред. 2.1: after `/free` the card counts as empty below this (ComfyUI keeps ≈471 MiB of
++#: context, LLM-PLUS-IMAGE §9.4); polled once a second, at most 30 times.
++FREED_MEMORY_MB = 2048
++FREE_POLL_SECONDS = 1.0
++FREE_WAIT_POLLS = 30
+ 
+ 
+ class Worker:
+@@ -68,8 +73,47 @@ class Worker:
          if task is None:
              return False
          self._execute(task)
@@ -6657,13 +6830,33 @@ index 5037c24f..274382c5 100644
 +            return
 +        if not getattr(self.executor, "free", lambda: False)():
 +            return
-+        if settings.get(self.conn, "llm.restore_after_heavy") == "1":
-+            self.gate.qwen_back()
++        if settings.get(self.conn, "llm.restore_after_heavy") != "1":
++            return
++        # ред. 2.1 (Codex r2, блокер 2): a 200 from /free is not an empty card — the LLM comes
++        # back only once the card's memory is down (LLM-PLUS-IMAGE §9.6: 471 MiB after /free)
++        used = None
++        for _ in range(FREE_WAIT_POLLS):
++            used = self.gate.memory_used_mb()
++            if used is not None and used <= FREED_MEMORY_MB:
++                break
++            self.sleep(FREE_POLL_SECONDS)
++        else:
++            self._llm_not_restored(f"память карты не освободилась за "
++                                   f"{FREE_WAIT_POLLS * FREE_POLL_SECONDS:g} с после /free"
++                                   + (f" ({used} МиБ)" if used is not None else ""))
++            return
++        why = self.gate.qwen_back()
++        if why:
++            self._llm_not_restored(why)
++
++    def _llm_not_restored(self, reason: str) -> None:
++        with db.tx(self.conn):
++            events.emit(self.conn, "llm_not_restored", payload={"reason": reason})
 +
      def _claim(self) -> sqlite3.Row | None:
          with db.tx(self.conn):
              for kind in self.kinds.values():
-@@ -127,7 +146,10 @@ class Worker:
+@@ -127,7 +171,10 @@ class Worker:
              self._fail(task["id"], f"входы задачи не собрались: {err}")
              return
          try:
@@ -6753,7 +6946,7 @@ Apply to `tests/_fake_dispatcher.py` (`git apply`; контекст — код �
 
 ```diff
 diff --git a/tests/_fake_dispatcher.py b/tests/_fake_dispatcher.py
-index 2e47d997..7f650594 100644
+index 2e47d997..8d9d56a2 100644
 --- a/tests/_fake_dispatcher.py
 +++ b/tests/_fake_dispatcher.py
 @@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -6761,20 +6954,27 @@ index 2e47d997..7f650594 100644
      def __init__(self, *, acquire=({"ok": True, "state": "ready", "engine": "h3"},),
                   temps=(44,), own=None, restore_status=200, gpu_null=False,
 -                 on_release=None):
-+                 on_release=None, qwen=None):
++                 on_release=None, qwen=None, memory=(100,)):
          self.headers: list[dict] = []
          self.calls: list[tuple[str, str, dict]] = []
          self._acquire = list(acquire)
-@@ -18,6 +18,7 @@ class FakeDispatcher:
+@@ -18,6 +18,8 @@ class FakeDispatcher:
          self.restore_status = restore_status
          self.gpu_null = gpu_null
          self.on_release = on_release
 +        self.qwen = qwen or {"running": False, "unloaded_by_us": False}   # S2b
++        self._memory = list(memory)          # S2b ред. 2.1: memory_used_mb, one per /status
          self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
          self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
          threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-@@ -38,7 +39,7 @@ class FakeDispatcher:
-                    "memory_total_mb": 65536}
+@@ -34,11 +36,11 @@ class FakeDispatcher:
+         if self.gpu_null:   # nvidia-smi is down on the host (dispatcher: gpu null + gpu_error)
+             gpu = None
+         else:
+-            gpu = {"temperature_c": self._next(self._temps), "memory_used_mb": 100,
+-                   "memory_total_mb": 65536}
++            gpu = {"temperature_c": self._next(self._temps),
++                   "memory_used_mb": self._next(self._memory), "memory_total_mb": 65536}
          return {"ok": True, "own": self.own, "foreign": [], "gpu": gpu,
                  **({"gpu_error": "nvidia-smi недоступен"} if self.gpu_null else {}),
 -                "qwen": {"running": False, "unloaded_by_us": False},
@@ -6788,7 +6988,7 @@ Apply to `tests/_studio_rig.py` (`git apply`; контекст — код пос
 
 ```diff
 diff --git a/tests/_studio_rig.py b/tests/_studio_rig.py
-index ff762482..48910647 100644
+index ff762482..f602f475 100644
 --- a/tests/_studio_rig.py
 +++ b/tests/_studio_rig.py
 @@ -24,10 +24,10 @@ READY = {"ok": True, "state": "ready", "engine": "comfy-studio"}
@@ -6796,23 +6996,25 @@ index ff762482..48910647 100644
  class Rig:
      def __init__(self, tmp_path: Path, *, acquire=(READY,), comfy_kwargs=None, kinds=None,
 -                 own=None, llm=None):
-+                 own=None, llm=None, qwen=None):
++                 own=None, llm=None, qwen=None, memory=(100,)):
          self.outdir = tmp_path / "out"
          self.comfy = FakeComfyStudio(tmp_path / "comfy-out", **(comfy_kwargs or {}))
 -        self.dispatcher = FakeDispatcher(acquire=acquire, own=own)
-+        self.dispatcher = FakeDispatcher(acquire=acquire, own=own, qwen=qwen)
++        self.dispatcher = FakeDispatcher(acquire=acquire, own=own, qwen=qwen, memory=memory)
          self.client = TestClient(
              create_app(self.outdir, llm=llm or ScriptedLlm([]),
                         dispatcher_factory=lambda url, client: DispatcherClient(
 ```
 
-- [ ] **Step 4: Зелёный** — `tests/test_studio_image_llm.py` 4 passed, `tests/test_gpu_dispatcher.py` 61 passed (старые тесты `h3`/`ltx`/панели — без правок), `test_gpu_gate.py`, `test_studio_gpu_gate.py` — зелёные; полный набор — 0 failed.
+- [ ] **Step 4: Зелёный** — `tests/test_studio_image_llm.py` 6 passed, `tests/test_gpu_dispatcher.py` 65 passed (старые тесты `h3`/`ltx`/панели — без правок), `test_gpu_gate.py`, `test_studio_gpu_gate.py` — зелёные; полный набор — 0 failed.
 
 - [ ] **Step 5: Мутации**
 1. В `acquire` убрать `or profile not in beside_qwen` → `assert {'ok': True, …'comfy-studio'} == {'ok': True, …'Qwen держит карту'…}` (тяжёлая задача пошла бы рядом с LLM).
 2. Не отфильтровывать процессы Qwen (`if beside:` → `if False:`) → `IndexError: list index out of range` в `test_a_picture_that_fits_beside_shared32_starts_the_studio_engine` (движок не стартовал: Qwen — «чужой»).
 3. В `_after_heavy` убрать проверку тяжёлой задачи следом → `assert [{'unload_mod…}, {'unload_mod…}] == [{'unload_mod…}]` (`/free` после каждой задачи партии).
 4. `is_heavy` → `False` → `assert [] == [{'unload_models': True, 'free_memory': True}]`.
+5. (ред. 2.1, блокер 1) проверка карты только при живом `/health` (`if beside_qwen is not None and self.host.url_ok(QWEN_HEALTH):`) → `assert {'ok': True, …'comfy-studio'} == {'ok': True, …'Qwen поднимается'…}` в `test_an_llm_coming_back_holds_every_task_even_with_the_engine_ready` (готовый движок пропускал тяжёлую задачу, пока LLM поднимается).
+6. (ред. 2.1, блокер 2) без ожидания памяти (`for _ in range(0):`) → `assert [] == [('/qwen/restore', {'keep': ['comfy-studio']})]`; без проверки порога (`break` сразу) → `['/acquire', … '/qwen/restore'] != ['/status', '/status', '/status', '/status', '/qwen/restore']` в `test_the_llm_comes_back_only_once_the_card_is_really_empty`.
 
 - [ ] **Step 6: Коммит** — `feat(studio,dispatcher): Krea 2 и Z-Image рядом с Qwen-LLM shared32; /free и возврат LLM после тяжёлой партии (S2b задача 12)`.
 
@@ -6833,7 +7035,7 @@ index ff762482..48910647 100644
   - `ImagePanel` — поля «Идея», «Промпт» (находки линта под полем: `warning` — `warn`, `error` — красная рамка), блок «В модель уйдёт · EN» с моно-меткой `ПЕРЕВЕДЕНО`/`ПЕРЕВОЖУ…`/`ПРАВЛЕНО ВРУЧНУЮ`, таблетки моделей с `badge` из O32 (недоступная — `disabled` с `reason`), сегмент «Быстро / Полное» у Qwen, чипы `1:1 · 16:9 · 9:16 · 4:3 · 3:4`, класс размера из `presets` выбранного соотношения, «Своё» Ш × В, кнопка LI2 «Округлить до {fix}», сид «Авто/Свой» (Inter Tight 30px, при «Авто» — «случайный»), «Вариантов» 1–8, «Ещё настройки» — шаги; главная кнопка 48px с `buttonLabel`, при `error`/`blocked` — `disabled` и причина словами. Сухой план запрашивается после каждой успешной O29 (дебаунс 400 мс); 409 `models_unchecked` — надпись «Проверяю модели, ≈1 мин», повтор по событию `inventory_checked`.
   - `test/imageServer.ts`: `draft(over) -> ImageDraft` (черновик по умолчанию: Krea 2, 1344×768, авто-сид, 4 варианта, `edit_version 0`), `snapshot(draft) -> ImageSnapshot`, `imageServer(state) -> routes` для `stubFetch`.
   - `AutoTranslate({pid, draft, onChanged, delayMs = 1500})` — `onChanged(draft)` получает новый черновик (из ответа O28 или из перечитанного снимка).
-  - Повтор с `differs` (ред. 2, Codex №6): перед подтверждением повтора мастер показывает под кнопкой одну строку по первому из `differs`: `template` — «шаблон обновлён — картинка может отличаться», `weights` — «веса изменились — картинка может отличаться», `engine` — «другая версия ComfyUI или неизвестна — повтор не гарантирован»; при пустом `differs` строки нет.
+  - Повтор с `differs` (ред. 2, Codex №6; компонент `RepeatNotice({differs})`, `role="note"`, ред. 2.1): перед подтверждением повтора мастер показывает под кнопкой одну строку по первому из `differs`: `template` — «шаблон обновлён — картинка может отличаться», `weights` — «веса изменились — картинка может отличаться», `engine` — «другая версия ComfyUI или неизвестна — повтор не гарантирован»; при пустом `differs` строки нет.
   - События (ред. 2, стык с фиксом S2 задачи 8): снимок перечитывается и по `task_status {task_id, status, wait_reason}` — карточка ждущего варианта показывает `wait_reason` словами; «Отменить партию» шлёт O14 по каждой незавершённой задаче, включая `submit_unknown` (O14 переводит её в `cancelled`).
   - `VariantFilm` — партии сверху вниз, подпись `№ 3 · Z-IMAGE · 16:9 · 4 ВАР.`, кадр ≈220px, моно-сид, «Годится» 36px на всю ширину, «⋯»: «Повторить» (`repeatable.ok`, иначе пункт `disabled` с `reason`), «Сид в поле» (O29 `{seed_mode: "manual", seed}`), «Скачать PNG» (`asset_url`); ждущий — серый кадр «шаг 5/8» и «×» (O14); «Отменить партию» — O14 по каждой незавершённой; «Ещё 4» в конце ленты.
 
@@ -6913,6 +7115,29 @@ describe("AutoTranslate", () => {
     expect(onChanged).toHaveBeenLastCalledWith(expect.objectContaining({ edit_version: 6, prompt_en: "A poster, night.", prompt_en_state: "fresh" }));
   });
 
+  it("a translation that comes back after a newer edit is not shown", async () => {
+    // Ред. 2.1 (Codex r2, №8): ответ к правке 4 приходит, когда владелец уже набрал правку 5 —
+    // мастер не передаёт его наверх и переводит снова для версии 5.
+    vi.useFakeTimers();
+    let answer!: (r: { status?: number; body: unknown }) => void;
+    const calls = stubFetch({
+      "POST /api/studio/projects/p_1/image/propose": [
+        () => new Promise((resolve) => { answer = resolve; }),
+        { body: { draft: draft({ prompt_en_state: "fresh", edit_version: 6, prompt_ru: "Афиша, ночь", prompt_en: "A poster, night." }), lint: [], suggested_aspect: null } },
+      ],
+    });
+    const onChanged = vi.fn();
+    const { rerender } = render(<AutoTranslate pid="p_1" draft={draft({ prompt_en_state: "stale", edit_version: 4, prompt_ru: "Афиша" })} onChanged={onChanged} />);
+    await act(() => vi.advanceTimersByTimeAsync(1500));
+    rerender(<AutoTranslate pid="p_1" draft={draft({ prompt_en_state: "stale", edit_version: 5, prompt_ru: "Афиша, ночь" })} onChanged={onChanged} />);
+    await act(async () => answer({ body: { draft: draft({ prompt_en_state: "fresh", edit_version: 5, prompt_ru: "Афиша", prompt_en: "A poster." }), lint: [], suggested_aspect: null } }));
+    expect(onChanged).not.toHaveBeenCalled();
+    await act(() => vi.advanceTimersByTimeAsync(1500));
+    expect(calls.map((c) => c.body)).toEqual([
+      { mode: "translate", expected_edit_version: 4 }, { mode: "translate", expected_edit_version: 5 }]);
+    expect(onChanged).toHaveBeenLastCalledWith(expect.objectContaining({ edit_version: 6, prompt_en: "A poster, night." }));
+  });
+
   it("after 409 with the English now the owner's it does not ask again", async () => {
     vi.useFakeTimers();
     const calls = stubFetch({
@@ -6928,6 +7153,31 @@ describe("AutoTranslate", () => {
 });
 ```
 
+```tsx
+// web/src/screens/image/RepeatNotice.test.tsx — ред. 2.1 (Codex r2, №6): строка под «Повторить»
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+import { RepeatNotice } from "./RepeatNotice";
+
+describe("RepeatNotice", () => {
+  it.each([
+    [["template"], "шаблон обновлён — картинка может отличаться"],
+    [["weights", "engine"], "веса изменились — картинка может отличаться"],
+    [["engine"], "другая версия ComfyUI или неизвестна — повтор не гарантирован"],
+  ])("differs %j shows exactly one line", (differs, text) => {
+    render(<RepeatNotice differs={differs} />);
+    expect(screen.getByRole("note").textContent).toBe(text);
+  });
+
+  it("an empty differs shows nothing", () => {
+    const { container } = render(<RepeatNotice differs={[]} />);
+    expect(container.textContent).toBe("");
+  });
+});
+```
+
+`ImageScreen.test.tsx` дополнительно: «⋯ → Повторить» над вариантом, у которого O10 отвечает `items[0].differs = ["weights"]`, показывает `role="note"` с текстом «веса изменились — картинка может отличаться» до нажатия «Подтвердить» и не показывает его при `differs: []` (тело O10 — `{kind: "image_set", repeat_variant_id: "v_2"}`).
+
 `web/src/screens/image/ImageScreen.test.tsx`, тест «idea → prompt → Krea 2 → «Сделать 4 варианта» → «Годится» → «Повторить»» (шаги 2–7 §19.1) против `imageServer` — мини-сервера с правилами O3, O28, O29, O10 `image_set`, O30, O31, O32 из §19.4 (как `sceneServer.ts` S1: обработчики `stubFetch`, состояние в замыкании). Тест пиннит **тела запросов целиком и по порядку**: `[["POST …/image/propose", {mode: "idea", expected_edit_version: 0}], ["POST …/plan", {kind: "image_set"}], ["POST …/image/batches", {plan_id: "pl_1"}], ["POST /api/studio/image-variants/v_2/keep", {kept: true}], ["POST …/plan", {kind: "image_set", repeat_variant_id: "v_2"}], ["POST …/image/batches", {plan_id: "pl_2"}]]`, заголовок `Idempotency-Key` — новый на каждое нажатие (два разных значения); кнопка называется ровно «Сделать 4 варианта · ≈ 24 с» (Krea 4 × 6 с, смен нет); сид варианта виден моно-цифрами; при LI8 кнопка `disabled` с текстом «Перевод устарел…»; у Z-Image под полем промпта — предупреждение LI1 с текстом сервера; таблетка недоступной модели — `disabled` с причиной «файла … нет на alex-neuro»; LI2 — кнопка «Округлить до 2048×1088» шлёт O29 `{width: 2048, height: 1088}`.
 
 - [ ] **Step 3: Увидеть красным** — `Failed to resolve import "./frame"` / `"./AutoTranslate"` (модулей нет).
@@ -6941,7 +7191,8 @@ describe("AutoTranslate", () => {
 2. В `frameFits` допуск `0.03` → `[true, true, true, false, false, true]`.
 3. Один `Idempotency-Key` на оба нажатия → тест `ImageScreen` (ключи различны) красный.
 4. (ред. 2) После 409 не перечитывать снимок, а повторять с прежней версией → первый тест «after 409…» красный (тело второго POST — `expected_edit_version: 4`).
-5. (ред. 2) Строка `differs` не показывается → тест «повтор: веса изменились» (в `ImageScreen.test.tsx`, ответ плана с `differs: ["weights"]`) красный.
+5. (ред. 2) Строка `differs` не показывается → `RepeatNotice.test.tsx` и тест повтора в `ImageScreen.test.tsx` красные.
+6. (ред. 2.1) `AutoTranslate` передаёт наверх любой пришедший ответ (без сверки с текущей `edit_version`) → «a translation that comes back after a newer edit is not shown» красный.
 
 - [ ] **Step 7: Коммит** — `feat(studio-web): экран «Картинка» на десктопе — поля, автоперевод, модели, формат, сид, лента вариантов (S2b задача 13)`.
 
@@ -6999,7 +7250,7 @@ test("390 px: no horizontal overflow, the main button stays at the bottom", asyn
 **Interfaces:** — (выкладка). Порядок — как задача 10 плана S2–S3: без «да» владельца ничего не выкладывается; старая панель :8765 не трогается.
 
 - [ ] **Step 1: Тест compose** — в `test_studio_deploy_scripts.py` по образцу S2: `services["studio-worker"]["volumes"]` содержит ровно `"<каталог моделей>:/models:ro"` (литерал), `studio-api` — нет. Красный до правки compose, зелёный после; мутация `:ro` → `:rw` — красная.
-- [ ] **Step 1b (координатор, alex-neuro, только чтение): опознание Qwen-LLM для задачи 12** — при поднятом `qwen.sh start-shared32`: `curl -s 127.0.0.1:8000/get_server_info | python3 -c 'import json,sys; print(json.load(sys.stdin)["context_length"])'` → `32768`; `nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -I{} sh -c 'tr "\0" " " </proc/{}/cmdline; echo'` — у процессов LLM в строке есть и `sglang`, и `--port 8000`. Если нет — поправить `QWEN_MARKERS`/`QWEN_PROFILE_BY_CONTEXT` (и тесты задачи 12) до выкладки.
+- [ ] **Step 1b (координатор, alex-neuro, только чтение): опознание Qwen-LLM для задачи 12** (ред. 2.1, Codex r2 №9: до этой проверки безопасное умолчание уже в коде — процесс, не опознанный как LLM, считается чужим и задача ждёт; неизвестный профиль — `wait_qwen`) — при поднятом `qwen.sh start-shared32`: `curl -s 127.0.0.1:8000/get_server_info | python3 -c 'import json,sys; print(json.load(sys.stdin)["context_length"])'` → `32768`; `nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -I{} sh -c 'tr "\0" " " </proc/{}/cmdline; echo'` — у процессов LLM в строке есть и `sglang`, и `--port 8000`. Если нет — поправить `QWEN_MARKERS`/`QWEN_PROFILE_BY_CONTEXT` (и тесты задачи 12) до выкладки.
 - [ ] **Step 2 (координатор, после «да» владельца): выкладка.** Диспетчер — новой версией `dispatcher.py` со скриптом отката S2 (`scripts/studio_dispatcher_rollback.py`, задача 10 S2–S3); старая панель после перезапуска диспетчера отвечает как раньше (`/status`, `/acquire` от `panel-worker`). Бэкап базы (`db.backup_once`), `git pull` ветки на alex-neuro, `docker compose -f compose.studio.yaml build && up -d`; миграция 004 — при старте `studio-api`; `python -m h3_48gb.studio setting comfy.model_roots '["/models"]' --outdir …` (в контейнере воркера). Ждать событие `inventory_checked` (первый проход ≈1 мин: 30 ГБ sha256); `GET /api/studio/image-models` — три модели `installed: true`, у Qwen оба профиля.
 - [ ] **Step 3: Живой контракт** (GPU через диспетчер, `comfy-studio` поднят студией; на alex-neuro, где читается output ComfyUI):
 
@@ -7013,7 +7264,7 @@ $PY -m pytest -q tests/test_studio_image_templates.py::test_live_picture_contrac
 Expected: 4 passed — граф = литерал теста, пиксели повтора равны. Затем (задача 12) вживую: `qwen.sh start-shared32`, партия Krea 2 и Z-Image — задачи идут без «Qwen держит карту», пик карты (`nvidia-smi`) ≤ 62 ГБ; партия Qwen-Image — ждёт «Qwen держит карту», «Освободить» → партия → `POST /free`; при `setting llm.restore_after_heavy 1` LLM поднимается рядом с ComfyUI студии, ответ «Сценариста» после подъёма — нормальный. Затем `verified_on` карточек картинок дописывается строкой этого прогона (дата, ComfyUI, `prompt_id`), копии — `cp` (тест побайтного равенства).
 - [ ] **Step 4: §15.4 п.18–20 вживую** — (18) `h3-fl2va` от PNG 1920×1088 и 1664×928 при холсте 896×512: кадр 0 глазами; (19) Qwen «Быстро» на 1328², 1664×928, 1920×1088: время, пик (`nvidia-smi`), вид; (20) Qwen → H3 fl2va подряд: время и пик. Итоги — в `docs/h3-modes/` отчётом и решения по исходу (допуск L7d, `presets` профиля, цена возврата H3) — правкой карточек/спеки отдельным коммитом.
 - [ ] **Step 5: Приёмка владельца** — владелец сам в `http://alex-neuro:8766/studio` (и с телефона): «Новый» → «Картинка» → идея по-русски с надписью в кавычках → «Предложить промпт» → правит русский, видит, как обновляется английский → Krea 2 → «Сделать 4 варианта» → сиды видны → «Годится» → «Повторить» — та же картинка → Qwen «Быстро» и Z-Image (надпись кириллицей — предупреждение) → «В сцену…» сцены 1 видеопроекта 16:9 → в шаге 4 видеопроекта кадр на месте; квадратный вариант — «В сцену…» неактивна с причиной, «В кастинг…» работает. Журнал прохода — в отчёт; дефекты — задачами.
-- [ ] **Step 6: Откат** (если приёмка не прошла): предыдущий образ `studio-*` (`docker compose … up -d` с прежним тегом), база — из бэкапа шага 2 (миграция 004 вниз не идёт); диспетчер и панель S2b не меняла.
+- [ ] **Step 6: Откат** (если приёмка не прошла): предыдущий образ `studio-*` (`docker compose … up -d` с прежним тегом), база — из бэкапа шага 2 (миграция 004 вниз не идёт). **Диспетчер S2b меняла (задача 12)** — вернуть его к версии S2: `git -C ~/Projects/minimax-h3-mlx-48gb show <коммит S2>:tools/gpu-dispatcher/dispatcher.py > <путь юнита>/dispatcher.py`, `systemctl --user restart h3-gpu-dispatcher`; `state.json` совместим (лишний ключ `qwen_starting_since` диспетчер S2 не читает). Старая панель не используется — гарантий для неё нет (решение владельца 23.10).
 - [ ] **Step 7: Коммит** — `chore(studio): выкладка S2b — том весов воркеру, verified_on картинок, приёмка (S2b задача 15)`.
 
 ---
@@ -7043,7 +7294,7 @@ Expected: 4 passed — граф = литерал теста, пиксели по
 |---|---|---|---|
 | 1 | повтор с новым сидом | 8 | `test_a_repeat_carries_the_variants_inputs_byte_for_byte`: `assert (196419009, …) == (1914716332, …)` |
 | 2 | авто-сид не доходит до графа | 10 | `test_one_task_per_variant_each_with_its_seed_in_the_graph` (сид исключён из values → `assert [] == [{'1': …` — задачи упали, граф не ушёл) |
-| 3 | партия одной задачей | 10 | выражено как «задач меньше, чем вариантов» (`for item in plan["items"][:1]`) — `assert 1 == 3` (`drain()`); граф с `batch_size>1` отсёк бы литерал (`batch_size: 1` в `expected_graph`); входа `batch_size` у карточки нет, мутацию самого `batch_size` не гоняли |
+| 3 | партия одной задачей с `batch_size=N` | 10 | ред. 2.1 прогнано буквально: карточке Krea добавлен вход `batch_size` (узел 6), `enqueue_batch` ставит одну задачу с `batch_size = N` — `assert 1 == 3` (`drain()`) в `test_one_task_per_variant_each_with_its_seed_in_the_graph`; граф такой задачи отсёк бы и литерал (`batch_size: 1`) |
 | 4 | снять триггер И14 | 2 | `Failed: DID NOT RAISE IntegrityError` |
 | 5 | `width`/`height` местами при подстановке | 10 | граф ≠ литералу (`assert [{'1': … == [{'1': …`) |
 | 6 | инвертировать LI1 | 4 | `Left contains one more item: {'rule': 'LI1', … 'Krea 2: кириллица в надписях не проверена'}` |
@@ -7090,7 +7341,7 @@ Expected: 4 passed — граф = литерал теста, пиксели по
 
 ## Числа
 
-База `studio/s2 afe05dcc`: 679 тестов набора `test_studio_*.py test_comfy_api.py test_gpu_dispatcher.py test_ltx_upscale.py test_gpu_gate.py`. После задач 1–12: 804 passed, 2 skipped. Новых тестовых файлов 12 (`test_studio_image_{templates,db,lint,project,draft,prompt,plan,batch,worker,path,llm}.py`, `test_studio_inventory.py`), помощник `_studio_images.py`, 7 тестов (11 с параметрами) дописано в `test_gpu_dispatcher.py`. Задач — 15 (12 Python, 2 мастер, 1 выкладка).
+База `studio/s2 afe05dcc`: 679 тестов набора `test_studio_*.py test_comfy_api.py test_gpu_dispatcher.py test_ltx_upscale.py test_gpu_gate.py`. После задач 1–12: 809 passed, 2 skipped. Новых тестовых файлов 12 (`test_studio_image_{templates,db,lint,project,draft,prompt,plan,batch,worker,path,llm}.py`, `test_studio_inventory.py`), помощник `_studio_images.py`, 7 тестов (11 с параметрами) дописано в `test_gpu_dispatcher.py`. Задач — 15 (12 Python, 2 мастер, 1 выкладка).
 
 ## Execution Handoff
 
