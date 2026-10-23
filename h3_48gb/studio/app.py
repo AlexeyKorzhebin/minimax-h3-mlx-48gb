@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +20,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from h3_48gb.engines.dispatcher_client import DispatcherClient, DispatcherUnavailable
 from h3_48gb.studio import (assets, config, db, events, idempotency, ops, plans, schemas,
                             settings, tasks)
-from h3_48gb.studio.executors.comfy import ComfyExecutor
+from h3_48gb.engines.comfy_api import ComfyApi
+from h3_48gb.studio.executors.comfy import PROBE_TASK_ID, ComfyExecutor
 from h3_48gb.studio.errors import StudioError
 from h3_48gb.studio.llm import Llm, ProviderLlm
 
@@ -156,6 +158,10 @@ class BodyLimit:
 #: worker's engine — never the old panel's (`release_all` is the panel's own button).
 STUDIO_WEB = "studio-web"
 STUDIO_WORKER = "studio-worker"
+#: O22 asks ComfyUI often (the screen polls it): a short timeout, one `/object_info` per request
+#: and the answer kept for a few seconds.
+EXECUTORS_TTL_S = 10.0
+EXECUTORS_TIMEOUT_S = 5.0
 
 
 def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
@@ -333,22 +339,40 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
     def cancel_task(task_id: str, body: schemas.CancelRequest, conn=Depends(get_conn)):
         return tasks.cancel_task(conn, task_id, reason=body.reason)
 
+    executors_cache: dict = {}
+
     @app.get(f"{api}/executors")
     def executors(conn=Depends(get_conn)):
         conf = settings.all_settings(conn)
+        key = (conf["comfy.url"], conf["comfy.output_dir"], conf["comfy.scope"])
+        hit = executors_cache.get("hit")
+        if hit and hit[0] == key and time.monotonic() - hit[1] < EXECUTORS_TTL_S:
+            return hit[2]
+        comfy = ComfyApi(conf["comfy.url"], timeout=EXECUTORS_TIMEOUT_S)
+        object_info = comfy.object_info
+        seen: list = []
+
+        def object_info_once():
+            if not seen:
+                seen.append(object_info())
+            return seen[0]
+        comfy.object_info = object_info_once            # three templates, one request
         executor = ComfyExecutor(url=conf["comfy.url"], output_dir=Path(conf["comfy.output_dir"]),
-                                 scope=conf["comfy.scope"])
+                                 scope=conf["comfy.scope"], api=comfy)
         from h3_48gb.studio import templates
         from h3_48gb.studio.executors.base import TaskSpec
-        probes = {t: executor.probe(TaskSpec(task_id="probe", template=t, values={},
+        probes = {t: executor.probe(TaskSpec(task_id=PROBE_TASK_ID, template=t, values={},
                                              dest_dir=home))
                   for t in templates.IDS}
         alive = all(p["alive"] for p in probes.values())
         ready = all(p["ready"] for p in probes.values())
         detail = "; ".join(f"{t}: {p['detail']}" for t, p in probes.items() if not p["ready"])
-        return [{"name": executor.name, "address": conf["comfy.url"], "scope": conf["comfy.scope"],
-                 "alive": alive, "ready": ready, "capabilities": executor.capabilities,
-                 "detail": detail or "готов", "templates": probes}]
+        answer = [{"name": executor.name, "address": conf["comfy.url"],
+                   "scope": conf["comfy.scope"], "alive": alive, "ready": ready,
+                   "capabilities": executor.capabilities, "detail": detail or "готов",
+                   "templates": probes}]
+        executors_cache["hit"] = (key, time.monotonic(), answer)
+        return answer
 
     def dispatcher_for(conn, client: str):
         conf = settings.all_settings(conn)
@@ -371,6 +395,13 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
 
     @app.post(f"{api}/gpu/release")
     def gpu_release(conn=Depends(get_conn)):
+        marks = ", ".join("?" for _ in tasks.ON_ENGINE)
+        busy = conn.execute(f"SELECT id FROM task WHERE status IN ({marks}) ORDER BY rowid",
+                            tasks.ON_ENGINE).fetchall()
+        if busy:
+            raise StudioError(409, "task_running",
+                              "Идёт рендер — сначала отмените задачу",
+                              {"task_ids": [r["id"] for r in busy]})
         client = dispatcher_for(conn, STUDIO_WORKER)
         return dispatcher_call(lambda: client.release(everything=False))
 

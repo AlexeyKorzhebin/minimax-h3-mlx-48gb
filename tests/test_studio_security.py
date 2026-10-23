@@ -44,6 +44,8 @@ CROSS = {"Origin": "http://evil.example"}
     ("PUT", "/api/studio/projects/p_x/scenes", {"json": {"expected_revision": 1, "scenes": []}}),
     ("POST", "/api/studio/assets", {"files": {"file": ("a.png", b"x")}}),
     ("DELETE", "/api/studio/projects/p_x", {}),
+    ("POST", "/api/studio/gpu/release", {}),
+    ("POST", "/api/studio/tasks/k_x/cancel", {"json": {"reason": ""}}),
 ])
 def test_a_changing_request_from_another_site_is_403(app, method, path, kwargs):
     r = _client(app, "alex-neuro:8766").request(method, path, headers=CROSS, **kwargs)

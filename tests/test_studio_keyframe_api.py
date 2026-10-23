@@ -12,7 +12,8 @@ from _fake_comfy_studio import FakeComfyStudio
 from _fake_dispatcher import FakeDispatcher
 from _studio_fixtures import BASE_URL, ScriptedLlm
 from h3_48gb.engines.dispatcher_client import DispatcherClient
-from h3_48gb.studio import config, db, settings
+from h3_48gb.studio import app as app_module
+from h3_48gb.studio import config, db, files, settings, tasks
 from h3_48gb.studio.app import create_app
 from h3_48gb.studio.director.keyframe_prompt import keyframe_prompt
 
@@ -183,9 +184,11 @@ def test_a_free_keyframe_needs_a_size_on_the_64_grid(rig):
     p = rig.project()
     r = rig.client.post(f"/api/studio/projects/{p['id']}/plan",
                         json={"kind": "image", "prompt": "x", "width": 1000, "height": 768})
-    assert (r.status_code, r.json()["error"]["code"]) == (400, "size_invalid")
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["code"] == "size_invalid"
     r = rig.client.post(f"/api/studio/projects/{p['id']}/plan", json={"kind": "image"})
-    assert (r.status_code, r.json()["error"]["code"]) == (400, "args_invalid")
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["code"] == "args_invalid"
 
 
 def test_confirming_is_idempotent_and_happens_once(rig):
@@ -193,17 +196,20 @@ def test_confirming_is_idempotent_and_happens_once(rig):
     plan = rig.post(f"/projects/{p['id']}/plan", {"kind": "image", "scene_id": s1["id"]})
     body = {"plan_id": plan["plan_id"]}
     r = rig.client.post(f"/api/studio/projects/{p['id']}/image", json=body)
-    assert (r.status_code, r.json()["error"]["code"]) == (400, "idempotency_key_required")
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["code"] == "idempotency_key_required"
     first = rig.post(f"/projects/{p['id']}/image", body, key="k1", expect=201)
     assert first == {"task_id": first["task_id"], "status": "queued"}
-    assert rig.post(f"/projects/{p['id']}/image", body, key="k1", expect=201) == first
+    assert rig.post(f"/projects/{p['id']}/image", body, key="k1", expect=200) == first
     other = rig.post(f"/projects/{p['id']}/plan", {"kind": "image", "scene_id": s1["id"]})
     r = rig.client.post(f"/api/studio/projects/{p['id']}/image",
                         json={"plan_id": other["plan_id"]}, headers={"Idempotency-Key": "k1"})
-    assert (r.status_code, r.json()["error"]["code"]) == (422, "idempotency_mismatch")
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["code"] == "idempotency_mismatch"
     r = rig.client.post(f"/api/studio/projects/{p['id']}/image", json=body,
                         headers={"Idempotency-Key": "k2"})
-    assert (r.status_code, r.json()["error"]["code"]) == (409, "plan_used")
+    assert r.status_code == 409, r.text
+    assert r.json()["error"]["code"] == "plan_used"
     assert rig.conn.execute("SELECT COUNT(*) FROM task").fetchone()[0] == 1
     # revision 4: a keyframe is a picture — priority 10 (§8.4); its flat payload (§19.3) carries
     # exactly the planned values (revision 4.1, Codex r4 finding 4: values, not only keys)
@@ -218,7 +224,8 @@ def test_confirming_is_idempotent_and_happens_once(rig):
                      (stale, other["plan_id"]))
     r = rig.client.post(f"/api/studio/projects/{p['id']}/image",
                         json={"plan_id": other["plan_id"]}, headers={"Idempotency-Key": "k3"})
-    assert (r.status_code, r.json()["error"]["code"]) == (409, "plan_expired")
+    assert r.status_code == 409, r.text
+    assert r.json()["error"]["code"] == "plan_expired"
     r = rig.client.post(f"/api/studio/projects/{p['id']}/image",
                         json={"plan_id": other["plan_id"]}, headers={"Idempotency-Key": "k4"})
     assert r.json()["error"]["code"] == "plan_expired"      # a failed confirm stores nothing
@@ -236,17 +243,20 @@ def test_a_queued_keyframe_is_cancelled_at_once(rig):
     assert (r.status_code, r.json()["status"], r.json()["cancel_requested"]) == (
         200, "cancelled", True)
     r = rig.client.post(f"/api/studio/tasks/{task_id}/cancel", json={"reason": ""})
-    assert (r.status_code, r.json()["error"]["code"]) == (409, "task_finished")
+    assert r.status_code == 409, r.text
+    assert r.json()["error"]["code"] == "task_finished"
     kinds = [r[0] for r in rig.conn.execute("SELECT kind FROM event WHERE task_id = ? "
                                             "ORDER BY seq", (task_id,))]
     assert kinds == ["task_queued", "task_cancel_requested", "task_cancelled"]
     snap = rig.client.get(f"/api/studio/projects/{p['id']}").json()
     assert [(t["id"], t["status"]) for t in snap["tasks"]] == [(task_id, "cancelled")]
     r = rig.client.get("/api/studio/tasks/k_nope")
-    assert (r.status_code, r.json()["error"]["code"]) == (404, "task_not_found")
+    assert r.status_code == 404, r.text
+    assert r.json()["error"]["code"] == "task_not_found"
 
 
-def test_executor_and_gpu_operations(rig):
+def test_executor_and_gpu_operations(rig, monkeypatch):
+    monkeypatch.setattr(app_module, "EXECUTORS_TTL_S", 0.0)    # this test edits the fake between calls
     [ex] = rig.client.get("/api/studio/executors").json()
     assert {k: ex[k] for k in ("name", "address", "scope", "alive", "ready", "capabilities",
                                "detail")} == {
@@ -268,8 +278,229 @@ def test_executor_and_gpu_operations(rig):
     assert [h.get("Origin") for h in rig.dispatcher.headers] == [None] * len(rig.dispatcher.headers)
     settings.put(rig.conn, "comfy.scope", "local-mac")
     r = rig.client.get("/api/studio/gpu")
-    assert (r.status_code, r.json()["error"]["code"]) == (409, "no_dispatcher")
+    assert r.status_code == 409, r.text
+    assert r.json()["error"]["code"] == "no_dispatcher"
     settings.put(rig.conn, "comfy.scope", "dispatcher:comfy-studio")
     settings.put(rig.conn, "dispatcher.url", "http://127.0.0.1:9")
     r = rig.client.get("/api/studio/gpu")
-    assert (r.status_code, r.json()["error"]["code"]) == (503, "dispatcher_unavailable")
+    assert r.status_code == 503, r.text
+    assert r.json()["error"]["code"] == "dispatcher_unavailable"
+
+
+# --- review round 1 (task 7) --------------------------------------------------------------------
+
+def _task(rig, task_id, *, status, template="krea2-t2i", project_id=None, kind="image",
+          submitted=None, **columns):
+    """A task row as the worker would leave it (the worker is not part of this file)."""
+    cols = {"id": task_id, "kind": kind, "executor": "comfy", "gpu_scope": "x",
+            "payload_json": json.dumps({"template": template}), "status": status,
+            "priority": 10 if kind == "image" else 0, "project_id": project_id,
+            "engine_submitted_at": submitted, "created_at": "n", "updated_at": "n", **columns}
+    rig.conn.execute(f"INSERT INTO task ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                     tuple(cols.values()))
+
+
+def _event_kinds(rig, task_id):
+    return [r[0] for r in rig.conn.execute("SELECT kind FROM event WHERE task_id = ? ORDER BY seq",
+                                           (task_id,))]
+
+
+def test_cancelling_a_taken_task_only_asks_and_a_repeat_asks_nothing_new(rig):
+    p = rig.project()
+    _task(rig, "k_run", status="running", project_id=p["id"], submitted=1.0)
+    r = rig.client.post("/api/studio/tasks/k_run/cancel", json={"reason": "стоп"})
+    assert r.status_code == 200, r.text
+    assert (r.json()["status"], r.json()["cancel_requested"]) == ("running", True)
+    assert _event_kinds(rig, "k_run") == ["task_cancel_requested"]
+    first = rig.conn.execute("SELECT cancel_requested_at FROM task WHERE id = 'k_run'"
+                             ).fetchone()[0]
+    r = rig.client.post("/api/studio/tasks/k_run/cancel", json={"reason": "ещё раз"})
+    assert r.status_code == 200, r.text
+    assert (r.json()["status"], r.json()["cancel_requested"]) == ("running", True)
+    assert _event_kinds(rig, "k_run") == ["task_cancel_requested"]
+    assert rig.conn.execute("SELECT cancel_requested_at FROM task WHERE id = 'k_run'"
+                            ).fetchone()[0] == first
+
+
+def test_a_blocked_task_is_cancelled_at_once(rig):
+    p = rig.project()
+    _task(rig, "k_blk", status="blocked", project_id=p["id"], kind="render", template="h3-fl2va")
+    r = rig.client.post("/api/studio/tasks/k_blk/cancel", json={"reason": ""})
+    assert r.status_code == 200, r.text
+    assert (r.json()["status"], r.json()["cancel_requested"]) == ("cancelled", True)
+    assert _event_kinds(rig, "k_blk") == ["task_cancel_requested", "task_cancelled"]
+
+
+def test_a_plan_belongs_to_its_project(rig):
+    pa, sa = _scene1(rig)
+    pb = rig.project()
+    plan = rig.post(f"/projects/{pa['id']}/plan", {"kind": "image", "scene_id": sa["id"]})
+    r = rig.client.post(f"/api/studio/projects/{pb['id']}/image", json={"plan_id": plan["plan_id"]},
+                        headers={"Idempotency-Key": "kb"})
+    assert r.status_code == 404, r.text
+    assert r.json()["error"]["code"] == "plan_not_found"
+    assert rig.conn.execute("SELECT used_at FROM render_plan WHERE id = ?",
+                            (plan["plan_id"],)).fetchone()[0] is None
+    rig.post(f"/projects/{pa['id']}/image", {"plan_id": plan["plan_id"]}, key="same", expect=201)
+    r = rig.client.post(f"/api/studio/projects/{pb['id']}/image", json={"plan_id": plan["plan_id"]},
+                        headers={"Idempotency-Key": "same"})
+    assert r.status_code == 422, r.text
+    assert r.json()["error"]["code"] == "idempotency_mismatch"
+
+
+def test_a_scene_of_another_project_is_not_planned(rig):
+    _, scene_a = _scene1(rig)
+    pb = rig.project()
+    r = rig.client.post(f"/api/studio/projects/{pb['id']}/plan",
+                        json={"kind": "image", "scene_id": scene_a["id"]})
+    assert r.status_code == 404, r.text
+    assert r.json()["error"]["code"] == "scene_not_found"
+
+
+def test_the_task_answer_carries_every_field_of_the_record(rig):
+    p = rig.project()
+    _task(rig, "k_full", status="running", project_id=p["id"], submitted=1.0,
+          wait_reason="ждёт карту", progress_step=3, progress_total=8, error="eh", attempts=2,
+          engine_stop="confirmed", engine_version="ComfyUI 0.42.0 · torch 2.9.1 · GPU",
+          template_sha256="abc", created_at="c-at", updated_at="u-at")
+    rig.conn.execute("INSERT INTO asset (id, kind, path, sha256, bytes, mime, origin_kind, "
+                     "created_at) VALUES ('a_1', 'image', 'assets/a_1.png', 'x', 1, 'image/png', "
+                     "'take_output', 'n')")
+    rig.conn.execute("UPDATE task SET result_asset_id = 'a_1', depends_on_task_id = NULL, "
+                     "cancel_requested_at = 5.0 WHERE id = 'k_full'")
+    assert rig.client.get("/api/studio/tasks/k_full").json() == {
+        "id": "k_full", "kind": "image", "project_id": p["id"], "status": "running",
+        "template": "krea2-t2i", "wait_reason": "ждёт карту", "progress_step": 3,
+        "progress_total": 8, "error": "eh", "attempts": 2, "engine_stop": "confirmed",
+        "engine_version": "ComfyUI 0.42.0 · torch 2.9.1 · GPU", "template_sha256": "abc",
+        "cancel_requested": True, "depends_on_task_id": None, "result_asset_id": "a_1",
+        "result_url": "/api/studio/assets/a_1/file", "created_at": "c-at", "updated_at": "u-at"}
+
+
+def test_executors_ask_comfyui_once_keep_the_answer_and_know_their_own_tasks(rig, monkeypatch):
+    seen = []
+    real = app_module.ComfyApi
+    monkeypatch.setattr(app_module, "ComfyApi",
+                        lambda url, timeout: seen.append(timeout) or real(url, timeout=timeout))
+    [ex] = rig.client.get("/api/studio/executors").json()
+    assert sorted(ex["templates"]) == ["h3-fl2va", "h3-ref2va", "krea2-t2i"]
+    assert seen == [5.0]
+    assert [r for r in rig.comfy.requests if r[1] == "/object_info"] == [("GET", "/object_info")]
+    before = list(rig.comfy.requests)
+    rig.client.get("/api/studio/executors")
+    assert rig.comfy.requests == before             # within 10 s nothing is asked again
+    monkeypatch.setattr(app_module, "EXECUTORS_TTL_S", 0.0)
+    rig.comfy._running = {"number": 1, "prompt_id": "pid", "prompt": {},
+                          "extra_data": {"studio_task_id": "k_own", "client_id": "k_own"}}
+    [ex] = rig.client.get("/api/studio/executors").json()
+    assert (ex["ready"], ex["detail"]) == (True, "готов")           # the studio's own is not foreign
+    rig.comfy.foreign_running = True
+    [ex] = rig.client.get("/api/studio/executors").json()
+    assert ex["detail"] == "; ".join(f"{t}: в очереди ComfyUI чужие задачи: 1"
+                                     for t in ("krea2-t2i", "h3-fl2va", "h3-ref2va"))
+    rig.comfy._running = None
+
+
+def test_the_card_is_not_released_under_a_running_task(rig):
+    p = rig.project()
+    _task(rig, "k_a", status="running", project_id=p["id"], submitted=1.0)
+    r = rig.client.post("/api/studio/gpu/release")
+    assert r.status_code == 409, r.text
+    assert r.json() == {"error": {"code": "task_running",
+                                  "message": "Идёт рендер — сначала отмените задачу",
+                                  "detail": {"task_ids": ["k_a"]}}}
+    assert [c for c in rig.dispatcher.calls if c[0] == "POST"] == []
+    rig.conn.execute("UPDATE task SET status = 'submitting'")
+    assert rig.client.post("/api/studio/gpu/release").status_code == 409
+    rig.conn.execute("UPDATE task SET status = 'queued'")
+    assert rig.client.post("/api/studio/gpu/release").json() == {"ok": True, "stopped": ["h3"]}
+
+
+def test_the_plan_pays_a_switch_only_when_it_causes_it(rig):
+    p, s1 = _scene1(rig)
+    # H3 is rendering and a picture is already queued: it pays the 17 s, the new plan behind it none
+    _task(rig, "k_h3", status="running", template="h3-fl2va", kind="render", project_id=p["id"],
+          submitted=2.0)
+    plan = rig.post(f"/projects/{p['id']}/plan", {"kind": "image", "scene_id": s1["id"]})
+    assert (plan["checkpoint_switches"], plan["total_s"]) == (
+        [{"from": "h3-fl2va", "to": "krea2-t2i", "seconds": 17.0}], 23.0)
+    _task(rig, "k_pic", status="queued", project_id=p["id"])
+    plan = rig.post(f"/projects/{p['id']}/plan", {"kind": "image", "scene_id": s1["id"]})
+    assert (plan["checkpoint_switches"], plan["total_s"]) == ([], 6.0)
+
+
+def test_the_engine_holds_the_model_of_the_task_submitted_last(rig):
+    p, s1 = _scene1(rig)
+    _task(rig, "k_old", status="succeeded", template="h3-fl2va", kind="render",
+          project_id=p["id"], submitted=1.0)
+    _task(rig, "k_new", status="succeeded", template="krea2-t2i", project_id=p["id"],
+          submitted=2.0)
+    plan = rig.post(f"/projects/{p['id']}/plan", {"kind": "image", "scene_id": s1["id"]})
+    assert (plan["checkpoint_switches"], plan["total_s"]) == ([], 6.0)
+
+
+def test_a_stored_path_stays_inside_the_home(tmp_path):
+    conn = db.connect(tmp_path / "home" / "studio.sqlite") if (tmp_path / "home").mkdir() is None \
+        else None
+    home = files.studio_home(conn)
+    assert home == (tmp_path / "home").resolve()
+    assert files.stored_path(home, home / "assets" / "a_1.png") == "assets/a_1.png"
+    assert files.asset_path(conn, "assets/a_1.png") == home / "assets" / "a_1.png"
+    for bad in ("/etc/passwd", "../outside.png", "assets/../../outside.png"):
+        with pytest.raises(ValueError):
+            files.asset_path(conn, bad)
+    with pytest.raises(ValueError):
+        files.stored_path(home, tmp_path / "elsewhere" / "a.png")
+
+
+def test_odd_requests_are_refused_plainly(rig):
+    p, s1 = _scene1(rig)
+    r = rig.client.post(f"/api/studio/projects/{p['id']}/plan",
+                        json={"kind": "image", "scene_id": s1["id"], "prompt": "x"})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["code"] == "args_invalid"
+    r = rig.client.post(f"/api/studio/projects/{p['id']}/plan",
+                        json={"kind": "image", "scene_id": s1["id"], "width": 1344})
+    assert r.status_code == 400, r.text
+    plan = rig.post(f"/projects/{p['id']}/plan", {"kind": "image", "scene_id": s1["id"]})
+    r = rig.client.post(f"/api/studio/projects/{p['id']}/image", json={"plan_id": plan["plan_id"]},
+                        headers={"Idempotency-Key": "k" * 201})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["code"] == "idempotency_key_invalid"
+    rig.post(f"/projects/{p['id']}/image", {"plan_id": plan["plan_id"]}, key="k" * 200, expect=201)
+
+
+def test_an_old_key_whose_log_entry_is_gone_is_409_not_500(rig):
+    p, s1 = _scene1(rig)
+    one = rig.post(f"/projects/{p['id']}/plan", {"kind": "image", "scene_id": s1["id"]})
+    rig.post(f"/projects/{p['id']}/image", {"plan_id": one["plan_id"]}, key="old", expect=201)
+    rig.conn.execute("DELETE FROM op_log")                          # the 24 h clean-up
+    two = rig.post(f"/projects/{p['id']}/plan", {"kind": "image", "scene_id": s1["id"]})
+    r = rig.client.post(f"/api/studio/projects/{p['id']}/image", json={"plan_id": two["plan_id"]},
+                        headers={"Idempotency-Key": "old"})
+    assert r.status_code == 409, r.text
+    assert r.json()["error"]["code"] == "idempotency_key_reused"
+    assert rig.conn.execute("SELECT used_at FROM render_plan WHERE id = ?",
+                            (two["plan_id"],)).fetchone()[0] is None
+
+
+def test_the_plan_counts_from_the_task_that_holds_the_engine_now(rig):
+    p, s1 = _scene1(rig)
+    _task(rig, "k_prev", status="succeeded", project_id=p["id"], submitted=1.0)   # krea, long ago
+    _task(rig, "k_now", status="submitting", template="h3-fl2va", kind="render",
+          project_id=p["id"])                                  # H3 is being loaded: not stamped yet
+    plan = rig.post(f"/projects/{p['id']}/plan", {"kind": "image", "scene_id": s1["id"]})
+    assert plan["checkpoint_switches"] == [{"from": "h3-fl2va", "to": "krea2-t2i", "seconds": 17.0}]
+
+
+def test_a_scene_and_a_free_prompt_are_refused_by_the_schema_and_by_the_plan(rig):
+    import pydantic
+
+    from h3_48gb.studio import plans, schemas
+    from h3_48gb.studio.errors import StudioError
+    with pytest.raises(pydantic.ValidationError):
+        schemas.PlanRequest(kind="image", scene_id="s_1", prompt="x")
+    p, s1 = _scene1(rig)
+    with pytest.raises(StudioError) as caught:
+        plans.plan_image(rig.conn, p["id"], scene_id=s1["id"], prompt="x", width=None, height=None)
+    assert (caught.value.status, caught.value.code) == (400, "args_invalid")

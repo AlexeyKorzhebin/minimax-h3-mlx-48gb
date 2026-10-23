@@ -19,6 +19,8 @@ NOT_STARTED = ("queued", "blocked")
 #: queued (the screen shows the presses in order); among renders the one on the model the engine
 #: holds goes first (a switch costs 16–38 s, R-S2-14), then age.
 IMAGE_PRIORITY = 10
+#: The worker holds the engine (and the GPU card) in these states.
+ON_ENGINE = ("submitting", "running", "verifying")
 
 
 def queue_key(*, kind: str, priority: int, template: str | None, seq: int,
@@ -83,10 +85,11 @@ def cancel_task(conn: sqlite3.Connection, task_id: str, *, reason: str) -> dict:
             raise StudioError(409, "task_finished", "Задача уже завершена",
                               {"task": task_out(row)})
         now = ids.now_iso()
-        conn.execute("UPDATE task SET cancel_requested_at = ?, updated_at = ? WHERE id = ?",
-                     (time.time(), now, task_id))
-        events.emit(conn, "task_cancel_requested", project_id=row["project_id"], task_id=task_id,
-                    payload={"reason": reason})
+        if row["cancel_requested_at"] is None:        # a repeated press changes nothing
+            conn.execute("UPDATE task SET cancel_requested_at = COALESCE(cancel_requested_at, ?), "
+                         "updated_at = ? WHERE id = ?", (time.time(), now, task_id))
+            events.emit(conn, "task_cancel_requested", project_id=row["project_id"],
+                        task_id=task_id, payload={"reason": reason})
         if row["status"] in NOT_STARTED:
             finish_cancelled(conn, task_id, project_id=row["project_id"], error=None)
         return task_out(task_row(conn, task_id))

@@ -12,6 +12,7 @@ from h3_48gb.studio import db, ids
 from h3_48gb.studio.errors import StudioError
 
 KEEP = timedelta(hours=24)
+MAX_KEY = 200
 
 
 def request_sha256(route: str, body: dict) -> str:
@@ -26,6 +27,9 @@ def run_once(conn: sqlite3.Connection, key: str | None, request_sha: str, operat
     operation stores nothing: the key stays free for a corrected retry."""
     if not key or not key.strip():
         raise StudioError(400, "idempotency_key_required", "Нужен заголовок Idempotency-Key")
+    if len(key) > MAX_KEY:
+        raise StudioError(400, "idempotency_key_invalid",
+                          f"Idempotency-Key длиннее {MAX_KEY} знаков", {"length": len(key)})
     with db.tx(conn):
         cutoff = (datetime.now(timezone.utc) - KEEP).isoformat(timespec="milliseconds")
         conn.execute("DELETE FROM op_log WHERE created_at < ?", (cutoff,))
@@ -35,7 +39,7 @@ def run_once(conn: sqlite3.Connection, key: str | None, request_sha: str, operat
             if row["request_sha256"] != request_sha:
                 raise StudioError(422, "idempotency_mismatch",
                                   "Этот ключ уже использован для другого запроса", {"key": key})
-            return row["http_status"], json.loads(row["response_json"])
+            return 200, json.loads(row["response_json"])        # a replay is not a creation (И5)
         answer = operation(conn)
         conn.execute("INSERT INTO op_log (idempotency_key, request_sha256, response_json, "
                      "http_status, created_at) VALUES (?, ?, ?, ?, ?)",

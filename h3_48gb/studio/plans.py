@@ -33,8 +33,27 @@ def last_engine_template(conn: sqlite3.Connection) -> str | None:
     return json.loads(row["payload_json"]).get("template") if row else None
 
 
-def switches(conn: sqlite3.Connection, order: list[str]) -> list[dict]:
-    out, before = [], last_engine_template(conn)
+def template_before_new_image(conn: sqlite3.Connection) -> str | None:
+    """The model the engine holds when a picture queued NOW starts (§8.4, one `queue_key` with the
+    worker): the last of the tasks that run before it — the running one, then the queued pictures
+    in the order they were queued; a render never goes before a picture. A switch is paid by the
+    first task that causes it, so a plan behind a queued picture on the same model pays nothing."""
+    marks = ", ".join("?" for _ in tasks.ON_ENGINE)
+    active = conn.execute(f"SELECT payload_json FROM task WHERE status IN ({marks}) "
+                          f"ORDER BY rowid DESC LIMIT 1", tasks.ON_ENGINE).fetchone()
+    loaded = (json.loads(active["payload_json"]).get("template") if active
+              else last_engine_template(conn))
+    ahead = tasks.queued_in_order(conn, kinds=("image",), loaded_template=loaded)
+    if ahead:
+        return json.loads(ahead[-1]["payload_json"]).get("template")
+    return loaded
+
+
+def switches(conn: sqlite3.Connection, order: list[str], *, before: str | None = None
+             ) -> list[dict]:
+    out = []
+    if before is None:
+        before = last_engine_template(conn)
     for template in order:
         cost = estimates.switch_cost(before, template)
         if cost:
@@ -83,6 +102,8 @@ def plan_image(conn: sqlite3.Connection, project_id: str, *, scene_id: str | Non
     """The keyframe of a scene (prompt from `keyframe_prompt`, size by the frame format) or a
     free one (prompt and size given)."""
     project = conn.execute("SELECT * FROM project WHERE id = ?", (project_id,)).fetchone()
+    if scene_id is not None and (prompt is not None or width is not None or height is not None):
+        raise StudioError(400, "args_invalid", "Сцена и свой промпт с размером — взаимоисключающие")
     if scene_id is not None:
         scene = conn.execute("SELECT * FROM scene WHERE id = ? AND project_id = ? "
                              "AND deleted_at IS NULL", (scene_id, project_id)).fetchone()
@@ -112,7 +133,8 @@ def plan_image(conn: sqlite3.Connection, project_id: str, *, scene_id: str | Non
             "prompt": prompt, "width": width, "height": height, "seed": new_seed(),
             "steps": IMAGE_STEPS, "estimate_s": estimate["seconds"],
             "estimate_source": estimate["source"], "status": "ready", "reasons": []}
-    switch = switches(conn, [templates.KEYFRAME_TEMPLATE])
+    switch = switches(conn, [templates.KEYFRAME_TEMPLATE],
+                       before=template_before_new_image(conn))
     plan_id, expires = _save_plan(conn, project_id, tier=None, items=[item], versions={})
     return {"plan_id": plan_id, "expires_at": expires, "kind": "image", "items": [item],
             "total_s": round(item["estimate_s"] + sum(s["seconds"] for s in switch), 1),
@@ -125,6 +147,9 @@ def enqueue_image(conn: sqlite3.Connection, project_id: str, plan_id: str, key: 
     """Inside `idempotency.run_once`'s transaction: one task, `queued`, with the pictures'
     priority (§8.4: a picture waits only for the running task, not for the render queue). The
     payload is flat — S2b's batches write the same keys at the root and add their own (§19.3)."""
+    if conn.execute("SELECT 1 FROM task WHERE idempotency_key = ?", (key,)).fetchone():
+        raise StudioError(409, "idempotency_key_reused",
+                          "Этот ключ уже поставил задачу (запись о нём устарела)", {"key": key})
     plan = load_plan(conn, project_id, plan_id, "image")
     item = plan["items"][0]
     task_id = ids.new_id("k")

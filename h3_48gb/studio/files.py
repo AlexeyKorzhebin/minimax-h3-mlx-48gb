@@ -10,13 +10,24 @@ from pathlib import Path
 
 
 def studio_home(conn: sqlite3.Connection) -> Path:
-    return Path(conn.execute("PRAGMA database_list").fetchone()["file"]).parent
+    return Path(conn.execute("PRAGMA database_list").fetchone()["file"]).resolve().parent
 
 
 def asset_path(conn: sqlite3.Connection, stored: str) -> Path:
-    return studio_home(conn) / stored
+    """The file `stored` names; never outside the home (an absolute path or `..` is refused)."""
+    home = studio_home(conn)
+    if Path(stored).is_absolute():
+        raise ValueError(f"asset path must be relative to the studio home: {stored!r}")
+    path = (home / stored).resolve()
+    if not path.is_relative_to(home):
+        raise ValueError(f"asset path leaves the studio home: {stored!r}")
+    return path
 
 
 def stored_path(home: Path, path: Path) -> str:
     """What goes into `asset.path` for a file the studio wrote under its home."""
-    return str(Path(path).relative_to(home))
+    home = Path(home).resolve()
+    path = Path(path).resolve()
+    if not path.is_relative_to(home):
+        raise ValueError(f"{str(path)!r} is outside the studio home")
+    return str(path.relative_to(home))

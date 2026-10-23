@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 FrameFormat = Literal["16:9", "9:16"]
 
@@ -142,6 +142,13 @@ class PlanRequest(_Body):
     height: int | None = None
     scene_ids: list[str] | None = None
     tier: Literal["sketch", "final"] | None = None
+
+    @model_validator(mode="after")
+    def _one_source(self):
+        if self.scene_id is not None and (self.prompt is not None or self.width is not None
+                                          or self.height is not None):
+            raise ValueError("scene_id excludes prompt, width and height")
+        return self
 
 
 class PlanConfirm(_Body):

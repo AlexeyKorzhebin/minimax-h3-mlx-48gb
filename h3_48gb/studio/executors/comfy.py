@@ -27,6 +27,11 @@ FILE_REF = "file:"
 WS_IDLE_S = 5.0
 
 
+#: `TaskSpec.task_id` of a probe that is not for any task (O22): every studio task in the queue is
+#: then the studio's own, and only entries without a studio task id are foreign.
+PROBE_TASK_ID = "probe"
+
+
 class ComfyExecutor:
     name = "comfy"
     capabilities: Capabilities = {"find": "exact", "restart_evidence": True, "progress": True,
@@ -75,8 +80,11 @@ class ComfyExecutor:
             queue = self.api.queue()
         except ComfyError as err:
             return {"alive": True, "ready": False, "detail": str(err)}
-        foreign = [e for e in (*queue.get("queue_running", []), *queue.get("queue_pending", []))
-                   if _studio_task_id(e) != spec.task_id]
+        entries = (*queue.get("queue_running", []), *queue.get("queue_pending", []))
+        if spec.task_id == PROBE_TASK_ID:
+            foreign = [e for e in entries if _studio_task_id(e) is None]
+        else:
+            foreign = [e for e in entries if _studio_task_id(e) != spec.task_id]
         if foreign:
             return {"alive": True, "ready": False,
                     "detail": f"в очереди ComfyUI чужие задачи: {len(foreign)}"}
