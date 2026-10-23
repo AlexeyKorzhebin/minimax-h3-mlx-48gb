@@ -239,30 +239,35 @@ def test_a_task_lost_in_a_restart_is_retried_once(rig):
     assert rig.events("task_requeued") == [("task_requeued", {"reason": "lost"})]
 
 
-def test_the_old_panels_free_the_card_button_counts_as_a_restart(rig):
-    """Revision 4 (coordinator 23.10, review of task 1): the old panel's «Освободить карту»
-    (`release(everything=True)`, web.py:5899; also `released_by_user`, `qwen_restore`) stops
-    `comfy-studio` mid-task and leaves no record of it in the dispatcher's /status. Accepted —
-    and the studio must read it as a restart (§8.5): `restarted_since` is True without a record,
-    so the task is retried once, not left as submit_unknown."""
+def test_an_engine_that_dies_under_a_live_worker_is_submit_unknown_not_a_retry(rig):
+    """Final review (coordinator ruling 23.10): the studio's ComfyUI dies mid-task (the old panel's
+    «Освободить карту», an OOM) while the worker lives and holds the gate; the dispatcher keeps no
+    record of it. The port is closed — ComfyUI cannot be asked, `lost` is never proven, so the
+    task ends as `submit_unknown` with the ref kept and NO automatic retry. A retry happens only
+    after a worker restart (test_a_task_lost_in_a_restart_is_retried_once). Making the dispatcher
+    say «живой pid → lost» is slice S5."""
     rig.comfy.hold = True
     _, _, _, task_id = _queued_keyframe(rig)
     real = rig.executor.status
-    released = []
+    killed = []
 
     def status(ref):
         answer = real(ref)
-        if answer["state"] == "running" and not released:
-            released.append(ref)
-            rig.comfy.restart()             # the panel's release killed the studio's ComfyUI
-            rig.comfy.hold = False
+        if answer["state"] == "running" and not killed:
+            killed.append(ref)
+            rig.comfy.close()               # the process is gone: connection refused from now on
             rig.dispatcher.own = {}         # ...and the dispatcher keeps no record of it
         return answer
     rig.executor.status = status
     rig.drain()
     task = rig.task(task_id)
-    assert (task["status"], task["attempts"], len(rig.comfy.prompts)) == ("succeeded", 1, 2)
-    assert rig.events("task_requeued") == [("task_requeued", {"reason": "lost"})]
+    kept = rig.conn.execute("SELECT engine_ref FROM task WHERE id = ?", (task_id,)).fetchone()
+    assert (task["status"], task["attempts"], kept["engine_ref"] == killed[0],
+            len(rig.comfy.prompts)) == ("submit_unknown", 0, True, 1)
+    assert task["wait_reason"].startswith("ComfyUI не отвечает на проверку задачи: ComfyUI GET "
+                                          f"/history/{killed[0]} недоступен: ")
+    assert rig.events("task_requeued") == []
+    assert [k for k, _ in rig.events("task_submit_unknown")] == ["task_submit_unknown"]
 
 
 def test_the_picture_task_reads_its_values_by_the_card_and_drops_nulls(rig):
