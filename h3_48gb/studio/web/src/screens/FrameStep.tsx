@@ -5,12 +5,13 @@ import type { Plan, SceneResult, Snapshot } from "@/api/types";
 import { PlanSummary } from "@/components/PlanSummary";
 import { TaskLine, TERMINAL } from "@/components/TaskLine";
 import { Button } from "@/components/ui/button";
+import { uuid4 } from "@/lib/uuid";
 import { useIsPhone, useMobileAction } from "@/mobileAction";
 
 /** Step 4 «Первый кадр» (spec §4.4): scene 1 in `from_frame` gets a Krea 2 keyframe —
  *  plan (O10) → «Подтвердить» (O12, a fresh Idempotency-Key per press) → progress (O13 via the
  *  snapshot and SSE) → «Взять в сцену 1» (O8 `source_frame{kind:"asset"}`). */
-export function FrameStep({ snap, onChanged, newKey = () => crypto.randomUUID() }: {
+export function FrameStep({ snap, onChanged, newKey = uuid4 }: {
   snap: Snapshot;
   onChanged: () => void;
   newKey?: () => string;
