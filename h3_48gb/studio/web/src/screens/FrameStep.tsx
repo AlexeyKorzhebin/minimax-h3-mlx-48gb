@@ -17,7 +17,11 @@ export function FrameStep({ snap, onChanged, newKey = () => crypto.randomUUID() 
 }) {
   const pid = snap.project.id;
   const scene = snap.scenes[0];
-  const [plan, setPlan] = useState<Plan | null>(null);
+  // The Idempotency-Key belongs to the plan, not to the press: a retry after a network failure
+  // reuses it and gets the stored answer (200) instead of a second task. A plan built for a scene
+  // that has changed since (revision) is dropped.
+  const [built, setBuilt] = useState<{ plan: Plan; key: string; sceneId: string; revision: number } | null>(null);
+  const plan = built && scene && built.sceneId === scene.id && built.revision === scene.revision ? built.plan : null;
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const phone = useIsPhone();
@@ -41,17 +45,33 @@ export function FrameStep({ snap, onChanged, newKey = () => crypto.randomUUID() 
     }
   }
   const makePlan = () => run(async () => {
-    setPlan(await api<Plan>("POST", `/projects/${pid}/plan`, { kind: "image", scene_id: scene!.id }));
+    const made = await api<Plan>("POST", `/projects/${pid}/plan`, { kind: "image", scene_id: scene!.id });
+    setBuilt({ plan: made, key: newKey(), sceneId: scene!.id, revision: scene!.revision });
   });
   const confirm = () => run(async () => {
-    await api("POST", `/projects/${pid}/image`, { plan_id: plan!.plan_id }, { "Idempotency-Key": newKey() });
-    setPlan(null);
+    try {
+      await api("POST", `/projects/${pid}/image`, { plan_id: plan!.plan_id }, { "Idempotency-Key": built!.key });
+    } catch (err) {
+      if (err instanceof ApiError && (err.code === "plan_used" || err.code === "plan_expired")) {
+        setBuilt(null);      // the plan is spent: the owner builds a new one
+        onChanged();
+      }
+      throw err;
+    }
+    setBuilt(null);
     onChanged();
   });
   const take = () => run(async () => {
-    await api<SceneResult>("PATCH", `/scenes/${scene!.id}`, {
-      expected_edit_version: scene!.edit_version, source_frame: { kind: "asset", asset_id: result },
-    });
+    try {
+      await api<SceneResult>("PATCH", `/scenes/${scene!.id}`, {
+        expected_edit_version: scene!.edit_version, source_frame: { kind: "asset", asset_id: result },
+      });
+    } catch (err) {
+      // 409: the scene moved under us — reload so the button retries with the new edit_version
+      // (explicit retry by the owner, never automatic)
+      if (err instanceof ApiError && err.status === 409) onChanged();
+      throw err;
+    }
     onChanged();
   });
 
@@ -78,9 +98,9 @@ export function FrameStep({ snap, onChanged, newKey = () => crypto.randomUUID() 
               </figure>
             )}
             {!plan && (
-              <Button variant={attached ? "outline" : "default"} size="lg" onClick={makePlan} disabled={busy || active} className="justify-self-start">
+              <Button variant={attached || canTake ? "outline" : "default"} size="lg" onClick={makePlan} disabled={busy || active} className="justify-self-start">
                 <ImageIcon />
-                {attached ? "Сделать другой кадр" : "Сделать кадр"}
+                {attached || canTake ? "Сделать другой кадр" : "Сделать кадр"}
               </Button>
             )}
             {plan && (
@@ -95,12 +115,12 @@ export function FrameStep({ snap, onChanged, newKey = () => crypto.randomUUID() 
                 )}
                 <div className="flex gap-2">
                   {!phone && <Button size="lg" onClick={confirm} disabled={busy || !ready}>Подтвердить</Button>}
-                  <Button size="lg" variant="outline" onClick={() => setPlan(null)} disabled={busy}>Отмена</Button>
+                  <Button size="lg" variant="outline" onClick={() => setBuilt(null)} disabled={busy}>Отмена</Button>
                 </div>
               </div>
             )}
             {task && !(task.status === "succeeded" && task.result_asset_id === attached) && (
-              <TaskLine task={task} onChanged={onChanged} />
+              <TaskLine key={task.id} task={task} onChanged={onChanged} />
             )}
             {canTake && (
               <figure className="grid gap-2">

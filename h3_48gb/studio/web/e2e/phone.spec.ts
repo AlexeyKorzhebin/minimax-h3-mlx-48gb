@@ -210,6 +210,7 @@ test("the dark theme tells the browser it is dark (native controls, scrollbars)"
 });
 
 declare const process: { env: Record<string, string | undefined> };   // no @types/node in this package
+const LONG = "ждём GPU: Qwen держит карту, а ещё карту держит ComfyUI клиента panel-worker (H3 и LTX-апскейл), освобождение займёт несколько минут";
 const SHOTS = process.env.S2T9_SHOTS;
 
 test("step 4: the bar carries «Подтвердить» for the plan and «Взять в сцену 1» for the frame", async ({ page }) => {
@@ -228,7 +229,7 @@ test("step 4: the bar carries «Подтвердить» for the plan and «Вз
     "GET /api/studio/events?after=5": [204, null],
     "POST /api/studio/projects/p_1/lint": [200, { findings: {} }],
     "POST /api/studio/projects/p_1/plan": [200, plan],
-    "POST /api/studio/projects/p_1/image": () => { tasks = [{ ...TASK, status: "waiting_gpu", wait_reason: "ждём GPU: Qwen держит карту" }]; return [201, { task_id: "k_1", status: "queued" }]; },
+    "POST /api/studio/projects/p_1/image": () => { tasks = [{ ...TASK, status: "waiting_gpu", wait_reason: LONG }]; return [201, { task_id: "k_1", status: "queued" }]; },
     "PATCH /api/studio/scenes/s_1": (body) => {
       s1 = { ...s1, edit_version: 2, source_frame: { kind: "asset", scene_id: null, asset_id: "a_9", auto: false } };
       void body; return [200, { scene: s1, cascade: [], lint: [] }];
@@ -247,7 +248,8 @@ test("step 4: the bar carries «Подтвердить» for the plan and «Вз
   if (SHOTS) await page.screenshot({ path: `${SHOTS}/frame-390-plan.png`, fullPage: true });
   await bar.getByRole("button", { name: "Подтвердить" }).click();
   expect(sent("POST /api/studio/projects/p_1/image")).toEqual([{ plan_id: "pl_1" }]);
-  await expect(page.getByRole("status")).toHaveText("ждём GPU: Qwen держит карту");
+  await expect(page.getByRole("status")).toHaveText(LONG);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);   // a long reason wraps, the page does not widen
   await expect(page.getByRole("button", { name: "Освободить" })).toBeVisible();
   if (SHOTS) await page.screenshot({ path: `${SHOTS}/frame-390-waiting.png`, fullPage: true });
 
@@ -258,4 +260,30 @@ test("step 4: the bar carries «Подтвердить» for the plan and «Вз
   await bar.getByRole("button", { name: "Взять в сцену 1" }).click();
   await expect(page.getByAltText("Кадр сцены 1")).toBeVisible();
   expect(sent("PATCH /api/studio/scenes/s_1")).toEqual([{ expected_edit_version: 1, source_frame: { kind: "asset", asset_id: "a_9" } }]);
+});
+
+test("step 4 holds the bar with «Подтвердить»: «Предложить сцены» stays reachable inline in step 3", async ({ page }) => {
+  const plan = { plan_id: "pl_1", expires_at: "2026-10-22T10:10:00.000+00:00", kind: "image",
+    items: [{ kind: "image", scene_id: "s_1", template: "krea2-t2i", prompt: "A woman at the lake.", width: 1344, height: 768,
+      seed: 7, steps: 8, estimate_s: 6, status: "ready", reasons: [] }],
+    total_s: 23, checkpoint_switches: [], lint: {}, blocked: [], invalid: [] };
+  const log = await api(page, {
+    "GET /api/studio/projects/p_1": [200, { project: PROJECT, scenes: [scene("s_1", 0)], cast: [], takes: [], tasks: [], last_seq: 5 }],
+    "GET /api/studio/events?after=5": [204, null],
+    "POST /api/studio/projects/p_1/lint": [200, { findings: {} }],
+    "POST /api/studio/projects/p_1/plan": [200, plan],
+    "POST /api/studio/projects/p_1/director/propose": [200, {
+      proposal_id: "r_1", dropped_tags: [], durations: [{ frames: 192, duration_s: 8 }],
+      scenes: [{ ...scene("x", 0), scene_id: null, seed: null, source_frame: { kind: "none" } }] }],
+  });
+  await page.goto("/studio/#/p/p_1");
+  const inline = page.locator("section[aria-labelledby=scenario-h]").getByRole("button", { name: "Предложить сцены" });
+  await expect(page.getByTestId("mobile-action-bar").getByRole("button", { name: "Предложить сцены" })).toBeVisible();
+  await expect(inline).toHaveCount(0);                       // the bar carries it: no twin
+  await page.getByRole("button", { name: "Сделать кадр" }).click();
+  await expect(page.getByTestId("mobile-action-bar").getByRole("button", { name: "Подтвердить" })).toBeVisible();
+  await expect(inline).toBeEnabled();                        // the bar went to step 4: step 3 has its own button
+  await inline.click();
+  await expect(page.getByRole("region", { name: "Предложение сценариста" })).toBeVisible();
+  expect(log.filter((r) => r.key === "POST /api/studio/projects/p_1/director/propose").length).toBe(1);
 });
