@@ -70,6 +70,43 @@ ssh alex-neuro 'curl -s 127.0.0.1:8790/status'
 - **Промпт:** по-английски надёжнее для всех трёх; по-русски понимают все. Надпись на картинке — в кавычках; русскую надпись — только Krea 2 или Qwen.
 - **Кадр для видео:** 16:9 → `1344×768` (или 896×512 для эскизов), 9:16 → `768×1344`. Картинка-кадр должна совпадать по пропорциям с видео.
 
+### 3.1. Картинка одной командой (без браузера)
+
+Скрипт `make_image.py` (в репо `scripts/make_image.py`, на сервере `/home/alex/Outputs/studio/tools/make_image.py`)
+сам берёт карту у диспетчера, собирает граф из нашей карточки модели, ждёт результат и печатает путь. Проверен 23.10:
+Krea 2 — 23 с, Z-Image — 15 с, Qwen «Быстро» — 34 с (с холодной загрузкой), Krea 2 + LoRA — 24 с.
+
+```bash
+ssh alex-neuro
+cd /home/alex/Outputs/studio/tools
+python3 make_image.py krea2  "a young woman in a linen dress on a forest path, morning" --seed 11
+python3 make_image.py zimage "a wooden cabin by a lake at dawn, mist" --size 1024x1024
+python3 make_image.py qwen   'a street sign that reads "ЛЕСНАЯ ТРОПА", forest' --profile fast --size 1328x1328
+python3 make_image.py qwen   "..." --profile full --negative "blurry, text artifacts"
+python3 make_image.py krea2  "a young woman portrait, soft light" --lora KNP/KNP_000003000.safetensors:0.8
+python3 make_image.py krea2  "..." --release        # последняя картинка — отдать карту студии
+```
+
+- `--seed` не задан — берётся случайный и печатается (запишите удачный). `--size ШxВ` — кратно 64 (Qwen — 16), по умолчанию 1344x768.
+- Результат: `/home/alex/Outputs/comfy-h3/studio/owner-<время>/f_00001_.png`, с Мака `/Volumes/home/Outputs/comfy-h3/studio/…`.
+- Если печатает «карта: wait ComfyUI студии занят клиентом studio-worker» — студия недавно рисовала кадр; она сама отдаёт
+  карту через 15 мин простоя. Быстрее — когда в студии нет идущей задачи:
+  `curl -s -X POST 127.0.0.1:8790/release -H 'Content-Type: application/json' -d '{"client":"studio-worker"}'`.
+- Без `--release` карта остаётся за вами (следующие картинки идут без загрузки модели); в конце отдайте её.
+
+### 3.2. LoRA
+
+| Модель | LoRA в ComfyUI | Как задать |
+|---|---|---|
+| **Krea 2** | подключены 23.10: `Identity-Edit/krea2_identity_edit_v1_2`, `KNP/KNP_000003000` (из `/home/alex/Models/Image/Krea-2/LoRA/`) | `--lora KNP/KNP_000003000.safetensors:0.8` или узел LoraLoaderModelOnly в ComfyUI |
+| **Qwen-Image** | Lightning-4steps (режим «Быстро») | `--profile fast`; свою — `--lora имя:сила` |
+| **Z-Image** | папка `angelina/*/pytorch_lora_weights.safetensors` видна в ComfyUI, но это экспорт PEFT/SimpleTuner — **с ComfyUI не проверено**; старые `.ckpt` Draw Things ComfyUI не читает. В скрипте и шаблоне Z-Image входа LoRA нет | только руками в ComfyUI: узел LoraLoaderModelOnly между UNETLoader и KSampler; если картинка не меняется — формат не подошёл, нужна конвертация |
+
+Полный список видимых LoRA: `curl -s 127.0.0.1:8189/models/loras` (на сервере, когда ComfyUI поднят). Добавить свою — положить
+`.safetensors` в `/home/alex/Models/Image/Krea-2/LoRA/` (Krea), `/home/alex/Models/Image/Qwen-Image-comfy/loras/` (Qwen)
+и перезапустить ComfyUI (отдать карту и взять снова). Пути прописаны в `~/Projects/comfy-h3/extra_model_paths.yaml`
+(копия до правки — `extra_model_paths.yaml.bak-20261023`).
+
 ---
 
 ## 4. Видео H3
@@ -114,7 +151,35 @@ ssh alex-neuro 'curl -s 127.0.0.1:8790/status'
 
 ---
 
-## 6. Если что-то пошло не так
+## 6. Частые вопросы
+
+**Какая LLM сейчас у студии?** Внешняя: **Claude Sonnet 5.5 через CAILA** (провайдер `caila-sonnet`). Это «Сценарист»
+(сцены из идеи) и описание героя. Список провайдеров — `/home/alex/Outputs/studio/providers.json` на сервере, ключ —
+в `.env` панели (не трогать). Второй провайдер в списке — `qwen-alex-neuro` (локальный Qwen 3.8 27B, `http://127.0.0.1:8000`).
+
+**Можно поменять на Qwen?** Да, но с оговорками:
+1. Поднять Qwen: `ssh alex-neuro '~/Projects/qwen/qwen.sh start-shared32'` (контекст 32k, ≈40 ГБ видеопамяти, готов через
+   1,5–2,5 мин; статус — `qwen.sh status`).
+2. В `providers.json` поменять `"active": "caila-sonnet"` на `"active": "qwen-alex-neuro"` (сделайте копию файла). Студия читает
+   файл на каждом вызове — перезапуск не нужен. Вернуть — обратно `caila-sonnet`.
+3. Оговорки: «Сценарист» на Qwen **не проверялся** (формат JSON-ответа может не пройти проверку — тогда «Сценарист не
+   ответил», переключитесь обратно). Пока поднят Qwen, кадр Krea на шаге 4 и видео **ждут** («Qwen держит карту») —
+   соседство LLM с Krea/Z-Image появится в срезе «Картинка» (S2b, задача 12). Для кадра — `qwen.sh stop` или
+   `/qwen/unload` через диспетчер.
+4. Удобная форма выбора провайдера и чат в самой студии — срез S2c (набор llm-kit уже готов, v0.1.0).
+
+**Могу ли я делать картинки скриптами на машине?** Да — `make_image.py` (раздел 3.1); или вручную: карточка и граф
+`/home/alex/Projects/h3-studio/docs/h3-modes/comfy-templates/` → `python3 comfy_template.py <модель>.card.json values.json` →
+`curl -X POST 127.0.0.1:8189/prompt -d @payload.json` (сначала взять карту). Для видео H3 скриптом — тот же
+`comfy_template.py` с `h3-fl2va.card.json` / `h3-ref2va.card.json` (входы: prompt, seed, steps, width, height, length
+по сетке 17k+5, first_frame или ref_images — имена после `POST /upload/image`).
+
+**Подключены ли LoRA к Krea 2 и Z-Image?** Krea 2 — да (с 23.10, раздел 3.2). Z-Image — папка видна, но формат не
+проверен; в студии и скрипте LoRA для Z-Image пока нет.
+
+---
+
+## 7. Если что-то пошло не так
 
 | Симптом | Что сделать |
 |---|---|
