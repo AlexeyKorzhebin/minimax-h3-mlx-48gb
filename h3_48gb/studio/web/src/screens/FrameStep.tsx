@@ -20,9 +20,11 @@ export function FrameStep({ snap, onChanged, newKey = uuid4 }: {
   const scene = snap.scenes[0];
   // The Idempotency-Key belongs to the plan, not to the press: a retry after a network failure
   // reuses it and gets the stored answer (200) instead of a second task. A plan built for a scene
-  // that has changed since (revision) is dropped.
-  const [built, setBuilt] = useState<{ plan: Plan; key: string; sceneId: string; revision: number } | null>(null);
-  const plan = built && scene && built.sceneId === scene.id && built.revision === scene.revision ? built.plan : null;
+  // that has changed since is dropped by the same pair the server checks (O12 `plan_stale`):
+  // scene 1's `edit_version` and the project's `revision`.
+  const [built, setBuilt] = useState<{ plan: Plan; key: string; sceneId: string; editVersion: number; projectRevision: number } | null>(null);
+  const plan = built && scene && built.sceneId === scene.id && built.editVersion === scene.edit_version
+    && built.projectRevision === snap.project.revision ? built.plan : null;
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const phone = useIsPhone();
@@ -47,7 +49,8 @@ export function FrameStep({ snap, onChanged, newKey = uuid4 }: {
   }
   const makePlan = () => run(async () => {
     const made = await api<Plan>("POST", `/projects/${pid}/plan`, { kind: "image", scene_id: scene!.id });
-    setBuilt({ plan: made, key: newKey(), sceneId: scene!.id, revision: scene!.revision });
+    setBuilt({ plan: made, key: newKey(), sceneId: scene!.id, editVersion: scene!.edit_version,
+      projectRevision: snap.project.revision });
   });
   const confirm = () => run(async () => {
     try {

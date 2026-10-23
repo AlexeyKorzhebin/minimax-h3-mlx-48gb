@@ -163,14 +163,32 @@ describe("FrameStep", () => {
     ]);
   });
 
-  it("a plan is dropped when scene 1 changes after it was built", async () => {
+  async function planBuilt() {
     stubFetch({ "POST /api/studio/projects/p_1/plan": { body: imagePlan() } });
     const view = render(<FrameStep snap={snapshot({ scenes: [fromFrame] })} onChanged={() => {}} />);
     await userEvent.click(screen.getByRole("button", { name: "Сделать кадр" }));
     await screen.findByRole("region", { name: "План кадра" });
-    view.rerender(<FrameStep snap={snapshot({ scenes: [{ ...fromFrame, revision: 2 }] })} onChanged={() => {}} />);
+    return view;
+  }
+
+  it("a plan is dropped when scene 1's edit_version changes after it was built", async () => {
+    const view = await planBuilt();
+    view.rerender(<FrameStep snap={snapshot({ scenes: [{ ...fromFrame, edit_version: 5 }] })} onChanged={() => {}} />);
     expect(screen.queryByRole("region", { name: "План кадра" })).toBeNull();
     expect(screen.getByRole("button", { name: "Сделать кадр" })).toBeTruthy();
+  });
+
+  it("a plan is dropped when the project's revision changes after it was built", async () => {
+    const view = await planBuilt();
+    const base = snapshot({ scenes: [fromFrame] });
+    view.rerender(<FrameStep snap={{ ...base, project: { ...base.project, revision: 4 } }} onChanged={() => {}} />);
+    expect(screen.queryByRole("region", { name: "План кадра" })).toBeNull();
+  });
+
+  it("a plan survives a change the server does not count (scene revision and state_version)", async () => {
+    const view = await planBuilt();
+    view.rerender(<FrameStep snap={snapshot({ scenes: [{ ...fromFrame, revision: 2, state_version: 9 }] })} onChanged={() => {}} />);
+    expect(screen.getByRole("region", { name: "План кадра" })).toBeTruthy();
   });
 
   it("a frame already taken leaves no task line behind", () => {
