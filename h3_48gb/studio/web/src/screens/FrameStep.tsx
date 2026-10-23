@@ -57,6 +57,11 @@ export function FrameStep({ snap, onChanged, newKey = uuid4 }: {
         setBuilt(null);      // the plan is spent: the owner builds a new one
         onChanged();
       }
+      if (err instanceof ApiError && err.code === "plan_stale") {
+        setBuilt(null);      // the scene changed after the plan was built (detail: scene_id, planned, current)
+        onChanged();
+        throw new ApiError(err.status, err.code, "Сцену изменили — постройте план заново", err.detail);
+      }
       throw err;
     }
     setBuilt(null);

@@ -10,7 +10,7 @@ import { ScenarioStep } from "./ScenarioStep";
 
 const RELOAD_ON = ["project_updated", "cast_added", "scenes_replaced", "scene_updated", "proposal_applied",
   // slice S2: the worker's task events (spec §8.5)
-  "task_queued", "task_waiting", "task_running", "task_progress", "task_succeeded", "task_failed",
+  "task_queued", "task_status", "task_waiting", "task_running", "task_progress", "task_succeeded", "task_failed",
   "task_cancelled", "task_cancel_requested", "task_requeued", "task_submit_unknown"];
 
 export function ProjectScreen({ id }: { id: string }) {

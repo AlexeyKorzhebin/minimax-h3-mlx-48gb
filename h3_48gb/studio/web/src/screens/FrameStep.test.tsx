@@ -279,6 +279,21 @@ describe("FrameStep", () => {
     }
   });
 
+  it("a stale plan (409 plan_stale) is dropped, the snapshot reloaded, the owner told in words", async () => {
+    stubFetch({
+      "POST /api/studio/projects/p_1/plan": { body: imagePlan() },
+      "POST /api/studio/projects/p_1/image": { status: 409, body: { error: { code: "plan_stale", message: "scene changed",
+        detail: { scene_id: "s_1", planned: 1, current: 2 } } } },
+    });
+    const onChanged = vi.fn();
+    render(<FrameStep snap={snapshot({ scenes: [fromFrame] })} onChanged={onChanged} />);
+    await userEvent.click(screen.getByRole("button", { name: "Сделать кадр" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Подтвердить" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("Сцену изменили — постройте план заново");
+    expect(screen.queryByRole("region", { name: "План кадра" })).toBeNull();
+    expect(onChanged).toHaveBeenCalledTimes(1);
+  });
+
   it("names every task state in words", () => {
     expect([
       taskText(task({ status: "queued" })), taskText(task({ status: "blocked" })),
