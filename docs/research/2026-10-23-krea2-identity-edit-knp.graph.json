@@ -1,0 +1,183 @@
+{
+ "1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "krea2_turbo_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  }
+ },
+ "2": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_4b_int8_convrot.safetensors",
+   "type": "krea2",
+   "device": "default"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "qwen_image_vae.safetensors"
+  }
+ },
+ "4": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "REF.jpg"
+  }
+ },
+ "5": {
+  "class_type": "LoraLoaderBypassModelOnly",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "lora_name": "Identity-Edit/krea2_identity_edit_v1_2.safetensors",
+   "strength_model": 1.0
+  }
+ },
+ "6": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "5",
+    0
+   ],
+   "lora_name": "KNP/KNP_000003000.safetensors",
+   "strength_model": 1.5
+  }
+ },
+ "7": {
+  "class_type": "Krea2EditGroundedEncode",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "prompt": "Transform the person in the reference photograph into an archmage standing in an ancient library, with shelves visible in the background. A fitted midnight-blue velvet ceremonial robe with delicate silver embroidery, a structured high collar and a silver clasp. The robe is closed in front and completely covers the casual shirt. No hood. A staff with a softly glowing blue crystal. Photorealistic photograph with natural skin and material texture. Professional portrait photography, natural perspective, sharp focus on the face. Soft directional studio lighting. Waist-up portrait, camera at eye level, natural head-to-body proportions. Preserve from the reference photograph: facial anatomy, eyes, nose, moustache, age and expression. Keep a slender figure and natural head-to-body proportions. Avoid: hoodie, hood, casual shirt, drawstrings, beard, exaggerated head size, plastic skin.",
+   "image": [
+    "4",
+    0
+   ],
+   "grounding_px": 1024
+  }
+ },
+ "8": {
+  "class_type": "Krea2EditGroundedEncode",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "prompt": "",
+   "image": [
+    "4",
+    0
+   ],
+   "grounding_px": 1024
+  }
+ },
+ "9": {
+  "class_type": "EmptyLatentImage",
+  "inputs": {
+   "width": 864,
+   "height": 1152,
+   "batch_size": 1
+  }
+ },
+ "10": {
+  "class_type": "Krea2EditModelPatch",
+  "inputs": {
+   "model": [
+    "6",
+    0
+   ],
+   "source_latent": [
+    "9",
+    0
+   ],
+   "ref_boost": 2.0,
+   "fit_mode": "fit",
+   "vae": [
+    "3",
+    0
+   ],
+   "source_image": [
+    "4",
+    0
+   ],
+   "target_latent": [
+    "9",
+    0
+   ]
+  }
+ },
+ "11": {
+  "class_type": "ManualSigmas",
+  "inputs": {
+   "sigmas": "1.000000, 0.972020, 0.940444, 0.904531, 0.863320, 0.815548, 0.759511, 0.692861, 0.612267, 0.512844, 0.387119, 0.223065, 0.000000"
+  }
+ },
+ "12": {
+  "class_type": "KSamplerSelect",
+  "inputs": {
+   "sampler_name": "euler"
+  }
+ },
+ "13": {
+  "class_type": "SamplerCustom",
+  "inputs": {
+   "model": [
+    "10",
+    0
+   ],
+   "add_noise": true,
+   "noise_seed": 145,
+   "cfg": 1.0,
+   "positive": [
+    "7",
+    0
+   ],
+   "negative": [
+    "8",
+    0
+   ],
+   "sampler": [
+    "12",
+    0
+   ],
+   "sigmas": [
+    "11",
+    0
+   ],
+   "latent_image": [
+    "9",
+    0
+   ]
+  }
+ },
+ "14": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "13",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  }
+ },
+ "15": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "14",
+    0
+   ],
+   "filename_prefix": "testcrea/img"
+  }
+ }
+}

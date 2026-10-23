@@ -94,6 +94,27 @@ python3 make_image.py krea2  "..." --release        # последняя кар�
   `curl -s -X POST 127.0.0.1:8790/release -H 'Content-Type: application/json' -d '{"client":"studio-worker"}'`.
 - Без `--release` карта остаётся за вами (следующие картинки идут без загрузки модели); в конце отдайте её.
 
+### 3.1а. Test CREA через ComfyUI (фото-референс + KNP) — с Мака
+
+Проект `~/Yandex.Disk.localized/Projects/Test CREA` переведён на ComfyUI студии (23.10, проверено вживую): тот же формат
+вызова и те же Markdown-шаблоны, карта — через диспетчер. Старый `run.zsh` (resident-сессия) сейчас не работает
+(сломан `./python3`, устаревший gate на сервере, застрявший файл сессии) — пользуйтесь новым:
+
+```bash
+cd "/Users/aleksey.korzhebin/Yandex.Disk.localized/Projects/Test CREA"
+zsh run-comfy.zsh                                         # archmage.md, фото из блока «Референс», случайный сид
+zsh run-comfy.zsh references/portrait.jpg prompts/traveler.md --count 4
+zsh run-comfy.zsh --no-reference --prompt-file prompts/scene.md --count 2 --seed 145
+zsh run-comfy.zsh --count 4 --seed 145 --size medium --aspect 9:16 --knp-strength 1.2
+zsh run-comfy.zsh --dry-run                               # только показать промпт и параметры
+zsh run-comfy.zsh ... --release                           # в конце отдать карту студии
+```
+
+По умолчанию: 1 картинка, medium, 3:4, 12 шагов, Krea 2 Turbo, KNP 1.5, Identity-Edit 1.0 (с фото). Серии —
+`outputs/series/series-<шаблон>-<дата>-<время>-<id>/` (`image-001.png`, `params.json`). Время: ≈30–40 с первая
+картинка, ≈8 с следующие. Фото-референс работает через узлы `ComfyUI-Krea2Edit` (положены в `~/Projects/comfy-h3/custom_nodes/`).
+Тот же режим доступен в `make_image.py`: `--prompt-file`, `--reference фото`, `--ref-boost`, `--grounding-px`.
+
 ### 3.2. LoRA
 
 | Модель | LoRA в ComfyUI | Как задать |

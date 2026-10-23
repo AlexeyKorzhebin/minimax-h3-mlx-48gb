@@ -25,7 +25,9 @@
 - Диспетчер переключён на клон студии `~/Projects/h3-studio` (откат — `scripts/studio_dispatcher_rollback.py`).
 - Ключ CAILA смонтирован в контейнер как `/run/secrets/studio.env:ro` (из `/home/alex/Outputs/h3-panel/.env`).
 - `~/Projects/comfy-h3/extra_model_paths.yaml`: добавлены LoRA Krea 2 и Z-Image (копия до правки — `.bak-20261023`).
-- `/home/alex/Outputs/studio/tools/make_image.py` — скрипт владельца для картинок.
+- `/home/alex/Outputs/studio/tools/make_image.py` — скрипт владельца для картинок (с фото-референсом Identity-Edit).
+- `~/Projects/comfy-h3/custom_nodes/ComfyUI-Krea2Edit/` — узлы Identity-Edit для Krea 2 (откат: удалить папку, перезапустить движок).
+- Test CREA (`~/Yandex.Disk.localized/Projects/Test CREA`): добавлен `run-comfy.zsh` через ComfyUI студии; старый `run.zsh` (resident) не работает, не чинили.
 - Старые комплекты Z-Image (Draw Things) и Qwen-Image 2.1 (GGUF) удалены 22.10 (LoRA сохранены); Hermes image-studio,
   `zimage.sh`, `smoke.sh` поэтому не работают.
 - Контейнер Qwen-LLM пересоздан с профилем shared32, остановлен.
