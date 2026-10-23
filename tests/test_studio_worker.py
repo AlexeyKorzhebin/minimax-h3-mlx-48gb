@@ -12,6 +12,16 @@ from _studio_rig import READY, Rig
 PORTRAIT = "a young woman with a loose dark braid in a pale linen dress"
 
 
+@pytest.fixture(autouse=True)
+def _no_hang():
+    """A hung test dumps every thread's stack and kills the run after 60 s instead of waiting
+    for an outer timeout (review of task 8, item 8)."""
+    import faulthandler
+    faulthandler.dump_traceback_later(60, exit=True)
+    yield
+    faulthandler.cancel_dump_traceback_later()
+
+
 @pytest.fixture
 def rig(tmp_path):
     r = Rig(tmp_path)
@@ -70,9 +80,17 @@ def test_the_keyframe_is_made_recorded_and_attached_to_scene_1(rig):
         "image", str(path.relative_to(rig.home)),
         hashlib.sha256(engine_file.read_bytes()).hexdigest(), "take_output", task_id,
         "image/png")
-    kinds = [k for k, _ in rig.events() if k.startswith("task_")]
-    assert kinds == ["task_queued", "task_running"] + ["task_progress"] * len(
-        [k for k in kinds if k == "task_progress"]) + ["task_succeeded"]
+    # every step of the lifecycle is an event, in order (R5), and the one-off events sit between
+    lifecycle = [(k, p.get("status")) for k, p in rig.events()
+                 if k in ("task_queued", "task_status", "task_running", "task_succeeded")]
+    assert lifecycle == [
+        ("task_queued", None), ("task_status", "waiting_gpu"), ("task_status", "waiting_ready"),
+        ("task_status", "submitting"), ("task_status", "running"), ("task_running", None),
+        ("task_status", "downloading"), ("task_status", "verifying"),
+        ("task_status", "succeeded"), ("task_succeeded", None)]
+    steps = [p for k, p in rig.events("task_progress")]
+    assert steps and all(s["total"] == 8 and 1 <= s["step"] <= 8 for s in steps)
+    assert [s["step"] for s in steps] == sorted({s["step"] for s in steps})   # no repeats
     assert rig.events("task_succeeded") == [("task_succeeded",
                                              {"kind": "image", "asset_id": asset_id})]
     sample = rig.conn.execute("SELECT executor, template, machine, width, height, frames, steps "
@@ -525,7 +543,8 @@ def test_an_unconfirmed_cancel_ends_30_seconds_after_the_first_press(rig):
     rig.comfy.hold = True
     _, _, _, task_id = _queued_keyframe(rig)
     fake = _Time()
-    rig.worker.clock, rig.worker.sleep, rig.worker.poll_s = fake.clock, fake.sleep, 1.0
+    rig.worker.clock, rig.worker.monotonic, rig.worker.sleep, rig.worker.poll_s = (
+        fake.clock, fake.clock, fake.sleep, 1.0)
     rig.worker.cancel_wait_s = 30.0
     _stuck_engine(rig, task_id)
     rig.worker.run_once()
@@ -544,7 +563,8 @@ def test_the_cancel_wait_is_counted_from_the_first_press_not_from_the_worker_tak
     rig.comfy.hold = True
     _, _, _, task_id = _queued_keyframe(rig)
     fake = _Time()
-    rig.worker.clock, rig.worker.sleep, rig.worker.poll_s = fake.clock, fake.sleep, 1.0
+    rig.worker.clock, rig.worker.monotonic, rig.worker.sleep, rig.worker.poll_s = (
+        fake.clock, fake.clock, fake.sleep, 1.0)
     rig.worker.cancel_wait_s = 30.0
     _stuck_engine(rig, task_id)
     real_stop = rig.worker._stop_engine
@@ -558,3 +578,622 @@ def test_the_cancel_wait_is_counted_from_the_first_press_not_from_the_worker_tak
     rig.worker._stop_engine = stop
     rig.worker.run_once()
     assert (rig.task(task_id)["engine_stop"], stop.slept) == ("unconfirmed", 5.0)
+
+
+# ---- review of task 8, round 1 --------------------------------------------------------------
+
+import threading  # noqa: E402
+
+from h3_48gb.engines.comfy_api import ComfyError  # noqa: E402
+from h3_48gb.studio.executors.base import ExecutorError  # noqa: E402
+from h3_48gb.studio.worker import Worker  # noqa: E402
+
+
+def _status_of(rig, task_id) -> str:
+    return rig.conn.execute("SELECT status FROM task WHERE id = ?", (task_id,)).fetchone()[0]
+
+
+def _crash_while_running(rig):
+    """Queue a keyframe and kill the worker (an exception out of `status`) while ComfyUI holds
+    it: the row is `running` with its `engine_ref`, as after a container restart."""
+    rig.comfy.hold = True
+    _, _, _, task_id = _queued_keyframe(rig)
+    real = rig.executor.status
+
+    class Crash(Exception):
+        pass
+
+    def status(ref):
+        answer = real(ref)
+        if answer["state"] == "running":
+            raise Crash
+        return answer
+    rig.executor.status = status
+    with pytest.raises(Crash):
+        rig.drain()
+    rig.executor.status = real
+    rig.comfy.release()
+    return task_id
+
+
+def _reborn(rig, **kwargs) -> Worker:
+    return Worker(rig.db_path, executor=rig.executor, gate=rig.gate, kinds=rig.worker.kinds,
+                  poll_s=0.01, probe_s=0.01, cancel_wait_s=2.0, sleep=rig._sleep, **kwargs)
+
+
+def _run_forever(rig, until, seconds=20.0) -> None:
+    stop = threading.Event()
+    thread = threading.Thread(target=rig.worker.run_forever, args=(stop,), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + seconds
+    try:
+        while time.monotonic() < deadline and not until():
+            time.sleep(0.02)
+    finally:
+        stop.set()
+        thread.join(5)
+    assert not thread.is_alive()
+
+
+# -- 1. a cancelled task never goes to the card (R1, R2) ----------------------------------------
+
+@pytest.mark.parametrize("state", ["waiting_gpu", "waiting_ready"])
+def test_recover_cancels_a_task_that_was_cancelled_while_it_waited(rig, state):
+    _, _, _, task_id = _queued_keyframe(rig)
+    rig.conn.execute("UPDATE task SET status = ?, cancel_requested_at = ? WHERE id = ?",
+                     (state, time.time(), task_id))
+    assert rig.worker.recover() == 0
+    assert _status_of(rig, task_id) == "cancelled"          # by the recovery itself, not the claim
+    rig.drain()
+    task = rig.task(task_id)
+    assert (task["status"], task["engine_stop"], len(rig.comfy.prompts)) == (
+        "cancelled", None, 0)
+    assert rig.events("task_cancelled") == [("task_cancelled", {"engine_stop": None})]
+
+
+@pytest.mark.parametrize("state", ["waiting_gpu", "waiting_ready"])
+def test_recover_puts_a_waiting_task_back_in_the_queue(rig, state):
+    _, _, _, task_id = _queued_keyframe(rig)
+    rig.conn.execute("UPDATE task SET status = ?, wait_reason = 'x' WHERE id = ?",
+                     (state, task_id))
+    assert rig.worker.recover() == 0
+    assert (_status_of(rig, task_id), rig.task(task_id)["wait_reason"]) == ("queued", None)
+
+
+def test_a_cancel_pressed_while_the_card_is_acquired_never_reaches_the_engine(rig):
+    _, _, _, task_id = _queued_keyframe(rig)
+    real = rig.gate.acquire
+
+    def acquire(wait):
+        rig.client.post(f"/api/studio/tasks/{task_id}/cancel", json={"reason": "x"})
+        return real(wait)
+    rig.gate.acquire = acquire
+    rig.drain()
+    task = rig.task(task_id)
+    assert (task["status"], task["engine_stop"], len(rig.comfy.prompts)) == (
+        "cancelled", None, 0)
+
+
+def test_a_queued_task_with_a_cancel_flag_is_cancelled_by_the_claim(rig):
+    _, _, _, task_id = _queued_keyframe(rig)
+    rig.conn.execute("UPDATE task SET cancel_requested_at = ? WHERE id = ?",
+                     (time.time(), task_id))
+    assert rig.worker.run_once() is False
+    assert (_status_of(rig, task_id), len(rig.comfy.prompts)) == ("cancelled", 0)
+
+
+def test_a_cancel_pressed_before_the_retry_is_not_retried(rig):
+    rig.comfy.hold = True
+    _, _, _, task_id = _queued_keyframe(rig)
+    real_status, real_find = rig.executor.status, rig.executor.find
+    restarted = []
+
+    def status(ref):
+        answer = real_status(ref)
+        if answer["state"] == "running" and not restarted:
+            restarted.append(1)
+            rig.comfy.restart()
+            rig.comfy.hold = False
+            _engine_started(rig, time.time() + 60)
+        return answer
+
+    def find(spec):
+        found = real_find(spec)
+        rig.client.post(f"/api/studio/tasks/{task_id}/cancel", json={"reason": "поздно"})
+        return found
+    rig.executor.status, rig.executor.find = status, find
+    rig.drain()
+    task = rig.task(task_id)
+    assert (task["status"], task["attempts"], len(rig.comfy.prompts),
+            rig.events("task_requeued")) == ("cancelled", 0, 1, [])
+
+
+# -- 2. an exception in one task is not the death of the worker (R3) ----------------------------
+
+def test_comfyui_down_during_the_download_fails_the_task_and_not_the_worker(rig):
+    _, _, _, task_id = _queued_keyframe(rig)
+    real_result = rig.executor.result
+
+    def refuse(ref):
+        raise ComfyError("connection refused")
+
+    def result(ref, dest):
+        rig.executor.api.history = refuse
+        return real_result(ref, dest)
+    rig.executor.result = result
+    rig.drain()
+    task = rig.task(task_id)
+    assert (task["status"], task["error"]) == ("failed", "connection refused")
+
+
+def test_an_exception_before_the_engine_has_the_task_fails_it_and_the_loop_goes_on(rig):
+    _, _, _, first = _queued_keyframe(rig)
+    _, _, _, second = _queued_keyframe(rig)
+    real = rig.executor.probe
+    calls = []
+
+    def probe(spec):
+        calls.append(spec.task_id)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        return real(spec)
+    rig.executor.probe = probe
+    _run_forever(rig, lambda: _status_of(rig, second) == "succeeded")
+    assert (rig.task(first)["status"], rig.task(first)["error"], rig.task(second)["status"]) == (
+        "failed", "воркер упал: boom", "succeeded")
+
+
+def test_an_exception_after_the_engine_took_the_task_keeps_its_ref(rig):
+    _, _, _, task_id = _queued_keyframe(rig)
+
+    def result(ref, dest):
+        raise RuntimeError("boom")
+    rig.executor.result = result
+    _run_forever(rig, lambda: _status_of(rig, task_id) == "submit_unknown")
+    task = rig.task(task_id)
+    [job] = rig.comfy.prompts
+    assert (task["status"], task["wait_reason"]) == (
+        "submit_unknown", "Воркер упал, ComfyUI задачу принял: boom")
+    assert rig.conn.execute("SELECT engine_ref FROM task").fetchone()[0] == job["prompt_id"]
+
+
+def test_a_task_whose_inputs_cannot_be_read_does_not_stop_the_recovery(rig):
+    task_id = _crash_while_running(rig)
+    rig.conn.execute("UPDATE task SET payload_json = '{\"template\": \"no-such\"}' WHERE id = ?",
+                     (task_id,))
+    reborn = _reborn(rig)
+    try:
+        assert reborn.recover() == 0
+        assert reborn.run_once() is False
+    finally:
+        reborn.conn.close()
+    task = rig.task(task_id)
+    assert task["status"] == "submit_unknown"
+    assert task["wait_reason"].startswith("Воркер упал, ComfyUI задачу принял: ")
+
+
+# -- 3. /gpu/release under a task (R6) -----------------------------------------------------------
+
+@pytest.mark.parametrize("state", ["waiting_ready", "submitting", "running", "downloading",
+                                   "verifying", "cancelling"])
+def test_release_is_refused_under_a_task_on_the_engine(rig, state):
+    _, _, _, task_id = _queued_keyframe(rig)
+    rig.conn.execute("UPDATE task SET status = ? WHERE id = ?", (state, task_id))
+    r = rig.client.post("/api/studio/gpu/release")
+    assert (r.status_code, r.json()) == (409, {"error": {
+        "code": "task_running", "message": "Идёт рендер — сначала отмените задачу",
+        "detail": {"task_ids": [task_id]}}})
+
+
+def test_release_is_allowed_when_no_task_holds_the_engine(rig):
+    _, _, _, task_id = _queued_keyframe(rig)
+    r = rig.client.post("/api/studio/gpu/release")
+    assert r.status_code == 200, r.text
+
+
+def test_a_task_in_the_download_is_the_engines_current_model_for_the_plan(rig):
+    from h3_48gb.studio import plans
+    _, _, _, task_id = _queued_keyframe(rig)
+    rig.conn.execute("UPDATE task SET status = 'downloading', payload_json = ? WHERE id = ?",
+                     ('{"template": "h3-fl2va"}', task_id))
+    assert plans.template_before_new_image(rig.conn) == "h3-fl2va"
+
+
+# -- 4. the keyframe plan and the versions it was made from (R4) ---------------------------------
+
+def _plan_of_scene(rig):
+    p, s1 = _scene1(rig)
+    plan = rig.post(f"/projects/{p['id']}/plan", {"kind": "image", "scene_id": s1["id"]},
+                    key=False)
+    return p, s1, plan
+
+
+def test_a_plan_survives_nothing_but_the_scene_it_was_made_from(rig):
+    p, s1, plan = _plan_of_scene(rig)
+    r = rig.client.patch(f"/api/studio/scenes/{s1['id']}", json={
+        "expected_edit_version": s1["edit_version"], "state_in_text": "Night, in the rain."})
+    assert r.status_code == 200, r.text
+    r = rig.client.post(f"/api/studio/projects/{p['id']}/image",
+                        json={"plan_id": plan["plan_id"]}, headers={"Idempotency-Key": "k1"})
+    scene = r.json()["error"]["detail"]
+    assert (r.status_code, r.json()["error"]["code"]) == (409, "plan_stale")
+    assert scene == {"scene_id": s1["id"],
+                     "planned": {"edit_version": s1["edit_version"], "project_revision": 3},
+                     "current": {"edit_version": s1["edit_version"] + 1, "project_revision": 3}}
+    # the refused press did not spend the plan
+    assert rig.conn.execute("SELECT used_at FROM render_plan WHERE id = ?",
+                            (plan["plan_id"],)).fetchone()[0] is None
+    assert rig.conn.execute("SELECT COUNT(*) FROM task").fetchone()[0] == 0
+
+
+def test_a_plan_is_stale_after_a_change_of_the_project_too(rig):
+    p, s1, plan = _plan_of_scene(rig)
+    r = rig.client.patch(f"/api/studio/projects/{p['id']}", json={
+        "expected_revision": 3, "title": "Другой лес"})
+    assert r.status_code == 200, r.text
+    r = rig.client.post(f"/api/studio/projects/{p['id']}/image",
+                        json={"plan_id": plan["plan_id"]}, headers={"Idempotency-Key": "k1"})
+    assert (r.status_code, r.json()["error"]["code"],
+            r.json()["error"]["detail"]["current"]["project_revision"]) == (409, "plan_stale", 4)
+
+
+def test_an_untouched_plan_is_confirmed_and_a_free_plan_has_no_versions(rig):
+    p, s1, plan = _plan_of_scene(rig)
+    rig.post(f"/projects/{p['id']}/image", {"plan_id": plan["plan_id"]}, expect=201)
+    free = rig.post(f"/projects/{p['id']}/plan", {"kind": "image", "prompt": "x", "width": 1344,
+                                                  "height": 768}, key=False)
+    assert rig.conn.execute("SELECT versions_json FROM render_plan WHERE id = ?",
+                            (free["plan_id"],)).fetchone()[0] == "{}"
+    rig.post(f"/projects/{p['id']}/image", {"plan_id": free["plan_id"]}, expect=201)
+
+
+# -- 5. every transition is an event (R5) --------------------------------------------------------
+
+def test_waiting_for_the_card_is_told_and_cleared_by_events(tmp_path):
+    rig = Rig(tmp_path, acquire=({"ok": True, "state": "wait_qwen", "engine": "comfy-studio"},
+                                 READY))
+    try:
+        _, _, _, task_id = _queued_keyframe(rig)
+        rig.drain()
+        told = [(k, p) for k, p in rig.events("task_status", "task_waiting")
+                if k == "task_waiting" or p["status"] in ("waiting_gpu", "waiting_ready")]
+        why = "ждём GPU: Qwen держит карту"
+        assert told == [
+            ("task_status", {"task_id": task_id, "status": "waiting_gpu", "wait_reason": None}),
+            ("task_status", {"task_id": task_id, "status": "waiting_gpu", "wait_reason": why}),
+            ("task_waiting", {"wait_reason": why}),
+            ("task_status", {"task_id": task_id, "status": "waiting_ready",
+                             "wait_reason": None})]
+    finally:
+        rig.close()
+
+
+# -- 6. submit_unknown: one look, and a cancel -----------------------------------------------------
+
+def test_an_uncertain_submit_that_the_engine_did_take_is_followed_on(rig):
+    _, _, _, task_id = _queued_keyframe(rig)
+    real = rig.executor.api.submit_prompt
+
+    def submit(payload):
+        real(payload)                         # ComfyUI got it...
+        raise ComfyError("timed out")         # ...the answer did not come back
+    rig.executor.api.submit_prompt = submit
+    rig.drain()
+    [job] = rig.comfy.prompts
+    assert (_status_of(rig, task_id), len(rig.comfy.prompts)) == ("succeeded", 1)
+    assert rig.conn.execute("SELECT engine_ref FROM task").fetchone()[0] == job["prompt_id"]
+
+
+def test_an_uncertain_submit_the_engine_did_not_take_stays_submit_unknown(rig):
+    _, _, _, task_id = _queued_keyframe(rig)
+
+    def submit(payload):
+        raise ComfyError("timed out")
+    rig.executor.api.submit_prompt = submit
+    assert rig.drain() == 1
+    task = rig.task(task_id)
+    assert (task["status"], task["wait_reason"], task["attempts"], len(rig.comfy.prompts)) == (
+        "submit_unknown", "Не знаю, принял ли ComfyUI задачу: timed out", 0, 0)
+    assert rig.events("task_submit_unknown") == [("task_submit_unknown",
+                                                  {"error": "timed out"})]
+
+
+def test_a_task_cut_off_while_submitting_is_looked_for_once_on_restart(rig):
+    from h3_48gb.studio.images import ImageKind
+    _, _, _, task_id = _queued_keyframe(rig)
+    rig.comfy.hold = True
+    row = rig.conn.execute("SELECT * FROM task WHERE id = ?", (task_id,)).fetchone()
+    rig.executor.submit(ImageKind(rig.home, machine="alex-neuro").spec(rig.conn, row))
+    rig.conn.execute("UPDATE task SET status = 'submitting', submit_attempt_at = ? WHERE id = ?",
+                     (time.time(), task_id))
+    rig.comfy.release()
+    assert rig.worker.recover() == 1
+    assert (_status_of(rig, task_id), len(rig.comfy.prompts)) == ("succeeded", 1)
+
+
+def test_a_submit_unknown_task_can_be_cancelled(rig):
+    _, _, _, task_id = _queued_keyframe(rig)
+    rig.conn.execute("UPDATE task SET status = 'submit_unknown' WHERE id = ?", (task_id,))
+    r = rig.client.post(f"/api/studio/tasks/{task_id}/cancel", json={"reason": "не нужно"})
+    assert (r.status_code, r.json()["status"], r.json()["cancel_requested"]) == (
+        200, "cancelled", True)
+    r = rig.client.post(f"/api/studio/tasks/{task_id}/cancel", json={"reason": ""})
+    assert (r.status_code, r.json()["error"]["code"]) == (409, "task_finished")
+
+
+# -- 7. what the review's mutations must not survive ---------------------------------------------
+
+def test_without_proof_of_a_restart_unknown_is_not_a_restart(rig):
+    """M2: a dispatcher that does not answer is `None`, not `True`."""
+    rig.comfy.hold = True
+    _, _, _, task_id = _queued_keyframe(rig)
+    real = rig.executor.status
+
+    def status(ref):
+        answer = real(ref)
+        if answer["state"] == "running":
+            rig.comfy.restart()
+        return answer
+    rig.executor.status = status
+    rig.executor.restarted_since = lambda t: None
+    rig.drain()
+    task = rig.task(task_id)
+    assert (task["status"], task["attempts"], len(rig.comfy.prompts)) == (
+        "submit_unknown", 0, 1)
+
+
+@pytest.mark.parametrize("state", ["running", "downloading", "verifying"])
+def test_a_reborn_worker_takes_the_task_on_from_any_state_of_the_engine(rig, state):
+    task_id = _crash_while_running(rig)
+    rig.conn.execute("UPDATE task SET status = ? WHERE id = ?", (state, task_id))
+    reborn = _reborn(rig)
+    try:
+        assert reborn.recover() == 1
+    finally:
+        reborn.conn.close()
+    assert (rig.task(task_id)["status"], len(rig.comfy.prompts)) == ("succeeded", 1)
+
+
+def test_a_reborn_worker_finishes_the_cancel_it_found_half_done(rig):
+    task_id = _crash_while_running(rig)
+    rig.comfy.hold = True
+    rig.conn.execute("UPDATE task SET status = 'cancelling', cancel_requested_at = ? "
+                     "WHERE id = ?", (time.time(), task_id))
+    reborn = _reborn(rig)
+    try:
+        assert reborn.recover() == 1
+    finally:
+        reborn.conn.close()
+    task = rig.task(task_id)
+    assert (task["status"], task["engine_stop"], rig.comfy.interrupts) == (
+        "cancelled", "confirmed", 1)
+
+
+def test_a_reborn_worker_takes_the_gpu_gate_before_it_follows(rig):
+    task_id = _crash_while_running(rig)
+    calls = []
+    real_acquire, real_done = rig.gate.acquire, rig.gate.done
+    rig.gate.acquire = lambda wait: (calls.append("acquire"), real_acquire(wait))[1]
+    rig.gate.done = lambda: (calls.append("done"), real_done())[1]
+    reborn = _reborn(rig)
+    try:
+        assert reborn.recover() == 1
+    finally:
+        reborn.conn.close()
+    assert (calls, rig.task(task_id)["status"]) == (["acquire", "done"], "succeeded")
+
+
+def test_a_cancel_pressed_while_waiting_for_the_card_ends_the_wait(tmp_path):
+    """M4: `_wait` answers True at once; the gate then leaves, nothing is submitted."""
+    rig = Rig(tmp_path, acquire=({"ok": True, "state": "wait_qwen", "engine": "comfy-studio"},
+                                 READY))
+    try:
+        _, _, _, task_id = _queued_keyframe(rig)
+        real_sleep = rig.worker.sleep
+
+        def sleep(seconds):
+            rig.client.post(f"/api/studio/tasks/{task_id}/cancel", json={"reason": "x"})
+            real_sleep(seconds)
+        rig.worker.sleep = sleep
+        rig.drain()
+        # the gate left at once: the dispatcher was asked ONCE (a wait that ignores the press
+        # would ask again, get READY, and only the later re-read would stop the task)
+        asked = [c for c in rig.dispatcher.calls if c[1] == "/acquire"]
+        assert (_status_of(rig, task_id), len(rig.comfy.prompts), len(asked)) == (
+            "cancelled", 0, 1)
+    finally:
+        rig.close()
+
+
+def test_isolated_status_errors_never_add_up_to_a_loss_of_contact(rig):
+    """M5: 30 failures in a row are a verdict, 30 failures with answers between them are not."""
+    from h3_48gb.studio.executors.base import ExecutorError
+    rig.comfy.hold = True
+    _, _, _, task_id = _queued_keyframe(rig)
+    real = rig.executor.status
+    calls = []
+
+    def status(ref):
+        calls.append(ref)
+        if len(calls) == 70:
+            rig.comfy.release()
+        if len(calls) % 2:
+            raise ExecutorError("blip")
+        return real(ref)
+    rig.executor.status = status
+    rig.drain()
+    assert (rig.task(task_id)["status"], len(calls) > 70) == ("succeeded", True)
+
+
+def test_progress_is_told_once_per_value(rig):
+    """M6: the expected events come from the input — the script of values the engine reports."""
+    _, _, _, task_id = _queued_keyframe(rig)
+    real = rig.executor.status
+    script = [("running", (1, 8)), ("running", (1, 8)), ("running", (2, 8)), ("running", (2, 8))]
+
+    def status(ref):
+        if script:
+            state, progress = script.pop(0)
+            return {"state": state, "progress": progress, "error": None}
+        answer = real(ref)
+        return {**answer, "progress": (8, 8) if answer["state"] == "done" else None}
+    rig.executor.status = status
+    rig.drain()
+    assert rig.events("task_progress") == [("task_progress", {"step": 1, "total": 8}),
+                                           ("task_progress", {"step": 2, "total": 8}),
+                                           ("task_progress", {"step": 8, "total": 8})]
+
+
+def test_the_idle_release_is_told_whether_the_worker_was_busy(rig):
+    """M7."""
+    ticks = []
+
+    class Idle:
+        def tick(self, busy):
+            ticks.append(busy)
+    rig.worker.idle = Idle()
+    assert rig.worker.run_once() is False
+    _queued_keyframe(rig)
+    assert rig.worker.run_once() is True
+    assert ticks == [False, True]
+
+
+def test_the_asset_records_the_size_of_the_file(rig):
+    """M8."""
+    _, _, _, task_id = _queued_keyframe(rig)
+    rig.drain()
+    asset = rig.conn.execute("SELECT bytes FROM asset").fetchone()
+    engine_file = rig.comfy.output_dir / "studio" / task_id / "f_00001_.png"
+    assert asset["bytes"] == engine_file.stat().st_size > 1000
+
+
+def test_an_interrupt_by_somebody_else_fails_the_task_it_does_not_cancel_it(rig):
+    """M9 / review small item: nobody pressed cancel; the engine was interrupted from outside."""
+    rig.comfy.hold = True
+    _, _, _, task_id = _queued_keyframe(rig)
+    real = rig.executor.status
+    done = []
+
+    def status(ref):
+        answer = real(ref)
+        if answer["state"] == "running" and not done:
+            done.append(1)
+            rig.executor.api.interrupt()
+        return answer
+    rig.executor.status = status
+    rig.drain()
+    task = rig.task(task_id)
+    assert (task["status"], task["error"], task["cancel_requested"], task["engine_stop"]) == (
+        "failed", "ComfyUI прервал задачу не по нашей просьбе", False, None)
+    assert rig.conn.execute("SELECT COUNT(*) FROM asset").fetchone()[0] == 0
+
+
+def test_a_task_the_engine_finished_while_we_cancelled_is_reported_as_finished(rig):
+    """M10: the cancel loop sees `done`: engine_stop = finished, never an attached result."""
+    rig.comfy.hold = True
+    _, _, _, task_id = _queued_keyframe(rig)
+    real = _hold_and_press_cancel(rig, task_id)
+    pressed_status = rig.executor.status
+
+    def status(ref):
+        if _status_of(rig, task_id) == "cancelling":
+            return {"state": "done", "progress": None, "error": None}
+        return pressed_status(ref)
+    rig.executor.status = status
+    rig.drain()
+    task = rig.task(task_id)
+    assert (task["status"], task["engine_stop"], task["result_asset_id"]) == (
+        "cancelled", "finished", None)
+    rig.executor.status = real
+
+
+def test_the_gate_is_given_back_after_every_task(tmp_path):
+    """M12: after a success and after a failure."""
+    for kwargs in ({}, {"fail": "CUDA out of memory"}):
+        rig = Rig(tmp_path / str(len(kwargs)), comfy_kwargs=kwargs)
+        try:
+            _queued_keyframe(rig)
+            done = []
+            real = rig.gate.done
+            rig.gate.done = lambda: (done.append(1), real())[1]
+            rig.drain()
+            assert done == [1]
+        finally:
+            rig.close()
+
+
+# -- small items of the review -------------------------------------------------------------------
+
+def test_a_blank_picture_fails_verification(tmp_path):
+    rig = Rig(tmp_path, comfy_kwargs={"flat": True})
+    try:
+        _, _, _, task_id = _queued_keyframe(rig)
+        rig.drain()
+        assert (rig.task(task_id)["status"], rig.task(task_id)["error"]) == (
+            "failed", "результат не прошёл проверку: кадр залит одним цветом")
+        assert rig.conn.execute("SELECT COUNT(*) FROM asset").fetchone()[0] == 0
+    finally:
+        rig.close()
+
+
+def test_the_files_of_a_retried_task_are_only_the_newest_run(rig):
+    from PIL import Image
+    folder = rig.comfy.output_dir / "studio" / "k_a"
+    other = rig.comfy.output_dir / "studio" / "k_b"
+    for place, name in ((folder, "f_00001_.png"), (folder, "f_00002_.png"),
+                        (other, "f_00001_.png")):
+        place.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (4, 4)).save(place / name)
+    dest = rig.home / "x"
+    got = rig.executor.result("file:k_a", dest)
+    assert [p.name for p in got] == ["f_00002_.png"]
+    assert sorted(p.name for p in dest.iterdir()) == ["f_00002_.png"]
+
+
+def test_a_cancel_pressed_long_ago_still_gets_one_look_at_the_engine(rig):
+    """After a restart the 30 s may be long over: the engine is asked once before «unconfirmed»."""
+    task_id = _crash_while_running(rig)
+    rig.conn.execute("UPDATE task SET cancel_requested_at = ? WHERE id = ?",
+                     (time.time() - 100.0, task_id))
+    rig.executor.cancel = lambda ref: None
+    asked = []
+
+    def status(ref):
+        asked.append(ref)
+        return {"state": "cancelled", "progress": None, "error": None}
+    rig.executor.status = status
+    reborn = _reborn(rig)
+    try:
+        assert reborn.recover() == 1
+    finally:
+        reborn.conn.close()
+    assert (rig.task(task_id)["engine_stop"], len(asked)) == ("confirmed", 1)
+
+
+def test_the_readiness_deadline_does_not_follow_the_wall_clock(rig):
+    """Deadlines run on the monotonic clock: a step of the wall clock changes nothing."""
+    _, _, _, task_id = _queued_keyframe(rig)
+    real = rig.executor.probe
+    calls = []
+
+    def probe(spec):
+        calls.append(1)
+        return real(spec) if len(calls) > 3 else {"alive": True, "ready": False, "detail": "x"}
+    rig.executor.probe = probe
+    jumps = []
+
+    def clock():
+        jumps.append(1)
+        return time.time() + 1e6 * len(jumps)
+    rig.worker.clock = clock
+    rig.drain()
+    assert (_status_of(rig, task_id), len(calls)) == ("succeeded", 4)
+
+
+def test_a_status_that_stays_lost_while_find_names_the_ref_ends_in_submit_unknown(rig):
+    _, _, _, task_id = _queued_keyframe(rig)
+    rig.executor.status = lambda ref: {"state": "lost", "progress": None, "error": None}
+    rig.drain()
+    task = rig.task(task_id)
+    assert (task["status"], task["wait_reason"]) == (
+        "submit_unknown", "ComfyUI называет задачу, но не отдаёт её состояние")

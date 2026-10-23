@@ -9,6 +9,7 @@ and `/queue`, so a dropped socket costs the progress bar, never the result."""
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import threading
 from pathlib import Path
@@ -224,7 +225,10 @@ class ComfyExecutor:
             task_id = ref[len(FILE_REF):]
             sources = self._files(task_id)
         else:
-            entry = self.api.history(ref) or {}
+            try:
+                entry = self.api.history(ref) or {}
+            except ComfyError as err:
+                raise ExecutorError(str(err)) from None
             task_id = _studio_task_id(entry.get("prompt") or [])
             if not task_id:
                 raise ExecutorError("в записи ComfyUI нет studio_task_id — чужой файл не отдаём")
@@ -276,8 +280,22 @@ class ComfyExecutor:
         return self._progress.get(ref)
 
     def _files(self, task_id: str) -> list[Path]:
+        """What this task's folder holds — and, after a retry, only the newest run: ComfyUI counts
+        `<prefix>_00001_`, `_00002_`… and the first attempt's files stay beside the second's."""
         folder = self.output_dir / "studio" / task_id
-        return sorted(p for p in folder.glob("*") if p.is_file()) if folder.is_dir() else []
+        if not folder.is_dir():
+            return []
+        newest: dict[tuple, tuple[int, Path]] = {}
+        loose = []
+        for path in sorted(p for p in folder.glob("*") if p.is_file()):
+            m = _COUNTED.match(path.name)
+            if m is None:
+                loose.append(path)
+                continue
+            key = (m["prefix"], m["rest"])
+            if key not in newest or int(m["n"]) > newest[key][0]:
+                newest[key] = (int(m["n"]), path)
+        return sorted([*loose, *(p for _, p in newest.values())])
 
     def _forget(self, ref: str) -> None:
         with self._lock:
@@ -366,6 +384,10 @@ class ComfyExecutor:
                     pass
 
         threading.Thread(target=follow, daemon=True, name=f"comfy-ws-{task_id}").start()
+
+
+#: ComfyUI's SaveImage/SaveVideo names: `<prefix>_<counter>_<rest>`
+_COUNTED = re.compile(r"^(?P<prefix>.*?)_(?P<n>\d{5})_?(?P<rest>.*)$")
 
 
 def _studio_task_id(entry) -> str | None:

@@ -19,8 +19,10 @@ NOT_STARTED = ("queued", "blocked")
 #: queued (the screen shows the presses in order); among renders the one on the model the engine
 #: holds goes first (a switch costs 16–38 s, R-S2-14), then age.
 IMAGE_PRIORITY = 10
-#: The worker holds the engine (and the GPU card) in these states.
-ON_ENGINE = ("submitting", "running", "verifying")
+#: The worker holds the engine (and the GPU card) in these states: from «the engine is ready, we
+#: are about to submit» to the end of the result check, and while a cancel is being carried out.
+#: A release under any of them kills the engine under a live task (review of task 8, R6).
+ON_ENGINE = ("waiting_ready", "submitting", "running", "downloading", "verifying", "cancelling")
 
 
 def queue_key(*, kind: str, priority: int, template: str | None, seq: int,
@@ -90,7 +92,9 @@ def cancel_task(conn: sqlite3.Connection, task_id: str, *, reason: str) -> dict:
                          "updated_at = ? WHERE id = ?", (time.time(), now, task_id))
             events.emit(conn, "task_cancel_requested", project_id=row["project_id"],
                         task_id=task_id, payload={"reason": reason})
-        if row["status"] in NOT_STARTED:
+        if row["status"] in NOT_STARTED or row["status"] == "submit_unknown":
+            # submit_unknown: nobody follows the task and no result will be attached — the
+            # logical cancel is the whole cancel (§8.5; resolving it by hand is S5)
             finish_cancelled(conn, task_id, project_id=row["project_id"], error=None)
         return task_out(task_row(conn, task_id))
 

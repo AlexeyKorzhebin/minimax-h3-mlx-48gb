@@ -271,8 +271,15 @@ class FakeComfyStudio:
                         16)
             info = PngImagePlugin.PngInfo()
             info.add_text("studio", json.dumps(record, sort_keys=True))
-            Image.new("RGB", (width, height), (shade >> 16, (shade >> 8) & 255, shade & 255)).save(
-                folder / name, pnginfo=info)
+            if self.flat:
+                picture = Image.new("RGB", (width, height),
+                                    (shade >> 16, (shade >> 8) & 255, shade & 255))
+            else:      # a gradient, so that «filled with one colour» is a real finding (§8.5)
+                ramp = Image.linear_gradient("L").resize((width, height))
+                picture = Image.merge("RGB", (ramp, Image.new("L", (width, height),
+                                                              (shade >> 8) & 255),
+                                              Image.new("L", (width, height), shade & 255)))
+            picture.save(folder / name, pnginfo=info)
         else:
             name = f"{stem}_00001_.mp4"
             hue = int(hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()[:4],

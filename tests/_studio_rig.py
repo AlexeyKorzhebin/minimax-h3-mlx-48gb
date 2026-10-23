@@ -19,6 +19,9 @@ from h3_48gb.studio.gpu import DispatcherGate
 from h3_48gb.studio.images import ImageKind
 from h3_48gb.studio.worker import Worker
 
+#: ~3000 polls of 2 ms is a few seconds of waiting nobody planned for
+MAX_SLEEPS = 3000
+
 READY = {"ok": True, "state": "ready", "engine": "comfy-studio"}
 
 
@@ -47,13 +50,15 @@ class Rig:
         self.worker = Worker(self.db_path, executor=self.executor, gate=self.gate,
                              kinds=kinds(self) if kinds else
                              {"image": ImageKind(self.home, machine="alex-neuro")},
-                             poll_s=0.01, probe_s=0.01, cancel_wait_s=2.0,
+                             poll_s=0.01, probe_s=0.01, cancel_wait_s=2.0, ready_timeout_s=1.0,
                              sleep=self._sleep)
 
     def _sleep(self, seconds):
         import time
         self.sleeps.append(seconds)
-        time.sleep(min(seconds, 0.01))
+        if len(self.sleeps) > MAX_SLEEPS:     # a loop that never ends fails in seconds, not by timeout
+            raise RuntimeError(f"worker slept {MAX_SLEEPS} times: it loops")
+        time.sleep(min(seconds, 0.002))
 
     def close(self):
         self.comfy.close()

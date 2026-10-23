@@ -135,7 +135,11 @@ def plan_image(conn: sqlite3.Connection, project_id: str, *, scene_id: str | Non
             "estimate_source": estimate["source"], "status": "ready", "reasons": []}
     switch = switches(conn, [templates.KEYFRAME_TEMPLATE],
                        before=template_before_new_image(conn))
-    plan_id, expires = _save_plan(conn, project_id, tier=None, items=[item], versions={})
+    # a scene's keyframe is planned from its text and the project's cast and style: remember both
+    # versions, O12 refuses a plan the owner has edited under (review of task 8, R4)
+    versions = ({"scene_id": scene_id, "edit_version": scene["edit_version"],
+                 "project_revision": project["revision"]} if scene_id is not None else {})
+    plan_id, expires = _save_plan(conn, project_id, tier=None, items=[item], versions=versions)
     return {"plan_id": plan_id, "expires_at": expires, "kind": "image", "items": [item],
             "total_s": round(item["estimate_s"] + sum(s["seconds"] for s in switch), 1),
             "checkpoint_switches": switch, "lint": {}, "blocked": [], "invalid": []}
@@ -152,6 +156,19 @@ def enqueue_image(conn: sqlite3.Connection, project_id: str, plan_id: str, key: 
                           "Этот ключ уже поставил задачу (запись о нём устарела)", {"key": key})
     plan = load_plan(conn, project_id, plan_id, "image")
     item = plan["items"][0]
+    planned = plan["versions"]
+    if planned:
+        scene = conn.execute("SELECT edit_version FROM scene WHERE id = ? AND deleted_at IS NULL",
+                             (planned["scene_id"],)).fetchone()
+        revision = conn.execute("SELECT revision FROM project WHERE id = ?",
+                                (project_id,)).fetchone()["revision"]
+        current = {"edit_version": scene["edit_version"] if scene else None,
+                   "project_revision": revision}
+        if current != {k: planned[k] for k in current}:
+            raise StudioError(409, "plan_stale", "Сцена или проект изменились после плана — "
+                              "постройте план заново",
+                              {"scene_id": planned["scene_id"],
+                               "planned": {k: planned[k] for k in current}, "current": current})
     task_id = ids.new_id("k")
     now = ids.now_iso()
     payload = {k: item[k] for k in ("template", "template_sha256", "prompt", "width", "height",

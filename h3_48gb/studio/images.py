@@ -63,11 +63,14 @@ class ImageKind:
             with Image.open(path) as image:
                 image.load()
                 size = image.size
+                flat = all(low == high for low, high in image.convert("RGB").getextrema())
         except Exception:                      # noqa: BLE001 -- Pillow raises many types
             raise VerifyError(f"кадр не читается: {path.name}") from None
         want = (spec.values["width"], spec.values["height"])
         if size != want:
             raise VerifyError(f"кадр {size[0]}×{size[1]} вместо {want[0]}×{want[1]}")
+        if flat:                               # §8.5: the engine «succeeded» on a blank frame
+            raise VerifyError("кадр залит одним цветом")
         data = path.read_bytes()
         asset_id = ids.new_id("a")
         conn.execute(

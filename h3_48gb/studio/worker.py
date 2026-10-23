@@ -7,6 +7,7 @@ right after the answer and before the first poll (И9).
 Task kinds plug in (`kinds`): slice S2 has `image` (Krea 2 keyframe), slice S3 adds `render`."""
 from __future__ import annotations
 
+import logging
 import math
 import sqlite3
 import threading
@@ -21,19 +22,23 @@ from h3_48gb.studio.images import VerifyError
 from h3_48gb.studio.plans import last_engine_template
 from h3_48gb.studio.tasks import finish_cancelled, queued_in_order
 
+log = logging.getLogger(__name__)
+
 POLL_SECONDS = 2.0
 PROBE_SECONDS = 5.0
 READY_TIMEOUT_SECONDS = 600.0      # the dispatcher's start_timeout for ComfyUI (§8.1)
 CANCEL_WAIT_SECONDS = 30.0         # §8.5: then cancelled with engine_stop=unconfirmed
 MAX_STATUS_ERRORS = 30             # consecutive failed status reads before submit_unknown
 MAX_ATTEMPTS = 2                   # §8.5: lost -> one automatic retry
+MAX_SAME_REF_POLLS = 30            # `lost` while `find` keeps naming the same ref: not a loop
 
 
 class Worker:
     def __init__(self, db_path: Path, *, executor, gate, kinds: dict, idle=None,
                  poll_s: float = POLL_SECONDS, probe_s: float = PROBE_SECONDS,
                  ready_timeout_s: float = READY_TIMEOUT_SECONDS,
-                 cancel_wait_s: float = CANCEL_WAIT_SECONDS, clock=time.time, sleep=time.sleep):
+                 cancel_wait_s: float = CANCEL_WAIT_SECONDS, clock=time.time,
+                 monotonic=time.monotonic, sleep=time.sleep):
         self.conn = db.connect(db_path)
         self.executor = executor
         self.gate = gate
@@ -43,8 +48,13 @@ class Worker:
         self.probe_s = probe_s
         self.ready_timeout_s = ready_timeout_s
         self.cancel_wait_s = cancel_wait_s
+        # `clock` stamps what other parties compare with their own wall clock (the dispatcher's
+        # `started_at`, the API's `cancel_requested_at`); deadlines inside this process run on
+        # `monotonic`, which a clock step cannot shorten or stretch
         self.clock = clock
+        self.monotonic = monotonic
         self.sleep = sleep
+        self._current: str | None = None      # the task the loop is on, for a crash report
         # the model the engine holds as far as the studio knows — the plan counts from it too
         # (revision 4.1: after a restart the worker and the plan start from the same model)
         self.last_template: str | None = last_engine_template(self.conn)
@@ -53,7 +63,13 @@ class Worker:
     # -- loop -------------------------------------------------------------------------------
     def run_forever(self, stop: threading.Event) -> None:
         while not stop.is_set():
-            if not self.run_once():
+            try:
+                busy = self.run_once()
+            except Exception as err:          # noqa: BLE001 -- one task must not kill the loop
+                log.exception("studio worker: task %s crashed", self._current)
+                self._crashed(err)
+                busy = False
+            if not busy:
                 stop.wait(self.poll_s)
 
     def run_once(self) -> bool:
@@ -74,28 +90,38 @@ class Worker:
         with db.tx(self.conn):
             for kind in self.kinds.values():
                 kind.prepare(self.conn)
-            # §8.4 `queue_order` (revision 4): the same order the plan counts switches by
-            rows = queued_in_order(self.conn, kinds=tuple(self.kinds),
-                                   loaded_template=self.last_template, limit=1)
-            if not rows:
-                return None
-            row = rows[0]
-            self.conn.execute("UPDATE task SET status = 'waiting_gpu', updated_at = ? "
-                              "WHERE id = ? AND status = 'queued'", (ids.now_iso(), row["id"]))
+            while True:
+                # §8.4 `queue_order` (revision 4): the same order the plan counts switches by
+                rows = queued_in_order(self.conn, kinds=tuple(self.kinds),
+                                       loaded_template=self.last_template, limit=1)
+                if not rows:
+                    return None
+                row = rows[0]
+                if row["cancel_requested_at"] is None:
+                    break
+                # pressed before the worker got here: it never goes to the card
+                finish_cancelled(self.conn, row["id"], project_id=row["project_id"], error=None)
+            self._update(row["id"], status="waiting_gpu")
             return self._row(row["id"])
 
     # -- after a restart -------------------------------------------------------------------
     def recover(self) -> int:
-        """At start — the worker or its container was restarted mid-task. The rows of the §8.5
-        reconcile table that need no guessing: a task waiting for the card or the engine goes
-        back to the queue; one cut off while submitting becomes `submit_unknown` (never a blind
-        resubmit, Codex-4); one the engine had accepted (`engine_ref` written, И9) is followed
-        on from where it was. `find`/`restarted_since` for the rest is slice S5. Returns how
-        many tasks were resumed."""
+        """At start — the worker or its container was restarted mid-task (§8.5 reconcile). A task
+        waiting for the card or the engine goes back to the queue (cancelled, if the owner had
+        pressed cancel meanwhile — it never reached the engine); one cut off while submitting
+        becomes `submit_unknown`, then ONE `find` by `extra_data` asks the engine whether it took
+        the task (never a blind resubmit, Codex-4); one the engine had accepted (`engine_ref`
+        written, И9) is followed on from where it was, under the GPU gate like any task. Returns
+        how many tasks were resumed. One task's failure never stops the others."""
+        cut = []
         with db.tx(self.conn):
             for row in self.conn.execute("SELECT * FROM task WHERE status IN "
                                          "('waiting_gpu', 'waiting_ready')").fetchall():
-                self._update(row["id"], status="queued", wait_reason=None)
+                if row["cancel_requested_at"] is not None:
+                    finish_cancelled(self.conn, row["id"], project_id=row["project_id"],
+                                     error=None)
+                else:
+                    self._update(row["id"], status="queued", wait_reason=None)
             for row in self.conn.execute("SELECT * FROM task WHERE status = 'submitting'"
                                          ).fetchall():
                 self._update(row["id"], status="submit_unknown",
@@ -103,23 +129,98 @@ class Worker:
                                          "принял ли ComfyUI задачу")
                 events.emit(self.conn, "task_submit_unknown", project_id=row["project_id"],
                             task_id=row["id"], payload={"error": "worker restarted"})
+                cut.append(row["id"])
+        resumed = 0
+        for task_id in cut:
+            resumed += self._guarded(task_id, self._resolve_cut, task_id)
         rows = self.conn.execute(
             "SELECT * FROM task WHERE status IN ('running', 'cancelling', 'downloading', "
             "'verifying') AND engine_ref IS NOT NULL ORDER BY rowid").fetchall()
         for row in rows:
-            kind = self.kinds[row["kind"]]
-            spec = kind.spec(self.conn, row)
-            self.last_template = spec.template
-            if row["status"] == "cancelling" or row["cancel_requested_at"] is not None:
-                self._stop_engine(row["id"], row["engine_ref"])
-                continue
-            ref = self._follow(row["id"], kind, spec, row["engine_ref"])
+            resumed += self._guarded(row["id"], self._resume, row["id"], row["engine_ref"],
+                                     row["engine_submitted_at"])
+        return resumed
+
+    def _guarded(self, task_id: str, call, *args) -> int:
+        """Run one task's recovery; an error ends that task, not the recovery. Returns 1 when
+        the task was resumed (the call's own answer), 0 otherwise."""
+        self._current = task_id
+        try:
+            return int(bool(call(*args)))
+        except Exception as err:          # noqa: BLE001
+            log.exception("studio worker: recovery of task %s failed", task_id)
+            self._crashed(err)
+            return 0
+        finally:
+            self._current = None
+
+    def _resolve_cut(self, task_id: str) -> bool:
+        """`submitting` at the crash: ask once. Found → follow it on; not found or no answer →
+        `submit_unknown` stays and the owner decides (S5)."""
+        task = self._row(task_id)
+        kind = self.kinds[task["kind"]]
+        spec = kind.spec(self.conn, task)
+        ref = self._find_once(spec)
+        if ref is None:
+            return False
+        self._adopt(task_id, kind, spec, ref, task["submit_attempt_at"] or self.clock())
+        self._resume(task_id, ref, task["submit_attempt_at"] or self.clock())
+        return True
+
+    def _resume(self, task_id: str, ref: str, submitted: float) -> bool:
+        task = self._row(task_id)
+        kind = self.kinds[task["kind"]]
+        spec = kind.spec(self.conn, task)
+        self.last_template = spec.template
+        cancelled = self.gate.acquire(lambda reason, s: self._wait(task_id, reason, s))
+        try:
+            if self._row(task_id)["wait_reason"] is not None:
+                self._set(task_id, wait_reason=None)
+            if cancelled:                 # `_follow` stops the engine itself on a cancel flag
+                self._stop_engine(task_id, ref)
+                return True
+            ref = self._follow(task_id, kind, spec, ref)
             if ref is not None:
-                self._collect(row["id"], kind, spec, ref, row["engine_submitted_at"])
-        return len(rows)
+                self._collect(task_id, kind, spec, ref, submitted or self.clock())
+            return True
+        finally:
+            self.gate.done()
+
+    def _find_once(self, spec) -> str | None:
+        """One `find` after an uncertain submit; «could not ask» is the same as «not found»."""
+        if self.executor.capabilities["find"] != "exact":
+            return None
+        try:
+            return self.executor.find(spec)
+        except ExecutorError:
+            return None
+
+    def _crashed(self, err: Exception) -> None:
+        """An exception escaped one task: the task ends — `submit_unknown` if the engine had
+        accepted it (the ref is kept), `failed` otherwise — and the loop goes on."""
+        task_id = self._current
+        self._current = None
+        if task_id is None:
+            return
+        try:
+            task = self._row(task_id)
+            if task is None or task["status"] in ("queued", "succeeded", "failed", "cancelled",
+                                                  "submit_unknown", "blocked"):
+                return
+            if task["engine_ref"] is not None:
+                self._unknown(task_id, f"Воркер упал, ComfyUI задачу принял: {err}")
+            else:
+                self._fail(task_id, f"воркер упал: {err}")
+        except Exception:                 # noqa: BLE001
+            log.exception("studio worker: could not record the crash of task %s", task_id)
 
     # -- one task ---------------------------------------------------------------------------
     def _execute(self, task: sqlite3.Row) -> None:
+        self._current = task["id"]       # left set on an exception: `_crashed` reads it
+        self._execute_task(task)
+        self._current = None
+
+    def _execute_task(self, task: sqlite3.Row) -> None:
         kind = self.kinds[task["kind"]]
         try:
             spec = kind.spec(self.conn, task)
@@ -142,20 +243,27 @@ class Worker:
 
     def _run_on_engine(self, task_id: str, kind, spec) -> None:
         self._set(task_id, status="waiting_ready", wait_reason=None)
-        deadline = self.clock() + self.ready_timeout_s
+        deadline = self.monotonic() + self.ready_timeout_s
         while True:
             probe = self.executor.probe(spec)
             if probe["ready"]:
                 break
-            if self.clock() > deadline:
+            if self.monotonic() > deadline:
                 self._fail(task_id, f"ComfyUI не готов за {self.ready_timeout_s:g} с: "
                            f"{probe['detail']}")
                 return
             if self._wait(task_id, f"ждём ComfyUI: {probe['detail']}", self.probe_s):
                 self._cancelled(task_id, None)
                 return
-        self._set(task_id, status="submitting", wait_reason=None,
-                  submit_attempt_at=self.clock())
+        with db.tx(self.conn):
+            # the press may have come while the card was being acquired or the engine warmed up:
+            # re-read the flag in the transaction that writes `submitting` (§8.5)
+            if self._row(task_id)["cancel_requested_at"] is not None:
+                task = self._row(task_id)
+                finish_cancelled(self.conn, task_id, project_id=task["project_id"], error=None)
+                return
+            self._update(task_id, status="submitting", wait_reason=None,
+                         submit_attempt_at=self.clock())
         version = self.executor.engine_version()
         try:
             ref = self.executor.submit(spec)
@@ -163,23 +271,34 @@ class Worker:
             self._event_set(task_id, "task_submit_unknown", {"error": str(err)},
                             status="submit_unknown",
                             wait_reason=f"Не знаю, принял ли ComfyUI задачу: {err}")
-            return
+            ref = self._find_once(spec)         # one look: the engine may have taken it after all
+            if ref is None:
+                return
         except ExecutorError as err:
             self._fail(task_id, str(err))
             return
         submitted = self.clock()
+        self._adopt(task_id, kind, spec, ref, submitted, version=version)
+        ref = self._follow(task_id, kind, spec, ref)
+        if ref is None:
+            return
+        self._collect(task_id, kind, spec, ref, submitted)
+
+    def _adopt(self, task_id: str, kind, spec, ref: str, submitted: float,
+               version: str | None = None) -> None:
+        """The engine has the task: `engine_ref` and `running` in one write, before the first
+        poll (И9)."""
         with db.tx(self.conn):
-            self._update(task_id, engine_ref=ref, engine_submitted_at=submitted, status="running",
-                         engine_version=version, template_sha256=spec.template_sha256)
+            fields = {"engine_ref": ref, "engine_submitted_at": submitted, "status": "running",
+                      "wait_reason": None, "template_sha256": spec.template_sha256}
+            if version is not None:
+                fields["engine_version"] = version
+            self._update(task_id, **fields)
             task = self._row(task_id)
             kind.on_running(self.conn, task)
             events.emit(self.conn, "task_running", project_id=task["project_id"],
                         task_id=task_id, payload={"engine_ref": ref})
         self.last_template = spec.template
-        ref = self._follow(task_id, kind, spec, ref)
-        if ref is None:
-            return
-        self._collect(task_id, kind, spec, ref, submitted)
 
     def _collect(self, task_id: str, kind, spec, ref: str, submitted: float) -> None:
         """§8.5 downloading → verifying → succeeded (or failed / cancelled)."""
@@ -207,6 +326,7 @@ class Worker:
     def _follow(self, task_id: str, kind, spec, ref: str) -> str | None:
         """Poll until done; returns the ref to fetch from, or None if the task ended otherwise."""
         errors = 0
+        same_ref = 0
         while True:
             task = self._row(task_id)
             if task["cancel_requested_at"] is not None:
@@ -235,8 +355,9 @@ class Worker:
                 self._fail(task_id, status["error"] or "ошибка исполнителя")
                 return None
             if state == "cancelled":
-                self._cancelled(task_id, "ComfyUI прервал задачу не по нашей просьбе",
-                                engine_stop="confirmed")
+                # we did not ask (the cancel flag is checked above): somebody else pressed
+                # interrupt on the engine — the task did not finish and nobody cancelled it
+                self._fail(task_id, "ComfyUI прервал задачу не по нашей просьбе")
                 return None
             if state == "lost":
                 try:
@@ -247,10 +368,15 @@ class Worker:
                     return None
                 if found is not None and found != ref:
                     ref = found
+                    same_ref = 0
                     self._set(task_id, engine_ref=found)
                     continue
                 if found is None:
                     self._lost(task_id, kind)
+                    return None
+                same_ref += 1                  # status says lost, find names the same ref
+                if same_ref >= MAX_SAME_REF_POLLS:
+                    self._unknown(task_id, "ComfyUI называет задачу, но не отдаёт её состояние")
                     return None
             self.sleep(self.poll_s)
 
@@ -263,9 +389,12 @@ class Worker:
             pass
         stop = "unconfirmed"
         # the 30 s run from the first press (`cancel_requested_at`, COALESCE in O14), not from the
-        # moment this worker got to it: a repeated press or a restart does not extend them
+        # moment this worker got to it: a repeated press or a restart does not extend them. The
+        # press is an absolute stamp (`clock`); the deadline is set on `monotonic`. The engine is
+        # asked at least once, however old the press.
         asked = self._row(task_id)["cancel_requested_at"]
-        deadline = (asked if asked is not None else self.clock()) + self.cancel_wait_s
+        waited = max(0.0, self.clock() - asked) if asked is not None else 0.0
+        deadline = self.monotonic() + max(0.0, self.cancel_wait_s - waited)
         while True:
             try:
                 state = self.executor.status(ref)["state"]
@@ -279,7 +408,7 @@ class Worker:
             if state in ("done", "failed"):
                 stop = "finished"
                 break
-            if self.clock() >= deadline:
+            if self.monotonic() >= deadline:
                 break
             self.sleep(self.poll_s)
         self._cancelled(task_id, None, engine_stop=stop)
@@ -298,6 +427,9 @@ class Worker:
             return
         with db.tx(self.conn):
             task = self._row(task_id)
+            if task["cancel_requested_at"] is not None:     # pressed meanwhile: no second run
+                finish_cancelled(self.conn, task_id, project_id=task["project_id"], error=None)
+                return
             if task["attempts"] + 1 < MAX_ATTEMPTS:
                 self._update(task_id, status="queued", attempts=task["attempts"] + 1,
                              engine_ref=None, submit_attempt_at=None, engine_submitted_at=None,
@@ -345,9 +477,22 @@ class Worker:
         return self.conn.execute("SELECT * FROM task WHERE id = ?", (task_id,)).fetchone()
 
     def _update(self, task_id: str, **fields) -> None:
+        """Inside a transaction. Every change of the status or of the wait reason is told to the
+        master as `task_status` (§19.5): the screen shows «ждём GPU» and clears it by events, not
+        by guessing from the next poll."""
+        watched = "status" in fields or "wait_reason" in fields
+        before = self._row(task_id) if watched else None
         sets = ", ".join(f"{name} = ?" for name in fields)
         self.conn.execute(f"UPDATE task SET {sets}, updated_at = ? WHERE id = ?",
                           (*fields.values(), ids.now_iso(), task_id))
+        if watched:
+            after = self._row(task_id)
+            if (before["status"], before["wait_reason"]) != (after["status"],
+                                                             after["wait_reason"]):
+                events.emit(self.conn, "task_status", project_id=after["project_id"],
+                            task_id=task_id, payload={"task_id": task_id,
+                                                      "status": after["status"],
+                                                      "wait_reason": after["wait_reason"]})
 
     def _set(self, task_id: str, **fields) -> None:
         with db.tx(self.conn):
