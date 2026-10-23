@@ -35,6 +35,8 @@ services:
   # Slice S2 (plan 2026-10-22): the task loop. Same image; host network for the dispatcher
   # (127.0.0.1:8790) and the studio's ComfyUI (127.0.0.1:8189); ComfyUI's output folder read-only —
   # the worker copies a result into the studio's own tree and never writes there.
+# Stopping it under a task normally ends in SIGKILL after stop_grace_period (40 s): it does not wait
+# for the task. Nothing is lost — `recover()` at the next start follows the task on (§8.5).
   studio-worker:
     image: h3-studio:latest
     network_mode: host
