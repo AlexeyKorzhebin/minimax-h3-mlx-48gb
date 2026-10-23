@@ -373,3 +373,23 @@ def test_migration_003_adds_the_task_links_of_slice_s2_and_keeps_the_rows(tmp_pa
     assert [tuple(r) for r in conn.execute(
         "SELECT id, status, project_id, result_asset_id, engine_version, template_sha256 "
         "FROM task")] == [("k", "blocked", None, None, None, None)]
+
+
+def test_migration_003_indexes_have_the_exact_columns_in_order(tmp_path):
+    conn = _fresh(tmp_path)
+
+    def index_columns(name):
+        return [r[2] for r in conn.execute(f"PRAGMA index_info({name})")]
+    assert index_columns("task_by_status") == ["status", "priority", "created_at"]
+    assert index_columns("task_by_project") == ["project_id", "created_at"]
+
+
+def test_migration_003_task_result_asset_id_is_a_foreign_key_to_asset(tmp_path):
+    conn = _fresh(tmp_path)
+    _seed_scene(conn)
+    conn.commit()
+    refs = {r["from"]: (r["table"], r["to"]) for r in conn.execute("PRAGMA foreign_key_list(task)")}
+    assert refs["result_asset_id"] == ("asset", "id")
+    assert refs["project_id"] == ("project", "id")
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
+        conn.execute("UPDATE task SET result_asset_id = 'no-such-asset' WHERE id = 'k'")
