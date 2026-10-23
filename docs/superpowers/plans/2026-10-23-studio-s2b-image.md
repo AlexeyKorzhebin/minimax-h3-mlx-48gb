@@ -1,4 +1,4 @@
-# Студия, срез S2b «Картинка» — план реализации (редакция 1)
+# Студия, срез S2b «Картинка» — план реализации (редакция 2)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -10,12 +10,32 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-10-studio-part1-core-design.md`, редакция 3.3. Читать до первой задачи: §19 целиком (19.1–19.11), §14 строка S2b и абзац «S2b и план S2–S3» (шесть стыков), §8.2 (карточка, отпечаток весов, необязательные входы, рекомендация «Быстро»), §8.4 (`queue_order`, вытеснение), §10 «Правила картинки» и L7d, §15.4, §17.1 п.10–11, §17.5. Строится на `docs/superpowers/plans/2026-10-22-studio-s2-s3.md` ред. 4.1, часть C (задачи 1–10): её интерфейсы здесь не повторяются, а называются (блоки Interfaces). Замеры: `docs/h3-modes/IMAGE-MODELS-20261022.md` (IMG-22), `docs/h3-modes/LLM-PLUS-IMAGE-20261023.md` §7, §9. Дизайн: `docs/design/2026-10-studio-style/AB/README.md`.
 
+## Редакция 2 (23.10): ревью Codex ред. 1 и решения координатора
+
+Ревью: `docs/superpowers/plans/review-codex-s2b.md` (коммит плана 79b4435c): 2 блокера, 7 важных, 3 мелких — закрыты все; решения координатора 23.10 — в столбце «Что стало». **База проверки сменилась:** ред. 2 прогнана на настоящем коде `studio/s2 afe05dcc` (S2 задачи 1–9 с правками ревью), а не на тексте плана S2–S3: каждая задача — коммит, тесты задачи поверх предыдущего коммита красные, на её коммите зелёные. Итог набора `test_studio_*.py test_comfy_api.py test_gpu_dispatcher.py test_ltx_upscale.py test_gpu_gate.py`: база 679 тестов → **804 passed, 2 skipped**. Новая задача 12 (сосуществование с Qwen-LLM); мастер — задачи 13–14, выкладка — 15.
+
+| № | Находка | Что стало | Где | Проверка |
+|---|---|---|---|---|
+| Б1 | Веса сверялись по сохранённому инвентарю и до ожидания карты | решение 1: `ImageKind.before_submit` — **после** `gate.acquire()` и готовности движка, перед `submit`; отпечаток по файлам на диске (размер+mtime против кэша, изменённый — пересчёт sha256, `inventory.fingerprint_on_disk`) | задача 10 | тест подменяет файл во время ожидания карты и не трогает инвентарь; без проверки — `('succeeded', None) == ('failed', …)` |
+| Б2 | `width=1` сохранялся, `nearest_size` бросал исключение, O3 падал | решение 2: O29 проверяет **названный** размер по карточке до записи → 400 `size_invalid {field, allowed, nearest}`; `nearest_size` → `None` вместо исключения, LI2 без `fix`; `lint_draft` не падает никогда (`lint_internal`) | задачи 1, 4, 5, 6 | `test_a_typed_size_out_of_the_card_is_refused_before_writing[width=1]`; без проверки — `KeyError: 'error'` (ответ 200) |
+| 3 | Повтор не сверял `cfg` | решение 3: `repeat_problem` сверяет `steps`, `cfg`, `seed` с входами текущей карточки; `cfg` вне входов (Krea) — с профилем | задача 8 | `test_a_repeat_is_checked_input_by_input_against_the_card` (3 случая); мутация — красная |
+| 4 | `models_unchecked` только при пустом инвентаре | решение 3: и когда нет записи выбранного шаблона/профиля (партия из черновика и повтор) | задача 8 | `test_no_plan_while_the_chosen_model_has_no_inventory_entry` |
+| 5 | Смены считались не по очереди S2 | решение 3: «до» — `template_before_new_image` (S2, учитывает `submitting`), «после» — рендер, который воркер возьмёт **с моделью партии** на карте | задача 8 | `test_the_return_is_to_the_render_the_worker_picks_after_the_batch`: старая логика — `'h3-fl2va' != 'h3-ref2va'` |
+| 6 | «Повтор не гарантирован» терялся | решение 3: `differs` содержит `engine`, если версия варианта или текущая (`plans.current_engine_version`, `/system_stats`) неизвестна или другая; `weights` — если отпечаток варианта неизвестен или другой; мастер показывает строку (задача 13) | задачи 8, 13 | `test_equal_pixels_are_promised_only_when_everything_is_known` (3 случая) |
+| 7 | O31 неидемпотентна под гонкой | решение 3: чтение, решение и запись в одной `BEGIN IMMEDIATE`, условный `UPDATE`, событие по `rowcount` | задача 9 | `test_two_presses_of_godится_at_once_give_one_event` (два потока, медленное чтение) |
+| 8 | Тест автоперевода считал вызовы | решение 3: тесты по содержимому — тела O28, `GET` снимка после 409, переданный наверх черновик, остановка на `owner` | задача 13 | не прогонялся (мастер) |
+| 9 | R-S2b-20: Krea/Z ждали выгрузки LLM | решение 4: **сосуществование** — задача 12: диспетчер пускает `comfy-studio` рядом с Qwen shared32 для задач, чья карточка это разрешает (`limits.coexists_with_llm` × `EngineSpec.coexists_with_qwen`, профиль LLM — по `context_length`); Qwen-Image/H3 ждут (даже при поднятом ComfyUI); после тяжёлой партии — `POST /free` и, по настройке `llm.restore_after_heavy`, возврат LLM с сохранением движка | задачи 1, 12, 15 | 7 тестов диспетчера (11 с параметрами) и 4 студии; 4 мутации красные |
+| 10 | Отчёт о мутациях №3 и №16 неточен | №16 ловит прямой тест подстановщика (вывод — в задаче 1); №3 описана честно: «задач меньше, чем вариантов», а литерал графа пиннит `batch_size: 1` | задачи 1, 10, таблица мутаций | прогнано |
+| 11 | Тест весов проверял форму | словарь `WEIGHTS` — значения из лога шага 1 задачи 1, независимо от карточки | задача 1 | значения — на alex-neuro |
+| 12 | Тест ошибки O28 не шёл через настоящий `ProviderLlm` | `test_a_provider_failure_through_the_real_door_leaks_nothing`: `providers.json` + `.env` с синтетическим ключом → тело, журнал, черновик без ключа | задача 7 | 2 случая зелёные |
+| реш. 5 | Стыки с фиксом S2 задачи 8 | `task_status` — журнал пути сравнивается по видам пути (задача 11), мастер перечитывает снимок по `task_status` и показывает `wait_reason` (задача 13); O14 на `submit_unknown` → `cancelled` — «Отменить партию» шлёт O14 и таким задачам (задача 13); `ON_ENGINE` — через `template_before_new_image` (задача 8); план кадра S2 с `edit_version`/`revision` и `find` после `SubmitUncertain` — код S2, S2b его не трогает; повтор ключа O30 — 200, как у O12 | задачи 8, 9, 11, 13 | `test_studio_image_path.py` не зависит от `task_status` |
+
 ## Где работать и база
 
 - Ветка `studio/s2b` от `studio/s2` **после приёмки S2** (задачи 1–10 плана S2–S3, включая выкладку задачи 10 и проход владельца). Worktree `~/worktrees/studio-s2b`. Пути — от корня worktree.
-- Кто что делает — как в плане S2–S3: исполнитель пишет код и тесты, гоняет команды, показывает мутации, **не коммитит** (шаг «коммит» = список файлов и сообщение в отчёте), `git add -A` запрещён; выкладка (задача 14) — только координатор и только после «да» владельца.
-- **Как проверен этот план (23.10).** Изолированная копия в scratch: `studio/s0-s1 1851f79f` + S2 задачи 1–3 (`35cd037c`) + S2 задачи 4–10 **из текста плана S2–S3 ред. 4.1** (скрипт Create/Apply, 13 диффов, 0 отказов; набор `test_studio_*.py test_comfy_api.py` — 614 passed) + шаблоны Z-Image/Qwen из `docs/h3-modes/comfy-templates/` (main). На этой базе задачи 1–11 этого плана выполнены по одному коммиту на задачу: тесты каждой задачи поверх дерева **предыдущей** — красные (вывод — в шаге «увидеть красным»), на её коммите — зелёные; итог: `test_studio_*.py test_comfy_api.py test_gpu_dispatcher.py test_ltx_upscale.py` — **714 passed, 2 skipped** (+100 тестов S2b, 0 правок поведения S2). Каждая мутация, названная в задачах 1–11, внесена и показана красной (текст — в шагах). Все блоки Python этого плана прошли `py_compile`. **Не прогонялись:** мастер (задачи 12–13 — Vitest/Playwright; в копии нет `node_modules`, а база мастера — шаг 4 S2, задача 9 S2–S3), выкладка и живой контракт (задача 14).
-- **Код S2 в ветке ушёл от текста плана S2–S3** (на 23.10: задачи 4–6 приняты, задача 7 на правках — `template_before_new_image`, `switches(..., before=)`, `files.py`, «повтор 200»). Диффы этого плана сняты с кода S2 **из текста плана 4.1**. Перед каждой задачей: `git apply --check <дифф>`; при отказе — перенести правку по смыслу по якорям диффа (имена функций и строк кода в контексте), а не подгонять тест. Имена, на которые S2b опирается, в ветке есть (проверено 23.10 `grep` по `studio/s2 ff43c1dc`): `tasks.IMAGE_PRIORITY`, `tasks.queue_key`, `tasks.queued_in_order`, `plans.new_seed`, `plans.last_engine_template`, `plans._save_plan`, `plans.load_plan`, `plans.enqueue_image`, `frame_shape.matches/shape_name`, `files.asset_path/stored_path`, `estimates.switch_in_s/switch_cost/estimate/record`, `idempotency.request_sha256/run_once`. Если задача 7 S2 введёт в `plans` готовое «что загружено перед новой картинкой» (`template_before_new_image`), `plans.picture_switches` задачи 8 обязан брать его, а не считать заново.
+- Кто что делает — как в плане S2–S3: исполнитель пишет код и тесты, гоняет команды, показывает мутации, **не коммитит** (шаг «коммит» = список файлов и сообщение в отчёте), `git add -A` запрещён; выкладка (задача 15) — только координатор и только после «да» владельца.
+- **Как проверен этот план (ред. 2, 23.10).** Копия в scratch — настоящий `studio/s2 afe05dcc` (S2 задачи 1–9 с правками ревью; набор `test_studio_*.py test_comfy_api.py test_gpu_dispatcher.py test_ltx_upscale.py test_gpu_gate.py` — 679 тестов, зелёные). На нём задачи 1–12 этого плана — по коммиту на задачу; тесты задачи поверх предыдущего коммита — красные (вывод — в шаге «увидеть красным»), на её коммите — зелёные; итог — **804 passed, 2 skipped** (+127 тестов S2b). Блоки Create/Apply плана применены скриптом к чистой копии `afe05dcc`: дерево совпало с эталоном побайтно (кроме шагов, которые план велит сделать командой: `cp` копий шаблонов и `limits` карточек, литерал хеша Krea, `openapi.json`), набор снова зелёный. Все мутации, названные в задачах 1–12, внесены и показаны красными. Все Python-файлы — `py_compile`. **Не прогонялись:** мастер (задачи 13–14), выкладка и живые проверки (задача 15).
+- **Незакоммиченный фикс S2 задачи 8** (в worktree на 23.10: `task_status`, `plan_stale` у кадра, O14 на `submit_unknown`, `find` после `SubmitUncertain`, `ON_ENGINE`) в базу проверки не входил; его стыки учтены (журнал ред. 2, решение 5). Перед каждой задачей — `git apply --check <дифф>`; при отказе — перенести правку по смыслу по якорям диффа, а не подгонять тест.
 
 ## Global Constraints
 
@@ -31,15 +51,15 @@
 - Порядок очереди — один `tasks.queue_key` (§8.4) для воркера и для расчёта смен; картинки `priority=10`, строго FIFO.
 - `POST /free` между моделями не шлётся (флаг карточки `free_before_switch=false` у всех трёх).
 - Сообщения человеку — по-русски; идентификаторы, комментарии, докстринги — по-английски. Размеры — `1344×768` (знак ×).
-- Старая панель (:8765) и LTX не меняются; `test_ltx_upscale.py` 22/22 и `test_gpu_dispatcher.py` без правок. Диспетчер в S2b не меняется.
+- Старая панель (:8765) и LTX не меняются; `test_ltx_upscale.py` 22/22 без правок. Диспетчер меняется только в задаче 12 (решение владельца 23.10): в `test_gpu_dispatcher.py` — дописанные тесты и один литерал EngineSpec студии; тесты `h3`/`ltx`/панели — без правок.
 - `H3_OUTDIR` не внутри `~/models`; логи — не в `/tmp`.
 
 ## Review Focus
 
-1. **Владелец правит русский текст, пока «Сценарист» переводит прошлую правку.** Ожидание: устаревший перевод не записан (409 по `edit_version`, мастер перечитывает и переводит снова, только пока `prompt_en_state='stale'`), английский не расходится с видимым русским; план с `stale` не строится (LI8). Тесты `test_an_edit_made_while_the_model_answers_wins` (задача 7), `test_the_english_goes_into_the_inputs_and_a_stale_one_makes_the_plan_invalid` (задача 8), Vitest `AutoTranslate` (задача 12).
-2. **Веса подменили на диске после плана** (обновили модель, не обновив карточку). Ожидание: задача `failed` до отправки, граф в ComfyUI не ушёл; повтор старого варианта говорит «веса изменились». Тесты `test_weights_swapped_after_the_plan_fail_the_task_before_it_is_sent` (задача 10), `test_a_quiet_disk_is_stat_only_and_a_swapped_file_is_caught_by_its_hash` (задача 3), `test_a_repeat_says_what_changed_since_and_never_promises_equal_pixels` (задача 8).
-3. **Квадратную картинку тянут в сцену 16:9.** Ожидание: «В сцену…» неактивна с причиной; прямой O8 — 409 `frame_shape_mismatch` до записи; та же картинка уходит в кастинг. Тесты `test_a_square_picture_never_becomes_the_frame_of_a_16_9_scene` (задача 11), Vitest `ToSceneDialog` (задача 13).
-4. **Qwen-партия встаёт перед ждущим рендером H3** (или LLM на карте). Ожидание: план показывает обе смены — загрузку Qwen и возврат H3 (≈, ставка); воркер выполняет в том же порядке; при локальном Qwen-LLM задача ждёт «Qwen держит карту» с кнопкой «Освободить» (S2). Тесты `test_a_qwen_batch_before_a_waiting_render_shows_both_switches` (задача 8), `test_the_worker_runs_pictures_in_the_order_the_plan_counted` (задача 10).
+1. **Владелец правит русский текст, пока «Сценарист» переводит прошлую правку.** Ожидание: устаревший перевод не записан (409 по `edit_version`, мастер перечитывает и переводит снова, только пока `prompt_en_state='stale'`), английский не расходится с видимым русским; план с `stale` не строится (LI8). Тесты `test_an_edit_made_while_the_model_answers_wins` (задача 7), `test_the_english_goes_into_the_inputs_and_a_stale_one_makes_the_plan_invalid` (задача 8), Vitest `AutoTranslate` (задача 13).
+2. **Веса подменили на диске после плана — в том числе пока задача ждала карту** (обновили модель, не обновив карточку). Ожидание: задача `failed` до отправки, граф в ComfyUI не ушёл; повтор старого варианта говорит «веса изменились». Тесты `test_weights_swapped_while_the_task_waits_for_the_card_never_reach_comfyui` (задача 10), `test_a_quiet_disk_is_stat_only_and_a_swapped_file_is_caught_by_its_hash` (задача 3), `test_a_repeat_says_what_changed_since_and_never_promises_equal_pixels` (задача 8).
+3. **Квадратную картинку тянут в сцену 16:9.** Ожидание: «В сцену…» неактивна с причиной; прямой O8 — 409 `frame_shape_mismatch` до записи; та же картинка уходит в кастинг. Тесты `test_a_square_picture_never_becomes_the_frame_of_a_16_9_scene` (задача 11), Vitest `ToSceneDialog` (задача 14).
+4. **Qwen-партия встаёт перед ждущим рендером H3, или на карте Qwen-LLM.** Ожидание: план показывает загрузку Qwen и возврат к рендеру, который воркер возьмёт следующим (≈, ставка); воркер выполняет в том же порядке; Krea 2 / Z-Image идут рядом с LLM shared32, Qwen-Image ждёт «Qwen держит карту» (даже если ComfyUI уже поднят), после партии — `/free` и, по настройке, возврат LLM. Тесты `test_the_return_is_to_the_render_the_worker_picks_after_the_batch` (задача 8), `test_the_worker_runs_pictures_in_the_order_the_plan_counted` (задача 10), `test_a_heavy_task_or_another_profile_waits_for_qwen_even_with_the_engine_ready`, `test_after_a_heavy_batch_comfyui_is_freed_once_and_the_llm_may_come_back` (задача 12).
 5. **Модель или LoRA не установлены на alex-neuro.** Ожидание: таблетка серая с причиной (O32), план `blocked` (LI7), а если задача всё же ушла — `failed` «модель … не установлена» сразу, без ожидания 600 с; без Lightning недоступно только «Быстро». Тесты `test_without_lightning_only_the_fast_profile_is_unavailable` (задача 3), `test_a_missing_lora_or_node_fails_at_once_and_warns_the_draft` (задача 10), `test_an_unavailable_model_blocks_and_a_size_error_invalidates` (задача 8).
 
 ---
@@ -61,20 +81,23 @@
 | R-S2b-9 | O30 — `plans.enqueue_batch` (рядом с `enqueue_image` S2), а не `images.enqueue_batch` (§19.7 И13 называет модуль) | `plans` импортирует `images` (входы варианта); обратный импорт — цикл |
 | R-S2b-10 | У задач партии `task.idempotency_key = NULL`; ключ O30 живёт в `op_log` | колонка `UNIQUE`, а задач N |
 | R-S2b-11 | O28 сверяет только `edit_version` после ответа LLM; отдельной сверки `prompt_ru_version` нет | любая правка `prompt_ru` растит и `edit_version` — отдельная проверка недостижима (мутация её снятия выживала) |
+| R-S2b-22 | (ред. 2, решение координатора) O29 отказывает 400 `size_invalid` размеру, **названному** в запросе и не входящему в карточку; хранится только размер, ставший недопустимым от смены модели (LI2) | §19.4 «хранит и недопустимое» сужено решением 2: `width=1` ломал снимок |
+| R-S2b-23 | (ред. 2) Сверка весов — `before_submit` по файлам на диске после `gate.acquire()` | решение 1, Codex Б1 |
+| R-S2b-24 | (ред. 2) `differs` у повтора: `engine` — если версия неизвестна хоть с одной стороны или разная; `weights` — если отпечаток варианта неизвестен или другой; версия «сейчас» — `/system_stats` движка (3 с), не последняя задача | И15 «только в проверенном окружении», Codex №6 |
 | R-S2b-12 | O28 при сбое провайдера отвечает как O25 — 502 `llm_failed` с текстом из `SAFE_PROVIDER_MESSAGES` (503 `llm_not_configured` — без настройки); кода `llm_unavailable` нет | §19.8 пишет «502 `llm_unavailable` (как O25)», а O25 в коде S1 — `llm_failed`; выбрано «как O25» |
 | R-S2b-13 | Надпись, которой нет в ответе модели, дописывается: в `prompt_en` — ` with the text "<надпись>"`, в `prompt_ru` — ` с надписью «<надпись>»` | §19.8 задаёт английский хвост; русский — симметрично |
 | R-S2b-14 | O29: смена модели ставит профиль по умолчанию **и сбрасывает шаги** к профилю (`steps=NULL`), если в том же запросе их не назвали; `steps: null` — «по умолчанию профиля»; поле, не названное в теле, не трогается (`exclude_unset`) | 8 шагов Krea на Qwen «Полное» дали бы молча 8 из 50 |
 | R-S2b-15 | «Ближайший допустимый размер» LI2 — перебор ширин с шагом кратности, высота по исходному соотношению, та же ориентация, минимум `|Δw|+|Δh|` (1350×770 → 1344×768; 2112×1152 → 2048×1088) | §10 требует «ближайший допустимый той же ориентации», алгоритм не задан |
-| R-S2b-16 | Смены в плане `image_set` (§19.9): загрузка модели партии после того, что идёт перед ней (последняя картинка очереди или загруженная модель), и **возврат** к модели первого ждущего рендера; `approx: true` у возврата H3 после Qwen (§15.4 п.20). Другой профиль той же модели — не смена (0 с). Пустой движок (ничего не загружено) — 0, как в S2 | §8.4/§19.9 описывают две строки; цена смены профиля Qwen не замерена |
+| R-S2b-16 | Смены в плане `image_set` (§19.9): загрузка модели партии после `template_before_new_image` (S2: задача на движке, затем ждущие картинки) и **возврат** к рендеру, который `queue_key` выберет с моделью партии на карте (ред. 2); `approx: true` у возврата H3 после Qwen (§15.4 п.20). Другой профиль той же модели — не смена (0 с). Пустой движок (ничего не загружено) — 0, как в S2 | §8.4/§19.9 описывают две строки; цена смены профиля Qwen не замерена |
 | R-S2b-17 | `blocked` плана — находки LI7 `error`; `invalid` — остальные `error`; O30 отказывает при любой (409 `plan_invalid`) | §19.4 «lint (LI8 блокирует); blocked — LI7» |
 | R-S2b-18 | O8 отказ L7d (`frame_shape_mismatch`) — только в O8 (как в §19.6), не в O7; размер берётся из файла ресурса (Pillow), в таблице `asset` размеров нет | O7 с несовпадающим кадром ловит L7d плана рендера (S3) |
 | R-S2b-19 | `project_created` у картинки — тот же payload `{title, frame_format}`; вид проекта — в O1/O3 | меньше литералов S0 |
-| R-S2b-20 | LLM-цикл (LLM-PLUS-IMAGE §9): S2b диспетчер не меняет. Если на карте локальный Qwen-LLM, любая задача `comfy-studio` (и Krea/Z, которые по замеру живут рядом с shared32) ждёт «Qwen держит карту» и кнопку O23 «Освободить» (S2); после партии LLM студия сама не поднимает. Совместная жизнь Krea/Z с shared32 и `/free` перед подъёмом LLM — вопрос координатору (ниже), не код S2b | по умолчанию «Сценарист» на alex-neuro — CAILA (вне карты, §8.4) |
+| R-S2b-20 | (ред. 2, решение владельца 23.10) Krea 2/Z-Image — рядом с Qwen-LLM shared32: пары «модель — профиль LLM» в карточке (`coexists_with_llm`) и в `EngineSpec.coexists_with_qwen`, профиль LLM диспетчер узнаёт по `context_length`; Qwen-Image/H3 ждут; после тяжёлой партии `/free` и (настройка) возврат LLM с сохранением движка; §8.4 «Qwen держит карту» для лёгких моделей снимается — правка спеки за автором спеки | LLM-PLUS-IMAGE §7, §9.6; задача 12 |
 | R-S2b-21 | Сила LoRA Lightning в карточке — 1.0 до сверки с прогоном `verified_on` (задача 1, шаг 1) | §8.2 «сила — как в прогоне verified_on»; в отчёте IMG-22 сила не записана |
 
 ## Литералы S0–S2, которые S2b меняет по существу
 
-Спека §14 называет два (список файлов шаблонов и хеш карточки Krea). Фактически меняются ещё пять — каждый с причиной, без правки проверяемого поведения; исполнитель приводит этот список в отчёте:
+Спека §14 называет два (список файлов шаблонов и хеш карточки Krea). Фактически меняются ещё шесть — каждый с причиной, без правки проверяемого поведения; исполнитель приводит этот список в отчёте:
 
 | Тест (срез) | Что меняется | Причина | Задача |
 |---|---|---|---|
@@ -84,6 +107,7 @@
 | `test_studio_api.py::test_create_then_list_then_snapshot`, `test_studio_ops.py::test_create_project_event_and_response_are_exact` (S0) | `"kind": "video"` в проекте, `"preview_url": None` в O1 | O1/O2/O3 ред. 3 (§7) | 5 |
 | `test_studio_executor_contract.py::test_probe_names_what_is_missing` (S2) | `"missing": [...]` в двух отказах probe | `Probe.missing` §8.1 ред. 3 | 10 |
 | `test_studio_scenes.py::test_switching_the_frame_from_one_asset_to_another_is_a_content_change` (S1) | два PNG 32×18 вместо `TINY_PNG` 2×2 | O8 больше не принимает 1:1 в 16:9 (L7d, Б4) | 11 |
+| `test_gpu_dispatcher.py::test_the_studio_engine_is_exactly_the_spec` (S2) | `coexists_with_qwen=("shared32",)` в литерале EngineSpec | сосуществование с LLM (решение владельца 23.10) | 12 |
 
 ## Карта файлов
 
@@ -101,12 +125,13 @@
 | `h3_48gb/studio/ops.py` | `kind`, `require_kind` (И18), снимок картинки, O1 `preview_url`, O8 L7d | 5, 11 |
 | `h3_48gb/studio/director/image_prompt.py`, `prompts/image_prompt.md`, `prompts/image_translate.md` (новые) | «Сценарист картинки» | 7 |
 | `h3_48gb/studio/estimates.py`, `plans.py` | оценка по профилю, цена смены по профилю; O10 `image_set`, O30; вес кадра O12 | 8, 9, 10 |
-| `h3_48gb/studio/executors/base.py`, `executors/comfy.py`, `worker.py`, `__main__.py` | `Probe.missing`, узлы для LI7, поток инвентаря | 10 |
+| `h3_48gb/studio/executors/base.py`, `executors/comfy.py`, `worker.py`, `__main__.py` | `Probe.missing`, узлы для LI7, поток инвентаря, сверка весов перед отправкой | 10, 12 |
 | `h3_48gb/studio/app.py`, `schemas.py`, `web/openapi.json` | маршруты O28–O32, O10 `image_set` | 5–9 |
 | `tests/_studio_images.py` (новый), `tests/_studio_rig.py` | веса на временном диске, `PictureRig`; `Rig(llm=…)` | 3, 8, 11 |
-| `web/src/api/{types,image}.ts`, `screens/image/*`, `test/imageServer.ts`, `ProjectScreen.tsx`, `ProjectsScreen.tsx`, `e2e/image.spec.ts` | экран §19.2 | 12, 13 |
-| `docs/design/2026-10-studio-style/AB/index.html#image` | эталон экрана до кода | 12 |
-| `compose.studio.yaml`, `tests/test_studio_deploy_scripts.py`, `README` студии | том весов, выкладка | 14 |
+| `tools/gpu-dispatcher/dispatcher.py`, `engines/dispatcher_client.py`, `engines/comfy_api.py`, `studio/gpu.py` | сосуществование с Qwen-LLM, `/free`, возврат LLM | 12 |
+| `web/src/api/{types,image}.ts`, `screens/image/*`, `test/imageServer.ts`, `ProjectScreen.tsx`, `ProjectsScreen.tsx`, `e2e/image.spec.ts` | экран §19.2 | 13, 14 |
+| `docs/design/2026-10-studio-style/AB/index.html#image` | эталон экрана до кода | 13 |
+| `compose.studio.yaml`, `tests/test_studio_deploy_scripts.py`, `README` студии | том весов, выкладка | 15 |
 
 ---
 
@@ -145,7 +170,7 @@ done | tee ~/Projects/h3-bench/logs/s2b-model-files-$(date +%Y%m%d).log
 grep -n 'strength' ~/Projects/h3-bench/image_models_probe.py   # сила Lightning в прогоне verified_on
 ```
 
-Expected: 9 строк `путь байты sha256` (sha256 совпадают с HF — IMG-22). Сила LoRA — значение из скрипта; если не 1.0, оно идёт в карточку и в литералы теста этой задачи (R-S2b-21).
+Expected: 9 строк `путь байты sha256` (sha256 совпадают с HF — IMG-22). Сила LoRA — значение из скрипта; если не 1.0, оно идёт в карточку и в литералы теста этой задачи (R-S2b-21). **Ред. 2 (Codex №11):** эти 9 пар `(bytes, sha256)` исполнитель переносит в словарь `WEIGHTS` теста дословно из лога — независимо от карточки; в тексте плана `WEIGHTS` — подставные значения копии.
 
 - [ ] **Step 2: Написать падающие тесты**
 
@@ -165,7 +190,6 @@ from __future__ import annotations
 
 import copy
 import os
-import re
 import time
 from pathlib import Path
 
@@ -185,6 +209,29 @@ PROMPT = 'A rural cinema poster with the text "Клуб «Заря»", evening l
 LIGHTNING = "Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors"
 QWEN_NEGATIVE = ("低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，"
                  "画面具有AI感。构图混乱。文字模糊，扭曲")
+#: Б6: the weight files of the run of 22.10 — `bytes` and `sha256` from the log of step 1
+#: (`logs/s2b-model-files-*.log`), typed here independently of the cards. The values below
+#: are the plan's stand-ins: the executor replaces them with the log's.
+WEIGHTS = {
+    "diffusion_models/krea2_turbo_int8_convrot.safetensors":
+        (1036, "129b224bc5040eb52d8a7ed7837868a57e272812452111dc4cc1e44ba3f11449"),
+    "text_encoders/qwen3vl_4b_int8_convrot.safetensors":
+        (1035, "d8f5da648d9cd219cea0817bd998c70d2a97abd45f5169eeb40b5b303de542ae"),
+    "vae/qwen_image_vae.safetensors":
+        (1026, "5fbdc0836d43bb087fb2b86419463c9be522982c02a36d0297e45b5d292ebad3"),
+    "diffusion_models/z_image_turbo_int8_convrot.safetensors":
+        (1038, "e7fd0ac7165aeb1467415ea4cb0cc3dce0fb49ff5a42353741837f24afb0bf8b"),
+    "text_encoders/qwen_3_4b_fp8_mixed.safetensors":
+        (1031, "e69fc2f07b3721c32077dd22c17a787d4b48fcbf0a36ddd51de064e9a326e743"),
+    "vae/ae.safetensors":
+        (1014, "e90d6eecb546f346e4fb8ae4dc27e92be2b3fd6d8452725f1f0f5a8acb3e3d45"),
+    "diffusion_models/qwen_image_2512_fp8_e4m3fn.safetensors":
+        (1038, "8c8ef26b276320e17505ef019388977e92429b5dc0efb62cf2f4027a02da0631"),
+    "text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors":
+        (1037, "248e514d1df7fc120fdc56ace07a5b77032b7590718bf9dcfbf6357e189abcc3"),
+    "loras/Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors":
+        (1054, "0a380ec33f2763240cd0e48b9409ae865c40cbc939f5832578eac0a83fd2f9c2"),
+}
 #: (template, profile) -> the values the image mode sends (§19.3 flat payload, card profile).
 CASES = {
     ("krea2-t2i", None): {"steps": 8},
@@ -321,6 +368,9 @@ def test_the_picture_cards_carry_the_measured_limits():
         ("Qwen-Image 2512", True, 16, 256, 2048, 2088960, 50, 4.0, True, 4, True,
          {"latin": True, "cyrillic": True}, True, 58.5, {"1mp": 47.2, "2mp": 48.5}, False)]
     assert (krea["switch_in_s"], z["switch_in_s"], "switch_in_s" in qwen) == (17, 10.5, False)
+    # ред. 2 (решение координатора 23.10, LLM-PLUS-IMAGE §7): which Qwen-LLM profile a model
+    # lives beside on the card — Krea 2 and Z-Image beside shared32, Qwen-Image beside none
+    assert [c["coexists_with_llm"] for c in (krea, z, qwen)] == [["shared32"], ["shared32"], []]
     assert (z["shift"], qwen["shift"], qwen["negative_text"]) == (3.0, 3.1, QWEN_NEGATIVE)
     one = [("1:1", 1024, 1024), ("16:9", 1344, 768), ("9:16", 768, 1344), ("4:3", 1152, 896),
            ("3:4", 896, 1152)]
@@ -348,25 +398,26 @@ def test_the_picture_cards_carry_the_measured_limits():
         (["LoraLoaderModelOnly"], [("loras", LIGHTNING)]), ([], [])]
 
 
-def test_every_weight_file_is_named_with_its_size_and_sha256():
-    """Б6: the reference the worker checks the disk against — the files of 22.10's run."""
-    want = {
-        "krea2-t2i": [("diffusion_models", "krea2_turbo_int8_convrot.safetensors"),
-                      ("text_encoders", "qwen3vl_4b_int8_convrot.safetensors"),
-                      ("vae", "qwen_image_vae.safetensors")],
-        "zimage-turbo-t2i": [("diffusion_models", "z_image_turbo_int8_convrot.safetensors"),
-                             ("text_encoders", "qwen_3_4b_fp8_mixed.safetensors"),
-                             ("vae", "ae.safetensors")],
-        "qwen-image-t2i": [("diffusion_models", "qwen_image_2512_fp8_e4m3fn.safetensors"),
-                           ("text_encoders", "qwen_2.5_vl_7b_fp8_scaled.safetensors"),
-                           ("vae", "qwen_image_vae.safetensors")]}
-    for template, files in want.items():
-        got = templates.load(template).requires["limits"]["model_files"]
-        assert [(f["folder"], f["name"]) for f in got] == files
-        for f in got:
-            assert sorted(f) == ["bytes", "folder", "name", "sha256"]
-            assert isinstance(f["bytes"], int) and f["bytes"] > 0, f
-            assert re.fullmatch(r"[0-9a-f]{64}", f["sha256"]), f
+def test_every_weight_file_is_the_one_of_the_verified_run():
+    """Б6: the reference the worker checks the disk against — the files of 22.10's run, value by
+    value (a shape check would let any 64 hex digits through)."""
+    got = {}
+    for template in templates.IMAGE_TEMPLATES:
+        limits = templates.load(template).requires["limits"]
+        groups = [limits["model_files"]] + [p["requires"]["model_files"]
+                                            for p in limits.get("profiles", {}).values()]
+        for f in (f for g in groups for f in g):
+            assert sorted(f) == ["bytes", "folder", "name", "sha256"], f
+            got[f"{f['folder']}/{f['name']}"] = (f["bytes"], f["sha256"])
+    assert got == WEIGHTS
+    assert [[f["name"] for f in templates.load(t).requires["limits"]["model_files"]]
+            for t in templates.IMAGE_TEMPLATES] == [
+        ["krea2_turbo_int8_convrot.safetensors", "qwen3vl_4b_int8_convrot.safetensors",
+         "qwen_image_vae.safetensors"],
+        ["z_image_turbo_int8_convrot.safetensors", "qwen_3_4b_fp8_mixed.safetensors",
+         "ae.safetensors"],
+        ["qwen_image_2512_fp8_e4m3fn.safetensors", "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+         "qwen_image_vae.safetensors"]]
 
 
 # -- the model accessors ------------------------------------------------------------------------
@@ -423,6 +474,7 @@ def test_a_size_is_checked_and_rounded_by_the_card():
             qwen.nearest_size(2048, 1152), krea.nearest_size(1000, 1000)] == [
         (1344, 768), (2048, 1152), (1920, 1088), (1024, 1024)]
     assert [krea.default_size("16:9"), krea.default_size("9:16")] == [(1344, 768), (768, 1344)]
+    assert krea.nearest_size(1, 768) is None             # ред. 2 (Codex №2): no shape, no crash
 
 
 # -- the substituter (Б2) -----------------------------------------------------------------------
@@ -506,7 +558,7 @@ Apply to `tests/test_studio_templates.py` (`git apply`; контекст — к�
 
 ```diff
 diff --git a/tests/test_studio_templates.py b/tests/test_studio_templates.py
-index c5315c0..7039a11 100644
+index c5315c06..7039a110 100644
 --- a/tests/test_studio_templates.py
 +++ b/tests/test_studio_templates.py
 @@ -14,7 +14,10 @@ ROOT = Path(__file__).resolve().parent.parent
@@ -629,7 +681,10 @@ Expected: `ImportError: cannot import name 'image_models' from 'h3_48gb.studio'`
    "sha256": "<sha256: шаг 1>"
   }
  ],
- "free_before_switch": false
+ "free_before_switch": false,
+ "coexists_with_llm": [
+  "shared32"
+ ]
 }
 ```
 
@@ -731,7 +786,10 @@ Expected: `ImportError: cannot import name 'image_models' from 'h3_48gb.studio'`
    "sha256": "<sha256: шаг 1>"
   }
  ],
- "free_before_switch": false
+ "free_before_switch": false,
+ "coexists_with_llm": [
+  "shared32"
+ ]
 }
 ```
 
@@ -894,17 +952,18 @@ Expected: `ImportError: cannot import name 'image_models' from 'h3_48gb.studio'`
    }
   }
  },
- "free_before_switch": false
+ "free_before_switch": false,
+ "coexists_with_llm": []
 }
 ```
 
-Источник значений — §8.2 (таблица карточки, замеры IMG-22). В `README.md` папки — строки о `zimage-turbo-t2i`/`qwen-image-t2i` и ключах `limits` S2b. Подстановщик (источник и копия правятся вместе):
+Источник значений — §8.2 (таблица карточки, замеры IMG-22). Ключ `coexists_with_llm` (ред. 2, решение координатора 23.10 по LLM-PLUS-IMAGE §7): профили Qwen-LLM, рядом с которыми модель живёт на карте — Krea 2 и Z-Image `["shared32"]`, Qwen-Image `[]`. В `README.md` папки — строки о `zimage-turbo-t2i`/`qwen-image-t2i` и ключах `limits` S2b. Подстановщик (источник и копия правятся вместе):
 
 Apply to `docs/h3-modes/comfy-templates/comfy_template.py` (`git apply`; контекст — код после предыдущих задач):
 
 ```diff
 diff --git a/docs/h3-modes/comfy-templates/comfy_template.py b/docs/h3-modes/comfy-templates/comfy_template.py
-index 9dfa92c..f06711d 100644
+index 9dfa92cd..f06711df 100644
 --- a/docs/h3-modes/comfy-templates/comfy_template.py
 +++ b/docs/h3-modes/comfy-templates/comfy_template.py
 @@ -68,8 +68,13 @@ def build_payload(graph, card, values):
@@ -955,7 +1014,7 @@ Apply to `h3_48gb/studio/templates.py` (`git apply`; контекст — код
 
 ```diff
 diff --git a/h3_48gb/studio/templates.py b/h3_48gb/studio/templates.py
-index c15ef07..3aa46d6 100644
+index c15ef07a..3aa46d65 100644
 --- a/h3_48gb/studio/templates.py
 +++ b/h3_48gb/studio/templates.py
 @@ -19,6 +19,10 @@ TEMPLATE_FOR_MODE = {"from_frame": "h3-fl2va", "refs": "h3-ref2va"}
@@ -1097,8 +1156,9 @@ class ImageModel:
             out.append(f"{width}×{height} = {width * height} пикселей, больше {lim['max_pixels']}")
         return out
 
-    def nearest_size(self, width: int, height: int) -> tuple[int, int]:
-        """The valid size of the same orientation nearest to the asked one (LI2 «Округлить до»)."""
+    def nearest_size(self, width: int, height: int) -> tuple[int, int] | None:
+        """The valid size of the same orientation nearest to the asked one (LI2 «Округлить до»);
+        None when the card has none of that shape (1×768: every height is out of bounds)."""
         lim = self.limits
         m = lim["sides_multiple_of"]
         best = None
@@ -1110,9 +1170,7 @@ class ImageModel:
                 continue
             key = (abs(w - width) + abs(h - height), w, h)
             best = key if best is None or key < best else best
-        if best is None:
-            raise ValueError(f"no valid size near {width}x{height} for {self.id}")
-        return best[1], best[2]
+        return (best[1], best[2]) if best is not None else None
 
     def cyrillic(self) -> bool | str:
         return self.limits["text_render"]["cyrillic"]
@@ -1146,7 +1204,7 @@ Apply to `tests/_fake_comfy_studio.py` (`git apply`; контекст — код
 
 ```diff
 diff --git a/tests/_fake_comfy_studio.py b/tests/_fake_comfy_studio.py
-index 0dd3975..3ecc438 100644
+index e3b369c7..d9990534 100644
 --- a/tests/_fake_comfy_studio.py
 +++ b/tests/_fake_comfy_studio.py
 @@ -46,10 +46,11 @@ from urllib.parse import parse_qs, urlsplit
@@ -1183,17 +1241,17 @@ index 0dd3975..3ecc438 100644
  _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
  _PREVIEW = b"\xff\xd8preview"
  
-@@ -91,6 +103,9 @@ class FakeComfyStudio:
-         self.post_timeout = post_timeout
+@@ -96,6 +108,9 @@ class FakeComfyStudio:
          self.history_pending = history_pending
          self.rename_to = rename_to
+         self.prompt_status = prompt_status
 +        #: what the model files the fake «loads» hold: name -> tag (S2b). A picture depends on
 +        #: the tags of the files its graph loads, so swapped weights change the pixels.
 +        self.weights: dict[str, str] = {}
          self.upload_bodies: list[bytes] = []
          self.upload_content_types: list[str] = []
          self.upload_mimes: dict[str, str] = {}
-@@ -249,6 +264,16 @@ class FakeComfyStudio:
+@@ -254,6 +269,16 @@ class FakeComfyStudio:
                    "prompt": _prompt(graph),
                    "pictures": [{"name": p, "sha256": hashlib.sha256(self.uploads[p]).hexdigest()}
                                 for p in pictures]}
@@ -1210,7 +1268,7 @@ index 0dd3975..3ecc438 100644
          return record
  
      def _write_outputs(self, graph) -> dict:
-@@ -552,10 +577,38 @@ def _length(graph) -> int | None:
+@@ -562,10 +587,38 @@ def _length(graph) -> int | None:
  
  def _prompt(graph) -> str:
      node = _node(graph, "MiniMaxH3ImageToVideo", "MiniMaxH3ReferenceToVideo")
@@ -1253,7 +1311,7 @@ index 0dd3975..3ecc438 100644
      return (int(node["inputs"]["width"]), int(node["inputs"]["height"])) if node else (64, 64)
 ```
 
-Хеш карточки Krea (литерал двух тестов S2, §14): новое значение — вывод `$PY -c "from h3_48gb.studio import templates; print(templates.load('krea2-t2i').sha256)"`; в копии с подставными весами было `da14971d…b3eb`, у настоящих весов будет другое. Комментарий у литерала в `test_studio_keyframe_api.py`: `# sha256 of krea2-t2i.card.json + .graph.json (S2b: limits/model_files)`.
+Хеш карточки Krea (литерал двух тестов S2, §14): новое значение — вывод `$PY -c "from h3_48gb.studio import templates; print(templates.load('krea2-t2i').sha256)"`; в копии с подставными весами было `1961896e…81b8`, у настоящих весов будет другое. Комментарий у литерала в `test_studio_keyframe_api.py`: `# sha256 of krea2-t2i.card.json + .graph.json (S2b: limits/model_files)`.
 
 - [ ] **Step 6: Зелёный**
 
@@ -1262,7 +1320,7 @@ Expected: всё зелёное, `test_live_picture_contract_and_repeat_by_seed`
 
 - [ ] **Step 7: Мутации**
 
-1. (№16) В `build_payload` вернуть `if name in values:` вместо `if values.get(name) is not None:` и пропустить `None` в `_apply_lora` как `{"name": "", "strength": 1.0}`. Expected: `FAILED …test_the_graph_comfyui_gets_for_every_template_and_profile[qwen-image-t2i-full]` (лишний узел `lora`).
+1. (№16) В `build_payload` вернуть `if name in values:` вместо `if values.get(name) is not None:` и пропустить `None` в `_apply_lora` как `{"name": "", "strength": 1.0}`. Expected (ред. 2, Codex №10 — ловит прямой тест подстановщика, а не графовый: `spec_for` выбрасывает `None` заранее): `FAILED …test_null_is_absence_for_an_optional_input_and_an_error_for_a_required_one` — `TemplateError: negative: expected non-empty string, got None`.
 2. (№7, доля карточки) `size_problems`: `side <= lim["side_max"] + lim["sides_multiple_of"]`. Expected: `FAILED …test_a_size_is_checked_and_rounded_by_the_card` (`ширина 2112 вне 256–2048` не найдена).
 3. (№14б, имитация) в `_inputs_record` имитации убрать `lora=lora`. Expected: `FAILED …test_the_fake_picture_is_the_same_for_the_same_inputs_and_changes_with_each` с `{'lora': {… 'strength': 0.8}}`.
 
@@ -1276,7 +1334,7 @@ Expected: всё зелёное, `test_live_picture_contract_and_repeat_by_seed`
 - Test: `tests/test_studio_image_db.py` (новый); литералы `tests/test_studio_db.py`, `tests/test_studio_api.py`
 
 **Interfaces:**
-- Produces: `project.kind`, таблицы `image_draft`, `image_batch`, `image_variant`, `model_file_hash`, `estimate_sample.profile`, `task.weights_sha256`, триггер `image_variant_inputs_are_frozen`; `PRAGMA user_version = 4`. `settings.HIDDEN`, `settings.KNOWN`, `settings.put_in_tx(conn, key, value)` (внутри чужой транзакции); `get/put` знают `HIDDEN`, `all_settings` — только `DEFAULTS`.
+- Produces: `project.kind`, таблицы `image_draft`, `image_batch`, `image_variant`, `model_file_hash`, `estimate_sample.profile`, `task.weights_sha256`, триггер `image_variant_inputs_are_frozen`; `PRAGMA user_version = 4`. `settings.HIDDEN` (`comfy.model_roots`, `comfy.inventory`, `comfy.nodes`; задача 12 добавит `llm.restore_after_heavy`), `settings.KNOWN`, `settings.put_in_tx(conn, key, value)` (внутри чужой транзакции); `get/put` знают `HIDDEN`, `all_settings` — только `DEFAULTS`.
 
 - [ ] **Step 1: Написать падающие тесты**
 
@@ -1431,7 +1489,7 @@ Apply to `tests/test_studio_db.py` (`git apply`; контекст — код п�
 
 ```diff
 diff --git a/tests/test_studio_db.py b/tests/test_studio_db.py
-index 1b37ed5..6acda71 100644
+index 8be2dbb0..92f46ac6 100644
 --- a/tests/test_studio_db.py
 +++ b/tests/test_studio_db.py
 @@ -9,7 +9,8 @@ import pytest
@@ -1468,7 +1526,7 @@ Apply to `tests/test_studio_api.py` (`git apply`; контекст — код п
 
 ```diff
 diff --git a/tests/test_studio_api.py b/tests/test_studio_api.py
-index a752738..ee98ce4 100644
+index a7527387..ee98ce4b 100644
 --- a/tests/test_studio_api.py
 +++ b/tests/test_studio_api.py
 @@ -223,7 +223,7 @@ def test_health_body_is_exact(tmp_path):
@@ -1581,7 +1639,7 @@ Apply to `h3_48gb/studio/settings.py` (`git apply`; контекст — код 
 
 ```diff
 diff --git a/h3_48gb/studio/settings.py b/h3_48gb/studio/settings.py
-index 7e4b32a..77010af 100644
+index 7e4b32ad..77010afe 100644
 --- a/h3_48gb/studio/settings.py
 +++ b/h3_48gb/studio/settings.py
 @@ -16,13 +16,23 @@ DEFAULTS = {
@@ -2049,7 +2107,7 @@ class InventoryLoop:
 - Test: `tests/test_studio_image_lint.py`
 
 **Interfaces:**
-- Produces: `texts.QUOTES`, `texts.quoted(text) -> [(start, end, inner)]` (внешние пары), `texts.inscriptions(text) -> list[str]`, `texts.unquoted(text)`; `lint.lint_image(draft: dict, model, *, models, entry, nodes, same_as) -> list[dict]` (находка `{rule, severity, field, message}` + `fix{width, height}` у LI2), `lint.image_finding(...)`.
+- Produces: `texts.QUOTES`, `texts.quoted(text) -> [(start, end, inner)]` (внешние пары), `texts.inscriptions(text) -> list[str]`, `texts.unquoted(text)`; `lint.lint_image(draft: dict, model, *, models, entry, nodes, same_as) -> list[dict]` (находка `{rule, severity, field, message}` + `fix{width, height}` у LI2; ред. 2: размер, для которого у карточки нет формы, — LI2 без `fix` «такой формы у модели нет», без исключения), `lint.image_finding(...)`.
 
 - [ ] **Step 1: Написать падающие тесты**
 
@@ -2113,6 +2171,9 @@ def test_li2_size_out_of_the_card_is_an_error_with_the_nearest_size():
     assert run(draft(template="qwen-image-t2i", profile="fast", width=1328, height=1328)) == []
     assert run(draft(width=1328, height=1328))[0]["message"] == (
         "ширина 1328 не кратна 64; высота 1328 не кратна 64 — округлить до 1344×1344")
+    assert run(draft(width=1, height=768)) == [{                    # ред. 2: no fitting shape
+        "rule": "LI2", "severity": "error", "field": "size",
+        "message": "ширина 1 вне 256–2048 — такой формы у модели нет"}]
 
 
 def test_li3_russian_outside_quotes_is_info_for_models_that_understand_it():
@@ -2179,7 +2240,7 @@ Apply to `h3_48gb/studio/texts.py` (`git apply`; контекст — код п�
 
 ```diff
 diff --git a/h3_48gb/studio/texts.py b/h3_48gb/studio/texts.py
-index d73ef02..3b658e7 100644
+index d73ef02c..3b658e75 100644
 --- a/h3_48gb/studio/texts.py
 +++ b/h3_48gb/studio/texts.py
 @@ -4,3 +4,51 @@ from __future__ import annotations
@@ -2240,7 +2301,7 @@ Apply to `h3_48gb/studio/lint.py` (`git apply`; контекст — код по
 
 ```diff
 diff --git a/h3_48gb/studio/lint.py b/h3_48gb/studio/lint.py
-index 7563a04..2099733 100644
+index 7563a04d..bebdb8fd 100644
 --- a/h3_48gb/studio/lint.py
 +++ b/h3_48gb/studio/lint.py
 @@ -6,7 +6,7 @@ import re
@@ -2252,7 +2313,7 @@ index 7563a04..2099733 100644
  
  TEXT_FIELDS = ("action_text", "performance_text", "sound_text", "music_text", "state_in_text",
                 "state_out_text")
-@@ -270,3 +270,84 @@ def lint_scene(scene: LintScene, project: LintProject, limits: dict | None = Non
+@@ -270,3 +270,88 @@ def lint_scene(scene: LintScene, project: LintProject, limits: dict | None = Non
  
  def has_errors(findings: list[dict]) -> bool:
      return any(f["severity"] == "error" for f in findings)
@@ -2293,10 +2354,14 @@ index 7563a04..2099733 100644
 +        out.append(image_finding("LI1", "warning", "prompt_en", text))
 +    problems = model.size_problems(draft["width"], draft["height"])
 +    if problems:
-+        width, height = model.nearest_size(draft["width"], draft["height"])
-+        out.append(image_finding("LI2", "error", "size",
-+                                 f"{'; '.join(problems)} — округлить до {width}×{height}",
-+                                 fix={"width": width, "height": height}))
++        near = model.nearest_size(draft["width"], draft["height"])
++        if near is None:
++            out.append(image_finding("LI2", "error", "size",
++                                     f"{'; '.join(problems)} — такой формы у модели нет"))
++        else:
++            out.append(image_finding("LI2", "error", "size",
++                                     f"{'; '.join(problems)} — округлить до {near[0]}×{near[1]}",
++                                     fix={"width": near[0], "height": near[1]}))
 +    if CYRILLIC.search(unquoted(prompt_en)):
 +        if model.limits["understands_ru"] is False:
 +            out.append(image_finding("LI3", "warning", "prompt_en",
@@ -2362,8 +2427,8 @@ index 7563a04..2099733 100644
 - Consumes: задачи 1–4; `tasks.project_tasks`, `events.last_seq` (S2).
 - Produces:
   - `ops.require_kind(conn, project_id, kind) -> Row` (409 `project_kind_mismatch`, `detail {project_id, kind, needed}`), `ops.KIND_REFUSAL`; `project_out` + `kind`; `create_project(..., kind="video")`; `list_projects` + `preview_url`; `snapshot(conn, pid, *, batches_before=None)` — у картинки `{project, image{draft, lint, inventory_checked, batches}, tasks, last_seq}`. `require_kind` первой строкой: O5 `add_cast`, O7 `replace_scenes`, O9 `lint_project`, O25 `propose_scenes`, O26 `apply_proposal`; маршруты O10 (`image`/`render`) и O12.
-  - `image_draft.DRAFT_FIELDS`, `draft_row`, `draft_out(row)`, `first_model(conn)`, `create_in_tx(conn, pid, *, frame_format, idea_text)`, `lint_draft(conn, pid, row)`, `image_snapshot(conn, pid, *, batches_before)`, `models_out(conn)` (O32).
-  - `images.PAGE = 20`, `canonical(dict) -> str`, `inputs_sha256(inputs)`, `draft_inputs(draft, model, *, seed, weights_sha256) -> dict` (§19.3), `repeat_problem(inputs, entry) -> str | None` (НБ4), `find_same(conn, pid, shas)`, `variant_out(conn, row, entry_for)`, `batches_out(conn, pid, *, before)`, `preview_asset(conn, pid)`.
+  - `image_draft.DRAFT_FIELDS`, `draft_row`, `draft_out(row)`, `first_model(conn)`, `create_in_tx(conn, pid, *, frame_format, idea_text)`, `lint_draft(conn, pid, row)` (ред. 2, Codex №2: не падает никогда — сбой правила становится находкой `lint_internal`, как `lint_scene` S1; вызывается после записи O29 и в O3), `image_snapshot(conn, pid, *, batches_before)`, `models_out(conn)` (O32).
+  - `images.PAGE = 20`, `canonical(dict) -> str`, `inputs_sha256(inputs)`, `draft_inputs(draft, model, *, seed, weights_sha256) -> dict` (§19.3), `repeat_problem(inputs, entry) -> str | None` (НБ4; задача 8 дополняет сверкой `cfg`, `seed`), `find_same(conn, pid, shas)`, `variant_out(conn, row, entry_for)`, `batches_out(conn, pid, *, before)`, `preview_asset(conn, pid)`.
   - `schemas.ProjectCreate`: `kind: "video"|"image" = "video"`, `frame_format` необязателен (видео без него — 400 `args_invalid` `loc ["body","frame_format"]`); маршруты `GET /projects/{id}?batches_before=`, `GET /image-models`.
 
 - [ ] **Step 1: Написать падающие тесты**
@@ -2553,7 +2618,7 @@ Apply to `tests/test_studio_api.py` (`git apply`; контекст — код п
 
 ```diff
 diff --git a/tests/test_studio_api.py b/tests/test_studio_api.py
-index ee98ce4..fb56021 100644
+index ee98ce4b..fb560213 100644
 --- a/tests/test_studio_api.py
 +++ b/tests/test_studio_api.py
 @@ -14,11 +14,11 @@ def test_create_then_list_then_snapshot(tmp_path):
@@ -2577,7 +2642,7 @@ Apply to `tests/test_studio_ops.py` (`git apply`; контекст — код п
 
 ```diff
 diff --git a/tests/test_studio_ops.py b/tests/test_studio_ops.py
-index 0c33e80..b66ed64 100644
+index 0c33e80e..b66ed642 100644
 --- a/tests/test_studio_ops.py
 +++ b/tests/test_studio_ops.py
 @@ -48,8 +48,8 @@ def test_create_project_event_and_response_are_exact(tmp_path):
@@ -2668,8 +2733,12 @@ def lint_draft(conn: sqlite3.Connection, project_id: str, row: sqlite3.Row) -> l
                                                          weights_sha256=entry["weights_sha256"]))
                 for k in range(row["count"])]
         same_as = images.find_same(conn, project_id, shas)
-    return lint.lint_image(dict(row), model, models=image_models.all_models(), entry=entry,
-                           nodes=inventory.nodes(conn).get(row["template"]), same_as=same_as)
+    try:
+        return lint.lint_image(dict(row), model, models=image_models.all_models(), entry=entry,
+                               nodes=inventory.nodes(conn).get(row["template"]), same_as=same_as)
+    except Exception as err:     # noqa: BLE001 — runs after a committed write and in O3 (ред. 2)
+        return [lint.image_finding("lint_internal", "info", None,
+                                   f"Линтер не смог проверить черновик ({type(err).__name__})")]
 
 
 def image_snapshot(conn: sqlite3.Connection, project_id: str, *,
@@ -2717,7 +2786,7 @@ Apply to `h3_48gb/studio/images.py` (`git apply`; контекст — код п
 
 ```diff
 diff --git a/h3_48gb/studio/images.py b/h3_48gb/studio/images.py
-index 638cd79..64feb79 100644
+index 638cd79d..64feb790 100644
 --- a/h3_48gb/studio/images.py
 +++ b/h3_48gb/studio/images.py
 @@ -10,8 +10,9 @@ from pathlib import Path
@@ -2860,7 +2929,7 @@ Apply to `h3_48gb/studio/ops.py` (`git apply`; контекст — код по�
 
 ```diff
 diff --git a/h3_48gb/studio/ops.py b/h3_48gb/studio/ops.py
-index 8996b9a..2efccd8 100644
+index 8996b9a5..2efccd85 100644
 --- a/h3_48gb/studio/ops.py
 +++ b/h3_48gb/studio/ops.py
 @@ -6,13 +6,16 @@ import json
@@ -3017,7 +3086,7 @@ Apply to `h3_48gb/studio/schemas.py` (`git apply`; контекст — код �
 
 ```diff
 diff --git a/h3_48gb/studio/schemas.py b/h3_48gb/studio/schemas.py
-index 9cea829..0f4b462 100644
+index 43b082bf..84a9e272 100644
 --- a/h3_48gb/studio/schemas.py
 +++ b/h3_48gb/studio/schemas.py
 @@ -14,8 +14,10 @@ class _Body(BaseModel):
@@ -3038,10 +3107,10 @@ Apply to `h3_48gb/studio/app.py` (`git apply`; контекст — код по�
 
 ```diff
 diff --git a/h3_48gb/studio/app.py b/h3_48gb/studio/app.py
-index 6ea0d6a..5ced215 100644
+index c4e3b9f1..67772de1 100644
 --- a/h3_48gb/studio/app.py
 +++ b/h3_48gb/studio/app.py
-@@ -17,8 +17,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
+@@ -18,8 +18,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
  from starlette.middleware.trustedhost import TrustedHostMiddleware
  
  from h3_48gb.engines.dispatcher_client import DispatcherClient, DispatcherUnavailable
@@ -3049,10 +3118,10 @@ index 6ea0d6a..5ced215 100644
 -                            settings, tasks)
 +from h3_48gb.studio import (assets, config, db, events, idempotency, image_draft, ops, plans,
 +                            schemas, settings, tasks)
- from h3_48gb.studio.executors.comfy import ComfyExecutor
+ from h3_48gb.engines.comfy_api import ComfyApi
+ from h3_48gb.studio.executors.comfy import PROBE_TASK_ID, ComfyExecutor
  from h3_48gb.studio.errors import StudioError
- from h3_48gb.studio.llm import Llm, ProviderLlm
-@@ -237,12 +237,17 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
+@@ -243,12 +243,17 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
  
      @app.post(f"{api}/projects", status_code=201)
      def create_project(body: schemas.ProjectCreate, conn=Depends(get_conn)):
@@ -3073,7 +3142,7 @@ index 6ea0d6a..5ced215 100644
  
      @app.patch(f"{api}/projects/{{project_id}}")
      def patch_project(body: schemas.ProjectPatch, project_id: str = Depends(project_exists),
-@@ -311,6 +316,7 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
+@@ -317,6 +322,7 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
      @app.post(f"{api}/projects/{{project_id}}/plan")
      def make_plan(body: schemas.PlanRequest, project_id: str = Depends(project_exists),
                    conn=Depends(get_conn)):
@@ -3081,7 +3150,7 @@ index 6ea0d6a..5ced215 100644
          if body.kind == "image":
              return plans.plan_image(conn, project_id, scene_id=body.scene_id, prompt=body.prompt,
                                      width=body.width, height=body.height)
-@@ -319,12 +325,18 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
+@@ -325,12 +331,18 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
      @app.post(f"{api}/projects/{{project_id}}/image")
      def confirm_image(body: schemas.PlanConfirm, project_id: str = Depends(project_exists),
                        idempotency_key: str | None = Header(default=None), conn=Depends(get_conn)):
@@ -3119,7 +3188,7 @@ index 6ea0d6a..5ced215 100644
 - Test: `tests/test_studio_image_draft.py`
 
 **Interfaces:**
-- Produces: `image_draft.patch_draft(conn, pid, *, expected_edit_version, changes) -> {draft, lint}` (событие `image_draft_changed {edit_version, fields, origin: "owner"}`), `_check_seed`, `_check_version`; `schemas.ImageDraftPatch`; `PATCH /projects/{id}/image/draft` (`exclude_unset`; `null` у NOT NULL-полей — 400 `args_invalid`).
+- Produces: `image_draft.patch_draft(conn, pid, *, expected_edit_version, changes) -> {draft, lint}` (событие `image_draft_changed {edit_version, fields, origin: "owner"}`), `_check_seed`, `_check_version`, `_check_size` (ред. 2, решение координатора по Codex №2: размер, **названный в запросе**, сверяется с карточкой модели (после смены модели — новой) до записи: кратность, мин/макс, `max_pixels` → 400 `size_invalid` «Размер вне пределов Krea 2: …», `detail {field: "width"|"height"|"size", allowed {side_min, side_max, multiple_of, max_pixels}, nearest {width, height} | null}`; размер, ставший недопустимым от смены модели, хранится, о нём — LI2 «Округлить до»); `schemas.ImageDraftPatch`; `PATCH /projects/{id}/image/draft` (`exclude_unset`; `null` у NOT NULL-полей — 400 `args_invalid`).
 
 - [ ] **Step 1: Написать падающие тесты**
 
@@ -3199,17 +3268,19 @@ def test_a_stale_version_is_refused_with_the_current_draft(client, pid):
 
 
 def test_a_new_model_brings_its_profile_and_steps_but_not_a_new_size(client, pid):
-    d = _patch(client, pid, expected_edit_version=0, steps=6, width=1350)["draft"]
-    assert (d["template"], d["profile"], d["steps"], d["width"]) == ("krea2-t2i", None, 6, 1350)
-    out = _patch(client, pid, expected_edit_version=1, template="qwen-image-t2i")
-    d = out["draft"]
+    d = _patch(client, pid, expected_edit_version=0, steps=6)["draft"]
+    assert (d["template"], d["profile"], d["steps"]) == ("krea2-t2i", None, 6)
+    d = _patch(client, pid, expected_edit_version=1, template="qwen-image-t2i", width=1328,
+               height=1328)["draft"]
     assert (d["template"], d["profile"], d["steps"], d["width"], d["height"]) == (
-        "qwen-image-t2i", "fast", None, 1350, 768)
+        "qwen-image-t2i", "fast", None, 1328, 1328)
+    out = _patch(client, pid, expected_edit_version=2, template="krea2-t2i", steps=8)
+    d = out["draft"]
+    assert (d["profile"], d["steps"], d["width"], d["height"]) == (None, 8, 1328, 1328)
     assert out["lint"][0] == {"rule": "LI2", "severity": "error", "field": "size",
-                              "message": "ширина 1350 не кратна 16 — округлить до 1344×768",
-                              "fix": {"width": 1344, "height": 768}}
-    d = _patch(client, pid, expected_edit_version=2, template="krea2-t2i", steps=8)["draft"]
-    assert (d["profile"], d["steps"]) == (None, 8)
+                              "message": "ширина 1328 не кратна 64; высота 1328 не кратна 64 — "
+                                         "округлить до 1344×1344",
+                              "fix": {"width": 1344, "height": 1344}}
     d = _patch(client, pid, expected_edit_version=3, template="qwen-image-t2i",
                profile="full")["draft"]
     assert (d["profile"], d["steps"]) == ("full", None)
@@ -3253,10 +3324,20 @@ def test_the_seed_range_is_rechecked_when_the_count_grows(client, pid):
         400, {"seed": JS_MAX - 3, "count": 5, "max_start": JS_MAX - 4})
 
 
-def test_a_size_out_of_the_card_is_stored_and_reported(client, pid):
-    out = _patch(client, pid, expected_edit_version=0, width=2112, height=1152)
-    assert (out["draft"]["width"], out["lint"][0]["rule"], out["lint"][0]["fix"]) == (
-        2112, "LI2", {"width": 2048, "height": 1088})
+@pytest.mark.parametrize("size,field,nearest", [
+    ({"width": 1}, "width", None),
+    ({"width": 2112, "height": 1152}, "width", {"width": 2048, "height": 1088}),
+    ({"width": 1350}, "width", {"width": 1344, "height": 768})])
+def test_a_typed_size_out_of_the_card_is_refused_before_writing(client, pid, size, field,
+                                                                nearest):
+    """Ред. 2 (Codex №2): `width=1` used to be stored and then broke O3 (no nearest size)."""
+    r = client.patch(f"/api/studio/projects/{pid}/image/draft",
+                     json={"expected_edit_version": 0, **size})
+    assert (r.status_code, r.json()["error"]["code"], r.json()["error"]["detail"]) == (
+        400, "size_invalid", {"field": field, "nearest": nearest, "allowed": {
+            "side_min": 256, "side_max": 2048, "multiple_of": 64, "max_pixels": 4194304}})
+    snap = client.get(f"/api/studio/projects/{pid}")
+    assert (snap.status_code, snap.json()["image"]["draft"]["width"]) == (200, 1344)
 
 
 def test_null_for_a_required_field_and_a_video_project_are_refused(client, pid):
@@ -3278,7 +3359,7 @@ Apply to `h3_48gb/studio/image_draft.py` (`git apply`; контекст — ко
 
 ```diff
 diff --git a/h3_48gb/studio/image_draft.py b/h3_48gb/studio/image_draft.py
-index 7cb26b4..814bd78 100644
+index c6483468..460fbbd5 100644
 --- a/h3_48gb/studio/image_draft.py
 +++ b/h3_48gb/studio/image_draft.py
 @@ -5,7 +5,7 @@ from __future__ import annotations
@@ -3290,7 +3371,7 @@ index 7cb26b4..814bd78 100644
  from h3_48gb.studio.errors import StudioError
  
  DRAFT_FIELDS = ("idea_text", "prompt_ru", "prompt_en", "template", "profile", "width", "height",
-@@ -109,3 +109,64 @@ def models_out(conn: sqlite3.Connection) -> list[dict]:
+@@ -113,3 +113,85 @@ def models_out(conn: sqlite3.Connection) -> list[dict]:
                      "seed_max": model.seed_max,
                      "switch_in_s": model.profile(model.profile_default).switch_in_s})
      return out
@@ -3309,12 +3390,31 @@ index 7cb26b4..814bd78 100644
 +                          {"seed": seed, "count": count, "max_start": top})
 +
 +
++def _check_size(model, width: int, height: int) -> None:
++    """Ред. 2 (решение координатора по Codex №2): a size the owner TYPES is checked against the
++    card of the model before anything is written — 400 with the limits and the nearest size.
++    A size that a model switch made unfit stays stored and is reported by LI2 (§19.4)."""
++    problems = model.size_problems(width, height)
++    if not problems:
++        return
++    lim = model.limits
++    side_bad = [n for n, v in (("width", width), ("height", height))
++                if not lim["side_min"] <= v <= lim["side_max"] or v % lim["sides_multiple_of"]]
++    near = model.nearest_size(width, height)
++    raise StudioError(400, "size_invalid", f"Размер вне пределов {model.title}: {'; '.join(problems)}",
++                      {"field": side_bad[0] if side_bad else "size",
++                       "allowed": {"side_min": lim["side_min"], "side_max": lim["side_max"],
++                                   "multiple_of": lim["sides_multiple_of"],
++                                   "max_pixels": lim["max_pixels"]},
++                       "nearest": {"width": near[0], "height": near[1]} if near else None})
++
++
 +def patch_draft(conn: sqlite3.Connection, project_id: str, *, expected_edit_version: int,
 +                changes: dict) -> dict:
-+    """O29. Stores even what the card does not allow (a size out of limits): the findings say so
-+    and only the plan is blocked. A new model takes its card's default profile, and the steps go
-+    back to the profile's default, unless the same request names them; the size is never fitted
-+    silently (LI2 offers «Округлить до»). An edit of `prompt_ru` makes the English stale (LI8);
++    """O29. A size the request names must fit the card (ред. 2, 400 `size_invalid`); a size a
++    model switch made unfit is kept and reported by LI2 — the plan is blocked, the size is never
++    fitted silently («Округлить до»). A new model takes its card's default profile, and the steps
++    go back to the profile's default, unless the same request names them. An edit of `prompt_ru` makes the English stale (LI8);
 +    an edit of `prompt_en` makes it the owner's."""
 +    from h3_48gb.studio import ops            # ops imports this module (O2, O3)
 +    ops.require_kind(conn, project_id, "image")
@@ -3336,6 +3436,8 @@ index 7cb26b4..814bd78 100644
 +            if "steps" not in changes:
 +                fields["steps"] = None
 +        model.profile(fields["profile"])                    # 400 profile_unknown
++        if "width" in changes or "height" in changes:
++            _check_size(model, fields["width"], fields["height"])
 +        _check_seed(model, fields["seed"], fields["count"], fields["seed_mode"])
 +        changed = sorted(n for n in DRAFT_FIELDS if fields[n] != row[n])
 +        if not changed:
@@ -3361,10 +3463,10 @@ Apply to `h3_48gb/studio/schemas.py` (`git apply`; контекст — код �
 
 ```diff
 diff --git a/h3_48gb/studio/schemas.py b/h3_48gb/studio/schemas.py
-index 0f4b462..bbddc8a 100644
+index 84a9e272..81882644 100644
 --- a/h3_48gb/studio/schemas.py
 +++ b/h3_48gb/studio/schemas.py
-@@ -152,3 +152,23 @@ class PlanConfirm(_Body):
+@@ -159,3 +159,23 @@ class PlanConfirm(_Body):
  
  class CancelRequest(_Body):
      reason: str = Field(default="", max_length=500)
@@ -3394,10 +3496,10 @@ Apply to `h3_48gb/studio/app.py` (`git apply`; контекст — код по�
 
 ```diff
 diff --git a/h3_48gb/studio/app.py b/h3_48gb/studio/app.py
-index 5ced215..5d58307 100644
+index 67772de1..e1f15d10 100644
 --- a/h3_48gb/studio/app.py
 +++ b/h3_48gb/studio/app.py
-@@ -333,6 +333,19 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
+@@ -339,6 +339,19 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
          return JSONResponse(answer, status_code=status)
  
      # --- slice S2b: the image mode (§19.4 O28–O32) ---------------------------------------------
@@ -3421,11 +3523,12 @@ index 5ced215..5d58307 100644
 
 Регенерировать `openapi.json`. Примечание: в задаче 7 `patch_draft` берёт общую `_check_version` вместо своей сверки (дифф задачи 7).
 
-- [ ] **Step 4: Зелёный** — 15 passed; полный набор — 0 failed.
+- [ ] **Step 4: Зелёный** — 17 passed; полный набор — 0 failed.
 
 - [ ] **Step 5: Мутации**
 1. (№13) `state, ru_version = state, ru_version + 1` (без `stale`). Expected: `At index 2 diff: 'none' != 'stale'`.
 2. (№21) `top = model.seed_max`. Expected: `'max_start': 9007199254740991` против `9007199254740988`.
+3. (ред. 2) Убрать вызов `_check_size`. Expected: `KeyError: 'error'` в `test_a_typed_size_out_of_the_card_is_refused_before_writing[size0-width-None]` (`width=1` сохранён, ответ 200).
 
 - [ ] **Step 6: Коммит** — `feat(studio): O29 — правка черновика картинки, сид всей партии, перевод устаревает (S2b задача 6)`.
 
@@ -3625,6 +3728,49 @@ def test_a_model_failure_leaves_the_draft_and_the_journal_alone(tmp_path):
     assert r.json()["error"]["detail"] == {"schema": "studio_image_prompt", "path": "/prompt_en",
                                            "rule": "non_empty"}
     assert (rig.draft()["edit_version"], rig.events()) == (0, [])
+
+
+SECRET = "sk-SYNTHETIC-SECRET-0042"
+
+
+@pytest.mark.parametrize("payload, code, message", [
+    ({"choices": [{"message": {"content": f"not json, key {SECRET}"}}]}, "bad_model_json",
+     "Модель ответила не по схеме"),
+    ({"error": {"message": f"Authorization: Bearer {SECRET}"}}, "bad_provider_reply",
+     "Сценарист недоступен: провайдер вернул ошибку")])
+def test_a_provider_failure_through_the_real_door_leaks_nothing(tmp_path, caplog, payload, code,
+                                                                message):
+    """Ред. 2 (Codex №12): the whole route — `ProviderLlm` → O28 → the body, the journal, the
+    draft — with a synthetic key in the provider's text."""
+    from _fake_llama import _FakeLlama
+    from fastapi.testclient import TestClient
+
+    from _studio_fixtures import BASE_URL
+    from h3_48gb.studio.app import create_app
+    fake = _FakeLlama(chat_payload=payload)
+    try:
+        home = config.studio_dir(tmp_path / "out")
+        home.mkdir(parents=True)
+        (home / "providers.json").write_text(json.dumps({"active": "f", "providers": {"f": {
+            "type": "openai", "base_url": f"http://127.0.0.1:{fake.port}", "model": "m",
+            "api_key_env": "KEY", "shares_gpu": False}}}))
+        (home / ".env").write_text(f"KEY={SECRET}\n")
+        client = TestClient(create_app(tmp_path / "out"), base_url=BASE_URL)
+        pid = client.post("/api/studio/projects", json={"title": "A", "kind": "image",
+                                                        "idea_text": IDEA}).json()["id"]
+        r = client.post(f"/api/studio/projects/{pid}/image/propose",
+                        json={"mode": "idea", "expected_edit_version": 0})
+    finally:
+        fake.close()
+    assert (r.status_code, r.json()) == (502, {"error": {
+        "code": "llm_failed", "message": message,
+        "detail": {"provider": "f", "provider_code": code}}})
+    conn = db.connect(home / "studio.sqlite")
+    journal = json.dumps([tuple(row) for row in conn.execute("SELECT * FROM event")],
+                         ensure_ascii=False)
+    stored = conn.execute("SELECT prompt_llm_json, edit_version FROM image_draft").fetchone()
+    assert (SECRET in r.text, SECRET in journal, SECRET in caplog.text, tuple(stored)) == (
+        False, False, False, (None, 0))
 ```
 
 - [ ] **Step 2: Увидеть красным** — `ImportError: cannot import name 'image_prompt' from 'h3_48gb.studio.director'`.
@@ -3781,7 +3927,7 @@ Apply to `h3_48gb/studio/image_draft.py` (`git apply`; контекст — ко
 
 ```diff
 diff --git a/h3_48gb/studio/image_draft.py b/h3_48gb/studio/image_draft.py
-index 814bd78..02517d2 100644
+index 460fbbd5..4ba56fae 100644
 --- a/h3_48gb/studio/image_draft.py
 +++ b/h3_48gb/studio/image_draft.py
 @@ -3,9 +3,12 @@ is editing — the idea, the Russian prompt and its English translation, the mod
@@ -3798,7 +3944,7 @@ index 814bd78..02517d2 100644
  from h3_48gb.studio.errors import StudioError
  
  DRAFT_FIELDS = ("idea_text", "prompt_ru", "prompt_en", "template", "profile", "width", "height",
-@@ -138,10 +141,7 @@ def patch_draft(conn: sqlite3.Connection, project_id: str, *, expected_edit_vers
+@@ -161,10 +164,7 @@ def patch_draft(conn: sqlite3.Connection, project_id: str, *, expected_edit_vers
                            {"count": changes["count"]})
      with db.tx(conn):
          row = draft_row(conn, project_id)
@@ -3810,7 +3956,7 @@ index 814bd78..02517d2 100644
          fields = {name: row[name] for name in DRAFT_FIELDS}
          fields.update(changes)
          model = image_models.get(fields["template"])
-@@ -170,3 +170,61 @@ def patch_draft(conn: sqlite3.Connection, project_id: str, *, expected_edit_vers
+@@ -195,3 +195,61 @@ def patch_draft(conn: sqlite3.Connection, project_id: str, *, expected_edit_vers
                               "origin": "owner"})
      row = draft_row(conn, project_id)
      return {"draft": draft_out(row), "lint": lint_draft(conn, project_id, row)}
@@ -3878,10 +4024,10 @@ Apply to `h3_48gb/studio/schemas.py` (`git apply`; контекст — код �
 
 ```diff
 diff --git a/h3_48gb/studio/schemas.py b/h3_48gb/studio/schemas.py
-index bbddc8a..44a86f8 100644
+index 81882644..2f0fa7ff 100644
 --- a/h3_48gb/studio/schemas.py
 +++ b/h3_48gb/studio/schemas.py
-@@ -172,3 +172,12 @@ class ImageDraftPatch(_Body):
+@@ -179,3 +179,12 @@ class ImageDraftPatch(_Body):
      seed_mode: Literal["auto", "manual"] | None = None
      seed: int | None = None
      count: int | None = None
@@ -3900,10 +4046,10 @@ Apply to `h3_48gb/studio/app.py` (`git apply`; контекст — код по�
 
 ```diff
 diff --git a/h3_48gb/studio/app.py b/h3_48gb/studio/app.py
-index 5d58307..3f00def 100644
+index e1f15d10..9bc0b9ac 100644
 --- a/h3_48gb/studio/app.py
 +++ b/h3_48gb/studio/app.py
-@@ -346,6 +346,14 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
+@@ -352,6 +352,14 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
                                         expected_edit_version=body.expected_edit_version,
                                         changes=changes)
  
@@ -3920,7 +4066,7 @@ index 5d58307..3f00def 100644
          return image_draft.models_out(conn)
 ```
 
-- [ ] **Step 4: Зелёный** — 8 passed; полный набор — 0 failed.
+- [ ] **Step 4: Зелёный** — 10 passed; полный набор — 0 failed. Тест `test_a_provider_failure_through_the_real_door_leaks_nothing` (ред. 2, Codex №12) идёт через настоящий `ProviderLlm` (`providers.json` + `.env` с синтетическим ключом, `_FakeLlama`): тело 502, журнал и черновик без ключа. Мутации к нему нет: утечку в коде S2b не воспроизвести без правки `llm.py` S1 — это страховочный тест маршрута.
 
 - [ ] **Step 5: Мутации**
 1. (№20) `if row["prompt_en_state"] == "owner" and not overwrite_owner:` → `if False:`. Expected: `assert (200, {'draft… == (409, {'error…` в `test_the_hand_edited_english_is_not_overwritten_by_the_automatic_translation`.
@@ -3932,12 +4078,12 @@ index 5d58307..3f00def 100644
 ### Task 8: O10 `image_set` — партия из черновика и повтор варианта (§19.4, И13–И16, §19.9)
 
 **Files:**
-- Modify: `h3_48gb/studio/estimates.py`, `h3_48gb/studio/plans.py`, `schemas.py`, `app.py`, `web/openapi.json`, `tests/_studio_images.py`
+- Modify: `h3_48gb/studio/estimates.py`, `h3_48gb/studio/plans.py`, `h3_48gb/studio/images.py`, `schemas.py`, `app.py`, `web/openapi.json`, `tests/_studio_images.py`
 - Test: `tests/test_studio_image_plan.py`
 
 **Interfaces:**
 - Consumes: `plans.new_seed/_save_plan/last_engine_template`, `tasks.queued_in_order` (S2); `images.draft_inputs/repeat_problem/find_same/canonical`, `inventory.current/entry/nodes`, `lint.lint_image`.
-- Produces: `estimates.record(..., profile=None)`, `estimates.estimate_image(conn, *, template, profile, machine, width, height, steps)`, `estimates.load_cost(template, profile)`, `estimates.model_switch(before, after)` (над `(template, profile)`); `plans.plan_image_set(conn, pid, *, repeat_variant_id=None)` → `{plan_id, expires_at, kind: "image_set", template, profile, items[{kind, ord, seed, inputs, inputs_sha256, estimate_s, estimate_source, same_as, differs}], total_s, checkpoint_switches[{from, to, seconds, reason: "load"|"return", approx}], lint, blocked, invalid, draft_edit_version, repeat_of_variant_id}`; план хранит `items` с `inputs_json` и `versions = {draft_edit_version, repeat_of_variant_id, refused, batch{template, template_sha256, profile, prompt_ru, seed_mode, count}}`; `plans.picture_switches(conn, (template, profile))`; `schemas.PlanRequest.kind` + `"image_set"`, `repeat_variant_id`. Тесты: `_studio_images.PictureRig(tmp_path, monkeypatch, *, check=True, replies=(), missing=())` с `.project(**draft)`, `.patch`, `.plan`, `.draft`, `.task_row`; `EN`.
+- Produces (ред. 2: Codex №3–6, решение координатора 3): `plans.current_engine_version(conn)` (версия движка сейчас — `ComfyExecutor.engine_version()` с таймаутом 3 с; `None`, если не ответил); у повтора `differs` содержит `engine`, если версия варианта или текущая неизвестна или они разные, и `weights`, если отпечаток задачи варианта неизвестен или не равен текущему — равные пиксели обещаются только когда всё известно и равно (И15); `models_unchecked` — и когда в инвентаре нет записи выбранного шаблона/профиля; `images.repeat_problem` сверяет `steps`, `cfg`, `seed` с одноимёнными входами текущей карточки, а `cfg`, которого нет среди входов (Krea 2), — с `cfg` профиля; `plans.picture_switches` — «до партии» = `template_before_new_image` (S2), «после» = рендер, который воркер возьмёт следующим **с моделью партии на карте**; `estimates.record(..., profile=None)`, `estimates.estimate_image(conn, *, template, profile, machine, width, height, steps)`, `estimates.load_cost(template, profile)`, `estimates.model_switch(before, after)` (над `(template, profile)`); `plans.plan_image_set(conn, pid, *, repeat_variant_id=None)` → `{plan_id, expires_at, kind: "image_set", template, profile, items[{kind, ord, seed, inputs, inputs_sha256, estimate_s, estimate_source, same_as, differs}], total_s, checkpoint_switches[{from, to, seconds, reason: "load"|"return", approx}], lint, blocked, invalid, draft_edit_version, repeat_of_variant_id}`; план хранит `items` с `inputs_json` и `versions = {draft_edit_version, repeat_of_variant_id, refused, batch{template, template_sha256, profile, prompt_ru, seed_mode, count}}`; `plans.picture_switches(conn, (template, profile))`; `schemas.PlanRequest.kind` + `"image_set"`, `repeat_variant_id`. Тесты: `_studio_images.PictureRig(tmp_path, monkeypatch, *, check=True, replies=(), missing=())` с `.project(**draft)`, `.patch`, `.plan`, `.draft`, `.task_row`; `EN`.
 
 - [ ] **Step 1: Написать падающие тесты**
 
@@ -3945,7 +4091,7 @@ Apply to `tests/_studio_images.py` (`git apply`; контекст — код п�
 
 ```diff
 diff --git a/tests/_studio_images.py b/tests/_studio_images.py
-index b3ab6ac..e28cbeb 100644
+index b3ab6ac9..e28cbebd 100644
 --- a/tests/_studio_images.py
 +++ b/tests/_studio_images.py
 @@ -44,3 +44,56 @@ def weights_on_disk(tmp_path: Path, monkeypatch, *, missing: tuple[str, ...] = (
@@ -4027,8 +4173,12 @@ LIGHTNING = "Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors"
 NEGATIVE = templates.load("qwen-image-t2i").requires["limits"]["negative_text"]
 
 
+ENGINE = "ComfyUI 0.42.0 · torch 2.9.1+cu128 · cuda:0 NVIDIA CMP 170HX"
+
+
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
+    monkeypatch.setattr(plans, "current_engine_version", lambda conn: ENGINE)
     return PictureRig(tmp_path, monkeypatch)
 
 
@@ -4115,7 +4265,8 @@ def test_an_unavailable_model_blocks_and_a_size_error_invalidates(tmp_path, monk
     plan = rig.plan(pid)
     assert ([f["rule"] for f in plan["blocked"]], plan["invalid"]) == (["LI7"], [])
     assert {i["inputs"]["weights_sha256"] for i in plan["items"]} == {None}
-    rig.patch(pid, profile="full", width=2112)
+    rig.patch(pid, profile="full", width=1328, height=1328)
+    rig.patch(pid, template="krea2-t2i")                 # 1328 is not a multiple of 64 for Krea
     plan = rig.plan(pid)
     assert (plan["blocked"], [f["rule"] for f in plan["invalid"]]) == ([], ["LI2"])
 
@@ -4145,7 +4296,7 @@ def test_a_qwen_batch_before_a_waiting_render_shows_both_switches(rig):
 
 # -- the repeat (Б1, И15, НБ4) -------------------------------------------------------------------
 
-def _variant(rig, pid, inputs, *, seed, task_weights="same", engine=None, vid="v_1"):
+def _variant(rig, pid, inputs, *, seed, task_weights="same", engine=ENGINE, vid="v_1"):
     task_weights = inputs["weights_sha256"] if task_weights == "same" else task_weights
     rig.conn.execute("INSERT INTO task (id, kind, executor, gpu_scope, payload_json, status, "
                      "project_id, weights_sha256, engine_version, created_at, updated_at) "
@@ -4182,9 +4333,6 @@ def test_a_repeat_says_what_changed_since_and_never_promises_equal_pixels(rig):
     source = rig.plan(pid)["items"][0]["inputs"]
     old = {**source, "template": {"id": "krea2-t2i", "sha256": "0" * 64}}
     _variant(rig, pid, old, seed=old["seed"], task_weights="1" * 64, engine="ComfyUI 0.41.0")
-    rig.task_row("k_now", kind="image", template="krea2-t2i", status="succeeded",
-                 submitted_at=5.0)
-    rig.conn.execute("UPDATE task SET engine_version = 'ComfyUI 0.42.0' WHERE id = 'k_now'")
     [item] = rig.plan(pid, repeat_variant_id="v_1")["items"]
     assert item["differs"] == ["template", "weights", "engine"]
     assert (item["inputs"]["template"]["sha256"], item["inputs"]["weights_sha256"]) == (
@@ -4227,9 +4375,84 @@ def test_an_image_set_over_a_video_project_is_refused(rig):
         "code": "project_kind_mismatch",
         "message": "Это видеопроект: режим «Картинка» — в проекте-картинке",
         "detail": {"project_id": v.json()["id"], "kind": "video", "needed": "image"}})
+
+
+
+@pytest.mark.parametrize("variant_engine,engine_now,variant_weights,differs", [
+    (None, ENGINE, "same", ["engine"]),          # the variant's engine is unknown
+    (ENGINE, None, "same", ["engine"]),          # ComfyUI does not answer now
+    (ENGINE, ENGINE, None, ["weights"])])        # the variant's fingerprint is unknown
+def test_equal_pixels_are_promised_only_when_everything_is_known(rig, monkeypatch, variant_engine,
+                                                                 engine_now, variant_weights,
+                                                                 differs):
+    """Ред. 2 (Codex №6, И15): «повтор не гарантирован» unless engine and weights are known
+    and equal."""
+    pid = rig.project()
+    source = rig.plan(pid)["items"][0]["inputs"]
+    _variant(rig, pid, source, seed=source["seed"], engine=variant_engine,
+             task_weights=variant_weights)
+    monkeypatch.setattr(plans, "current_engine_version", lambda conn: engine_now)
+    [item] = rig.plan(pid, repeat_variant_id="v_1")["items"]
+    assert (item["differs"], item["inputs"]) == (differs, source)
+
+
+@pytest.mark.parametrize("template,profile,change,reason", [
+    ("qwen-image-t2i", "fast", {"cfg": 12.0}, "cfg 12.0 вне 0.0–10.0"),
+    ("krea2-t2i", None, {"cfg": 2.0}, "cfg 2.0 у Krea 2 теперь 1.0"),
+    ("zimage-turbo-t2i", None, {"steps": 30}, "шаги 30 вне 1–20")])
+def test_a_repeat_is_checked_input_by_input_against_the_card(rig, template, profile, change,
+                                                             reason):
+    """Ред. 2 (Codex №3): cfg too, not only size and steps."""
+    pid = rig.project(template=template)
+    source = rig.plan(pid)["items"][0]["inputs"]
+    _variant(rig, pid, {**source, **change}, seed=source["seed"])
+    r = rig.client.post(f"/api/studio/projects/{pid}/plan",
+                        json={"kind": "image_set", "repeat_variant_id": "v_1"})
+    assert (r.status_code, r.json()["error"]["code"], r.json()["error"]["detail"]["reason"]) == (
+        409, "repeat_incompatible", reason)
+
+
+def test_no_plan_while_the_chosen_model_has_no_inventory_entry(rig):
+    """Ред. 2 (Codex №4): an inventory written before the card of this model (or of its profile)
+    appeared would give a plan with an empty fingerprint."""
+    state = inventory.current(rig.conn)
+    del state["templates"]["qwen-image-t2i"]["profiles"]["full"]
+    from h3_48gb.studio import settings
+    settings.put(rig.conn, "comfy.inventory", json.dumps(state))
+    pid = rig.project(template="qwen-image-t2i")
+    assert rig.plan(pid)["items"][0]["inputs"]["profile"] == "fast"
+    source = rig.plan(pid)["items"][0]["inputs"]
+    rig.patch(pid, profile="full")
+    r = rig.client.post(f"/api/studio/projects/{pid}/plan", json={"kind": "image_set"})
+    assert (r.status_code, r.json()["error"]["code"]) == (409, "models_unchecked")
+    _variant(rig, pid, {**source, "profile": "full", "lora": None, "steps": 50, "cfg": 4.0},
+             seed=source["seed"])
+    r = rig.client.post(f"/api/studio/projects/{pid}/plan",
+                        json={"kind": "image_set", "repeat_variant_id": "v_1"})
+    assert (r.status_code, r.json()["error"]["code"]) == (409, "models_unchecked")
+
+
+def test_the_return_is_to_the_render_the_worker_picks_after_the_batch(rig):
+    """Ред. 2 (Codex №5): fl2va is loaded, ref2va was queued before fl2va; once Qwen has run
+    the worker takes the OLDER render (neither is on the loaded model) — the plan says ref2va.
+    A task in `submitting` (no `engine_submitted_at` yet) is what runs before the batch."""
+    rig.task_row("k_done", kind="render", template="h3-fl2va", status="succeeded",
+                 submitted_at=1.0)
+    rig.task_row("k_ref", kind="render", template="h3-ref2va")
+    rig.task_row("k_fl", kind="render", template="h3-fl2va")
+    pid = rig.project(template="qwen-image-t2i")
+    assert rig.plan(pid)["checkpoint_switches"] == [
+        {"from": "h3-fl2va", "to": "qwen-image-t2i", "seconds": 19.0, "reason": "load",
+         "approx": False},
+        {"from": "qwen-image-t2i", "to": "h3-ref2va", "seconds": 38.0, "reason": "return",
+         "approx": True}]
+    rig.task_row("k_z", kind="image", template="zimage-turbo-t2i", status="submitting")
+    assert rig.plan(pid)["checkpoint_switches"][0] == {
+        "from": "zimage-turbo-t2i", "to": "qwen-image-t2i", "seconds": 19.0, "reason": "load",
+        "approx": False}
 ```
 
-- [ ] **Step 2: Увидеть красным** — `assert (400, …'image_set'…) == (409, …models_unchecked…)` (вид `image_set` неизвестен схеме).
+- [ ] **Step 2: Увидеть красным** — `AttributeError: <module 'h3_48gb.studio.plans'> has no attribute 'current_engine_version'` (фикстура), затем `assert (400, …'image_set'…) == (409, …models_unchecked…)`.
 
 - [ ] **Step 3: Реализовать**
 
@@ -4237,7 +4460,7 @@ Apply to `h3_48gb/studio/estimates.py` (`git apply`; контекст — код
 
 ```diff
 diff --git a/h3_48gb/studio/estimates.py b/h3_48gb/studio/estimates.py
-index 751be5a..b840e41 100644
+index 751be5a1..b840e416 100644
 --- a/h3_48gb/studio/estimates.py
 +++ b/h3_48gb/studio/estimates.py
 @@ -8,7 +8,7 @@ from __future__ import annotations
@@ -4301,14 +4524,46 @@ index 751be5a..b840e41 100644
 +    return load_cost(*after)
 ```
 
+Apply to `h3_48gb/studio/images.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/h3_48gb/studio/images.py b/h3_48gb/studio/images.py
+index 64feb790..dc393ae3 100644
+--- a/h3_48gb/studio/images.py
++++ b/h3_48gb/studio/images.py
+@@ -130,9 +130,19 @@ def repeat_problem(inputs: dict, entry: dict | None) -> str | None:
+     problems = model.size_problems(inputs["width"], inputs["height"])
+     if problems:
+         return problems[0]
+-    low, high = model.steps_range
+-    if not low <= inputs["steps"] <= high:
+-        return f"шаги {inputs['steps']} вне {low}–{high}"
++    # ред. 2 (Codex №3): every other input against the card's input of the same name; a value
++    # the card does not take as an input (cfg of Krea 2) must be the profile's own
++    names = {"steps": "шаги", "cfg": "cfg", "seed": "сид"}
++    for name, word in names.items():
++        spec = model.inputs.get(name)
++        value = inputs[name]
++        if spec is None:
++            if name == "cfg" and value != profile.cfg:
++                return f"cfg {value} у {model.title} теперь {profile.cfg}"
++            continue
++        low, high = spec.get("min"), spec.get("max")
++        if (low is not None and value < low) or (high is not None and value > high):
++            return f"{word} {value} вне {low}–{high}"
+     if entry is None:
+         return "Проверяю модели, ≈1 мин"
+     if not entry["installed"]:
+```
+
 Apply to `h3_48gb/studio/plans.py` (`git apply`; контекст — код после предыдущих задач):
 
 ```diff
 diff --git a/h3_48gb/studio/plans.py b/h3_48gb/studio/plans.py
-index 424cc33..cb7a64d 100644
+index 3ba9ca60..2032df62 100644
 --- a/h3_48gb/studio/plans.py
 +++ b/h3_48gb/studio/plans.py
-@@ -3,12 +3,14 @@ take and what blocks it; it lives 10 minutes and is confirmed once. Slice S2: th
+@@ -3,12 +3,15 @@ take and what blocks it; it lives 10 minutes and is confirmed once. Slice S2: th
  (`kind=image`, Krea 2)."""
  from __future__ import annotations
  
@@ -4317,6 +4572,7 @@ index 424cc33..cb7a64d 100644
  import secrets
  import sqlite3
  from datetime import datetime, timedelta, timezone
++from pathlib import Path
  
 -from h3_48gb.studio import db, estimates, events, ids, settings, tasks, templates
 +from h3_48gb.studio import (db, estimates, events, ids, image_draft, image_models, images,
@@ -4324,7 +4580,7 @@ index 424cc33..cb7a64d 100644
  from h3_48gb.studio.director import keyframe_prompt
  from h3_48gb.studio.errors import StudioError
  
-@@ -140,3 +142,158 @@ def enqueue_image(conn: sqlite3.Connection, project_id: str, plan_id: str, key:
+@@ -165,3 +168,170 @@ def enqueue_image(conn: sqlite3.Connection, project_id: str, plan_id: str, key:
      events.emit(conn, "task_queued", project_id=project_id, task_id=task_id,
                  payload={"kind": "image", "plan_id": plan_id})
      return {"task_id": task_id, "status": "queued"}
@@ -4349,42 +4605,34 @@ index 424cc33..cb7a64d 100644
 +
 +def picture_switches(conn: sqlite3.Connection, model: tuple[str, str | None]) -> list[dict]:
 +    """§19.9 «Вытеснение»: the price a batch adds, counted on the ORDER the worker will run
-+    (`tasks.queue_key`, §8.4): the load of its model after what runs before it, and — when renders
-+    wait behind it — the return of their model. Pictures are FIFO and go before renders, so the
-+    batch is one block: before it the queued pictures (or the loaded model), after it the first
-+    queued render. The return to H3 after Qwen is a guess (§15.4 п.20) and says so (`approx`)."""
-+    loaded = last_engine_template(conn)
-+    queued = tasks.queued_in_order(conn, kinds=("image", "render"), loaded_template=loaded)
-+    before: tuple[str, str | None] | None = None
-+    after: tuple[str, str | None] | None = None
-+    if loaded is not None:
-+        row = conn.execute("SELECT payload_json FROM task WHERE engine_submitted_at IS NOT NULL "
-+                           "ORDER BY engine_submitted_at DESC LIMIT 1").fetchone()
-+        before = (loaded, json.loads(row["payload_json"]).get("profile"))
-+    for row in queued:
-+        payload = json.loads(row["payload_json"])
-+        key = (payload.get("template"), payload.get("profile"))
-+        if row["kind"] == "image":
-+            before = key
-+        elif after is None:
-+            after = key
++    (`tasks.queue_key`, §8.4). Before the batch — `template_before_new_image` (the task on the
++    engine, `submitting` included, then the queued pictures, S2). After it — the render the worker
++    will pick NEXT, with the batch's model loaded (ред. 2, Codex №5: not the model held before
++    the batch). Another profile of the same model is no switch. The return to H3 after Qwen is a
++    guess (§15.4 п.20) and says so (`approx`)."""
++    before = template_before_new_image(conn)
++    nxt = tasks.queued_in_order(conn, kinds=("render",), loaded_template=model[0], limit=1)
++    after = json.loads(nxt[0]["payload_json"]).get("template") if nxt else None
 +    out = []
-+    cost = estimates.model_switch(before, model)
++    cost = estimates.model_switch((before, None) if before else None, model)
 +    if cost:
-+        out.append({"from": before[0], "to": model[0], "seconds": cost, "reason": "load",
++        out.append({"from": before, "to": model[0], "seconds": cost, "reason": "load",
 +                    "approx": False})
 +    if after is not None:
-+        back = estimates.model_switch(model, after)
++        back = estimates.model_switch(model, (after, None))
 +        if back:
-+            out.append({"from": model[0], "to": after[0], "seconds": back, "reason": "return",
-+                        "approx": model[0] == "qwen-image-t2i" and after[0].startswith("h3-")})
++            out.append({"from": model[0], "to": after, "seconds": back, "reason": "return",
++                        "approx": model[0] == "qwen-image-t2i" and after.startswith("h3-")})
 +    return out
 +
 +
-+def _repeat_items(conn, project_id: str, variant_id: str, inv: dict) -> tuple[list, dict]:
++def _repeat_items(conn, project_id: str, variant_id: str, inv: dict,
++                  engine_now: str | None) -> tuple[list, dict]:
 +    """Б1: the draft is not read. One item with the SAVED inputs of the variant (И15) — the
 +    current template version and weights replace the old ones only when those changed, and the
-+    plan says so (`differs`)."""
++    plan says so (`differs`). Equal pixels are promised only in the verified environment
++    (ред. 2, Codex №6): `engine` is in `differs` unless the variant's engine and the engine now
++    are both known and equal; `weights` — unless the variant's fingerprint is known and equal."""
 +    row = conn.execute(
 +        "SELECT v.*, b.prompt_ru, b.ord AS batch_ord, t.weights_sha256 AS task_weights, "
 +        "t.engine_version AS task_engine FROM image_variant v "
@@ -4396,6 +4644,8 @@ index 424cc33..cb7a64d 100644
 +    inputs = json.loads(row["inputs_json"])
 +    template, profile = inputs["template"]["id"], inputs["profile"]
 +    entry = inventory.entry(inv, template, profile)
++    if entry is None:                     # ред. 2 (Codex №4): this template/profile not checked
++        raise _unchecked()
 +    problem = images.repeat_problem(inputs, entry)
 +    if problem:
 +        raise StudioError(409, "repeat_incompatible", f"Повторить нельзя: {problem}",
@@ -4405,14 +4655,14 @@ index 424cc33..cb7a64d 100644
 +    if inputs["template"]["sha256"] != current_sha:
 +        inputs["template"]["sha256"] = current_sha
 +        differs.append("template")
-+    if row["task_weights"] is not None and row["task_weights"] != entry["weights_sha256"]:
-+        inputs["weights_sha256"] = entry["weights_sha256"]
++    if row["task_weights"] != entry["weights_sha256"]:
++        if inputs["weights_sha256"] != entry["weights_sha256"]:
++            inputs["weights_sha256"] = entry["weights_sha256"]
 +        differs.append("weights")
-+    engine = conn.execute("SELECT engine_version FROM task WHERE engine_version IS NOT NULL "
-+                          "ORDER BY engine_submitted_at DESC LIMIT 1").fetchone()
-+    if row["task_engine"] is not None and engine and engine[0] != row["task_engine"]:
++    if row["task_engine"] is None or engine_now is None or engine_now != row["task_engine"]:
 +        differs.append("engine")
-+    raw = row["inputs_json"] if not differs or differs == ["engine"] else images.canonical(inputs)
++    changed = json.loads(row["inputs_json"]) != inputs
++    raw = images.canonical(inputs) if changed else row["inputs_json"]
 +    estimate = estimates.estimate_image(conn, template=template, profile=profile,
 +                                        machine=settings.get(conn, "machine"),
 +                                        width=inputs["width"], height=inputs["height"],
@@ -4426,24 +4676,42 @@ index 424cc33..cb7a64d 100644
 +    return [item], batch
 +
 +
++ENGINE_VERSION_TIMEOUT_S = 3.0
++
++
++def current_engine_version(conn: sqlite3.Connection) -> str | None:
++    """«ComfyUI · torch · GPU» of the studio's engine NOW (ред. 2, Codex №6) — what a repeat is
++    compared with; None when the engine does not answer (then no equality is promised)."""
++    from h3_48gb.engines.comfy_api import ComfyApi
++    from h3_48gb.studio.executors.comfy import ComfyExecutor
++    url = settings.get(conn, "comfy.url")
++    return ComfyExecutor(url=url, output_dir=Path(settings.get(conn, "comfy.output_dir")),
++                         scope=settings.get(conn, "comfy.scope"),
++                         api=ComfyApi(url, timeout=ENGINE_VERSION_TIMEOUT_S)).engine_version()
++
++
 +def plan_image_set(conn: sqlite3.Connection, project_id: str, *,
 +                   repeat_variant_id: str | None = None) -> dict:
 +    """O10 `image_set`: a batch from the draft (N variants, one task and one seed each, Р3-4)
 +    or the repeat of one variant. Without a checked inventory there is no weights fingerprint,
-+    so no plan (409 `models_unchecked`, И14). Lint errors make the plan `invalid`, an unavailable
-+    model `blocked` (LI7); O30 refuses both."""
++    so no plan (409 `models_unchecked`, И14) — nor when the chosen template/profile has no
++    entry yet (ред. 2, Codex №4). Lint errors make the plan `invalid`, an unavailable model
++    `blocked` (LI7); O30 refuses both. A repeat asks the engine for its version now."""
 +    inv = inventory.current(conn)
 +    if inv is None:
 +        raise _unchecked()
 +    findings: list[dict] = []
 +    if repeat_variant_id is not None:
-+        items, batch = _repeat_items(conn, project_id, repeat_variant_id, inv)
++        items, batch = _repeat_items(conn, project_id, repeat_variant_id, inv,
++                                     current_engine_version(conn))
 +        draft_version = None
 +    else:
 +        draft = image_draft.draft_row(conn, project_id)
 +        model = image_models.get(draft["template"])
 +        entry = inventory.entry(inv, model.id, draft["profile"])
-+        weights = entry["weights_sha256"] if entry and entry["installed"] else None
++        if entry is None:
++            raise _unchecked()
++        weights = entry["weights_sha256"] if entry["installed"] else None
 +        seeds = ([draft["seed"] + k for k in range(draft["count"])]
 +                 if draft["seed_mode"] == "manual" else _distinct_seeds(draft["count"]))
 +        items, same = [], []
@@ -4489,7 +4757,7 @@ Apply to `h3_48gb/studio/schemas.py` (`git apply`; контекст — код �
 
 ```diff
 diff --git a/h3_48gb/studio/schemas.py b/h3_48gb/studio/schemas.py
-index 44a86f8..1954de1 100644
+index 2f0fa7ff..1a64fc97 100644
 --- a/h3_48gb/studio/schemas.py
 +++ b/h3_48gb/studio/schemas.py
 @@ -137,13 +137,15 @@ class ApplyRequest(_Body):
@@ -4507,18 +4775,18 @@ index 44a86f8..1954de1 100644
 +    #: S2b, `image_set`: repeat this variant with its saved inputs instead of the draft (Б1)
 +    repeat_variant_id: str | None = None
  
- 
- class PlanConfirm(_Body):
+     @model_validator(mode="after")
+     def _one_source(self):
 ```
 
 Apply to `h3_48gb/studio/app.py` (`git apply`; контекст — код после предыдущих задач):
 
 ```diff
 diff --git a/h3_48gb/studio/app.py b/h3_48gb/studio/app.py
-index 3f00def..38c9300 100644
+index 9bc0b9ac..6348e97f 100644
 --- a/h3_48gb/studio/app.py
 +++ b/h3_48gb/studio/app.py
-@@ -316,7 +316,11 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
+@@ -322,7 +322,11 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
      @app.post(f"{api}/projects/{{project_id}}/plan")
      def make_plan(body: schemas.PlanRequest, project_id: str = Depends(project_exists),
                    conn=Depends(get_conn)):
@@ -4533,7 +4801,7 @@ index 3f00def..38c9300 100644
                                      width=body.width, height=body.height)
 ```
 
-- [ ] **Step 4: Зелёный** — 11 passed; полный набор — 0 failed (тест S2 `test_the_switch_costs_what_the_target_card_says_and_never_raises` — без правок: у Qwen нет верхнего `switch_in_s`, R-S2b-3).
+- [ ] **Step 4: Зелёный** — 19 passed; полный набор — 0 failed (тест S2 `test_the_switch_costs_what_the_target_card_says_and_never_raises` — без правок: у Qwen нет верхнего `switch_in_s`, R-S2b-3).
 
 - [ ] **Step 5: Мутации** (все — красные на копии)
 1. (№23) `if inv is None: raise _unchecked()` → `if False:` → `assert (200, {'plan_… == (409, {'error…y_checked'}}})`.
@@ -4545,6 +4813,10 @@ index 3f00def..38c9300 100644
 7. (№22) `if now != was:` → `if False:` в `repeat_problem` → `assert (200, {'plan_… == (409, …угую LoRA'}}})`.
 8. (№17) `if repeat_variant_id is not None:` → `if False:` → `assert (1400229737, … == (211463746, …`.
 9. `approx` всегда `False` → `{'approx': False} != {'approx': True}`.
+10. (ред. 2, №5) «после партии» по модели до партии (`loaded_template=last_engine_template(conn)`) → `'to': 'h3-fl2va' != 'to': 'h3-ref2va'` в `test_the_return_is_to_the_render_the_worker_picks_after_the_batch`.
+11. (ред. 2, №4) без проверки записи инвентаря у партии из черновика → `TypeError: 'NoneType' object is not subscriptable` в `test_no_plan_while_the_chosen_model_has_no_inventory_entry`.
+12. (ред. 2, №3) `cfg` не сверяется (`if name != "cfg" and …`) → `KeyError: 'error'` в `…checked_input_by_input…[qwen-image-t2i-fast-…cfg 12.0…]`.
+13. (ред. 2, №6) прежнее условие (`engine` только при обеих известных и разных) → `assert ([], …) == (['engine'], …)`.
 
 - [ ] **Step 6: Коммит** — `feat(studio): O10 image_set — сиды, входы, оценка по профилю, смены на очереди воркера, повтор варианта (S2b задача 8)`.
 
@@ -4556,7 +4828,7 @@ index 3f00def..38c9300 100644
 
 **Interfaces:**
 - Consumes: `plans.load_plan`, `idempotency.run_once` (S2), задача 8.
-- Produces: `plans.enqueue_batch(conn, pid, plan_id) -> {"batch": {id, ord, variants[{variant_id, task_id, seed, status}]}}` (внутри `run_once`; 409 `plan_stale {planned, current}`, `plan_invalid`; события `image_batch_queued`, затем `task_queued` по задаче); `images.keep(conn, variant_id, kept) -> variant` (404 `variant_not_found`, 409 `variant_not_ready {variant_id, status}`, событие `image_variant_kept` только при изменении); `schemas.VariantKeep`; `POST /projects/{id}/image/batches` (+ `Idempotency-Key`, 201), `POST /image-variants/{id}/keep`.
+- Produces: `plans.enqueue_batch(conn, pid, plan_id) -> {"batch": {id, ord, variants[{variant_id, task_id, seed, status}]}}` (внутри `run_once`; 409 `plan_stale {planned, current}`, `plan_invalid`; события `image_batch_queued`, затем `task_queued` по задаче; повтор ключа — 200 с тем же телом, как O12 после ревью S2 задачи 7); `images.keep(conn, variant_id, kept) -> variant` (404 `variant_not_found`, 409 `variant_not_ready {variant_id, status}`; ред. 2, Codex №7: чтение, решение и запись — одна транзакция `BEGIN IMMEDIATE` с условным `UPDATE … WHERE (kept_at IS NULL) = ?`, событие `image_variant_kept` — только если строка изменилась; помощник `images._variant_row`); `schemas.VariantKeep`; `POST /projects/{id}/image/batches` (+ `Idempotency-Key`, 201), `POST /image-variants/{id}/keep`.
 
 - [ ] **Step 1: Написать падающие тесты**
 
@@ -4662,7 +4934,7 @@ def test_the_same_key_answers_the_same_and_a_second_press_is_plan_used(rig):
     pid = rig.project(count=1)
     plan_id = rig.plan(pid)["plan_id"]
     first = confirm(rig, pid, plan_id)
-    assert confirm(rig, pid, plan_id) == first
+    assert confirm(rig, pid, plan_id, expect=200) == first       # S2 task 7: a replay is 200
     r = rig.client.post(f"/api/studio/projects/{pid}/image/batches", json={"plan_id": plan_id},
                         headers={"Idempotency-Key": "key-2"})
     assert (r.status_code, r.json()["error"]["code"]) == (409, "plan_used")
@@ -4772,6 +5044,42 @@ def test_a_batch_on_a_video_project_is_refused(rig):
     r = rig.client.post(f"/api/studio/projects/{v.json()['id']}/image/batches",
                         json={"plan_id": "pl_x"}, headers={"Idempotency-Key": "k"})
     assert (r.status_code, r.json()["error"]["code"]) == (409, "project_kind_mismatch")
+
+
+def test_two_presses_of_godится_at_once_give_one_event(rig, monkeypatch):
+    """Ред. 2 (Codex №7): the read that decides «changed or not» is inside the write
+    transaction — a slow read in one request holds the other one at BEGIN IMMEDIATE."""
+    import threading
+    import time as _time
+
+    from h3_48gb.studio import config, db, images
+    pid = rig.project(count=1)
+    [v] = confirm(rig, pid, rig.plan(pid)["plan_id"])["batch"]["variants"]
+    finish(rig, v["task_id"])
+    real = images._variant_row
+
+    def slow_read(conn, variant_id):
+        row = real(conn, variant_id)
+        _time.sleep(0.2)
+        return row
+    monkeypatch.setattr(images, "_variant_row", slow_read)
+    home = config.studio_dir(rig.client.app.state.outdir)
+    results = []
+
+    def press():
+        conn = db.connect(home / "studio.sqlite")
+        try:
+            results.append(images.keep(conn, v["variant_id"], True)["kept"])
+        finally:
+            conn.close()
+    threads = [threading.Thread(target=press) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert results == [True, True]
+    assert rig.conn.execute("SELECT COUNT(*) FROM event WHERE kind = 'image_variant_kept'"
+                            ).fetchone()[0] == 1
 ```
 
 - [ ] **Step 2: Увидеть красным** — `{"error":{"code":"not_found",…}}`, `assert 404 == 201`.
@@ -4782,10 +5090,10 @@ Apply to `h3_48gb/studio/plans.py` (`git apply`; контекст — код п�
 
 ```diff
 diff --git a/h3_48gb/studio/plans.py b/h3_48gb/studio/plans.py
-index cb7a64d..47cb25a 100644
+index 2032df62..bd864546 100644
 --- a/h3_48gb/studio/plans.py
 +++ b/h3_48gb/studio/plans.py
-@@ -297,3 +297,62 @@ def plan_image_set(conn: sqlite3.Connection, project_id: str, *,
+@@ -335,3 +335,62 @@ def plan_image_set(conn: sqlite3.Connection, project_id: str, *,
              "checkpoint_switches": switch, "lint": findings, "blocked": blocked,
              "invalid": invalid, "draft_edit_version": draft_version,
              "repeat_of_variant_id": repeat_variant_id}
@@ -4854,7 +5162,7 @@ Apply to `h3_48gb/studio/images.py` (`git apply`; контекст — код п
 
 ```diff
 diff --git a/h3_48gb/studio/images.py b/h3_48gb/studio/images.py
-index 64feb79..03cd11c 100644
+index dc393ae3..5e9dd7d6 100644
 --- a/h3_48gb/studio/images.py
 +++ b/h3_48gb/studio/images.py
 @@ -10,7 +10,7 @@ from pathlib import Path
@@ -4866,29 +5174,35 @@ index 64feb79..03cd11c 100644
  from h3_48gb.studio import files as asset_files
  from h3_48gb.studio.errors import StudioError
  from h3_48gb.studio.executors.base import TaskSpec
-@@ -200,3 +200,27 @@ def preview_asset(conn: sqlite3.Connection, project_id: str) -> str | None:
+@@ -210,3 +210,33 @@ def preview_asset(conn: sqlite3.Connection, project_id: str) -> str | None:
          "ORDER BY v.kept_at IS NULL, v.kept_at DESC, b.ord DESC, v.ord DESC LIMIT 1",
          (project_id,)).fetchone()
      return row["result_asset_id"] if row else None
 +
 +
++def _variant_row(conn: sqlite3.Connection, variant_id: str) -> sqlite3.Row | None:
++    return conn.execute("SELECT v.*, b.project_id, t.status, t.result_asset_id FROM image_variant v "
++                        "JOIN image_batch b ON b.id = v.batch_id JOIN task t ON t.id = v.task_id "
++                        "WHERE v.id = ?", (variant_id,)).fetchone()
++
++
 +def keep(conn: sqlite3.Connection, variant_id: str, kept: bool) -> dict:
 +    """O31 «Годится» (И17): only a finished variant with its picture; the same value again is a
-+    200 without an event; neither the inputs nor the asset move."""
-+    row = conn.execute("SELECT v.*, b.project_id FROM image_variant v JOIN image_batch b "
-+                       "ON b.id = v.batch_id WHERE v.id = ?", (variant_id,)).fetchone()
-+    if row is None:
-+        raise StudioError(404, "variant_not_found", "Вариант не найден",
-+                          {"variant_id": variant_id})
-+    task = conn.execute("SELECT status, result_asset_id FROM task WHERE id = ?",
-+                        (row["task_id"],)).fetchone()
-+    if kept and (task["status"] != "succeeded" or task["result_asset_id"] is None):
-+        raise StudioError(409, "variant_not_ready", "Вариант ещё не готов",
-+                          {"variant_id": variant_id, "status": task["status"]})
-+    if (row["kept_at"] is not None) != kept:
-+        with db.tx(conn):
-+            conn.execute("UPDATE image_variant SET kept_at = ? WHERE id = ?",
-+                         (ids.now_iso() if kept else None, variant_id))
++    200 without an event; neither the inputs nor the asset move. Read, decide and write in ONE
++    `BEGIN IMMEDIATE` transaction with a conditional UPDATE (ред. 2, Codex №7): two presses at
++    once give one event."""
++    with db.tx(conn):
++        row = _variant_row(conn, variant_id)
++        if row is None:
++            raise StudioError(404, "variant_not_found", "Вариант не найден",
++                              {"variant_id": variant_id})
++        if kept and (row["status"] != "succeeded" or row["result_asset_id"] is None):
++            raise StudioError(409, "variant_not_ready", "Вариант ещё не готов",
++                              {"variant_id": variant_id, "status": row["status"]})
++        changed = conn.execute(
++            "UPDATE image_variant SET kept_at = ? WHERE id = ? AND (kept_at IS NULL) = ?",
++            (ids.now_iso() if kept else None, variant_id, kept)).rowcount
++        if changed:
 +            events.emit(conn, "image_variant_kept", project_id=row["project_id"],
 +                        payload={"variant_id": variant_id, "kept": kept})
 +    inv = inventory.current(conn)
@@ -4900,10 +5214,10 @@ Apply to `h3_48gb/studio/schemas.py` (`git apply`; контекст — код �
 
 ```diff
 diff --git a/h3_48gb/studio/schemas.py b/h3_48gb/studio/schemas.py
-index 1954de1..823820a 100644
+index 1a64fc97..a1d9d2e3 100644
 --- a/h3_48gb/studio/schemas.py
 +++ b/h3_48gb/studio/schemas.py
-@@ -183,3 +183,8 @@ class ImagePromptRequest(_Body):
+@@ -190,3 +190,8 @@ class ImagePromptRequest(_Body):
      expected_edit_version: int
      idea_text: str | None = Field(default=None, max_length=20000)
      overwrite_owner: bool = False
@@ -4918,10 +5232,10 @@ Apply to `h3_48gb/studio/app.py` (`git apply`; контекст — код по�
 
 ```diff
 diff --git a/h3_48gb/studio/app.py b/h3_48gb/studio/app.py
-index 38c9300..f7fe93d 100644
+index 6348e97f..2e5766ed 100644
 --- a/h3_48gb/studio/app.py
 +++ b/h3_48gb/studio/app.py
-@@ -17,8 +17,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
+@@ -18,8 +18,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
  from starlette.middleware.trustedhost import TrustedHostMiddleware
  
  from h3_48gb.engines.dispatcher_client import DispatcherClient, DispatcherUnavailable
@@ -4929,10 +5243,10 @@ index 38c9300..f7fe93d 100644
 -                            schemas, settings, tasks)
 +from h3_48gb.studio import (assets, config, db, events, idempotency, image_draft, images, ops,
 +                            plans, schemas, settings, tasks)
- from h3_48gb.studio.executors.comfy import ComfyExecutor
+ from h3_48gb.engines.comfy_api import ComfyApi
+ from h3_48gb.studio.executors.comfy import PROBE_TASK_ID, ComfyExecutor
  from h3_48gb.studio.errors import StudioError
- from h3_48gb.studio.llm import Llm, ProviderLlm
-@@ -358,6 +358,21 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
+@@ -364,6 +364,21 @@ def create_app(outdir: Path, *, web_dist: Path = WEB_DIST,
                                            expected_edit_version=body.expected_edit_version,
                                            overwrite_owner=body.overwrite_owner)
  
@@ -4956,9 +5270,10 @@ index 38c9300..f7fe93d 100644
          return image_draft.models_out(conn)
 ```
 
-- [ ] **Step 4: Зелёный** — 8 passed; полный набор — 0 failed.
+- [ ] **Step 4: Зелёный** — 9 passed; полный набор — 0 failed.
 
 - [ ] **Step 5: Мутации**
+0. (ред. 2, №7) `UPDATE` без условия `(kept_at IS NULL) = ?` → `assert [('image_vari…')] == [('image_vari…', … False})]` (лишнее событие на повторе); `test_two_presses_of_godится_at_once_give_one_event` держит одновременные нажатия: медленное чтение (0,2 с) в одном потоке, второй ждёт на `BEGIN IMMEDIATE`.
 1. (№8) `if current != meta["draft_edit_version"]:` → `if False:` → `assert (201, {'batch… == (409, {'error…urrent': 2}}})`.
 2. (№9) `if kept and task["status"] == "queued":` → `assert (200, {'id': … == (409, {'error…: 'failed'}}})`.
 3. (И13) `"seed": None` в payload → `assert {'template': … == {'template': …` (payload ≠ литералу).
@@ -4968,12 +5283,12 @@ index 38c9300..f7fe93d 100644
 ### Task 10: Воркер на партиях — веса, `Probe.missing`, профиль в оценке, поток инвентаря (§19.9, §8.1, Б6)
 
 **Files:**
-- Modify: `h3_48gb/studio/executors/base.py`, `executors/comfy.py`, `worker.py`, `images.py`, `plans.py`, `__main__.py`
+- Modify: `h3_48gb/studio/executors/base.py`, `executors/comfy.py`, `worker.py`, `images.py`, `inventory.py`, `plans.py`, `__main__.py`
 - Test: `tests/test_studio_image_worker.py`; литерал `tests/test_studio_executor_contract.py`
 
 **Interfaces:**
 - Consumes: `Worker`, `ImageKind`, `Rig` (S2 задача 8), задачи 3, 9.
-- Produces: `Probe.missing: NotRequired[list[str]]`; `ComfyExecutor.probe` проверяет и `LoraLoaderModelOnly` + `loras/<name>`, когда в `values` есть `lora`; воркер: `missing` → `failed` «модель <template> не установлена на alex-neuro: …» без ожидания, узлы пробы → `inventory.record_nodes`; `ImageKind.spec`: каталог по виду проекта (R-S2b-8), сверка `task.weights_sha256` с инвентарём до отправки (`ExecutorError` «веса … изменились после постановки … — постройте план заново», только при не-NULL и `engine_ref IS NULL`); `ImageKind.finish`: `estimates.record(..., profile=)`, у варианта событие `task_succeeded {kind, asset_id, variant_id}`; `plans._keyframe_weights(conn)` — O12 пишет `task.weights_sha256` кадра (NULL, пока диск не проверен); CLI `worker` запускает `InventoryLoop`.
+- Produces: `Probe.missing: NotRequired[list[str]]`; `ComfyExecutor.probe` проверяет и `LoraLoaderModelOnly` + `loras/<name>`, когда в `values` есть `lora`; воркер: `missing` → `failed` «модель <template> не установлена на alex-neuro: …» без ожидания, узлы пробы → `inventory.record_nodes`; `ImageKind.spec`: каталог по виду проекта (R-S2b-8); ред. 2 (решение координатора по Codex №1) — `ImageKind.before_submit(conn, task) -> str | None`: воркер зовёт его **после** `gate.acquire()` и готовности движка, перед `submitting`/`submit`; отпечаток считается по файлам на диске сейчас (`inventory.fingerprint_on_disk(conn, template, profile)` — размер+mtime против кэша, изменённый файл перечитывается), а не по сохранённому инвентарю; расхождение → `failed` «веса <template> изменились после постановки (<план> → <сейчас>) — постройте план заново»; задача с `weights_sha256 = NULL` не сверяется; `ImageKind.finish`: `estimates.record(..., profile=)`, у варианта событие `task_succeeded {kind, asset_id, variant_id}`; `plans._keyframe_weights(conn)` — O12 пишет `task.weights_sha256` кадра (NULL, пока диск не проверен); CLI `worker` запускает `InventoryLoop`.
 
 - [ ] **Step 1: Написать падающие тесты**
 
@@ -5065,21 +5380,42 @@ def test_qwen_runs_with_its_profile_and_is_estimated_by_it(rig):
         ("qwen-image-t2i", "fast", 4), ("qwen-image-t2i", "full", 50)]
 
 
-def test_weights_swapped_after_the_plan_fail_the_task_before_it_is_sent(rig):
-    """Mutation 18 (Б6): the worker compares `task.weights_sha256` with the disk now."""
-    pid = picture(rig, count=1)
-    _, b = batch(rig, pid)
-    unet = rig.root / "diffusion_models" / "krea2_turbo_int8_convrot.safetensors"
-    unet.write_bytes(unet.read_bytes()[:-1] + b"#")
-    os.utime(unet, ns=(2, 2))
-    check_inventory(rig.conn, rig.root)
-    rig.drain()
-    task = rig.task(b["variants"][0]["task_id"])
-    planned = rig.conn.execute("SELECT weights_sha256 FROM task").fetchone()[0]
-    assert (task["status"], task["error"]) == (
-        "failed", f"входы задачи не собрались: веса krea2-t2i изменились после постановки "
-                  f"({planned[:12]} → нет) — постройте план заново")
-    assert rig.comfy.prompts == []
+def test_weights_swapped_while_the_task_waits_for_the_card_never_reach_comfyui(tmp_path,
+                                                                             monkeypatch):
+    """Mutation 18 (Б6), ред. 2 (Codex №1): the file is swapped while the task waits for the GPU,
+    the stored inventory still says «as planned» — the check right before sending reads the disk
+    (size and mtime, then sha256) and fails the task; no graph goes to ComfyUI."""
+    wait = {"ok": True, "state": "wait", "engine": "comfy-studio", "reason": "GPU занята"}
+    from _studio_rig import READY
+    rig = Rig(tmp_path, comfy_kwargs={"models": ALL_MODELS}, acquire=(wait, READY))
+    try:
+        root = weights_on_disk(tmp_path, monkeypatch)
+        check_inventory(rig.conn, root)
+        pid = picture(rig, count=1)
+        _, b = batch(rig, pid)
+        unet = root / "diffusion_models" / "krea2_turbo_int8_convrot.safetensors"
+        swapped = unet.read_bytes()[:-1] + b"#"
+        real_sleep = rig.worker.sleep
+
+        def swap_during_the_wait(seconds):
+            if unet.read_bytes() != swapped:
+                unet.write_bytes(swapped)
+                os.utime(unet, ns=(2, 2))
+            real_sleep(seconds)
+        rig.worker.sleep = swap_during_the_wait
+        rig.drain()
+        planned = rig.conn.execute("SELECT weights_sha256 FROM task").fetchone()[0]
+        now = inventory.fingerprint_on_disk(rig.conn, "krea2-t2i", None)
+        task = rig.task(b["variants"][0]["task_id"])
+        assert (task["status"], task["error"]) == (
+            "failed", f"веса krea2-t2i изменились после постановки ({planned[:12]} → {now[:12]}) "
+                      f"— постройте план заново")
+        assert now != planned
+        assert inventory.entry(inventory.current(rig.conn), "krea2-t2i", None)[
+            "weights_sha256"] == planned                  # the stored inventory did not see it
+        assert rig.comfy.prompts == []
+    finally:
+        rig.close()
 
 
 def test_a_keyframe_without_a_fingerprint_runs_as_in_s2(tmp_path, monkeypatch):
@@ -5158,10 +5494,10 @@ Apply to `tests/test_studio_executor_contract.py` (`git apply`; контекст
 
 ```diff
 diff --git a/tests/test_studio_executor_contract.py b/tests/test_studio_executor_contract.py
-index 8f31065..ee65219 100644
+index 3e34e8e9..bbec8f86 100644
 --- a/tests/test_studio_executor_contract.py
 +++ b/tests/test_studio_executor_contract.py
-@@ -236,14 +236,17 @@ def test_probe_names_what_is_missing(fake, tmp_path):
+@@ -237,14 +237,17 @@ def test_probe_names_what_is_missing(fake, tmp_path):
      executor = _fake_executor(fake, tmp_path)
      spec = _spec(tmp_path, "h3-ref2va")
      fake.classes.remove("MiniMaxH3ReferenceToVideo")
@@ -5183,15 +5519,44 @@ index 8f31065..ee65219 100644
      assert executor.probe(spec) == {"alive": True, "ready": False,
 ```
 
-- [ ] **Step 2: Увидеть красным** — `At index 0 diff: ('k_…', {'asset_id': 'a_…', 'kind': 'image'}) != ('k_…', {'kind': 'image', 'asset_id': 'a_…', 'variant_id': 'v_…'})`.
+- [ ] **Step 2: Увидеть красным** — `At index 0 diff: ('k_…', {'asset_id': 'a_…', 'kind': 'image'}) != ('k_…', {'kind': 'image', 'asset_id': 'a_…', 'variant_id': 'v_…'})`. Тест подмены весов (ред. 2) подменяет файл **во время ожидания карты** (диспетчер отвечает `wait`, затем `ready`; подмена — в `worker.sleep` первого ожидания) и не трогает сохранённый инвентарь — окно, которое закрывает проверка перед отправкой.
 
 - [ ] **Step 3: Реализовать**
+
+Apply to `h3_48gb/studio/inventory.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/h3_48gb/studio/inventory.py b/h3_48gb/studio/inventory.py
+index d25542e7..1fc7dc46 100644
+--- a/h3_48gb/studio/inventory.py
++++ b/h3_48gb/studio/inventory.py
+@@ -82,6 +82,19 @@ def _check_files(conn, roots: list[Path], files: list[dict]) -> str | None:
+     return None
+ 
+ 
++def fingerprint_on_disk(conn: sqlite3.Connection, template: str, profile: str | None) -> str | None:
++    """Ред. 2: the weights fingerprint of what lies on disk NOW (the files' own sha256, through
++    the size+mtime cache); None when a file is missing."""
++    roots = model_roots(conn)
++    files = []
++    for f in image_models.get(template).model_files(profile):
++        path = _locate(roots, f["folder"], f["name"])
++        if path is None:
++            return None
++        files.append({"folder": f["folder"], "name": f["name"], "sha256": file_sha256(conn, path)})
++    return weights_sha256(files)
++
++
+ def scan(conn: sqlite3.Connection, roots: list[Path]) -> dict:
+     """One pass over every picture card; writes the setting and, on a change, the event."""
+     state: dict = {"templates": {}}
+```
 
 Apply to `h3_48gb/studio/executors/base.py` (`git apply`; контекст — код после предыдущих задач):
 
 ```diff
 diff --git a/h3_48gb/studio/executors/base.py b/h3_48gb/studio/executors/base.py
-index 8efc3ba..bc34716 100644
+index 8efc3bae..bc347165 100644
 --- a/h3_48gb/studio/executors/base.py
 +++ b/h3_48gb/studio/executors/base.py
 @@ -4,7 +4,7 @@ the terms below. The contract test checks every capability an adapter declares,
@@ -5220,10 +5585,10 @@ Apply to `h3_48gb/studio/executors/comfy.py` (`git apply`; контекст — 
 
 ```diff
 diff --git a/h3_48gb/studio/executors/comfy.py b/h3_48gb/studio/executors/comfy.py
-index cf023ed..03336bf 100644
+index 0ed915e0..dd6d0ed0 100644
 --- a/h3_48gb/studio/executors/comfy.py
 +++ b/h3_48gb/studio/executors/comfy.py
-@@ -56,17 +56,23 @@ class ComfyExecutor:
+@@ -65,17 +65,23 @@ class ComfyExecutor:
          except ComfyError as err:
              return {"alive": False, "ready": False, "detail": str(err)}
          template = templates.load(spec.template)
@@ -5256,7 +5621,7 @@ Apply to `h3_48gb/studio/worker.py` (`git apply`; контекст — код п
 
 ```diff
 diff --git a/h3_48gb/studio/worker.py b/h3_48gb/studio/worker.py
-index 47435ce..d1fefdd 100644
+index 2974b494..5037c24f 100644
 --- a/h3_48gb/studio/worker.py
 +++ b/h3_48gb/studio/worker.py
 @@ -13,7 +13,7 @@ import threading
@@ -5282,43 +5647,37 @@ index 47435ce..d1fefdd 100644
              if probe["ready"]:
                  break
              if self.clock() > deadline:
+@@ -154,6 +161,11 @@ class Worker:
+             if self._wait(task_id, f"ждём ComfyUI: {probe['detail']}", self.probe_s):
+                 self._cancelled(task_id, None)
+                 return
++        check = getattr(kind, "before_submit", None)       # S2b: weights on disk, Б6 (ред. 2)
++        problem = check(self.conn, self._row(task_id)) if check else None
++        if problem:
++            self._fail(task_id, problem)
++            return
+         self._set(task_id, status="submitting", wait_reason=None,
+                   submit_attempt_at=self.clock())
+         version = self.executor.engine_version()
 ```
 
 Apply to `h3_48gb/studio/images.py` (`git apply`; контекст — код после предыдущих задач):
 
 ```diff
 diff --git a/h3_48gb/studio/images.py b/h3_48gb/studio/images.py
-index 03cd11c..dc05585 100644
+index 5e9dd7d6..e5f743ee 100644
 --- a/h3_48gb/studio/images.py
 +++ b/h3_48gb/studio/images.py
-@@ -13,7 +13,7 @@ from PIL import Image
- from h3_48gb.studio import db, estimates, events, ids, image_models, inventory, templates
- from h3_48gb.studio import files as asset_files
- from h3_48gb.studio.errors import StudioError
--from h3_48gb.studio.executors.base import TaskSpec
-+from h3_48gb.studio.executors.base import ExecutorError, TaskSpec
- 
- 
- class VerifyError(Exception):
-@@ -34,15 +34,28 @@ class ImageKind:
+@@ -34,15 +34,36 @@ class ImageKind:
          """The payload is flat (spec §19.3). The values are the template card's inputs found in it
          and not null (revision 4, §14 seam 3): the keyframe gives prompt, seed, steps, width,
          height as before; S2b's batches add cfg, negative, lora without a change here, and a
 -        `lora: null` never reaches the substituter (no LoRA node, `templates.build_payload`)."""
 +        `lora: null` never reaches the substituter (no LoRA node, `templates.build_payload`).
-+        S2b: a picture of a picture project lands in `images/`, and before it is sent its weights
-+        fingerprint must still be the one it was planned with (Б6) — only when the task has one
-+        (a keyframe queued before S2b or while the disk was unchecked has NULL: S2 behaviour)."""
++        S2b: a picture of a picture project lands in `images/` (its weights are checked later, in
++        `before_submit`)."""
          payload = json.loads(task["payload_json"])
          inputs = templates.load(payload["template"]).card["inputs"]
-+        if task["weights_sha256"] is not None and task["engine_ref"] is None:
-+            entry = inventory.entry(inventory.current(conn), payload["template"],
-+                                    payload.get("profile"))
-+            now = entry["weights_sha256"] if entry else None
-+            if now != task["weights_sha256"]:
-+                raise ExecutorError(f"веса {payload['template']} изменились после постановки "
-+                                    f"({task['weights_sha256'][:12]} → {(now or 'нет')[:12]}) — "
-+                                    f"постройте план заново")
 +        project = conn.execute("SELECT kind FROM project WHERE id = ?",
 +                               (task["project_id"],)).fetchone()
 +        folder = "images" if project is not None and project["kind"] == "image" else "keyframes"
@@ -5329,10 +5688,27 @@ index 03cd11c..dc05585 100644
 -                        dest_dir=self.home / "projects" / task["project_id"] / "keyframes"
 -                        / task["id"])
 +                        dest_dir=self.home / "projects" / task["project_id"] / folder / task["id"])
++
++    def before_submit(self, conn: sqlite3.Connection, task: sqlite3.Row) -> str | None:
++        """Ред. 2 (решение координатора по Codex №1): right before the graph goes to ComfyUI —
++        after the card is ours and the engine is ready — the weight files ON DISK must still give
++        the fingerprint the task was planned with (Б6). Not the stored inventory: a swap while the
++        task waited for the GPU would slip through it. Size and mtime against the cache, a changed
++        file is re-hashed. A task with NULL (a keyframe of S2, or planned while unchecked) is not
++        compared. Returns the error of the task, or None."""
++        if task["weights_sha256"] is None:
++            return None
++        payload = json.loads(task["payload_json"])
++        now = inventory.fingerprint_on_disk(conn, payload["template"], payload.get("profile"))
++        if now == task["weights_sha256"]:
++            return None
++        return (f"веса {payload['template']} изменились после постановки "
++                f"({task['weights_sha256'][:12]} → {(now or 'нет файла')[:12]}) — постройте план "
++                f"заново")
  
      def on_running(self, conn, task) -> None:
          pass
-@@ -77,9 +90,13 @@ class ImageKind:
+@@ -77,9 +98,13 @@ class ImageKind:
              (asset_id, asset_files.stored_path(self.home, path),
               hashlib.sha256(data).hexdigest(), len(data), task["id"], ids.now_iso()))
          conn.execute("UPDATE task SET result_asset_id = ? WHERE id = ?", (asset_id, task["id"]))
@@ -5353,10 +5729,10 @@ Apply to `h3_48gb/studio/plans.py` (`git apply`; контекст — код п�
 
 ```diff
 diff --git a/h3_48gb/studio/plans.py b/h3_48gb/studio/plans.py
-index 47cb25a..dd1b8ca 100644
+index bd864546..304e379c 100644
 --- a/h3_48gb/studio/plans.py
 +++ b/h3_48gb/studio/plans.py
-@@ -123,6 +123,13 @@ def plan_image(conn: sqlite3.Connection, project_id: str, *, scene_id: str | Non
+@@ -146,6 +146,13 @@ def plan_image(conn: sqlite3.Connection, project_id: str, *, scene_id: str | Non
  
  # -- O12 ---------------------------------------------------------------------------------------
  
@@ -5370,7 +5746,7 @@ index 47cb25a..dd1b8ca 100644
  def enqueue_image(conn: sqlite3.Connection, project_id: str, plan_id: str, key: str) -> dict:
      """Inside `idempotency.run_once`'s transaction: one task, `queued`, with the pictures'
      priority (§8.4: a picture waits only for the running task, not for the render queue). The
-@@ -135,10 +142,11 @@ def enqueue_image(conn: sqlite3.Connection, project_id: str, plan_id: str, key:
+@@ -161,10 +168,11 @@ def enqueue_image(conn: sqlite3.Connection, project_id: str, plan_id: str, key:
                                      "seed", "steps", "scene_id")}
      conn.execute(
          "INSERT INTO task (id, kind, executor, gpu_scope, payload_json, idempotency_key, status, "
@@ -5391,7 +5767,7 @@ Apply to `h3_48gb/studio/__main__.py` (`git apply`; контекст — код 
 
 ```diff
 diff --git a/h3_48gb/studio/__main__.py b/h3_48gb/studio/__main__.py
-index 0cca45b..214dfd5 100644
+index 0cca45bc..214dfd58 100644
 --- a/h3_48gb/studio/__main__.py
 +++ b/h3_48gb/studio/__main__.py
 @@ -71,6 +71,9 @@ def run_worker(outdir: Path) -> int:
@@ -5412,8 +5788,8 @@ index 0cca45b..214dfd5 100644
 1. (§8.1) `if probe.get("missing"):` → `if False:` → `'ComfyUI не готов за 0.5 с: в ComfyUI нет узлов: LoraLoaderModelOnly' != 'модель qwen-image-t2i не установлена…'`.
 2. (№5) в `ImageKind.spec` подставить `width`↔`height` → граф ≠ литералу.
 3. (№3) `for item in plan["items"][:1]:` в `enqueue_batch` → `assert 1 == 3`.
-4. (№18) сверку весов → `if False:` → `assert ('succeeded', None) == ('failed', 'в… план заново')`.
-5. (№24) условие без `task["weights_sha256"] is not None` → `TypeError: 'NoneType' object is not subscriptable` в `test_a_keyframe_without_a_fingerprint_runs_as_in_s2`.
+4. (№18) в воркере `problem = None` вместо вызова `before_submit` → `assert ('succeeded', None) == ('failed', 'в… план заново')` в `test_weights_swapped_while_the_task_waits_for_the_card_never_reach_comfyui`.
+5. (№24) в `before_submit` убрать возврат при `weights_sha256 is None` → `TypeError: 'NoneType' object is not subscriptable` в `test_a_keyframe_without_a_fingerprint_runs_as_in_s2`.
 6. (№2) исключить `seed` из `values` → задачи падают, `assert [] == [{'1': …`.
 7. (№14а) исключить `lora` из `values` → граф Qwen «Быстро» без узла `lora` ≠ литералу.
 
@@ -5435,7 +5811,7 @@ Apply to `tests/_studio_rig.py` (`git apply`; контекст — код пос
 
 ```diff
 diff --git a/tests/_studio_rig.py b/tests/_studio_rig.py
-index 90e3d73..ff76248 100644
+index 90e3d737..ff762482 100644
 --- a/tests/_studio_rig.py
 +++ b/tests/_studio_rig.py
 @@ -24,12 +24,12 @@ READY = {"ok": True, "state": "ready", "engine": "comfy-studio"}
@@ -5546,13 +5922,17 @@ def test_idea_to_picture_to_repeat_to_scene_1(rig):
                                             "asset_id": first["result_asset_id"], "auto": False}
     shown = api(rig, "GET", f"/projects/{video['id']}")["scenes"][0]["source_frame"]
     assert shown["asset_id"] == first["result_asset_id"]
+    # the journal by kinds and order (§19.11) — the kinds this path is about; the worker's own
+    # progress events (task_waiting/progress/running, S2's `task_status`) are S2's to pin
+    path_kinds = {"inventory_checked", "project_created", "image_draft_changed",
+                  "image_batch_queued", "task_queued", "task_succeeded", "image_variant_kept",
+                  "scenes_replaced", "scene_updated"}
     kinds = [r[0] for r in rig.conn.execute("SELECT kind FROM event ORDER BY seq")]
-    assert [k for k in kinds if k not in ("task_waiting", "task_progress")] == [
+    assert [k for k in kinds if k in path_kinds] == [
         "inventory_checked", "project_created", "image_draft_changed", "image_draft_changed",
-        "image_batch_queued", "task_queued", "task_queued",
-        "task_running", "task_succeeded", "task_running", "task_succeeded",
+        "image_batch_queued", "task_queued", "task_queued", "task_succeeded", "task_succeeded",
         "image_variant_kept", "image_draft_changed",
-        "image_batch_queued", "task_queued", "task_running", "task_succeeded",
+        "image_batch_queued", "task_queued", "task_succeeded",
         "project_created", "scenes_replaced", "scene_updated"]
 
 
@@ -5617,7 +5997,7 @@ Apply to `tests/test_studio_scenes.py` (`git apply`; контекст — код
 
 ```diff
 diff --git a/tests/test_studio_scenes.py b/tests/test_studio_scenes.py
-index 6aa9de0..13ff178 100644
+index 6aa9de0d..13ff1789 100644
 --- a/tests/test_studio_scenes.py
 +++ b/tests/test_studio_scenes.py
 @@ -274,11 +274,17 @@ def test_deleting_the_middle_scene_rechains_the_next_one_to_the_previous(client)
@@ -5651,7 +6031,7 @@ Apply to `h3_48gb/studio/ops.py` (`git apply`; контекст — код по�
 
 ```diff
 diff --git a/h3_48gb/studio/ops.py b/h3_48gb/studio/ops.py
-index 2efccd8..0135b69 100644
+index 2efccd85..0135b69c 100644
 --- a/h3_48gb/studio/ops.py
 +++ b/h3_48gb/studio/ops.py
 @@ -294,6 +294,24 @@ def _resolve_source(conn: sqlite3.Connection, source: dict, *, prev_id: str | No
@@ -5690,7 +6070,7 @@ index 2efccd8..0135b69 100644
          if changes.get("refs") is not None:
 ```
 
-- [ ] **Step 4: Зелёный** — 3 passed; полный набор: `test_studio_*.py test_comfy_api.py test_gpu_dispatcher.py test_ltx_upscale.py` — на копии 714 passed, 2 skipped; весь репо — 0 failed.
+- [ ] **Step 4: Зелёный** — 3 passed; полный набор — 0 failed. Журнал пути сравнивается по видам, о которых путь (ред. 2): события прогресса воркера (`task_waiting`, `task_progress`, `task_running` и `task_status` из фикса S2 задачи 8) — забота тестов S2.
 
 - [ ] **Step 5: Мутации**
 1. (№19) `if not frame_shape.matches(...)` → `if False:` → `assert (200, {'scene… == (409, …)`.
@@ -5699,7 +6079,744 @@ index 2efccd8..0135b69 100644
 
 - [ ] **Step 6: Коммит** — `feat(studio): O8 не берёт кадр чужой формы (L7d 2 %, до записи); сквозной путь режима «Картинка» (S2b задача 11)`.
 
-### Task 12: Мастер — эталон `#image` и экран «Картинка» на десктопе (§19.1, §19.2)
+### Task 12: Krea 2 и Z-Image рядом с Qwen-LLM shared32; `/free` и возврат LLM после тяжёлой партии (решение владельца 23.10, LLM-PLUS-IMAGE §7, §9.6)
+
+Ред. 2, решение координатора 4 (вместо прежнего R-S2b-20): в режиме «Картинка» владелец держит Qwen-LLM рядом — замер: shared32 + Krea 2/Z-Image помещаются (пик ≤ 61,8 ГБ, запас ≥ 3 ГБ). Qwen-Image и H3 по-прежнему ждут выгрузки LLM. Владелец разрешил трогать диспетчер; старые `h3`/`ltx` и клиент панели — без изменений (их тесты не правятся).
+
+**Files:**
+- Modify: `tools/gpu-dispatcher/dispatcher.py`, `h3_48gb/engines/dispatcher_client.py`, `h3_48gb/engines/comfy_api.py`, `h3_48gb/studio/gpu.py`, `h3_48gb/studio/executors/comfy.py`, `h3_48gb/studio/worker.py`, `h3_48gb/studio/images.py`, `h3_48gb/studio/settings.py`
+- Modify (тесты): `tests/_fake_comfy_studio.py` (`POST /free`, `.frees`), `tests/_fake_dispatcher.py` (`qwen=` для `/status`), `tests/_studio_rig.py` (`Rig(..., qwen=None)`)
+- Test: `tests/test_studio_image_llm.py` (новый); дописанные тесты и один литерал в `tests/test_gpu_dispatcher.py`
+
+**Interfaces:**
+- Consumes: карточки (`limits.coexists_with_llm`, задача 1), `ImageKind` (задача 10), `queued_in_order` (S2).
+- Produces:
+  - Диспетчер: `EngineSpec.coexists_with_qwen: tuple = ()` (у `comfy-studio` — `("shared32",)`, у `h3`/`ltx` — `()`); константы `QWEN_INFO`, `QWEN_PROFILE_BY_CONTEXT = {32768: "shared32"}`, `QWEN_MARKERS = ("sglang", "--port 8000")`, `QWEN_RESTORE_PROFILE = "shared32"`; `Host.qwen_profile() -> str | None` (контекст из `GET :8000/get_server_info`); `Dispatcher.acquire(engine, client, beside_qwen=None)`: при поднятом Qwen и переданном `beside_qwen` задача идёт рядом только если текущий профиль есть и в `beside_qwen`, и в `coexists_with_qwen` (процессы Qwen по `QWEN_MARKERS` не считаются чужими); иначе `wait_qwen` — **даже при уже готовом движке**; без `beside_qwen` — поведение до S2b; `Dispatcher.qwen_restore(keep=())` — движки из `keep`, сосуществующие с `QWEN_RESTORE_PROFILE`, остаются; HTTP: `POST /acquire {…, beside_qwen: [str]}` (не список — 400 `bad_beside_qwen`), `POST /qwen/restore {keep: [str]}`.
+  - Студия: `DispatcherClient.acquire(engine, beside_qwen=None)` (ключ в теле только когда не `None` — тело S2 прежнее), `DispatcherClient.qwen_restore(keep=None)`; `DispatcherGate.acquire(wait, beside_qwen=None)`, `DispatcherGate.qwen_back()` (`qwen_restore(keep=[engine])`, если `/status` говорит `qwen.unloaded_by_us`); `LocalGate.acquire(wait, beside_qwen=None)`, `LocalGate.qwen_back()` — ничего; `ComfyApi.free()` (`POST /free {"unload_models": true, "free_memory": true}`), `ComfyExecutor.free() -> bool`; `ImageKind.beside_qwen(task) -> list[str]` (из карточки), `ImageKind.is_heavy(task)` (список пуст); `Worker._after_heavy(task)`: тяжёлая задача, дошедшая до движка, без тяжёлой задачи следом → `executor.free()`, и при `settings llm.restore_after_heavy == "1"` → `gate.qwen_back()`; `settings.HIDDEN["llm.restore_after_heavy"] = "0"`.
+  - Стык S3: `RenderKind` (H3) объявляет `beside_qwen(task) -> []` и `is_heavy(task) -> True` — автор плана S3 добавляет это в задачу 12 S2–S3; без них рендер ведёт себя как до S2b (ждёт Qwen только при старте движка).
+
+- [ ] **Step 1: Написать падающие тесты**
+
+Create `tests/test_studio_image_llm.py`:
+
+```python
+"""Slice S2b, the picture models beside Qwen-LLM (owner 23.10, LLM-PLUS-IMAGE §7, §9.6): the
+worker tells the dispatcher which LLM profile a task fits beside (from the card); after a heavy
+batch (Qwen-Image) it frees ComfyUI once and, if asked to, brings the LLM back beside it."""
+from __future__ import annotations
+
+import pytest
+
+from _fake_comfy_studio import ALL_MODELS
+from _studio_images import EN, check_inventory, weights_on_disk
+from _studio_rig import Rig
+from h3_48gb.studio import settings
+
+
+@pytest.fixture
+def make_rig(tmp_path, monkeypatch):
+    made = []
+
+    def make(**dispatcher):
+        rig = Rig(tmp_path, comfy_kwargs={"models": ALL_MODELS}, **dispatcher)
+        check_inventory(rig.conn, weights_on_disk(tmp_path, monkeypatch))
+        made.append(rig)
+        return rig
+    yield make
+    for rig in made:
+        rig.close()
+
+
+def batch(rig, template, count):
+    pid = rig.client.post("/api/studio/projects",
+                          json={"title": "A", "kind": "image"}).json()["id"]
+    r = rig.client.patch(f"/api/studio/projects/{pid}/image/draft", json={
+        "expected_edit_version": 0, "prompt_en": EN, "template": template, "count": count})
+    assert r.status_code == 200, r.text
+    plan = rig.post(f"/projects/{pid}/plan", {"kind": "image_set"}, key=False)
+    return rig.post(f"/projects/{pid}/image/batches", {"plan_id": plan["plan_id"]},
+                    expect=201)["batch"]
+
+
+def acquires(rig):
+    return [body for method, path, body in rig.dispatcher.calls if path == "/acquire"]
+
+
+def test_the_worker_asks_for_the_card_with_the_cards_llm_profiles(make_rig):
+    rig = make_rig()
+    batch(rig, "krea2-t2i", 1)
+    batch(rig, "qwen-image-t2i", 1)
+    rig.drain()
+    assert acquires(rig) == [
+        {"engine": "comfy-studio", "client": "studio-worker", "beside_qwen": ["shared32"]},
+        {"engine": "comfy-studio", "client": "studio-worker", "beside_qwen": []}]
+
+
+@pytest.mark.parametrize("restore,calls", [("1", [("/qwen/restore", {"keep": ["comfy-studio"]})]),
+                                           ("0", [])])
+def test_after_a_heavy_batch_comfyui_is_freed_once_and_the_llm_may_come_back(make_rig, restore,
+                                                                            calls):
+    rig = make_rig(qwen={"running": False, "unloaded_by_us": True})
+    settings.put(rig.conn, "llm.restore_after_heavy", restore)
+    batch(rig, "qwen-image-t2i", 2)
+    rig.drain()
+    assert rig.comfy.frees == [{"unload_models": True, "free_memory": True}]
+    assert [(path, body) for method, path, body in rig.dispatcher.calls
+            if path == "/qwen/restore"] == calls
+
+
+def test_a_picture_that_lives_beside_the_llm_frees_nothing(make_rig):
+    rig = make_rig(qwen={"running": False, "unloaded_by_us": True})
+    settings.put(rig.conn, "llm.restore_after_heavy", "1")
+    batch(rig, "zimage-turbo-t2i", 2)
+    rig.drain()
+    assert (rig.comfy.frees, [c for c in rig.dispatcher.calls if c[1] == "/qwen/restore"]) == (
+        [], [])
+```
+
+Тесты диспетчера (дописаны в конец файла) и литерал S2 (EngineSpec студии целиком, R-S2b-20):
+
+Apply to `tests/test_gpu_dispatcher.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/tests/test_gpu_dispatcher.py b/tests/test_gpu_dispatcher.py
+index 507b221c..16be350b 100644
+--- a/tests/test_gpu_dispatcher.py
++++ b/tests/test_gpu_dispatcher.py
+@@ -750,7 +750,7 @@ def test_the_studio_engine_is_exactly_the_spec():
+              "--output-directory", "/home/alex/Outputs/comfy-h3", "--listen", "127.0.0.1"),
+         cwd=comfy, ready_url=STUDIO_READY, port=8189, markers=("main.py", "--port 8189"),
+         log_dir=comfy / "logs", log_prefix="comfy-studio", start_timeout=600.0,
+-        label="ComfyUI студии")
++        label="ComfyUI студии", coexists_with_qwen=("shared32",))    # S2b, owner 23.10
+ 
+ 
+ def test_acquire_comfy_studio_starts_the_measured_command(tmp_path, host):
+@@ -827,3 +827,128 @@ def test_http_unknown_engine_names_the_three(tmp_path, host):
+     finally:
+         server.shutdown()
+         server.server_close()
++
++
++
++# -- studio S2b: the picture models beside Qwen-LLM shared32 (owner 23.10, LLM-PLUS-IMAGE §7) ----
++
++QWEN_CMD = ("/usr/bin/python3 -m sglang.launch_server --model-path /models/qwen38 --port 8000 "
++            "--context-length 32768")
++
++
++def _qwen_up(host, profile="shared32"):
++    host.ok_urls.add(gd.QWEN_HEALTH)
++    host.apps = [{"pid": 900, "name": "python3", "memory_mb": 40541}]
++    host.cmdlines[900] = QWEN_CMD
++    host.pgids[900] = 900
++    host.qwen_profile = lambda: profile
++
++
++def test_a_picture_that_fits_beside_shared32_starts_the_studio_engine(tmp_path, host):
++    _qwen_up(host)
++    answer = _dispatcher(tmp_path, host).acquire("comfy-studio", "studio-worker",
++                                                 beside_qwen=["shared32"])
++    assert answer == {"ok": True, "state": "starting", "engine": "comfy-studio",
++                      "log": host.spawned[0][4]}
++    assert (host.killed, host.qwen_calls) == ([], [])
++
++
++@pytest.mark.parametrize("beside,profile", [([], "shared32"), (["shared32"], None),
++                                            (["shared32"], "fast")])
++def test_a_heavy_task_or_another_profile_waits_for_qwen_even_with_the_engine_ready(
++        tmp_path, host, beside, profile):
++    """Qwen-Image and H3 (`beside_qwen=[]`) never load next to the LLM; an unknown or another
++    profile of Qwen is not shared32 — the card holds no promise for it."""
++    d = _dispatcher(tmp_path, host)
++    d.acquire("comfy-studio", "studio-worker")
++    host.ok_urls.add("http://127.0.0.1:8189/system_stats")
++    assert d.acquire("comfy-studio", "studio-worker")["state"] == "ready"
++    _qwen_up(host, profile)
++    assert d.acquire("comfy-studio", "studio-worker", beside_qwen=beside) == {
++        "ok": True, "state": "wait_qwen", "engine": "comfy-studio",
++        "reason": "Qwen держит карту", "foreign": []}
++    assert host.killed == []
++
++
++def test_beside_qwen_another_gpu_process_still_blocks(tmp_path, host):
++    _qwen_up(host)
++    host.apps.append({"pid": 777, "name": "comfy-python", "memory_mb": 30000})
++    host.pgids[777] = 777
++    answer = _dispatcher(tmp_path, host).acquire("comfy-studio", "studio-worker",
++                                                 beside_qwen=["shared32"])
++    assert (answer["state"], answer["reason"]) == ("wait",
++                                                   "GPU занята: comfy-python (pid 777, 30000 МБ)")
++
++
++def test_only_the_studio_engine_lives_beside_qwen():
++    specs = gd.engine_specs()
++    assert {n: s.coexists_with_qwen for n, s in specs.items()} == {
++        "h3": (), "ltx": (), "comfy-studio": ("shared32",)}
++
++
++def test_qwen_back_keeps_a_freed_studio_engine_and_stops_the_rest(tmp_path, host):
++    """After a Qwen-Image/H3 batch the worker frees ComfyUI (`/free`) and asks for the LLM back
++    with `keep=["comfy-studio"]`: the studio engine stays, Qwen starts beside it."""
++    d = _dispatcher(tmp_path, host)
++    host.ok_urls.add(gd.QWEN_HEALTH)
++    d.qwen_unload()
++    host.ok_urls.discard(gd.QWEN_HEALTH)
++    d.acquire("comfy-studio", "studio-worker")
++    assert d.qwen_restore(keep=("comfy-studio", "h3")) == (200, {"ok": True, "state": "starting"})
++    assert (host.killed, host.qwen_calls) == ([], ["stop", "start-shared32"])
++    assert list(d.status()["own"]) == ["comfy-studio"]
++
++
++def test_the_http_api_passes_beside_qwen_and_keep(tmp_path, host):
++    d = _dispatcher(tmp_path, host)
++    seen = []
++    d.acquire = lambda engine, client, beside_qwen=None: seen.append(
++        ("acquire", engine, client, beside_qwen)) or {"ok": True, "state": "ready"}
++    d.qwen_restore = lambda keep=(): seen.append(("restore", keep)) or (200, {"ok": True})
++    server = gd.make_server(d, host="127.0.0.1", port=0)
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    base = f"http://127.0.0.1:{server.server_address[1]}"
++
++    def post(path, body):
++        request = urllib.request.Request(base + path, data=json.dumps(body).encode(),
++                                         method="POST")
++        try:
++            with urllib.request.urlopen(request, timeout=5) as r:
++                return r.status, json.loads(r.read())
++        except urllib.error.HTTPError as e:
++            return e.code, json.loads(e.read())
++    try:
++        assert post("/acquire", {"engine": "comfy-studio", "client": "w",
++                                 "beside_qwen": ["shared32"]})[0] == 200
++        assert post("/acquire", {"engine": "comfy-studio", "client": "w"})[0] == 200
++        assert post("/acquire", {"engine": "comfy-studio", "client": "w",
++                                 "beside_qwen": "shared32"}) == (400, {"ok": False, "error": {
++            "code": "bad_beside_qwen", "message": "beside_qwen: список профилей"}})
++        assert post("/qwen/restore", {"keep": ["comfy-studio"]})[0] == 200
++    finally:
++        server.shutdown()
++    assert seen == [("acquire", "comfy-studio", "w", ["shared32"]),
++                    ("acquire", "comfy-studio", "w", None), ("restore", ("comfy-studio",))]
++
++
++def test_the_profile_is_read_from_the_servers_context(monkeypatch):
++    class Answer:
++        status = 200
++
++        def __init__(self, ctx):
++            self.ctx = ctx
++
++        def read(self):
++            return json.dumps({"context_length": self.ctx}).encode()
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *exc):
++            return False
++    for ctx, profile in ((32768, "shared32"), (262144, None)):
++        monkeypatch.setattr(gd.urllib.request, "urlopen", lambda url, timeout, c=ctx: Answer(c))
++        assert gd.Host().qwen_profile() == profile
++    monkeypatch.setattr(gd.urllib.request, "urlopen",
++                        lambda url, timeout: (_ for _ in ()).throw(OSError("down")))
++    assert gd.Host().qwen_profile() is None
+```
+
+- [ ] **Step 2: Увидеть красным** — `{'engine': 'comfy-studio', 'client': 'studio-worker'} != {…, 'beside_qwen': ['shared32']}`; `KeyError: "unknown studio setting 'llm.restore_after_heavy'"`; `TypeError: EngineSpec.__init__() got an unexpected keyword argument 'coexists_with_qwen'`.
+
+- [ ] **Step 3: Реализовать**
+
+Apply to `tools/gpu-dispatcher/dispatcher.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/tools/gpu-dispatcher/dispatcher.py b/tools/gpu-dispatcher/dispatcher.py
+index 5d0b2c19..49602508 100644
+--- a/tools/gpu-dispatcher/dispatcher.py
++++ b/tools/gpu-dispatcher/dispatcher.py
+@@ -44,6 +44,15 @@ SERVER_OUTPUTS = OUTPUTS / "h3-bench" / "server-outputs"
+ STATE_PATH = Path(os.environ.get(
+     "H3_DISPATCHER_STATE", str(Path.home() / ".local/state/h3-gpu-dispatcher/state.json")))
+ QWEN_HEALTH = "http://127.0.0.1:8000/health"
++#: Studio S2b (owner 23.10, LLM-PLUS-IMAGE §7): which `qwen.sh` profile runs, told by the context
++#: the sglang server reports; only a profile named here can share the card with an engine.
++QWEN_INFO = "http://127.0.0.1:8000/get_server_info"
++QWEN_PROFILE_BY_CONTEXT = {32768: "shared32"}
++#: What the Qwen-LLM server's GPU processes look like in /proc/<pid>/cmdline (the container's
++#: processes are seen from the host): never "foreign" while an engine shares the card with it.
++QWEN_MARKERS = ("sglang", "--port 8000")
++#: The profile `qwen.sh start-shared32` (Host.start_qwen) brings back.
++QWEN_RESTORE_PROFILE = "shared32"
+ STOP_GRACE_SECONDS = 120.0
+ PROC = Path("/proc")
+ 
+@@ -62,6 +71,9 @@ class EngineSpec:
+     start_timeout: float = 600.0
+     variant: str | None = None
+     label: str = ""
++    #: Qwen-LLM profiles this engine may run beside — and only for a task whose client says it
++    #: fits (`beside_qwen` of /acquire, from the studio's template card). Empty: Qwen waits.
++    coexists_with_qwen: tuple = ()
+ 
+ 
+ def engine_specs() -> dict[str, EngineSpec]:
+@@ -92,7 +104,8 @@ def engine_specs() -> dict[str, EngineSpec]:
+                  "--output-directory", str(OUTPUTS / "comfy-h3"), "--listen", "127.0.0.1"),
+             cwd=COMFY_H3, ready_url="http://127.0.0.1:8189/system_stats", port=8189,
+             markers=("main.py", "--port 8189"), log_dir=COMFY_H3 / "logs",
+-            log_prefix="comfy-studio", start_timeout=600.0, label="ComfyUI студии"),
++            log_prefix="comfy-studio", start_timeout=600.0, label="ComfyUI студии",
++            coexists_with_qwen=("shared32",)),
+     }
+ 
+ 
+@@ -169,6 +182,15 @@ class Host:
+         return parse_gpu_stats(self._run("nvidia-smi", "--query-gpu=temperature.gpu,memory.used,"
+                                          "memory.total", "--format=csv,noheader,nounits"))
+ 
++    def qwen_profile(self) -> str | None:
++        """The `qwen.sh` profile of the running Qwen-LLM by its context; None if unknown."""
++        try:
++            with urllib.request.urlopen(QWEN_INFO, timeout=3) as response:
++                info = json.loads(response.read())
++        except Exception:  # noqa: BLE001 -- not answering is "unknown profile"
++            return None
++        return QWEN_PROFILE_BY_CONTEXT.get(info.get("context_length"))
++
+     def url_ok(self, url: str) -> bool:
+         try:
+             with urllib.request.urlopen(url, timeout=3) as response:
+@@ -425,9 +447,21 @@ class Dispatcher:
+             answer["gpu_error"] = "; ".join(errors)
+         return answer
+ 
+-    def acquire(self, engine: str, client: str) -> dict:
++    def acquire(self, engine: str, client: str, beside_qwen: list | None = None) -> dict:
++        """`beside_qwen` (studio S2b): the Qwen-LLM profiles the client's task fits beside. Given
++        and Qwen is up: the task runs beside it only if the running profile is in both this list
++        and the engine's `coexists_with_qwen` — otherwise `wait_qwen`, even with our engine ready
++        (a heavy model must not load next to the LLM). Not given: the behaviour before S2b."""
+         with self._ops:
+             spec = self.specs[engine]
++            beside = False
++            if beside_qwen is not None and self.host.url_ok(QWEN_HEALTH):
++                profile = self.host.qwen_profile()
++                if profile is None or profile not in spec.coexists_with_qwen \
++                        or profile not in beside_qwen:
++                    return {"ok": True, "state": "wait_qwen", "engine": engine,
++                            "reason": "Qwen держит карту", "foreign": []}
++                beside = True
+             state = self._snapshot()
+             record = state["engines"].get(engine)
+             if record and not self._alive(engine, record):
+@@ -470,7 +504,10 @@ class Dispatcher:
+             except HostError as exc:
+                 return {"ok": True, "state": "wait", "engine": engine,
+                         "reason": f"nvidia-smi недоступен: {exc}", "foreign": []}
+-            if self.host.url_ok(QWEN_HEALTH):
++            if beside:
++                foreign = [a for a in foreign if not all(
++                    m in (self.host.cmdline(a["pid"]) or "") for m in QWEN_MARKERS)]
++            elif self.host.url_ok(QWEN_HEALTH):
+                 return {"ok": True, "state": "wait_qwen", "engine": engine,
+                         "reason": "Qwen держит карту", "foreign": foreign}
+             if foreign:
+@@ -519,7 +556,9 @@ class Dispatcher:
+                         seconds=round(self.host.monotonic() - began, 1))
+             return 200, {"ok": code == 0, "was_running": True, "exit_code": code}
+ 
+-    def qwen_restore(self) -> tuple[int, dict]:
++    def qwen_restore(self, keep: tuple = ()) -> tuple[int, dict]:
++        """`keep` (studio S2b): own engines that freed their memory (ComfyUI `POST /free`) and
++        may stay — only those whose spec coexists with the profile `qwen.sh` brings back."""
+         with self._ops:
+             if not self._snapshot()["qwen_was_running"]:
+                 return 409, {"ok": False, "error": {"code": "qwen_was_not_running",
+@@ -527,9 +566,18 @@ class Dispatcher:
+             if self.host.url_ok(QWEN_HEALTH):      # someone already brought it back
+                 self._update(lambda st: st.__setitem__("qwen_was_running", False))
+                 return 200, {"ok": True, "state": "already_running"}
+-            self._release_all()
++            kept = [e for e in keep if e in self.specs
++                    and QWEN_RESTORE_PROFILE in self.specs[e].coexists_with_qwen]
++            if kept:
++                state = self._snapshot()
++                for name, record in list(self._own_records(state).items()):
++                    if name not in kept:
++                        self._stop(name, record)
++                self._release_lock_if_idle()
++            else:
++                self._release_all()
+             self.host.start_qwen()
+-            self._event("qwen_restore", None)
++            self._event("qwen_restore", None, kept=kept)
+             self._update(lambda st: st.__setitem__("qwen_was_running", False))
+             return 200, {"ok": True, "state": "starting"}
+ 
+@@ -597,13 +645,22 @@ def make_server(dispatcher: Dispatcher, host: str = "127.0.0.1", port: int = 879
+                     return self._send(400, {"ok": False, "error": {
+                         "code": "unknown_engine",
+                         "message": f"движок {engine!r}: {', '.join(sorted(dispatcher.specs))}"}})
+-                return self._send(200, dispatcher.acquire(engine, client))
++                beside = body.get("beside_qwen")
++                if beside is not None and not (isinstance(beside, list)
++                                               and all(isinstance(p, str) for p in beside)):
++                    return self._send(400, {"ok": False, "error": {
++                        "code": "bad_beside_qwen", "message": "beside_qwen: список профилей"}})
++                if beside is None:            # a client before S2b: the call it always made
++                    return self._send(200, dispatcher.acquire(engine, client))
++                return self._send(200, dispatcher.acquire(engine, client, beside_qwen=beside))
+             if self.path == "/release":
+                 return self._send(200, dispatcher.release(client, body.get("all") is True))
+             if self.path == "/qwen/unload":
+                 return self._send(*dispatcher.qwen_unload())
+             if self.path == "/qwen/restore":
+-                return self._send(*dispatcher.qwen_restore())
++                keep = body.get("keep") or []
++                return self._send(*dispatcher.qwen_restore(tuple(k for k in keep
++                                                                 if isinstance(k, str))))
+             self._send(404, {"ok": False, "error": {"code": "not_found", "message": self.path}})
+ 
+     server = ThreadingHTTPServer((host, port), Handler)
+```
+
+Apply to `h3_48gb/engines/dispatcher_client.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/h3_48gb/engines/dispatcher_client.py b/h3_48gb/engines/dispatcher_client.py
+index 194c88a9..71f335c4 100644
+--- a/h3_48gb/engines/dispatcher_client.py
++++ b/h3_48gb/engines/dispatcher_client.py
+@@ -63,8 +63,13 @@ class DispatcherClient:
+     def status(self) -> dict:
+         return self._ok("GET", "/status", timeout=min(self.timeout, STATUS_TIMEOUT))
+ 
+-    def acquire(self, engine: str) -> dict:
+-        return self._ok("POST", "/acquire", {"engine": engine, "client": self.client})
++    def acquire(self, engine: str, beside_qwen: list[str] | None = None) -> dict:
++        """`beside_qwen` (studio S2b): the Qwen-LLM profiles the task fits beside; not sent when
++        None — the request of S2 and of the old panel."""
++        body = {"engine": engine, "client": self.client}
++        if beside_qwen is not None:
++            body["beside_qwen"] = list(beside_qwen)
++        return self._ok("POST", "/acquire", body)
+ 
+     def release(self, everything: bool = False) -> dict:
+         """Stop this client's engines; `everything=True` only for "Освободить карту"."""
+@@ -73,5 +78,5 @@ class DispatcherClient:
+     def qwen_unload(self) -> tuple[int, dict]:
+         return self._call("POST", "/qwen/unload", {})
+ 
+-    def qwen_restore(self) -> tuple[int, dict]:
+-        return self._call("POST", "/qwen/restore", {})
++    def qwen_restore(self, keep: list[str] | None = None) -> tuple[int, dict]:
++        return self._call("POST", "/qwen/restore", {"keep": list(keep)} if keep else {})
+```
+
+Apply to `h3_48gb/engines/comfy_api.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/h3_48gb/engines/comfy_api.py b/h3_48gb/engines/comfy_api.py
+index a294b17e..d4cacaf0 100644
+--- a/h3_48gb/engines/comfy_api.py
++++ b/h3_48gb/engines/comfy_api.py
+@@ -111,5 +111,11 @@ class ComfyApi:
+         body = json.dumps({"prompt_id": prompt_id}).encode() if prompt_id else b"{}"
+         self._open("POST", "/interrupt", body, {"Content-Type": "application/json"})
+ 
++    def free(self) -> None:
++        """`POST /free {unload_models, free_memory}` — the models leave the card, the process
++        stays (LLM-PLUS-IMAGE §9.6: enough to bring the LLM up beside it; the answer is empty)."""
++        self._open("POST", "/free", json.dumps({"unload_models": True, "free_memory": True})
++                   .encode(), {"Content-Type": "application/json"})
++
+     def delete_queued(self, prompt_ids: list[str]) -> None:
+         self._post_json("/queue", {"delete": list(prompt_ids)})
+```
+
+Apply to `h3_48gb/studio/gpu.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/h3_48gb/studio/gpu.py b/h3_48gb/studio/gpu.py
+index f8a309d1..38d316ef 100644
+--- a/h3_48gb/studio/gpu.py
++++ b/h3_48gb/studio/gpu.py
+@@ -47,11 +47,13 @@ class DispatcherGate:
+         except (DispatcherUnavailable, KeyError, TypeError):
+             return None
+ 
+-    def acquire(self, wait) -> bool:
+-        """True = cancelled while waiting; False = the card is ours and cool."""
++    def acquire(self, wait, beside_qwen: list[str] | None = None) -> bool:
++        """True = cancelled while waiting; False = the card is ours and cool. `beside_qwen` —
++        S2b: the Qwen-LLM profiles the task fits beside (from its card)."""
+         while True:
+             try:
+-                answer = self.client.acquire(self.engine)
++                answer = (self.client.acquire(self.engine) if beside_qwen is None
++                          else self.client.acquire(self.engine, beside_qwen=beside_qwen))
+             except DispatcherUnavailable as exc:
+                 if wait(f"ждём GPU: диспетчер недоступен ({exc})", ACQUIRE_RETRY_SECONDS):
+                     return True
+@@ -84,6 +86,15 @@ class DispatcherGate:
+     def done(self) -> None:
+         """The engine stays up after a task (§8.4); the idle release gives it back."""
+ 
++    def qwen_back(self) -> None:
++        """S2b: after a heavy batch, ComfyUI freed (`/free`) — bring the LLM back and keep our
++        engine (the dispatcher keeps only an engine that coexists with that profile)."""
++        try:
++            if (self.client.status().get("qwen") or {}).get("unloaded_by_us"):
++                self.client.qwen_restore(keep=[self.engine])
++        except DispatcherUnavailable:
++            pass
++
+ 
+ class LocalGate:
+     """`local-mac`: an exclusive flock for the task's duration."""
+@@ -95,7 +106,7 @@ class LocalGate:
+         self.fd: int | None = None
+         self.acquired = threading.Event()
+ 
+-    def acquire(self, wait) -> bool:
++    def acquire(self, wait, beside_qwen: list[str] | None = None) -> bool:
+         if self.fd is not None:      # already ours: a second fd would leak and hold the lock for ever
+             return False
+         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+@@ -116,6 +127,9 @@ class LocalGate:
+             os.close(self.fd)
+             self.fd = None
+ 
++    def qwen_back(self) -> None:
++        """No dispatcher on the Mac."""
++
+ 
+ class IdleRelease:
+     """POST /release (this client's engines only) once the studio has had no task to run for 15
+```
+
+Apply to `h3_48gb/studio/executors/comfy.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/h3_48gb/studio/executors/comfy.py b/h3_48gb/studio/executors/comfy.py
+index dd6d0ed0..9d7323e6 100644
+--- a/h3_48gb/studio/executors/comfy.py
++++ b/h3_48gb/studio/executors/comfy.py
+@@ -264,6 +264,14 @@ class ComfyExecutor:
+         self._forget(ref)
+         return copied
+ 
++    def free(self) -> bool:
++        """S2b: unload the models after a heavy batch; False when ComfyUI did not answer."""
++        try:
++            self.api.free()
++        except ComfyError:
++            return False
++        return True
++
+     def cancel(self, ref: str) -> None:
+         if ref.startswith(FILE_REF):
+             return
+```
+
+Apply to `h3_48gb/studio/worker.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/h3_48gb/studio/worker.py b/h3_48gb/studio/worker.py
+index 5037c24f..274382c5 100644
+--- a/h3_48gb/studio/worker.py
++++ b/h3_48gb/studio/worker.py
+@@ -13,7 +13,7 @@ import threading
+ import time
+ from pathlib import Path
+ 
+-from h3_48gb.studio import db, events, ids, inventory
++from h3_48gb.studio import db, events, ids, inventory, settings
+ from h3_48gb.studio.errors import StudioError
+ from h3_48gb.studio.executors.base import ExecutorError, SubmitUncertain
+ from h3_48gb.studio.gpu import GpuEngineFailed
+@@ -68,8 +68,27 @@ class Worker:
+         if task is None:
+             return False
+         self._execute(task)
++        self._after_heavy(task)
+         return True
+ 
++    def _after_heavy(self, task: sqlite3.Row) -> None:
++        """S2b (owner 23.10, LLM-PLUS-IMAGE §9.6): a heavy model (Qwen-Image; H3 in S3) that ran
++        and has no heavy task right behind it leaves the card — ComfyUI `POST /free`, the process
++        stays — and, when `llm.restore_after_heavy` is «1», the Qwen-LLM unloaded for it comes
++        back beside the studio's engine. A batch of heavy tasks frees once, after the last."""
++        kind = self.kinds[task["kind"]]
++        heavy = getattr(kind, "is_heavy", None)
++        if heavy is None or not heavy(task) or self._row(task["id"])["engine_submitted_at"] is None:
++            return
++        nxt = queued_in_order(self.conn, kinds=tuple(self.kinds),
++                              loaded_template=self.last_template, limit=1)
++        if nxt and getattr(self.kinds[nxt[0]["kind"]], "is_heavy", lambda t: True)(nxt[0]):
++            return
++        if not getattr(self.executor, "free", lambda: False)():
++            return
++        if settings.get(self.conn, "llm.restore_after_heavy") == "1":
++            self.gate.qwen_back()
++
+     def _claim(self) -> sqlite3.Row | None:
+         with db.tx(self.conn):
+             for kind in self.kinds.values():
+@@ -127,7 +146,10 @@ class Worker:
+             self._fail(task["id"], f"входы задачи не собрались: {err}")
+             return
+         try:
+-            cancelled = self.gate.acquire(lambda reason, s: self._wait(task["id"], reason, s))
++            wait = lambda reason, s: self._wait(task["id"], reason, s)    # noqa: E731
++            beside = kind.beside_qwen(task) if hasattr(kind, "beside_qwen") else None
++            cancelled = (self.gate.acquire(wait) if beside is None
++                         else self.gate.acquire(wait, beside_qwen=beside))
+         except GpuEngineFailed as err:
+             self._fail(task["id"], f"движок не поднялся: {err.reason}"
+                        + (f" (лог {err.log})" if err.log else ""))
+```
+
+Apply to `h3_48gb/studio/images.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/h3_48gb/studio/images.py b/h3_48gb/studio/images.py
+index e5f743ee..5b9e9e4a 100644
+--- a/h3_48gb/studio/images.py
++++ b/h3_48gb/studio/images.py
+@@ -48,6 +48,17 @@ class ImageKind:
+                                 if k != "task_id" and payload.get(k) is not None},
+                         dest_dir=self.home / "projects" / task["project_id"] / folder / task["id"])
+ 
++    def beside_qwen(self, task: sqlite3.Row) -> list[str]:
++        """S2b (owner 23.10): the Qwen-LLM profiles this picture's model lives beside — from its
++        card (`limits.coexists_with_llm`: Krea 2 and Z-Image beside shared32, Qwen-Image none).
++        The dispatcher decides with it whether the task waits for the LLM."""
++        template = json.loads(task["payload_json"])["template"]
++        return list(templates.load(template).requires["limits"].get("coexists_with_llm", []))
++
++    def is_heavy(self, task: sqlite3.Row) -> bool:
++        """A model that does not live beside the LLM: after it the worker frees the card."""
++        return not self.beside_qwen(task)
++
+     def before_submit(self, conn: sqlite3.Connection, task: sqlite3.Row) -> str | None:
+         """Ред. 2 (решение координатора по Codex №1): right before the graph goes to ComfyUI —
+         after the card is ours and the engine is ready — the weight files ON DISK must still give
+```
+
+Apply to `h3_48gb/studio/settings.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/h3_48gb/studio/settings.py b/h3_48gb/studio/settings.py
+index 77010afe..2fd38b67 100644
+--- a/h3_48gb/studio/settings.py
++++ b/h3_48gb/studio/settings.py
+@@ -24,6 +24,8 @@ HIDDEN = {
+     "comfy.model_roots": '["/models"]',
+     "comfy.inventory": "",
+     "comfy.nodes": "",
++    #: «1» — after a Qwen-Image/H3 batch bring the Qwen-LLM back (it was unloaded for the batch)
++    "llm.restore_after_heavy": "0",
+ }
+ KNOWN = {**DEFAULTS, **HIDDEN}
+ 
+```
+
+Apply to `tests/_fake_comfy_studio.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/tests/_fake_comfy_studio.py b/tests/_fake_comfy_studio.py
+index d9990534..e9ae4a0a 100644
+--- a/tests/_fake_comfy_studio.py
++++ b/tests/_fake_comfy_studio.py
+@@ -111,6 +111,7 @@ class FakeComfyStudio:
+         #: what the model files the fake «loads» hold: name -> tag (S2b). A picture depends on
+         #: the tags of the files its graph loads, so swapped weights change the pixels.
+         self.weights: dict[str, str] = {}
++        self.frees: list[dict] = []
+         self.upload_bodies: list[bytes] = []
+         self.upload_content_types: list[str] = []
+         self.upload_mimes: dict[str, str] = {}
+@@ -478,6 +479,9 @@ class FakeComfyStudio:
+                     if hit:
+                         fake._released.set()
+                     return self._raw(200, b"", "text/plain")
++                if self.path == "/free":                  # S2b: empty body, like server.py
++                    fake.frees.append(json.loads(body or b"{}"))
++                    return self._raw(200, b"", "text/plain")
+                 if self.path == "/queue":
+                     delete = json.loads(body).get("delete", [])
+                     with fake._lock:
+```
+
+Apply to `tests/_fake_dispatcher.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/tests/_fake_dispatcher.py b/tests/_fake_dispatcher.py
+index 2e47d997..7f650594 100644
+--- a/tests/_fake_dispatcher.py
++++ b/tests/_fake_dispatcher.py
+@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ class FakeDispatcher:
+     def __init__(self, *, acquire=({"ok": True, "state": "ready", "engine": "h3"},),
+                  temps=(44,), own=None, restore_status=200, gpu_null=False,
+-                 on_release=None):
++                 on_release=None, qwen=None):
+         self.headers: list[dict] = []
+         self.calls: list[tuple[str, str, dict]] = []
+         self._acquire = list(acquire)
+@@ -18,6 +18,7 @@ class FakeDispatcher:
+         self.restore_status = restore_status
+         self.gpu_null = gpu_null
+         self.on_release = on_release
++        self.qwen = qwen or {"running": False, "unloaded_by_us": False}   # S2b
+         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
+         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+@@ -38,7 +39,7 @@ class FakeDispatcher:
+                    "memory_total_mb": 65536}
+         return {"ok": True, "own": self.own, "foreign": [], "gpu": gpu,
+                 **({"gpu_error": "nvidia-smi недоступен"} if self.gpu_null else {}),
+-                "qwen": {"running": False, "unloaded_by_us": False},
++                "qwen": dict(self.qwen),
+                 "lock": {"held_by_us": bool(self.own), "path": "/x/generation.lock"},
+                 "server_outputs_bytes": 0}
+ 
+```
+
+Apply to `tests/_studio_rig.py` (`git apply`; контекст — код после предыдущих задач):
+
+```diff
+diff --git a/tests/_studio_rig.py b/tests/_studio_rig.py
+index ff762482..48910647 100644
+--- a/tests/_studio_rig.py
++++ b/tests/_studio_rig.py
+@@ -24,10 +24,10 @@ READY = {"ok": True, "state": "ready", "engine": "comfy-studio"}
+ 
+ class Rig:
+     def __init__(self, tmp_path: Path, *, acquire=(READY,), comfy_kwargs=None, kinds=None,
+-                 own=None, llm=None):
++                 own=None, llm=None, qwen=None):
+         self.outdir = tmp_path / "out"
+         self.comfy = FakeComfyStudio(tmp_path / "comfy-out", **(comfy_kwargs or {}))
+-        self.dispatcher = FakeDispatcher(acquire=acquire, own=own)
++        self.dispatcher = FakeDispatcher(acquire=acquire, own=own, qwen=qwen)
+         self.client = TestClient(
+             create_app(self.outdir, llm=llm or ScriptedLlm([]),
+                        dispatcher_factory=lambda url, client: DispatcherClient(
+```
+
+- [ ] **Step 4: Зелёный** — `tests/test_studio_image_llm.py` 4 passed, `tests/test_gpu_dispatcher.py` 61 passed (старые тесты `h3`/`ltx`/панели — без правок), `test_gpu_gate.py`, `test_studio_gpu_gate.py` — зелёные; полный набор — 0 failed.
+
+- [ ] **Step 5: Мутации**
+1. В `acquire` убрать `or profile not in beside_qwen` → `assert {'ok': True, …'comfy-studio'} == {'ok': True, …'Qwen держит карту'…}` (тяжёлая задача пошла бы рядом с LLM).
+2. Не отфильтровывать процессы Qwen (`if beside:` → `if False:`) → `IndexError: list index out of range` в `test_a_picture_that_fits_beside_shared32_starts_the_studio_engine` (движок не стартовал: Qwen — «чужой»).
+3. В `_after_heavy` убрать проверку тяжёлой задачи следом → `assert [{'unload_mod…}, {'unload_mod…}] == [{'unload_mod…}]` (`/free` после каждой задачи партии).
+4. `is_heavy` → `False` → `assert [] == [{'unload_models': True, 'free_memory': True}]`.
+
+- [ ] **Step 6: Коммит** — `feat(studio,dispatcher): Krea 2 и Z-Image рядом с Qwen-LLM shared32; /free и возврат LLM после тяжёлой партии (S2b задача 12)`.
+
+### Task 13: Мастер — эталон `#image` и экран «Картинка» на десктопе (§19.1, §19.2)
 
 **Files:**
 - Modify: `docs/design/2026-10-studio-style/AB/index.html` (`data-screen="image"`, 1440 и 390), `AB/shots/`
@@ -5714,7 +6831,10 @@ index 2efccd8..0135b69 100644
   - `frame.ts`: `frameFits(w, h, frameFormat) -> boolean` (|(w/h)/r − 1| ≤ 0,02, как `frame_shape.matches`), `shapeName(w, h)`.
   - `AutoTranslate({draft, onChanged, delayMs = 1500})`: пока `prompt_en_state === "stale"` — через `delayMs` после последней правки `POST /image/propose {mode: "translate", expected_edit_version}`; на 409 `revision_conflict` — перечитать снимок и повторить, только если всё ещё `stale`; при `owner` не зовёт никогда; «Перевести заново» — подтверждение и `overwrite_owner: true`.
   - `ImagePanel` — поля «Идея», «Промпт» (находки линта под полем: `warning` — `warn`, `error` — красная рамка), блок «В модель уйдёт · EN» с моно-меткой `ПЕРЕВЕДЕНО`/`ПЕРЕВОЖУ…`/`ПРАВЛЕНО ВРУЧНУЮ`, таблетки моделей с `badge` из O32 (недоступная — `disabled` с `reason`), сегмент «Быстро / Полное» у Qwen, чипы `1:1 · 16:9 · 9:16 · 4:3 · 3:4`, класс размера из `presets` выбранного соотношения, «Своё» Ш × В, кнопка LI2 «Округлить до {fix}», сид «Авто/Свой» (Inter Tight 30px, при «Авто» — «случайный»), «Вариантов» 1–8, «Ещё настройки» — шаги; главная кнопка 48px с `buttonLabel`, при `error`/`blocked` — `disabled` и причина словами. Сухой план запрашивается после каждой успешной O29 (дебаунс 400 мс); 409 `models_unchecked` — надпись «Проверяю модели, ≈1 мин», повтор по событию `inventory_checked`.
-  - `test/imageServer.ts`: `draft(over) -> ImageDraft` (черновик по умолчанию: Krea 2, 1344×768, авто-сид, 4 варианта, `edit_version 0`), `imageServer(state) -> routes` для `stubFetch`.
+  - `test/imageServer.ts`: `draft(over) -> ImageDraft` (черновик по умолчанию: Krea 2, 1344×768, авто-сид, 4 варианта, `edit_version 0`), `snapshot(draft) -> ImageSnapshot`, `imageServer(state) -> routes` для `stubFetch`.
+  - `AutoTranslate({pid, draft, onChanged, delayMs = 1500})` — `onChanged(draft)` получает новый черновик (из ответа O28 или из перечитанного снимка).
+  - Повтор с `differs` (ред. 2, Codex №6): перед подтверждением повтора мастер показывает под кнопкой одну строку по первому из `differs`: `template` — «шаблон обновлён — картинка может отличаться», `weights` — «веса изменились — картинка может отличаться», `engine` — «другая версия ComfyUI или неизвестна — повтор не гарантирован»; при пустом `differs` строки нет.
+  - События (ред. 2, стык с фиксом S2 задачи 8): снимок перечитывается и по `task_status {task_id, status, wait_reason}` — карточка ждущего варианта показывает `wait_reason` словами; «Отменить партию» шлёт O14 по каждой незавершённой задаче, включая `submit_unknown` (O14 переводит её в `cancelled`).
   - `VariantFilm` — партии сверху вниз, подпись `№ 3 · Z-IMAGE · 16:9 · 4 ВАР.`, кадр ≈220px, моно-сид, «Годится» 36px на всю ширину, «⋯»: «Повторить» (`repeatable.ok`, иначе пункт `disabled` с `reason`), «Сид в поле» (O29 `{seed_mode: "manual", seed}`), «Скачать PNG» (`asset_url`); ждущий — серый кадр «шаг 5/8» и «×» (O14); «Отменить партию» — O14 по каждой незавершённой; «Ещё 4» в конце ленты.
 
 - [ ] **Step 1: Эталон** — нарисовать `AB/index.html#image` (1440 и 390) по §19.2 в токенах AB (кремового, терракоты, serif и вида shadcn по умолчанию нет); снимки `shots/image-1440.png`, `shots/image-390.png`; `scrollWidth == 390` на телефоне. Показать владельцу до кода (как `#projects`, `#scene`).
@@ -5769,15 +6889,41 @@ describe("AutoTranslate", () => {
     expect(calls).toEqual([]);
   });
 
-  it("after 409 re-reads the draft and asks again only while it is still stale", async () => {
+  it("after 409 re-reads the snapshot: asks again with the new version while still stale, stops at owner", async () => {
+    // Ред. 2 (Codex №8): по содержимому — тела запросов, переданный наверх черновик, и
+    // запоздавший ответ к уже изменённому русскому не пишется.
     vi.useFakeTimers();
-    const conflict = { status: 409, body: { error: { code: "revision_conflict", message: "Черновик изменился в другом окне — обновите и повторите", detail: { current: draft({ prompt_en_state: "owner", edit_version: 5 }) } } } };
-    const calls = stubFetch({ "POST /api/studio/projects/p_1/image/propose": conflict });
+    const conflict = (current: object) => ({ status: 409, body: { error: { code: "revision_conflict", message: "Черновик изменился в другом окне — обновите и повторите", detail: { current } } } });
+    const calls = stubFetch({
+      "POST /api/studio/projects/p_1/image/propose": [
+        conflict(draft({ prompt_en_state: "stale", edit_version: 5, prompt_ru: "Афиша, ночь" })),
+        { body: { draft: draft({ prompt_en_state: "fresh", edit_version: 6, prompt_ru: "Афиша, ночь", prompt_en: "A poster, night." }), lint: [], suggested_aspect: null } },
+      ],
+      "GET /api/studio/projects/p_1": { body: snapshot(draft({ prompt_en_state: "stale", edit_version: 5, prompt_ru: "Афиша, ночь" })) },
+    });
     const onChanged = vi.fn();
     render(<AutoTranslate pid="p_1" draft={draft({ prompt_en_state: "stale", edit_version: 4 })} onChanged={onChanged} />);
-    await act(() => vi.advanceTimersByTimeAsync(3000));
-    expect(calls.length).toBe(1);
-    expect(onChanged).toHaveBeenCalledTimes(1);
+    await act(() => vi.advanceTimersByTimeAsync(1500));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(calls.map((c) => [c.key, c.body])).toEqual([
+      ["POST /api/studio/projects/p_1/image/propose", { mode: "translate", expected_edit_version: 4 }],
+      ["GET /api/studio/projects/p_1", null],
+      ["POST /api/studio/projects/p_1/image/propose", { mode: "translate", expected_edit_version: 5 }],
+    ]);
+    expect(onChanged).toHaveBeenLastCalledWith(expect.objectContaining({ edit_version: 6, prompt_en: "A poster, night.", prompt_en_state: "fresh" }));
+  });
+
+  it("after 409 with the English now the owner's it does not ask again", async () => {
+    vi.useFakeTimers();
+    const calls = stubFetch({
+      "POST /api/studio/projects/p_1/image/propose": { status: 409, body: { error: { code: "revision_conflict", message: "Черновик изменился в другом окне — обновите и повторите", detail: { current: draft({ prompt_en_state: "owner", edit_version: 5 }) } } } },
+      "GET /api/studio/projects/p_1": { body: snapshot(draft({ prompt_en_state: "owner", edit_version: 5, prompt_en: "Mine." })) },
+    });
+    const onChanged = vi.fn();
+    render(<AutoTranslate pid="p_1" draft={draft({ prompt_en_state: "stale", edit_version: 4 })} onChanged={onChanged} />);
+    await act(() => vi.advanceTimersByTimeAsync(5000));
+    expect(calls.map((c) => c.key)).toEqual(["POST /api/studio/projects/p_1/image/propose", "GET /api/studio/projects/p_1"]);
+    expect(onChanged).toHaveBeenLastCalledWith(expect.objectContaining({ prompt_en_state: "owner", prompt_en: "Mine." }));
   });
 });
 ```
@@ -5794,10 +6940,12 @@ describe("AutoTranslate", () => {
 1. В `AutoTranslate` убрать условие `prompt_en_state === "stale"` → `expected [] to equal [...]` в «never translates over the owner's English».
 2. В `frameFits` допуск `0.03` → `[true, true, true, false, false, true]`.
 3. Один `Idempotency-Key` на оба нажатия → тест `ImageScreen` (ключи различны) красный.
+4. (ред. 2) После 409 не перечитывать снимок, а повторять с прежней версией → первый тест «after 409…» красный (тело второго POST — `expected_edit_version: 4`).
+5. (ред. 2) Строка `differs` не показывается → тест «повтор: веса изменились» (в `ImageScreen.test.tsx`, ответ плана с `differs: ["weights"]`) красный.
 
-- [ ] **Step 7: Коммит** — `feat(studio-web): экран «Картинка» на десктопе — поля, автоперевод, модели, формат, сид, лента вариантов (S2b задача 12)`.
+- [ ] **Step 7: Коммит** — `feat(studio-web): экран «Картинка» на десктопе — поля, автоперевод, модели, формат, сид, лента вариантов (S2b задача 13)`.
 
-### Task 13: Мастер — телефон 390, «В сцену…» и «В кастинг…» (§19.1 шаг 8, §19.2)
+### Task 14: Мастер — телефон 390, «В сцену…» и «В кастинг…» (§19.1 шаг 8, §19.2)
 
 **Files:**
 - Create: `web/src/screens/image/{ToSceneDialog,ToCastDialog}.tsx` (+ тесты), `web/e2e/image.spec.ts`
@@ -5841,9 +6989,9 @@ test("390 px: no horizontal overflow, the main button stays at the bottom", asyn
 - [ ] **Step 3: Реализовать** по Interfaces.
 - [ ] **Step 4: Зелёный** — `npm … test`, `run build`, `npm … run test:phone`.
 - [ ] **Step 5: Мутации** — `frameFits` в диалоге заменить на `true` → первый тест красный; `expected_edit_version` из варианта вместо сцены → второй красный.
-- [ ] **Step 6: Коммит** — `feat(studio-web): «Картинка» на телефоне, «В сцену…» и «В кастинг…» (S2b задача 13)`.
+- [ ] **Step 6: Коммит** — `feat(studio-web): «Картинка» на телефоне, «В сцену…» и «В кастинг…» (S2b задача 14)`.
 
-### Task 14: Выкладка S2b на alex-neuro (:8766), живой контракт, приёмка владельца (§14, §15.4)
+### Task 15: Выкладка S2b на alex-neuro (:8766), живой контракт, приёмка владельца (§14, §15.4)
 
 **Files:**
 - Modify: `compose.studio.yaml` (воркеру — том весов только на чтение: каталог моделей ComfyUI и цели его ссылок, как их показал шаг 1 задачи 1; `STUDIO_*` не нужны — путь в `comfy.model_roots`), `tests/test_studio_deploy_scripts.py` (тест: у `studio-worker` том весов `:ro`, у `studio-api` его нет), README студии (режим «Картинка», откат)
@@ -5851,7 +6999,8 @@ test("390 px: no horizontal overflow, the main button stays at the bottom", asyn
 **Interfaces:** — (выкладка). Порядок — как задача 10 плана S2–S3: без «да» владельца ничего не выкладывается; старая панель :8765 не трогается.
 
 - [ ] **Step 1: Тест compose** — в `test_studio_deploy_scripts.py` по образцу S2: `services["studio-worker"]["volumes"]` содержит ровно `"<каталог моделей>:/models:ro"` (литерал), `studio-api` — нет. Красный до правки compose, зелёный после; мутация `:ro` → `:rw` — красная.
-- [ ] **Step 2 (координатор, после «да» владельца): выкладка.** Бэкап базы (`db.backup_once`), `git pull` ветки на alex-neuro, `docker compose -f compose.studio.yaml build && up -d`; миграция 004 — при старте `studio-api`; `python -m h3_48gb.studio setting comfy.model_roots '["/models"]' --outdir …` (в контейнере воркера). Ждать событие `inventory_checked` (первый проход ≈1 мин: 30 ГБ sha256); `GET /api/studio/image-models` — три модели `installed: true`, у Qwen оба профиля.
+- [ ] **Step 1b (координатор, alex-neuro, только чтение): опознание Qwen-LLM для задачи 12** — при поднятом `qwen.sh start-shared32`: `curl -s 127.0.0.1:8000/get_server_info | python3 -c 'import json,sys; print(json.load(sys.stdin)["context_length"])'` → `32768`; `nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -I{} sh -c 'tr "\0" " " </proc/{}/cmdline; echo'` — у процессов LLM в строке есть и `sglang`, и `--port 8000`. Если нет — поправить `QWEN_MARKERS`/`QWEN_PROFILE_BY_CONTEXT` (и тесты задачи 12) до выкладки.
+- [ ] **Step 2 (координатор, после «да» владельца): выкладка.** Диспетчер — новой версией `dispatcher.py` со скриптом отката S2 (`scripts/studio_dispatcher_rollback.py`, задача 10 S2–S3); старая панель после перезапуска диспетчера отвечает как раньше (`/status`, `/acquire` от `panel-worker`). Бэкап базы (`db.backup_once`), `git pull` ветки на alex-neuro, `docker compose -f compose.studio.yaml build && up -d`; миграция 004 — при старте `studio-api`; `python -m h3_48gb.studio setting comfy.model_roots '["/models"]' --outdir …` (в контейнере воркера). Ждать событие `inventory_checked` (первый проход ≈1 мин: 30 ГБ sha256); `GET /api/studio/image-models` — три модели `installed: true`, у Qwen оба профиля.
 - [ ] **Step 3: Живой контракт** (GPU через диспетчер, `comfy-studio` поднят студией; на alex-neuro, где читается output ComfyUI):
 
 ```bash
@@ -5861,11 +7010,11 @@ $PY -m pytest -q tests/test_studio_image_templates.py::test_live_picture_contrac
   2>&1 | tee ~/Projects/h3-bench/logs/s2b-live-contract-$(date +%Y%m%d-%H%M).log
 ```
 
-Expected: 4 passed — граф = литерал теста, пиксели повтора равны. Затем `verified_on` карточек картинок дописывается строкой этого прогона (дата, ComfyUI, `prompt_id`), копии — `cp` (тест побайтного равенства).
+Expected: 4 passed — граф = литерал теста, пиксели повтора равны. Затем (задача 12) вживую: `qwen.sh start-shared32`, партия Krea 2 и Z-Image — задачи идут без «Qwen держит карту», пик карты (`nvidia-smi`) ≤ 62 ГБ; партия Qwen-Image — ждёт «Qwen держит карту», «Освободить» → партия → `POST /free`; при `setting llm.restore_after_heavy 1` LLM поднимается рядом с ComfyUI студии, ответ «Сценариста» после подъёма — нормальный. Затем `verified_on` карточек картинок дописывается строкой этого прогона (дата, ComfyUI, `prompt_id`), копии — `cp` (тест побайтного равенства).
 - [ ] **Step 4: §15.4 п.18–20 вживую** — (18) `h3-fl2va` от PNG 1920×1088 и 1664×928 при холсте 896×512: кадр 0 глазами; (19) Qwen «Быстро» на 1328², 1664×928, 1920×1088: время, пик (`nvidia-smi`), вид; (20) Qwen → H3 fl2va подряд: время и пик. Итоги — в `docs/h3-modes/` отчётом и решения по исходу (допуск L7d, `presets` профиля, цена возврата H3) — правкой карточек/спеки отдельным коммитом.
 - [ ] **Step 5: Приёмка владельца** — владелец сам в `http://alex-neuro:8766/studio` (и с телефона): «Новый» → «Картинка» → идея по-русски с надписью в кавычках → «Предложить промпт» → правит русский, видит, как обновляется английский → Krea 2 → «Сделать 4 варианта» → сиды видны → «Годится» → «Повторить» — та же картинка → Qwen «Быстро» и Z-Image (надпись кириллицей — предупреждение) → «В сцену…» сцены 1 видеопроекта 16:9 → в шаге 4 видеопроекта кадр на месте; квадратный вариант — «В сцену…» неактивна с причиной, «В кастинг…» работает. Журнал прохода — в отчёт; дефекты — задачами.
 - [ ] **Step 6: Откат** (если приёмка не прошла): предыдущий образ `studio-*` (`docker compose … up -d` с прежним тегом), база — из бэкапа шага 2 (миграция 004 вниз не идёт); диспетчер и панель S2b не меняла.
-- [ ] **Step 7: Коммит** — `chore(studio): выкладка S2b — том весов воркеру, verified_on картинок, приёмка (S2b задача 14)`.
+- [ ] **Step 7: Коммит** — `chore(studio): выкладка S2b — том весов воркеру, verified_on картинок, приёмка (S2b задача 15)`.
 
 ---
 
@@ -5873,19 +7022,20 @@ Expected: 4 passed — граф = литерал теста, пиксели по
 
 | Раздел спеки | Где |
 |---|---|
-| §19.1 шаги 1–8, отмена | 5 (O2), 7 (O28), 6 (O29), 8–9 (O10/O30), 9 (O31), 11 (O8/O5), 12–13 (экран; отмена — O14 S2 у варианта и партии) |
-| §19.2 экран 1440 и 390, эталон `#image` | 12, 13 |
+| §19.1 шаги 1–8, отмена | 5 (O2), 7 (O28), 6 (O29), 8–9 (O10/O30), 9 (O31), 11 (O8/O5), 13–14 (экран; отмена — O14 S2 у варианта и партии) |
+| §19.2 экран 1440 и 390, эталон `#image` | 13, 14 |
 | §19.3 миграция 004, канонические входы, плоский payload, `task.weights_sha256`, каталог | 2, 8, 9, 10 |
 | §19.4 O1*, O2*, O3*, O10*, O28–O32 | 5, 6, 7, 8, 9 |
 | §19.5 события | 3 (`inventory_checked`), 6–7 (`image_draft_changed`), 9 (`image_batch_queued`, `image_variant_kept`), 10 (`task_succeeded` с `variant_id`) |
 | §19.6 ошибки | 5 (`project_kind_mismatch`, `template_unknown`), 6 (`seed_invalid`, `count_invalid`, `profile_unknown`, `revision_conflict`), 7 (`translation_owner`), 8 (`models_unchecked`, `repeat_incompatible`, `variant_not_found`), 9 (`plan_stale`, `plan_invalid`, `variant_not_ready`), 10 (`failed` «не установлена»), 11 (`frame_shape_mismatch`) |
 | §19.7 И13–И18 | И13 — 9, 10, 11; И14 — 2, 9; И15 — 8, 11, 14 (живой); И16 — 2, 8; И17 — 9; И18 — 5, 6, 7, 8, 9 |
 | §19.8 «Сценарист картинки» | 7 |
-| §19.9 исполнение, инвентарь, `queue_order`, вытеснение, без `/free` | 3, 8, 10 |
+| §19.9 исполнение, инвентарь, `queue_order`, вытеснение, без `/free` между моделями | 3, 8, 10 |
+| LLM-PLUS-IMAGE §7, §9.6 (решение владельца 23.10): Krea/Z рядом с Qwen-LLM shared32, `/free` и возврат LLM после тяжёлой партии | 12, 15 |
 | §19.11 26 мутаций, сквозной тест | таблица ниже; 11 |
 | §8.2 карточки, отпечаток весов, `null` необязательного входа | 1, 3 |
 | §10 LI1–LI8, L7d 2 % | 4, 11 |
-| §14 гейт S2b: живой контракт трёх шаблонов (оба профиля Qwen) с равенством декодированных пикселей; §15.4 п.18–20 | 14 |
+| §14 гейт S2b: живой контракт трёх шаблонов (оба профиля Qwen) с равенством декодированных пикселей; §15.4 п.18–20 | 15 |
 
 **26 мутаций §19.11 → задача, тест, красный вывод (прогнано на копии):**
 
@@ -5893,7 +7043,7 @@ Expected: 4 passed — граф = литерал теста, пиксели по
 |---|---|---|---|
 | 1 | повтор с новым сидом | 8 | `test_a_repeat_carries_the_variants_inputs_byte_for_byte`: `assert (196419009, …) == (1914716332, …)` |
 | 2 | авто-сид не доходит до графа | 10 | `test_one_task_per_variant_each_with_its_seed_in_the_graph` (сид исключён из values → `assert [] == [{'1': …` — задачи упали, граф не ушёл) |
-| 3 | партия одной задачей | 10 | `assert 1 == 3` (`drain()`) |
+| 3 | партия одной задачей | 10 | выражено как «задач меньше, чем вариантов» (`for item in plan["items"][:1]`) — `assert 1 == 3` (`drain()`); граф с `batch_size>1` отсёк бы литерал (`batch_size: 1` в `expected_graph`); входа `batch_size` у карточки нет, мутацию самого `batch_size` не гоняли |
 | 4 | снять триггер И14 | 2 | `Failed: DID NOT RAISE IntegrityError` |
 | 5 | `width`/`height` местами при подстановке | 10 | граф ≠ литералу (`assert [{'1': … == [{'1': …`) |
 | 6 | инвертировать LI1 | 4 | `Left contains one more item: {'rule': 'LI1', … 'Krea 2: кириллица в надписях не проверена'}` |
@@ -5907,9 +7057,9 @@ Expected: 4 passed — граф = литерал теста, пиксели по
 | 14а | повтор «Быстро» без LoRA | 10, 11 | граф ≠ литералу (`'lora'` выброшен из values) |
 | 14б | сила LoRA 1,0 → 0,8 | 1, 8, 10 | `test_the_fake_picture_is_the_same_for_the_same_inputs_and_changes_with_each` + литерал графа / входов |
 | 15 | `negative` карточки не подставлен у Qwen | 8 | `assert {'profile': '… == {'profile': '…` (входы без negative). На уровне графа мутация невидима по построению: текст карточки = текст узла 5 графа (R-S2b-5) |
-| 16 | `lora: null` вставляет пустой узел | 1 | литерал графа Qwen «Полное» без узла `lora` |
+| 16 | `lora: null` вставляет пустой узел | 1 | `test_null_is_absence_for_an_optional_input_and_an_error_for_a_required_one`: `TemplateError: negative: expected non-empty string, got None` (графовый тест мутацию не видит: `spec_for` выбрасывает `None` заранее) |
 | 17 | повтор читает черновик | 8 | `assert (1400229737, … == (211463746, …` |
-| 18 | веса не сверяются перед отправкой | 10 | `assert ('succeeded', None) == ('failed', 'в… план заново')` |
+| 18 | веса не сверяются перед отправкой | 10 | подмена во время ожидания карты: `assert ('succeeded', None) == ('failed', 'в… план заново')` |
 | 19 | O8 подключает 1:1 к 16:9 | 11 | `assert (200, {'scene…}) == (409, {'error… '16:9'}}})` |
 | 20 | автоперевод затирает `owner` | 7 | `assert (200, {'draft… == (409, {'error… 'My own English.' …})` |
 | 21 | ручной сид 2^53−2 при `count=4` принят | 6 | `max_start: 9007199254740991 != 9007199254740988` |
@@ -5924,23 +7074,25 @@ Expected: 4 passed — граф = литерал теста, пиксели по
 |---|---|
 | L7d с допуском 2 % в `plan_render` (стык 6) | S3 (план S2–S3 задача 12 уже берёт `frame_shape.matches`) |
 | `require_kind` в O11, O16–O20 | S3/S4: автор плана вызывает `ops.require_kind(conn, pid, "video")` первой строкой операции |
-| Сосуществование Krea/Z с Qwen-LLM shared32 на карте; авто-подъём LLM после партии (`/free`) | вопрос координатору (R-S2b-20) |
+| `RenderKind.beside_qwen -> []`, `is_heavy -> True` (H3 не идёт рядом с LLM, после рендера — `/free`) | S3: задача 12 плана S2–S3 (стык задачи 12 этого плана) |
+| Правка §8.4 спеки («Qwen держит карту» — только для тяжёлых моделей) | автор спеки (R-S2b-20) |
 | MCP-инструменты режима «Картинка» | S5 (слой 1 MCP) |
 
 ## Что осталось непроверенным при написании плана
 
-- Мастер (задачи 12–13): код компонентов и Vitest не запускались (в копии нет `node_modules`; база — шаг 4 S2, задача 9 S2–S3, ещё не принят). Тексты тестов сверены с `fetchStub.ts` и `ProjectsScreen.test.tsx` S1.
-- Эталон `AB/index.html#image` не нарисован (задача 12, шаг 1 — до кода).
-- Реальные `bytes`/`sha256` весов и сила LoRA Lightning (задача 1, шаг 1 — на alex-neuro); раскладка каталога моделей ComfyUI (`models/<folder>/<name>` или `extra_model_paths.yaml`) и тома контейнера воркера (задача 14).
-- Живой контракт трёх шаблонов и обоих профилей Qwen с повтором по сиду, §15.4 п.18–20, проход владельца (задача 14).
-- Диффы сняты с кода S2 из текста плана 4.1, а не с ветки `studio/s2` (она впереди): `git apply --check` перед каждой задачей.
+- Мастер (задачи 13–14): код компонентов и Vitest не запускались (в копии нет `node_modules`). Тексты тестов сверены с `fetchStub.ts` и `ProjectsScreen.test.tsx` S1.
+- Эталон `AB/index.html#image` не нарисован (задача 13, шаг 1 — до кода).
+- Опознание Qwen-LLM диспетчером (`context_length` 32768 → shared32, процессы по `sglang` + `--port 8000`) и пик карты Krea/Z рядом с LLM — живьём (задача 15, шаги 1b и 3); в тестах — подделки хоста.
+- Фикс S2 задачи 8 (незакоммиченный на 23.10) в базу проверки не входил.
+- Реальные `bytes`/`sha256` весов и сила LoRA Lightning (задача 1, шаг 1 — на alex-neuro); раскладка каталога моделей ComfyUI (`models/<folder>/<name>` или `extra_model_paths.yaml`) и тома контейнера воркера (задача 15).
+- Живой контракт трёх шаблонов и обоих профилей Qwen с повтором по сиду, §15.4 п.18–20, проход владельца (задача 15).
 - Порядок событий сквозного теста (`inventory_checked` первым) — следствие фикстуры, проверяющей диск до создания проекта.
 
 ## Числа
 
-База (S2 задачи 1–10 из текста плана): 614 passed. После задач 1–11: `test_studio_*.py test_comfy_api.py test_gpu_dispatcher.py test_ltx_upscale.py` — 714 passed, 2 skipped. Новых тестовых файлов 11 (`test_studio_image_{templates,db,lint,project,draft,prompt,plan,batch,worker,path}.py`, `test_studio_inventory.py`), помощник `_studio_images.py`. Задач — 14 (11 Python, 2 мастер, 1 выкладка).
+База `studio/s2 afe05dcc`: 679 тестов набора `test_studio_*.py test_comfy_api.py test_gpu_dispatcher.py test_ltx_upscale.py test_gpu_gate.py`. После задач 1–12: 804 passed, 2 skipped. Новых тестовых файлов 12 (`test_studio_image_{templates,db,lint,project,draft,prompt,plan,batch,worker,path,llm}.py`, `test_studio_inventory.py`), помощник `_studio_images.py`, 7 тестов (11 с параметрами) дописано в `test_gpu_dispatcher.py`. Задач — 15 (12 Python, 2 мастер, 1 выкладка).
 
 ## Execution Handoff
 
-План сохранён в `docs/superpowers/plans/2026-10-23-studio-s2b-image.md`. По §14 до первого исполнителя — проверка плана против спеки **не автором** (`/codex`, CLAUDE.md). Рекомендуемый способ — subagent-driven: задачи 5–11 тесно связаны интерфейсами, ревьюер на каждой задаче ловит расхождение с веткой S2, ушедшей вперёд.
+План сохранён в `docs/superpowers/plans/2026-10-23-studio-s2b-image.md`. По §14 до первого исполнителя — проверка плана против спеки **не автором** (`/codex`, CLAUDE.md). Рекомендуемый способ — subagent-driven: задачи 5–12 тесно связаны интерфейсами, ревьюер на каждой задаче ловит расхождение с веткой S2 (фикс задачи 8 ещё не в ней).
 
